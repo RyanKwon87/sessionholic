@@ -593,6 +593,61 @@ function drawDetail(s) {
 function chatKey(source) {
   return JSON.stringify([source.host, source.agent, source.home || "", source.id]);
 }
+function attachmentMetadata(files) {
+  if (!Array.isArray(files)) return [];
+  return files.filter((file) => file && typeof file === "object").map((file) => {
+    const type = typeof file.type === "string" ? file.type : "";
+    const kind = file.kind === "image" || file.kind !== "file" && type.startsWith("image/") ? "image" : "file";
+    return { id: typeof file.id === "string" ? file.id : null,
+      name: typeof file.name === "string" && file.name ? file.name : kind === "image" ? "이미지 첨부" : "첨부파일",
+      type, size: Number.isInteger(file.size) && file.size >= 0 ? file.size : null, kind,
+      source: file.source === "native" ? "native" : "sessionholic" };
+  });
+}
+function attachmentGroup(files, caption = `첨부 ${files.length}개`) {
+  const group = el("div", "msg-attachments");
+  group.setAttribute("role", "group");
+  group.setAttribute("aria-label", caption);
+  group.append(el("span", "attachment-caption", caption));
+  const chips = el("div", "attachment-chips");
+  chips.setAttribute("role", "list");
+  for (const file of files) {
+    const kind = file.kind === "image" ? "이미지" : "파일";
+    const size = file.size == null ? "" : formatBytes(file.size);
+    const chip = el("span", "msg-attachment");
+    chip.setAttribute("role", "listitem");
+    chip.setAttribute("aria-label", `${kind}: ${file.name}${size ? `, ${size}` : ""}`);
+    chip.title = file.name;
+    chip.append(el("span", "attachment-kind", kind), el("span", "attachment-name", file.name));
+    if (size) chip.append(el("span", "attachment-size", size));
+    chips.append(chip);
+  }
+  group.append(chips);
+  return group;
+}
+function updateChatDeliveryEvidence(entry) {
+  const box = $("chat-delivery-evidence");
+  const receipt = entry.receipt;
+  const pending = entry.pending;
+  const matchingReceipt = !pending || receipt?.requestId === pending.requestId;
+  const files = attachmentMetadata(matchingReceipt && Array.isArray(receipt?.attachments)
+    ? receipt.attachments : pending?.attachmentDetails);
+  const retained = pending || ["accepted", "queued", "completed", "interrupted", "unknown"].includes(receipt?.status) ||
+    receipt?.status === "failed" && receipt.confirmed === true;
+  const visible = retained && files.length > 0;
+  box.hidden = !visible;
+  if (!visible) { box.replaceChildren(); box.deliveryRevision = null; return false; }
+  const labels = { accepted: "전송 접수", queued: "대기열 접수", completed: "요청 완료",
+    interrupted: "접수 후 중단", unknown: "전송 결과 미확인", failed: "접수 후 오류" };
+  const label = pending ? entry.sending ? "전송 중" : "전송 결과 미확인" : labels[receipt?.status];
+  const record = receipt?.readbackConfirmed === true && !pending ? " · 세션 기록 확인" : "";
+  const caption = `${label}${record} · 전송에 포함한 첨부 ${files.length}개`;
+  const revision = JSON.stringify([pending?.requestId || receipt?.requestId, caption, files]);
+  if (box.deliveryRevision === revision) return true;
+  box.deliveryRevision = revision;
+  box.replaceChildren(attachmentGroup(files, caption));
+  return true;
+}
 function chatEntry(s) {
   const source = sourceOf(s);
   const key = chatKey(source);
@@ -640,6 +695,12 @@ function buildChatComposer(s) {
   status.id = "chat-status";
   status.setAttribute("role", "status");
   status.setAttribute("aria-live", "polite");
+  const evidence = el("div", "chat-delivery-evidence");
+  evidence.id = "chat-delivery-evidence";
+  evidence.hidden = true;
+  const attachmentsLabel = el("p", "chat-attachments-label");
+  attachmentsLabel.id = "chat-attachments-label";
+  attachmentsLabel.hidden = true;
   const attachments = el("div", "chat-attachments");
   attachments.id = "chat-attachments";
   const input = el("textarea", "chat-input");
@@ -756,7 +817,7 @@ function buildChatComposer(s) {
   actions.append(attach, expand, terminal, tools);
   const main = el("div", "chat-main");
   main.append(input, send);
-  box.append(heading, status, attachments, main, files, actions, hint);
+  box.append(heading, status, evidence, attachmentsLabel, attachments, main, files, actions, hint);
   queueMicrotask(() => {
     if (!editorCurrent()) return;
     updateChatComposer(entry);
@@ -852,7 +913,16 @@ function updateChatComposer(entry) {
     ? "첨부는 이 작업 폴더에 저장됐습니다. 첨부의 ‘경로’를 복사해 터미널에 붙여넣으세요."
     : entry.data?.capability?.reason || "직접 입력을 지원하지 않습니다. 터미널을 사용해 주세요.";
   $("chat-status").textContent = (offline ? "오프라인입니다. 초안은 유지됩니다. 연결 후 상태를 확인하고 보내 주세요." : entry.error || entry.notice || (entry.uploads ? `첨부 ${entry.uploads}개를 올리고 있습니다…` : !entry.data ? "메시지 전송 환경을 확인하고 있습니다…" : !supported ? unsupportedCopy : chatReceiptCopy(entry.receipt) || phaseCopy)) + budgetNote;
+  const deliveryVisible = updateChatDeliveryEvidence(entry);
   const chips = $("chat-attachments");
+  chips.hidden = !!entry.pending && deliveryVisible;
+  const attachmentsLabel = $("chat-attachments-label");
+  attachmentsLabel.hidden = chips.hidden || !entry.attachments.length;
+  const selectedCaption = entry.pending
+    ? `전송 요청 첨부 ${entry.attachments.length}개 · 결과 미확인`
+    : `전송 전 첨부 ${entry.attachments.length}개 · 업로드 완료`;
+  attachmentsLabel.textContent = selectedCaption;
+  chips.setAttribute("aria-label", selectedCaption);
   chips.replaceChildren();
   for (const file of entry.attachments) {
     const chip = el("div", "chat-attachment");
@@ -899,7 +969,9 @@ function scheduleChatPoll(s, entry) {
 }
 function applyChatReceipt(entry, receipt) {
   if (!receipt || (entry.pending && receipt.requestId !== entry.pending.requestId)) return;
-  entry.receipt = receipt;
+  const fallback = entry.pending?.attachmentDetails ||
+    (entry.receipt?.requestId === receipt.requestId ? entry.receipt.attachments : []);
+  entry.receipt = { ...receipt, attachments: attachmentMetadata(Array.isArray(receipt.attachments) ? receipt.attachments : fallback) };
   if (!entry.pending || !["accepted", "queued", "completed", "interrupted", "failed"].includes(receipt.status)) return;
   if ((receipt.status !== "failed" || receipt.confirmed === true) && entry.revision === entry.pending.revision) {
     entry.text = "";
@@ -963,7 +1035,8 @@ async function sendChat(entry) {
   // Keep the exact source and idempotency key even if selection changes during transport.
   const authEpoch = state.authEpoch;
   const pending = { requestId: requestId(), revision: entry.revision, source: entry.source,
-    text: entry.text, attachments: entry.attachments.map((item) => item.id) };
+    text: entry.text, attachments: entry.attachments.map((item) => item.id),
+    attachmentDetails: attachmentMetadata(entry.attachments) };
   entry.pending = pending;
   entry.stateEpoch++;
   entry.sending = true;
@@ -1001,7 +1074,7 @@ async function sendChat(entry) {
         }
       } else {
         // HTTP status alone cannot establish whether the native runtime started.
-        entry.receipt = { requestId: pending.requestId, status: "unknown" };
+        entry.receipt = { requestId: pending.requestId, status: "unknown", attachments: pending.attachmentDetails };
         entry.error = "전송 결과를 확인하지 못했습니다. 상태 다시 확인을 눌러 주세요. 중복 전송은 잠겼습니다.";
       }
     }
@@ -1237,7 +1310,8 @@ function renderMessages(s, messages, error = "", fresh = false) {
     available.get(item.key).push(item);
   }
   const rows = messages.map((message) => {
-    const key = JSON.stringify([message.role, message.text, message.ts || null]);
+    const attachments = attachmentMetadata(message.attachments);
+    const key = JSON.stringify([message.role, message.text, message.ts || null, attachments]);
     const retained = available.get(key)?.shift();
     if (retained) return retained;
     const role = ["user", "assistant", "tool", "system"].includes(message.role) ? message.role : "system";
@@ -1263,7 +1337,13 @@ function renderMessages(s, messages, error = "", fresh = false) {
             } catch { toast("클립보드에 접근할 수 없습니다. 본문을 길게 눌러 선택해 주세요."); }
           },
         });
-      } else bubble.textContent = message.text || "";
+      } else {
+        const text = message.text || "";
+        if (role === "user" && attachments.length) {
+          if (text) bubble.append(el("span", "msg-body", text));
+          bubble.append(attachmentGroup(attachments));
+        } else bubble.textContent = text;
+      }
       row.append(bubble);
     }
     const copy = button("복사", "msg-copy", async () => {
@@ -1273,6 +1353,11 @@ function renderMessages(s, messages, error = "", fresh = false) {
       catch { toast("클립보드에 접근할 수 없습니다. 본문을 길게 눌러 선택해 주세요."); }
     });
     copy.setAttribute("aria-label", "메시지 본문 복사");
+    if (role === "user" && attachments.length && !message.text) {
+      copy.disabled = true;
+      copy.hidden = true;
+      copy.setAttribute("aria-label", "복사할 텍스트 본문이 없습니다");
+    }
     row.append(copy);
     return { key, message, row };
   });

@@ -202,6 +202,18 @@ def tool_summary(name, args):
     return name or "도구"
 
 
+def native_attachments(blocks):
+    """Attachment evidence only: never expose URLs, paths or encoded contents."""
+    out = []
+    for block in blocks if isinstance(blocks, list) else []:
+        if isinstance(block, dict) and block.get("type") in ("image", "localImage", "document"):
+            image = block["type"] != "document"
+            out.append({"id": None, "name": "이미지" if image else "파일",
+                        "type": "image/*" if image else "application/octet-stream",
+                        "size": None, "kind": "image" if image else "file", "source": "native"})
+    return out[:32]
+
+
 def claude_messages(entries):
     out = []
     for entry in entries:
@@ -211,6 +223,8 @@ def claude_messages(entries):
         content = (entry.get("message") or {}).get("content")
         blocks = [{"type": "text", "text": content}] if isinstance(content, str) else content
         ts = to_epoch(entry.get("timestamp"))
+        attached = native_attachments(blocks) if kind == "user" else []
+        attachment_row = None
         for block in blocks if isinstance(blocks, list) else []:
             if not isinstance(block, dict):
                 continue
@@ -218,8 +232,15 @@ def claude_messages(entries):
                 shown = user_text(block["text"]) if kind == "user" else ("assistant", block["text"])
                 if shown:
                     out.append({"role": shown[0], "text": clip(shown[1]), "ts": ts})
+                    if shown[0] == "user" and attachment_row is None:
+                        attachment_row = out[-1]
             elif block.get("type") == "tool_use":
                 out.append({"role": "tool", "text": tool_summary(block.get("name"), block.get("input")), "ts": ts})
+        if attached:
+            if attachment_row is None:
+                attachment_row = {"role": "user", "text": "[이미지 첨부]" if all(a["kind"] == "image" for a in attached) else "[파일 첨부]", "ts": ts}
+                out.append(attachment_row)
+            attachment_row["attachments"] = attached
     return out[-MESSAGE_LIMIT:]
 
 
@@ -410,8 +431,13 @@ def codex_messages(turns):
             if kind == "userMessage":
                 text = "\n".join(str(c.get("text") or "") for c in item.get("content") or []
                                  if isinstance(c, dict) and c.get("type") == "text").strip()
-                if text:
-                    out.append({"role": "user", "text": clip(text), "ts": ts})
+                attached = native_attachments(item.get("content"))
+                if text or attached:
+                    fallback = "[이미지 첨부]" if all(a["kind"] == "image" for a in attached) else "[파일 첨부]"
+                    row = {"role": "user", "text": clip(text) if text else fallback, "ts": ts}
+                    if attached:
+                        row["attachments"] = attached
+                    out.append(row)
             elif kind == "agentMessage" and str(item.get("text") or "").strip():
                 out.append({"role": "assistant", "text": clip(item["text"]), "ts": ts})
             elif kind == "commandExecution":

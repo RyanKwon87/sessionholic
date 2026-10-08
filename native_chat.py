@@ -6,6 +6,7 @@ never browser-provided. Native approvals remain in the original terminal.
 from __future__ import annotations
 
 import fcntl
+from collections import Counter
 import hashlib
 import json
 import os
@@ -164,21 +165,27 @@ def _receipt(identity, request_id, thread, queue):
             "reason": "Native 수신 여부를 확인하지 못했습니다. 같은 입력을 자동으로 다시 보내지 않습니다."}
 
 
-def _messages(thread):
+def _messages(thread, identity=None, home=None):
     out = []
-    for turn in thread["turns"]:
-        for item in turn.get("items") or []:
+    # Only the retained history window may read attachment metadata from disk.
+    for turn in reversed(thread["turns"]):
+        for item in reversed(turn.get("items") or []):
             if not isinstance(item, dict):
                 continue
             rows = collector.codex_messages([{**turn, "items": [item]}])
-            if not rows and item.get("type") == "userMessage":
-                images = [c for c in item.get("content") or [] if isinstance(c, dict)
-                          and c.get("type") in ("image", "localImage")]
-                if images:
-                    rows = [{"role": "user", "text": "[이미지 첨부]", "ts": collector.to_epoch(turn.get("startedAt"))}]
+            manifest = _history_attachments(identity, item.get("clientId"), home, item.get("content")) if rows and identity and item.get("type") == "userMessage" else []
+            group = []
             for row in rows:
-                out.append({**row, "turnId": turn.get("id"), "turnStatus": turn.get("status"),
+                if manifest:
+                    generic = row.get("attachments", [])
+                    images = [a for a in generic if a["kind"] == "image"]
+                    extra_images = max(0, len(images) - sum(a["kind"] == "image" for a in manifest))
+                    row["attachments"] = manifest + images[:extra_images] + [a for a in generic if a["kind"] != "image"]
+                group.append({**row, "turnId": turn.get("id"), "turnStatus": turn.get("status"),
                             "itemId": item.get("id"), "clientId": item.get("clientId")})
+            out[0:0] = group
+            if len(out) >= collector.MESSAGE_LIMIT:
+                return out[-collector.MESSAGE_LIMIT:]
     return out[-collector.MESSAGE_LIMIT:]
 
 
@@ -224,14 +231,94 @@ def _private_dir(path):
         raise ValueError("안전한 메시지 수신 기록 경로를 확인하지 못했습니다.")
 
 
+def _ledger_key(identity, request_id):
+    return hashlib.sha256(json.dumps([identity, request_id], sort_keys=True).encode()).hexdigest()
+
+
+def _manifest(value):
+    """Accept only bounded, path-free metadata written by attachment resolution."""
+    if not isinstance(value, list) or len(value) > 8:
+        return []
+    out = []
+    for item in value:
+        if (not isinstance(item, dict) or set(item) != {"id", "name", "type", "size", "kind", "source"}
+                or not isinstance(item.get("id"), str) or not re.fullmatch(r"[a-f0-9]{32}", item["id"])
+                or not isinstance(item.get("name"), str) or not item["name"] or len(item["name"].encode()) > 240
+                or any(c in item["name"] for c in ("/", "\\")) or any(ord(c) < 32 or ord(c) == 127 for c in item["name"])
+                or not isinstance(item.get("type"), str) or not re.fullmatch(r"[A-Za-z0-9.+_-]+/[A-Za-z0-9.+_-]+", item["type"])
+                or len(item["type"]) > 128 or type(item.get("size")) is not int or not 0 <= item["size"] <= attachments.MAX_FILE_BYTES
+                or item.get("kind") not in ("image", "file") or item.get("source") != "sessionholic"):
+            return []
+        out.append(dict(item))
+    return out
+
+
+def _input_marker(block):
+    if not isinstance(block, dict):
+        return None
+    kind = block.get("type")
+    value = block.get("text") if kind == "text" else block.get("path") if kind == "localImage" else None
+    if not isinstance(value, str):
+        return None
+    return hashlib.sha256(json.dumps([kind, value], ensure_ascii=False).encode()).hexdigest()
+
+
+def _proven_manifest(manifest, evidence, content):
+    """A matching request proves reception, not preservation of each input."""
+    if not isinstance(evidence, list) or len(evidence) > 8 or not isinstance(content, list):
+        return []
+    proofs = {}
+    for item in evidence:
+        if (not isinstance(item, dict) or set(item) != {"id", "kind", "sha256", "occurrence"}
+                or not isinstance(item.get("id"), str) or item["id"] in proofs
+                or not re.fullmatch(r"[a-f0-9]{32}", item["id"])
+                or item.get("kind") not in ("image", "file")
+                or type(item.get("occurrence")) is not int or not 1 <= item["occurrence"] <= 17
+                or not isinstance(item.get("sha256"), str) or not re.fullmatch(r"[a-f0-9]{64}", item["sha256"])):
+            return []
+        proofs[item["id"]] = item
+    markers = Counter(marker for marker in (_input_marker(block) for block in content) if marker)
+    out = []
+    for item in manifest:
+        proof = proofs.get(item["id"])
+        if proof and proof["kind"] == item["kind"] and markers[proof["sha256"]] >= proof["occurrence"]:
+            out.append(item)
+    return out
+
+
+def _history_attachments(identity, request_id, home, content=None):
+    """Atomic ledger read only; absent or unsafe history never writes or locks."""
+    if not isinstance(request_id, str) or not REQUEST_ID.fullmatch(request_id):
+        return []
+    root = launch._home(home) / ".sessionholic"
+    folder = root / "chat-receipts"
+    try:
+        for path in (root, folder):
+            info = path.lstat()
+            if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
+                return []
+        fd = os.open(str(folder / (_ledger_key(identity, request_id) + ".json")), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(fd, "rb") as file:
+            info = os.fstat(file.fileno())
+            if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077 or info.st_size > 16384:
+                return []
+            record = json.loads(file.read(16385))
+        if not isinstance(record, dict):
+            return []
+        manifest = _manifest(record.get("attachments"))
+        return manifest if content is None else _proven_manifest(manifest, record.get("attachmentEvidence"), content)
+    except (OSError, ValueError, UnicodeError):
+        return []
+
+
 class _Ledger:
-    """Cross-worker deduplication. Persists only IDs, hashes and receipt metadata."""
+    """Deduplication and bounded attachment metadata, never message/file contents."""
     def __init__(self, identity, request_id, home):
         root = launch._home(home) / ".sessionholic"
         _private_dir(root)
         folder = root / "chat-receipts"
         _private_dir(folder)
-        key = hashlib.sha256(json.dumps([identity, request_id], sort_keys=True).encode()).hexdigest()
+        key = _ledger_key(identity, request_id)
         self.path = folder / (key + ".json")
         fd = os.open(str(folder / (key + ".lock")), os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
         self.lock = os.fdopen(fd, "a+")
@@ -274,6 +361,7 @@ def _send(client, identity, args, thread, queue, home):
         raise ValueError("메시지 입력이 올바르지 않습니다.")
     raw_inputs = list(raw_inputs)
     ids = args.get("attachmentIds", [])
+    manifest, evidence = [], []
     if not isinstance(ids, list) or len(ids) > 8 or any(not isinstance(i, str) for i in ids) or len(set(ids)) != len(ids):
         raise ValueError("첨부 식별자가 올바르지 않습니다.")
     if ids:
@@ -282,11 +370,16 @@ def _send(client, identity, args, thread, queue, home):
             raise ValueError("실제 세션의 작업 폴더가 변경되었습니다. 목록을 다시 읽어 주세요.")
         for identifier in ids:
             item = attachments.resolve(cwd, identifier)
+            manifest.append({"id": item["id"], "name": item["name"], "type": item["mime"],
+                             "size": item["size"], "kind": "image" if item["mime"].startswith("image/") else "file", "source": "sessionholic"})
             if item["mime"] in ("image/png", "image/jpeg", "image/gif", "image/webp"):
                 raw_inputs.append({"type": "localImage", "path": item["path"]})
             else:
                 # A path reference, never fake inline extraction of arbitrary files.
                 raw_inputs.append({"type": "text", "text": "첨부 파일: " + json.dumps(item["path"], ensure_ascii=False)})
+            marker = _input_marker(raw_inputs[-1])
+            evidence.append({"id": item["id"], "kind": manifest[-1]["kind"], "sha256": marker,
+                             "occurrence": sum(_input_marker(block) == marker for block in raw_inputs)})
     inputs = _inputs(raw_inputs)
     mode = args.get("mode", "queue")
     if mode not in ("queue", "steer"):
@@ -297,6 +390,9 @@ def _send(client, identity, args, thread, queue, home):
         if prior and prior.get("digest") != digest:
             raise ValueError("이미 사용한 요청 ID에 다른 메시지를 보낼 수 없습니다.")
         before = _receipt(identity, request_id, thread, queue)
+        recorded = _manifest(prior.get("attachments")) if prior else ([] if before["confirmed"] else manifest)
+        if recorded:
+            before["attachments"] = recorded
         if before["confirmed"]:
             return before
         if prior:
@@ -309,7 +405,7 @@ def _send(client, identity, args, thread, queue, home):
         if mode == "steer" and (not capabilities["canSteer"] or
                                 args.get("expectedTurnId") != state["activeTurnId"]):
             return {**before, "delivery": "rejected", "reason": "정확한 실행 중 turn을 확인해야 방향을 수정할 수 있습니다."}
-        ledger.save({"digest": digest, "receipt": before})
+        ledger.save({"digest": digest, "receipt": before, "attachments": manifest, "attachmentEvidence": evidence})
         acknowledged, queue_id, turn_id = False, None, None
         try:
             if mode == "steer":
@@ -346,7 +442,9 @@ def _send(client, identity, args, thread, queue, home):
                             "turnId": turn_id, "queueId": queue_id,
                             "reason": "Native 수신 응답을 받았습니다. 대화 기록 반영은 아직 확인되지 않았습니다."})
         receipt["fallback"] = FALLBACK
-        ledger.save({"digest": digest, "receipt": receipt})
+        if manifest:
+            receipt["attachments"] = manifest
+        ledger.save({"digest": digest, "receipt": receipt, "attachments": manifest, "attachmentEvidence": evidence})
         return receipt
 
 
@@ -410,7 +508,7 @@ def handle(args, *, home=None, timeout=10):
         result = {"source": identity, "cwd": thread.get("cwd"), **_state(thread),
                   "capabilities": _capabilities(thread, queue_available)}
         if action == "read":
-            result["messages"] = _messages(thread)
+            result["messages"] = _messages(thread, identity, home)
             result["queue"] = [{"id": q.get("id"), "clientId": q.get("clientUserMessageId")} for q in queue]
         elif action == "receipt":
             request_id = _request(args.get("requestId"))
@@ -421,6 +519,9 @@ def handle(args, *, home=None, timeout=10):
                     if saved.get("confirmed") or saved.get("delivery") == "rejected":
                         receipt = saved
             result.update(receipt)
+            manifest = _history_attachments(identity, request_id, home)
+            if manifest:
+                result["attachments"] = manifest
         elif action == "send":
             if not queue_available:
                 return {**result, "requestId": _request(args.get("requestId")), "delivery": "rejected",

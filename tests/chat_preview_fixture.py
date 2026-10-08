@@ -24,7 +24,9 @@ class FakeNative:
     def __init__(self, rows):
         self.rows = {row['id']: row for row in rows}
         self.messages = {row['id']: [
-            {'role': 'user', 'text': '휴대폰에서 한글과 이미지를 함께 보낼 수 있게 해줘.', 'ts': time.time() - 20},
+            {'role': 'user', 'text': '휴대폰에서 한글과 이미지를 함께 보낼 수 있게 해줘.', 'ts': time.time() - 20,
+             'attachments': [{'id': None, 'name': '이미지 첨부', 'type': 'image/*', 'size': None,
+                              'kind': 'image', 'source': 'native'}]},
             {'role': 'tool', 'text': '검증용 파일 읽기\n선택한 텍스트와 펼친 기록은 상태 갱신 중에도 유지됩니다.', 'ts': time.time() - 15},
             {'role': 'assistant', 'text': (
                 '**검증 화면**입니다. 실제 모델 호출 없이 접수와 대기열을 확인할 수 있습니다.\n\n'
@@ -45,6 +47,7 @@ class FakeNative:
             self.messages[identifier].append({'role': 'assistant', 'text': '검증 응답: ' + text, 'ts': time.time()})
             self.rows[identifier]['phase'] = 'idle'
             self.receipts[request_id]['delivery'] = 'completed'
+            self.receipts[request_id]['readbackConfirmed'] = True
 
     def rpc(self, host, command, payload, timeout=20):
         if command == 'attachment':
@@ -69,12 +72,19 @@ class FakeNative:
             if row['agent'] != 'codex':
                 return {'delivery': 'failed', 'reason': '검증 Claude는 터미널만 지원합니다.'}
             text = '\n'.join(item['text'] for item in payload.get('input', []) if item['type'] == 'text')
+            sent_files = []
             for aid in payload.get('attachmentIds', []):
                 record = attachments.resolve(row['cwd'], aid)
-                text += '\n[실제 첨부 경로] ' + record['path']
+                kind = 'image' if record['mime'] in ('image/png', 'image/jpeg', 'image/gif', 'image/webp') else 'file'
+                sent_files.append({'id': record['id'], 'name': record['name'], 'type': record['mime'],
+                                   'size': record['size'], 'kind': kind, 'source': 'sessionholic'})
+                if kind == 'file':
+                    text += '\n첨부 파일: ' + record['path']
             queued = row['phase'] == 'working'
-            self.messages[row['id']].append({'role': 'user', 'text': text, 'ts': time.time()})
-            self.receipts[rid] = {'delivery': 'queued' if queued else 'accepted', 'confirmed': True, 'turnId': rid}
+            self.messages[row['id']].append({'role': 'user', 'text': text, 'ts': time.time(),
+                                             'clientId': rid, 'attachments': sent_files})
+            self.receipts[rid] = {'delivery': 'queued' if queued else 'accepted', 'confirmed': True, 'turnId': rid,
+                                  'readbackConfirmed': True, 'acknowledged': True, 'attachments': sent_files}
             row['phase'] = 'working'
             timer = threading.Timer(8 if queued else 5, self.finish, args=(row['id'], rid, text))
             timer.daemon = True

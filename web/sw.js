@@ -1,7 +1,7 @@
 "use strict";
 
 // Sessionholic caches only public static assets. All session and terminal data remains online-only.
-const CACHE = "sessionholic-shell-v4";
+const CACHE = "sessionholic-shell-v5";
 const SHELL = [
   "/",
   "/app.js",

@@ -2077,7 +2077,7 @@ test('service worker evicts only its own old shells and offline reads use the cu
     self, URL, Set, Response,
     fetch: async () => { throw new Error('offline'); },
     caches: {
-      keys: async () => ['another-app-shell', 'sessionholic-shell-v0', 'sessionholic-shell-v1', 'sessionholic-shell-v2', 'sessionholic-shell-v4'],
+      keys: async () => ['another-app-shell', 'sessionholic-shell-v0', 'sessionholic-shell-v1', 'sessionholic-shell-v2', 'sessionholic-shell-v4', 'sessionholic-shell-v5'],
       delete: async (key) => { deleted.push(key); },
       open: async (key) => { opened.push(key); return { match: async () => currentShell }; },
       match: async () => { throw new Error('Global cross-application cache lookup is forbidden'); },
@@ -2085,11 +2085,11 @@ test('service worker evicts only its own old shells and offline reads use the cu
   });
   let activated;
   listeners.activate({ waitUntil: (promise) => { activated = promise; } }); await activated;
-  assert.deepEqual(deleted, ['sessionholic-shell-v0', 'sessionholic-shell-v1', 'sessionholic-shell-v2']);
+  assert.deepEqual(deleted, ['sessionholic-shell-v0', 'sessionholic-shell-v1', 'sessionholic-shell-v2', 'sessionholic-shell-v4']);
   listeners.fetch({ request: { method: 'GET', url: 'https://app.example/' },
     respondWith: (promise) => { response = promise; }, waitUntil() {} });
   assert.equal(await response, currentShell);
-  assert.deepEqual(opened, ['sessionholic-shell-v4']);
+  assert.deepEqual(opened, ['sessionholic-shell-v5']);
 });
 
 test('an offline first launch restores authentication and already-open terminal rows without reopening their sessions', async () => {
@@ -2516,4 +2516,216 @@ test('programmatic clipboard insertion grows the editor and accepted delivery sh
   c.applyChatReceipt(entry, { requestId: 'older-draft-request', status: 'accepted' });
   assert.equal(input.value, text);
   assert.equal(input.style.height, '88px');
+});
+
+function byClass(root, className) {
+  const found = [];
+  const visit = (current) => {
+    if ((current.className || '').split(' ').includes(className)) found.push(current);
+    for (const child of current.children || []) visit(child);
+  };
+  visit(root);
+  return found;
+}
+
+function attachmentState(entry, receipts = [], messages) {
+  return { route: entry.source, capability: { supported: true }, phase: 'idle', receipts: receipts.filter(Boolean),
+    ...(messages ? { messages } : {}) };
+}
+
+test('user history displays durable attachment names, image kinds and attachment-only rows without altering body copy', async () => {
+  const c = client(undefined, noChatTimers);
+  const { s } = selectChat(c);
+  let copied;
+  c.context.navigator = { clipboard: { writeText: async (text) => { copied = text; } } };
+  const messages = [
+    { role: 'user', text: '사진 **원문**을 확인해 주세요', attachments: [
+      { id: 'photo', name: '화면.png', type: 'image/png', size: 2048, kind: 'image', source: 'sessionholic' },
+      { id: 'notes', name: '<img onerror=alert(1)>.txt', type: 'text/plain', size: 12, kind: 'file', source: 'sessionholic' },
+    ] },
+    { role: 'user', text: '', attachments: [{ id: null, name: '이미지 첨부', type: '', size: null, kind: 'image', source: 'native' }] },
+    { role: 'user', text: '파일을 보냈다고만 말하는 텍스트' },
+  ];
+  c.renderMessages(s, messages);
+  const rows = c.get('messages').children;
+  const group = byClass(rows[0], 'msg-attachments')[0];
+  assert.equal(group.attributes['aria-label'], '첨부 2개');
+  assert.equal(byClass(group, 'msg-attachment').length, 2);
+  assert.match(textOf(group), /이미지.*화면.png.*파일.*<img onerror=alert\(1\)>.txt/);
+  assert.equal(byClass(group, 'attachment-name')[1].textContent, '<img onerror=alert(1)>.txt');
+  await byClass(rows[0], 'msg-copy')[0].events.click();
+  assert.equal(copied, messages[0].text);
+  assert.match(textOf(rows[1]), /첨부 1개.*이미지.*이미지 첨부/);
+  assert.equal(byClass(rows[1], 'attachment-size').length, 0);
+  assert.equal(byClass(rows[1], 'msg-copy')[0].hidden, true);
+  assert.equal(byClass(rows[2], 'msg-attachments').length, 0);
+});
+
+test('attachment metadata refresh replaces only changed message rows and preserves unrelated tool state and scroll', () => {
+  const c = client(undefined, noChatTimers);
+  const { s } = selectChat(c);
+  const messages = [{ role: 'tool', text: '기존 도구 기록' },
+    { role: 'user', text: '검토 부탁', attachments: [{ id: 'a', name: 'old.txt', kind: 'file', source: 'sessionholic' }] }];
+  const list = c.get('messages');
+  list.scrollHeight = 500; list.clientHeight = 100; list.scrollTop = 70;
+  c.renderMessages(s, messages);
+  const [tool, user] = list.children;
+  tool.children[0].open = true;
+  c.renderMessages(s, JSON.parse(JSON.stringify(messages)));
+  assert.equal(list.children[0], tool); assert.equal(list.children[1], user);
+  const renamed = structuredClone(messages);
+  renamed[1].attachments[0].name = '서버에서 복원된 이름.txt';
+  c.renderMessages(s, renamed);
+  assert.equal(list.children[0], tool); assert.equal(tool.children[0].open, true);
+  assert.notEqual(list.children[1], user);
+  assert.match(textOf(list.children[1]), /서버에서 복원된 이름.txt/);
+  assert.equal(list.scrollTop, 70);
+});
+
+test('upload completion labels files as before-send and creates neither a history message nor delivery evidence', async () => {
+  const requests = [];
+  let entry;
+  const c = client(async (url) => {
+    requests.push(url);
+    if (url === '/api/chat/state') return { ok: true, status: 200, json: async () => attachmentState(entry) };
+    return { ok: true, status: 200, json: async () => ({ attachment: {
+      id: 'uploaded', name: 'server-normalized.png', type: 'image/png', size: 5,
+    } }) };
+  }, noChatTimers);
+  const selected = selectChat(c); entry = selected.entry;
+  const s = selected.s;
+  wireTree(c, c.buildChatComposer(s));
+  await new Promise((resolve) => setImmediate(resolve));
+  await c.uploadChatFiles(entry, [{ name: 'local.png', type: 'image/png', size: 5 }]);
+  assert.deepEqual(requests.filter((url) => url !== '/api/chat/state'), ['/api/chat/upload']);
+  assert.equal(c.get('chat-attachments-label').hidden, false);
+  assert.match(c.get('chat-attachments-label').textContent, /전송 전 첨부 1개.*업로드 완료/);
+  assert.match(textOf(c.get('chat-attachments')), /server-normalized.png/);
+  assert.equal(c.get('chat-delivery-evidence').hidden, true);
+  assert.equal(c.get('messages').children.length, 0);
+  assert.equal(entry.receipt, null);
+});
+
+test('queued attachment delivery keeps server metadata evidence after clearing the sent draft and avoids content-read claims', async () => {
+  const requests = [];
+  let entry;
+  let receipt;
+  const c = client(async (url, options) => {
+    requests.push({ url, body: JSON.parse(options.body) });
+    if (url === '/api/chat/send') {
+      receipt = { requestId: requests.at(-1).body.requestId, status: 'queued', confirmed: true,
+        acknowledged: true, readbackConfirmed: true, attachments: [
+          { id: 'selected', name: 'authoritative.png', type: 'image/png', size: 7, kind: 'image', source: 'sessionholic' },
+        ] };
+      return { ok: true, status: 200, json: async () => ({ status: 'queued', receipt }) };
+    }
+    return { ok: true, status: 200, json: async () => attachmentState(entry, [receipt]) };
+  }, noChatTimers);
+  const selected = selectChat(c); entry = selected.entry;
+  wireTree(c, c.buildChatComposer(selected.s));
+  await new Promise((resolve) => setImmediate(resolve));
+  entry.text = '첨부를 확인해 주세요';
+  entry.attachments = [{ id: 'selected', name: 'local.png', type: 'image/png', size: 7, path: '/not-for-evidence/local.png' }];
+  await c.sendChat(entry); await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(entry.pending, null); assert.equal(entry.text, ''); assert.equal(entry.attachments.length, 0);
+  const outbound = requests.find((request) => request.url === '/api/chat/send');
+  assert.deepEqual(outbound.body.attachments, ['selected']);
+  assert.equal(Object.hasOwn(outbound.body, 'attachmentDetails'), false);
+  const evidence = c.get('chat-delivery-evidence');
+  assert.equal(evidence.hidden, false);
+  assert.match(textOf(evidence), /대기열 접수.*세션 기록 확인.*전송에 포함한 첨부 1개.*authoritative.png/);
+  assert.doesNotMatch(textOf(evidence), /local.png|not-for-evidence|모델.*읽|동기화 완료/);
+  assert.equal(c.get('chat-attachments-label').hidden, true);
+  const retained = evidence.children[0];
+  await c.loadChatState(selected.s, true);
+  assert.equal(evidence.children[0], retained);
+  receipt = { ...receipt, status: 'completed' };
+  await c.loadChatState(selected.s, true);
+  assert.match(textOf(evidence), /요청 완료.*authoritative.png/);
+  assert.doesNotMatch(textOf(evidence), /모델.*읽|동기화 완료/);
+});
+
+test('uncertain attachment sends retain file evidence, stay locked and remain isolated across session changes', async () => {
+  const sends = [];
+  let entry;
+  let emptyMetadata = false;
+  const c = client(async (url, options) => {
+    if (url === '/api/chat/send') { sends.push(JSON.parse(options.body)); throw new Error('response lost'); }
+    const receipt = entry.pending && { requestId: entry.pending.requestId, status: 'unknown',
+      ...(emptyMetadata ? { attachments: [] } : {}) };
+    return { ok: true, status: 200, json: async () => attachmentState(entry, [receipt]) };
+  }, noChatTimers);
+  const original = selectChat(c); entry = original.entry;
+  wireTree(c, c.buildChatComposer(original.s));
+  await new Promise((resolve) => setImmediate(resolve));
+  entry.attachments = [{ id: 'lost-image', name: '보낸 사진.png', type: 'image/png', size: 6 }];
+  await c.sendChat(entry); await new Promise((resolve) => setImmediate(resolve));
+  assert.ok(entry.pending);
+  assert.equal(entry.pending.attachmentDetails[0].name, '보낸 사진.png');
+  assert.match(textOf(c.get('chat-delivery-evidence')), /전송 결과 미확인.*보낸 사진.png/);
+  assert.equal(c.get('chat-attachments').hidden, true);
+  assert.equal(c.get('chat-send').disabled, true);
+  await c.sendChat(entry);
+  assert.equal(sends.length, 1);
+  emptyMetadata = true;
+  await c.loadChatState(original.s, true);
+  assert.equal(c.get('chat-delivery-evidence').hidden, true);
+  assert.equal(c.get('chat-attachments').hidden, false);
+  assert.match(c.get('chat-attachments-label').textContent, /전송 요청 첨부 1개.*결과 미확인/);
+  assert.match(textOf(c.get('chat-attachments')), /보낸 사진.png/);
+  const other = selectChat(c, { id: 'other-session' });
+  wireTree(c, c.buildChatComposer(other.s));
+  // A user edit runs the same composer update without starting a network read.
+  c.get('chat-input').value = '다른 세션 초안'; c.get('chat-input').events.input();
+  assert.equal(c.get('chat-delivery-evidence').hidden, true);
+  assert.doesNotMatch(textOf(c.get('chat-attachments')), /보낸 사진/);
+  assert.equal(entry.pending.requestId, sends[0].requestId);
+  assert.equal(other.entry.text, '다른 세션 초안');
+});
+
+test('server receipt metadata takes precedence while a pending request stays uncertain and newer Korean drafts remain intact', async () => {
+  let entry;
+  let receipt;
+  const c = client(async () => ({ ok: true, status: 200, json: async () => attachmentState(entry, [receipt]) }), noChatTimers);
+  const selected = selectChat(c); entry = selected.entry;
+  wireTree(c, c.buildChatComposer(selected.s));
+  await new Promise((resolve) => setImmediate(resolve));
+  const input = c.get('chat-input');
+  entry.pending = { requestId: 'old', revision: entry.revision,
+    attachmentDetails: [{ id: 'old-file', name: 'local-name.png', type: 'image/png' }] };
+  receipt = { requestId: 'old', status: 'unknown', attachments: [
+    { id: 'old-file', name: 'server-name.png', type: 'image/png', kind: 'image', source: 'sessionholic' },
+  ] };
+  await c.loadChatState(selected.s, true);
+  assert.match(textOf(c.get('chat-delivery-evidence')), /server-name.png/);
+  assert.doesNotMatch(textOf(c.get('chat-delivery-evidence')), /local-name/);
+  // A composition already in progress can commit after a receipt arrives.
+  input.value = '나중에 작성한 한글'; input.events.compositionstart(); input.events.input();
+  entry.attachments = [{ id: 'new-file', name: '다음 초안.txt', type: 'text/plain', size: 4 }];
+  receipt = { ...receipt, status: 'accepted', confirmed: true };
+  await c.loadChatState(selected.s, true);
+  assert.equal(entry.pending, null);
+  assert.equal(entry.text, '나중에 작성한 한글'); assert.equal(input.value, entry.text);
+  assert.equal(entry.composing, true);
+  assert.equal(entry.attachments[0].id, 'new-file');
+  assert.match(textOf(c.get('chat-delivery-evidence')), /전송 접수.*server-name.png/);
+  assert.match(textOf(c.get('chat-attachments')), /다음 초안.txt/);
+  assert.match(c.get('chat-attachments-label').textContent, /전송 전 첨부/);
+});
+
+test('a pre-dispatch rejection keeps attachments editable and never labels them as sent', async () => {
+  let entry;
+  const c = client(async (url) => url === '/api/chat/send'
+    ? { ok: false, status: 409, json: async () => ({ error: '세션을 먼저 확인해 주세요.', dispatchState: 'not_started' }) }
+    : { ok: true, status: 200, json: async () => attachmentState(entry) }, noChatTimers);
+  const selected = selectChat(c); entry = selected.entry;
+  wireTree(c, c.buildChatComposer(selected.s));
+  entry.attachments = [{ id: 'draft-file', name: '미전송.txt', type: 'text/plain', size: 3 }];
+  await c.sendChat(entry); await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(entry.pending, null);
+  assert.equal(entry.attachments.length, 1);
+  assert.equal(c.get('chat-delivery-evidence').hidden, true);
+  assert.match(c.get('chat-attachments-label').textContent, /전송 전 첨부/);
+  assert.equal(byClass(c.get('chat-attachments'), 'chat-attachment-remove')[0].disabled, false);
+  assert.equal(c.get('messages').children.length, 0);
 });

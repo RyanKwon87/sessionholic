@@ -272,7 +272,7 @@ class SecurityTest(unittest.TestCase):
 
     def test_chat_failure_after_dispatch_is_never_labelled_not_started(self):
         payload = {'source': REF, 'requestId': 'message-unknown-0001', 'text': 'draft'}
-        prepared = ({**SOURCE, 'host': 'local'}, HOST, payload['requestId'], 'draft', [])
+        prepared = ({**SOURCE, 'host': 'local'}, HOST, payload['requestId'], 'draft', [], [])
         with patch.object(self.httpd.chat, '_prepare_send', return_value=prepared), \
              patch.object(self.httpd.chat, 'rpc', side_effect=ValueError('fixture late response')):
             res, body = self.request('POST', '/api/chat/send', payload, self.auth())

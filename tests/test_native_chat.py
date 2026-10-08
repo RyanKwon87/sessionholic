@@ -83,6 +83,146 @@ class NativeChatTests(unittest.TestCase):
     def writes(self, client):
         return [(method, params) for method, params in client.calls if method not in ('thread/read', 'thread/queue/list')]
 
+    def test_attachment_manifest_survives_read_and_does_not_resolve_files_again(self):
+        image = attachments.store(str(self.cwd), 'picture.png', b'\x89PNG\r\n\x1a\nfixture')
+        file = attachments.store(str(self.cwd), 'document.txt', b'FILE-CONTENT-PRIVATE')
+        client = FakeClient(self.thread())
+        sent = self.handle(client, {**self.args, 'attachmentIds': [image['id'], file['id']]})
+        expected = sent['attachments']
+        self.assertEqual([a['name'] for a in expected], ['picture.png', 'document.txt'])
+        self.assertEqual([a['kind'] for a in expected], ['image', 'file'])
+        with patch.object(attachments, 'resolve', side_effect=AssertionError('history must not load attachments')):
+            read = self.handle(FakeClient(client.thread), {'action': 'read', 'source': self.source})
+            receipt = self.handle(FakeClient(client.thread), {'action': 'receipt', 'source': self.source, 'requestId': self.request})
+        self.assertEqual(read['messages'][0]['attachments'], expected)
+        self.assertEqual(receipt['attachments'], expected)
+        self.assertTrue(receipt['readbackConfirmed'])
+        records = list((self.home / '.sessionholic/chat-receipts').glob('*.json'))
+        self.assertNotIn(str(self.cwd), records[0].read_text())
+        self.assertNotIn('FILE-CONTENT-PRIVATE', records[0].read_text())
+        self.assertEqual(records[0].stat().st_mode & 0o777, 0o600)
+
+    def test_unknown_attachment_receipt_is_not_history_until_exact_client_readback(self):
+        file = attachments.store(str(self.cwd), 'document.txt', b'fixture')
+        client = FakeClient(self.thread(), outcomes={'thread/queue/add': TimeoutError()})
+        args = {**self.args, 'attachmentIds': [file['id']]}
+        sent = self.handle(client, args)
+        self.assertEqual(sent['delivery'], 'unknown')
+        self.assertFalse(sent['confirmed'])
+        clean = FakeClient(self.thread())
+        self.assertEqual(self.handle(clean, {'action': 'read', 'source': self.source})['messages'], [])
+        receipt = self.handle(clean, {'action': 'receipt', 'source': self.source, 'requestId': self.request})
+        self.assertEqual(receipt['attachments'], sent['attachments'])
+        submitted = next(params['input'] for method, params in client.calls if method == 'thread/queue/add')
+        same_text = {'type': 'userMessage', 'clientId': self.request + '-different', 'content': submitted}
+        exact = {**same_text, 'clientId': self.request}
+        text_only = {**exact, 'content': self.args['input']}
+        clean.thread['turns'] = [{'id': 'same-turn', 'status': 'completed', 'items': [same_text, text_only, exact]}]
+        rows = self.handle(clean, {'action': 'read', 'source': self.source})['messages']
+        self.assertNotIn('attachments', rows[0])
+        self.assertNotIn('attachments', rows[1])
+        self.assertEqual(rows[2]['attachments'], sent['attachments'])
+        self.assertEqual(self.writes(clean), [])
+
+    def test_legacy_mixed_image_read_is_read_only_and_malformed_manifest_falls_back(self):
+        content = self.args['input'] + [{'type': 'localImage', 'path': '/example/private/image.png'}]
+        thread = self.thread()
+        thread['turns'] = [{'id': 'legacy-turn', 'status': 'completed', 'items': [{'type': 'userMessage', 'clientId': self.request, 'content': content}]}]
+        rows = self.handle(FakeClient(thread), {'action': 'read', 'source': self.source})['messages']
+        self.assertEqual(rows[0]['text'], 'fixture message')
+        self.assertEqual(rows[0]['attachments'][0]['source'], 'native')
+        self.assertFalse((self.home / '.sessionholic').exists())
+        identity = {k: self.source[k] for k in ('agent', 'home', 'id')}
+        with chat._Ledger(identity, self.request, self.home) as ledger:
+            ledger.save({'attachments': [{'path': '/example/private/bad', 'name': 'wrong'}]})
+        before = sorted((self.home / '.sessionholic/chat-receipts').iterdir())
+        rows = self.handle(FakeClient(thread), {'action': 'read', 'source': self.source})['messages']
+        self.assertEqual(rows[0]['attachments'][0]['source'], 'native')
+        self.assertNotIn('private', json.dumps(rows))
+        self.assertEqual(sorted((self.home / '.sessionholic/chat-receipts').iterdir()), before)
+
+    def test_attachment_chips_require_each_exact_native_input_not_similar_paths(self):
+        first = attachments.store(str(self.cwd), 'first.txt', b'first fixture')
+        second = attachments.store(str(self.cwd), 'second.txt', b'second fixture')
+        client = FakeClient(self.thread())
+        sent = self.handle(client, {**self.args, 'attachmentIds': [first['id'], second['id']]})
+        submitted = client.thread['turns'][0]['items'][0]['content']
+        item = client.thread['turns'][0]['items'][0]
+        # One retained marker proves only that file, never the other attempted file.
+        item['content'] = submitted[:2]
+        read = self.handle(FakeClient(client.thread), {'action': 'read', 'source': self.source})
+        self.assertEqual([a['id'] for a in read['messages'][0]['attachments']], [first['id']])
+        # A marker appearing inside another text block is not an exact input.
+        item['content'] = [{'type': 'text', 'text': 'quoted example: ' + submitted[1]['text']}]
+        read = self.handle(FakeClient(client.thread), {'action': 'read', 'source': self.source})
+        self.assertNotIn('attachments', read['messages'][0])
+        receipt = self.handle(FakeClient(client.thread), {'action': 'receipt', 'source': self.source, 'requestId': self.request})
+        self.assertEqual(receipt['attachments'], sent['attachments'])
+
+    def test_image_named_chip_needs_exact_local_image_and_legacy_proof_is_optional(self):
+        image = attachments.store(str(self.cwd), 'picture.png', b'\x89PNG\r\n\x1a\nfixture')
+        client = FakeClient(self.thread())
+        self.handle(client, {**self.args, 'attachmentIds': [image['id']]})
+        item = client.thread['turns'][0]['items'][0]
+        original = list(item['content'])
+        for unrelated in ({'type': 'localImage', 'path': '/example/other/image.png'},
+                          {'type': 'image', 'url': 'https://example.com/image.png'}):
+            with self.subTest(unrelated=unrelated['type']):
+                item['content'] = self.args['input'] + [unrelated]
+                read = self.handle(FakeClient(client.thread), {'action': 'read', 'source': self.source})
+                self.assertEqual(read['messages'][0]['attachments'][0]['source'], 'native')
+                self.assertIsNone(read['messages'][0]['attachments'][0]['id'])
+        # Old records without input evidence remain readable receipts, but cannot name an image.
+        record_path = next((self.home / '.sessionholic/chat-receipts').glob('*.json'))
+        record = json.loads(record_path.read_text())
+        record.pop('attachmentEvidence')
+        record_path.write_text(json.dumps(record))
+        item['content'] = original
+        read = self.handle(FakeClient(client.thread), {'action': 'read', 'source': self.source})
+        self.assertEqual(read['messages'][0]['attachments'][0]['source'], 'native')
+        receipt = self.handle(FakeClient(client.thread), {'action': 'receipt', 'source': self.source, 'requestId': self.request})
+        self.assertEqual(receipt['attachments'][0]['id'], image['id'])
+
+    def test_duplicate_user_text_cannot_stand_in_for_missing_attachment_input(self):
+        file = attachments.store(str(self.cwd), 'document.txt', b'fixture')
+        marker = {'type': 'text', 'text': '첨부 파일: ' + json.dumps(file['path'], ensure_ascii=False)}
+        client = FakeClient(self.thread())
+        self.handle(client, {**self.args, 'input': [marker], 'attachmentIds': [file['id']]})
+        item = client.thread['turns'][0]['items'][0]
+        self.assertEqual(item['content'], [marker, marker])
+        self.assertEqual(self.handle(FakeClient(client.thread), {'action': 'read', 'source': self.source})['messages'][0]['attachments'][0]['id'], file['id'])
+        item['content'] = [marker]
+        self.assertNotIn('attachments', self.handle(FakeClient(client.thread), {'action': 'read', 'source': self.source})['messages'][0])
+
+    def test_final_receipt_save_failure_preserves_pre_send_manifest_for_readback(self):
+        file = attachments.store(str(self.cwd), 'document.txt', b'fixture')
+        client = FakeClient(self.thread())
+        original = chat._Ledger.save
+        count = [0]
+        def save(ledger, value):
+            count[0] += 1
+            if count[0] == 2:
+                raise OSError('fixture disk failure after native acceptance')
+            return original(ledger, value)
+        with patch.object(chat._Ledger, 'save', save):
+            with self.assertRaises(OSError):
+                self.handle(client, {**self.args, 'attachmentIds': [file['id']]})
+        fresh = FakeClient(client.thread)
+        receipt = self.handle(fresh, {'action': 'receipt', 'source': self.source, 'requestId': self.request})
+        self.assertTrue(receipt['confirmed'])
+        self.assertEqual(receipt['attachments'][0]['id'], file['id'])
+        self.assertEqual(self.writes(fresh), [])
+
+    def test_metadata_lookups_are_bounded_to_display_window(self):
+        thread = self.thread()
+        thread['turns'] = [{'id': str(index), 'status': 'completed', 'items': [{
+            'type': 'userMessage', 'clientId': 'fixture-request-' + str(index),
+            'content': [{'type': 'text', 'text': str(index)}]}]} for index in range(200)]
+        with patch.object(chat, '_history_attachments', return_value=[]) as lookup:
+            rows = self.handle(FakeClient(thread), {'action': 'read', 'source': self.source})['messages']
+        self.assertEqual(lookup.call_count, collector.MESSAGE_LIMIT)
+        self.assertEqual([r['text'] for r in rows], [str(i) for i in range(200 - collector.MESSAGE_LIMIT, 200)])
+
     def test_idle_atomically_starts_queued_input_and_readback_exact_client_id(self):
         client = FakeClient(self.thread())
         result = self.handle(client)

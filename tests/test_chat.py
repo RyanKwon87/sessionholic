@@ -64,6 +64,22 @@ class ChatTest(unittest.TestCase):
         self.flow.transfers.rpc=lambda *a,**k: (_ for _ in ()).throw(RuntimeError('timeout'))
         result=self.chat.send({'source':REF,'requestId':'request-0001','text':'hello'})
         self.assertEqual(result['status'],'unknown')
+    def test_attachment_receipt_survives_transport_unknown_without_claiming_delivery(self):
+        uploaded=self.chat.upload(REF,'fixture.txt',b'fixture')['attachment']
+        self.flow.transfers.rpc=lambda *a,**k: (_ for _ in ()).throw(RuntimeError('timeout'))
+        result=self.chat.send({'source':REF,'requestId':'request-0001','text':'hello','attachments':[uploaded['id']]})
+        receipt=result['receipt']
+        self.assertEqual(receipt['status'],'unknown')
+        self.assertFalse(receipt['confirmed'])
+        self.assertFalse(receipt['readbackConfirmed'])
+        self.assertFalse(receipt['acknowledged'])
+        self.assertEqual(receipt['attachments'][0]['name'],'fixture.txt')
+        self.assertNotIn('path',receipt['attachments'][0])
+        self.assertNotIn('sha256',receipt['attachments'][0])
+    def test_receipt_preserves_acknowledged_and_readback_separately(self):
+        receipt=self.chat.receipt({'delivery':'queued','confirmed':True,'acknowledged':True,'readbackConfirmed':False},'request-0001')
+        self.assertTrue(receipt['acknowledged'])
+        self.assertFalse(receipt['readbackConfirmed'])
     def test_state_is_exact_cached_and_offline_stops(self):
         first=self.chat.state({'source':REF})
         second=self.chat.state({'source':REF})

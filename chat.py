@@ -57,13 +57,22 @@ class Chat:
         return self.workflow.transfers.rpc(host, 'chat', {'action': action, 'source': source, **kwargs}, timeout=20)
 
     @staticmethod
+    def attachment_history(items):
+        from launch import scrub_text
+        from native_chat import _manifest
+        return [{**item, 'name': scrub_text(item['name'])} for item in _manifest(items)]
+
+    @staticmethod
     def receipt(result, request_id):
         status = result.get('delivery') or result.get('status') or 'unknown'
         if status == 'rejected': status = 'failed'
         return {'requestId': request_id, 'status': status,
                 'confirmed': result.get('confirmed', False),
+                'readbackConfirmed': result.get('readbackConfirmed', False),
+                'acknowledged': result.get('acknowledged', False),
                 'turnId': result.get('turnId'), 'queueId': result.get('queueId'),
-                'reason': result.get('reason')}
+                'reason': result.get('reason'),
+                'attachments': Chat.attachment_history(result.get('attachments', []))}
 
     def state(self, data):
         source, host = self.source(data.get('source'))
@@ -88,11 +97,18 @@ class Chat:
             receipt = self.rpc(host, 'receipt', source, requestId=request_id)
             receipts.append(self.receipt(receipt, request_id))
         from server import scrub_payload
+        messages = scrub_payload(result.get('messages', []))
+        for message in messages:
+            if isinstance(message, dict) and isinstance(message.get('attachments'), list):
+                from launch import scrub_text
+                message['attachments'] = [{**item, 'name': scrub_text(item['name'])}
+                                          if isinstance(item, dict) and isinstance(item.get('name'), str) else item
+                                          for item in message['attachments']]
         response = {'route': identity, 'phase': phase,
                     'capability': {'supported': bool(caps.get('canSend')),
                                    'attachments': bool(source.get('cwd')),
                                    'reason': caps.get('reason') or result.get('reason')},
-                    'messages': scrub_payload(result.get('messages', [])),
+                    'messages': messages,
                     'receipts': receipts, 'maxAttachmentBytes': MAX_FILE,
                     'requiresNativeTerminal': result.get('requiresNativeTerminal', phase == 'needs_input')}
         with self.lock:
@@ -142,6 +158,7 @@ class Chat:
             raise ValueError('한 메시지에는 첨부 파일을 8개까지 보낼 수 있습니다.')
         if not text.strip() and not ids:
             raise ValueError('메시지나 첨부 파일을 추가해 주세요.')
+        manifest = []
         for aid in ids:
             if not isinstance(aid, str) or not re.fullmatch('[a-f0-9]{32}', aid):
                 raise ValueError('첨부 식별자가 올바르지 않습니다.')
@@ -151,11 +168,14 @@ class Chat:
             record = json.loads(path.read_text())
             if record.get('source') != self.identity(source) or record.get('cwd') != source.get('cwd'):
                 raise ValueError('다른 세션에 올린 파일은 이 메시지에 첨부할 수 없습니다.')
-        return source, host, request_id, text, ids
+            item = record['attachment']
+            manifest.append({'id': item['id'], 'name': item['name'], 'type': item['mime'],
+                             'size': item['size'], 'kind': 'image' if item['mime'].startswith('image/') else 'file', 'source': 'sessionholic'})
+        return source, host, request_id, text, ids, self.attachment_history(manifest)
 
     def send(self, data):
         try:
-            source, host, request_id, text, ids = self._prepare_send(data)
+            source, host, request_id, text, ids, manifest = self._prepare_send(data)
         except (ValueError, RuntimeError, OSError, KeyError) as exc:
             reason = str(exc) if isinstance(exc, (ValueError, RuntimeError)) else '메시지와 첨부 정보를 다시 확인해 주세요.'
             raise SendRejected(reason, 409 if isinstance(exc, RuntimeError) else 400) from None
@@ -165,6 +185,8 @@ class Chat:
         except (RuntimeError, OSError):
             # A broken SSH/HTTP response is not evidence that submission failed.
             result = {'delivery': 'unknown', 'reason': '전송 결과를 확인하지 못했습니다. 상태를 다시 확인해 주세요.'}
+        if manifest and not result.get('attachments'):
+            result = {**result, 'attachments': manifest}
         receipt = self.receipt(result, request_id)
         with self.lock:
             self.cache_epoch += 1

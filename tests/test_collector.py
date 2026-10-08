@@ -67,6 +67,33 @@ class PhaseTest(unittest.TestCase):
 
 
 class MessageTest(unittest.TestCase):
+    def test_mixed_and_image_only_codex_history_keeps_evidence_without_content(self):
+        image = {"type": "localImage", "path": "/example/private/image.png"}
+        rows = collector.codex_messages([{"items": [
+            {"type": "userMessage", "content": [{"type": "text", "text": "확인"}, image]},
+            {"type": "userMessage", "content": [{"type": "image", "url": "data:image/png;base64,PRIVATE"}]}]}])
+        self.assertEqual([row["text"] for row in rows], ["확인", "[이미지 첨부]"])
+        self.assertTrue(all(row["attachments"][0]["source"] == "native" for row in rows))
+        self.assertNotIn("private", json.dumps(rows))
+        self.assertNotIn("PRIVATE", json.dumps(rows))
+
+        document = collector.codex_messages([{"items": [{"type": "userMessage", "content": [
+            {"type": "document", "source": {"data": "PRIVATE"}}]}]}])
+        self.assertEqual(document[0]["text"], "[파일 첨부]")
+        self.assertEqual(document[0]["attachments"][0]["kind"], "file")
+        self.assertNotIn("PRIVATE", json.dumps(document))
+
+    def test_claude_image_evidence_is_attached_once_and_meta_stays_hidden(self):
+        image = {"type": "image", "source": {"type": "base64", "data": "PRIVATE"}}
+        rows = collector.claude_messages([
+            {"type": "user", "message": {"content": [{"type": "text", "text": "첫 문장"}, image,
+                                                         {"type": "text", "text": "둘째 문장"}]}},
+            {"type": "user", "message": {"content": [image]}},
+            {"type": "user", "isMeta": True, "message": {"content": [image]}}])
+        self.assertEqual([r["text"] for r in rows], ["첫 문장", "둘째 문장", "[이미지 첨부]"])
+        self.assertEqual([len(r.get("attachments", [])) for r in rows], [1, 0, 1])
+        self.assertNotIn("PRIVATE", json.dumps(rows))
+
     def test_claude_messages_hide_harness_wrappers(self):
         entries = [
             {"type": "user", "timestamp": "2026-10-07T01:00:00Z",

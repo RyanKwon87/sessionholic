@@ -1,4 +1,5 @@
 import json
+import struct
 from pathlib import Path
 import sys
 import tempfile
@@ -7,6 +8,69 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import collector  # noqa: E402
+
+
+class SocketBufferTest(unittest.TestCase):
+    class Socket:
+        def __init__(self, data, chunk=65536):
+            self.data, self.chunk, self.offset = data, chunk, 0
+            self.sent, self.closed = [], False
+
+        def settimeout(self, timeout): pass
+        def connect(self, path): pass
+        def close(self): self.closed = True
+        def sendall(self, data): self.sent.append(data)
+        def recv(self, limit):
+            end = min(self.offset + min(limit, self.chunk), len(self.data))
+            result, self.offset = self.data[self.offset:end], end
+            return result
+
+    @staticmethod
+    def frame(payload, opcode=1, final=True, masked=False):
+        size = len(payload)
+        header = bytes([(0x80 if final else 0) | opcode,
+                        (0x80 if masked else 0) | (size if size < 126 else 126 if size < 65536 else 127)])
+        if size >= 126:
+            header += struct.pack('>H' if size < 65536 else '>Q', size)
+        if masked:
+            mask = b'\x01\x02\x03\x04'
+            header += mask
+            payload = bytes(value ^ mask[index % 4] for index, value in enumerate(payload))
+        return header + payload
+
+    def client(self, wire, chunk=65536):
+        client = object.__new__(collector.AppServer)
+        client.sock = self.Socket(wire, chunk)
+        client.buf = bytearray()
+        return client
+
+    def test_handshake_preserves_prefetched_rpc_frames(self):
+        wire = (b'HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\r\n'
+                + self.frame(b'{"id":1,"result":{}}')
+                + self.frame(b'{"method":"notification","params":{}}')
+                + self.frame(b'{"id":2,"result":{"ok":true}}'))
+        sock = self.Socket(wire)
+        with patch.object(collector.socket, 'socket', return_value=sock):
+            with collector.AppServer('/synthetic/socket') as client:
+                self.assertEqual(client.call('thread/read', {}), {'ok': True})
+        self.assertTrue(sock.closed)
+
+    def test_fragmented_masked_text_and_ping_across_small_reads(self):
+        payload = ('한글 메시지 ' * 30).encode()
+        client = self.client(self.frame(payload[:100], final=False, masked=True)
+                             + self.frame(b'ping', opcode=9)
+                             + self.frame(payload[100:], opcode=0, masked=True), chunk=7)
+        self.assertEqual(client._message(), payload)
+        self.assertEqual(client.sock.sent[0][0], 0x8A)
+        self.assertEqual(self.client(client.sock.sent[0])._frame()[2], b'ping')
+
+    def test_large_frame_and_following_message_preserve_exact_bytes(self):
+        payload = bytes(range(256)) * 8192
+        client = self.client(self.frame(payload, opcode=2) + self.frame(b'next'), chunk=8192)
+        self.assertEqual(client._message(), payload)
+        self.assertEqual(client._message(), b'next')
+        with self.assertRaises(collector.RpcError):
+            client._message()
 
 
 class LabelTest(unittest.TestCase):

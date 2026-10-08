@@ -3645,6 +3645,14 @@ select:disabled {
 
 /* Attachment metadata stays readable without turning the compact composer
    into an image gallery. User bubbles keep their existing blue treatment. */
+.conversation-sync-notice {
+  flex: none;
+  margin: 0;
+  padding: 4px var(--detail-pad) 6px;
+  color: var(--label-2);
+  font-size: var(--fs-cap);
+  line-height: 1.4;
+}
 .msg-attachments {
   display: flex;
   flex-direction: column;

@@ -287,7 +287,7 @@ class AppServer:
     def __init__(self, path, timeout=10.0):
         self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self.sock.settimeout(timeout)
-        self.buf = b""
+        self.buf = bytearray()
         self.next_id = 0
         try:
             self.sock.connect(str(path))
@@ -315,7 +315,9 @@ class AppServer:
         chunk = self.sock.recv(65536)
         if not chunk:
             raise RpcError("Codex daemon 연결이 끊겼습니다.")
-        self.buf += chunk
+        # Large histories can contain inline images. Extend in place instead
+        # of copying the entire accumulated response on every socket read.
+        self.buf.extend(chunk)
 
     def _need(self, size):
         while len(self.buf) < size:
@@ -346,7 +348,8 @@ class AppServer:
             self._need(offset + 4)
             mask, offset = self.buf[offset:offset + 4], offset + 4
         self._need(offset + size)
-        payload, self.buf = self.buf[offset:offset + size], self.buf[offset + size:]
+        payload = bytes(self.buf[offset:offset + size])
+        del self.buf[:offset + size]
         if mask:
             payload = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
         return fin, opcode, payload

@@ -65,7 +65,12 @@ function client(
       },
     },
     hidden: false,
-    createElement(tag) { const created = node(); created.tagName = tag.toUpperCase(); return created; },
+    createElement(tag) {
+      const created = node(); created.tagName = tag.toUpperCase();
+      Object.defineProperty(created, 'id', { get() { return this.elementId; },
+        set(value) { this.elementId = value; nodes.set(value, this); } });
+      return created;
+    },
     getElementById(id) {
       if (!nodes.has(id)) nodes.set(id, node());
       return nodes.get(id);
@@ -1072,9 +1077,9 @@ test("empty lists distinguish filtered results, offline hosts, and pending colle
 
 test("conversation retry reloads its selected source and ignores a switched selection", async () => {
   const calls = [];
-  const c = client(async (url) => {
+  const c = client(async (url, options) => {
     calls.push(url);
-    return { ok: true, status: 200, json: async () => ({ messages: [] }) };
+    return { ok: true, status: 200, json: async () => ({ route: JSON.parse(options.body).source, messages: [] }) };
   });
   const session = { key: "homeserver|codex||session-id", host: "homeserver", agent: "codex", id: "session-id" };
   c.state.snapshot = { hosts: [{ name: "homeserver", label: "Home server", ok: true, data: { codex: [session] } }] };
@@ -1085,7 +1090,7 @@ test("conversation retry reloads its selected source and ignores a switched sele
   retry.events.click();
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(calls.length, 1);
-  assert.match(calls[0], /\/api\/read\?/);
+  assert.equal(calls[0], '/api/chat/state');
   assert.match(textOf(c.get("messages")), /저장된 대화를 아직/);
   c.state.selected = "another-source";
   retry.events.click();
@@ -1893,7 +1898,7 @@ test('online recovery reads one selected state and snapshot without resending un
   }, noChatTimers);
   const { s, entry } = selectChat(c); snapshot = c.state.snapshot;
   c.state.detailFor = s.key; c.state.detailUpdatedAt = s.updatedAt;
-  c.state.detailRevision = JSON.stringify([false, undefined, undefined, undefined, '현재 계정 설정', 'Workstation', undefined]);
+  c.state.detailRevision = JSON.stringify([false, undefined, undefined, undefined, '현재 계정 설정', 'Workstation', undefined, null, null]);
   c.state.capabilities = {}; c.state.capabilitiesRevision = JSON.stringify([['workstation', true, undefined]]);
   entry.pending = { requestId: 'unknown-request', revision: entry.revision }; entry.text = '전송 결과 모르는 초안';
   c.state.offline = true; c.context.navigator = { onLine: true };
@@ -1990,7 +1995,7 @@ test('offline visibility and return-online events restart only bounded reads and
   await new Promise((resolve) => setImmediate(resolve));
   const { s, entry } = selectChat(c);
   c.state.detailFor = s.key; c.state.detailUpdatedAt = s.updatedAt;
-  c.state.detailRevision = JSON.stringify([false, undefined, undefined, undefined, '현재 계정 설정', 'Workstation', undefined]);
+  c.state.detailRevision = JSON.stringify([false, undefined, undefined, undefined, '현재 계정 설정', 'Workstation', undefined, null, null]);
   c.state.capabilities = {}; c.state.capabilitiesRevision = JSON.stringify([['workstation', true, undefined]]);
   entry.text = '미전송 초안';
   c.windowEvents.offline(); assert.equal(c.state.offline, true);
@@ -2077,7 +2082,7 @@ test('service worker evicts only its own old shells and offline reads use the cu
     self, URL, Set, Response,
     fetch: async () => { throw new Error('offline'); },
     caches: {
-      keys: async () => ['another-app-shell', 'sessionholic-shell-v0', 'sessionholic-shell-v1', 'sessionholic-shell-v2', 'sessionholic-shell-v4', 'sessionholic-shell-v5'],
+      keys: async () => ['another-app-shell', 'sessionholic-shell-v0', 'sessionholic-shell-v1', 'sessionholic-shell-v2', 'sessionholic-shell-v4', 'sessionholic-shell-v5', 'sessionholic-shell-v6'],
       delete: async (key) => { deleted.push(key); },
       open: async (key) => { opened.push(key); return { match: async () => currentShell }; },
       match: async () => { throw new Error('Global cross-application cache lookup is forbidden'); },
@@ -2085,11 +2090,11 @@ test('service worker evicts only its own old shells and offline reads use the cu
   });
   let activated;
   listeners.activate({ waitUntil: (promise) => { activated = promise; } }); await activated;
-  assert.deepEqual(deleted, ['sessionholic-shell-v0', 'sessionholic-shell-v1', 'sessionholic-shell-v2', 'sessionholic-shell-v4']);
+  assert.deepEqual(deleted, ['sessionholic-shell-v0', 'sessionholic-shell-v1', 'sessionholic-shell-v2', 'sessionholic-shell-v4', 'sessionholic-shell-v5']);
   listeners.fetch({ request: { method: 'GET', url: 'https://app.example/' },
     respondWith: (promise) => { response = promise; }, waitUntil() {} });
   assert.equal(await response, currentShell);
-  assert.deepEqual(opened, ['sessionholic-shell-v5']);
+  assert.deepEqual(opened, ['sessionholic-shell-v6']);
 });
 
 test('an offline first launch restores authentication and already-open terminal rows without reopening their sessions', async () => {
@@ -2728,4 +2733,199 @@ test('a pre-dispatch rejection keeps attachments editable and never labels them 
   assert.match(c.get('chat-attachments-label').textContent, /전송 전 첨부/);
   assert.equal(byClass(c.get('chat-attachments'), 'chat-attachment-remove')[0].disabled, false);
   assert.equal(c.get('messages').children.length, 0);
+});
+
+test('selecting readable Codex, closed Codex and native Claude uses one state read independently of send capability', async () => {
+  for (const mode of ['codex', 'closed-codex', 'native-claude', 'empty-codex']) {
+    const calls = [];
+    const c = client(async (url, options) => {
+      calls.push(url);
+      return { ok: true, status: 200, json: async () => ({ route: JSON.parse(options.body).source,
+        capability: { supported: mode === 'codex' || mode === 'empty-codex' }, phase: 'idle',
+        messages: mode === 'empty-codex' ? [] : [{ role: 'assistant', text: mode + ' readable transcript' }] }) };
+    }, noChatTimers);
+    const { s } = selectChat(c, { agent: mode === 'native-claude' ? 'claude' : 'codex' });
+    if (mode === 'native-claude') s.nativeSource = true;
+    c.refreshDetail(s);
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.deepEqual(calls, ['/api/chat/state'], mode);
+    assert.doesNotMatch(textOf(c.get('messages')), /불러오고 있습니다/);
+    assert.match(textOf(c.get('messages')), mode === 'empty-codex' ? /저장된 대화를 아직/ : /readable transcript/);
+    if (mode === 'closed-codex' || mode === 'native-claude') assert.equal(c.get('chat-input').disabled, true);
+  }
+});
+
+test('reselecting a conversation renders current memory before transport and preserves reading position and Korean draft during refresh', async () => {
+  let defer = false; let release; let calls = 0;
+  const c = client(async (url, options) => {
+    calls++; assert.equal(url, '/api/chat/state');
+    if (defer) await new Promise((resolve) => { release = resolve; });
+    return { ok: true, status: 200, json: async () => ({ route: JSON.parse(options.body).source,
+      capability: { supported: true }, phase: 'idle', messages: [
+        { role: 'assistant', text: 'previously read reply' }, ...(defer ? [{ role: 'assistant', text: 'new appended reply' }] : []),
+      ] }) };
+  }, noChatTimers);
+  const { s, entry } = selectChat(c); s.cwd = '/example/work';
+  c.refreshDetail(s); await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(calls, 1);
+  entry.text = '작성해 둔 초안';
+  const other = selectChat(c, { id: 'other-session' });
+  c.drawDetail(other.s);
+  selectChat(c); s.cwd = '/example/work';
+  c.state.snapshot.hosts[0].data.codex[0] = s;
+  c.state.detailFor = null; defer = true;
+  c.refreshDetail(s);
+  const list = c.get('messages'); const input = c.get('chat-input'); const cachedRow = list.children[0];
+  assert.match(textOf(list), /previously read reply/);
+  assert.equal(c.get('conversation-sync-notice').hidden, false);
+  assert.match(c.get('conversation-sync-notice').textContent, /저장된 대화.*최신 내용 확인 중/);
+  assert.equal(input.value, '작성해 둔 초안');
+  list.scrollHeight = 900; list.clientHeight = 200; list.scrollTop = 40;
+  input.value = '갱신 중 한글 조합'; input.events.compositionstart(); input.events.input();
+  release(); await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(calls, 2);
+  assert.equal(list.children[0], cachedRow); assert.equal(list.scrollTop, 40);
+  assert.match(textOf(list), /new appended reply/);
+  assert.equal(c.get('conversation-sync-notice').hidden, true);
+  assert.equal(c.get('chat-input'), input); assert.equal(entry.composing, true); assert.equal(entry.text, input.value);
+});
+
+test('failed refresh keeps the cached transcript with an explicit stale notice and successful retry clears it', async () => {
+  let fail = false; const requests = [];
+  const c = client(async (url, options) => {
+    requests.push(url);
+    if (fail) throw new Error('fixture read failed');
+    return { ok: true, status: 200, json: async () => ({ route: JSON.parse(options.body).source,
+      capability: { supported: true }, phase: 'idle', messages: [{ role: 'assistant', text: 'cached reply to retain' }] }) };
+  }, noChatTimers);
+  const { s } = selectChat(c);
+  c.refreshDetail(s); await new Promise((resolve) => setImmediate(resolve));
+  fail = true; c.state.detailFor = null; c.refreshDetail(s);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.match(textOf(c.get('messages')), /cached reply to retain/);
+  assert.match(c.get('conversation-sync-notice').textContent, /저장된 대화.*최신 내용을 확인하지 못했습니다/);
+  assert.equal(requests.filter((url) => url.startsWith('/api/read?')).length, 1);
+  fail = false;
+  c.get('messages').conversationError.children[1].events.click();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(c.get('conversation-sync-notice').hidden, true);
+  assert.equal(c.get('messages').conversationError, null);
+  assert.match(textOf(c.get('messages')), /cached reply to retain/);
+});
+
+test('memory transcripts do not cross auth epochs, cwd changes, account homes or Claude transcript IDs, including offline views', async () => {
+  for (const boundary of ['auth', 'cwd', 'home', 'claude-session']) {
+    const c = client(async (url, options) => ({ ok: true, status: 200, json: async () => ({
+      route: JSON.parse(options.body).source, capability: { supported: false }, phase: 'idle',
+      messages: [{ role: 'assistant', text: 'private cached transcript' }],
+    }) }), noChatTimers);
+    const { s } = selectChat(c, { agent: boundary === 'claude-session' ? 'claude' : 'codex' });
+    s.cwd = '/example/original'; if (s.agent === 'claude') s.sessionId = 'original-transcript';
+    c.refreshDetail(s); await new Promise((resolve) => setImmediate(resolve));
+    if (boundary === 'auth') c.beginAuthEpoch();
+    if (boundary === 'cwd') s.cwd = '/example/changed';
+    if (boundary === 'home') {
+      s.home = '.codex-different'; s.key = 'different-account'; c.state.selected = s.key;
+    }
+    if (boundary === 'claude-session') s.sessionId = 'different-transcript';
+    c.state.offline = true; c.state.detailFor = null; c.refreshDetail(s);
+    assert.doesNotMatch(textOf(c.get('messages')), /private cached transcript|불러오고 있습니다/, boundary);
+    assert.match(textOf(c.get('messages')), /오프라인/, boundary);
+    assert.equal(c.get('conversation-sync-notice').hidden, true, boundary);
+  }
+});
+
+test('canonical detail loads join a current state read without queuing duplicate readback', async () => {
+  let release; const calls = [];
+  const c = client(async (url, options) => {
+    calls.push(url); await new Promise((resolve) => { release = resolve; });
+    return { ok: true, status: 200, json: async () => ({ route: JSON.parse(options.body).source,
+      capability: { supported: true }, phase: 'idle', messages: [{ role: 'assistant', text: 'joined reply' }] }) };
+  }, noChatTimers);
+  const { s, entry } = selectChat(c);
+  const first = c.loadChatState(s, false);
+  c.refreshDetail(s); await Promise.resolve();
+  assert.equal(entry.recheckQueued, false);
+  release(); await first; await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(calls, ['/api/chat/state']);
+  assert.match(textOf(c.get('messages')), /joined reply/);
+});
+
+test('legacy fallback cannot overwrite a newer send or a newer independent native state read', async () => {
+  for (const boundary of ['send', 'state', 'state-failure']) {
+    let releaseLegacy; let stateReads = 0; let sends = 0;
+    const c = client(async (url, options) => {
+      if (url.startsWith('/api/read?')) {
+        await new Promise((resolve) => { releaseLegacy = resolve; });
+        if (boundary === 'state-failure') throw new Error('obsolete legacy failure');
+        return { ok: true, status: 200, json: async () => ({ messages: [{ role: 'assistant', text: 'obsolete legacy reply' }] }) };
+      }
+      const body = JSON.parse(options.body);
+      if (url === '/api/chat/send') {
+        sends++;
+        return { ok: true, status: 200, json: async () => ({ status: 'accepted', receipt: { requestId: body.requestId, confirmed: true } }) };
+      }
+      stateReads++;
+      return { ok: true, status: 200, json: async () => ({ route: body.source, capability: { supported: true }, phase: 'idle',
+        ...(stateReads > 1 ? { messages: [{ role: 'assistant', text: 'new authoritative reply' }] } : {}),
+      }) };
+    }, noChatTimers);
+    const { s, entry } = selectChat(c); c.drawDetail(s);
+    const loading = c.loadDetail(s, true);
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(typeof releaseLegacy, 'function');
+    if (boundary === 'send') { entry.text = 'new send'; await c.sendChat(entry); }
+    else await c.loadChatState(s, true);
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.match(textOf(c.get('messages')), /new authoritative reply/);
+    releaseLegacy(); await loading;
+    assert.doesNotMatch(textOf(c.get('messages')), /obsolete legacy reply/);
+    assert.doesNotMatch(textOf(c.get('messages')), /obsolete legacy failure/);
+    assert.equal(c.get('conversation-sync-notice').hidden, true);
+    assert.equal(stateReads, 2); assert.equal(sends, boundary === 'send' ? 1 : 0);
+  }
+});
+
+test('legacy fallback responses and native memory reads from a locked epoch cannot restore the new login view', async () => {
+  let release; let requests = 0;
+  const c = client(async (url, options) => {
+    requests++;
+    if (url === '/api/chat/state') return { ok: true, status: 200, json: async () => ({ route: JSON.parse(options.body).source, capability: { supported: false } }) };
+    await new Promise((resolve) => { release = resolve; });
+    return { ok: true, status: 200, json: async () => ({ messages: [{ role: 'assistant', text: 'old private transcript' }] }) };
+  }, noChatTimers);
+  const { s } = selectChat(c); c.drawDetail(s);
+  const load = c.loadDetail(s, true);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(requests, 2); c.showLogin();
+  const next = selectChat(c, { home: '.codex-new-login' }); c.drawDetail(next.s);
+  c.get('chat-input').value = '새 로그인 초안'; c.get('chat-input').events.input();
+  release(); await load;
+  assert.doesNotMatch(textOf(c.get('messages')), /old private transcript/);
+  assert.equal(c.state.chats.size, 1);
+  assert.equal(next.entry.text, '새 로그인 초안');
+  assert.equal(next.entry.conversation, null);
+});
+
+test('a cwd change during an in-flight read fetches the new view once and keeps its mounted Korean editor', async () => {
+  let release; const calls = [];
+  const c = client(async (url, options) => {
+    calls.push(url); const ordinal = calls.length;
+    if (ordinal === 1) await new Promise((resolve) => { release = resolve; });
+    return { ok: true, status: 200, json: async () => ({ route: JSON.parse(options.body).source,
+      capability: { supported: true }, phase: 'idle', messages: [{ role: 'assistant', text: ordinal === 1 ? 'obsolete cwd reply' : 'new cwd reply' }] }) };
+  }, noChatTimers);
+  const { s, entry } = selectChat(c); s.cwd = '/example/original';
+  c.refreshDetail(s);
+  const input = c.get('chat-input'); input.value = '계속 조합하는 한글'; input.events.compositionstart(); input.events.input();
+  const updated = { ...s, cwd: '/example/changed' };
+  c.state.snapshot.hosts[0].data.codex[0] = updated;
+  c.refreshDetail(updated);
+  assert.equal(c.get('chat-input'), input); assert.equal(calls.length, 1);
+  release(); await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(calls, ['/api/chat/state', '/api/chat/state']);
+  assert.match(textOf(c.get('messages')), /new cwd reply/);
+  assert.doesNotMatch(textOf(c.get('messages')), /obsolete cwd reply/);
+  assert.equal(entry.composing, true); assert.equal(entry.text, '계속 조합하는 한글');
+  assert.equal(c.get('chat-input'), input);
 });

@@ -481,7 +481,8 @@ function select(key) {
   if (mobile) focusDetailBack();
 }
 function refreshDetail(s) {
-  const revision = JSON.stringify([s.stale, s.phase, s.title, s.project, s.account, s.hostLabel, s.fetchedAt]);
+  const revision = JSON.stringify([s.stale, s.phase, s.title, s.project, s.account, s.hostLabel, s.fetchedAt,
+    s.cwd || null, s.sessionId || null]);
   if (
     state.detailFor === s.key &&
     state.detailUpdatedAt === s.updatedAt &&
@@ -522,33 +523,54 @@ function patchDetailMetadata(s) {
   if (route) route.textContent = `${s.hostLabel || s.host} · ${AGENTS[s.agent] || s.agent} · ${sessionAccountLabel(s)}`;
 }
 async function loadDetail(s, fresh = false) {
-  if (s.nativeSource) { await loadChatState(s, true); return; }
   const run = ++state.detailRun;
+  const authEpoch = state.authEpoch;
+  const identity = conversationIdentity(s);
+  const entry = chatEntry(s);
+  const stateEpoch = entry.stateEpoch;
+  const viewCurrent = () => run === state.detailRun && authEpoch === state.authEpoch &&
+    state.authenticated && state.selected === s.key && conversationIdentity(selectedSession()) === identity &&
+    stateEpoch === entry.stateEpoch;
+  const cached = entry.conversation;
+  const usableCache = cached && cached.authEpoch === authEpoch && cached.identity === identity;
+  if (usableCache) {
+    renderMessages(s, cached.messages, "", fresh);
+    conversationSyncNotice(s, "checking");
+  }
+  if (networkOffline() || !chatVisible()) {
+    conversationSyncNotice(s, "stale");
+    if (!usableCache && networkOffline()) renderMessages(s, null, "오프라인입니다. 연결 후 대화를 다시 확인해 주세요.");
+    return;
+  }
+  const live = await loadChatState(s, true, { join: true });
+  if (!viewCurrent()) return;
+  if (live?.status === "success" && chatReadSupported(entry, live.data)) {
+    conversationSyncNotice(s, live.data.stale ? "stale" : "");
+    return;
+  }
   const params = new URLSearchParams({
     ...sourceOf(s),
     id: s.agent === "claude" ? s.sessionId || s.id : s.id,
   });
+  const fallbackSnapshot = entry.conversation;
   try {
-    const data = await api(`/api/read?${params}`);
-    if (
-      run !== state.detailRun ||
-      state.selected !== s.key ||
-      !state.authenticated
-    )
-      return;
-    const live = chatEntry(s);
-    renderMessages(s, chatSupported(live) && Array.isArray(live.data.messages) ? live.data.messages : data.messages || [],
-      chatSupported(live) ? "" : data.error || "", fresh);
+    const data = await api(`/api/read?${params}`, { authEpoch });
+    if (!viewCurrent()) return;
+    if (entry.conversation !== fallbackSnapshot && chatReadSupported(entry)) return;
+    const messages = data.messages || [];
+    rememberConversation(s, messages, data);
+    renderMessages(s, messages, data.error || "", fresh && !usableCache);
     updateReadNotice(data);
+    conversationSyncNotice(s, data.error ? "failed" : data.stale ? "stale" : "");
   } catch (err) {
-    if (
-      !err.unauthorized && !err.staleAuth &&
-      run === state.detailRun &&
-      state.selected === s.key
-    )
+    if (!err.unauthorized && !err.staleAuth && viewCurrent()) {
+      if (entry.conversation !== fallbackSnapshot && chatReadSupported(entry)) return;
       renderMessages(s, null, err.message);
+      conversationSyncNotice(s, "failed");
+    }
   }
 }
+
 function drawDetail(s) {
   const pane = $("detail");
   pane.replaceChildren();
@@ -585,13 +607,40 @@ function drawDetail(s) {
   list.id = "messages";
   list.setAttribute("aria-label", "최근 대화 읽기");
   list.append(el("p", "group-empty", "대화를 불러오고 있습니다…"));
-  pane.append(bar, list, buildChatComposer(s), buildContinuePanel(s));
+  const sync = el("p", "conversation-sync-notice");
+  sync.id = "conversation-sync-notice";
+  sync.hidden = true;
+  sync.setAttribute("role", "status");
+  pane.append(bar, sync, list, buildChatComposer(s), buildContinuePanel(s));
 }
 
 // Drafts and attachment handles stay in memory and are keyed by the actual
 // runtime identity, independently of the continuation/transfer route selectors.
 function chatKey(source) {
   return JSON.stringify([source.host, source.agent, source.home || "", source.id]);
+}
+function conversationIdentity(s) {
+  if (!s) return null;
+  return JSON.stringify([chatKey(sourceOf(s)), s.cwd || null, s.agent === "claude" ? s.sessionId || s.id : s.id]);
+}
+function chatReadSupported(entry, data = entry.data) {
+  return !!data && !data.error && chatKey(data.route || {}) === chatKey(entry.source) && Array.isArray(data.messages);
+}
+function rememberConversation(s, messages, data = {}) {
+  if (!Array.isArray(messages) || data.error) return;
+  chatEntry(s).conversation = { identity: conversationIdentity(s), authEpoch: state.authEpoch,
+    messages, fetchedAt: data.fetchedAt || Date.now() / 1000, stale: !!data.stale };
+}
+function conversationSyncNotice(s, status) {
+  if (state.selected !== s.key || $("detail").dataset.key !== s.key) return;
+  const cached = chatEntry(s).conversation;
+  const sameCache = cached && cached.authEpoch === state.authEpoch && cached.identity === conversationIdentity(s);
+  const text = status === "checking" ? "저장된 대화 · 최신 내용 확인 중…"
+    : status === "failed" && sameCache ? "저장된 대화 · 최신 내용을 확인하지 못했습니다."
+    : status === "stale" && sameCache ? "저장된 대화 · 연결 후 최신 내용을 확인해 주세요." : "";
+  const notice = $("conversation-sync-notice");
+  notice.textContent = text;
+  notice.hidden = !text;
 }
 function attachmentMetadata(files) {
   if (!Array.isArray(files)) return [];
@@ -652,7 +701,7 @@ function chatEntry(s) {
   const source = sourceOf(s);
   const key = chatKey(source);
   if (!state.chats.has(key)) state.chats.set(key, {
-    source: Object.freeze({ ...source }), text: "", attachments: [], data: null,
+    source: Object.freeze({ ...source }), text: "", attachments: [], data: null, conversation: null,
     pending: null, receipt: null, sending: false, uploads: 0,
     composing: false, editorEpoch: 0, stateEpoch: 0, recheckQueued: false, expanded: false, inputCollapsed: false, checking: false, error: "", notice: "", revision: 0,
   });
@@ -821,7 +870,6 @@ function buildChatComposer(s) {
   queueMicrotask(() => {
     if (!editorCurrent()) return;
     updateChatComposer(entry);
-    loadChatState(s, true);
   });
   return box;
 }
@@ -983,11 +1031,27 @@ function applyChatReceipt(entry, receipt) {
   }
   entry.pending = null;
 }
-async function loadChatState(s, manual = false) {
+async function loadChatState(s, manual = false, { join = false } = {}) {
   const entry = chatEntry(s);
   if (!currentChat(entry) || !chatVisible() || networkOffline()) return;
-  if (entry.checking) { if (manual) entry.recheckQueued = true; return; }
+  const identity = conversationIdentity(s);
+  if (entry.checking) {
+    if (join) {
+      if (entry.stateReadIdentity === identity && entry.stateReadAuthEpoch === state.authEpoch)
+        return entry.stateReadPromise;
+      // A different cwd/transcript is a new read, not a retry of the old view.
+      await entry.stateReadPromise;
+      return loadChatState(s, manual, { join: true });
+    }
+    if (manual) entry.recheckQueued = true;
+    return;
+  }
   entry.checking = true;
+  let complete;
+  entry.stateReadPromise = new Promise((resolve) => { complete = resolve; });
+  entry.stateReadIdentity = identity;
+  entry.stateReadAuthEpoch = state.authEpoch;
+  let outcome = { status: "skipped" };
   const epoch = entry.stateEpoch;
   const pollRun = state.chatPollRun;
   let readFailed = false;
@@ -1000,28 +1064,42 @@ async function loadChatState(s, manual = false) {
       source: entry.source, ...(lastRequestId ? { requestId: lastRequestId } : {}),
     } });
     if (!state.authenticated || state.chats.get(chatKey(entry.source)) !== entry) return;
-    if (epoch !== entry.stateEpoch) return;
+    if (epoch !== entry.stateEpoch || currentChat(entry) && conversationIdentity(selectedSession()) !== identity) return;
     entry.data = data;
+    outcome = { status: "success", data };
     entry.error = "";
     for (const receipt of data.receipts || []) {
       if (receipt.requestId === entry.pending?.requestId ||
           (entry.receipt?.dispatchState !== "not_started" && receipt.requestId === entry.receipt?.requestId))
         applyChatReceipt(entry, receipt);
     }
-    if (currentChat(entry) && chatSupported(entry) && Array.isArray(data.messages)) renderMessages(s, data.messages);
+    if (chatReadSupported(entry, data)) {
+      rememberConversation(s, data.messages, data);
+      if (currentChat(entry)) {
+        renderMessages(s, data.messages);
+        conversationSyncNotice(s, data.stale ? "stale" : "");
+      }
+    }
     scheduleChatPoll(s, entry);
   } catch (err) {
     readFailed = true;
+    outcome = { status: "failed", error: err };
+    if (!err.unauthorized && !err.staleAuth && epoch === entry.stateEpoch &&
+        currentChat(entry) && conversationIdentity(selectedSession()) === identity)
+      conversationSyncNotice(s, "failed");
     if (!err.unauthorized && !err.staleAuth && epoch === entry.stateEpoch) entry.error = `${err.message} 상태 다시 확인을 눌러 주세요.`;
     if (currentChat(entry) && pollRun === state.chatPollRun) clearTimeout(state.chatPollTimer);
   } finally {
     entry.checking = false;
+    complete(outcome);
+    entry.stateReadPromise = null;
     updateChatComposer(entry);
     const recheck = entry.recheckQueued || epoch !== entry.stateEpoch;
     entry.recheckQueued = false;
     if (recheck && !readFailed && currentChat(entry) && chatVisible() && !networkOffline())
       queueMicrotask(() => loadChatState(s, false));
   }
+  return outcome;
 }
 async function sendChat(entry) {
   if (networkOffline()) { updateChatComposer(entry); return; }

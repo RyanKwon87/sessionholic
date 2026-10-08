@@ -61,6 +61,8 @@ class FakeNative:
             if action == 'read':
                 supported = row['agent'] == 'codex'
                 return {'phase': row['phase'], 'cwd': row['cwd'], 'messages': list(self.messages[row['id']]),
+                        'receipts': [{**self.receipts.get(payload['requestId'], {'delivery': 'unknown'}),
+                                      'requestId': payload['requestId']}] if payload.get('requestId') else [],
                         'capabilities': {'canSend': supported, 'reason': None if supported else '이 Claude 실행은 실제 터미널에서 입력해 주세요.'}}
             if action == 'receipt':
                 return self.receipts.get(payload['requestId'], {'delivery': 'unknown'})

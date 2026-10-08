@@ -36,7 +36,8 @@ class ChatTest(unittest.TestCase):
             if op=='attachment': return attachments.receive(args)
             if args['action']=='read':
                 return {'cwd':str(self.project),'phase':'idle','capabilities':{'canSend':True},
-                        'messages':[{'role':'assistant','text':'준비 완료'}]}
+                        'messages':[{'role':'assistant','text':'준비 완료'}],
+                        'receipts':[{'requestId':args['requestId'],'delivery':'queued','confirmed':True,'queueId':'q1'}] if args.get('requestId') else []}
             return {'delivery':'queued','confirmed':True,'queueId':'q1'}
         self.flow.transfers.rpc=rpc
         self.chat=chat.Chat(self.board,self.flow,self.root)
@@ -92,7 +93,19 @@ class ChatTest(unittest.TestCase):
         self.assertEqual(receipt['receipts'][0]['requestId'],'request-0001')
         plain=self.chat.state({'source':REF})
         self.assertEqual(plain['receipts'],[])
-        self.assertEqual(len(self.calls),3)
+        self.assertEqual(len(self.calls),2)
+        self.assertEqual([args['action'] for _,_,args in self.calls],['read','read'])
+        self.assertEqual(self.calls[0][2]['requestId'],'request-0001')
+        self.assertNotIn('requestId',self.calls[1][2])
+    def test_combined_missing_or_other_request_receipt_remains_unknown(self):
+        for result in ({'messages':[]}, {'messages':[],'receipts':[{'requestId':'different-request','delivery':'completed','confirmed':True}]}):
+            with self.subTest(result=result):
+                calls=[]
+                self.flow.transfers.rpc=lambda *a,**k: calls.append((a,k)) or result
+                response=self.chat.state({'source':REF,'requestId':'request-0001'})
+                self.assertEqual(response['receipts'][0]['status'],'unknown')
+                self.assertFalse(response['receipts'][0]['confirmed'])
+                self.assertEqual(len(calls),1)
     def test_cwd_change_bypasses_cached_state(self):
         self.chat.state({'source':REF})
         changed=self.root/'changed';changed.mkdir()

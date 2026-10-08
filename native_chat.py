@@ -165,6 +165,20 @@ def _receipt(identity, request_id, thread, queue):
             "reason": "Native 수신 여부를 확인하지 못했습니다. 같은 입력을 자동으로 다시 보내지 않습니다."}
 
 
+def _read_receipt(identity, request_id, thread, queue, home):
+    """Reuse the exact snapshot; this path never submits or retries input."""
+    receipt = _receipt(identity, request_id, thread, queue)
+    if not receipt["confirmed"]:
+        with _Ledger(identity, request_id, home) as ledger:
+            saved = (ledger.read() or {}).get("receipt") or {}
+            if saved.get("confirmed") or saved.get("delivery") == "rejected":
+                receipt = saved
+    manifest = _history_attachments(identity, request_id, home)
+    if manifest:
+        receipt = {**receipt, "attachments": manifest}
+    return receipt
+
+
 def _messages(thread, identity=None, home=None):
     out = []
     # Only the retained history window may read attachment metadata from disk.
@@ -483,10 +497,14 @@ def _claude(identity, action, home, deadline, args):
         if len(paths) != 1:
             raise ValueError("정확한 원본 Claude 대화 기록을 확인하지 못했습니다.")
         result["messages"] = collector.claude_messages(collector.tail_entries(paths[0], 2 * 1024 * 1024))
-    if action in ("send", "receipt"):
-        result.update({"requestId": _request(args.get("requestId")), "delivery": "rejected",
-                       "confirmed": False, "readbackConfirmed": False, "canRetry": False,
-                       "reason": result["capabilities"]["reason"], "fallback": FALLBACK})
+    if action in ("send", "receipt") or (action == "read" and args.get("requestId") is not None):
+        receipt = {"requestId": _request(args.get("requestId")), "delivery": "rejected",
+                   "confirmed": False, "readbackConfirmed": False, "canRetry": False,
+                   "reason": result["capabilities"]["reason"], "fallback": FALLBACK}
+        if action == "read":
+            result["receipts"] = [receipt]
+        else:
+            result.update(receipt)
     return result
 
 
@@ -495,6 +513,7 @@ def handle(args, *, home=None, timeout=10):
     if not isinstance(args, dict) or args.get("action") not in ("capabilities", "read", "send", "receipt"):
         raise ValueError("Native 메시지 작업이 올바르지 않습니다.")
     identity, action = native._identity(args.get("source")), args["action"]
+    request_id = _request(args["requestId"]) if action == "read" and args.get("requestId") is not None else None
     deadline = time.monotonic() + min(max(float(timeout), 0.05), 30)
     if identity["agent"] == "claude":
         return _claude(identity, action, home, deadline, args)
@@ -510,18 +529,11 @@ def handle(args, *, home=None, timeout=10):
         if action == "read":
             result["messages"] = _messages(thread, identity, home)
             result["queue"] = [{"id": q.get("id"), "clientId": q.get("clientUserMessageId")} for q in queue]
+            if request_id:
+                result["receipts"] = [_read_receipt(identity, request_id, thread, queue, home)]
         elif action == "receipt":
             request_id = _request(args.get("requestId"))
-            receipt = _receipt(identity, request_id, thread, queue)
-            if not receipt["confirmed"]:
-                with _Ledger(identity, request_id, home) as ledger:
-                    saved = (ledger.read() or {}).get("receipt") or {}
-                    if saved.get("confirmed") or saved.get("delivery") == "rejected":
-                        receipt = saved
-            result.update(receipt)
-            manifest = _history_attachments(identity, request_id, home)
-            if manifest:
-                result["attachments"] = manifest
+            result.update(_read_receipt(identity, request_id, thread, queue, home))
         elif action == "send":
             if not queue_available:
                 return {**result, "requestId": _request(args.get("requestId")), "delivery": "rejected",

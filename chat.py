@@ -88,13 +88,15 @@ class Chat:
                 return cached[1]
             self.read_sequence += 1
             sequence, epoch = self.read_sequence, self.cache_epoch
-        result = self.rpc(host, 'read', source)
+        result = self.rpc(host, 'read', source, **({'requestId': request_id} if request_id else {}))
         caps = result.get('capabilities', {})
         phase = result.get('phase', 'unavailable')
         if phase in ('unknown', 'notLoaded'): phase = 'unavailable'
         receipts = []
         if request_id:
-            receipt = self.rpc(host, 'receipt', source, requestId=request_id)
+            receipt = next((receipt for receipt in result.get('receipts', [])
+                            if isinstance(receipt, dict) and receipt.get('requestId') == request_id),
+                           {'delivery': 'unknown', 'reason': '전송 결과를 확인하지 못했습니다. 상태를 다시 확인해 주세요.'})
             receipts.append(self.receipt(receipt, request_id))
         from server import scrub_payload
         messages = scrub_payload(result.get('messages', []))

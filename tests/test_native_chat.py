@@ -83,6 +83,56 @@ class NativeChatTests(unittest.TestCase):
     def writes(self, client):
         return [(method, params) for method, params in client.calls if method not in ('thread/read', 'thread/queue/list')]
 
+    def test_combined_read_receipt_reuses_one_exact_thread_and_queue_snapshot(self):
+        thread = self.thread()
+        thread['turns'] = [{'id': 'completed-turn', 'status': 'completed', 'items': [{
+            'type': 'userMessage', 'clientId': self.request, 'content': self.args['input']}]}]
+        client = FakeClient(thread)
+        result = self.handle(client, {'action': 'read', 'source': self.source, 'requestId': self.request})
+        self.assertEqual(result['messages'][0]['clientId'], self.request)
+        self.assertEqual(result['receipts'][0]['requestId'], self.request)
+        self.assertEqual(result['receipts'][0]['delivery'], 'completed')
+        self.assertTrue(result['receipts'][0]['readbackConfirmed'])
+        self.assertEqual([method for method, _ in client.calls], ['thread/read', 'thread/queue/list'])
+        self.assertEqual(self.writes(client), [])
+
+    def test_combined_receipt_matches_independent_unknown_rejected_and_acknowledged(self):
+        cases = [TimeoutError(), chat.NativeRejected({'code': -32600, 'message': 'failed to prepare attachment'}), None]
+        for error in cases:
+            with self.subTest(error=type(error).__name__):
+                rid = self.request + '-' + str(cases.index(error))
+                args = {**self.args, 'requestId': rid}
+                outcomes = {'thread/queue/add': error} if error else {'thread/queue/list': {'data': []}}
+                self.handle(FakeClient(self.thread('active'), outcomes=outcomes), args)
+                clean = FakeClient(self.thread())
+                combined = self.handle(clean, {'action': 'read', 'source': self.source, 'requestId': rid})
+                standalone = self.handle(FakeClient(self.thread()), {'action': 'receipt', 'source': self.source, 'requestId': rid})
+                receipt = combined['receipts'][0]
+                for key in ('requestId', 'delivery', 'confirmed', 'readbackConfirmed', 'acknowledged', 'canRetry'):
+                    self.assertEqual(receipt.get(key), standalone.get(key))
+                self.assertEqual(combined['phase'], 'idle')
+                self.assertEqual([m for m, _ in clean.calls], ['thread/read', 'thread/queue/list'])
+                self.assertEqual(self.writes(clean), [])
+                retry = FakeClient(self.thread())
+                self.handle(retry, args)
+                self.assertEqual(self.writes(retry), [])
+
+    def test_combined_receipt_matches_exact_queued_client_id(self):
+        client = FakeClient(self.thread('active'), [{'id': 'exact-queue', 'clientUserMessageId': self.request}])
+        read = self.handle(client, {'action': 'read', 'source': self.source, 'requestId': self.request})
+        self.assertEqual(read['receipts'][0]['delivery'], 'queued')
+        self.assertEqual(read['receipts'][0]['queueId'], 'exact-queue')
+        other = self.handle(FakeClient(client.thread, client.queue), {
+            'action': 'read', 'source': self.source, 'requestId': self.request + '-other'})
+        self.assertEqual(other['receipts'][0]['delivery'], 'unknown')
+        self.assertFalse(other['receipts'][0]['confirmed'])
+
+    def test_invalid_combined_request_id_is_rejected_before_native_connection(self):
+        with patch.object(chat, '_client') as connect:
+            with self.assertRaises(ValueError):
+                chat.handle({'action': 'read', 'source': self.source, 'requestId': 'x'}, home=self.home)
+        connect.assert_not_called()
+
     def test_attachment_manifest_survives_read_and_does_not_resolve_files_again(self):
         image = attachments.store(str(self.cwd), 'picture.png', b'\x89PNG\r\n\x1a\nfixture')
         file = attachments.store(str(self.cwd), 'document.txt', b'FILE-CONTENT-PRIVATE')
@@ -454,12 +504,17 @@ class NativeChatTests(unittest.TestCase):
         with patch.object(chat.native, '_claude_binary', return_value='/fixture/claude'), \
                 patch.object(chat.native, '_claude_run', return_value=json.dumps([row]).encode()) as run:
             read = chat.handle({'action': 'read', 'source': source}, home=self.home)
+            combined = chat.handle({'action': 'read', 'source': source, 'requestId': self.request}, home=self.home)
             send = chat.handle({**self.args, 'source': source}, home=self.home)
         self.assertEqual(read['cwd'], str(self.cwd))
         self.assertEqual(read['messages'][0]['text'], 'fixture')
         self.assertFalse(read['capabilities']['canSend'])
         self.assertTrue(read['requiresNativeTerminal'])
         self.assertEqual(send['delivery'], 'rejected')
+        self.assertEqual(combined['messages'], read['messages'])
+        self.assertEqual(combined['receipts'][0]['delivery'], 'rejected')
+        self.assertEqual(combined['receipts'][0]['requestId'], self.request)
+        self.assertEqual(len(run.call_args_list), 3)
         self.assertTrue(all(call.args[1] == ['agents', '--json', '--all'] for call in run.call_args_list))
 
 

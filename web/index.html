@@ -322,6 +322,21 @@
         </button>
       </div>
     </dialog>
+    <dialog id="chat-queue-dialog" class="plan-dialog chat-queue-dialog" aria-labelledby="chat-queue-title" aria-describedby="chat-queue-description">
+      <div class="dialog-top">
+        <p class="eyebrow">보낸 메시지</p>
+        <button id="chat-queue-close" class="icon-button" type="button" aria-label="예약 내용 닫기" autofocus>×</button>
+      </div>
+      <h2 id="chat-queue-title">예약 내용</h2>
+      <div class="dialog-body">
+        <p id="chat-queue-description" class="plan-preserve">본문과 첨부, 마지막으로 확인한 상태를 볼 수 있습니다.</p>
+        <div id="chat-queue-list" class="chat-queue-list"></div>
+        <p id="chat-queue-note" class="queued-message-note"></p>
+      </div>
+      <div class="dialog-actions">
+        <button id="chat-queue-dismiss" class="secondary" type="button">닫기</button>
+      </div>
+    </dialog>
     <div id="toast" class="toast" role="status" hidden></div>
   </body>
 </html>

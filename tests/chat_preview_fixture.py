@@ -40,14 +40,27 @@ class FakeNative:
             ), 'ts': time.time() - 10},
         ] for row in rows}
         self.receipts = {}
+        self.queued = {row['id']: [] for row in rows}
         self.lock = threading.RLock()
 
     def finish(self, identifier, request_id, text):
         with self.lock:
+            queued = next((item for item in self.queued[identifier] if item['requestId'] == request_id), None)
+            if queued:
+                self.queued[identifier].remove(queued)
+                self.messages[identifier].append({'role': 'user', 'text': queued['text'], 'ts': time.time(),
+                                                 'clientId': request_id, 'turnId': request_id, 'turnStatus': 'completed',
+                                                 'attachments': queued['attachments']})
+            for message in self.messages[identifier]:
+                if message.get('clientId') == request_id:
+                    message['turnStatus'] = 'completed'
             self.messages[identifier].append({'role': 'assistant', 'text': '검증 응답: ' + text, 'ts': time.time()})
-            self.rows[identifier]['phase'] = 'idle'
+            self.rows[identifier]['phase'] = 'working' if self.queued[identifier] else 'idle'
             self.receipts[request_id]['delivery'] = 'completed'
             self.receipts[request_id]['readbackConfirmed'] = True
+            self.receipts[request_id]['currentSnapshotConfirmed'] = True
+            self.receipts[request_id]['turnId'] = request_id
+            self.receipts[request_id]['queueId'] = None
 
     def rpc(self, host, command, payload, timeout=20):
         if command == 'attachment':
@@ -60,9 +73,12 @@ class FakeNative:
         with self.lock:
             if action == 'read':
                 supported = row['agent'] == 'codex'
+                ids = list(dict.fromkeys(([payload['requestId']] if payload.get('requestId') else []) + payload.get('requestIds', [])))
                 return {'phase': row['phase'], 'cwd': row['cwd'], 'messages': list(self.messages[row['id']]),
-                        'receipts': [{**self.receipts.get(payload['requestId'], {'delivery': 'unknown'}),
-                                      'requestId': payload['requestId']}] if payload.get('requestId') else [],
+                        'queuedMessages': list(self.queued[row['id']]),
+                        'queueState': {'available': supported, 'complete': supported, 'total': len(self.queued[row['id']]) if supported else None,
+                                       'truncated': False, 'reason': None if supported else 'Native 예약 읽기를 지원하지 않습니다.'},
+                        'receipts': [{**self.receipts.get(identifier, {'delivery': 'unknown'}), 'requestId': identifier} for identifier in ids],
                         'capabilities': {'canSend': supported, 'reason': None if supported else '이 Claude 실행은 실제 터미널에서 입력해 주세요.'}}
             if action == 'receipt':
                 return self.receipts.get(payload['requestId'], {'delivery': 'unknown'})
@@ -83,10 +99,18 @@ class FakeNative:
                 if kind == 'file':
                     text += '\n첨부 파일: ' + record['path']
             queued = row['phase'] == 'working'
-            self.messages[row['id']].append({'role': 'user', 'text': text, 'ts': time.time(),
-                                             'clientId': rid, 'attachments': sent_files})
-            self.receipts[rid] = {'delivery': 'queued' if queued else 'accepted', 'confirmed': True, 'turnId': rid,
-                                  'readbackConfirmed': True, 'acknowledged': True, 'attachments': sent_files}
+            if queued:
+                self.queued[row['id']].append({'queueId': 'queue-' + rid, 'requestId': rid, 'text': text,
+                                              'textTruncated': False, 'contentAvailable': True, 'attachments': sent_files,
+                                              'status': 'queued', 'confirmed': True, 'readbackConfirmed': True,
+                                              'currentSnapshotConfirmed': True, 'acknowledged': True})
+            else:
+                self.messages[row['id']].append({'role': 'user', 'text': text, 'ts': time.time(),
+                                                 'clientId': rid, 'turnId': rid, 'turnStatus': 'inProgress', 'attachments': sent_files})
+            self.receipts[rid] = {'delivery': 'queued' if queued else 'accepted', 'confirmed': True,
+                                  'turnId': None if queued else rid, 'queueId': 'queue-' + rid if queued else None,
+                                  'readbackConfirmed': True, 'currentSnapshotConfirmed': True,
+                                  'acknowledged': True, 'attachments': sent_files}
             row['phase'] = 'working'
             timer = threading.Timer(8 if queued else 5, self.finish, args=(row['id'], rid, text))
             timer.daemon = True

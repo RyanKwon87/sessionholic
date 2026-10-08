@@ -3708,3 +3708,24 @@ select:disabled {
 }
 .chat-delivery-evidence .msg-attachments { gap: 3px; margin: 0; }
 .chat-delivery-evidence .msg-attachment { padding-top: 2px; padding-bottom: 2px; }
+
+/* Reservation details use the existing dialog / mobile sheet. The toolbar
+   shortcut stays in the compact composer's existing action row. */
+.chat-toolbar > #chat-queue-open {
+  padding: 0 8px;
+  gap: 0;
+  color: var(--accent);
+  font-size: var(--fs-cap);
+}
+.chat-queue-list { display: flex; flex-direction: column; gap: 12px; padding: 8px 0; }
+.queued-message { min-width: 0; padding: 12px; border: 1px solid var(--sep); border-radius: var(--radius-s); background: var(--fill-soft); }
+.queued-message-meta { display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px 12px; margin-bottom: 8px; }
+.queued-message-status { color: var(--label); font-size: var(--fs-sub); }
+.queued-message-time,
+.queued-message-origin,
+.queued-message-note { color: var(--label-2); font-size: var(--fs-cap); line-height: 1.5; }
+.queued-message-origin { margin: 0 0 6px; }
+.queued-message-body { white-space: pre-wrap; overflow-wrap: anywhere; font-size: var(--fs-body); line-height: 1.5; user-select: text; }
+.queued-message-note { margin: 8px 0; }
+.queued-message-copy { margin-top: 10px; min-height: var(--tap); font-size: var(--fs-sub); }
+.chat-queue-dialog .dialog-actions { padding-top: 12px; }

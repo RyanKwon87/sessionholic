@@ -9,6 +9,7 @@ import time
 
 MAX_FILE = 20 * 1024 * 1024
 REQUEST = re.compile(r'[A-Za-z0-9_-]{8,100}\Z')
+STATE_REQUEST = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.:-]{7,127}\Z')
 
 
 class SendRejected(ValueError):
@@ -69,38 +70,98 @@ class Chat:
         return {'requestId': request_id, 'status': status,
                 'confirmed': result.get('confirmed', False),
                 'readbackConfirmed': result.get('readbackConfirmed', False),
+                'currentSnapshotConfirmed': result.get('currentSnapshotConfirmed', result.get('readbackConfirmed', False)),
                 'acknowledged': result.get('acknowledged', False),
                 'turnId': result.get('turnId'), 'queueId': result.get('queueId'),
                 'reason': result.get('reason'),
                 'attachments': Chat.attachment_history(result.get('attachments', []))}
+
+    @staticmethod
+    def queue_history(result):
+        """Old/malformed workers must not report an authoritative empty queue."""
+        unknown = {'available': False, 'complete': False, 'total': None, 'truncated': False,
+                   'reason': '예약 대기열을 확인하지 못했습니다.'}
+        state, rows = result.get('queueState'), result.get('queuedMessages')
+        if (not isinstance(state, dict) or not isinstance(rows, list) or len(rows) > 50
+                or not {'available', 'complete', 'total', 'truncated'} <= state.keys()
+                or any(type(state.get(key)) is not bool for key in ('available', 'complete', 'truncated'))
+                or (state.get('total') is not None and (type(state['total']) is not int or state['total'] < len(rows)))
+                or (state['available'] and state.get('total') is None)
+                or (not state['available'] and (rows or state['total'] is not None))
+                or (state['complete'] and (not state['available'] or state['truncated'] or state['total'] != len(rows)))):
+            return [], unknown
+        out, total_bytes = [], 0
+        for row in rows:
+            if (not isinstance(row, dict) or not isinstance(row.get('queueId'), str) or not row['queueId'] or len(row['queueId']) > 256
+                    or (row.get('requestId') is not None and (not isinstance(row['requestId'], str) or len(row['requestId']) > 128))
+                    or not isinstance(row.get('text'), str) or len(row['text']) > 32768
+                    or not isinstance(row.get('attachments'), list)
+                    or row.get('status') != 'queued' or row.get('confirmed') is not True
+                    or row.get('readbackConfirmed') is not True
+                    or (state['complete'] and (row.get('textTruncated') is True or row.get('contentAvailable') is not True))):
+                return [], unknown
+            total_bytes += len(row['text'].encode())
+            if total_bytes > 256 * 1024:
+                return [], unknown
+            attached = []
+            for item in row['attachments'][:40]:
+                if not isinstance(item, dict):
+                    continue
+                if item.get('source') == 'sessionholic':
+                    attached.extend(Chat.attachment_history([item]))
+                elif item.get('source') == 'native' and item.get('kind') in ('image', 'file'):
+                    image = item['kind'] == 'image'
+                    attached.append({'id': None, 'name': '이미지' if image else '파일',
+                                     'type': 'image/*' if image else 'application/octet-stream',
+                                     'size': None, 'kind': item['kind'], 'source': 'native'})
+            out.append({'queueId': row['queueId'], 'requestId': row.get('requestId'), 'text': row['text'],
+                        'textTruncated': row.get('textTruncated') is True, 'contentAvailable': row.get('contentAvailable') is True,
+                        'attachments': attached, 'status': 'queued', 'confirmed': True,
+                        'readbackConfirmed': True, 'currentSnapshotConfirmed': True, 'acknowledged': row.get('acknowledged') is True})
+        from launch import scrub_text
+        reason = state.get('reason')
+        return out, {key: state[key] for key in ('available', 'complete', 'total', 'truncated')} | {
+            'reason': scrub_text(reason[:1000]) if isinstance(reason, str) else None}
 
     def state(self, data):
         source, host = self.source(data.get('source'))
         identity = self.identity(source)
         key = json.dumps(identity, sort_keys=True)
         request_id = data.get('requestId')
-        if request_id is not None and (not isinstance(request_id, str) or not REQUEST.fullmatch(request_id)):
+        if request_id is not None and (not isinstance(request_id, str) or not STATE_REQUEST.fullmatch(request_id)):
             raise ValueError('메시지 요청 식별자가 올바르지 않습니다.')
+        additional = data.get('requestIds', [])
+        if (not isinstance(additional, list) or len(additional) > 20
+                or any(not isinstance(identifier, str) or not STATE_REQUEST.fullmatch(identifier) for identifier in additional)):
+            raise ValueError('한 번에 확인할 메시지는 올바른 식별자로 20개까지 선택할 수 있습니다.')
+        request_ids = list(dict.fromkeys(([request_id] if request_id else []) + additional))
+        if len(request_ids) > 20:
+            raise ValueError('한 번에 확인할 메시지는 20개까지 선택할 수 있습니다.')
         with self.lock:
             cached = self.cache.get(key)
-            if (not request_id and cached and cached[3] == source.get('cwd')
+            if (not request_ids and cached and cached[3] == source.get('cwd')
                     and time.monotonic() - cached[0] < 2):
                 return cached[1]
             self.read_sequence += 1
             sequence, epoch = self.read_sequence, self.cache_epoch
-        result = self.rpc(host, 'read', source, **({'requestId': request_id} if request_id else {}))
+        kwargs = {'requestId': request_id} if request_id else {}
+        if additional:
+            kwargs['requestIds'] = additional
+        result = self.rpc(host, 'read', source, **kwargs)
         caps = result.get('capabilities', {})
         phase = result.get('phase', 'unavailable')
         if phase in ('unknown', 'notLoaded'): phase = 'unavailable'
         receipts = []
-        if request_id:
+        for request_id in request_ids:
             receipt = next((receipt for receipt in result.get('receipts', [])
                             if isinstance(receipt, dict) and receipt.get('requestId') == request_id),
                            {'delivery': 'unknown', 'reason': '전송 결과를 확인하지 못했습니다. 상태를 다시 확인해 주세요.'})
             receipts.append(self.receipt(receipt, request_id))
         from server import scrub_payload
         messages = scrub_payload(result.get('messages', []))
-        for message in messages:
+        queued, queue_state = self.queue_history(result)
+        queued = scrub_payload(queued)
+        for message in messages + queued:
             if isinstance(message, dict) and isinstance(message.get('attachments'), list):
                 from launch import scrub_text
                 message['attachments'] = [{**item, 'name': scrub_text(item['name'])}
@@ -111,13 +172,15 @@ class Chat:
                                    'attachments': bool(source.get('cwd')),
                                    'reason': caps.get('reason') or result.get('reason')},
                     'messages': messages,
+                    'queuedMessages': queued,
+                    'queueState': queue_state,
                     'receipts': receipts, 'maxAttachmentBytes': MAX_FILE,
                     'requiresNativeTerminal': result.get('requiresNativeTerminal', phase == 'needs_input')}
         with self.lock:
             cached = self.cache.get(key)
             # Receipt reads are request-specific. A send or a newer read must
             # also prevent an earlier in-flight snapshot from repopulating cache.
-            if (not request_id and epoch == self.cache_epoch
+            if (not request_ids and epoch == self.cache_epoch
                     and (cached is None or sequence > cached[2])):
                 if key not in self.cache and len(self.cache) >= 64:
                     self.cache.pop(next(iter(self.cache)))

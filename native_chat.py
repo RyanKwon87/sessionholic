@@ -22,6 +22,9 @@ import launch
 import transfer_native as native
 
 REQUEST_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{7,127}\Z")
+MAX_QUEUED_MESSAGES = 50
+MAX_QUEUE_TEXT = 32768
+MAX_QUEUE_TEXT_TOTAL = 256 * 1024
 FALLBACK = "승인·질문 응답과 지원되지 않는 입력은 원본 native 터미널에서 처리하세요."
 
 
@@ -168,15 +171,90 @@ def _receipt(identity, request_id, thread, queue):
 def _read_receipt(identity, request_id, thread, queue, home):
     """Reuse the exact snapshot; this path never submits or retries input."""
     receipt = _receipt(identity, request_id, thread, queue)
+    current = receipt["confirmed"]
     if not receipt["confirmed"]:
         with _Ledger(identity, request_id, home) as ledger:
             saved = (ledger.read() or {}).get("receipt") or {}
             if saved.get("confirmed") or saved.get("delivery") == "rejected":
                 receipt = saved
+    receipt = {**receipt, "currentSnapshotConfirmed": current}
+    if not current:
+        # A durable acknowledgement is not evidence of membership in this read.
+        receipt["readbackConfirmed"] = False
     manifest = _history_attachments(identity, request_id, home)
     if manifest:
         receipt = {**receipt, "attachments": manifest}
     return receipt
+
+
+def _request_ids(args):
+    ids = args.get("requestIds", [])
+    if not isinstance(ids, list) or len(ids) > 20:
+        raise ValueError("한 번에 확인할 메시지는 20개까지 선택할 수 있습니다.")
+    ids = [_request(identifier) for identifier in ids]
+    if args.get("requestId") is not None:
+        ids.insert(0, _request(args["requestId"]))
+    ids = list(dict.fromkeys(ids))
+    if len(ids) > 20:
+        raise ValueError("한 번에 확인할 메시지는 20개까지 선택할 수 있습니다.")
+    return ids
+
+
+def _queued_messages(identity, queue, home, available, thread=None):
+    """Use only Native's existing input snapshot, never load attachment bodies."""
+    if not available:
+        return [], {"available": False, "complete": False, "total": None, "truncated": False,
+                    "reason": "예약 대기열을 확인하지 못했습니다. 원본 터미널에서 확인해 주세요."}
+    # Native may advance between thread/read and queue/list. A confirmed user
+    # item takes precedence, just as it does in the independent receipt path.
+    queued_ids = {q.get("clientUserMessageId") for q in queue if isinstance(q.get("clientUserMessageId"), str)}
+    observed = {item.get("clientId") for turn in (thread or {}).get("turns", [])
+                for item in turn.get("items") or [] if isinstance(item, dict)
+                and item.get("type") == "userMessage" and isinstance(item.get("clientId"), str)
+                and item["clientId"] in queued_ids}
+    queue = [q for q in queue if not isinstance(q.get("clientUserMessageId"), str)
+             or q["clientUserMessageId"] not in observed]
+    out, remaining, incomplete = [], MAX_QUEUE_TEXT_TOTAL, False
+    for submission in queue[:MAX_QUEUED_MESSAGES]:
+        identifier = submission.get("id")
+        if not isinstance(identifier, str) or not identifier or len(identifier) > 256:
+            incomplete = True
+            continue
+        client_id = submission.get("clientUserMessageId")
+        if not isinstance(client_id, str) or not client_id or len(client_id) > 128:
+            client_id = None
+        inputs = submission.get("input")
+        content_available = isinstance(inputs, list)
+        # Construct at most the display budget rather than joining unbounded text.
+        parts, used, used_bytes, truncated = [], 0, 0, False
+        for block in inputs if content_available else []:
+            if not isinstance(block, dict) or block.get("type") != "text" or not isinstance(block.get("text"), str):
+                continue
+            if parts:
+                if used < MAX_QUEUE_TEXT and used_bytes < remaining:
+                    parts.append("\n"); used += 1; used_bytes += 1
+                else:
+                    truncated = True
+            value = block["text"]
+            encoded = value[:MAX_QUEUE_TEXT - used].encode()
+            shown = encoded[:remaining - used_bytes].decode('utf-8', errors='ignore')
+            parts.append(shown); used += len(shown); used_bytes += len(shown.encode())
+            truncated = truncated or len(shown) < len(value)
+        text = "".join(parts)
+        remaining -= used_bytes
+        generic = collector.native_attachments(inputs)
+        manifest = _history_attachments(identity, client_id, home, inputs) if client_id and content_available else []
+        images = [item for item in generic if item["kind"] == "image"]
+        extra_images = max(0, len(images) - sum(item["kind"] == "image" for item in manifest))
+        attached = manifest + images[:extra_images] + [item for item in generic if item["kind"] != "image"]
+        row = {"queueId": identifier, "requestId": client_id, "text": text, "textTruncated": truncated,
+               "contentAvailable": content_available, "attachments": attached, "status": "queued",
+               "confirmed": True, "readbackConfirmed": True, "currentSnapshotConfirmed": True, "acknowledged": False}
+        out.append(row)
+        incomplete = incomplete or truncated or not content_available
+    limited = len(queue) > MAX_QUEUED_MESSAGES or incomplete
+    return out, {"available": True, "complete": not limited, "total": len(queue), "truncated": limited,
+                 "reason": "예약 내용을 일부만 표시합니다. 원본 터미널에서 전체 목록을 확인해 주세요." if limited else None}
 
 
 def _messages(thread, identity=None, home=None):
@@ -497,14 +575,17 @@ def _claude(identity, action, home, deadline, args):
         if len(paths) != 1:
             raise ValueError("정확한 원본 Claude 대화 기록을 확인하지 못했습니다.")
         result["messages"] = collector.claude_messages(collector.tail_entries(paths[0], 2 * 1024 * 1024))
-    if action in ("send", "receipt") or (action == "read" and args.get("requestId") is not None):
-        receipt = {"requestId": _request(args.get("requestId")), "delivery": "rejected",
-                   "confirmed": False, "readbackConfirmed": False, "canRetry": False,
-                   "reason": result["capabilities"]["reason"], "fallback": FALLBACK}
-        if action == "read":
-            result["receipts"] = [receipt]
-        else:
-            result.update(receipt)
+    if action == "read":
+        result["queuedMessages"], result["queueState"] = _queued_messages(identity, [], home, False)
+        result["queueState"]["reason"] = result["capabilities"]["reason"]
+        result["receipts"] = [{"requestId": identifier, "delivery": "rejected", "confirmed": False,
+                               "readbackConfirmed": False, "canRetry": False,
+                               "reason": result["capabilities"]["reason"], "fallback": FALLBACK}
+                              for identifier in _request_ids(args)]
+    elif action in ("send", "receipt"):
+        result.update({"requestId": _request(args.get("requestId")), "delivery": "rejected",
+                       "confirmed": False, "readbackConfirmed": False, "canRetry": False,
+                       "reason": result["capabilities"]["reason"], "fallback": FALLBACK})
     return result
 
 
@@ -513,7 +594,7 @@ def handle(args, *, home=None, timeout=10):
     if not isinstance(args, dict) or args.get("action") not in ("capabilities", "read", "send", "receipt"):
         raise ValueError("Native 메시지 작업이 올바르지 않습니다.")
     identity, action = native._identity(args.get("source")), args["action"]
-    request_id = _request(args["requestId"]) if action == "read" and args.get("requestId") is not None else None
+    request_ids = _request_ids(args) if action == "read" else []
     deadline = time.monotonic() + min(max(float(timeout), 0.05), 30)
     if identity["agent"] == "claude":
         return _claude(identity, action, home, deadline, args)
@@ -529,8 +610,9 @@ def handle(args, *, home=None, timeout=10):
         if action == "read":
             result["messages"] = _messages(thread, identity, home)
             result["queue"] = [{"id": q.get("id"), "clientId": q.get("clientUserMessageId")} for q in queue]
-            if request_id:
-                result["receipts"] = [_read_receipt(identity, request_id, thread, queue, home)]
+            result["queuedMessages"], result["queueState"] = _queued_messages(identity, queue, home, queue_available, thread)
+            if request_ids:
+                result["receipts"] = [_read_receipt(identity, identifier, thread, queue, home) for identifier in request_ids]
         elif action == "receipt":
             request_id = _request(args.get("requestId"))
             result.update(_read_receipt(identity, request_id, thread, queue, home))

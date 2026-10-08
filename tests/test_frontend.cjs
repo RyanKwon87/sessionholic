@@ -120,7 +120,7 @@ function client(
   vm.runInContext(messageSource, context);
   vm.runInContext(source, context);
   const api = vm.runInContext(
-    "({state,api,sourceOf,accountOf,sendInput,pasteDraft,prepareDraftPaste,startDraftComposition,endDraftComposition,inputDraft,stopTerminalReader,startTerminalReader,closePlan,navigateView,backToList,backFromTerminal,closeTerminal,cancelTerminalClose,confirmTerminalClose,populateAccount,populateRoute,updateContinue,renderPlan,launchPlan,openTerminal,saveDraft,draftKey,refreshTerminals,renderTerminals,renderTerminalReturn,renderFilters,terminalCloseCopy,warnDraftUnload,preparePlan,renderGroups,renderMessages,loadDetail,chatKey,chatEntry,currentChat,chatSupported,chatAttachmentsSupported,buildChatComposer,sendChat,loadChatState,applyChatReceipt,uploadChatFiles,pasteChat,scheduleChatPoll,stopChatPolling,openNativeChat,allSessions,buildContinuePanel,chatReceiptCopy,returnToBoard,readChatClipboard,accountDisplay,sessionAccountLabel,closeChatToolsOutside,closeChatToolsEscape,drawDetail,refreshDetail,loadCapabilities,matches,recoverConnection,networkOffline,poll,select,focusDetailBack,restoreSelectedCardFocus,showLogin,lock,beginAuthEpoch,resizeChatInput,updateViewport})",
+    "({state,api,sourceOf,accountOf,sendInput,pasteDraft,prepareDraftPaste,startDraftComposition,endDraftComposition,inputDraft,stopTerminalReader,startTerminalReader,closePlan,navigateView,backToList,backFromTerminal,closeTerminal,cancelTerminalClose,confirmTerminalClose,populateAccount,populateRoute,updateContinue,renderPlan,launchPlan,openTerminal,saveDraft,draftKey,refreshTerminals,renderTerminals,renderTerminalReturn,renderFilters,terminalCloseCopy,warnDraftUnload,preparePlan,renderGroups,renderMessages,loadDetail,chatKey,chatEntry,currentChat,chatSupported,chatAttachmentsSupported,buildChatComposer,sendChat,loadChatState,applyChatReceipt,uploadChatFiles,pasteChat,scheduleChatPoll,stopChatPolling,openNativeChat,allSessions,buildContinuePanel,chatReceiptCopy,returnToBoard,readChatClipboard,accountDisplay,sessionAccountLabel,closeChatToolsOutside,closeChatToolsEscape,drawDetail,refreshDetail,loadCapabilities,matches,recoverConnection,networkOffline,poll,select,focusDetailBack,restoreSelectedCardFocus,showLogin,lock,beginAuthEpoch,resizeChatInput,updateViewport,openChatQueue,closeChatQueue,chatQueueCount})",
     context,
   );
   api.state.csrf = "csrf-test";
@@ -2082,7 +2082,7 @@ test('service worker evicts only its own old shells and offline reads use the cu
     self, URL, Set, Response,
     fetch: async () => { throw new Error('offline'); },
     caches: {
-      keys: async () => ['another-app-shell', 'sessionholic-shell-v0', 'sessionholic-shell-v1', 'sessionholic-shell-v2', 'sessionholic-shell-v4', 'sessionholic-shell-v5', 'sessionholic-shell-v6'],
+      keys: async () => ['another-app-shell', 'sessionholic-shell-v0', 'sessionholic-shell-v1', 'sessionholic-shell-v2', 'sessionholic-shell-v4', 'sessionholic-shell-v5', 'sessionholic-shell-v6', 'sessionholic-shell-v7'],
       delete: async (key) => { deleted.push(key); },
       open: async (key) => { opened.push(key); return { match: async () => currentShell }; },
       match: async () => { throw new Error('Global cross-application cache lookup is forbidden'); },
@@ -2090,11 +2090,11 @@ test('service worker evicts only its own old shells and offline reads use the cu
   });
   let activated;
   listeners.activate({ waitUntil: (promise) => { activated = promise; } }); await activated;
-  assert.deepEqual(deleted, ['sessionholic-shell-v0', 'sessionholic-shell-v1', 'sessionholic-shell-v2', 'sessionholic-shell-v4', 'sessionholic-shell-v5']);
+  assert.deepEqual(deleted, ['sessionholic-shell-v0', 'sessionholic-shell-v1', 'sessionholic-shell-v2', 'sessionholic-shell-v4', 'sessionholic-shell-v5', 'sessionholic-shell-v6']);
   listeners.fetch({ request: { method: 'GET', url: 'https://app.example/' },
     respondWith: (promise) => { response = promise; }, waitUntil() {} });
   assert.equal(await response, currentShell);
-  assert.deepEqual(opened, ['sessionholic-shell-v6']);
+  assert.deepEqual(opened, ['sessionholic-shell-v7']);
 });
 
 test('an offline first launch restores authentication and already-open terminal rows without reopening their sessions', async () => {
@@ -2928,4 +2928,228 @@ test('a cwd change during an in-flight read fetches the new view once and keeps 
   assert.doesNotMatch(textOf(c.get('messages')), /obsolete cwd reply/);
   assert.equal(entry.composing, true); assert.equal(entry.text, '계속 조합하는 한글');
   assert.equal(c.get('chat-input'), input);
+});
+
+function queueStateReply(source, queuedMessages, receipts = [], queueState = {}) {
+  return { route: source, capability: { supported: true }, phase: 'working', messages: [], queuedMessages,
+    queueState: { available: true, complete: true, total: queuedMessages.length, truncated: false, ...queueState }, receipts };
+}
+function queueItem(requestId, text, attachments = [], extra = {}) {
+  return { requestId, queueId: 'queue-' + requestId, text, textTruncated: false, contentAvailable: true,
+    attachments, status: 'queued', confirmed: true, ...extra };
+}
+
+test('queued send snapshots keep multiple original bodies visible after draft clearing, and readonly dialog refresh preserves new Korean input', async () => {
+  const requests = []; const queued = []; const stored = []; let copied;
+  const c = client(async (url, options) => {
+    const body = JSON.parse(options.body); requests.push({ url, body });
+    if (url === '/api/chat/send') {
+      queued.push(queueItem(body.requestId, body.text + '\n첨부 파일: [native-added-path]', body.attachments.map((id) => ({ id, name: '사진.png', type: 'image/png', kind: 'image', size: 3, source: 'sessionholic' }))));
+      return { ok: true, status: 200, json: async () => ({ status: 'queued', receipt: { requestId: body.requestId,
+        queueId: queued.at(-1).queueId, confirmed: true, currentSnapshotConfirmed: true } }) };
+    }
+    return { ok: true, status: 200, json: async () => queueStateReply(body.source, queued,
+      queued.map((item) => ({ requestId: item.requestId, status: 'queued', confirmed: true, currentSnapshotConfirmed: true }))) };
+  }, noChatTimers);
+  c.context.navigator = { clipboard: { writeText: async (text) => { copied = text; } } };
+  c.context.localStorage.setItem = (...args) => stored.push(args);
+  const { s, entry } = selectChat(c); entry.data.phase = 'working';
+  c.buildChatComposer(s);
+  const original = '첫 요청 **원문**\n> 인용 기호도 원문입니다.';
+  entry.text = original; entry.attachments = [{ id: 'photo-id', name: '사진.png', type: 'image/png', size: 3 }];
+  await c.sendChat(entry); await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(entry.text, ''); assert.equal(entry.pending, null);
+  c.get('chat-input').value = '두 번째 요청 전체 본문'; c.get('chat-input').events.input();
+  await c.sendChat(entry); await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(c.chatQueueCount(entry), 2); assert.equal(c.get('chat-queue-open').textContent, '예약 2개');
+  const beforeOpen = requests.length;
+  c.get('chat-queue-open').events.click();
+  assert.equal(c.get('chat-queue-dialog').open, true); assert.equal(requests.length, beforeOpen);
+  const list = c.get('chat-queue-list'); const firstRow = list.children[0];
+  assert.equal(byClass(firstRow, 'queued-message-body')[0].textContent, original);
+  assert.match(textOf(firstRow), /이 탭에서 보낸 원문.*사진.png/s);
+  assert.doesNotMatch(textOf(firstRow), /native-added-path/);
+  await byClass(firstRow, 'queued-message-copy')[0].events.click(); assert.equal(copied, original);
+  assert.equal(byClass(firstRow, 'queued-message-copy')[0].attributes['aria-label'], '표시된 메시지 본문 복사');
+  c.closeChatQueue();
+  const input = c.get('chat-input'); input.value = '보낸 후 새 한글 초안'; input.events.compositionstart(); input.events.input();
+  c.get('chat-queue-open').events.click();
+  assert.equal(c.get('chat-queue-dialog').open, false); assert.equal(entry.composing, true);
+  input.events.compositionend(); c.openChatQueue(entry);
+  const bodyNode = byClass(c.get('chat-queue-list').children[0], 'queued-message-body')[0];
+  c.get('chat-queue-list').scrollTop = 45;
+  await c.loadChatState(s, true);
+  assert.equal(byClass(c.get('chat-queue-list').children[0], 'queued-message-body')[0], bodyNode);
+  assert.equal(c.get('chat-queue-list').scrollTop, 45);
+  assert.equal(c.get('chat-input'), input); assert.equal(entry.text, '보낸 후 새 한글 초안');
+  assert.equal(requests.filter((request) => request.url === '/api/chat/send').length, 2);
+  assert.equal(requests.filter((request) => request.url === '/api/chat/state').length, 3);
+  assert.deepEqual(stored, []);
+});
+
+test('an uncertain send exposes its original content for review but is never counted as a reservation or retransmitted', async () => {
+  let sends = 0; let copied;
+  const c = client(async (url, options) => {
+    const body = JSON.parse(options.body);
+    if (url === '/api/chat/send') { sends++; throw new Error('lost response'); }
+    return { ok: true, status: 200, json: async () => queueStateReply(body.source, [],
+      [{ requestId: body.requestId, status: 'unknown', confirmed: false, currentSnapshotConfirmed: false }]) };
+  }, noChatTimers);
+  const { entry } = selectChat(c); c.buildChatComposer(c.state.snapshot.hosts[0].data.codex[0]);
+  c.context.navigator = { clipboard: { writeText: async (text) => { copied = text; } } };
+  entry.text = '전송 결과를 모르는 원문\n둘째 줄';
+  await c.sendChat(entry); await new Promise((resolve) => setImmediate(resolve));
+  assert.ok(entry.pending); assert.equal(c.chatQueueCount(entry), 0);
+  assert.equal(c.get('chat-queue-open').textContent, '미확인 내역');
+  c.openChatQueue(entry); const row = c.get('chat-queue-list').children[0];
+  assert.match(textOf(row), /전송 결과 미확인/);
+  assert.equal(byClass(row, 'queued-message-body')[0].textContent, entry.pending.text);
+  await byClass(row, 'queued-message-copy')[0].events.click(); assert.equal(copied, entry.pending.text);
+  await c.sendChat(entry); assert.equal(sends, 1);
+});
+
+test('a fresh page restores native queue contents, generic attachments and missing-content warnings without adding an API call', async () => {
+  const calls = [];
+  const native = [queueItem('native.request:001', '<script>literal</script>\nfull native request', [], { textTruncated: true }),
+    queueItem(null, '', [{ id: null, name: '이미지', kind: 'image', type: 'image/*', size: null, source: 'native' }], { queueId: 'native-queue-two' }),
+    queueItem(null, '', [], { queueId: 'native-queue-three', contentAvailable: false })];
+  const c = client(async (url, options) => { calls.push(url); return { ok: true, status: 200,
+    json: async () => queueStateReply(JSON.parse(options.body).source, native) }; }, noChatTimers);
+  const { s, entry } = selectChat(c); c.buildChatComposer(s);
+  await c.loadChatState(s, true); c.openChatQueue(entry);
+  assert.deepEqual(calls, ['/api/chat/state']); assert.equal(c.chatQueueCount(entry), 3);
+  const rows = c.get('chat-queue-list').children;
+  assert.equal(byClass(rows[0], 'queued-message-body')[0].textContent, '<script>literal</script>\nfull native request');
+  assert.match(textOf(rows[0]), /원본 세션 대기열에서 확인한 내용.*일부만 표시/s);
+  assert.equal(byClass(rows[0], 'queued-message-time')[0].textContent, '');
+  assert.match(textOf(rows[1]), /첨부만 보낸 메시지.*이미지/);
+  assert.equal(byClass(rows[1], 'queued-message-copy')[0].hidden, true);
+  assert.match(textOf(rows[2]), /메시지 내용을 확인하지 못했습니다/);
+  assert.equal(byClass(rows[2], 'queued-message-copy')[0].hidden, true);
+});
+
+test('queueId aliases prevent duplicate reservations when a native row lacks its client request ID', async () => {
+  let queued; let requestId;
+  const c = client(async (url, options) => {
+    const body = JSON.parse(options.body);
+    if (url === '/api/chat/send') {
+      requestId = body.requestId; queued = queueItem(null, body.text, [], { queueId: 'shared-queue-id' });
+      return { ok: true, status: 200, json: async () => ({ status: 'queued', receipt: { requestId,
+        queueId: 'shared-queue-id', confirmed: true, currentSnapshotConfirmed: true } }) };
+    }
+    return { ok: true, status: 200, json: async () => queueStateReply(body.source, [queued],
+      [{ requestId, status: 'queued', confirmed: true, currentSnapshotConfirmed: false }]) };
+  }, noChatTimers);
+  const { s, entry } = selectChat(c); c.buildChatComposer(s); entry.text = 'only one request';
+  await c.sendChat(entry); await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(entry.submissions.length, 1); assert.equal(c.chatQueueCount(entry), 1);
+  c.openChatQueue(entry); assert.equal(c.get('chat-queue-list').children.length, 1);
+  assert.match(textOf(c.get('chat-queue-list')), /대기 중.*only one request/);
+});
+
+test('queue absence and historical queued receipts remain uncertain, while exact fresh receipts alone advance execution and completion', async () => {
+  let phase = 'queued';
+  const c = client(async (url, options) => {
+    const body = JSON.parse(options.body);
+    const item = queueItem('known-request-001', '내용이 남아야 하는 예약');
+    return { ok: true, status: 200, json: async () => queueStateReply(body.source, phase === 'queued' ? [item] : [],
+      phase === 'queued' ? [] : [{ requestId: item.requestId, status: phase === 'historical' ? 'queued' : phase,
+        confirmed: true, currentSnapshotConfirmed: phase !== 'historical' }]) };
+  }, noChatTimers);
+  const { s, entry } = selectChat(c); c.buildChatComposer(s);
+  await c.loadChatState(s, true); c.openChatQueue(entry);
+  phase = 'historical'; await c.loadChatState(s, true);
+  assert.equal(c.chatQueueCount(entry), 0);
+  assert.match(textOf(c.get('chat-queue-list')), /접수 후 상태 미확인.*내용이 남아야/);
+  assert.doesNotMatch(textOf(c.get('chat-queue-list')), /완료|실행 시작/);
+  phase = 'accepted'; await c.loadChatState(s, true); assert.match(textOf(c.get('chat-queue-list')), /실행 시작/);
+  phase = 'completed'; await c.loadChatState(s, true); assert.match(textOf(c.get('chat-queue-list')), /완료.*내용이 남아야/);
+});
+
+test('partial queue totals never double-count a local queued message outside the returned window and unavailable snapshots stay uncertain', async () => {
+  let receipt; let available = true;
+  const c = client(async (url, options) => {
+    const body = JSON.parse(options.body);
+    if (url === '/api/chat/send') {
+      receipt = { requestId: body.requestId, status: 'queued', confirmed: true, currentSnapshotConfirmed: true };
+      return { ok: true, status: 200, json: async () => ({ status: 'queued', receipt }) };
+    }
+    return { ok: true, status: 200, json: async () => queueStateReply(body.source, [],
+      [{ ...receipt, currentSnapshotConfirmed: available }], { available, complete: false, truncated: true, total: available ? 60 : null }) };
+  }, noChatTimers);
+  const { s, entry } = selectChat(c); c.buildChatComposer(s); entry.text = 'window 밖 새 예약';
+  await c.sendChat(entry); await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(c.chatQueueCount(entry), 60);
+  c.openChatQueue(entry); assert.match(c.get('chat-queue-note').textContent, /일부 내역/);
+  available = false; await c.loadChatState(s, true);
+  assert.equal(c.chatQueueCount(entry), 0);
+  assert.match(textOf(c.get('chat-queue-list')), /접수 후 상태 미확인/);
+  assert.match(c.get('chat-queue-note').textContent, /대기열을 확인하지 못했습니다/);
+});
+
+test('submission memory and batched receipt requests are bounded, native IDs remain valid and completed records stop requesting readback', async () => {
+  const bodies = []; let complete = false;
+  const items = Array.from({ length: 25 }, (_, index) => queueItem('native.request:' + String(index).padStart(3, '0'), '한'.repeat(32768)));
+  const c = client(async (url, options) => {
+    const body = JSON.parse(options.body); bodies.push(body);
+    return { ok: true, status: 200, json: async () => queueStateReply(body.source, complete ? [] : items,
+      complete ? (body.requestIds || []).map((requestId) => ({ requestId, status: 'completed', confirmed: true, currentSnapshotConfirmed: true })) : [],
+      { total: complete ? 0 : 25 }) };
+  }, noChatTimers);
+  const { s, entry } = selectChat(c); c.buildChatComposer(s);
+  await c.loadChatState(s, true);
+  assert.ok(entry.submissions.length <= 20);
+  assert.ok(entry.submissions.reduce((bytes, item) => bytes + Buffer.byteLength(item.text || ''), 0) <= 256 * 1024);
+  c.openChatQueue(entry); assert.match(c.get('chat-queue-note').textContent, /일부 내역/);
+  entry.pending = { requestId: 'last-pending-001', revision: entry.revision };
+  await c.loadChatState(s, true);
+  const selected = bodies.at(-1);
+  assert.ok(new Set([selected.requestId, ...selected.requestIds]).size <= 20);
+  assert.ok(selected.requestIds.includes('last-pending-001'));
+  assert.ok(selected.requestIds.some((id) => id.includes('.request:')));
+  entry.pending = null; entry.receipt = null;
+  complete = true; await c.loadChatState(s, true); await c.loadChatState(s, true);
+  assert.equal(bodies.at(-1).requestIds, undefined); assert.equal(bodies.at(-1).requestId, undefined);
+});
+
+test('queue details purge on auth, session and cwd boundaries; close and Escape return focus to the shortcut without editing drafts', async () => {
+  for (const boundary of ['auth', 'session', 'cwd', 'removed']) {
+    const c = client(async (url, options) => ({ ok: true, status: 200,
+      json: async () => queueStateReply(JSON.parse(options.body).source, [queueItem('private-request-001', 'private queue body')]) }), noChatTimers);
+    const { s, entry } = selectChat(c); s.cwd = '/example/original'; c.buildChatComposer(s);
+    await c.loadChatState(s, true); entry.text = '새 초안'; c.openChatQueue(entry);
+    assert.match(textOf(c.get('chat-queue-list')), /private queue body/);
+    if (boundary === 'auth') c.showLogin();
+    if (boundary === 'session') { const other = selectChat(c, { id: 'different-session' }); c.buildChatComposer(other.s); c.get('chat-input').events.input(); }
+    if (boundary === 'cwd') { s.cwd = '/example/changed'; c.get('chat-input').events.input(); }
+    if (boundary === 'removed') { c.state.snapshot.hosts[0].data.codex = []; vm.runInContext('render()', c.context); }
+    assert.equal(c.get('chat-queue-dialog').open, false, boundary);
+    assert.equal(c.get('chat-queue-list').children.length, 0, boundary);
+  }
+  const c = client(undefined, noChatTimers); c.context.navigator = { onLine: false }; c.windowEvents.DOMContentLoaded();
+  const { s, entry } = selectChat(c); c.buildChatComposer(s); entry.text = '닫기 후 남을 초안';
+  c.openChatQueue(entry); c.get('chat-queue-dismiss').events.click();
+  assert.equal(c.get('chat-queue-dialog').open, false); assert.equal(entry.text, '닫기 후 남을 초안');
+  assert.ok(c.get('chat-queue-open').focusCount > 0);
+  c.openChatQueue(entry); let prevented = false;
+  c.get('chat-queue-dialog').events.cancel({ preventDefault() { prevented = true; } });
+  assert.equal(prevented, true); assert.equal(c.get('chat-queue-dialog').open, false);
+  assert.equal(c.get('chat-input').focusCount, undefined);
+});
+
+test('confirmed queued work keeps the existing bounded poll alive while idle, but unknown-only work and offline or hidden views do not', async () => {
+  const timers = []; let mode = 'queued';
+  const c = client(async (url, options) => ({ ok: true, status: 200, json: async () => ({
+    ...queueStateReply(JSON.parse(options.body).source, mode === 'queued' ? [queueItem('poll-request-001', '대기 중 본문')] : [],
+      mode === 'queued' ? [] : [{ requestId: 'poll-request-001', status: 'unknown', confirmed: true, currentSnapshotConfirmed: false }]), phase: 'idle',
+  }) }), { setTimeout: (callback, delay) => { timers.push({ callback, delay }); return timers.length; }, clearTimeout() {} });
+  const { s, entry } = selectChat(c); c.buildChatComposer(s);
+  await c.loadChatState(s, true);
+  assert.equal(timers.at(-1).delay, 3000);
+  let count = timers.length;
+  c.state.chatPollCount = 40; c.scheduleChatPoll(s, entry); assert.equal(timers.length, count);
+  c.state.chatPollCount = 0; c.context.document.hidden = true; c.scheduleChatPoll(s, entry); assert.equal(timers.length, count);
+  c.context.document.hidden = false; c.state.offline = true; c.scheduleChatPoll(s, entry); assert.equal(timers.length, count);
+  c.state.offline = false; mode = 'unknown'; await c.loadChatState(s, false);
+  assert.equal(c.chatQueueCount(entry), 0); assert.equal(timers.length, count);
 });

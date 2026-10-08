@@ -155,6 +155,7 @@ function assertAuthEpoch(epoch) {
   throw err;
 }
 function beginAuthEpoch() {
+  closeChatQueue(false);
   state.authEpoch++;
   state.pollBusy = false;
   state.terminalsRefreshing = false;
@@ -299,6 +300,7 @@ function render() {
   }
   if (selected) refreshDetail(selected);
   else if (state.selected) {
+    closeChatQueue(false);
     state.selected = null;
     state.detailFor = null;
     $("detail").replaceChildren(
@@ -472,6 +474,7 @@ function select(key) {
     if (mobile) focusDetailBack();
     return;
   }
+  closeChatQueue(false);
   state.selected = key;
   stopChatPolling();
   state.detailFor = null;
@@ -697,6 +700,219 @@ function updateChatDeliveryEvidence(entry) {
   box.replaceChildren(attachmentGroup(files, caption));
   return true;
 }
+const CHAT_SUBMISSIONS_MAX = 20;
+const CHAT_SUBMISSIONS_BYTES = 256 * 1024;
+function queueContext(entry, s = selectedSession()) {
+  if (!s || chatKey(sourceOf(s)) !== chatKey(entry.source)) return false;
+  const identity = conversationIdentity(s);
+  if (entry.submissionIdentity !== identity || entry.submissionAuthEpoch !== state.authEpoch) {
+    entry.submissions = [];
+    entry.submissionIdentity = identity;
+    entry.submissionAuthEpoch = state.authEpoch;
+    entry.queueState = null;
+    entry.queueKeys = new Set();
+    entry.submissionsLimited = false;
+  }
+  return true;
+}
+function queueRecordKey(item) {
+  return typeof item.requestId === "string" && item.requestId ? `request:${item.requestId}`
+    : typeof item.queueId === "string" && item.queueId ? `queue:${item.queueId}` : null;
+}
+function limitSubmissions(entry) {
+  let bytes = entry.submissions.reduce((total, item) => total + item.textBytes, 0);
+  while (entry.submissions.length > CHAT_SUBMISSIONS_MAX || bytes > CHAT_SUBMISSIONS_BYTES) {
+    let index = entry.submissions.findIndex((item) => !["queued", "sending", "unknown"].includes(item.status));
+    if (index < 0) index = 0;
+    bytes -= entry.submissions[index].textBytes;
+    entry.submissions.splice(index, 1);
+    entry.submissionsLimited = true;
+  }
+}
+function queueRecords(entry) {
+  return (entry.submissions || []).filter((item) => item.wasQueued || ["unknown", "sending"].includes(item.status));
+}
+function rememberSubmission(entry, pending) {
+  if (!queueContext(entry)) return;
+  entry.submissions.push({ key: `request:${pending.requestId}`, requestId: pending.requestId, queueId: null,
+    text: pending.text, textTruncated: false, attachments: pending.attachmentDetails,
+    contentAvailable: true,
+    textBytes: new TextEncoder().encode(pending.text).length,
+    submittedAt: Date.now() / 1000, status: "sending", confirmed: false, wasQueued: false, local: true,
+    localQueuedAfterRead: false });
+  limitSubmissions(entry);
+}
+function updateSubmissionReceipt(entry, receipt, fromSnapshot = false) {
+  const item = (entry.submissions || []).find((record) => record.requestId === receipt?.requestId);
+  if (!item) return;
+  const confirmed = receipt.confirmed === true;
+  const inCurrentQueue = entry.queueState?.available === true && entry.queueKeys?.has(item.key);
+  const historicalActive = receipt.currentSnapshotConfirmed === false && ["queued", "accepted"].includes(receipt.status);
+  item.confirmed = confirmed;
+  item.status = historicalActive || receipt.status === "unknown" || !confirmed && receipt.status !== "failed" ? "unknown" : receipt.status;
+  if (inCurrentQueue && ["queued", "unknown"].includes(receipt.status)) { item.status = "queued"; item.confirmed = true; }
+  if (fromSnapshot && item.status === "queued" && !inCurrentQueue && receipt.currentSnapshotConfirmed !== true) item.status = "unknown";
+  if (confirmed && receipt.status === "queued") item.wasQueued = true;
+  if (receipt.dispatchState === "not_started") item.status = "failed";
+  if (Array.isArray(receipt.attachments)) item.attachments = attachmentMetadata(receipt.attachments);
+  if (receipt.queueId) item.queueId = receipt.queueId;
+  if (item.status === "queued") {
+    item.wasQueued = true;
+    item.localQueuedAfterRead = !fromSnapshot;
+  }
+}
+function syncQueuedMessages(entry, s, data) {
+  if (!queueContext(entry, s) || chatKey(data.route || {}) !== chatKey(entry.source)) return;
+  const supplied = Array.isArray(data.queuedMessages);
+  const queue = supplied ? data.queuedMessages : [];
+  const seen = new Set();
+  if (supplied) {
+    for (const item of entry.submissions) item.localQueuedAfterRead = false;
+    entry.queueState = data.queueState && typeof data.queueState === "object" ? { ...data.queueState } : null;
+    for (const raw of queue) {
+      if (!raw || typeof raw !== "object") continue;
+      const key = queueRecordKey(raw);
+      if (!key) continue;
+      let item = entry.submissions.find((record) => record.key === key || raw.requestId && record.requestId === raw.requestId ||
+        raw.queueId && record.queueId === raw.queueId);
+      if (!item) {
+        item = { key, requestId: typeof raw.requestId === "string" ? raw.requestId : null,
+          submittedAt: null, local: false };
+        entry.submissions.push(item);
+      }
+      seen.add(item.key);
+      Object.assign(item, { queueId: raw.queueId || null,
+        text: item.local ? item.text : typeof raw.text === "string" ? raw.text : null,
+        textTruncated: !item.local && raw.textTruncated === true,
+        contentAvailable: item.local || raw.contentAvailable !== false && typeof raw.text === "string",
+        attachments: attachmentMetadata(raw.attachments), status: "queued", confirmed: true,
+        wasQueued: true, localQueuedAfterRead: false });
+      item.textBytes = new TextEncoder().encode(item.text || "").length;
+    }
+    entry.queueKeys = seen;
+    if (entry.queueState?.available === false || entry.queueState?.complete === true && !entry.queueState.truncated) {
+      for (const item of entry.submissions) {
+        if (item.status === "queued" && !seen.has(item.key)) item.status = "unknown";
+        item.localQueuedAfterRead = false;
+      }
+    }
+  }
+  // Receipts carry exact request evidence; queue absence alone proves no turn state.
+  for (const receipt of data.receipts || []) updateSubmissionReceipt(entry, receipt, true);
+  limitSubmissions(entry);
+}
+function chatQueueCount(entry) {
+  const queue = entry.queueState;
+  const known = (entry.submissions || []).filter((item) => item.status === "queued" && item.confirmed);
+  if (queue?.available === true && Number.isInteger(queue.total) && queue.total >= 0) {
+    const added = known.filter((item) => item.localQueuedAfterRead && !entry.queueKeys?.has(item.key));
+    return queue.total + added.length;
+  }
+  return known.length;
+}
+function submissionRequestIds(entry, lastRequestId) {
+  const active = (entry.submissions || []).filter((item) => ["queued", "accepted", "unknown", "sending"].includes(item.status));
+  return [...new Set([lastRequestId, ...active.map((item) => item.requestId).reverse()])]
+    .filter((id) => typeof id === "string" && /^[A-Za-z0-9][A-Za-z0-9_.:-]{7,127}$/.test(id)).slice(0, 20);
+}
+function submissionStatus(item) {
+  const labels = { queued: "대기 중", accepted: "실행 시작", completed: "완료",
+    interrupted: "실행 중단", failed: item.confirmed ? "처리 오류" : "미접수",
+    sending: "전송 중", unknown: item.wasQueued ? "접수 후 상태 미확인" : "전송 결과 미확인" };
+  return labels[item.status] || "상태 미확인";
+}
+function closeChatQueue(restoreFocus = true) {
+  const view = state.chatQueueView;
+  state.chatQueueView = null;
+  const dialog = $("chat-queue-dialog");
+  if (dialog.open) dialog.close();
+  $("chat-queue-list").replaceChildren();
+  $("chat-queue-note").textContent = "";
+  if (restoreFocus && view?.authEpoch === state.authEpoch && currentChat(view.entry) &&
+      view.identity === conversationIdentity(selectedSession())) $("chat-queue-open").focus({ preventScroll: true });
+}
+function renderChatQueue(entry) {
+  const view = state.chatQueueView;
+  if (!view) return;
+  if (view.entry !== entry) {
+    if (!currentChat(view.entry) || view.identity !== conversationIdentity(selectedSession())) closeChatQueue(false);
+    return;
+  }
+  if (view.authEpoch !== state.authEpoch || !currentChat(entry) || view.identity !== conversationIdentity(selectedSession())) {
+    closeChatQueue(false); return;
+  }
+  const records = queueRecords(entry);
+  const list = $("chat-queue-list");
+  const desired = [];
+  for (const item of records) {
+    let shown = view.rows.get(item.key);
+    if (!shown) {
+      const row = el("article", "queued-message");
+      const meta = el("div", "queued-message-meta");
+      const status = el("strong", "queued-message-status");
+      const timestamp = el("span", "queued-message-time");
+      meta.append(status, timestamp);
+      const body = el("div", "queued-message-body");
+      const origin = el("p", "queued-message-origin");
+      const attachments = el("div", "queued-message-files");
+      const note = el("p", "queued-message-note");
+      const copy = button("본문 복사", "secondary queued-message-copy", async () => {
+        if (state.chatQueueView !== view || !currentChat(entry) || view.identity !== conversationIdentity(selectedSession())) return;
+        const latest = entry.submissions.find((record) => record.key === item.key);
+        if (latest?.contentAvailable === false || typeof latest?.text !== "string" || !latest.text) return;
+        try { await navigator.clipboard.writeText(latest.text); toast("보낸 메시지 본문을 복사했습니다."); }
+        catch { toast("클립보드에 접근할 수 없습니다. 본문을 길게 눌러 선택해 주세요."); }
+      });
+      row.append(meta, origin, body, attachments, note, copy);
+      shown = { row, status, timestamp, origin, body, attachments, note, copy, attachmentRevision: null };
+      view.rows.set(item.key, shown);
+    }
+    shown.status.textContent = submissionStatus(item);
+    shown.timestamp.textContent = item.submittedAt ? `이 탭에서 보낸 시각 · ${clock(item.submittedAt)}` : "";
+    shown.origin.textContent = item.local ? "이 탭에서 보낸 원문" : "원본 세션 대기열에서 확인한 내용";
+    const hasText = item.contentAvailable !== false && typeof item.text === "string";
+    const bodyText = hasText ? item.text || (item.attachments.length ? "첨부만 보낸 메시지" : "텍스트 본문이 없습니다.") : "메시지 내용을 확인하지 못했습니다.";
+    if (shown.body.textContent !== bodyText) shown.body.textContent = bodyText;
+    const attachmentRevision = JSON.stringify(item.attachments);
+    if (shown.attachmentRevision !== attachmentRevision) {
+      shown.attachments.replaceChildren(...(item.attachments.length ? [attachmentGroup(item.attachments, `전송에 포함한 첨부 ${item.attachments.length}개`)] : []));
+      shown.attachmentRevision = attachmentRevision;
+    }
+    shown.note.textContent = item.textTruncated ? "본문이 길어 일부만 표시합니다. 전체 내용은 원본 세션에서 확인해 주세요." : "";
+    shown.note.hidden = !item.textTruncated;
+    shown.copy.disabled = !hasText || !item.text;
+    shown.copy.hidden = shown.copy.disabled;
+    shown.copy.setAttribute("aria-label", "표시된 메시지 본문 복사");
+    desired.push(shown.row);
+  }
+  if (!desired.length) desired.push(el("p", "group-empty", "현재 표시할 메시지 내용을 확인하지 못했습니다."));
+  for (const child of [...list.children]) if (!desired.includes(child)) list.removeChild(child);
+  for (let index = 0; index < desired.length; index++)
+    if (list.children[index] !== desired[index]) list.insertBefore(desired[index], list.children[index] || null);
+  for (const [key, shown] of view.rows) if (!desired.includes(shown.row)) view.rows.delete(key);
+  const partial = entry.submissionsLimited || entry.queueState?.truncated || entry.queueState?.complete === false;
+  $("chat-queue-note").textContent = `${partial ? "표시 범위를 넘어 일부 내역은 보이지 않을 수 있습니다. " : ""}상태는 마지막 확인 기준입니다. 대기열 정보만으로 완료 여부를 알 수 없습니다.${entry.queueState?.available === false ? " 현재 대기열을 확인하지 못했습니다." : ""}${networkOffline() ? " 오프라인입니다." : ""}`;
+}
+function openChatQueue(entry) {
+  if (!currentChat(entry) || !queueContext(entry)) return;
+  if (entry.composing) { toast("한글 입력을 마친 뒤 예약 내용을 확인해 주세요."); return; }
+  state.chatQueueView = { entry, identity: conversationIdentity(selectedSession()), authEpoch: state.authEpoch, rows: new Map() };
+  renderChatQueue(entry);
+  $("chat-queue-open").focus({ preventScroll: true });
+  if (!$("chat-queue-dialog").open) $("chat-queue-dialog").showModal();
+}
+function updateChatQueue(entry) {
+  if (!queueContext(entry)) return;
+  const records = queueRecords(entry);
+  const count = chatQueueCount(entry);
+  const control = $("chat-queue-open");
+  control.hidden = !records.length && !count;
+  control.textContent = count ? `예약 ${count}개` : records.some((item) => item.status === "unknown") ? "미확인 내역"
+    : records.some((item) => item.status === "sending") ? "전송 중" : "예약 내역";
+  control.setAttribute("aria-label", `${count ? `예약 ${count}개` : "보낸 메시지 내역"} 내용 보기`);
+  control.title = "보낸 메시지와 예약 내용 보기";
+  renderChatQueue(entry);
+}
 function chatEntry(s) {
   const source = sourceOf(s);
   const key = chatKey(source);
@@ -863,7 +1079,13 @@ function buildChatComposer(s) {
   for (const action of [clipboard, check, native])
     action.addEventListener("pointerdown", (event) => event.preventDefault());
   tools.append(toolsActions);
-  actions.append(attach, expand, terminal, tools);
+  const queue = button("예약 내용", "chat-queue-open", () => { if (editorCurrent()) openChatQueue(entry); });
+  queue.id = "chat-queue-open";
+  queue.hidden = true;
+  queue.setAttribute("aria-haspopup", "dialog");
+  queue.setAttribute("aria-controls", "chat-queue-dialog");
+  queue.addEventListener("pointerdown", (event) => event.preventDefault());
+  actions.append(attach, expand, terminal, queue, tools);
   const main = el("div", "chat-main");
   main.append(input, send);
   box.append(heading, status, evidence, attachmentsLabel, attachments, main, files, actions, hint);
@@ -961,6 +1183,7 @@ function updateChatComposer(entry) {
     ? "첨부는 이 작업 폴더에 저장됐습니다. 첨부의 ‘경로’를 복사해 터미널에 붙여넣으세요."
     : entry.data?.capability?.reason || "직접 입력을 지원하지 않습니다. 터미널을 사용해 주세요.";
   $("chat-status").textContent = (offline ? "오프라인입니다. 초안은 유지됩니다. 연결 후 상태를 확인하고 보내 주세요." : entry.error || entry.notice || (entry.uploads ? `첨부 ${entry.uploads}개를 올리고 있습니다…` : !entry.data ? "메시지 전송 환경을 확인하고 있습니다…" : !supported ? unsupportedCopy : chatReceiptCopy(entry.receipt) || phaseCopy)) + budgetNote;
+  updateChatQueue(entry);
   const deliveryVisible = updateChatDeliveryEvidence(entry);
   const chips = $("chat-attachments");
   chips.hidden = !!entry.pending && deliveryVisible;
@@ -1006,8 +1229,9 @@ function stopChatPolling() {
 function scheduleChatPoll(s, entry) {
   if (!currentChat(entry)) return;
   clearTimeout(state.chatPollTimer);
+  const queuedWork = chatQueueCount(entry) > 0 || (entry.submissions || []).some((item) => item.wasQueued && item.status === "accepted" && item.confirmed);
   if (networkOffline() || !currentChat(entry) || !chatVisible() || state.chatPollCount >= 40 ||
-      (!entry.pending && !["working", "needs_input"].includes(entry.data?.phase))) return;
+      (!entry.pending && !queuedWork && !["working", "needs_input"].includes(entry.data?.phase))) return;
   const run = state.chatPollRun;
   state.chatPollTimer = setTimeout(() => {
     if (run !== state.chatPollRun || !currentChat(entry) || !chatVisible()) return;
@@ -1015,7 +1239,8 @@ function scheduleChatPoll(s, entry) {
     loadChatState(s, false);
   }, 3000);
 }
-function applyChatReceipt(entry, receipt) {
+function applyChatReceipt(entry, receipt, fromSnapshot = false) {
+  updateSubmissionReceipt(entry, receipt, fromSnapshot);
   if (!receipt || (entry.pending && receipt.requestId !== entry.pending.requestId)) return;
   const fallback = entry.pending?.attachmentDetails ||
     (entry.receipt?.requestId === receipt.requestId ? entry.receipt.attachments : []);
@@ -1059,19 +1284,22 @@ async function loadChatState(s, manual = false, { join = false } = {}) {
   updateChatComposer(entry);
   try {
     const lastRequestId = entry.pending?.requestId ||
-      (entry.receipt?.dispatchState === "not_started" ? null : entry.receipt?.requestId);
+      (entry.receipt?.dispatchState === "not_started" || ["completed", "interrupted", "failed"].includes(entry.receipt?.status) ? null : entry.receipt?.requestId);
+    const requestIds = submissionRequestIds(entry, lastRequestId);
     const data = await api("/api/chat/state", { method: "POST", body: {
       source: entry.source, ...(lastRequestId ? { requestId: lastRequestId } : {}),
+      ...(requestIds.length ? { requestIds } : {}),
     } });
     if (!state.authenticated || state.chats.get(chatKey(entry.source)) !== entry) return;
     if (epoch !== entry.stateEpoch || currentChat(entry) && conversationIdentity(selectedSession()) !== identity) return;
     entry.data = data;
     outcome = { status: "success", data };
     entry.error = "";
+    syncQueuedMessages(entry, s, data);
     for (const receipt of data.receipts || []) {
       if (receipt.requestId === entry.pending?.requestId ||
           (entry.receipt?.dispatchState !== "not_started" && receipt.requestId === entry.receipt?.requestId))
-        applyChatReceipt(entry, receipt);
+        applyChatReceipt(entry, receipt, true);
     }
     if (chatReadSupported(entry, data)) {
       rememberConversation(s, data.messages, data);
@@ -1115,6 +1343,7 @@ async function sendChat(entry) {
   const pending = { requestId: requestId(), revision: entry.revision, source: entry.source,
     text: entry.text, attachments: entry.attachments.map((item) => item.id),
     attachmentDetails: attachmentMetadata(entry.attachments) };
+  rememberSubmission(entry, pending);
   entry.pending = pending;
   entry.stateEpoch++;
   entry.sending = true;
@@ -1153,6 +1382,7 @@ async function sendChat(entry) {
       } else {
         // HTTP status alone cannot establish whether the native runtime started.
         entry.receipt = { requestId: pending.requestId, status: "unknown", attachments: pending.attachmentDetails };
+        updateSubmissionReceipt(entry, entry.receipt);
         entry.error = "전송 결과를 확인하지 못했습니다. 상태 다시 확인을 눌러 주세요. 중복 전송은 잠겼습니다.";
       }
     }
@@ -1495,6 +1725,7 @@ function navigateView(view, replace = false) {
   );
 }
 function backToList() {
+  closeChatQueue(false);
   stopChatPolling();
   if (
     window.history.state?.sessionholic &&
@@ -2180,6 +2411,7 @@ function fitTerminal() {
   }, 180);
 }
 async function openTerminal(terminal, { recordHistory = true } = {}) {
+  closeChatQueue(false);
   stopChatPolling();
   if (recordHistory) navigateView("terminal");
   const changing = state.terminal?.id !== terminal.id;
@@ -2753,6 +2985,7 @@ async function manualRefresh() {
   }
 }
 function showLogin() {
+  closeChatQueue(false);
   beginAuthEpoch();
   state.loginBusy = false;
   state.launchBusy = false;
@@ -2942,6 +3175,14 @@ window.addEventListener("DOMContentLoaded", () => {
   $("refresh").addEventListener("click", manualRefresh);
   $("running-refresh").addEventListener("click", () => refreshTerminals());
   $("logout").addEventListener("click", lock);
+  $("chat-queue-close").addEventListener("click", () => closeChatQueue());
+  $("chat-queue-dismiss").addEventListener("click", () => closeChatQueue());
+  $("chat-queue-dialog").addEventListener("cancel", (event) => { event.preventDefault(); closeChatQueue(); });
+  $("chat-queue-dialog").addEventListener("click", (event) => {
+    if (event.target !== $("chat-queue-dialog")) return;
+    const rect = event.target.getBoundingClientRect?.();
+    if (rect && (event.clientX < rect.left || event.clientX > rect.right || event.clientY < rect.top || event.clientY > rect.bottom)) closeChatQueue();
+  });
   $("plan-close").addEventListener("click", closePlan);
   $("plan-cancel").addEventListener("click", closePlan);
   $("plan-launch").addEventListener("click", launchPlan);

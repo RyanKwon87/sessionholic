@@ -81,6 +81,61 @@ class ChatTest(unittest.TestCase):
         receipt=self.chat.receipt({'delivery':'queued','confirmed':True,'acknowledged':True,'readbackConfirmed':False},'request-0001')
         self.assertTrue(receipt['acknowledged'])
         self.assertFalse(receipt['readbackConfirmed'])
+    def test_batch_receipts_use_one_read_and_never_enter_plain_state_cache(self):
+        def rpc(host,op,args,timeout):
+            self.calls.append((host['name'],op,args))
+            return {'messages':[], 'receipts':[{'requestId':identifier,'delivery':'queued','confirmed':True,
+                    'readbackConfirmed':False,'currentSnapshotConfirmed':False} for identifier in args.get('requestIds',[])]}
+        self.flow.transfers.rpc=rpc
+        ids=['request-0001','request-0002']
+        result=self.chat.state({'source':REF,'requestIds':ids})
+        self.assertEqual([r['requestId'] for r in result['receipts']],ids)
+        self.assertTrue(all(not r['currentSnapshotConfirmed'] for r in result['receipts']))
+        self.assertEqual(len(self.calls),1)
+        self.assertEqual(self.calls[0][2]['action'],'read')
+        self.assertEqual(self.chat.state({'source':REF})['receipts'],[])
+        self.assertEqual(len(self.calls),2)
+        for ids in (['invalid'], ['request-'+str(i) for i in range(21)], None):
+            with self.assertRaises(ValueError):self.chat.state({'source':REF,'requestIds':ids})
+        self.assertEqual(len(self.calls),2)
+    def test_state_accepts_native_ids_without_broadening_web_send_ids(self):
+        ids=['native.request:000','n'*128]
+        response=self.chat.state({'source':REF,'requestId':ids[0],'requestIds':ids})
+        self.assertEqual([r['requestId'] for r in response['receipts']],ids)
+        self.assertEqual(self.calls[-1][2]['requestIds'],ids)
+        for identifier in ids:
+            with self.assertRaises(chat.SendRejected):
+                self.chat.send({'source':REF,'requestId':identifier,'text':'fixture'})
+        for invalid in ('n'*129,'../outside','/absolute-path'):
+            with self.assertRaises(ValueError):
+                self.chat.state({'source':REF,'requestIds':[invalid]})
+        self.assertEqual(len(self.calls),1)
+    def test_queue_typed_fallback_and_inconsistent_completeness_are_unknown(self):
+        row={'queueId':'queue-1','requestId':None,'text':'예약','contentAvailable':True,
+             'textTruncated':False,'attachments':[],'status':'queued','confirmed':True,'readbackConfirmed':True}
+        valid={'available':True,'complete':True,'total':1,'truncated':False}
+        for state,rows in ((None,[]),([],[]),({'available':False,'complete':False,'truncated':False},[]),
+                           ({**valid,'available':False},[row]),({**valid,'total':2},[row]),
+                           ({**valid,'truncated':True},[row]),(valid,'invalid'),(valid,[None])):
+            with self.subTest(state=state):
+                queued,info=self.chat.queue_history({'queueState':state,'queuedMessages':rows})
+                self.assertEqual(queued,[])
+                self.assertFalse(info['available'])
+                self.assertFalse(info['complete'])
+                self.assertIsNone(info['total'])
+    def test_queue_metadata_is_scrubbed_and_never_forwards_raw_native_inputs(self):
+        row={'queueId':'queue-1','requestId':'request-0001','text':'예약 본문','contentAvailable':True,
+             'textTruncated':False,'status':'queued','confirmed':True,'readbackConfirmed':True,
+             'input':[{'url':'data:image/png;base64,PRIVATE'}],
+             'attachments':[{'source':'native','kind':'image','name':'/example/private/picture.png','url':'PRIVATE','path':'PRIVATE'}]}
+        result={'queuedMessages':[row],'queueState':{'available':True,'complete':True,'total':1,'truncated':False}}
+        self.flow.transfers.rpc=lambda *a,**k:result
+        state=self.chat.state({'source':REF})
+        self.assertEqual(state['queuedMessages'][0]['text'],'예약 본문')
+        self.assertEqual(state['queuedMessages'][0]['attachments'][0]['name'],'이미지')
+        self.assertNotIn('PRIVATE',json.dumps(state))
+        self.assertNotIn('/example/private',json.dumps(state))
+        self.assertNotIn('input',state['queuedMessages'][0])
     def test_state_is_exact_cached_and_offline_stops(self):
         first=self.chat.state({'source':REF})
         second=self.chat.state({'source':REF})

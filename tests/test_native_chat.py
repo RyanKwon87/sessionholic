@@ -133,6 +133,99 @@ class NativeChatTests(unittest.TestCase):
                 chat.handle({'action': 'read', 'source': self.source, 'requestId': 'x'}, home=self.home)
         connect.assert_not_called()
 
+    def test_queue_read_uses_native_input_and_contains_no_image_urls_or_paths(self):
+        queue = [{'id': 'queue-a', 'clientUserMessageId': self.request, 'input': [
+                    {'type': 'text', 'text': '  예약 본문\n둘째 줄  '},
+                    {'type': 'image', 'url': 'data:image/png;base64,PRIVATE'}]},
+                 {'id': 'queue-b', 'clientUserMessageId': None, 'input': [
+                    {'type': 'text', 'text': '다른 예약'}, {'type': 'localImage', 'path': '/example/private/image.png'}]},
+                 {'id': 'queue-c', 'clientUserMessageId': {'invalid': 'object'}, 'input': []}]
+        client = FakeClient(self.thread('active'), queue)
+        result = self.handle(client, {'action': 'read', 'source': self.source})
+        rows = result['queuedMessages']
+        self.assertEqual([row['queueId'] for row in rows], ['queue-a', 'queue-b', 'queue-c'])
+        self.assertEqual(rows[0]['text'], '  예약 본문\n둘째 줄  ')
+        self.assertIsNone(rows[1]['requestId'])
+        self.assertIsNone(rows[2]['requestId'])
+        self.assertEqual(rows[0]['attachments'][0]['source'], 'native')
+        self.assertNotIn('PRIVATE', json.dumps(rows))
+        self.assertNotIn('/example/private', json.dumps(rows))
+        self.assertEqual(result['queueState']['total'], 3)
+        self.assertTrue(result['queueState']['complete'])
+        self.assertEqual([m for m, _ in client.calls], ['thread/read', 'thread/queue/list'])
+        self.assertFalse((self.home / '.sessionholic').exists())
+
+    def test_queue_reload_recovers_proven_attachment_metadata_without_loading_files(self):
+        image = attachments.store(str(self.cwd), 'picture.png', b'\x89PNG\r\n\x1a\nfixture')
+        file = attachments.store(str(self.cwd), 'document.txt', b'PRIVATE-FILE-CONTENT')
+        client = FakeClient(self.thread('active'))
+        sent = self.handle(client, {**self.args, 'attachmentIds': [image['id'], file['id']]})
+        with patch.object(attachments, 'resolve', side_effect=AssertionError('queue read must not read files')):
+            read = self.handle(FakeClient(client.thread, client.queue), {'action': 'read', 'source': self.source})
+        self.assertEqual(read['queuedMessages'][0]['attachments'], sent['attachments'])
+        self.assertNotIn('PRIVATE-FILE-CONTENT', json.dumps(read))
+        self.assertNotIn(str(self.cwd), json.dumps(read['queuedMessages'][0]['attachments']))
+
+    def test_queue_limits_use_utf8_body_budget_and_keep_web_sized_input_complete(self):
+        normal = [{'id': 'web', 'clientUserMessageId': None, 'input': [{'type': 'text', 'text': '한' * 10000}]}]
+        rows, state = chat._queued_messages({}, normal, self.home, True)
+        self.assertEqual(rows[0]['text'], '한' * 10000)
+        self.assertFalse(rows[0]['textTruncated'])
+        self.assertTrue(state['complete'])
+        large = [{'id': 'queue-' + str(i), 'input': [{'type': 'text', 'text': '🙂' * 32768}]} for i in range(60)]
+        rows, state = chat._queued_messages({}, large, self.home, True)
+        self.assertEqual(len(rows), 50)
+        self.assertLessEqual(sum(len(row['text'].encode()) for row in rows), 256 * 1024)
+        self.assertTrue(any(row['textTruncated'] for row in rows))
+        self.assertFalse(state['complete'])
+        self.assertTrue(state['truncated'])
+        self.assertEqual(state['total'], 60)
+
+    def test_batch_receipts_reuse_snapshot_and_history_priority_removes_queue_duplicates(self):
+        completed, unknown, queued = self.request + '-done', self.request + '-unknown', self.request + '-queued'
+        thread = self.thread('active')
+        thread['turns'] = [{'id': 'completed-turn', 'status': 'completed', 'items': [
+            {'type': 'userMessage', 'clientId': completed, 'content': self.args['input']},
+            *[{'type': 'agentMessage', 'text': str(i)} for i in range(100)]]}]
+        queue = [{'id': identifier, 'clientUserMessageId': identifier, 'input': self.args['input']} for identifier in (completed, queued)]
+        client = FakeClient(thread, queue)
+        read = self.handle(client, {'action': 'read', 'source': self.source, 'requestId': completed,
+                                    'requestIds': [completed, unknown, queued]})
+        self.assertEqual([r['delivery'] for r in read['receipts']], ['completed', 'unknown', 'queued'])
+        self.assertNotIn(completed, [m.get('clientId') for m in read['messages']])
+        self.assertEqual([r['requestId'] for r in read['queuedMessages']], [queued])
+        self.assertEqual(read['queueState']['total'], 1)
+        self.assertEqual([m for m, _ in client.calls], ['thread/read', 'thread/queue/list'])
+        for ids in ([self.request] * 21, ['invalid'], None):
+            with patch.object(chat, '_client') as connect:
+                with self.assertRaises(ValueError):
+                    chat.handle({'action': 'read', 'source': self.source, 'requestIds': ids}, home=self.home)
+                connect.assert_not_called()
+
+    def test_queue_disappearance_preserves_acknowledgement_without_fresh_waiting_claim(self):
+        client = FakeClient(self.thread('active'))
+        sent = self.handle(client)
+        self.assertEqual(sent['delivery'], 'queued')
+        clean = FakeClient(self.thread())
+        read = self.handle(clean, {'action': 'read', 'source': self.source, 'requestIds': [self.request]})
+        self.assertEqual(read['queuedMessages'], [])
+        self.assertTrue(read['queueState']['complete'])
+        receipt = read['receipts'][0]
+        self.assertTrue(receipt['confirmed'])
+        self.assertEqual(receipt['delivery'], 'queued')
+        self.assertFalse(receipt['currentSnapshotConfirmed'])
+        self.assertFalse(receipt['readbackConfirmed'])
+        self.assertEqual(self.writes(clean), [])
+
+    def test_queue_unavailable_does_not_claim_complete_empty_or_add_extra_rpc(self):
+        client = FakeClient(self.thread(), outcomes={'thread/queue/list': collector.RpcError('fixture queue unavailable')})
+        read = self.handle(client, {'action': 'read', 'source': self.source})
+        self.assertEqual(read['queuedMessages'], [])
+        self.assertFalse(read['queueState']['available'])
+        self.assertFalse(read['queueState']['complete'])
+        self.assertIsNone(read['queueState']['total'])
+        self.assertEqual(self.writes(client), [])
+
     def test_attachment_manifest_survives_read_and_does_not_resolve_files_again(self):
         image = attachments.store(str(self.cwd), 'picture.png', b'\x89PNG\r\n\x1a\nfixture')
         file = attachments.store(str(self.cwd), 'document.txt', b'FILE-CONTENT-PRIVATE')

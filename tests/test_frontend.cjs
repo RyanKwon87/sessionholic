@@ -112,7 +112,7 @@ function client(
   });
   vm.runInContext(source, context);
   const api = vm.runInContext(
-    "({state,api,sourceOf,accountOf,sendInput,pasteDraft,prepareDraftPaste,startDraftComposition,endDraftComposition,inputDraft,stopTerminalReader,startTerminalReader,closePlan,navigateView,backToList,backFromTerminal,closeTerminal,cancelTerminalClose,confirmTerminalClose,populateAccount,populateRoute,updateContinue,renderPlan,launchPlan,openTerminal,saveDraft,draftKey,refreshTerminals,renderTerminals,renderTerminalReturn,renderFilters,terminalCloseCopy,warnDraftUnload,preparePlan,renderGroups,renderMessages,loadDetail,chatKey,chatEntry,currentChat,chatSupported,chatAttachmentsSupported,buildChatComposer,sendChat,loadChatState,applyChatReceipt,uploadChatFiles,pasteChat,scheduleChatPoll,stopChatPolling,openNativeChat,allSessions,buildContinuePanel,chatReceiptCopy,returnToBoard,readChatClipboard,accountDisplay,sessionAccountLabel,closeChatToolsOutside,closeChatToolsEscape,drawDetail,refreshDetail,loadCapabilities,matches,recoverConnection,networkOffline,poll,select,focusDetailBack,restoreSelectedCardFocus})",
+    "({state,api,sourceOf,accountOf,sendInput,pasteDraft,prepareDraftPaste,startDraftComposition,endDraftComposition,inputDraft,stopTerminalReader,startTerminalReader,closePlan,navigateView,backToList,backFromTerminal,closeTerminal,cancelTerminalClose,confirmTerminalClose,populateAccount,populateRoute,updateContinue,renderPlan,launchPlan,openTerminal,saveDraft,draftKey,refreshTerminals,renderTerminals,renderTerminalReturn,renderFilters,terminalCloseCopy,warnDraftUnload,preparePlan,renderGroups,renderMessages,loadDetail,chatKey,chatEntry,currentChat,chatSupported,chatAttachmentsSupported,buildChatComposer,sendChat,loadChatState,applyChatReceipt,uploadChatFiles,pasteChat,scheduleChatPoll,stopChatPolling,openNativeChat,allSessions,buildContinuePanel,chatReceiptCopy,returnToBoard,readChatClipboard,accountDisplay,sessionAccountLabel,closeChatToolsOutside,closeChatToolsEscape,drawDetail,refreshDetail,loadCapabilities,matches,recoverConnection,networkOffline,poll,select,focusDetailBack,restoreSelectedCardFocus,showLogin,lock,beginAuthEpoch})",
     context,
   );
   api.state.csrf = "csrf-test";
@@ -2051,7 +2051,7 @@ test('service worker evicts only its own old shells and offline reads use the cu
     self, URL, Set, Response,
     fetch: async () => { throw new Error('offline'); },
     caches: {
-      keys: async () => ['another-app-shell', 'sessionholic-shell-v0', 'sessionholic-shell-v1', 'sessionholic-shell-v2'],
+      keys: async () => ['another-app-shell', 'sessionholic-shell-v0', 'sessionholic-shell-v1', 'sessionholic-shell-v2', 'sessionholic-shell-v3'],
       delete: async (key) => { deleted.push(key); },
       open: async (key) => { opened.push(key); return { match: async () => currentShell }; },
       match: async () => { throw new Error('Global cross-application cache lookup is forbidden'); },
@@ -2059,11 +2059,11 @@ test('service worker evicts only its own old shells and offline reads use the cu
   });
   let activated;
   listeners.activate({ waitUntil: (promise) => { activated = promise; } }); await activated;
-  assert.deepEqual(deleted, ['sessionholic-shell-v0', 'sessionholic-shell-v1']);
+  assert.deepEqual(deleted, ['sessionholic-shell-v0', 'sessionholic-shell-v1', 'sessionholic-shell-v2']);
   listeners.fetch({ request: { method: 'GET', url: 'https://app.example/' },
     respondWith: (promise) => { response = promise; }, waitUntil() {} });
   assert.equal(await response, currentShell);
-  assert.deepEqual(opened, ['sessionholic-shell-v2']);
+  assert.deepEqual(opened, ['sessionholic-shell-v3']);
 });
 
 test('an offline first launch restores authentication and already-open terminal rows without reopening their sessions', async () => {
@@ -2141,4 +2141,271 @@ test('native file paste during an upload preserves accompanying text and explain
   assert.equal(input.value, '기존 초안와 붙여넣은 텍스트');
   assert.equal(entry.text, input.value); assert.equal(entry.uploads, 1); assert.equal(entry.attachments.length, 0);
   assert.match(entry.notice, /첨부.*완료.*다시 붙여넣/);
+});
+
+test('locking invalidates delayed snapshot, capability and terminal reads without restoring private UI', async () => {
+  for (const kind of ['snapshot', 'capabilities', 'terminals']) {
+    let release;
+    const c = client(async (url) => {
+      if (url === '/logout') return { ok: true, status: 200, json: async () => ({ ok: true }) };
+      return await new Promise((resolve) => { release = resolve; });
+    }, noChatTimers);
+    selectChat(c);
+    c.get('app').hidden = false;
+    const old = kind === 'snapshot' ? c.poll(false) : kind === 'capabilities' ? c.loadCapabilities() : c.refreshTerminals();
+    // Capabilities intentionally rejects stale results; attach before settling.
+    const settled = old.catch((err) => { assert.equal(err.staleAuth, true); });
+    await c.lock();
+    assert.equal(c.state.authenticated, false); assert.equal(c.get('app').hidden, true);
+    release({ ok: true, status: 200, json: async () => ({
+      hosts: [{ name: 'workstation', ok: true, data: { codex: [{ id: 'old', agent: 'codex', title: '과거 비공개 제목' }] } }],
+      csrfToken: 'old-csrf', terminals: [{ id: 'old-terminal', title: '과거 터미널' }],
+    }) });
+    await settled;
+    assert.equal(c.state.authenticated, false); assert.equal(c.get('app').hidden, true);
+    assert.equal(c.state.snapshot, null); assert.equal(c.state.capabilities, null);
+    assert.equal(c.state.csrf, ''); assert.equal(c.state.terminals.length, 0);
+    assert.doesNotMatch(textOf(c.get('groups')), /과거 비공개 제목/);
+  }
+});
+
+test('a delayed response body is also discarded when locking advances the authentication epoch', async () => {
+  let releaseBody;
+  const c = client(async () => ({ ok: true, status: 200, json: () => new Promise((resolve) => { releaseBody = resolve; }) }), noChatTimers);
+  const pending = c.api('/api/capabilities').catch((err) => { assert.equal(err.staleAuth, true); });
+  await new Promise((resolve) => setImmediate(resolve));
+  c.showLogin();
+  releaseBody({ csrfToken: 'old-csrf' }); await pending;
+  assert.equal(c.state.authenticated, false); assert.equal(c.state.csrf, '');
+});
+
+test('late API and binary-upload 401 responses cannot lock a newly logged-in session or erase its new draft', async () => {
+  for (const kind of ['api', 'upload']) {
+    let releaseOld;
+    const c = client(async (url) => {
+      if (url === '/api/old-read' || url === '/api/chat/upload') return await new Promise((resolve) => { releaseOld = resolve; });
+      return { ok: true, status: 200, json: async () => url.startsWith('/api/snapshot') ? { hosts: [] }
+        : url === '/api/capabilities' ? { hosts: [], csrfToken: 'new-csrf' } : { terminals: [] } };
+    }, noChatTimers);
+    c.context.navigator = { onLine: false }; c.windowEvents.DOMContentLoaded();
+    c.context.navigator.onLine = true;
+    const original = selectChat(c);
+    const old = kind === 'api' ? c.api('/api/old-read').catch((err) => { assert.equal(err.staleAuth, true); })
+      : c.uploadChatFiles(original.entry, [{ name: 'old.png', size: 1 }]);
+    c.showLogin();
+    c.get('login-token').value = 'test-only-token';
+    await c.get('login-form').events.submit({ preventDefault() {} });
+    await new Promise((resolve) => setImmediate(resolve));
+    const current = selectChat(c, { id: 'new-session' }); current.entry.text = '새 로그인에서 쓴 초안';
+    const epoch = c.state.authEpoch;
+    releaseOld({ ok: false, status: 401, json: async () => ({ error: 'expired old request' }) });
+    await old;
+    assert.equal(c.state.authEpoch, epoch); assert.equal(c.state.authenticated, true);
+    assert.equal(c.get('app').hidden, false); assert.equal(c.state.csrf, 'new-csrf');
+    assert.equal(current.entry.text, '새 로그인에서 쓴 초안');
+    assert.equal(c.state.chats.get(c.chatKey(current.entry.source)), current.entry);
+  }
+});
+
+test('finishing an old poll cannot release the busy flag of a new authentication generation', async () => {
+  const releases = [];
+  const c = client(async (url) => url.startsWith('/api/snapshot')
+    ? await new Promise((resolve) => releases.push(resolve))
+    : { ok: true, status: 200, json: async () => ({ hosts: [], csrfToken: 'current-csrf' }) }, noChatTimers);
+  const old = c.poll(false); c.showLogin();
+  const current = c.poll(false); assert.equal(releases.length, 2);
+  releases[0]({ ok: true, status: 200, json: async () => ({ hosts: [] }) }); await old;
+  assert.equal(c.state.pollBusy, true); assert.equal(c.state.authenticated, false);
+  releases[1]({ ok: true, status: 200, json: async () => ({ hosts: [] }) }); await current;
+  assert.equal(c.state.pollBusy, false); assert.equal(c.state.authenticated, true);
+});
+
+test('only explicit not_started send errors unlock the draft and attachments, preserving the rejection reason across reads', async () => {
+  for (const status of [400, 403, 409]) {
+    const requests = [];
+    const c = client(async (url, options) => {
+      const body = JSON.parse(options.body); requests.push({ url, body });
+      if (url === '/api/chat/send') return { ok: false, status, json: async () => ({
+        error: '첨부를 다시 확인해 주세요.', dispatchState: 'not_started',
+      }) };
+      return { ok: true, status: 200, json: async () => ({ route: body.source, capability: { supported: true }, phase: 'idle',
+        receipts: body.requestId ? [{ requestId: body.requestId, status: 'unknown' }] : [] }) };
+    }, noChatTimers);
+    const { s, entry } = selectChat(c); entry.text = '거절된 초안'; entry.attachments = [{ id: 'file-1', name: 'image.png', size: 1 }];
+    await c.sendChat(entry); await new Promise((resolve) => setImmediate(resolve)); await c.loadChatState(s, true);
+    assert.equal(entry.pending, null); assert.equal(entry.receipt.status, 'failed'); assert.equal(entry.receipt.confirmed, false);
+    assert.equal(entry.text, '거절된 초안'); assert.equal(entry.attachments.length, 1);
+    assert.equal(c.get('chat-input').disabled, false); assert.equal(c.get('chat-send').disabled, false);
+    assert.match(c.get('chat-status').textContent, /첨부를 다시 확인.*전송되지 않았습니다.*초안과 첨부는 유지/);
+    assert.equal(requests.filter((r) => r.url === '/api/chat/send').length, 1);
+    assert.equal(requests.filter((r) => r.url === '/api/chat/state').some((r) => r.body.requestId), false);
+    c.get('chat-attachments').children[0].children[1].events.click();
+    assert.equal(entry.attachments.length, 0); assert.equal(entry.text, '거절된 초안');
+  }
+});
+
+test('HTTP status without a not_started guarantee remains unknown and never automatically resends or unlocks', async () => {
+  for (const status of [400, 403, 409, 503]) {
+    let sends = 0;
+    const c = client(async (url, options) => {
+      const body = JSON.parse(options.body);
+      if (url === '/api/chat/send') { sends++; return { ok: false, status, json: async () => ({ error: '불확실한 전송 오류' }) }; }
+      return { ok: true, status: 200, json: async () => ({ route: body.source, capability: { supported: true }, phase: 'idle',
+        receipts: [{ requestId: body.requestId, status: 'unknown' }] }) };
+    }, noChatTimers);
+    const { entry } = selectChat(c); entry.text = '전송 결과를 모르는 초안';
+    await c.sendChat(entry); await new Promise((resolve) => setImmediate(resolve)); await c.sendChat(entry);
+    assert.equal(sends, 1); assert.equal(!!entry.pending, true); assert.equal(entry.receipt.status, 'unknown');
+    assert.equal(c.get('chat-input').disabled, true); assert.equal(entry.text, '전송 결과를 모르는 초안');
+  }
+});
+
+test('closing a composing terminal then opening another detaches all late final input from the new draft', async () => {
+  const c = client(async () => ({ ok: true, status: 200, json: async () => ({ terminals: [] }) }), noChatTimers);
+  c.state.authenticated = true;
+  await c.openTerminal({ id: 'A', mode: 'attach' });
+  const old = c.get('terminal-draft'); old.cloneNode = () => node(); old.replaceWith = (next) => c.nodes.set('terminal-draft', next);
+  old.value = 'A의 조합 중 초안'; c.startDraftComposition({ target: old });
+  c.closeTerminal('A'); await c.confirmTerminalClose();
+  c.state.drafts.set('B', 'B의 보관 초안'); await c.openTerminal({ id: 'B', mode: 'attach' });
+  const current = c.get('terminal-draft'); assert.notEqual(current, old);
+  old.value = 'A의 늦은 입력'; c.inputDraft({ target: old, isComposing: false, inputType: 'insertText' });
+  c.endDraftComposition({ target: old });
+  assert.equal(current.value, 'B의 보관 초안'); assert.equal(c.state.drafts.get('B'), 'B의 보관 초안');
+  assert.equal(c.state.drafts.get('A'), 'A의 조합 중 초안');
+  current.value = 'B에서 새로 쓴 초안'; current.events.input({ target: current, isComposing: false, inputType: 'insertText' });
+  assert.equal(c.state.drafts.get('B'), 'B에서 새로 쓴 초안');
+});
+
+test('launch recovery describes definite or uncertain destination starts and registers only a reviewable terminal row', async () => {
+  for (const targetStarted of [true, null]) {
+    const requests = [];
+    const nativeSource = { host: 'homeserver', agent: 'codex', home: '.codex-secondary', id: 'destination' };
+    const c = client(async (url) => {
+      requests.push(url);
+      return { ok: false, status: 409, json: async () => ({ error: '터미널 연결 실패', recovery: {
+        targetStarted, host: 'homeserver', nativeSource, terminal: { id: 'prepared-terminal', title: '준비된 대상 작업', alive: true },
+      } }) };
+    }, noChatTimers);
+    const { s, entry } = selectChat(c); entry.text = '원본 초안';
+    c.state.route = { host: s.host, agent: s.agent, account: c.accountOf(s) };
+    c.state.plan = { id: 'plan', allowed: true, mode: 'handoff', target: { host: 'homeserver' } };
+    await c.launchPlan(); await c.launchPlan();
+    assert.deepEqual(requests, ['/api/launch']); assert.equal(c.state.plan, null);
+    assert.match(c.get('plan-error').textContent, targetStarted ? /이미 시작됐습니다/ : /이미 시작됐을 수 있습니다/);
+    assert.match(c.get('plan-error').textContent, /다시 실행하지 말고.*목록을 새로고침/);
+    assert.equal(c.get('plan-launch').disabled, true); assert.equal(c.state.terminal, null); assert.equal(c.state.terminalVisible, false);
+    assert.equal(c.state.terminals[0].id, 'prepared-terminal');
+    assert.deepEqual({ ...c.state.terminals[0].nativeSource }, nativeSource);
+    assert.match(textOf(c.get('running-list')), /준비된 대상 작업/); assert.equal(entry.text, '원본 초안');
+  }
+});
+
+test('a launch recovery from an old authentication epoch cannot register a target in the new session', async () => {
+  let release;
+  const c = client(async () => await new Promise((resolve) => { release = resolve; }), noChatTimers);
+  c.state.plan = { id: 'old-plan', allowed: true, mode: 'handoff' };
+  const old = c.launchPlan(); c.showLogin(); c.beginAuthEpoch(); c.state.authenticated = true;
+  c.state.terminals = [{ id: 'current-terminal', title: '현재 접속 작업' }];
+  release({ ok: false, status: 409, json: async () => ({ recovery: { targetStarted: null, terminal: { id: 'old-target' } } }) });
+  await old;
+  assert.deepEqual(c.state.terminals.map((row) => row.id), ['current-terminal']);
+  assert.equal(c.state.launchBusy, false); assert.equal(c.state.terminal, null);
+});
+
+test('a successful close with delayed input cleanup stays closed, reports pending cleanup and never repeats close or input', async () => {
+  const requests = []; let cleanupPending = true;
+  const c = client(async (url) => {
+    requests.push(url);
+    return { ok: true, status: 200, json: async () => url.endsWith('/close')
+      ? { ok: true, inputCleanupPending: true }
+      : { terminals: [{ id: 'term-1', closed: true, alive: false }], inputCleanupPending: cleanupPending } };
+  }, noChatTimers);
+  c.state.authenticated = true; c.state.terminal = { id: 'term-1', mode: 'attach' }; c.state.terminalVisible = true;
+  c.closeTerminal('term-1'); await c.confirmTerminalClose();
+  assert.equal(c.state.terminal, null); assert.equal(c.state.terminalVisible, false);
+  assert.equal(c.get('close-terminal-dialog').open, false);
+  assert.match(c.get('connection-notice').textContent, /터미널은 닫혔지만.*정리가 남았습니다.*목록을 새로고침/);
+  assert.equal(c.get('connection-notice').hidden, false);
+  cleanupPending = false; await c.refreshTerminals();
+  assert.equal(c.get('connection-notice').hidden, true);
+  assert.equal(requests.filter((url) => url.endsWith('/close')).length, 1);
+  assert.equal(requests.some((url) => url.endsWith('/input')), false);
+});
+
+test('a failed initial snapshot after successful token submission leaves login enabled for a deliberate retry', async () => {
+  const c = client(async (url) => ({ ok: url === '/login', status: url === '/login' ? 200 : 401, json: async () => ({}) }), noChatTimers);
+  c.context.navigator = { onLine: false }; c.windowEvents.DOMContentLoaded(); c.context.navigator.onLine = true;
+  await c.get('login-form').events.submit({ preventDefault() {} });
+  assert.equal(c.state.authenticated, false); assert.equal(c.get('login').hidden, false);
+  assert.equal(c.get('login-submit').disabled, false); assert.equal(c.state.loginBusy, false);
+});
+
+test('the terminal-list retry button refreshes the current epoch when clicked with a browser event', async () => {
+  const requests = [];
+  const c = client(async (url) => {
+    requests.push(url);
+    return { ok: true, status: 200, json: async () => ({ terminals: [{ id: 'term-1', title: '다시 확인한 터미널', alive: true }] }) };
+  }, noChatTimers);
+  c.context.navigator = { onLine: false }; c.windowEvents.DOMContentLoaded();
+  c.context.navigator.onLine = true; c.beginAuthEpoch(); c.state.authenticated = true;
+  await c.get('running-refresh').events.click({ type: 'click' });
+  assert.deepEqual(requests, ['/api/terminals']);
+  assert.match(textOf(c.get('running-list')), /다시 확인한 터미널/);
+});
+
+test('a confirmed CSRF rejection refreshes capabilities once, retains the draft and attachment, and requires a new send click', async () => {
+  const requests = [];
+  const c = client(async (url, options) => {
+    requests.push({ url, options });
+    if (url === '/api/chat/send') return { ok: false, status: 403, json: async () => ({
+      error: '접속 설정을 확인해 주세요.', code: 'csrf_expired', dispatchState: 'not_started',
+    }) };
+    if (url === '/api/capabilities') return { ok: true, status: 200, json: async () => ({ hosts: [], csrfToken: 'fresh-csrf' }) };
+    return { ok: true, status: 200, json: async () => ({ route: JSON.parse(options.body).source,
+      capability: { supported: true }, phase: 'idle' }) };
+  }, noChatTimers);
+  const { entry } = selectChat(c); entry.text = '재전송 전 확인할 초안';
+  entry.attachments = [{ id: 'selected-file', name: 'image.png', size: 1 }];
+  const editor = c.get('chat-input'); const editorEpoch = entry.editorEpoch;
+  await c.sendChat(entry); await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(requests.filter((r) => r.url === '/api/chat/send').length, 1);
+  assert.equal(requests.filter((r) => r.url === '/api/capabilities').length, 1);
+  assert.equal(requests.find((r) => r.url === '/api/capabilities').options.method, 'GET');
+  assert.equal(requests.find((r) => r.url === '/api/chat/state').options.headers['X-CSRF-Token'], 'fresh-csrf');
+  assert.equal(c.state.csrf, 'fresh-csrf'); assert.equal(c.get('chat-input'), editor); assert.equal(entry.editorEpoch, editorEpoch);
+  assert.equal(entry.pending, null); assert.equal(entry.receipt.dispatchState, 'not_started');
+  assert.equal(entry.text, '재전송 전 확인할 초안'); assert.equal(entry.attachments[0].id, 'selected-file');
+  assert.equal(c.get('chat-send').disabled, false);
+  assert.match(c.get('chat-status').textContent, /접속 설정을 갱신했습니다.*내용을 확인.*보내기를 다시/);
+});
+
+test('CSRF recovery failures preserve known non-delivery, while a current 401 follows the normal privacy lock policy', async () => {
+  for (const failure of ['network', 503, 401]) {
+    const requests = [];
+    const c = client(async (url, options) => {
+      requests.push(url);
+      if (url === '/api/chat/send') return { ok: false, status: 403, json: async () => ({
+        error: '접속 설정을 확인해 주세요.', code: 'csrf_expired', dispatchState: 'not_started',
+      }) };
+      if (url === '/api/capabilities') {
+        if (failure === 'network') throw new Error('network unavailable');
+        return { ok: false, status: failure, json: async () => ({ error: 'capabilities unavailable' }) };
+      }
+      return { ok: true, status: 200, json: async () => ({ route: JSON.parse(options.body).source,
+        capability: { supported: true }, phase: 'idle' }) };
+    }, noChatTimers);
+    const { entry } = selectChat(c); entry.text = '갱신 실패에도 보관할 초안';
+    entry.attachments = [{ id: 'selected-file', name: 'image.png', size: 1 }];
+    await c.sendChat(entry); await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(requests.filter((url) => url === '/api/chat/send').length, 1);
+    assert.equal(requests.filter((url) => url === '/api/capabilities').length, 1);
+    if (failure === 401) {
+      assert.equal(c.state.authenticated, false); assert.equal(c.state.chats.size, 0); assert.equal(c.get('app').hidden, true);
+    } else {
+      assert.equal(entry.pending, null); assert.equal(entry.receipt.dispatchState, 'not_started');
+      assert.equal(entry.text, '갱신 실패에도 보관할 초안'); assert.equal(entry.attachments[0].id, 'selected-file');
+      assert.match(c.get('chat-status').textContent, /갱신하지 못했습니다.*전송되지 않았습니다/);
+    }
+  }
 });

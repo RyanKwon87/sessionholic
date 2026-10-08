@@ -147,6 +147,31 @@ class SetupTest(unittest.TestCase):
             self.assertEqual(cli.main(["serve", "--", "--port", "9001"]), 0)
         main.assert_called_once_with(["--port", "9001"])
 
+    def test_doctor_checks_input_receipts_without_reading_or_changing_them(self):
+        folder = self.home / '.local/state/sessionholic/terminal-inputs'
+        folder.mkdir(parents=True, mode=0o700)
+        folder.parent.chmod(0o700)
+        receipt = folder / 'receipts.sqlite3'
+        receipt.write_bytes(b'fixture-private-receipt')
+        receipt.chmod(0o644)
+        with patch.object(cli.shutil, 'which', return_value='/fixture/tool'):
+            checks = cli.diagnose(self.home)
+        self.assertEqual(next(r['status'] for r in checks if r['name'] == 'terminal-input-file'), 'error')
+        self.assertEqual(receipt.stat().st_mode & 0o777, 0o644)
+        self.assertEqual(receipt.read_bytes(), b'fixture-private-receipt')
+        self.assertNotIn('fixture-private-receipt', json.dumps(checks))
+
+    def test_cleanup_transfer_targets_only_requested_job_and_reports_pending(self):
+        import server
+        from transfer import Transfers
+        with patch.object(server, 'load_hosts', return_value=[]), \
+                patch.object(Transfers, 'cleanup_pending', create=True, return_value={'archiveCleanupPending': True}) as cleanup, \
+                contextlib.redirect_stdout(io.StringIO()) as output:
+            result = cli.main(['cleanup-transfer', 'a'*32, '--state-dir', str(self.home)])
+        self.assertEqual(result, 1)
+        cleanup.assert_called_once_with('a'*32)
+        self.assertTrue(json.loads(output.getvalue())['archiveCleanupPending'])
+
 
 if __name__ == "__main__":
     unittest.main()

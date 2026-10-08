@@ -16,6 +16,7 @@ const BADGES = {
 const AGENTS = { claude: "Claude Code", codex: "Codex" };
 const POLL_MS = 60000;
 const RECENT_SECONDS = 3 * 24 * 3600;
+const INPUT_CLEANUP_NOTICE = "터미널은 닫혔지만 입력 기록 정리가 남았습니다. 목록을 새로고침해 다시 확인해 주세요.";
 const $ = (id) => document.getElementById(id);
 const prefs = {
   get(key, fallback) {
@@ -55,6 +56,8 @@ const state = {
   pollTimer: null,
   pollBusy: false,
   authenticated: false,
+  authEpoch: 0,
+  loginBusy: false,
   offline: false,
   terminals: [],
   terminalsRefreshing: false,
@@ -135,24 +138,41 @@ function toast(text) {
     $("toast").hidden = true;
   }, 3500);
 }
+function updateInputCleanupNotice(pending) {
+  if (pending) notice(INPUT_CLEANUP_NOTICE);
+  else if ($("connection-notice").textContent === INPUT_CLEANUP_NOTICE) notice();
+}
 function notice(text = "") {
   const box = $("connection-notice");
   box.textContent = text;
   box.hidden = !text;
 }
 
-async function api(path, { method = "GET", body, signal } = {}) {
+function assertAuthEpoch(epoch) {
+  if (epoch === state.authEpoch) return;
+  const err = new Error("이전 접속에서 시작한 요청입니다.");
+  err.staleAuth = true;
+  throw err;
+}
+function beginAuthEpoch() {
+  state.authEpoch++;
+  state.pollBusy = false;
+  state.terminalsRefreshing = false;
+  return state.authEpoch;
+}
+async function api(path, { method = "GET", body, signal, authEpoch = state.authEpoch } = {}) {
+  assertAuthEpoch(authEpoch);
   const headers = {};
   if (body !== undefined) headers["Content-Type"] = "application/json";
   if (method !== "GET" && state.csrf) headers["X-CSRF-Token"] = state.csrf;
-  const response = await fetch(path, {
-    method,
-    headers,
-    body: body === undefined ? undefined : JSON.stringify(body),
-    credentials: "same-origin",
-    cache: "no-store",
-    signal,
-  });
+  let response;
+  try {
+    response = await fetch(path, {
+      method, headers, body: body === undefined ? undefined : JSON.stringify(body),
+      credentials: "same-origin", cache: "no-store", signal,
+    });
+  } catch (err) { assertAuthEpoch(authEpoch); throw err; }
+  assertAuthEpoch(authEpoch);
   if (response.status === 401) {
     showLogin();
     const err = new Error("로그인이 필요합니다.");
@@ -160,6 +180,7 @@ async function api(path, { method = "GET", body, signal } = {}) {
     throw err;
   }
   const data = await response.json().catch(() => ({}));
+  assertAuthEpoch(authEpoch);
   if (!response.ok) {
     const err = new Error(
       typeof data.error === "string"
@@ -167,6 +188,9 @@ async function api(path, { method = "GET", body, signal } = {}) {
         : `요청을 완료하지 못했습니다 (${response.status}).`,
     );
     err.status = response.status;
+    err.code = data.code;
+    err.dispatchState = data.dispatchState;
+    if (data.recovery && typeof data.recovery === "object" && !Array.isArray(data.recovery)) err.recovery = data.recovery;
     throw err;
   }
   return data;
@@ -518,7 +542,7 @@ async function loadDetail(s, fresh = false) {
     updateReadNotice(data);
   } catch (err) {
     if (
-      !err.unauthorized &&
+      !err.unauthorized && !err.staleAuth &&
       run === state.detailRun &&
       state.selected === s.key
     )
@@ -754,6 +778,8 @@ function closeChatToolsEscape(event) {
   }
 }
 function chatReceiptCopy(receipt) {
+  if (receipt?.dispatchState === "not_started")
+    return `${receipt.reason || "메시지 전송 조건을 확인해 주세요."} 메시지는 전송되지 않았습니다. 초안과 첨부는 유지됩니다.`;
   if (receipt?.status === "failed" && receipt.confirmed === true)
     return "요청 처리 중 오류가 발생했습니다. 대화를 확인해 주세요.";
   const labels = {
@@ -857,7 +883,8 @@ async function loadChatState(s, manual = false) {
   if (manual) { state.chatPollCount = 0; entry.error = ""; }
   updateChatComposer(entry);
   try {
-    const lastRequestId = entry.pending?.requestId || entry.receipt?.requestId;
+    const lastRequestId = entry.pending?.requestId ||
+      (entry.receipt?.dispatchState === "not_started" ? null : entry.receipt?.requestId);
     const data = await api("/api/chat/state", { method: "POST", body: {
       source: entry.source, ...(lastRequestId ? { requestId: lastRequestId } : {}),
     } });
@@ -866,14 +893,15 @@ async function loadChatState(s, manual = false) {
     entry.data = data;
     entry.error = "";
     for (const receipt of data.receipts || []) {
-      if (receipt.requestId === entry.pending?.requestId || receipt.requestId === entry.receipt?.requestId)
+      if (receipt.requestId === entry.pending?.requestId ||
+          (entry.receipt?.dispatchState !== "not_started" && receipt.requestId === entry.receipt?.requestId))
         applyChatReceipt(entry, receipt);
     }
     if (currentChat(entry) && chatSupported(entry) && Array.isArray(data.messages)) renderMessages(s, data.messages);
     scheduleChatPoll(s, entry);
   } catch (err) {
     readFailed = true;
-    if (!err.unauthorized && epoch === entry.stateEpoch) entry.error = `${err.message} 상태 다시 확인을 눌러 주세요.`;
+    if (!err.unauthorized && !err.staleAuth && epoch === entry.stateEpoch) entry.error = `${err.message} 상태 다시 확인을 눌러 주세요.`;
     if (currentChat(entry) && pollRun === state.chatPollRun) clearTimeout(state.chatPollTimer);
   } finally {
     entry.checking = false;
@@ -894,6 +922,7 @@ async function sendChat(entry) {
     return;
   }
   // Keep the exact source and idempotency key even if selection changes during transport.
+  const authEpoch = state.authEpoch;
   const pending = { requestId: requestId(), revision: entry.revision, source: entry.source,
     text: entry.text, attachments: entry.attachments.map((item) => item.id) };
   entry.pending = pending;
@@ -905,16 +934,37 @@ async function sendChat(entry) {
   try {
     const result = await api("/api/chat/send", { method: "POST", body: {
       source: pending.source, requestId: pending.requestId, text: pending.text, attachments: pending.attachments,
-    } });
+    }, authEpoch });
     if (!state.authenticated || state.chats.get(chatKey(entry.source)) !== entry) return;
     if (result.receipt?.requestId && result.receipt.requestId !== pending.requestId)
       throw new Error("요청 확인 번호가 일치하지 않습니다.");
     applyChatReceipt(entry, { ...result.receipt, requestId: pending.requestId, status: result.status || "unknown" });
   } catch (err) {
-    if (!err.unauthorized) {
-      // A timeout cannot tell us whether the native runtime accepted the message.
-      entry.receipt = { requestId: pending.requestId, status: "unknown" };
-      entry.error = "전송 결과를 확인하지 못했습니다. 상태 다시 확인을 눌러 주세요. 중복 전송은 잠겼습니다.";
+    if (authEpoch === state.authEpoch && !err.unauthorized && !err.staleAuth) {
+      if (err.dispatchState === "not_started") {
+        applyChatReceipt(entry, { requestId: pending.requestId, status: "failed", confirmed: false,
+          dispatchState: "not_started", reason: err.message });
+        entry.error = `${err.message} 메시지는 전송되지 않았습니다. 초안과 첨부는 유지됩니다.`;
+        if (err.code === "csrf_expired") {
+          try {
+            // Refresh credentials once; keep the current editor mounted and
+            // require a new explicit send rather than replaying this request.
+            await loadCapabilities(authEpoch, { refreshView: false });
+            assertAuthEpoch(authEpoch);
+            entry.receipt.reason = "접속 설정을 갱신했습니다. 내용을 확인한 뒤 보내기를 다시 눌러 주세요.";
+            entry.error = "";
+          } catch (refreshError) {
+            if (authEpoch === state.authEpoch && !refreshError.unauthorized && !refreshError.staleAuth) {
+              entry.receipt.reason = "접속 설정을 갱신하지 못했습니다. 연결을 확인한 뒤 다시 시도해 주세요.";
+              entry.error = chatReceiptCopy(entry.receipt);
+            }
+          }
+        }
+      } else {
+        // HTTP status alone cannot establish whether the native runtime started.
+        entry.receipt = { requestId: pending.requestId, status: "unknown" };
+        entry.error = "전송 결과를 확인하지 못했습니다. 상태 다시 확인을 눌러 주세요. 중복 전송은 잠겼습니다.";
+      }
     }
   } finally {
     entry.stateEpoch++;
@@ -932,11 +982,13 @@ async function uploadChatFiles(entry, files) {
     updateChatComposer(entry);
     return;
   }
+  const authEpoch = state.authEpoch;
   entry.uploads = files.length;
   entry.error = "";
   entry.notice = "";
   updateChatComposer(entry);
   for (const file of files) {
+    if (authEpoch !== state.authEpoch) { entry.uploads = 0; return; }
     if (networkOffline()) {
       entry.notice = `아직 올리지 못한 파일 ${entry.uploads}개가 있습니다. 다시 첨부해 주세요.`;
       entry.uploads = 0; updateChatComposer(entry); break;
@@ -950,20 +1002,23 @@ async function uploadChatFiles(entry, files) {
           "X-Chat-Source": encodeURIComponent(JSON.stringify(entry.source)),
           "X-File-Name": encodeURIComponent(file.name || `clipboard-${Date.now()}.${file.type?.split("/")[1]?.replace("jpeg", "jpg") || "bin"}`) },
       });
+      assertAuthEpoch(authEpoch);
       if (response.status === 401) { showLogin(); return; }
       const data = await response.json().catch(() => ({}));
+      assertAuthEpoch(authEpoch);
       if (!response.ok || !data.attachment?.id) throw new Error(data.error || "첨부파일을 올리지 못했습니다.");
       if (!state.authenticated || state.chats.get(chatKey(entry.source)) !== entry) return;
       entry.attachments.push(data.attachment);
       entry.revision++;
     } catch (err) {
+      if (authEpoch !== state.authEpoch || err.staleAuth) { entry.uploads = 0; return; }
       entry.error = err.message;
       if (networkOffline()) {
         entry.notice = `아직 올리지 못한 파일 ${entry.uploads}개가 있습니다. 다시 첨부해 주세요.`;
         entry.error = `${err.message} ${entry.notice}`;
         break;
       }
-    } finally { entry.uploads--; updateChatComposer(entry); }
+    } finally { entry.uploads = Math.max(0, entry.uploads - 1); updateChatComposer(entry); }
   }
   entry.uploads = 0;
   updateChatComposer(entry);
@@ -1538,7 +1593,7 @@ async function preparePlan() {
     state.plan = plan;
     renderPlan(s, plan, target);
   } catch (err) {
-    if (!err.unauthorized && run === state.planRun && $("plan-dialog").open) {
+    if (!err.unauthorized && !err.staleAuth && run === state.planRun && $("plan-dialog").open) {
       $("plan-title").textContent = "준비를 완료하지 못했습니다";
       $("plan-body").replaceChildren();
       $("plan-error").textContent = err.message;
@@ -1685,6 +1740,7 @@ function closePlan() {
 async function launchPlan() {
   if (!state.plan?.allowed || state.launchBusy) return;
   const plan = state.plan;
+  const authEpoch = state.authEpoch;
   state.launchBusy = true;
   $("plan-launch").disabled = true;
   $("plan-close").disabled = true;
@@ -1704,13 +1760,15 @@ async function launchPlan() {
   try {
     const result = await api("/api/launch", {
       method: "POST",
-      body: { planId: plan.id, requestId: requestId() },
+      body: { planId: plan.id, requestId: requestId() }, authEpoch,
     });
+    assertAuthEpoch(authEpoch);
     if (!result.terminal?.id)
       throw new Error("터미널 연결 정보를 받지 못했습니다.");
     $("plan-dialog").close();
     state.plan = null;
     await openTerminal(result.terminal);
+    assertAuthEpoch(authEpoch);
     if (plan.mode === "transfer" || result.mode === "transfer")
       toast(
         `실제 실행 위치가 ${plan.transfer?.targetHostLabel || hostLabel(plan.target?.host || "")}로 바뀌었습니다. 새 작업 폴더에서 이어가세요.`,
@@ -1719,22 +1777,38 @@ async function launchPlan() {
       toast(
         "열어 둔 터미널에 다시 연결했습니다. 새 요청은 터미널에서 이어가세요.",
       );
-    refreshTerminals();
+    refreshTerminals(authEpoch);
   } catch (err) {
-    if (!err.unauthorized) {
-      $("plan-error").textContent =
-        `${err.message} 원본 작업은 목록에서 다시 확인할 수 있습니다.`;
+    if (authEpoch === state.authEpoch && !err.unauthorized && !err.staleAuth) {
+      if (err.recovery) {
+        const recovery = err.recovery;
+        const location = hostLabel(recovery.host || plan.target?.host);
+        const started = recovery.targetStarted === true ? "대상 작업이 이미 시작됐습니다." : "대상 작업이 이미 시작됐을 수 있습니다.";
+        $("plan-error").textContent = `${err.message} ${location}: ${started} 다시 실행하지 말고 보드 목록을 새로고침해 대상 작업을 확인해 주세요.`;
+        state.plan = null;
+        if (recovery.terminal?.id) {
+          const terminal = { ...recovery.terminal };
+          terminal.host ||= recovery.host;
+          if (!terminalInfo(terminal).nativeSource && recovery.nativeSource) terminal.nativeSource = { ...recovery.nativeSource };
+          const existing = state.terminals.findIndex((item) => item.id === terminal.id);
+          if (existing < 0) state.terminals.push(terminal);
+          else state.terminals[existing] = { ...state.terminals[existing], ...terminal };
+          renderTerminals();
+        }
+      } else $("plan-error").textContent = `${err.message} 원본 작업은 목록에서 다시 확인할 수 있습니다.`;
       $("plan-body").querySelector(".plan-progress")?.remove();
       $("plan-launch").disabled = true;
       $("plan-launch").textContent = "다시 검토해 주세요";
     }
   } finally {
-    state.launchBusy = false;
-    $("plan-close").disabled = false;
-    $("plan-cancel").disabled = false;
-    const s = selectedSession();
-    if (s && $("continue-open")) updateContinue(s);
-    if (s) updateChatComposer(chatEntry(s));
+    if (authEpoch === state.authEpoch) {
+      state.launchBusy = false;
+      $("plan-close").disabled = false;
+      $("plan-cancel").disabled = false;
+      const s = selectedSession();
+      if (s && $("continue-open")) updateContinue(s);
+      if (s) updateChatComposer(chatEntry(s));
+    }
   }
 }
 
@@ -1884,7 +1958,7 @@ function fitTerminal() {
       );
       state.lastSize = size;
     } catch (err) {
-      if (!err.unauthorized)
+      if (!err.unauthorized && !err.staleAuth)
         terminalError("터미널 크기를 맞추지 못했습니다. 다시 연결해 주세요.");
     }
   }, 180);
@@ -1893,15 +1967,14 @@ async function openTerminal(terminal, { recordHistory = true } = {}) {
   stopChatPolling();
   if (recordHistory) navigateView("terminal");
   const changing = state.terminal?.id !== terminal.id;
-  const wasComposing = state.composing;
   saveDraft();
   if (state.composing) {
     $("terminal-draft").blur();
     saveDraft();
   }
-  if (changing && wasComposing && $("terminal-draft").cloneNode) {
-    // A late Android IME event belongs to the old control, even after blur.
-    // Replacing only that control keeps it from editing the next terminal's draft.
+  if (changing && $("terminal-draft").cloneNode) {
+    // Closing a terminal may clear the composition flag before its final input.
+    // Every new terminal identity gets a new control, so old events stay detached.
     const previous = $("terminal-draft");
     const next = previous.cloneNode(true);
     previous.replaceWith(next);
@@ -2053,7 +2126,7 @@ async function startTerminalReader() {
       if (
         err.name === "AbortError" ||
         run !== state.terminalRun ||
-        err.unauthorized
+        err.unauthorized || err.staleAuth
       )
         return;
       state.inputEpoch++;
@@ -2084,7 +2157,7 @@ function sendInput(text) {
         body: { text, requestId: req },
       });
     } catch (err) {
-      if (!err.unauthorized && epoch === state.inputEpoch) {
+      if (!err.unauthorized && !err.staleAuth && epoch === state.inputEpoch) {
         state.inputFailed = true;
         state.inputEpoch++;
         stopTerminalReader();
@@ -2194,14 +2267,17 @@ async function pasteDraft() {
     }
   }
 }
-async function refreshTerminals() {
+async function refreshTerminals(authEpoch = state.authEpoch) {
+  if (authEpoch !== state.authEpoch) return null;
   if (state.terminalsRefreshing) return null;
   state.terminalsRefreshing = true;
   $("running-refresh").disabled = true;
   try {
-    const result = await api("/api/terminals");
+    const result = await api("/api/terminals", { authEpoch });
+    assertAuthEpoch(authEpoch);
     state.terminals = result.terminals || [];
     state.terminalsError = "";
+    updateInputCleanupNotice(result.inputCleanupPending === true);
     const current = state.terminals.find((t) => t.id === state.terminal?.id);
     if (current) {
       state.terminal = { ...state.terminal, ...current };
@@ -2221,14 +2297,16 @@ async function refreshTerminals() {
     renderTerminals();
     return state.terminals;
   } catch (err) {
-    if (!err.unauthorized) {
+    if (!err.unauthorized && !err.staleAuth) {
       state.terminalsError = "열린 터미널 목록을 확인하지 못했습니다. 마지막 목록을 표시합니다.";
       renderTerminals();
     }
     return null;
   } finally {
-    state.terminalsRefreshing = false;
-    $("running-refresh").disabled = false;
+    if (authEpoch === state.authEpoch) {
+      state.terminalsRefreshing = false;
+      $("running-refresh").disabled = false;
+    }
   }
 }
 function renderTerminals() {
@@ -2335,6 +2413,7 @@ function finishTerminalClose(closing) {
 async function confirmTerminalClose() {
   if (!state.closingTerminal || state.closingTerminal.uncertain || state.terminalCloseBusy) return;
   const closing = state.closingTerminal;
+  const authEpoch = state.authEpoch;
   if (state.terminal?.id === closing.id) {
     saveDraft();
     stopTerminalReader();
@@ -2345,20 +2424,24 @@ async function confirmTerminalClose() {
   for (const id of ["close-terminal-confirm", "close-terminal-cancel", "close-terminal-close"])
     $(id).disabled = true;
   try {
-    await api(`/api/terminal/${encodeURIComponent(closing.id)}/close`, { method: "POST", body: {} });
+    const result = await api(`/api/terminal/${encodeURIComponent(closing.id)}/close`, { method: "POST", body: {}, authEpoch });
+    assertAuthEpoch(authEpoch);
     finishTerminalClose(closing);
+    updateInputCleanupNotice(result.inputCleanupPending === true);
   } catch (err) {
-    if (!err.unauthorized) {
+    if (!err.unauthorized && !err.staleAuth) {
       closing.uncertain = true;
       $("close-terminal-error").textContent = `${closing.copy.action} 결과를 확인하지 못했습니다. 종료 여부는 목록을 새로고침해 확인하세요. 요청을 자동으로 다시 보내지 않습니다.`;
       // An uncertain close is never resent by this confirmation dialog.
       $("close-terminal-confirm").disabled = true;
     }
   } finally {
-    state.terminalCloseBusy = false;
-    $("close-terminal-cancel").disabled = false;
-    $("close-terminal-close").disabled = false;
-    await refreshTerminals();
+    if (authEpoch === state.authEpoch) {
+      state.terminalCloseBusy = false;
+      $("close-terminal-cancel").disabled = false;
+      $("close-terminal-close").disabled = false;
+      await refreshTerminals(authEpoch);
+    }
   }
 }
 
@@ -2374,11 +2457,13 @@ function schedule() {
     collecting ? 2000 : POLL_MS,
   );
 }
-async function loadCapabilities() {
+async function loadCapabilities(authEpoch = state.authEpoch, { refreshView = true } = {}) {
   const accountFilter = state.filters.account;
   const previousRoutes = state.accountFilterRoutes || (accountFilter ? new Set(
     allSessions().filter((s) => s.account === accountFilter).map(accountRouteKey)) : null);
-  state.capabilities = await api("/api/capabilities");
+  const capabilities = await api("/api/capabilities", { authEpoch });
+  assertAuthEpoch(authEpoch);
+  state.capabilities = capabilities;
   state.csrf = state.capabilities.csrfToken || "";
   $("logout").hidden = state.capabilities.authMode === "tailscale";
   if (accountFilter && state.filters.account === accountFilter && previousRoutes?.size) {
@@ -2386,17 +2471,21 @@ async function loadCapabilities() {
     if (labels.size === 1) state.filters.account = [...labels][0];
     state.accountFilterRoutes = previousRoutes;
   }
+  if (!refreshView) return;
   render();
   const s = selectedSession();
   if (s && $("route-host")) populateRoute(s);
 }
 async function poll(refresh = false) {
-  if (networkOffline() || state.pollBusy || document.hidden || state.terminalVisible) return;
+  if (networkOffline() || state.loginBusy || state.pollBusy || document.hidden || state.terminalVisible) return;
+  const authEpoch = state.authEpoch;
   state.pollBusy = true;
   if (refresh) state.refreshDeadline = Date.now() + 60000;
   clearTimeout(state.pollTimer);
   try {
-    state.snapshot = await api(`/api/snapshot${refresh ? "?refresh=1" : ""}`);
+    const snapshot = await api(`/api/snapshot${refresh ? "?refresh=1" : ""}`, { authEpoch });
+    assertAuthEpoch(authEpoch);
+    state.snapshot = snapshot;
     state.authenticated = true;
     $("login").hidden = true;
     $("app").hidden = false;
@@ -2406,12 +2495,13 @@ async function poll(refresh = false) {
       state.snapshot.hosts.map((host) => [host.name, host.ok, host.fetchedAt]),
     );
     if (!state.capabilities || state.capabilitiesRevision !== revision) {
-      await loadCapabilities();
+      await loadCapabilities(authEpoch);
+      assertAuthEpoch(authEpoch);
       state.capabilitiesRevision = revision;
     }
     schedule();
   } catch (err) {
-    if (!err.unauthorized) {
+    if (!err.unauthorized && !err.staleAuth) {
       notice(
         "보드 연결을 확인하지 못했습니다. 마지막으로 읽은 내용을 표시합니다. 새로고침을 눌러 다시 확인하세요.",
       );
@@ -2422,27 +2512,38 @@ async function poll(refresh = false) {
       }
     }
   } finally {
-    state.pollBusy = false;
+    if (authEpoch === state.authEpoch) state.pollBusy = false;
   }
 }
 async function manualRefresh() {
   if (state.pollBusy || state.launchBusy) return;
+  const authEpoch = state.authEpoch;
   $("refresh").disabled = true;
   try {
-    if (!state.csrf) await loadCapabilities();
+    if (!state.csrf) await loadCapabilities(authEpoch);
+    assertAuthEpoch(authEpoch);
     state.refreshDeadline = Date.now() + 60000;
-    await api("/api/refresh", { method: "POST", body: {} });
+    await api("/api/refresh", { method: "POST", body: {}, authEpoch });
+    assertAuthEpoch(authEpoch);
     state.detailUpdatedAt = null;
-    await loadCapabilities();
+    await loadCapabilities(authEpoch);
+    assertAuthEpoch(authEpoch);
     await poll(false);
-    refreshTerminals();
+    if (authEpoch === state.authEpoch) refreshTerminals(authEpoch);
   } catch (err) {
-    if (!err.unauthorized) notice(err.message);
+    if (!err.unauthorized && !err.staleAuth) notice(err.message);
   } finally {
-    $("refresh").disabled = false;
+    if (authEpoch === state.authEpoch) $("refresh").disabled = false;
   }
 }
 function showLogin() {
+  beginAuthEpoch();
+  state.loginBusy = false;
+  state.launchBusy = false;
+  state.terminalCloseBusy = false;
+  $("refresh").disabled = false;
+  $("running-refresh").disabled = false;
+  $("login-submit").disabled = false;
   clearTimeout(state.pollTimer);
   stopTerminalReader();
   stopChatPolling();
@@ -2489,13 +2590,15 @@ async function lock() {
     toast("터미널 준비가 끝난 뒤 잠글 수 있습니다.");
     return;
   }
+  const authEpoch = state.authEpoch;
   try {
-    await api("/logout", { method: "POST", body: {} });
+    await api("/logout", { method: "POST", body: {}, authEpoch });
+    assertAuthEpoch(authEpoch);
     showLogin();
     $("login-error").textContent = "";
     toast("잠갔습니다. 실행 중인 작업은 종료하지 않습니다.");
   } catch (err) {
-    if (!err.unauthorized)
+    if (!err.unauthorized && !err.staleAuth)
       toast("잠금 요청을 완료하지 못했습니다. 연결을 확인해 주세요.");
   }
 }
@@ -2516,8 +2619,8 @@ function showOfflineStart() {
 function recoverConnection() {
   state.offline = false;
   if (networkOffline()) return;
-  $("login-submit").disabled = false;
-  if (document.hidden) return;
+  if (!state.loginBusy) $("login-submit").disabled = false;
+  if (document.hidden || state.loginBusy) return;
   if (!state.snapshot) $("login-error").textContent = "";
   if (state.terminalVisible) {
     terminalStatus("네트워크 연결이 돌아왔습니다. 다시 연결을 눌러 주세요.");
@@ -2525,9 +2628,10 @@ function recoverConnection() {
   }
   notice("연결이 돌아왔습니다. 작업 상태를 확인하고 있습니다…");
   const initialAuthentication = !state.authenticated;
+  const authEpoch = state.authEpoch;
   poll(false).then(() => {
-    if (initialAuthentication && state.authenticated && !document.hidden &&
-        !state.terminalVisible && !networkOffline()) refreshTerminals();
+    if (authEpoch === state.authEpoch && initialAuthentication && state.authenticated && !document.hidden &&
+        !state.terminalVisible && !networkOffline()) refreshTerminals(authEpoch);
   });
   const selected = selectedSession();
   if (selected) { updateChatComposer(chatEntry(selected)); loadChatState(selected, true); }
@@ -2574,6 +2678,9 @@ window.addEventListener("DOMContentLoaded", () => {
   $("login-form").addEventListener("submit", async (event) => {
     event.preventDefault();
     if (networkOffline()) { showOfflineStart(); return; }
+    if (state.loginBusy) return;
+    let authEpoch = beginAuthEpoch();
+    state.loginBusy = true;
     $("login-submit").disabled = true;
     $("login-error").textContent = "";
     try {
@@ -2584,19 +2691,25 @@ window.addEventListener("DOMContentLoaded", () => {
         body: JSON.stringify({ token: $("login-token").value.trim() }),
         cache: "no-store",
       });
+      assertAuthEpoch(authEpoch);
       if (!response.ok)
         throw new Error(
           response.status === 403
             ? "접속 토큰이 맞지 않습니다."
             : "접속할 수 없습니다. 서버 연결을 확인해 주세요.",
         );
+      authEpoch = beginAuthEpoch();
+      state.loginBusy = false;
       $("login-token").value = "";
       await poll(true);
-      refreshTerminals();
+      if (authEpoch === state.authEpoch && state.authenticated) refreshTerminals(authEpoch);
     } catch (err) {
-      $("login-error").textContent = err.message;
+      if (authEpoch === state.authEpoch && !err.staleAuth) $("login-error").textContent = err.message;
     } finally {
-      $("login-submit").disabled = false;
+      if (authEpoch === state.authEpoch) {
+        state.loginBusy = false;
+        $("login-submit").disabled = false;
+      }
     }
   });
   $("search").addEventListener("input", (event) => {
@@ -2609,7 +2722,7 @@ window.addEventListener("DOMContentLoaded", () => {
   });
   $("home").addEventListener("click", backToList);
   $("refresh").addEventListener("click", manualRefresh);
-  $("running-refresh").addEventListener("click", refreshTerminals);
+  $("running-refresh").addEventListener("click", () => refreshTerminals());
   $("logout").addEventListener("click", lock);
   $("plan-close").addEventListener("click", closePlan);
   $("plan-cancel").addEventListener("click", closePlan);
@@ -2740,7 +2853,10 @@ window.addEventListener("DOMContentLoaded", () => {
     navigator.serviceWorker.register("/sw.js").catch(() => {});
   if (networkOffline()) {
     showOfflineStart();
-  } else poll(true).then(() => {
-    if (state.authenticated) refreshTerminals();
-  });
+  } else {
+    const authEpoch = state.authEpoch;
+    poll(true).then(() => {
+      if (authEpoch === state.authEpoch && state.authenticated) refreshTerminals(authEpoch);
+    });
+  }
 });

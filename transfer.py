@@ -1,6 +1,7 @@
 """Bounded SSH transfer coordinator for registered machines and fresh workspaces."""
 import base64
 import hashlib
+import fcntl
 import io
 import json
 import os
@@ -10,6 +11,8 @@ import shlex
 import shutil
 import subprocess
 import sys
+import stat
+from contextlib import contextmanager
 import threading
 import time
 import zipfile
@@ -163,7 +166,36 @@ class Transfers:
         finally:
             if archive.exists(): archive.unlink()
 
+    @contextmanager
+    def coordinator_operation(self, transfer_id, wait=False):
+        if not isinstance(transfer_id, str) or not re.fullmatch('[a-f0-9]{32}', transfer_id):
+            raise ValueError('이전 식별자가 올바르지 않습니다.')
+        directory = settings.safe_path(self.state_dir, directory=True, allow_missing=True)
+        directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        fd = os.open(str(directory / (transfer_id + '.coordinator.lock')), os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+        try:
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
+                raise ValueError('이전 정리 잠금 파일이 안전하지 않습니다.')
+            deadline = time.monotonic() + (40 if wait else 0)
+            while True:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if not wait or time.monotonic() >= deadline:
+                        raise RuntimeError('이전 작업이 진행 중입니다. 작업이 끝난 뒤 정리를 다시 확인해 주세요.') from None
+                    time.sleep(0.05)
+            yield
+        finally:
+            os.close(fd)
+
     def execute(self, source, target, source_host, target_host, profile, request_id, read_messages):
+        transfer_id = hashlib.sha256(request_id.encode()).hexdigest()[:32]
+        with self.coordinator_operation(transfer_id):
+            return self._execute(source, target, source_host, target_host, profile, request_id, read_messages)
+
+    def _execute(self, source, target, source_host, target_host, profile, request_id, read_messages):
         # Durable request identity prevents a lost HTTP response from starting a second model.
         transfer_id = hashlib.sha256(request_id.encode()).hexdigest()[:32]
         folder = self.state_dir / transfer_id
@@ -172,7 +204,8 @@ class Transfers:
         folder.mkdir(mode=0o700, parents=True)
         record = {'id': transfer_id, 'status': 'stopping', 'source': {k:source.get(k) for k in ('host','agent','home','id','cwd')},
                   'target': target, 'startedAt': int(time.time()), 'sourceStopped': False,
-                  'targetPreparation': 'not_started'}
+                  'targetPreparation': 'not_started', 'archiveCleanupHosts': [],
+                  'archiveCleanupPending': False}
         def status(value):
             record['status'] = value; record['updatedAt'] = int(time.time()); _save(folder/'transfer.json', record)
         status('stopping')
@@ -190,9 +223,12 @@ class Transfers:
             source = {**source, 'phase': stopped.get('phase', 'idle')}
             messages = read_messages()
             if not messages: raise ValueError('최근 대화를 읽지 못해 이전을 중단했습니다.')
+            record['archiveCleanupHosts'] = [source_host['name']]
+            record['archiveCleanupPending'] = True
             status('packing')
             exported = self.rpc(source_host, 'export', {'source': source, 'transferId': transfer_id,
                                 'revision': stopped.get('revision')}, timeout=180)
+            record['archiveCleanupHosts'].append(target_host['name'])
             status('copying')
             self._copy(source_host, target_host, transfer_id, exported['sha256'], folder)
             status('preparing')
@@ -223,20 +259,84 @@ class Transfers:
             record['targetPreparation'] = 'prepared'
             record.update(destinationCwd=prepared['cwd'], sourceRevision=stopped.get('revision'))
             status('ready')
-            for cleanup_host in (source_host, target_host):
-                try: self.rpc(cleanup_host, 'cleanup', {'transferId':transfer_id}, timeout=12)
-                except (OSError, RuntimeError, ValueError):
-                    record['archiveCleanupPending'] = True
-                    status('ready')
+            self._cleanup_record(record, folder / 'transfer.json')
             import collector
             return {'argv':self.command(target_host, ['-I', self.runtime_paths[target_host['name']], 'exec', transfer_id], tty=True),
                     'cwd':str(Path.home()), 'env':collector.tool_env(), 'transferId':transfer_id,
                     'destinationCwd':prepared['cwd'], 'nativeSource':prepared.get('nativeSource'), 'connectionMode':prepared.get('connectionMode'), 'warnings':prepared.get('warnings',[])}
         except Exception as exc:
             record['error'] = scrub_text(str(exc))[:1000]; status('failed')
+            # An unknown prepare may still be reading its incoming archive.
+            # The target remains pending until an explicit status-confirmed retry.
+            self._cleanup_record(record, folder / 'transfer.json')
             raise
 
+    def _cleanup_record(self, record, path, explicit=False):
+        names = record.get('archiveCleanupHosts', [])
+        pending, deferred = [], []
+        for name in names:
+            if name not in self.hosts:
+                pending.append(name)
+                continue
+            if name == record['target']['host'] and record.get('targetPreparation') == 'unknown':
+                if not explicit:
+                    pending.append(name); deferred.append(name)
+                    continue
+                try:
+                    state = self.rpc(self.hosts[name], 'status', {'transferId': record['id']}, timeout=12)
+                    if not isinstance(state, dict) or state.get('prepared') is not True:
+                        pending.append(name); deferred.append(name)
+                        continue
+                except (OSError, RuntimeError, ValueError):
+                    pending.append(name); deferred.append(name)
+                    continue
+            try:
+                result = self.rpc(self.hosts[name], 'cleanup', {'transferId': record['id']}, timeout=12)
+                if not isinstance(result, dict) or result.get('ok') is not True:
+                    pending.append(name)
+            except (OSError, RuntimeError, ValueError):
+                pending.append(name)
+        record.update(archiveCleanupHosts=pending, archiveCleanupPending=bool(pending))
+        _save(path, record)
+        return {'id': record['id'], 'archiveCleanupPending': bool(pending),
+                'pendingHosts': pending, 'deferredHosts': deferred}
+
+    def cleanup_pending(self, transfer_id):
+        with self.coordinator_operation(transfer_id):
+            return self._cleanup_pending(transfer_id)
+
+    def _cleanup_pending(self, transfer_id):
+        if not isinstance(transfer_id, str) or not re.fullmatch('[a-f0-9]{32}', transfer_id):
+            raise ValueError('이전 식별자가 올바르지 않습니다.')
+        path = settings.safe_path(self.state_dir / transfer_id / 'transfer.json', private=True)
+        if path.stat().st_size > 1024 * 1024:
+            raise ValueError('이전 기록이 허용 크기를 넘습니다.')
+        record = json.loads(path.read_text())
+        if (not isinstance(record, dict) or record.get('id') != transfer_id
+                or not isinstance(record.get('source'), dict) or not isinstance(record.get('target'), dict)):
+            raise ValueError('이전 기록 형식이 올바르지 않습니다.')
+        if record.get('status') not in ('stopping', 'packing', 'copying', 'preparing', 'failed', 'ready', 'started'):
+            raise ValueError('이전 기록의 진행 상태가 올바르지 않습니다.')
+        hosts = [record['source'].get('host'), record['target'].get('host')]
+        if any(not isinstance(name, str) or name not in self.hosts for name in hosts):
+            raise ValueError('이전 기록의 기기가 현재 등록된 기기와 다릅니다.')
+        names = record.get('archiveCleanupHosts')
+        if names is None:
+            names = hosts if record.get('sourceStopped') else []
+            record['archiveCleanupHosts'] = names
+        if not isinstance(names, list) or any(name not in hosts for name in names) or len(set(names)) != len(names):
+            raise ValueError('이전 임시 파일 정리 기록이 올바르지 않습니다.')
+        archive = path.parent / 'workspace.tar.gz'
+        if os.path.lexists(archive):
+            settings.safe_path(archive, private=True)
+            archive.unlink()
+        return self._cleanup_record(record, path, explicit=True)
+
     def mark_started(self, transfer_id, terminal_id):
+        with self.coordinator_operation(transfer_id, wait=True):
+            return self._mark_started(transfer_id, terminal_id)
+
+    def _mark_started(self, transfer_id, terminal_id):
         path = self.state_dir / transfer_id / 'transfer.json'
         record = json.loads(path.read_text()); record.update(status='started', terminalId=terminal_id, updatedAt=int(time.time()))
         _save(path, record)

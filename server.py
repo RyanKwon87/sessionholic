@@ -278,6 +278,12 @@ def private_json(path, value):
         temp.unlink(missing_ok=True)
 
 
+class LaunchFailure(RuntimeError):
+    def __init__(self, recovery):
+        super().__init__("대상 실행 준비 뒤 터미널 연결을 완료하지 못했습니다. 대상 작업이 이미 시작됐을 수 있습니다.")
+        self.recovery = recovery
+
+
 class Workflow:
     """Only server-discovered identities become native terminal launch commands."""
     def __init__(self, board, terminals, state_dir=STATE_DIR):
@@ -420,6 +426,8 @@ class Workflow:
                 previous_plan, result = self.requests[request_id]
                 if previous_plan != plan_id:
                     raise ValueError("이미 사용한 요청입니다.")
+                if isinstance(result, LaunchFailure):
+                    raise result
                 return result
             saved = self.plans.get(plan_id)
             if not saved or saved[0]["expiresAt"] <= time.time():
@@ -438,59 +446,75 @@ class Workflow:
                 raise RuntimeError("열어 둔 터미널이 종료됐어요. 실행 설정을 다시 확인해 주세요.")
             # A new explicit launch after a completed CLI is separate from reconnect.
             key = key_base + (":" + plan_id if previous else "")
-            # Re-validate cached identity, and refresh original status at the transition boundary.
-            host = next(h for h in self.board.hosts if h["name"] == source["host"])
-            if not self.board.poll(host):
-                raise RuntimeError("원본 기기에 연결할 수 없어 실행하지 않았어요.")
-            fresh = self.board.source(plan["source"])
-            if plan["mode"] == "handoff" and fresh.get("phase") in ("working", "needs_input"):
-                raise ValueError("원래 작업이 실행 중이거나 승인을 기다리고 있어요. 마무리한 뒤 다시 전환해 주세요.")
-            source = fresh
-            if plan["mode"] == "transfer":
-                target_host = next(h for h in self.board.hosts if h["name"] == plan["target"]["host"])
-                if sum(bool(item.get("alive")) for item in self.terminals.list()) >= getattr(self.terminals, "max_terminals", 4):
-                    raise ValueError("열린 터미널이 가득 찼습니다. 하나를 닫은 뒤 넘겨 주세요.")
-                def read_for_transfer():
-                    result = self.board.read(source["host"], source["agent"], source.get("sessionId") or source["id"], source.get("home"), fresh=True)
-                    if result.get("error"):
-                        raise RuntimeError("중단 후 최근 대화를 읽지 못해 이전을 중단했습니다.")
-                    return result.get("messages") or []
-                spec = self.transfers.execute(source, plan["target"], host, target_host, profile, request_id, read_for_transfer)
-            elif host["local"]:
-                from launch import build_launch
-                messages = []
-                if plan["mode"] == "handoff":
-                    result = self.board.read(source["host"], source["agent"], source.get("sessionId") or source["id"], source.get("home"), fresh=True)
-                    if result.get("error"):
-                        raise RuntimeError("원본 대화를 읽지 못해 인계를 중단했어요.")
-                    messages = result.get("messages") or []
-                spec = build_launch(source, {**profile, "host": source["host"]}, messages, self.state_dir)
-                from managed_launch import bind
-                spec = bind(spec, profile, source["host"], receipt_path=self.state_dir / "native-launches" / (key_base + ".json"))
-            else:
-                spec = self.remote_attach(host, source)
-            metadata = {"title": source.get("title") or "작업", "host": plan["target"]["host"], "agent": profile["agent"],
-                        "account": profile["label"], "sourceKey": json.dumps(plan["source"], sort_keys=True), "mode": plan["mode"]}
-            if spec.get("connectionMode"):
-                metadata.update(mode=spec["connectionMode"], launchMode=plan["mode"])
-            native_source = spec.get("nativeSource")
-            if plan["mode"] == "attach":
-                native_source = {**self.identity(source), "cwd": source.get("cwd"), "kind": source.get("kind")}
-            if native_source:
-                metadata["nativeSource"] = native_source
-            if spec.get("transferId"):
-                metadata.update(transferId=spec["transferId"], destinationCwd=spec["destinationCwd"], sourceHost=source["host"])
-            terminal = self.terminals.create(key, spec["argv"], spec["cwd"], spec["env"], metadata)
-            if spec.get("nativeReceiptPath"):
-                from managed_launch import mark_attached
-                mark_attached(spec, terminal["id"])
-            if spec.get("transferId"):
-                self.transfers.mark_started(spec["transferId"], terminal["id"])
-            result = {"terminal": terminal, "mode": plan["mode"]}
-            self.requests[request_id] = (plan_id, result)
-            if len(self.requests) > 256:
-                self.requests.pop(next(iter(self.requests)))
-            return result
+            with self.terminals.reserve(key):
+                # Re-validate cached identity, and refresh original status at the transition boundary.
+                host = next(h for h in self.board.hosts if h["name"] == source["host"])
+                if not self.board.poll(host):
+                    raise RuntimeError("원본 기기에 연결할 수 없어 실행하지 않았어요.")
+                fresh = self.board.source(plan["source"])
+                if plan["mode"] == "handoff" and fresh.get("phase") in ("working", "needs_input"):
+                    raise ValueError("원래 작업이 실행 중이거나 승인을 기다리고 있어요. 마무리한 뒤 다시 전환해 주세요.")
+                source = fresh
+                if plan["mode"] == "transfer":
+                    target_host = next(h for h in self.board.hosts if h["name"] == plan["target"]["host"])
+                    def read_for_transfer():
+                        result = self.board.read(source["host"], source["agent"], source.get("sessionId") or source["id"], source.get("home"), fresh=True)
+                        if result.get("error"):
+                            raise RuntimeError("중단 후 최근 대화를 읽지 못해 이전을 중단했습니다.")
+                        return result.get("messages") or []
+                    spec = self.transfers.execute(source, plan["target"], host, target_host, profile, request_id, read_for_transfer)
+                elif host["local"]:
+                    from launch import build_launch
+                    messages = []
+                    if plan["mode"] == "handoff":
+                        result = self.board.read(source["host"], source["agent"], source.get("sessionId") or source["id"], source.get("home"), fresh=True)
+                        if result.get("error"):
+                            raise RuntimeError("원본 대화를 읽지 못해 인계를 중단했어요.")
+                        messages = result.get("messages") or []
+                    spec = build_launch(source, {**profile, "host": source["host"]}, messages, self.state_dir)
+                    from managed_launch import bind
+                    spec = bind(spec, profile, source["host"], receipt_path=self.state_dir / "native-launches" / (key_base + ".json"))
+                else:
+                    spec = self.remote_attach(host, source)
+                metadata = {"title": source.get("title") or "작업", "host": plan["target"]["host"], "agent": profile["agent"],
+                            "account": profile["label"], "sourceKey": json.dumps(plan["source"], sort_keys=True), "mode": plan["mode"]}
+                if spec.get("connectionMode"):
+                    metadata.update(mode=spec["connectionMode"], launchMode=plan["mode"])
+                native_source = spec.get("nativeSource")
+                if plan["mode"] == "attach":
+                    native_source = {**self.identity(source), "cwd": source.get("cwd"), "kind": source.get("kind")}
+                if native_source:
+                    metadata["nativeSource"] = native_source
+                if spec.get("transferId"):
+                    metadata.update(transferId=spec["transferId"], destinationCwd=spec["destinationCwd"], sourceHost=source["host"])
+                try:
+                    terminal = self.terminals.create(key, spec["argv"], spec["cwd"], spec["env"], metadata)
+                    if spec.get("nativeReceiptPath"):
+                        from managed_launch import mark_attached
+                        mark_attached(spec, terminal["id"])
+                    if spec.get("transferId"):
+                        self.transfers.mark_started(spec["transferId"], terminal["id"])
+                except (RuntimeError, ValueError, OSError) as exc:
+                    # Preparation can start a native turn before the TUI connects.
+                    # Retain an explicit recovery result instead of rerunning it.
+                    recovery = {"targetStarted": None, "host": plan["target"]["host"],
+                                "destinationCwd": spec.get("destinationCwd") or spec["cwd"]}
+                    if native_source:
+                        recovery["nativeSource"] = native_source
+                    try:
+                        opened = next((t for t in self.terminals.list() if t.get("key") == key), None)
+                    except (RuntimeError, OSError):
+                        opened = None
+                    if opened:
+                        recovery["terminal"] = opened
+                    failure = LaunchFailure(recovery)
+                    self.requests[request_id] = (plan_id, failure)
+                    raise failure from exc
+                result = {"terminal": terminal, "mode": plan["mode"]}
+                self.requests[request_id] = (plan_id, result)
+                if len(self.requests) > 256:
+                    self.requests.pop(next(iter(self.requests)))
+                return result
 
     def remote_attach(self, host, source):
         # The owning helper resolves binaries and explicit environment settings.
@@ -680,7 +704,13 @@ class Handler(BaseHTTPRequestHandler):
                     return self.send_json(200, {**result, "csrfToken": self.server.csrf,
                                                "authMode": "tailscale" if self.tailscale_authorized() else "token"})
                 if url.path == "/api/terminals":
-                    return self.send_json(200, {"terminals": self.server.terminals.list()})
+                    records = self.server.terminals.list()
+                    result = {"terminals": records}
+                    try:
+                        self.server.terminal_inputs.prune_all_closed(records)
+                    except (ValueError, RuntimeError, OSError):
+                        result["inputCleanupPending"] = True
+                    return self.send_json(200, result)
                 match = re.fullmatch(r"/api/terminal/([a-f0-9]{32})/events", url.path)
                 if match:
                     after = int(query.get("after", "0"))
@@ -699,11 +729,15 @@ class Handler(BaseHTTPRequestHandler):
         return self.static(url.path)
 
     def do_POST(self):
+        from chat import SendRejected
+        path = urlparse(self.path).path
+        not_started = {"dispatchState": "not_started"} if path == "/api/chat/send" else {}
         if not host_allowed(self.headers.get("Host")):
+            if not_started:
+                return self.send_json(421, {"error": "접속 주소를 확인해 주세요.", **not_started})
             return self.send_body(421, b"misdirected", "text/plain; charset=utf-8")
         if not self.origin_allowed():
-            return self.send_json(403, {"error": "이 보드에서 요청해 주세요."})
-        path = urlparse(self.path).path
+            return self.send_json(403, {"error": "이 보드에서 요청해 주세요.", **not_started})
         if path == "/api/chat/upload":
             if not self.authorized():
                 return self.send_json(401, {"error": "로그인이 필요합니다."})
@@ -739,7 +773,7 @@ class Handler(BaseHTTPRequestHandler):
         try:
             data = self.json_body()
         except ValueError as exc:
-            return self.send_json(400, {"error": str(exc)})
+            return self.send_json(400, {"error": str(exc), **not_started})
         if path == "/login":
             token = str(data.get("token") or "")
             if not token or not hmac.compare_digest(token.encode(), self.server.token.encode()):
@@ -747,9 +781,10 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_json(403, {"error": "토큰이 맞지 않습니다."})
             return self.send_json(200, {"ok": True, "csrfToken": self.server.csrf}, {"Set-Cookie": self.session_cookie()})
         if not self.authorized():
-            return self.send_json(401, {"error": "로그인이 필요합니다."})
+            return self.send_json(401, {"error": "로그인이 필요합니다.", **not_started})
         if not hmac.compare_digest(self.headers.get("X-CSRF-Token", ""), self.server.csrf):
-            return self.send_json(403, {"error": "화면을 새로 열고 다시 시도해 주세요."})
+            return self.send_json(403, {"error": "보안 연결을 갱신한 뒤 다시 시도해 주세요.",
+                                        "code": "csrf_expired", **not_started})
         try:
             if path == "/logout":
                 jar = cookies.SimpleCookie(self.headers.get("Cookie") or "")
@@ -778,24 +813,23 @@ class Handler(BaseHTTPRequestHandler):
                     text = data.get("text")
                     if not isinstance(text, str) or len(text.encode()) > 32768:
                         raise ValueError("입력이 비었거나 너무 깁니다.")
-                    key = (tid, request_id)
-                    digest = hashlib.sha256(text.encode()).hexdigest()
-                    with self.server.input_lock:
-                        previous = self.server.inputs.get(key)
-                        if previous and previous != digest:
-                            raise ValueError("같은 요청으로 다른 입력을 보낼 수 없습니다.")
-                        if not previous:
-                            self.server.terminals.write(tid, text)
-                            self.server.inputs[key] = digest
-                            if len(self.server.inputs) > 4096:
-                                self.server.inputs.pop(next(iter(self.server.inputs)))
+                    self.server.terminal_inputs.submit(tid, request_id, text, self.server.terminals.write)
                 elif action == "resize":
                     self.server.terminals.resize(tid, data.get("cols"), data.get("rows"))
                 elif action == "close":
                     self.server.terminals.close_terminal(tid)
+                    try:
+                        self.server.terminal_inputs.prune_closed(tid, self.server.terminals.list())
+                    except (ValueError, RuntimeError, OSError):
+                        # Closing the CLI succeeded even if optional receipt cleanup failed.
+                        return self.send_json(200, {"ok": True, "inputCleanupPending": True})
                 else:
                     self.server.terminals.detach(tid)
                 return self.send_json(200, {"ok": True})
+        except SendRejected as exc:
+            return self.send_json(exc.status, {"error": str(exc), "dispatchState": "not_started"})
+        except LaunchFailure as exc:
+            return self.send_json(409, {"error": str(exc), "recovery": exc.recovery})
         except (ValueError, KeyError) as exc:
             return self.send_json(400, {"error": str(exc) if isinstance(exc, ValueError) else "터미널을 찾지 못했어요."})
         except RuntimeError as exc:
@@ -855,10 +889,11 @@ def make_server(bind, port, board, token, terminals=None, workflow=None, state_d
     server.once, server.once_lock = ("", 0), threading.Lock()
     server.sessions, server.auth_lock = {}, threading.Lock()
     server.csrf = secrets.token_urlsafe(32)
-    server.input_lock, server.inputs = threading.Lock(), {}
     server.upload_gate = threading.BoundedSemaphore(2)
     try:
         server.terminals = terminals if terminals is not None else TerminalManager(state_dir=Path(state_dir) / "terminals", max_terminals=max_terminals)
+        from terminal_input import TerminalInputs
+        server.terminal_inputs = TerminalInputs(state_dir)
     except BaseException:
         server.server_close()
         raise

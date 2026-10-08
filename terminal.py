@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import base64
 import copy
+from contextlib import contextmanager
 import fcntl
 import json
 import os
@@ -146,6 +147,7 @@ class TerminalManager:
         self.buffer_limit = buffer_limit
         self.lock = threading.RLock()
         self.terminals = {}
+        self.reservations = set()
         self._closed = False
         lock_path = self.state_dir / ".lock"
         try:
@@ -225,6 +227,22 @@ class TerminalManager:
             raise KeyError("터미널을 찾을 수 없습니다.")
         return terminal
 
+    @contextmanager
+    def reserve(self, key):
+        """Reserve capacity before a launch can submit its first model input."""
+        with self.lock:
+            if self._closed:
+                raise RuntimeError("터미널 연결 관리자가 종료되었습니다.")
+            live = sum(self._exists(t) for t in self.terminals.values())
+            if key in self.reservations or live + len(self.reservations) >= self.max_terminals:
+                raise RuntimeError("열린 터미널이 가득 찼습니다. 연결 하나를 정리한 뒤 다시 실행해 주세요.")
+            self.reservations.add(key)
+        try:
+            yield
+        finally:
+            with self.lock:
+                self.reservations.discard(key)
+
     def create(self, key, argv, cwd, env, metadata=None):
         """Create once per stable key; a dead saved command is never rerun implicitly."""
         if not isinstance(key, str) or not key or len(key) > 1024:
@@ -250,7 +268,7 @@ class TerminalManager:
                     self._attach(terminal)
                     return self._public(terminal)
             live = sum(self._exists(t) for t in self.terminals.values())
-            if live >= self.max_terminals:
+            if live + len(self.reservations - {key}) >= self.max_terminals:
                 raise RuntimeError("열 수 있는 터미널 수를 초과했습니다.")
             terminal_id = secrets.token_hex(16)
             record = {"id": terminal_id, "name": "sb-" + terminal_id, "key": key,
@@ -427,9 +445,22 @@ class TerminalManager:
     def list(self):
         with self.lock:
             result = []
+            changed = []
             for terminal in self.terminals.values():
                 terminal.alive = self._exists(terminal)
+                if not terminal.alive and not terminal.record.get("closed", False):
+                    # A generated tmux session that ended is never restarted by
+                    # this ID. Persist that fact before input receipts are pruned.
+                    terminal.record["closed"] = True
+                    changed.append(terminal)
                 result.append(self._public(terminal))
+            if changed:
+                try:
+                    self._save()
+                except (ValueError, RuntimeError, OSError):
+                    for terminal in changed:
+                        terminal.record.pop("closed", None)
+                    raise
             return result
 
     def detach(self, terminal_id):
@@ -458,7 +489,11 @@ class TerminalManager:
                         if done.returncode != 0 and self._exists(terminal):
                             raise RuntimeError("터미널을 닫지 못했습니다.")
                     terminal.record["closed"] = True
-                    self._save()
+                    try:
+                        self._save()
+                    except (ValueError, RuntimeError, OSError):
+                        terminal.record.pop("closed", None)
+                        raise
                 with terminal.condition:
                     terminal.alive = False
                     terminal.condition.notify_all()

@@ -71,6 +71,44 @@ class ValidationTest(unittest.TestCase):
         self.manager.close()
         self.directory.cleanup()
 
+    def test_reservations_protect_capacity_and_release_on_failure(self):
+        self.manager.max_terminals = 1
+        with self.assertRaisesRegex(RuntimeError, 'fixture'):
+            with self.manager.reserve('handoff'):
+                with self.assertRaisesRegex(RuntimeError, '가득'):
+                    with self.manager.reserve('other'):
+                        self.fail('A second launch claimed the reserved slot')
+                with patch.object(self.manager, '_run') as run:
+                    with self.assertRaisesRegex(RuntimeError, '초과'):
+                        self.manager.create('unreserved', ['/bin/cat'], self.directory.name, {})
+                    run.assert_not_called()
+                raise RuntimeError('fixture failure before launch')
+        with self.manager.reserve('next'):
+            self.assertEqual(self.manager.reservations, {'next'})
+        self.assertEqual(self.manager.reservations, set())
+
+    def test_reserved_launch_uses_its_own_slot(self):
+        self.manager.max_terminals = 1
+        with self.manager.reserve('handoff'), patch.object(self.manager, '_run') as run:
+            run.return_value.returncode = 1
+            with self.assertRaisesRegex(RuntimeError, '시작하지'):
+                self.manager.create('handoff', ['/bin/cat'], self.directory.name, {})
+            self.assertEqual(run.call_count, 1)
+
+    def test_natural_exit_tombstone_is_not_exposed_before_it_is_saved(self):
+        row = {'id': 'a'*32, 'name': 'sb-'+'a'*32, 'key': 'fixture', 'metadata': {}}
+        instance = terminal._Terminal(row, 1024)
+        self.manager.terminals[row['id']] = instance
+        with patch.object(self.manager, '_exists', return_value=False), \
+                patch.object(self.manager, '_save', side_effect=OSError('fixture full disk')):
+            with self.assertRaises(OSError):
+                self.manager.list()
+            self.assertFalse(instance.record.get('closed', False))
+            with self.assertRaises(OSError):
+                self.manager.close_terminal(row['id'])
+        self.assertFalse(instance.record.get('closed', False))
+        self.manager.terminals.clear()
+
     def test_rejects_untrusted_ids_and_payloads_before_execution(self):
         for value in ("../../x", "-Ldefault", "a" * 31, 5):
             with self.assertRaises(ValueError):
@@ -294,6 +332,9 @@ class TmuxFixtureTest(unittest.TestCase):
         subprocess.run([shutil.which("tmux"), "-L", self.socket, "kill-session", "-t", "=sb-" + created["id"]],
                        check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
         self.assertFalse(self.manager.list()[0]["alive"])
+        self.assertTrue(self.manager.list()[0]["closed"])
+        saved = json.loads(self.manager.state_path.read_text())
+        self.assertTrue(saved[0]['closed'])
         with self.assertRaises(RuntimeError):
             self.create()
         self.assertEqual(self.launch_count.read_text(), "start\n")

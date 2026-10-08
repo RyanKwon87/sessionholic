@@ -89,6 +89,9 @@ def diagnose(home=None):
         ("snapshot-file", state / "snapshot.json", False, "snapshot.json 파일의 종류·소유자·권한을 확인하세요(600)."),
         ("conversations-file", state / "conversations.json", False, "conversations.json 파일의 종류·소유자·권한을 확인하세요(600)."),
         ("terminal-dir", state / "terminals", True, "terminals 폴더의 종류·소유자·권한을 확인하세요(700)."),
+        ("terminal-input-dir", state / "terminal-inputs", True, "terminal-inputs 폴더의 종류·소유자·권한을 확인하세요(700)."),
+        ("terminal-input-file", state / "terminal-inputs/receipts.sqlite3", False, "터미널 입력 기록 파일의 종류·소유자·읽기·쓰기 권한을 확인하세요(600)."),
+        ("terminal-input-journal", state / "terminal-inputs/receipts.sqlite3-journal", False, "터미널 입력 기록 journal의 종류·소유자·권한을 확인하세요(600)."),
     ):
         try:
             settings.safe_path(path, directory=directory, private=True,
@@ -105,7 +108,7 @@ def diagnose(home=None):
                     access |= os.W_OK
                 if not os.access(existing, access):
                     raise ValueError("startup directory is not accessible")
-            elif path.exists() and not os.access(path, os.R_OK):
+            elif path.exists() and not os.access(path, os.R_OK | (os.W_OK if name.startswith("terminal-input-") else 0)):
                 raise ValueError("startup file is not readable")
             if name == "token-file" and path.exists() and path.stat().st_size == 0:
                 check(name, "error", "접속 토큰 파일이 비어 있습니다. 기존 토큰을 확인·복구하세요. 자동 교체하지 않습니다.")
@@ -177,6 +180,10 @@ def main(argv=None):
     service = commands.add_parser("service-file", help="macOS 백그라운드 실행 파일 생성 (자동 실행 없음)")
     service.add_argument("--port", type=int, default=8790)
     service.add_argument("--tailscale-user-file", type=Path)
+    cleanup = commands.add_parser("cleanup-transfer", help="이전 한 건의 남은 임시 압축 파일 정리 (등록 기기에 연결)")
+    cleanup.add_argument("transfer_id", metavar="TRANSFER_ID")
+    cleanup.add_argument("--hosts", type=Path)
+    cleanup.add_argument("--state-dir", type=Path)
     args, remaining = parser.parse_known_args(argv)
     if remaining and args.command != "serve":
         parser.error("알 수 없는 옵션입니다.")
@@ -200,6 +207,14 @@ def main(argv=None):
             if remaining[:1] == ["--"]:
                 remaining = remaining[1:]
             return server.main(remaining)
+        elif args.command == "cleanup-transfer":
+            import server
+            from transfer import Transfers
+            transfers = Transfers(server.load_hosts(args.hosts or server.DEFAULT_HOSTS),
+                                  args.state_dir or server.STATE_DIR)
+            result = transfers.cleanup_pending(args.transfer_id)
+            print(json.dumps(result, ensure_ascii=False))
+            return 1 if result.get("archiveCleanupPending") else 0
         elif args.command == "service-file":
             if not 1 <= args.port <= 65535:
                 raise ValueError("포트는 1~65535 범위여야 합니다.")
@@ -208,7 +223,7 @@ def main(argv=None):
             print("시작: launchctl bootstrap gui/$(id -u) " + shlex.quote(str(path)))
             print("중지: launchctl bootout gui/$(id -u)/" + LABEL)
         return 0
-    except ValueError as error:
+    except (ValueError, RuntimeError) as error:
         print(str(error), file=sys.stderr)
         return 1
     except OSError:

@@ -11,6 +11,13 @@ MAX_FILE = 20 * 1024 * 1024
 REQUEST = re.compile(r'[A-Za-z0-9_-]{8,100}\Z')
 
 
+class SendRejected(ValueError):
+    """Validation failed before the native send boundary was entered."""
+    def __init__(self, reason, status=400):
+        super().__init__(reason)
+        self.status = status
+
+
 class Chat:
     def __init__(self, board, workflow, state_dir):
         self.board, self.workflow = board, workflow
@@ -123,7 +130,7 @@ class Chat:
         finally:
             self.upload_gate.release()
 
-    def send(self, data):
+    def _prepare_send(self, data):
         source, host = self.source(data.get('source'))
         request_id, text = data.get('requestId'), data.get('text', '')
         if not isinstance(request_id, str) or not REQUEST.fullmatch(request_id):
@@ -144,6 +151,14 @@ class Chat:
             record = json.loads(path.read_text())
             if record.get('source') != self.identity(source) or record.get('cwd') != source.get('cwd'):
                 raise ValueError('다른 세션에 올린 파일은 이 메시지에 첨부할 수 없습니다.')
+        return source, host, request_id, text, ids
+
+    def send(self, data):
+        try:
+            source, host, request_id, text, ids = self._prepare_send(data)
+        except (ValueError, RuntimeError, OSError, KeyError) as exc:
+            reason = str(exc) if isinstance(exc, (ValueError, RuntimeError)) else '메시지와 첨부 정보를 다시 확인해 주세요.'
+            raise SendRejected(reason, 409 if isinstance(exc, RuntimeError) else 400) from None
         try:
             result = self.rpc(host, 'send', source, requestId=request_id,
                               input=[{'type': 'text', 'text': text}] if text.strip() else [], attachmentIds=ids)

@@ -1,11 +1,14 @@
 """Finite per-host transfer helper. No listener, model proxy or credential copying."""
 import hashlib
+import fcntl
 import json
 import os
 from pathlib import Path
 import re
 import secrets
 import sys
+import stat
+from contextlib import contextmanager
 from collector import RpcError
 
 MAX_ARCHIVE = 128 * 1024 * 1024
@@ -32,6 +35,49 @@ def job(transfer_id):
     if not isinstance(transfer_id, str) or not ID.fullmatch(transfer_id):
         raise ValueError('이전 식별자가 올바르지 않습니다.')
     return private_dir(root() / transfer_id)
+
+
+@contextmanager
+def job_operation(transfer_id):
+    """A cleanup must never unlink archives used by an active finite worker."""
+    folder = job(transfer_id)
+    fd = os.open(str(folder / '.operation.lock'), os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
+            raise ValueError('이전 작업 잠금 파일이 안전하지 않습니다.')
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise ValueError('이전 파일을 사용 중입니다. 작업이 끝난 뒤 정리를 다시 확인해 주세요.') from None
+        yield
+    finally:
+        os.close(fd)
+
+
+def cleanup_archives(folder):
+    """Remove only this helper's archive names; preserve workspaces and receipts."""
+    removed = 0
+    for directory, pattern in ((folder, r'(?:incoming\.tar\.gz|incoming\.[a-f0-9]{12}\.tmp)'),
+                               (folder / 'export', r'workspace-[a-f0-9]{32}\.tar\.gz')):
+        if not os.path.lexists(directory):
+            continue
+        fd = os.open(str(directory), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            info = os.fstat(fd)
+            if info.st_uid != os.getuid() or info.st_mode & 0o077:
+                raise ValueError('이전 임시 저장 폴더가 안전하지 않습니다.')
+            for name in os.listdir(fd):
+                if not re.fullmatch(pattern, name):
+                    continue
+                item = os.stat(name, dir_fd=fd, follow_symlinks=False)
+                if not stat.S_ISREG(item.st_mode) or item.st_uid != os.getuid() or item.st_mode & 0o077:
+                    raise ValueError('이전 임시 파일의 종류 또는 권한이 안전하지 않습니다.')
+                os.unlink(name, dir_fd=fd)
+                removed += 1
+        finally:
+            os.close(fd)
+    return {'ok': True, 'removed': removed}
 
 
 def save(path, value):
@@ -62,7 +108,7 @@ def source_ready(source, expected=None):
     return state
 
 
-def rpc(request):
+def _rpc(request):
     from transfer_native import profiles, source_state, interrupt_source
     from transfer_workspace import inspect_workspace, export_workspace, import_workspace
     op, args = request.get('op'), request.get('args', {})
@@ -113,19 +159,18 @@ def rpc(request):
         return {'cwd': imported['cwd'], 'root': imported['root'], 'nativeSource': spec.get('nativeSource'), 'connectionMode': spec.get('connectionMode'), 'warnings': spec.get('warnings', []), 'summary': imported.get('summary', {})}
     if op == 'cleanup':
         folder = job(args['transferId'])
-        incoming = folder / 'incoming.tar.gz'
-        if incoming.exists() and not incoming.is_symlink(): incoming.unlink()
-        record_path = folder / 'export.json'
-        if record_path.exists():
-            record = read_private(record_path)
-            archive = Path(record['archivePath'])
-            if archive.exists() and not archive.is_symlink() and archive.parent == folder / 'export':
-                archive.unlink()
-        return {'ok': True}
+        return cleanup_archives(folder)
     if op == 'status':
         folder = job(args['transferId'])
         return {'prepared': (folder / 'launch.json').exists(), 'started': (folder / 'started.json').exists()}
     raise ValueError('지원하지 않는 이전 작업입니다.')
+
+
+def rpc(request):
+    if request.get('op') in ('export', 'prepare', 'cleanup', 'status'):
+        with job_operation(request['args']['transferId']):
+            return _rpc(request)
+    return _rpc(request)
 
 
 def attach(source):
@@ -146,7 +191,7 @@ def attach(source):
     os.execve(spec['argv'][0], spec['argv'], spec['env'])
 
 
-def main():
+def _main():
     if len(sys.argv) == 3 and sys.argv[1] == 'attach':
         try:
             attach(json.loads(sys.argv[2]))
@@ -208,6 +253,13 @@ def main():
     except (ValueError, OSError, RuntimeError, KeyError, RpcError) as exc:
         from launch import scrub_text
         print(json.dumps({'ok': False, 'error': scrub_text(str(exc))[:1000]}, ensure_ascii=False))
+
+
+def main():
+    if len(sys.argv) > 2 and sys.argv[1] in ('send', 'receive', 'exec'):
+        with job_operation(sys.argv[2]):
+            return _main()
+    return _main()
 
 
 if __name__ == '__main__': main()

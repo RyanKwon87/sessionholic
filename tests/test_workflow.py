@@ -1,4 +1,5 @@
 import http.client
+from contextlib import contextmanager
 import json
 from pathlib import Path
 import tempfile
@@ -18,11 +19,17 @@ REF = {'host': 'local', 'agent': 'codex', 'home': '.codex', 'id': SOURCE['id']}
 
 
 class FakeTerminals:
+    max_terminals = 4
     def __init__(self):
         self.calls = []
         self.records = []
     def list(self):
         return [dict(row) for row in self.records]
+    @contextmanager
+    def reserve(self, key):
+        if sum(bool(row.get('alive')) for row in self.records) >= self.max_terminals:
+            raise RuntimeError('열린 터미널이 가득 찼습니다.')
+        yield
     def create(self, key, argv, cwd, env, metadata):
         self.calls.append(('create', key))
         record = {'id': 'abcdef'[len(self.records)] * 32, 'key': key, **metadata, 'alive': True}
@@ -34,6 +41,7 @@ class FakeTerminals:
             raise KeyError(tid)
         self.calls.append(('close', tid))
         record['alive'] = False
+        record['closed'] = True
         return {'ok': True}
     def write(self, tid, text):
         self.calls.append(('write', tid, text))
@@ -106,6 +114,30 @@ class WorkflowTest(unittest.TestCase):
         plan['expiresAt'] = 0
         with self.assertRaises(ValueError):
             self.flow.launch(plan['id'], 'request-0001')
+    def test_full_capacity_blocks_local_handoff_before_native_preparation(self):
+        plan = self.plan(OTHER)
+        self.terms.max_terminals = 1
+        self.terms.records = [{'id': 'a'*32, 'key': 'other-route', 'alive': True}]
+        with patch('launch.build_launch') as build, patch('managed_launch.bind') as bind:
+            with self.assertRaisesRegex(RuntimeError, '가득'):
+                self.flow.launch(plan['id'], 'full-handoff-0001')
+            build.assert_not_called()
+            bind.assert_not_called()
+        self.assertEqual(self.terms.calls, [])
+
+    def test_prepared_handoff_connection_failure_records_target_and_does_not_repeat(self):
+        plan = self.plan(OTHER)
+        native = {**REF, 'home': OTHER['home'], 'id': SOURCE['id'][:-1]+'2', 'cwd': '/tmp'}
+        spec = {'argv': ['/bin/cat'], 'cwd': '/tmp', 'env': {}, 'nativeSource': native}
+        with patch('launch.build_launch', return_value=spec), \
+             patch('managed_launch.bind', return_value=spec) as bind, \
+             patch.object(self.terms, 'create', side_effect=RuntimeError('fixture connection failure')):
+            for _ in range(2):
+                with self.assertRaises(server.LaunchFailure) as result:
+                    self.flow.launch(plan['id'], 'failed-handoff-0001')
+                self.assertEqual(result.exception.recovery['nativeSource'], native)
+                self.assertEqual(result.exception.recovery['host'], 'local')
+            self.assertEqual(bind.call_count, 1)
     def test_failed_host_requires_manual_refresh(self):
         def broken(*args):
             raise RuntimeError('offline')
@@ -164,6 +196,88 @@ class SecurityTest(unittest.TestCase):
         self.assertEqual(self.terms.calls, [('write', 'a'*32, 'hello')])
         res, _ = self.request('POST', path, {**payload, 'text': 'changed'}, self.auth())
         self.assertEqual(res.status, 400)
+
+    def restart_server(self):
+        self.httpd.shutdown()
+        self.httpd.server_close()
+        self.httpd = server.make_server('127.0.0.1', 0, self.board, 'secret-test-only',
+                                       terminals=self.terms, state_dir=self.temp.name)
+        threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
+        self.port = self.httpd.server_address[1]
+        res, data = self.request('POST', '/login', {'token': 'secret-test-only'})
+        self.cookie = res.getheader('Set-Cookie').split(';')[0]
+        self.csrf = json.loads(data)['csrfToken']
+
+    def test_accepted_input_is_not_written_again_after_server_restart(self):
+        path = '/api/terminal/' + 'a'*32 + '/input'
+        payload = {'text': '한글\r', 'requestId': 'restart-input-0001'}
+        self.assertEqual(self.request('POST', path, payload, self.auth())[0].status, 200)
+        self.restart_server()
+        self.assertEqual(self.request('POST', path, payload, self.auth())[0].status, 200)
+        self.assertEqual(self.terms.calls, [('write', 'a'*32, '한글\r')])
+
+    def test_partial_input_failure_stays_unknown_after_retry_and_restart(self):
+        path = '/api/terminal/' + 'a'*32 + '/input'
+        payload = {'text': 'x'*2048, 'requestId': 'partial-input-0001'}
+        received = []
+        def partial(tid, text):
+            received.append(text[:1024])
+            raise RuntimeError('fixture partial write timeout')
+        self.terms.write = partial
+        self.assertEqual(self.request('POST', path, payload, self.auth())[0].status, 409)
+        self.restart_server()
+        self.assertEqual(self.request('POST', path, payload, self.auth())[0].status, 409)
+        self.assertEqual(len(''.join(received)), 1024)
+
+    def test_terminal_list_prunes_persisted_closed_receipts_and_releases_capacity(self):
+        self.httpd.terminal_inputs.max_records = 1
+        path = '/api/terminal/' + 'a'*32 + '/input'
+        payload = {'text': 'fixture', 'requestId': 'quota-input-0001'}
+        self.assertEqual(self.request('POST', path, payload, self.auth())[0].status, 200)
+        self.terms.records = [{'id': 'a'*32, 'alive': False, 'closed': True}]
+        res, body = self.request('GET', '/api/terminals', headers=self.auth())
+        self.assertEqual(res.status, 200)
+        self.assertNotIn('inputCleanupPending', json.loads(body))
+        path = '/api/terminal/' + 'b'*32 + '/input'
+        self.assertEqual(self.request('POST', path, payload, self.auth())[0].status, 200)
+
+    def test_close_succeeds_and_reports_failed_receipt_cleanup_for_refresh_retry(self):
+        self.terms.records = [{'id': 'a'*32, 'alive': True, 'closed': False}]
+        with patch.object(self.httpd.terminal_inputs, 'prune_all_closed', side_effect=RuntimeError('fixture disk error')):
+            res, body = self.request('POST', '/api/terminal/'+'a'*32+'/close', {}, self.auth())
+            self.assertEqual(res.status, 200)
+            self.assertTrue(json.loads(body)['inputCleanupPending'])
+            res, body = self.request('GET', '/api/terminals', headers=self.auth())
+            self.assertEqual(res.status, 200)
+            self.assertTrue(json.loads(body)['inputCleanupPending'])
+        self.assertFalse(self.terms.records[0]['alive'])
+        res, body = self.request('GET', '/api/terminals', headers=self.auth())
+        self.assertNotIn('inputCleanupPending', json.loads(body))
+
+    def test_chat_rejection_before_dispatch_is_explicit(self):
+        payload = {'source': REF, 'requestId': 'message-rejected-0001', 'text': 'draft'}
+        res, body = self.request('POST', '/api/chat/send', payload, {'Cookie': self.cookie})
+        self.assertEqual(res.status, 403)
+        self.assertEqual(json.loads(body)['dispatchState'], 'not_started')
+        self.assertEqual(json.loads(body)['code'], 'csrf_expired')
+        with patch.object(self.httpd.chat, 'rpc') as rpc:
+            res, body = self.request('POST', '/api/chat/send', payload, self.auth())
+            self.assertEqual(res.status, 400)
+            self.assertEqual(json.loads(body)['dispatchState'], 'not_started')
+            rpc.assert_not_called()
+        with patch.object(self.httpd.chat, '_prepare_send', side_effect=RuntimeError('offline')):
+            res, body = self.request('POST', '/api/chat/send', payload, self.auth())
+            self.assertEqual(res.status, 409)
+            self.assertEqual(json.loads(body)['dispatchState'], 'not_started')
+
+    def test_chat_failure_after_dispatch_is_never_labelled_not_started(self):
+        payload = {'source': REF, 'requestId': 'message-unknown-0001', 'text': 'draft'}
+        prepared = ({**SOURCE, 'host': 'local'}, HOST, payload['requestId'], 'draft', [])
+        with patch.object(self.httpd.chat, '_prepare_send', return_value=prepared), \
+             patch.object(self.httpd.chat, 'rpc', side_effect=ValueError('fixture late response')):
+            res, body = self.request('POST', '/api/chat/send', payload, self.auth())
+            self.assertEqual(res.status, 400)
+            self.assertNotIn('dispatchState', json.loads(body))
     def test_close_requires_auth_csrf_and_same_origin(self):
         self.terms.records = [{'id': 'a'*32, 'key': 'fixture', 'alive': True}]
         path = '/api/terminal/' + 'a'*32 + '/close'

@@ -1,4 +1,7 @@
 import json
+import hashlib
+import concurrent.futures
+import threading
 from contextlib import contextmanager, ExitStack
 from pathlib import Path
 import tempfile
@@ -174,6 +177,100 @@ class CoordinatorTest(unittest.TestCase):
         self.assertEqual(len(self.calls),1)
         with self.assertRaises(RuntimeError):self.flow.profiles(HOSTS[1],refresh=True)
         self.assertEqual(len(self.calls),2)
+    def test_failed_postcopy_validation_cleans_both_hosts_and_preserves_error(self):
+        self.fingerprint='changed'
+        with self.assertRaisesRegex(ValueError,'파일이 바뀌'):self.execute()
+        self.assertEqual([host for host,op in self.calls if op=='cleanup'],['local','remote'])
+        record=json.loads(next((Path(self.temp.name)/'transfers').glob('*/transfer.json')).read_text())
+        self.assertEqual(record['status'],'failed')
+        self.assertFalse(record['archiveCleanupPending'])
+    def test_failed_cleanup_is_pending_and_explicit_retry_keeps_failure_state(self):
+        original=self.flow.rpc
+        def fail(host,op,args=None,timeout=30):
+            if op=='cleanup' and host['name']=='remote':raise RuntimeError('fixture cleanup busy')
+            return original(host,op,args,timeout)
+        self.flow.rpc=fail;self.fingerprint='changed'
+        with self.assertRaises(ValueError):self.execute()
+        path=next((Path(self.temp.name)/'transfers').glob('*/transfer.json'))
+        record=json.loads(path.read_text())
+        self.assertEqual(record['archiveCleanupHosts'],['remote'])
+        self.assertTrue(record['archiveCleanupPending'])
+        self.flow.rpc=original
+        result=self.flow.cleanup_pending(record['id'])
+        self.assertFalse(result['archiveCleanupPending'])
+        self.assertEqual(json.loads(path.read_text())['status'],'failed')
+    def test_unknown_prepare_defers_target_until_explicit_prepared_readback(self):
+        original=self.flow.rpc
+        def lost(host,op,args=None,timeout=30):
+            if op=='prepare':raise RuntimeError('fixture response lost')
+            if op=='status':return {'prepared':False,'started':False}
+            return original(host,op,args,timeout)
+        self.flow.rpc=lost
+        with self.assertRaises(RuntimeError):self.execute()
+        path=next((Path(self.temp.name)/'transfers').glob('*/transfer.json'))
+        record=json.loads(path.read_text())
+        self.assertEqual([host for host,op in self.calls if op=='cleanup'],['local'])
+        result=self.flow.cleanup_pending(record['id'])
+        self.assertEqual(result['deferredHosts'],['remote'])
+        self.assertTrue(result['archiveCleanupPending'])
+        self.flow.rpc=lambda host,op,args=None,timeout=30: {'prepared':True,'started':False} if op=='status' else original(host,op,args,timeout)
+        self.assertFalse(self.flow.cleanup_pending(record['id'])['archiveCleanupPending'])
+        self.assertEqual(json.loads(path.read_text())['targetPreparation'],'unknown')
+    def test_active_copy_cannot_be_cleaned_in_rpc_gap(self):
+        entered,release=threading.Event(),threading.Event()
+        identifier=hashlib.sha256(b'active-copy-fixture').hexdigest()[:32]
+        archive=Path(self.temp.name)/'transfers'/identifier/'workspace.tar.gz'
+        def copy(*args):
+            archive.write_bytes(b'fixture active archive');archive.chmod(0o600)
+            entered.set()
+            if not release.wait(3):raise RuntimeError('fixture timeout')
+            archive.unlink()
+        self.flow._copy=copy
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            active=pool.submit(self.execute,'active-copy-fixture')
+            try:
+                self.assertTrue(entered.wait(3))
+                with self.assertRaisesRegex(RuntimeError,'진행 중'):self.flow.cleanup_pending(identifier)
+                self.assertTrue(archive.exists())
+                self.assertFalse(any(op=='cleanup' for _,op in self.calls))
+            finally:release.set()
+            active.result(3)
+    def test_cleanup_and_mark_started_are_serialized_without_overwriting_terminal_id(self):
+        result=self.execute()
+        identifier=result['transferId'];path=Path(self.temp.name)/'transfers'/identifier/'transfer.json'
+        record=json.loads(path.read_text());record.update(archiveCleanupHosts=['local'],archiveCleanupPending=True)
+        transfer_worker.save(path,record)
+        original=self.flow.rpc;entered,release,marking=threading.Event(),threading.Event(),threading.Event()
+        def rpc(host,op,args=None,timeout=30):
+            if op=='cleanup':
+                entered.set()
+                if not release.wait(3):raise RuntimeError('fixture timeout')
+            return original(host,op,args,timeout)
+        self.flow.rpc=rpc
+        def mark():
+            marking.set();self.flow.mark_started(identifier,'a'*32)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            clean=pool.submit(self.flow.cleanup_pending,identifier)
+            try:
+                self.assertTrue(entered.wait(3))
+                started=pool.submit(mark)
+                self.assertTrue(marking.wait(3));self.assertFalse(started.done())
+            finally:release.set()
+            clean.result(3);started.result(3)
+        saved=json.loads(path.read_text())
+        self.assertEqual(saved['status'],'started');self.assertEqual(saved['terminalId'],'a'*32)
+        self.assertFalse(saved['archiveCleanupPending'])
+    def test_stale_coordinator_archive_is_exact_private_regular_cleanup_only(self):
+        identifier=self.execute()['transferId'];folder=Path(self.temp.name)/'transfers'/identifier
+        path=folder/'transfer.json';record=json.loads(path.read_text());record['status']='copying'
+        transfer_worker.save(path,record)
+        archive=folder/'workspace.tar.gz';archive.write_bytes(b'fixture crash archive');archive.chmod(0o600)
+        self.assertFalse(self.flow.cleanup_pending(identifier)['archiveCleanupPending'])
+        self.assertFalse(archive.exists())
+        external=Path(self.temp.name)/'original';external.write_bytes(b'preserve');external.chmod(0o600)
+        archive.symlink_to(external)
+        with self.assertRaises(ValueError):self.flow.cleanup_pending(identifier)
+        self.assertEqual(external.read_bytes(),b'preserve')
 
 
 class WorkflowTransferTest(unittest.TestCase):
@@ -190,6 +287,11 @@ class WorkflowTransferTest(unittest.TestCase):
             max_terminals=4
             def __init__(self):self.records=[]
             def list(self):return list(self.records)
+            @contextmanager
+            def reserve(self,key):
+                if sum(bool(row.get('alive')) for row in self.records)>=self.max_terminals:
+                    raise ValueError('열린 터미널이 가득 찼습니다.')
+                yield
             def create(self,key,argv,cwd,env,metadata):
                 t={'id':str(len(self.records)+1)*32,'key':key,'alive':True,**metadata};self.records.append(t);return t
         self.terms=Terminals();self.flow=server.Workflow(self.board,self.terms,self.temp.name)
@@ -261,6 +363,48 @@ class WorkflowTransferTest(unittest.TestCase):
         self.assertTrue(plan(PROFILE['id'])['allowed'])
         self.assertFalse(plan(default_environment['id'])['allowed'])
         self.assertFalse(self.executions)
+
+
+class WorkerCleanupTest(unittest.TestCase):
+    def setUp(self):
+        self.temp=tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.home=Path(self.temp.name).resolve()
+        self.home_patch=patch.object(Path,'home',return_value=self.home)
+        self.home_patch.start();self.addCleanup(self.home_patch.stop)
+        self.identifier='a'*32
+        self.folder=transfer_worker.job(self.identifier)
+        (self.folder/'export').mkdir(mode=0o700)
+        self.archive=self.file(self.folder/'export'/('workspace-'+'b'*32+'.tar.gz'))
+        self.incoming=self.file(self.folder/'incoming.tar.gz')
+    def file(self,path):
+        path.write_bytes(b'fixture');path.chmod(0o600);return path
+    def cleanup(self):return transfer_worker.rpc({'op':'cleanup','args':{'transferId':self.identifier}})
+    def test_cleanup_removes_only_exact_regular_helper_archives(self):
+        temporary=self.file(self.folder/('incoming.'+'c'*12+'.tmp'))
+        preserved=[self.file(self.folder/name) for name in ('launch.json','handoff.md.native.json','transfer.json','started.json')]
+        preserved.append(self.file(self.folder/'export'/'unrelated-file.txt'))
+        workdir=self.home/'.local/share/sessionholic/workspaces'/self.identifier
+        workdir.mkdir(parents=True)
+        preserved.append(self.file(workdir/'original.txt'))
+        result=self.cleanup()
+        self.assertEqual(result['removed'],3)
+        self.assertFalse(any(path.exists() for path in (self.archive,self.incoming,temporary)))
+        self.assertTrue(all(path.exists() for path in preserved))
+    def test_busy_operation_never_unlinks_files_in_use(self):
+        with transfer_worker.job_operation(self.identifier):
+            with self.assertRaisesRegex(ValueError,'사용 중'):self.cleanup()
+            self.assertTrue(self.archive.exists());self.assertTrue(self.incoming.exists())
+        self.assertEqual(self.cleanup()['removed'],2)
+    def test_exact_archive_symlink_is_rejected_and_external_target_preserved(self):
+        self.incoming.unlink()
+        external=self.file(self.home/'external')
+        self.incoming.symlink_to(external)
+        with self.assertRaises(ValueError):self.cleanup()
+        self.assertEqual(external.read_bytes(),b'fixture')
+    def test_export_without_receipt_is_still_cleaned_after_source_verification_failure(self):
+        self.assertFalse((self.folder/'export.json').exists())
+        self.assertEqual(self.cleanup()['removed'],2)
 
 
 if __name__=='__main__':unittest.main()

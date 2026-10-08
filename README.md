@@ -1,5 +1,7 @@
 # 세션홀릭 - 에이전트 세션 매니저
 
+[![Test](https://github.com/RyanKwon87/sessionholic/actions/workflows/test.yml/badge.svg)](https://github.com/RyanKwon87/sessionholic/actions/workflows/test.yml)
+
 **Sessionholic — 내 AI 작업, 어디서든 이어서.**
 
 여러 컴퓨터의 Codex·Claude Code 작업을 모아 보고, 대화를 확인하고, 실제 터미널에 연결하는 개인용 세션 매니저입니다. 작업 파일과 최근 대화를 다른 컴퓨터로 인계할 수 있습니다. 각자 자신의 컴퓨터에서 실행하는 self-hosted 앱이며, 첫 공개판은 macOS를 대상으로 합니다.
@@ -32,6 +34,8 @@ brew install tmux
 소스를 받은 뒤 저장소 루트에서 실행합니다.
 
 ```sh
+git clone https://github.com/RyanKwon87/sessionholic.git
+cd sessionholic
 python3 scripts/sessionholic.py init
 python3 scripts/sessionholic.py doctor
 python3 scripts/sessionholic.py serve

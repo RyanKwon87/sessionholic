@@ -12,6 +12,8 @@
 
 Python 검증에는 macOS의 Python 3.9.6을 사용했습니다. 원격 실행 계약은 가짜 SSH 실행 파일과 실제 로컬 하위 프로세스로 검사했습니다. 실제 원격 기기에는 접속하지 않았습니다. 공개 파일 검사는 알려지지 않은 민감정보까지 모두 찾는다는 보장이 아닙니다.
 
+공개 후 최초 커밋 `7e2a6ce`의 [GitHub Actions 실행](https://github.com/RyanKwon87/sessionholic/actions/runs/37712905081)에서도 Python 228개·프런트엔드 82개 테스트와 공개 파일 검사가 통과했습니다. CI 환경은 macOS 14, Python 3.12, Node.js 22입니다. 이후 커밋의 결과는 [현재 워크플로 기록](https://github.com/RyanKwon87/sessionholic/actions/workflows/test.yml)에서 확인할 수 있습니다.
+
 ## 실제 Chrome 검수
 
 별도 합성 세션 서버에서 다음을 확인했습니다. 실제 사용자 작업과 native 모델에는 입력하지 않았습니다.
@@ -34,6 +36,5 @@ HTTP 업로드는 저장된 실제 파일 내용과 SHA-256을 비교했습니�
 - 이 공개 후보의 실제 Flip5 키보드·클립보드, 잠금 복귀와 Wi-Fi/데이터 전환
 - 공개 후보에서 실제 Codex·Claude 계정의 모델 turn, 버전별 호환성
 - 실제 두 컴퓨터 사이의 작업공간 이전과 네트워크 장애 복구
-- GitHub Actions의 원격 실행: 워크플로 파일만 준비했습니다.
 
 이전 개인 개발판의 실기 검증을 새 공개 후보의 검증으로 대신 계산하지 않습니다. [지원 범위](limitations.md)와 [보안 경계](../SECURITY.md)도 함께 확인하세요.

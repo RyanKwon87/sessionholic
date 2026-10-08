@@ -986,7 +986,7 @@ select:disabled {
   width: 100%;
   min-height: 64px;
   margin: 0;
-  padding: 12px 14px 12px 58px;
+  padding: 12px 14px;
   border: 0;
   border-radius: 0;
   background: var(--surface);
@@ -1005,8 +1005,8 @@ select:disabled {
   content: "";
   position: absolute;
   top: 0;
-  left: 58px;
-  right: 0;
+  left: 14px;
+  right: 14px;
   height: 1px;
   background: var(--sep);
 }
@@ -1024,64 +1024,47 @@ select:disabled {
 .card.selected + .card::before {
   opacity: 0;
 }
-.card-top {
-  display: flex;
-  align-items: baseline;
-  gap: 8px;
-}
-.agent {
-  position: absolute;
-  top: 13px;
-  left: 14px;
-  display: grid;
-  place-items: center;
-  width: 32px;
-  height: 32px;
-  border-radius: 9px;
-  background: var(--codex-tint);
-  color: var(--codex);
-  font-size: 14px;
-  font-weight: 700;
-}
-.agent.claude {
-  background: var(--claude-tint);
-  color: var(--claude);
-}
-.card-title {
-  flex: 1;
-  min-width: 0;
+.card-project {
+  display: block;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  font-size: var(--fs-body);
+  color: var(--label-2);
+  font-size: var(--fs-sub);
   font-weight: 600;
   line-height: 1.35;
+  margin-bottom: 3px;
 }
-.card-time {
-  flex: none;
-  color: var(--label-2);
-  font-size: var(--fs-sub);
-}
-.card-meta {
-  display: flex;
-  align-items: baseline;
-  gap: 6px;
-  min-width: 0;
-  margin-top: 4px;
-  color: var(--label-2);
-  font-size: var(--fs-sub);
-  line-height: 1.3;
-}
-/* project · account · device: wraps to a second line so the device (last) stays visible. */
-.card-meta > span:nth-child(2) {
-  flex: 1 1 auto;
-  min-width: 0;
+.card-title {
   display: -webkit-box;
   -webkit-line-clamp: 2;
   -webkit-box-orient: vertical;
+  min-width: 0;
   overflow: hidden;
   overflow-wrap: anywhere;
+  font-size: max(16px, var(--fs-body));
+  font-weight: 600;
+  line-height: 1.35;
 }
+.card-meta {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  margin-top: 6px;
+  color: var(--label-2);
+  font-size: var(--fs-cap);
+  line-height: 1.35;
+}
+.card-agent { flex: none; color: var(--codex); font-weight: 500; }
+.card-agent.claude { color: var(--claude); }
+.card-host { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.card-host::before { content: "·"; margin-right: 6px; }
+.card-time { flex: none; margin-left: auto; color: var(--label-2); font-size: var(--fs-cap); }
+.card-account-line { display: flex; align-items: baseline; gap: 6px; min-width: 0; margin-top: 4px; }
+.card-account { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--label-2); font-size: var(--fs-cap); line-height: 1.35; }
+.card-folder { display: block; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; margin-top: 4px; color: var(--label-2); font-size: var(--fs-cap); line-height: 1.35; }
+
 .badge {
   display: inline-flex;
   align-items: center;
@@ -1110,15 +1093,16 @@ select:disabled {
   white-space: nowrap;
 }
 .card-snippet {
-  display: -webkit-box;
-  -webkit-line-clamp: 2;
-  -webkit-box-orient: vertical;
+  display: block;
   overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
   margin-top: 4px;
   color: var(--snippet);
-  font-size: 14px;
-  line-height: 1.4;
+  font-size: var(--fs-sub);
+  line-height: 1.35;
 }
+
 .list-footnote {
   margin-top: auto;
   padding: 20px 0 4px;
@@ -2281,16 +2265,10 @@ select:disabled {
   }
   .card {
     min-height: 72px;
-    padding: 13px 14px 13px 58px;
-  }
-  .card-time {
-    font-size: var(--fs-sub);
+    padding: 13px 14px;
   }
   .card-meta {
-    font-size: 13px;
-  }
-  .card-snippet {
-    font-size: 15px;
+    gap: 5px;
   }
 
   .detail-pane {

@@ -2082,7 +2082,7 @@ test('service worker evicts only its own old shells and offline reads use the cu
     self, URL, Set, Response,
     fetch: async () => { throw new Error('offline'); },
     caches: {
-      keys: async () => ['another-app-shell', 'sessionholic-shell-v0', 'sessionholic-shell-v1', 'sessionholic-shell-v2', 'sessionholic-shell-v4', 'sessionholic-shell-v5', 'sessionholic-shell-v6', 'sessionholic-shell-v7'],
+      keys: async () => ['another-app-shell', 'sessionholic-shell-v0', 'sessionholic-shell-v1', 'sessionholic-shell-v2', 'sessionholic-shell-v4', 'sessionholic-shell-v5', 'sessionholic-shell-v6', 'sessionholic-shell-v7', 'sessionholic-shell-v8'],
       delete: async (key) => { deleted.push(key); },
       open: async (key) => { opened.push(key); return { match: async () => currentShell }; },
       match: async () => { throw new Error('Global cross-application cache lookup is forbidden'); },
@@ -2090,11 +2090,11 @@ test('service worker evicts only its own old shells and offline reads use the cu
   });
   let activated;
   listeners.activate({ waitUntil: (promise) => { activated = promise; } }); await activated;
-  assert.deepEqual(deleted, ['sessionholic-shell-v0', 'sessionholic-shell-v1', 'sessionholic-shell-v2', 'sessionholic-shell-v4', 'sessionholic-shell-v5', 'sessionholic-shell-v6']);
+  assert.deepEqual(deleted, ['sessionholic-shell-v0', 'sessionholic-shell-v1', 'sessionholic-shell-v2', 'sessionholic-shell-v4', 'sessionholic-shell-v5', 'sessionholic-shell-v6', 'sessionholic-shell-v7']);
   listeners.fetch({ request: { method: 'GET', url: 'https://app.example/' },
     respondWith: (promise) => { response = promise; }, waitUntil() {} });
   assert.equal(await response, currentShell);
-  assert.deepEqual(opened, ['sessionholic-shell-v7']);
+  assert.deepEqual(opened, ['sessionholic-shell-v8']);
 });
 
 test('an offline first launch restores authentication and already-open terminal rows without reopening their sessions', async () => {
@@ -3152,4 +3152,130 @@ test('confirmed queued work keeps the existing bounded poll alive while idle, bu
   c.context.document.hidden = false; c.state.offline = true; c.scheduleChatPoll(s, entry); assert.equal(timers.length, count);
   c.state.offline = false; mode = 'unknown'; await c.loadChatState(s, false);
   assert.equal(c.chatQueueCount(entry), 0); assert.equal(timers.length, count);
+});
+
+function recentSession(id, fields = {}) {
+  const s = { host: 'workstation', hostLabel: 'Workstation', agent: 'codex', home: '.codex-example', id,
+    title: '검토할 작업', project: 'Sample project', account: 'Sample profile', phase: 'idle', updatedAt: 1000, ...fields };
+  s.key = [s.host, s.agent, s.home || '', s.id].join('|');
+  return s;
+}
+function setRecentSnapshot(c, sessions) {
+  c.state.authenticated = true;
+  c.state.snapshot = { serverTime: 1100, hosts: [{ name: 'workstation', label: 'Workstation', ok: true,
+    data: { codex: sessions.filter((s) => s.agent === 'codex'), claude: sessions.filter((s) => s.agent === 'claude') } }] };
+}
+
+test('recent cards give project and full task separate priority while retaining device, status and account without transport or generated titles', () => {
+  let calls = 0; const c = client(async () => { calls++; throw new Error('render must not fetch'); }, noChatTimers);
+  const project = '매우 긴 프로젝트 라벨 '.repeat(8); const title = '긴 실제 작업 제목 '.repeat(12);
+  const s = recentSession('layout', { project, title, snippet: '  ' + title + '  ', cwd: '/Users/example/work/service', phase: 'working', stale: true });
+  setRecentSnapshot(c, [s]); c.state.selected = s.key;
+  c.renderGroups([s], 1100);
+  const card = byClass(c.get('groups'), 'card')[0];
+  assert.equal(card.tagName, 'BUTTON'); assert.equal(card.type, 'button');
+  assert.equal(card.children[0].className, 'card-project'); assert.equal(card.children[1].className, 'card-title');
+  assert.equal(byClass(card, 'card-project')[0].textContent, project.trim());
+  assert.equal(byClass(card, 'card-project')[0].title, project.trim());
+  assert.equal(byClass(card, 'card-title')[0].textContent, title.trim());
+  assert.equal(byClass(card, 'card-snippet')[0].hidden, true);
+  assert.match(card.attributes['aria-label'], /프로젝트:.*작업:.*작업 중.*Codex.*기기: Workstation.*계정 설정: Sample profile.*마지막 확인 기준/s);
+  assert.equal(card.attributes['aria-pressed'], 'true');
+  assert.equal(byClass(card, 'agent').length, 0);
+  assert.equal(byClass(card, 'card-agent')[0].textContent, 'Codex');
+  assert.equal(byClass(card, 'card-account')[0].textContent, '계정 설정 · Sample profile');
+  assert.equal(calls, 0); assert.equal(c.state.chats.size, 0);
+  assert.equal(s.title, title); assert.equal(s.cwd, '/Users/example/work/service');
+});
+
+test('recent cards expose only disambiguating folder suffixes, handle home and missing project labels honestly, and search actual cwd', () => {
+  const c = client(undefined, noChatTimers);
+  const rows = [
+    recentSession('a', { project: 'Shared project', cwd: '/Users/source/work/team-a/repo/src' }),
+    recentSession('b', { project: 'Shared project', cwd: '/home/other/work/team-b/repo/src' }),
+    recentSession('simple', { project: 'Sessionholic', cwd: '/Users/source/projects/sessionholic' }),
+    recentSession('home', { project: '~', cwd: '/Users/source', title: '(제목 없음)' }),
+    recentSession('unknown', { project: '', cwd: '', title: '(이름 없음)' }),
+  ];
+  c.renderGroups(rows, 1100);
+  const cards = byClass(c.get('groups'), 'card');
+  assert.equal(byClass(cards[0], 'card-folder')[0].textContent, '작업 폴더 · team-a / repo / src');
+  assert.equal(byClass(cards[1], 'card-folder')[0].textContent, '작업 폴더 · team-b / repo / src');
+  for (const card of cards) {
+    assert.doesNotMatch(textOf(card) + card.attributes['aria-label'], /source|other|\/Users|\/home/);
+  }
+  assert.equal(byClass(cards[2], 'card-folder')[0].hidden, true);
+  assert.equal(byClass(cards[3], 'card-project')[0].textContent, '홈 폴더');
+  assert.equal(byClass(cards[3], 'card-folder')[0].hidden, true);
+  assert.equal(byClass(cards[4], 'card-project')[0].textContent, '프로젝트 확인 필요');
+  assert.equal(byClass(cards[4], 'card-title')[0].textContent, '제목 없는 작업');
+  c.state.search = 'work/team-b/repo/src';
+  assert.equal(c.matches(rows[1], 1100), true); assert.equal(c.matches(rows[0], 1100), false);
+  assert.equal(rows[0].project, 'Shared project'); // Folder hints never rename the project.
+});
+
+test('recent card updates retain mounted buttons, selection, keyboard focus and list scroll through group changes without stealing search focus', () => {
+  const c = client(undefined, noChatTimers);
+  const first = recentSession('first', { updatedAt: 1001 }); const second = recentSession('second', { updatedAt: 1002 });
+  c.state.selected = first.key;
+  c.renderGroups([first, second], 1100);
+  const cards = byClass(c.get('groups'), 'card'); const selected = cards.find((card) => card.dataset.sessionKey === first.key);
+  assert.equal(cards[0].dataset.sessionKey, second.key); // Existing recent sort is unchanged.
+  selected.focus = function () { this.focusCount = (this.focusCount || 0) + 1; c.context.document.activeElement = this; };
+  c.context.document.activeElement = selected;
+  const pane = c.get('task-list-pane'); pane.scrollTop = 55;
+  c.renderGroups([{ ...first, title: '수정된 작업 제목' }, second], 1100);
+  assert.equal(byClass(c.get('groups'), 'card').find((card) => card.dataset.sessionKey === first.key), selected);
+  assert.equal(c.context.document.activeElement, selected); assert.equal(pane.scrollTop, 55);
+  const create = c.context.document.createElement;
+  c.context.document.createElement = (tag) => {
+    const made = create(tag); const insert = made.insertBefore;
+    made.insertBefore = function (child, before) {
+      if (child === selected) { c.context.document.activeElement = c.context.document.body; pane.scrollTop = 0; }
+      return insert.call(this, child, before);
+    };
+    return made;
+  };
+  c.renderGroups([{ ...first, phase: 'needs_input' }, second], 1100);
+  assert.equal(byClass(c.get('groups'), 'card')[0], selected);
+  assert.equal(selected.attributes['aria-pressed'], 'true');
+  assert.equal(c.context.document.activeElement, selected); assert.equal(selected.focusCount, 1); assert.equal(pane.scrollTop, 55);
+  const search = c.get('search'); c.context.document.activeElement = search;
+  c.renderGroups([{ ...first, phase: 'needs_input', account: 'Updated profile' }, second], 1100);
+  assert.equal(c.context.document.activeElement, search); assert.equal(selected.focusCount, 1);
+});
+
+test('card activation keeps exact home identity and one initial read, while removed and prior-authentication buttons cannot activate later sessions', async () => {
+  const requests = [];
+  const c = client(async (url, options) => { requests.push({ url, body: JSON.parse(options.body) });
+    return { ok: true, status: 200, json: async () => queueStateReply(JSON.parse(options.body).source, [], [], { total: 0 }) };
+  }, noChatTimers);
+  const first = recentSession('same-session', { home: '.codex-first', project: 'Same project', title: 'Same title' });
+  const second = recentSession('same-session', { home: '.codex-second', project: 'Same project', title: 'Same title' });
+  setRecentSnapshot(c, [first, second]); c.renderGroups(c.allSessions(), 1100);
+  const cards = byClass(c.get('groups'), 'card'); const oldFirst = cards[0]; const oldSecond = cards[1];
+  assert.notEqual(oldFirst, oldSecond); assert.notEqual(oldFirst.dataset.sourceKey, oldSecond.dataset.sourceKey);
+  oldSecond.events.click(); await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(c.state.selected, second.key); assert.equal(requests.length, 1);
+  assert.equal(requests[0].url, '/api/chat/state'); assert.equal(requests[0].body.source.home, '.codex-second');
+  c.state.snapshot.hosts[0].data.codex = [first]; vm.runInContext('render()', c.context);
+  oldSecond.events.click(); assert.equal(c.state.selected, null); assert.equal(requests.length, 1);
+  c.showLogin(); setRecentSnapshot(c, [first]); c.renderGroups(c.allSessions(), 1100);
+  const newFirst = byClass(c.get('groups'), 'card')[0];
+  assert.notEqual(newFirst, oldFirst); oldFirst.events.click(); assert.equal(requests.length, 1);
+  newFirst.events.click(); await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(requests.length, 2); assert.equal(requests[1].body.source.home, '.codex-first');
+});
+
+test('changing list filters removes hidden cards without changing the selected source and different preview text stays explicitly a conversation preview', () => {
+  const c = client(undefined, noChatTimers);
+  const first = recentSession('preview-a', { title: '설정 점검', snippet: '이전에 확인한 대화의 본문', project: 'First project' });
+  const second = recentSession('preview-b', { project: 'Second project' });
+  c.state.selected = first.key; c.renderGroups([first, second], 1100);
+  const original = byClass(c.get('groups'), 'card')[0];
+  assert.equal(byClass(original, 'card-snippet')[0].textContent, '대화 미리보기 · 이전에 확인한 대화의 본문');
+  c.state.filters.project = 'Second project'; c.renderGroups([second], 1100);
+  assert.equal(byClass(c.get('groups'), 'card').length, 1);
+  assert.equal(c.state.selected, first.key);
+  assert.equal(byClass(c.get('groups'), 'card')[0].dataset.sessionKey, second.key);
 });

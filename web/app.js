@@ -263,6 +263,7 @@ function matches(s, now) {
   return [
     s.title,
     s.project,
+    s.cwd,
     s.account,
     s.snippet,
     s.hostLabel,
@@ -383,75 +384,172 @@ function renderFilters(sessions) {
   const n = Object.values(state.filters).filter(Boolean).length;
   $("filter-count").textContent = n ? `${n}개 적용` : "";
 }
+function cardLine(value) {
+  return String(value || "").replace(/\s+/g, " ").trim();
+}
+function cardProject(s) {
+  const project = cardLine(s.project);
+  return project === "~" ? "홈 폴더" : project || "프로젝트 확인 필요";
+}
+function cardFolderParts(s) {
+  const cwd = cardLine(s.cwd).replace(/\\/g, "/").replace(/\/+$/, "");
+  if (!cwd) return cardLine(s.cwd).startsWith("/") ? ["최상위 폴더"] : [];
+  if (cwd === "~" || cwd === "/root") return ["홈 폴더"];
+  if (cwd === ".") return ["현재 폴더"];
+  let parts = cwd.split("/").filter(Boolean);
+  if (parts[0] === "~") parts = parts.slice(1);
+  else if (["users", "home"].includes(parts[0]?.toLowerCase()) && parts.length >= 2) parts = parts.slice(2);
+  else if (/^[A-Za-z]:$/.test(parts[0] || "") && parts[1]?.toLowerCase() === "users" && parts.length >= 3) parts = parts.slice(3);
+  return parts.length ? parts : ["홈 폴더"];
+}
+function cardFolderHints(shown) {
+  const folders = shown.map((s) => ({ s, project: cardProject(s), parts: cardFolderParts(s), cwd: cardLine(s.cwd) }));
+  const hints = new Map();
+  const suffix = (parts, depth) => parts.slice(-depth).join(" / ");
+  for (const folder of folders) {
+    const { s, project, parts, cwd } = folder;
+    if (!parts.length) { hints.set(s.key, ""); continue; }
+    const peers = folders.filter((other) => other.project === project && other.cwd !== cwd && other.parts.length);
+    if (!peers.length && parts.at(-1).toLocaleLowerCase() === project.toLocaleLowerCase()) {
+      hints.set(s.key, ""); continue;
+    }
+    let depth = Math.min(2, parts.length);
+    while (depth < parts.length && peers.some((other) => suffix(other.parts, depth) === suffix(parts, depth))) depth++;
+    hints.set(s.key, suffix(parts, depth));
+  }
+  return hints;
+}
+function placeChildren(parent, desired) {
+  for (const child of [...parent.children]) if (!desired.includes(child)) parent.removeChild(child);
+  for (let index = 0; index < desired.length; index++)
+    if (parent.children[index] !== desired[index]) parent.insertBefore(desired[index], parent.children[index] || null);
+}
 function renderGroups(shown, now) {
   const box = $("groups");
-  box.replaceChildren();
+  const pane = $("task-list-pane");
+  const scroll = pane?.scrollTop;
+  const active = document.activeElement;
+  const sections = new Map();
+  const cards = new Map();
+  // Reuse only what is mounted now; lock clears this DOM and its references.
+  for (const section of box.children) {
+    if (section.dataset.groupKey) sections.set(section.dataset.groupKey, section);
+    for (const node of section.children)
+      if (node.dataset.sessionKey) cards.set(node.dataset.sessionKey, node);
+  }
+  const focused = active?.dataset?.sessionKey && cards.get(active.dataset.sessionKey) === active ? active : null;
+  const folders = cardFolderHints(shown);
+  const desired = [];
+  const visible = new Set();
   for (const group of GROUPS) {
     const items = shown
       .filter((s) => groupOf(s) === group.key)
       .sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
     if (!items.length) continue;
-    const section = el("section", "group");
-    const head = el("h2", `group-head ${group.tone}`, group.label);
-    head.append(el("span", "group-count", items.length));
-    section.append(head);
-    for (const session of items) section.append(card(session, now));
-    box.append(section);
-  }
-  if (!shown.length)
-    {
-      const filtered = state.search || Object.values(state.filters).some(Boolean);
-      const unconfigured = !state.snapshot?.hosts?.length;
-      const offline = state.snapshot?.hosts?.length && state.snapshot.hosts.every((host) => !host.ok && !host.refreshing);
-      const empty = el("div", "empty-list");
-      empty.append(el("p", null, filtered ? "조건에 맞는 작업이 없습니다." : unconfigured
-        ? "연결할 기기가 아직 설정되지 않았습니다. 설치 안내에 따라 기기를 설정한 뒤 새로고침해 주세요." : offline
-        ? "기기에 연결되지 않아 작업을 확인하지 못했습니다. 기기 연결과 에이전트 설치 상태를 확인한 뒤 다시 확인해 주세요."
-        : state.snapshot?.hosts?.some((host) => host.refreshing)
-          ? "기기에서 작업을 확인하고 있습니다…"
-          : "표시할 최근 작업이 없습니다. 설정한 기기에서 Claude Code나 Codex로 대화를 시작한 뒤 새로고침해 주세요. 이전 대화는 필터에서 확인할 수 있습니다."));
-      if (filtered) empty.append(button("검색·필터 초기화", "secondary", () => {
-        state.search = "";
-        for (const key of Object.keys(state.filters)) state.filters[key] = "";
-        state.accountFilterRoutes = null;
-        $("search").value = "";
-        render();
-      }));
-      else if (offline) empty.append(button("다시 확인", "secondary", manualRefresh));
-      box.append(empty);
+    let section = sections.get(group.key);
+    if (!section) {
+      section = el("section", "group");
+      section.dataset.groupKey = group.key;
+      const head = el("h2", `group-head ${group.tone}`, group.label);
+      const count = el("span", "group-count");
+      head.append(count);
+      section.cardHeading = head;
+      section.cardCount = count;
     }
+    section.cardCount.textContent = items.length;
+    const children = [section.cardHeading];
+    for (const session of items) {
+      const source = chatKey(sourceOf(session));
+      const previous = cards.get(session.key);
+      const node = previous?.dataset.sourceKey === source ? previous : card(session);
+      updateCard(node, session, now, folders.get(session.key));
+      children.push(node); visible.add(node);
+    }
+    placeChildren(section, children);
+    desired.push(section);
+  }
+  if (!shown.length) {
+    const filtered = state.search || Object.values(state.filters).some(Boolean);
+    const unconfigured = !state.snapshot?.hosts?.length;
+    const offline = state.snapshot?.hosts?.length && state.snapshot.hosts.every((host) => !host.ok && !host.refreshing);
+    const empty = el("div", "empty-list");
+    empty.append(el("p", null, filtered ? "조건에 맞는 작업이 없습니다." : unconfigured
+      ? "연결할 기기가 아직 설정되지 않았습니다. 설치 안내에 따라 기기를 설정한 뒤 새로고침해 주세요." : offline
+      ? "기기에 연결되지 않아 작업을 확인하지 못했습니다. 기기 연결과 에이전트 설치 상태를 확인한 뒤 다시 확인해 주세요."
+      : state.snapshot?.hosts?.some((host) => host.refreshing)
+        ? "기기에서 작업을 확인하고 있습니다…"
+        : "표시할 최근 작업이 없습니다. 설정한 기기에서 Claude Code나 Codex로 대화를 시작한 뒤 새로고침해 주세요. 이전 대화는 필터에서 확인할 수 있습니다."));
+    if (filtered) empty.append(button("검색·필터 초기화", "secondary", () => {
+      state.search = "";
+      for (const key of Object.keys(state.filters)) state.filters[key] = "";
+      state.accountFilterRoutes = null;
+      $("search").value = "";
+      render();
+    }));
+    else if (offline) empty.append(button("다시 확인", "secondary", manualRefresh));
+    desired.push(empty);
+  }
+  placeChildren(box, desired);
+  if (focused && visible.has(focused) && document.activeElement !== focused) focused.focus({ preventScroll: true });
+  if (typeof scroll === "number") pane.scrollTop = scroll;
 }
-function card(s, now) {
-  const node = button(
-    "",
-    `card${state.selected === s.key ? " selected" : ""}`,
-    () => select(s.key),
-  );
-  node.setAttribute("aria-pressed", String(state.selected === s.key));
+function card(s) {
+  const node = button("", "card", () => {
+    const mounted = [...$("groups").children].some((section) => [...section.children].includes(node));
+    const current = allSessions().find((session) => session.key === node.dataset.sessionKey);
+    if (state.authenticated && mounted && current && chatKey(sourceOf(current)) === node.dataset.sourceKey) select(current.key);
+  });
   node.dataset.sessionKey = s.key;
-  const top = el("span", "card-top");
-  top.append(
-    el("span", `agent ${s.agent}`, s.agent === "claude" ? "C" : "X"),
-    el("span", "card-title", s.title || "제목 없는 작업"),
-    el("span", "card-time", ago(s.updatedAt, now)),
-  );
+  node.dataset.sourceKey = chatKey(sourceOf(s));
+  const project = el("span", "card-project");
+  const title = el("span", "card-title");
+  const snippet = el("span", "card-snippet");
+  const folder = el("span", "card-folder");
   const meta = el("span", "card-meta");
-  const [label, tone] = BADGES[s.phase] || [
-    s.phase || "상태 확인 필요",
-    "gray",
-  ];
-  meta.append(
-    el("span", `badge ${tone}`, label),
-    el(
-      "span",
-      null,
-      [s.project, s.account, s.hostLabel].filter(Boolean).join(" · "),
-    ),
-  );
-  if (s.stale) meta.append(el("span", "stale-tag", "마지막 확인 기준"));
-  node.append(top, meta);
-  if (s.snippet) node.append(el("span", "card-snippet", s.snippet));
+  const badge = el("span", "badge");
+  const agent = el("span", "card-agent");
+  const host = el("span", "card-host");
+  const time = el("span", "card-time");
+  meta.append(badge, agent, host, time);
+  const accountLine = el("span", "card-account-line");
+  const account = el("span", "card-account");
+  const stale = el("span", "stale-tag", "마지막 확인 기준");
+  accountLine.append(account, stale);
+  node.append(project, title, snippet, folder, meta, accountLine);
+  node.cardParts = { project, title, snippet, folder, badge, agent, host, time, accountLine, account, stale };
   return node;
+}
+function updateCard(node, s, now, folderHint = "") {
+  const p = node.cardParts;
+  const write = (target, value) => { if (target.textContent !== value) target.textContent = value; };
+  const project = cardProject(s);
+  const rawTitle = cardLine(s.title);
+  const title = !rawTitle || ["(제목 없음)", "(이름 없음)"].includes(rawTitle) ? "제목 없는 작업" : rawTitle;
+  const snippet = cardLine(s.snippet);
+  const preview = snippet && snippet !== rawTitle && snippet !== title ? snippet : "";
+  const agent = AGENTS[s.agent] || s.agent || "에이전트";
+  const host = s.hostLabel || s.host || "기기 확인 필요";
+  const account = cardLine(s.account);
+  const [label, tone] = BADGES[s.phase] || [s.phase || "상태 확인 필요", "gray"];
+  const time = ago(s.updatedAt, now);
+  node.className = `card${state.selected === s.key ? " selected" : ""}`;
+  node.setAttribute("aria-pressed", String(state.selected === s.key));
+  node.setAttribute("aria-label", ["프로젝트: " + project, "작업: " + title,
+    preview ? "대화 미리보기: " + preview : "", folderHint ? "작업 폴더: " + folderHint : "",
+    label, agent, "기기: " + host, account ? "계정 설정: " + account : "", time,
+    s.stale ? "마지막 확인 기준" : ""].filter(Boolean).join(". "));
+  node.title = `${project}\n${title}`;
+  write(p.project, project); p.project.title = project;
+  write(p.title, title); p.title.title = title;
+  write(p.snippet, preview ? `대화 미리보기 · ${preview}` : ""); p.snippet.hidden = !preview; p.snippet.title = preview;
+  write(p.folder, folderHint ? `작업 폴더 · ${folderHint}` : ""); p.folder.hidden = !folderHint; p.folder.title = folderHint;
+  write(p.badge, label); p.badge.className = `badge ${tone}`;
+  write(p.agent, agent); p.agent.className = `card-agent ${s.agent}`;
+  write(p.host, host); p.host.title = host;
+  write(p.time, time);
+  write(p.account, account ? `계정 설정 · ${account}` : ""); p.account.title = account; p.account.hidden = !account;
+  p.stale.hidden = !s.stale;
+  p.accountLine.hidden = !account && !s.stale;
 }
 
 function focusDetailBack() {

@@ -599,7 +599,7 @@ function chatEntry(s) {
   if (!state.chats.has(key)) state.chats.set(key, {
     source: Object.freeze({ ...source }), text: "", attachments: [], data: null,
     pending: null, receipt: null, sending: false, uploads: 0,
-    composing: false, editorEpoch: 0, stateEpoch: 0, recheckQueued: false, expanded: false, checking: false, error: "", notice: "", revision: 0,
+    composing: false, editorEpoch: 0, stateEpoch: 0, recheckQueued: false, expanded: false, inputCollapsed: false, checking: false, error: "", notice: "", revision: 0,
   });
   return state.chats.get(key);
 }
@@ -650,6 +650,7 @@ function buildChatComposer(s) {
   input.value = entry.text;
   input.addEventListener("input", () => {
     if (!editorCurrent()) return;
+    entry.inputCollapsed = false;
     entry.text = input.value;
     entry.notice = "";
     entry.revision++;
@@ -663,6 +664,7 @@ function buildChatComposer(s) {
   input.addEventListener("compositionend", () => {
     if (!editorCurrent()) return;
     entry.composing = false;
+    entry.inputCollapsed = false;
     entry.text = input.value;
     entry.revision++;
     updateChatComposer(entry);
@@ -730,7 +732,9 @@ function buildChatComposer(s) {
   hint.hidden = !entry.expanded;
   const expand = button(entry.expanded ? "접기" : "펼치기", "chat-toggle", () => {
     if (!editorCurrent()) return;
-    entry.expanded = !entry.expanded;
+    const collapse = entry.expanded || input.dataset.grown === "true";
+    entry.expanded = !collapse;
+    entry.inputCollapsed = collapse;
     box.classList.toggle?.("is-compact", !entry.expanded);
     input.rows = entry.expanded ? 3 : 1;
     heading.hidden = hint.hidden = !entry.expanded;
@@ -759,6 +763,37 @@ function buildChatComposer(s) {
     loadChatState(s, true);
   });
   return box;
+}
+function resizeChatInput(entry) {
+  if (!currentChat(entry) || $("chat-composer")?.dataset.source !== chatKey(entry.source)) return;
+  const input = $("chat-input");
+  const style = window.getComputedStyle?.(input);
+  const line = parseFloat(style?.lineHeight) || 22;
+  const padding = (parseFloat(style?.paddingTop) || 10) + (parseFloat(style?.paddingBottom) || 10);
+  const border = (parseFloat(style?.borderTopWidth) || 1) + (parseFloat(style?.borderBottomWidth) || 1);
+  const base = Math.max(44, line + padding + border);
+  const viewport = window.visualViewport?.height || window.innerHeight || 800;
+  const cap = entry.inputCollapsed ? base : Math.max(base,
+    Math.min(line * (entry.expanded ? 11 : 6) + padding + border, viewport * 0.34, viewport - 200));
+  const minimum = Math.min(cap, entry.expanded ? 3 * line + padding + border : base);
+  const list = $("messages");
+  const atBottom = list && list.scrollHeight - list.scrollTop - list.clientHeight < 50;
+  const inputScroll = input.scrollTop || 0;
+  input.style.minHeight = `${minimum}px`;
+  input.style.maxHeight = `${cap}px`;
+  input.style.height = "0px";
+  const content = input.value ? input.scrollHeight + border || minimum : minimum;
+  const height = Math.max(minimum, Math.min(cap, content));
+  input.style.height = `${Math.ceil(height)}px`;
+  input.style.overflowY = content > cap ? "auto" : "hidden";
+  input.scrollTop = input.value ? inputScroll : 0;
+  if (document.activeElement === input && input.selectionEnd === input.value.length && content > cap)
+    input.scrollTop = input.scrollHeight;
+  input.dataset.grown = String(height > base + 1);
+  const toggle = $("chat-expand");
+  toggle.textContent = height > base + 1 || entry.expanded ? "접기" : "펼치기";
+  toggle.setAttribute("aria-expanded", String(height > base + 1 || entry.expanded));
+  if (atBottom) list.scrollTop = list.scrollHeight;
 }
 function closeChatToolsOutside(event) {
   for (const id of ["chat-tools", "terminal-settings"]) {
@@ -842,6 +877,7 @@ function updateChatComposer(entry) {
     }
     chips.append(chip);
   }
+  resizeChatInput(entry);
 }
 function stopChatPolling() {
   clearTimeout(state.chatPollTimer);
@@ -868,7 +904,10 @@ function applyChatReceipt(entry, receipt) {
   if ((receipt.status !== "failed" || receipt.confirmed === true) && entry.revision === entry.pending.revision) {
     entry.text = "";
     entry.attachments = [];
-    if (currentChat(entry)) $("chat-input").value = "";
+    if (currentChat(entry)) {
+      $("chat-input").value = "";
+      resizeChatInput(entry);
+    }
   }
   entry.pending = null;
 }
@@ -1030,6 +1069,7 @@ function insertChatText(entry, input, text) {
   input.value = input.value.slice(0, start) + text + input.value.slice(end);
   input.setSelectionRange?.(start + text.length, start + text.length);
   entry.text = input.value;
+  entry.inputCollapsed = false;
   entry.revision++;
   updateChatComposer(entry);
 }
@@ -1213,10 +1253,23 @@ function renderMessages(s, messages, error = "", fresh = false) {
         if (message.ts) label.append(el("span", null, clock(message.ts)));
         row.append(label);
       }
-      row.append(el("div", "bubble", message.text));
+      const bubble = el("div", "bubble");
+      if (role === "assistant" && typeof MessageFormat !== "undefined") {
+        MessageFormat.render(bubble, message.text || "", {
+          onCopy: async (text, kind) => {
+            try {
+              await navigator.clipboard.writeText(text);
+              toast(kind === "code" ? "코드를 복사했습니다." : "인용문을 복사했습니다.");
+            } catch { toast("클립보드에 접근할 수 없습니다. 본문을 길게 눌러 선택해 주세요."); }
+          },
+        });
+      } else bubble.textContent = message.text || "";
+      row.append(bubble);
     }
     const copy = button("복사", "msg-copy", async () => {
-      try { await navigator.clipboard.writeText(message.text || ""); toast("메시지 본문을 복사했습니다."); }
+      const text = role === "assistant" && typeof MessageFormat !== "undefined"
+        ? MessageFormat.plainText(message.text || "") : message.text || "";
+      try { await navigator.clipboard.writeText(text); toast("메시지 본문을 복사했습니다."); }
       catch { toast("클립보드에 접근할 수 없습니다. 본문을 길게 눌러 선택해 주세요."); }
     });
     copy.setAttribute("aria-label", "메시지 본문 복사");
@@ -2607,6 +2660,8 @@ function updateViewport() {
     window.visualViewport?.height || window.innerHeight,
   );
   document.documentElement.style.setProperty("--app-height", `${height}px`);
+  const selected = selectedSession();
+  if (selected) resizeChatInput(chatEntry(selected));
   fitTerminal();
 }
 function showOfflineStart() {

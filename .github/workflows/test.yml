@@ -23,6 +23,6 @@ jobs:
       - name: Python regressions
         run: python -m unittest discover -s tests -v
       - name: Frontend regressions
-        run: node --test tests/test_frontend.cjs
+        run: node --test tests/test_*.cjs
       - name: Public tree checks
         run: python scripts/check_public.py --release

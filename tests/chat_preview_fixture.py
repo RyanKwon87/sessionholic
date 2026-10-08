@@ -26,7 +26,16 @@ class FakeNative:
         self.messages = {row['id']: [
             {'role': 'user', 'text': '휴대폰에서 한글과 이미지를 함께 보낼 수 있게 해줘.', 'ts': time.time() - 20},
             {'role': 'tool', 'text': '검증용 파일 읽기\n선택한 텍스트와 펼친 기록은 상태 갱신 중에도 유지됩니다.', 'ts': time.time() - 15},
-            {'role': 'assistant', 'text': '검증 화면입니다. 실제 모델 호출 없이 접수와 대기열을 확인할 수 있습니다.', 'ts': time.time() - 10},
+            {'role': 'assistant', 'text': (
+                '**검증 화면**입니다. 실제 모델 호출 없이 접수와 대기열을 확인할 수 있습니다.\n\n'
+                '아래 문구를 복사해 보세요.\n\n'
+                '> 미리보기 화면의 안내 문구를 쉽게 바꿔주세요.\n>\n'
+                '> 제목은 **작업 미리보기**로 바꾸고, 휴대폰에서도 잘 읽히게 해주세요.\n\n'
+                '코드의 기호와 들여쓰기는 그대로 복사됩니다.\n\n'
+                '```python\nif a > b:\n    print("값 확인")\n```\n\n'
+                '- 입력창은 줄바꿈에 맞춰 늘어납니다.\n'
+                '- [프로젝트 문서](https://example.com/docs)를 참고하세요.'
+            ), 'ts': time.time() - 10},
         ] for row in rows}
         self.receipts = {}
         self.lock = threading.RLock()

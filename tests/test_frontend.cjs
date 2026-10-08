@@ -7,6 +7,7 @@ const fs = require("node:fs");
 const path = require("node:path");
 const vm = require("node:vm");
 const source = fs.readFileSync(path.join(__dirname, "../web/app.js"), "utf8");
+const messageSource = fs.readFileSync(path.join(__dirname, "../web/message-format.js"), "utf8");
 
 function node() {
   return {
@@ -92,6 +93,7 @@ function client(
     },
     localStorage: { getItem: () => null },
     fetch: fetchImpl,
+    URL,
     URLSearchParams,
     Uint8Array,
     TextEncoder,
@@ -110,9 +112,10 @@ function client(
       this.disabled = false;
     },
   });
+  vm.runInContext(messageSource, context);
   vm.runInContext(source, context);
   const api = vm.runInContext(
-    "({state,api,sourceOf,accountOf,sendInput,pasteDraft,prepareDraftPaste,startDraftComposition,endDraftComposition,inputDraft,stopTerminalReader,startTerminalReader,closePlan,navigateView,backToList,backFromTerminal,closeTerminal,cancelTerminalClose,confirmTerminalClose,populateAccount,populateRoute,updateContinue,renderPlan,launchPlan,openTerminal,saveDraft,draftKey,refreshTerminals,renderTerminals,renderTerminalReturn,renderFilters,terminalCloseCopy,warnDraftUnload,preparePlan,renderGroups,renderMessages,loadDetail,chatKey,chatEntry,currentChat,chatSupported,chatAttachmentsSupported,buildChatComposer,sendChat,loadChatState,applyChatReceipt,uploadChatFiles,pasteChat,scheduleChatPoll,stopChatPolling,openNativeChat,allSessions,buildContinuePanel,chatReceiptCopy,returnToBoard,readChatClipboard,accountDisplay,sessionAccountLabel,closeChatToolsOutside,closeChatToolsEscape,drawDetail,refreshDetail,loadCapabilities,matches,recoverConnection,networkOffline,poll,select,focusDetailBack,restoreSelectedCardFocus,showLogin,lock,beginAuthEpoch})",
+    "({state,api,sourceOf,accountOf,sendInput,pasteDraft,prepareDraftPaste,startDraftComposition,endDraftComposition,inputDraft,stopTerminalReader,startTerminalReader,closePlan,navigateView,backToList,backFromTerminal,closeTerminal,cancelTerminalClose,confirmTerminalClose,populateAccount,populateRoute,updateContinue,renderPlan,launchPlan,openTerminal,saveDraft,draftKey,refreshTerminals,renderTerminals,renderTerminalReturn,renderFilters,terminalCloseCopy,warnDraftUnload,preparePlan,renderGroups,renderMessages,loadDetail,chatKey,chatEntry,currentChat,chatSupported,chatAttachmentsSupported,buildChatComposer,sendChat,loadChatState,applyChatReceipt,uploadChatFiles,pasteChat,scheduleChatPoll,stopChatPolling,openNativeChat,allSessions,buildContinuePanel,chatReceiptCopy,returnToBoard,readChatClipboard,accountDisplay,sessionAccountLabel,closeChatToolsOutside,closeChatToolsEscape,drawDetail,refreshDetail,loadCapabilities,matches,recoverConnection,networkOffline,poll,select,focusDetailBack,restoreSelectedCardFocus,showLogin,lock,beginAuthEpoch,resizeChatInput,updateViewport})",
     context,
   );
   api.state.csrf = "csrf-test";
@@ -1805,6 +1808,29 @@ test('unchanged and appended conversations retain selected nodes and expanded to
   assert.equal(answer.children.at(-1).attributes['aria-label'], '메시지 본문 복사');
 });
 
+test('assistant replies render Markdown and copy readable body or exact code while user input stays literal', async () => {
+  const c = client(undefined, noChatTimers); const { s } = selectChat(c);
+  const raw = '**요청**\n\n> 첫 줄\n>\n> **둘째 줄**\n\n```python\nif a > b:\n    print("확인")\n```';
+  c.renderMessages(s, [{ role: 'assistant', text: raw }, { role: 'user', text: raw }]);
+  const [answer, user] = c.get('messages').children;
+  const flatten = (root) => [root, ...(root.children || []).flatMap(flatten)];
+  const rendered = flatten(answer);
+  assert.equal(rendered.filter((n) => n.tagName === 'BLOCKQUOTE').length, 1);
+  assert.deepEqual(rendered.filter((n) => n.tagName === 'STRONG' && textOf(n).trim() !== 'Codex').map((n) => textOf(n).trim()), ['요청', '둘째 줄']);
+  assert.equal(rendered.filter((n) => n.tagName === 'PRE').length, 1);
+  assert.equal(flatten(user).some((n) => n.tagName === 'BLOCKQUOTE'), false);
+  let copied;
+  c.context.navigator = { clipboard: { writeText: async (text) => { copied = text; } } };
+  await answer.children.at(-1).events.click();
+  assert.equal(copied, '요청\n\n첫 줄\n\n둘째 줄\n\nif a > b:\n    print("확인")\n');
+  rendered.find((n) => n.attributes['aria-label'] === '인용문 본문 복사').events.click();
+  assert.equal(copied, '첫 줄\n\n둘째 줄\n');
+  rendered.find((n) => n.attributes['aria-label'] === '코드 블록 복사').events.click();
+  assert.equal(copied, 'if a > b:\n    print("확인")\n');
+  await user.children.at(-1).events.click();
+  assert.equal(copied, raw);
+});
+
 test('a delayed previous-session state success or failure cannot cancel the current polling timer', async () => {
   for (const failed of [false, true]) {
     let release; let timer = 0; const cancelled = [];
@@ -2051,7 +2077,7 @@ test('service worker evicts only its own old shells and offline reads use the cu
     self, URL, Set, Response,
     fetch: async () => { throw new Error('offline'); },
     caches: {
-      keys: async () => ['another-app-shell', 'sessionholic-shell-v0', 'sessionholic-shell-v1', 'sessionholic-shell-v2', 'sessionholic-shell-v3'],
+      keys: async () => ['another-app-shell', 'sessionholic-shell-v0', 'sessionholic-shell-v1', 'sessionholic-shell-v2', 'sessionholic-shell-v4'],
       delete: async (key) => { deleted.push(key); },
       open: async (key) => { opened.push(key); return { match: async () => currentShell }; },
       match: async () => { throw new Error('Global cross-application cache lookup is forbidden'); },
@@ -2063,7 +2089,7 @@ test('service worker evicts only its own old shells and offline reads use the cu
   listeners.fetch({ request: { method: 'GET', url: 'https://app.example/' },
     respondWith: (promise) => { response = promise; }, waitUntil() {} });
   assert.equal(await response, currentShell);
-  assert.deepEqual(opened, ['sessionholic-shell-v3']);
+  assert.deepEqual(opened, ['sessionholic-shell-v4']);
 });
 
 test('an offline first launch restores authentication and already-open terminal rows without reopening their sessions', async () => {
@@ -2408,4 +2434,86 @@ test('CSRF recovery failures preserve known non-delivery, while a current 401 fo
       assert.match(c.get('chat-status').textContent, /갱신하지 못했습니다.*전송되지 않았습니다/);
     }
   }
+});
+
+test('chat grows while typing or pasting, shrinks after deletion and bounds long drafts', () => {
+  const c = client(undefined, noChatTimers);
+  const { s, entry } = selectChat(c);
+  const composer = wireTree(c, c.buildChatComposer(s));
+  const input = c.get('chat-input');
+  c.context.window.innerHeight = 800;
+  Object.defineProperty(input, 'scrollHeight', { get: () => 20 + 22 * (input.value.split('\n').length) });
+  input.value = '첫 줄\n둘째 줄\n셋째 줄'; input.events.input();
+  assert.equal(input.style.height, '88px');
+  assert.equal(c.get('chat-expand').textContent, '접기');
+  input.value = Array(20).fill('긴 글').join('\n'); input.events.input();
+  assert.equal(input.style.height, '154px');
+  assert.equal(input.style.overflowY, 'auto');
+  c.get('chat-expand').events.click();
+  assert.equal(input.style.height, '44px');
+  assert.equal(entry.text, Array(20).fill('긴 글').join('\n'));
+  input.value += '\n계속 작성'; input.events.input();
+  assert.equal(input.style.height, '154px');
+  input.value = '짧게'; input.events.input();
+  assert.equal(input.style.height, '44px');
+  input.value = ''; input.events.input();
+  assert.equal(input.style.height, '44px');
+  assert.equal(input.style.overflowY, 'hidden');
+  c.get('chat-expand').events.click();
+  c.get('chat-expand').events.click();
+  input.events.compositionstart();
+  input.value = '조합 첫 줄\n둘째 줄\n셋째 줄';
+  input.events.compositionend(); // Some IMEs commit without a following input event.
+  assert.equal(input.style.height, '88px');
+  assert.equal(entry.inputCollapsed, false);
+  assert.equal(findId(composer, 'chat-input'), input);
+});
+
+test('chat resize preserves active Korean composition and respects keyboard viewport and wrapping changes', () => {
+  const c = client(undefined, noChatTimers);
+  const { s, entry } = selectChat(c);
+  wireTree(c, c.buildChatComposer(s));
+  const input = c.get('chat-input');
+  c.context.document.activeElement = input;
+  c.context.window.innerHeight = 800;
+  let measured = 64;
+  Object.defineProperty(input, 'scrollHeight', { get: () => measured });
+  input.value = '아직 입력 중인 한글'; input.events.compositionstart(); input.events.input();
+  const epoch = entry.editorEpoch;
+  assert.equal(input.style.height, '66px');
+  measured = 152;
+  c.updateViewport(); // A narrower width wraps the same text onto more lines.
+  assert.equal(input.style.height, '154px');
+  c.context.window.visualViewport = { height: 300 };
+  c.updateViewport();
+  assert.equal(input.style.height, '100px');
+  assert.equal(input.style.overflowY, 'auto');
+  assert.equal(entry.composing, true);
+  assert.equal(entry.editorEpoch, epoch);
+  assert.equal(c.context.document.activeElement, input);
+  c.context.window.visualViewport.height = 240;
+  c.updateViewport();
+  assert.equal(input.style.height, '44px');
+  assert.equal(input.value, '아직 입력 중인 한글');
+});
+
+test('programmatic clipboard insertion grows the editor and accepted delivery shrinks it without clearing newer drafts', async () => {
+  const text = '복사 첫 줄\n둘째 줄\n셋째 줄';
+  const c = client(undefined, noChatTimers);
+  const { s, entry } = selectChat(c);
+  wireTree(c, c.buildChatComposer(s));
+  const input = c.get('chat-input');
+  c.context.navigator = { clipboard: { readText: async () => text } };
+  Object.defineProperty(input, 'scrollHeight', { get: () => 20 + 22 * input.value.split('\n').length });
+  await c.readChatClipboard(entry, input, c.get('chat-files'), entry.editorEpoch);
+  assert.equal(input.style.height, '88px');
+  entry.pending = { requestId: 'grow-draft-request', revision: entry.revision };
+  c.applyChatReceipt(entry, { requestId: 'grow-draft-request', status: 'accepted' });
+  assert.equal(input.value, '');
+  assert.equal(input.style.height, '44px');
+  input.value = text; input.events.input();
+  entry.pending = { requestId: 'older-draft-request', revision: entry.revision - 1 };
+  c.applyChatReceipt(entry, { requestId: 'older-draft-request', status: 'accepted' });
+  assert.equal(input.value, text);
+  assert.equal(input.style.height, '88px');
 });

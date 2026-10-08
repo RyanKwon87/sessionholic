@@ -16,7 +16,8 @@
 - 실제 native CLI 터미널 연결, 여러 터미널 전환과 재연결
 - 지원되는 Codex 세션에 메시지·이미지·파일 전송
 - 작업 파일·Git 변경·최근 대화를 다른 기기의 새 작업 폴더와 세션으로 인계
-- 모바일 입력창 접기·펼치기, 한글 입력, 파일 선택, 브라우저가 허용하는 클립보드 붙여넣기
+- 읽기 쉬운 답변 서식, 답변·인용문·코드 복사
+- 내용에 맞춰 늘어나는 입력창과 접기·펼치기, 한글 입력, 파일 선택, 브라우저가 허용하는 클립보드 붙여넣기
 - 자기 Tailscale 네트워크에서 HTTPS로 접속
 
 기기 이전은 실행 중인 프로세스의 메모리를 옮기는 기능이 아닙니다. 현재 응답 중단을 확인한 뒤 작업 파일과 대화 맥락을 전달합니다. 승인 대기 상태와 모든 대화 이력을 그대로 복제하지 않습니다. **Claude 직접 메시지는 지원하지 않으며** 터미널과 파일 업로드를 사용합니다. 상세 내용은 [지원 범위](docs/limitations.md)를 확인하세요.
@@ -72,7 +73,7 @@ python3 scripts/sessionholic.py serve
 
 ```sh
 python3 -m unittest discover -s tests -v
-node --test tests/test_frontend.cjs
+node --test tests/test_*.cjs
 python3 scripts/check_public.py
 ```
 

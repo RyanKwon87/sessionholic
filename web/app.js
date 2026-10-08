@@ -991,7 +991,25 @@ function pasteChat(entry, event, input) {
   }
   if (!files.length) return; // Native text paste retains browser selection and IME behavior.
   event.preventDefault();
+  if (!currentChat(entry)) return;
+  if (entry.composing) {
+    entry.notice = "한글 입력을 마친 뒤 사진·파일을 다시 붙여넣어 주세요.";
+    updateChatComposer(entry);
+    return;
+  }
+  // Text-only paste stays native. For mixed file/text pastes, preserve the text
+  // even when the file cannot be uploaded yet, and explain the skipped file.
   insertChatText(entry, input, clipboard.getData("text/plain"));
+  const blocked = networkOffline() ? "오프라인이라 파일을 추가하지 못했습니다. 연결 후 다시 붙여넣어 주세요."
+    : entry.uploads ? "첨부를 올리고 있습니다. 완료된 뒤 파일을 다시 붙여넣어 주세요."
+    : entry.sending || entry.pending ? "전송 결과를 확인한 뒤 파일을 다시 붙여넣어 주세요."
+    : !chatAttachmentsSupported(entry) ? "이 세션은 파일 첨부를 지원하지 않습니다. 터미널에서 파일을 확인해 주세요."
+    : "";
+  if (blocked) {
+    entry.notice = blocked;
+    updateChatComposer(entry);
+    return;
+  }
   uploadChatFiles(entry, files);
 }
 async function readChatClipboard(entry, input, files, editorEpoch = entry.editorEpoch) {
@@ -2488,15 +2506,29 @@ function updateViewport() {
   document.documentElement.style.setProperty("--app-height", `${height}px`);
   fitTerminal();
 }
+function showOfflineStart() {
+  if (state.snapshot || state.terminalVisible) return;
+  $("login").hidden = false;
+  $("app").hidden = true;
+  $("login-error").textContent = "오프라인입니다. 연결이 돌아오면 접속 상태를 다시 확인합니다.";
+  $("login-submit").disabled = true;
+}
 function recoverConnection() {
   state.offline = false;
-  if (!state.authenticated || document.hidden || networkOffline()) return;
+  if (networkOffline()) return;
+  $("login-submit").disabled = false;
+  if (document.hidden) return;
+  if (!state.snapshot) $("login-error").textContent = "";
   if (state.terminalVisible) {
     terminalStatus("네트워크 연결이 돌아왔습니다. 다시 연결을 눌러 주세요.");
     return;
   }
   notice("연결이 돌아왔습니다. 작업 상태를 확인하고 있습니다…");
-  poll(false);
+  const initialAuthentication = !state.authenticated;
+  poll(false).then(() => {
+    if (initialAuthentication && state.authenticated && !document.hidden &&
+        !state.terminalVisible && !networkOffline()) refreshTerminals();
+  });
   const selected = selectedSession();
   if (selected) { updateChatComposer(chatEntry(selected)); loadChatState(selected, true); }
 }
@@ -2541,6 +2573,7 @@ window.addEventListener("DOMContentLoaded", () => {
   }
   $("login-form").addEventListener("submit", async (event) => {
     event.preventDefault();
+    if (networkOffline()) { showOfflineStart(); return; }
     $("login-submit").disabled = true;
     $("login-error").textContent = "";
     try {
@@ -2670,10 +2703,11 @@ window.addEventListener("DOMContentLoaded", () => {
       poll(true);
       const selected = selectedSession();
       if (selected) loadChatState(selected, true);
-    }
+    } else recoverConnection();
   });
   window.addEventListener("offline", () => {
     state.offline = true;
+    showOfflineStart();
     stopChatPolling();
     const selected = selectedSession();
     if (selected) updateChatComposer(chatEntry(selected));
@@ -2704,7 +2738,9 @@ window.addEventListener("DOMContentLoaded", () => {
   updateViewport();
   if ("serviceWorker" in navigator)
     navigator.serviceWorker.register("/sw.js").catch(() => {});
-  poll(true).then(() => {
+  if (networkOffline()) {
+    showOfflineStart();
+  } else poll(true).then(() => {
     if (state.authenticated) refreshTerminals();
   });
 });

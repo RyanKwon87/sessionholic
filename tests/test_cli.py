@@ -75,6 +75,68 @@ class SetupTest(unittest.TestCase):
                 cli.service_file(home=self.home, tailscale_user_file=identity)
         self.assertFalse((self.home / "Library/LaunchAgents" / (cli.LABEL + ".plist")).exists())
 
+    def test_doctor_detects_startup_permissions_and_links_without_mutation(self):
+        cli.initialize(self.home)
+        config = self.home / ".config/sessionholic"
+        config.chmod(0o755)
+        token = config / "token"
+        token.write_text("private-token-content-must-not-be-read")
+        token.chmod(0o644)
+        state = self.home / ".local/state/sessionholic"
+        state.parent.mkdir(parents=True)
+        destination = self.home / "outside"
+        destination.mkdir()
+        state.symlink_to(destination, target_is_directory=True)
+        with patch.object(cli.shutil, "which", return_value="/fixture/tool"), \
+                patch("server.load_token") as token_reader:
+            checks = cli.diagnose(self.home)
+        errors = {row["name"] for row in checks if row["status"] == "error"}
+        self.assertTrue({"config-dir", "token-file", "state-dir"}.issubset(errors))
+        token_reader.assert_not_called()
+        self.assertNotIn(token.read_text(), json.dumps(checks))
+        self.assertEqual(config.stat().st_mode & 0o777, 0o755)
+        self.assertEqual(token.stat().st_mode & 0o777, 0o644)
+        self.assertTrue(state.is_symlink())
+        self.assertEqual(list(destination.iterdir()), [])
+
+    def test_doctor_empty_home_creates_nothing_and_empty_token_is_reported(self):
+        with patch.object(cli.shutil, "which", return_value="/fixture/tool"):
+            checks = cli.diagnose(self.home)
+        self.assertFalse(any(row["status"] == "error" for row in checks))
+        self.assertEqual(list(self.home.iterdir()), [])
+        cli.initialize(self.home)
+        token = self.home / ".config/sessionholic/token"
+        token.touch(mode=0o600)
+        with patch.object(cli.shutil, "which", return_value="/fixture/tool"):
+            checks = cli.diagnose(self.home)
+        self.assertEqual(next(row["status"] for row in checks if row["name"] == "token-file"), "error")
+        self.assertEqual(token.read_bytes(), b"")
+
+    def test_service_file_refuses_invalid_startup_paths_before_writing_plist(self):
+        cli.initialize(self.home)
+        (self.home / ".config/sessionholic").chmod(0o755)
+        with patch.object(cli.sys, "platform", "darwin"), \
+                patch.object(cli.shutil, "which", return_value="/fixture/tool"):
+            with self.assertRaisesRegex(ValueError, "doctor"):
+                cli.service_file(home=self.home)
+        self.assertFalse((self.home / "Library/LaunchAgents" / (cli.LABEL + ".plist")).exists())
+
+    def test_doctor_checks_directory_access_and_allows_read_only_config_with_token(self):
+        cli.initialize(self.home)
+        config = self.home / ".config/sessionholic"
+        def access(path, mode):
+            return not (Path(path) == config and mode & cli.os.W_OK)
+        with patch.object(cli.shutil, "which", return_value="/fixture/tool"), \
+                patch.object(cli.os, "access", side_effect=access):
+            checks = cli.diagnose(self.home)
+            self.assertEqual(next(row["status"] for row in checks if row["name"] == "config-dir"), "error")
+            token = config / "token"
+            token.write_text("fixture-token")
+            token.chmod(0o400)
+            checks = cli.diagnose(self.home)
+            self.assertFalse(any(row["status"] == "error" for row in checks))
+        self.assertEqual(token.stat().st_mode & 0o777, 0o400)
+
     def test_invalid_port_explains_the_error_and_serve_forwards_options(self):
         output = io.StringIO()
         with contextlib.redirect_stderr(output):

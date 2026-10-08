@@ -10,6 +10,8 @@ python3 scripts/sessionholic.py serve --port 8791
 
 `serve --help`로 서버 옵션을 확인할 수 있습니다. 설정 파일이 없으면 로컬 한 대로 시작하며, `--hosts`로 별도 기기 목록을 지정할 수 있습니다. 기존 SSH 접속이나 CLI 로그인 문제는 각 도구에서 먼저 해결하세요. 세션홀릭은 기존 인증을 교체하지 않습니다.
 
+`doctor`는 설정 형식뿐 아니라 기본 설정·토큰·상태 경로의 종류와 소유자·권한도 확인합니다. 비밀값을 읽거나 파일·권한을 자동 변경하지 않습니다. 권한 오류가 있으면 표시된 대상만 확인하세요. 기본 권한은 설정·상태 폴더 700, 접속 토큰과 대화 캐시 파일 600입니다. 다른 프로그램의 인증 파일이나 홈 폴더 전체에 재귀적으로 권한을 적용하지 마세요. 빈 토큰 파일은 기존 토큰을 복구해야 하며, 토큰이 아예 없는 첫 실행에서는 서버가 새로 만듭니다.
+
 ## 원격 기기
 
 1. 원격 기기에 Python 3.9 이상, Git, tmux, 사용할 native CLI를 설치합니다.
@@ -29,6 +31,17 @@ python3 scripts/sessionholic.py service-file
 ```
 
 이 명령은 서비스를 자동 시작하지 않습니다. 출력된 `launchctl bootstrap` 명령을 실행하면 로그인 시 시작하는 사용자 서비스가 등록됩니다. 같은 포트의 포그라운드 서버와 동시에 실행하지 마세요. 파일에는 현재 저장소와 Python의 절대 경로가 들어가므로, 두 경로를 옮기면 서비스를 중지하고 설치 파일을 다시 만들어야 합니다. 기존 plist를 자동 덮어쓰지 않습니다.
+
+경로나 포트를 바꿔 설치 파일을 다시 만들 때는 서비스를 중지한 뒤 기존 파일을 백업 이름으로 옮깁니다. 백업 파일이 이미 있다면 덮어쓰지 말고 다른 이름을 사용하세요.
+
+```sh
+launchctl bootout gui/$(id -u)/io.github.sessionholic
+mv -i ~/Library/LaunchAgents/io.github.sessionholic.plist ~/Library/LaunchAgents/io.github.sessionholic.plist.backup
+python3 scripts/sessionholic.py doctor
+python3 scripts/sessionholic.py service-file
+```
+
+이전 설치에서 `--port` 또는 `--tailscale-user-file`을 사용했다면 필요한 옵션을 다시 지정하고, 새로 출력된 시작 명령을 실행하세요. 재생성 실패 시 백업 파일을 원래 이름으로 복구할 수 있습니다.
 
 서비스 중지:
 

@@ -63,7 +63,7 @@ def initialize(home=None):
 def diagnose(home=None):
     import settings
     import server
-    home, config, _ = paths(home)
+    home, config, state = paths(home)
     checks = []
 
     def check(name, status, message):
@@ -80,16 +80,54 @@ def diagnose(home=None):
     agent_found = any(shutil.which(name) for name in ("codex", "claude"))
     check("agent", "ok" if agent_found else "warning",
           "설치·로그인한 Codex 또는 Claude Code가 필요합니다. 이 명령은 로그인하지 않습니다.")
+    # Match the startup path checks without creating state, reading credentials,
+    # acquiring locks, or changing permissions on an existing installation.
+    for name, path, directory, advice in (
+        ("config-dir", config, True, "~/.config/sessionholic 폴더의 소유자·권한을 확인하세요(700)."),
+        ("token-file", config / "token", False, "접속 토큰 파일의 종류·소유자·권한을 확인하세요(600). 내용은 출력하지 않습니다."),
+        ("state-dir", state, True, "~/.local/state/sessionholic 폴더의 소유자·권한을 확인하세요(700)."),
+        ("snapshot-file", state / "snapshot.json", False, "snapshot.json 파일의 종류·소유자·권한을 확인하세요(600)."),
+        ("conversations-file", state / "conversations.json", False, "conversations.json 파일의 종류·소유자·권한을 확인하세요(600)."),
+        ("terminal-dir", state / "terminals", True, "terminals 폴더의 종류·소유자·권한을 확인하세요(700)."),
+    ):
+        try:
+            settings.safe_path(path, directory=directory, private=True,
+                               allow_missing=True, home=home)
+            if directory:
+                # For a new directory, its closest existing parent must allow
+                # creation. A read-only config is valid if its token exists.
+                existing = path
+                while not existing.exists():
+                    existing = existing.parent
+                access = os.R_OK | os.X_OK
+                if (existing != path or name != "config-dir"
+                        or not (config / "token").exists()):
+                    access |= os.W_OK
+                if not os.access(existing, access):
+                    raise ValueError("startup directory is not accessible")
+            elif path.exists() and not os.access(path, os.R_OK):
+                raise ValueError("startup file is not readable")
+            if name == "token-file" and path.exists() and path.stat().st_size == 0:
+                check(name, "error", "접속 토큰 파일이 비어 있습니다. 기존 토큰을 확인·복구하세요. 자동 교체하지 않습니다.")
+            else:
+                check(name, "ok", "경로·권한 검사 통과. 파일 내용은 읽지 않았습니다."
+                      if path.exists() else "첫 실행 시 준비할 경로입니다.")
+        except (ValueError, OSError):
+            check(name, "error", advice + " 상위 폴더 접근 권한도 필요하며 심볼릭 링크는 사용할 수 없습니다.")
     try:
         settings.load(home=home)
         check("config", "ok", "사용자 설정 형식이 올바릅니다. 설정 값은 출력하지 않습니다.")
     except (ValueError, OSError):
         check("config", "error", "config.json 형식·경로·권한을 확인해 주세요.")
     try:
-        hosts = server.load_hosts(config / "hosts.json")
-        check("hosts", "ok", "기기 설정 형식이 올바릅니다. SSH 접속은 실행하지 않았습니다.")
-        if not hosts:
-            check("host-count", "error", "기기를 한 대 이상 등록해 주세요.")
+        path = settings.safe_path(config / "hosts.json", allow_missing=True, home=home)
+        if not path.exists():
+            check("hosts", "ok", "기기 설정이 없어 이 컴퓨터 한 대로 시작합니다.")
+        else:
+            hosts = server.load_hosts(path)
+            check("hosts", "ok", "기기 설정 형식이 올바릅니다. SSH 접속은 실행하지 않았습니다.")
+            if not hosts:
+                check("host-count", "error", "기기를 한 대 이상 등록해 주세요.")
     except (ValueError, OSError, KeyError, TypeError, AttributeError):
         check("hosts", "error", "hosts.json에 유효한 기기 목록을 넣어 주세요.")
     return checks

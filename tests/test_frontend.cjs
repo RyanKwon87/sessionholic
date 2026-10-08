@@ -2051,7 +2051,7 @@ test('service worker evicts only its own old shells and offline reads use the cu
     self, URL, Set, Response,
     fetch: async () => { throw new Error('offline'); },
     caches: {
-      keys: async () => ['another-app-shell', 'sessionholic-shell-v0', 'sessionholic-shell-v1'],
+      keys: async () => ['another-app-shell', 'sessionholic-shell-v0', 'sessionholic-shell-v1', 'sessionholic-shell-v2'],
       delete: async (key) => { deleted.push(key); },
       open: async (key) => { opened.push(key); return { match: async () => currentShell }; },
       match: async () => { throw new Error('Global cross-application cache lookup is forbidden'); },
@@ -2059,9 +2059,86 @@ test('service worker evicts only its own old shells and offline reads use the cu
   });
   let activated;
   listeners.activate({ waitUntil: (promise) => { activated = promise; } }); await activated;
-  assert.deepEqual(deleted, ['sessionholic-shell-v0']);
+  assert.deepEqual(deleted, ['sessionholic-shell-v0', 'sessionholic-shell-v1']);
   listeners.fetch({ request: { method: 'GET', url: 'https://app.example/' },
     respondWith: (promise) => { response = promise; }, waitUntil() {} });
   assert.equal(await response, currentShell);
-  assert.deepEqual(opened, ['sessionholic-shell-v1']);
+  assert.deepEqual(opened, ['sessionholic-shell-v2']);
+});
+
+test('an offline first launch restores authentication and already-open terminal rows without reopening their sessions', async () => {
+  const requests = [];
+  const c = client(async (url) => {
+    requests.push(url);
+    return { ok: true, status: 200, json: async () => url === '/api/snapshot'
+      ? { hosts: [], serverTime: Date.now() / 1000 }
+      : url === '/api/terminals' ? { terminals: [{ id: 'existing-terminal', alive: true,
+        host: 'workstation', agent: 'codex', title: '이미 열린 작업' }] }
+      : { hosts: [], csrfToken: 'test-csrf', authMode: 'token' } };
+  }, noChatTimers);
+  c.context.navigator = { onLine: false };
+  c.get('app').hidden = true; c.get('login').hidden = true;
+  c.windowEvents.DOMContentLoaded(); await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(c.get('login').hidden, false);
+  assert.match(c.get('login-error').textContent, /오프라인.*연결/);
+  assert.equal(c.get('login-submit').disabled, true);
+  assert.equal(requests.length, 0); assert.equal(c.state.authenticated, false);
+  c.get('login-form').events.submit({ preventDefault() {} });
+  assert.equal(requests.length, 0);
+  c.context.navigator.onLine = true; c.windowEvents.online();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(requests, ['/api/snapshot', '/api/capabilities', '/api/terminals']);
+  assert.match(textOf(c.get('running-list')), /이미 열린 작업/);
+  assert.equal(c.state.terminal, null); assert.equal(c.state.terminalVisible, false);
+  assert.equal(c.get('app').hidden, false); assert.equal(c.get('login').hidden, true);
+  assert.equal(c.get('login-submit').disabled, false);
+  c.windowEvents.online(); await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(requests, ['/api/snapshot', '/api/capabilities', '/api/terminals', '/api/snapshot']);
+});
+
+test('returning to a first-launch tab after online recovery while hidden reads login state without transmitting a token', async () => {
+  const requests = [];
+  const c = client(async (url, options) => {
+    requests.push({ url, method: options.method });
+    return { ok: false, status: 401, json: async () => ({}) };
+  }, noChatTimers);
+  c.context.navigator = { onLine: false }; c.windowEvents.DOMContentLoaded();
+  await new Promise((resolve) => setImmediate(resolve));
+  c.context.document.hidden = true; c.documentEvents.visibilitychange();
+  c.context.navigator.onLine = true; c.windowEvents.online();
+  assert.equal(requests.length, 0);
+  c.context.document.hidden = false; c.documentEvents.visibilitychange();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(requests, [{ url: '/api/snapshot', method: 'GET' }]);
+  assert.equal(c.get('login').hidden, false); assert.equal(c.get('login-submit').disabled, false);
+  assert.equal(c.get('app').hidden, true);
+});
+
+test('native file paste cannot replace an active Korean composition and leaves text-only paste to the browser', async () => {
+  let uploads = 0;
+  const c = client(async () => { uploads++; return { ok: true, status: 200, json: async () => ({ attachment: { id: 'new-image' } }) }; }, noChatTimers);
+  const { entry } = selectChat(c); const input = c.get('chat-input');
+  input.value = entry.text = '조합 중인 한글'; input.selectionStart = 4; input.selectionEnd = 7;
+  entry.composing = true; const revision = entry.revision;
+  let prevented = 0;
+  c.pasteChat(entry, { clipboardData: { files: [{ name: 'image.png', size: 1 }], getData: () => '붙여넣은 텍스트' },
+    preventDefault() { prevented++; } }, input);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(uploads, 0); assert.equal(prevented, 1);
+  assert.equal(input.value, '조합 중인 한글'); assert.equal(entry.revision, revision);
+  assert.equal(entry.composing, true); assert.match(entry.notice, /한글 입력.*마친 뒤/);
+  c.pasteChat(entry, { clipboardData: { files: [], getData: () => '브라우저 텍스트' }, preventDefault() { prevented++; } }, input);
+  assert.equal(prevented, 1); assert.equal(input.value, '조합 중인 한글');
+});
+
+test('native file paste during an upload preserves accompanying text and explains why its new files need to be pasted again', () => {
+  const c = client(undefined, noChatTimers); const { entry } = selectChat(c);
+  const input = c.get('chat-input'); input.value = entry.text = '기존 초안';
+  input.selectionStart = input.selectionEnd = input.value.length;
+  entry.uploads = 1;
+  c.pasteChat(entry, { clipboardData: { files: [{ name: 'next.png', size: 1 }], getData: () => '와 붙여넣은 텍스트' },
+    preventDefault() {} }, input);
+  assert.equal(input.value, '기존 초안와 붙여넣은 텍스트');
+  assert.equal(entry.text, input.value); assert.equal(entry.uploads, 1); assert.equal(entry.attachments.length, 0);
+  assert.match(entry.notice, /첨부.*완료.*다시 붙여넣/);
 });

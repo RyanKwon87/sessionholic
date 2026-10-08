@@ -171,7 +171,8 @@ class Transfers:
             raise ValueError('이미 처리한 이전 요청입니다. 열린 터미널이나 이전 기록을 확인해 주세요.')
         folder.mkdir(mode=0o700, parents=True)
         record = {'id': transfer_id, 'status': 'stopping', 'source': {k:source.get(k) for k in ('host','agent','home','id','cwd')},
-                  'target': target, 'startedAt': int(time.time()), 'sourceStopped': False}
+                  'target': target, 'startedAt': int(time.time()), 'sourceStopped': False,
+                  'targetPreparation': 'not_started'}
         def status(value):
             record['status'] = value; record['updatedAt'] = int(time.time()); _save(folder/'transfer.json', record)
         status('stopping')
@@ -204,15 +205,22 @@ class Transfers:
                         'sourceCwd': source['cwd'], 'sourceStopped': True, 'originalHead': exported.get('summary',{}).get('head'),
                         'sourceEnvironment': source_environment,
                         'archiveSha256':exported['sha256'], 'workspace':exported.get('summary',{})}
-            prepared = self.rpc(target_host, 'prepare', {'source': source, 'target': target, 'messages': messages,
-                            'transferId':transfer_id, 'sha256':exported['sha256'], 'metadata':metadata}, timeout=180)
-            # Do not launch two machines if the source was resumed while copying.
-            current = self.rpc(source_host, 'state', {'source':source}, timeout=12)
+            # prepare can materialize the initial native input, before TUI exec.
+            # Validate files first, then read native state at the last boundary.
             workspace_now = self.rpc(source_host, 'inspect', {'source':source}, timeout=45)
             if workspace_now.get('fingerprint') != exported.get('summary', {}).get('fingerprint'):
                 raise ValueError('복사 중 원본 파일이 바뀌었습니다. 대상 실행을 시작하지 않았습니다.')
+            current = self.rpc(source_host, 'state', {'source':source}, timeout=12)
             if not current.get('safeToTransfer') or current.get('revision') != stopped.get('revision'):
                 raise ValueError('복사 중 원본 작업이 다시 바뀌었습니다. 대상 실행을 시작하지 않았습니다.')
+            record['targetPreparation'] = 'unknown'
+            status('preparing')
+            try:
+                prepared = self.rpc(target_host, 'prepare', {'source': source, 'target': target, 'messages': messages,
+                                'transferId':transfer_id, 'sha256':exported['sha256'], 'metadata':metadata}, timeout=180)
+            except (OSError, RuntimeError, ValueError):
+                raise RuntimeError('대상 준비 결과를 확인하지 못했습니다. 이미 작업이 시작되었을 수 있으므로 대상 기기의 작업 목록과 이전 기록을 확인해 주세요.') from None
+            record['targetPreparation'] = 'prepared'
             record.update(destinationCwd=prepared['cwd'], sourceRevision=stopped.get('revision'))
             status('ready')
             for cleanup_host in (source_host, target_host):

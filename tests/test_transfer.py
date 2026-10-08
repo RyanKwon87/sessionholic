@@ -1,4 +1,5 @@
 import json
+from contextlib import contextmanager, ExitStack
 from pathlib import Path
 import tempfile
 import unittest
@@ -6,6 +7,7 @@ from unittest.mock import patch
 
 import server
 from transfer import Transfers
+import transfer_worker
 
 PROFILE = {'id':'codex:.codex-isolated','agent':'codex','home':'.codex-isolated','label':'격리 환경','environment':'isolated','available':True}
 HOSTS = [{'name':'remote','label':'원격 기기','local':True},
@@ -39,9 +41,44 @@ class CoordinatorTest(unittest.TestCase):
     def tearDown(self): self.temp.cleanup()
     def execute(self, request='request-1234'):
         return self.flow.execute(self.source,self.target,HOSTS[1],HOSTS[0],PROFILE,request,lambda:[{'role':'user','text':'이어가기'}])
+    @contextmanager
+    def native_prepare(self):
+        home=Path(tempfile.mkdtemp(prefix='target-home-',dir=self.temp.name)).resolve()
+        destination=home/'project';destination.mkdir()
+        native_id='019aaaaa-0000-7000-8000-000000000001'
+        calls=[]
+        class Native:
+            def __enter__(self):return self
+            def __exit__(self,*args):pass
+            def call(self,method,params):
+                calls.append((method,params))
+                if method=='thread/start':return {'thread':{'id':native_id,'cwd':str(destination)}}
+                if method=='thread/queue/add':return {'queuedSubmission':{
+                    'id':'fixture-queue','clientUserMessageId':params['clientUserMessageId']}}
+                if method=='thread/read':return {'thread':{'id':native_id,'turns':[{'id':'fixture-turn'}]}}
+                return {'turn':{'id':'fixture-turn'}}
+        original=self.flow.rpc
+        def rpc(host,op,args=None,timeout=30):
+            if op!='prepare':return original(host,op,args,timeout)
+            self.calls.append((host['name'],op))
+            # Exercise the real worker and binder; only native IO and workspace
+            # import/build boundaries are synthetic. No model is executed.
+            return transfer_worker.rpc({'op':op,'args':args})
+        spec={'mode':'transfer','argv':['/fixture/codex','fixture initial prompt'],
+              'cwd':str(destination),'env':{},'handoffPath':str(home/'handoff.md')}
+        with ExitStack() as stack:
+            stack.enter_context(patch.object(Path,'home',return_value=home))
+            stack.enter_context(patch('transfer_native.profiles',return_value=[PROFILE]))
+            stack.enter_context(patch('transfer_workspace.import_workspace',return_value={
+                'cwd':str(destination),'root':str(destination)}))
+            stack.enter_context(patch('launch.build_transferred_launch',return_value=spec))
+            stack.enter_context(patch('transfer_native._socket_path',return_value=home/'fixture.sock'))
+            stack.enter_context(patch('native_chat._client',return_value=Native()))
+            stack.enter_context(patch.object(self.flow,'rpc',side_effect=rpc))
+            yield calls
     def test_interrupt_export_copy_prepare_order_and_once(self):
         result=self.execute()
-        self.assertEqual(self.calls,[('remote','profiles'),('local','interrupt'),('local','export'),('transport','copy'),('remote','prepare'),('local','state'),('local','inspect'),('local','cleanup'),('remote','cleanup')])
+        self.assertEqual(self.calls,[('remote','profiles'),('local','interrupt'),('local','export'),('transport','copy'),('local','inspect'),('local','state'),('remote','prepare'),('local','cleanup'),('remote','cleanup')])
         self.assertEqual(result['destinationCwd'],'/new/work')
         self.assertEqual(result['argv'][-2],'exec')
         with self.assertRaises(ValueError): self.execute()
@@ -51,9 +88,57 @@ class CoordinatorTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError,'파일이 바뀌'): self.execute()
         records=list((Path(self.temp.name)/'transfers').glob('*/transfer.json'))
         self.assertEqual(json.loads(records[0].read_text())['status'],'failed')
+        self.assertEqual(json.loads(records[0].read_text())['targetPreparation'],'not_started')
+        self.assertFalse(any(op=='prepare' for _,op in self.calls))
     def test_source_resumed_after_copy_never_returns_launch(self):
         self.phase='working'
         with self.assertRaisesRegex(ValueError,'원본 작업이 다시'): self.execute()
+        self.assertFalse(any(op=='prepare' for _,op in self.calls))
+    def test_real_prepare_materializes_native_initial_input_only_after_source_revalidation(self):
+        with self.native_prepare() as calls:
+            result=self.execute()
+        self.assertEqual([method for method,_ in calls],['thread/start','thread/queue/add','thread/queue/start','thread/read'])
+        self.assertEqual(calls[1][1]['input'],[{'type':'text','text':'fixture initial prompt'}])
+        self.assertEqual(result['connectionMode'],'attach')
+        operations=[op for _,op in self.calls]
+        self.assertLess(operations.index('state'),operations.index('prepare'))
+    def test_copy_time_source_changes_never_prime_destination_native_input(self):
+        for change in ('working','files'):
+            self.phase='idle';self.fingerprint='snapshot1'
+            with self.subTest(change=change),self.native_prepare() as calls:
+                def copy(*args):
+                    self.calls.append(('transport','copy'))
+                    if change=='working':self.phase='working'
+                    else:self.fingerprint='changed'
+                self.flow._copy=copy
+                with self.assertRaises(ValueError):self.execute('copy-change-'+change)
+                self.assertEqual(calls,[])
+                self.phase='idle';self.fingerprint='snapshot1'
+    def test_prepare_response_loss_preserves_possible_destination_initialization_without_retry(self):
+        with self.native_prepare() as calls:
+            original=self.flow.rpc
+            def rpc(host,op,args=None,timeout=30):
+                result=original(host,op,args,timeout)
+                if op=='prepare':raise RuntimeError('fixture response lost after native queue start')
+                return result
+            self.flow.rpc=rpc
+            with self.assertRaisesRegex(RuntimeError,'대상.*확인'):self.execute()
+            record=json.loads(next((Path(self.temp.name)/'transfers').glob('*/transfer.json')).read_text())
+            self.assertEqual(record['targetPreparation'],'unknown')
+            self.assertTrue(record['sourceStopped'])
+            self.assertEqual(sum(method=='thread/queue/add' for method,_ in calls),1)
+            with self.assertRaises(ValueError):self.execute()
+            self.assertEqual(sum(method=='thread/queue/add' for method,_ in calls),1)
+    def test_source_resumes_during_final_file_inspection_blocks_native_preparation(self):
+        with self.native_prepare() as calls:
+            original=self.flow.rpc
+            def rpc(host,op,args=None,timeout=30):
+                result=original(host,op,args,timeout)
+                if op=='inspect':self.phase='working'
+                return result
+            self.flow.rpc=rpc
+            with self.assertRaisesRegex(ValueError,'원본 작업이 다시'):self.execute()
+            self.assertEqual(calls,[])
     def test_target_invalid_never_interrupts_source(self):
         self.flow.profiles=lambda *a,**k:[]
         with self.assertRaises(ValueError): self.execute()

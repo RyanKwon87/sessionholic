@@ -1,0 +1,83 @@
+Sessionholic Source Available License 1.0
+SPDX-License-Identifier: LicenseRef-Sessionholic-Source-Available-1.0
+
+Copyright 2026 Ryan Kwon (RyanKwon87)
+
+1. Scope and definitions
+
+This license applies to the original Sessionholic software and documentation
+made available under this license (the "Software"). Third-party components
+identified in THIRD_PARTY_NOTICES.md remain governed solely by their own
+licenses. This license does not restrict rights granted by those licenses.
+
+"You" means the individual or organization exercising rights under this
+license. "Modified Software" means modifications to, or derivative works of,
+the Software. The restrictions below apply equally to the Software and
+Modified Software, regardless of whether You operate for profit.
+
+2. Permission
+
+Subject to all terms below, each copyright holder grants You a worldwide,
+non-exclusive, royalty-free copyright license to:
+
+(a) use, copy, study, and modify the Software for personal purposes or for
+    Your internal business operations, including commercial work;
+(b) operate the Software for Your employees or contractors solely for those
+    internal operations; and
+(c) redistribute the Software or Modified Software without charge, including
+    through a public source repository, under this same license.
+
+3. Restrictions on resale and services
+
+Without a separate written license from the relevant copyright holders, You
+may not sell, rent, lease, license for a fee, or otherwise provide the
+Software or Modified Software in exchange for monetary or other commercial
+consideration. This includes bundling it into a paid product or service.
+
+You may not offer or operate the Software or Modified Software for external
+users as a paid hosted, managed, subscription, SaaS, or other service that
+provides access to its session-management or terminal functionality. Payment
+through a related party, a required membership, a paid bundle, or a required
+donation is also payment for purposes of this restriction. Nonprofit status
+does not create an exception.
+
+These restrictions do not prohibit charging for Your ordinary work products
+or services created with the Software, provided customers are not supplied
+the Software or access to its functionality. For example, using the Software
+internally while developing commercial applications or doing client work is
+permitted. Such work products are not covered by this license merely because
+the Software was used to create them.
+
+4. Redistribution conditions
+
+Every permitted redistribution must include this license and all applicable
+copyright and third-party notices. Modified Software must carry a clear notice
+that it has been modified. If You redistribute Your modifications, You must
+license them under these same terms and must not offer recipients fewer rights
+than this license grants. You are not required to publish private modifications.
+You may not imply endorsement by the original authors or use their trademarks
+except to identify the Software and its origin.
+
+5. Ownership and other rights
+
+Copyright holders retain ownership of their respective contributions. No
+copyright assignment is required by this license. No trademark or patent
+license is granted. Rights not expressly granted are reserved. This license
+does not limit rights You have independently under applicable law.
+
+6. Termination
+
+Your permissions under this license terminate if You violate its terms.
+They are automatically reinstated if You cure the violation within 30 days
+after first becoming aware of it, unless a copyright holder has previously
+terminated Your permissions for a violation. Otherwise reinstatement requires
+written permission from the relevant copyright holders.
+
+7. No warranty or liability
+
+TO THE MAXIMUM EXTENT PERMITTED BY APPLICABLE LAW, THE SOFTWARE IS PROVIDED
+"AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING WARRANTIES
+OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, TITLE, OR NONINFRINGEMENT.
+IN NO EVENT SHALL THE COPYRIGHT HOLDERS OR CONTRIBUTORS BE LIABLE FOR ANY
+CLAIM, DAMAGES, OR OTHER LIABILITY ARISING FROM, OUT OF, OR IN CONNECTION WITH
+THE SOFTWARE OR ITS USE, WHETHER IN CONTRACT, TORT, OR OTHERWISE.

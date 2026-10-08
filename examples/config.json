@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "profiles": [
+    {"agent": "codex", "home": ".codex", "label": "기본 Codex"},
+    {"agent": "codex", "home": ".codex-work", "label": "업무 Codex", "environment": "work"},
+    {"agent": "claude", "home": ".claude", "label": "기본 Claude"}
+  ],
+  "environments": {
+    "default": {"label": "기본 환경", "variables": {}},
+    "work": {"label": "업무 환경", "variables": {}}
+  },
+  "projects": [
+    {"id": "sample", "label": "예제 프로젝트", "root": "~/Projects/sample"},
+    {"id": "work", "label": "업무 프로젝트", "root": "~/Work", "environment": "work"}
+  ]
+}

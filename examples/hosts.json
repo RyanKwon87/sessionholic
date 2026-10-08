@@ -1,0 +1,4 @@
+[
+  {"name": "local", "label": "이 컴퓨터", "local": true},
+  {"name": "home", "label": "집 컴퓨터", "ssh": "my-home-computer", "python": "/usr/bin/python3"}
+]

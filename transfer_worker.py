@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import re
 import secrets
+import shutil
 import sys
 import stat
 from contextlib import contextmanager
@@ -108,6 +109,62 @@ def source_ready(source, expected=None):
     return state
 
 
+@contextmanager
+def stage(name):
+    """Tag a failure with the prepare step it came from, for the coordinator."""
+    try:
+        yield
+    except Exception as exc:
+        if getattr(exc, 'transfer_stage', None) is None:
+            exc.transfer_stage = name
+        raise
+
+
+def discard_import(destination, transfer_id):
+    """Remove this transfer's freshly imported copy when no session was bound to it."""
+    path = destination / transfer_id
+    try:
+        info = os.lstat(path)
+        if stat.S_ISDIR(info.st_mode) and info.st_uid == os.getuid():
+            shutil.rmtree(path)
+    except OSError:
+        pass
+
+
+def prepare(args, profiles, import_workspace):
+    # validate/import/build failures start nothing; bind may create a native
+    # session, so its failures and later ones stay unknown to the coordinator.
+    from launch import build_transferred_launch
+    from managed_launch import bind
+    with stage('validate'):
+        folder = job(args['transferId'])
+        if (folder / 'launch.json').exists():
+            error = ValueError('이미 준비한 이전입니다. 열린 터미널을 확인해 주세요.')
+            error.transfer_stage = 'prepared'
+            raise error
+        profile = next((p for p in profiles() if p['id'] == args['target']['account'] and p['agent'] == args['target']['agent']), None)
+        if not profile or not profile.get('available'):
+            raise ValueError('대상 기기의 기존 계정을 사용할 수 없습니다.')
+        destination = private_dir(Path.home() / '.local/share/sessionholic/workspaces')
+    with stage('import'):
+        imported = import_workspace(folder / 'incoming.tar.gz', destination, args['transferId'], args['sha256'])
+    try:
+        with stage('build'):
+            metadata = {**args['metadata'], 'destinationCwd': imported['cwd'], 'projectRoot': imported['root'],
+                        'attachmentsPathMap': imported.get('attachmentsPathMap', [])}
+            spec = build_transferred_launch(args['source'], {**profile, 'host': args['target']['host']},
+                                            args['messages'], folder, imported['cwd'], metadata)
+    except Exception:
+        discard_import(destination, args['transferId'])
+        raise
+    with stage('bind'):
+        spec = bind(spec, profile, args['target']['host'])
+    with stage('save'):
+        save(folder / 'launch.json', spec)
+        save(folder / 'transfer.json', metadata)
+    return {'cwd': imported['cwd'], 'root': imported['root'], 'nativeSource': spec.get('nativeSource'), 'connectionMode': spec.get('connectionMode'), 'warnings': spec.get('warnings', []), 'summary': imported.get('summary', {})}
+
+
 def _rpc(request):
     from transfer_native import profiles, source_state, interrupt_source
     from transfer_workspace import inspect_workspace, export_workspace, import_workspace
@@ -139,24 +196,7 @@ def _rpc(request):
         save(folder / 'export.json', result)
         return result
     if op == 'prepare':
-        from launch import build_transferred_launch
-        folder = job(args['transferId'])
-        if (folder / 'launch.json').exists():
-            raise ValueError('이미 준비한 이전입니다. 열린 터미널을 확인해 주세요.')
-        profile = next((p for p in profiles() if p['id'] == args['target']['account'] and p['agent'] == args['target']['agent']), None)
-        if not profile or not profile.get('available'):
-            raise ValueError('대상 기기의 기존 계정을 사용할 수 없습니다.')
-        destination = private_dir(Path.home() / '.local/share/sessionholic/workspaces')
-        imported = import_workspace(folder / 'incoming.tar.gz', destination, args['transferId'], args['sha256'])
-        metadata = {**args['metadata'], 'destinationCwd': imported['cwd'], 'projectRoot': imported['root'],
-                    'attachmentsPathMap': imported.get('attachmentsPathMap', [])}
-        spec = build_transferred_launch(args['source'], {**profile, 'host': args['target']['host']},
-                                        args['messages'], folder, imported['cwd'], metadata)
-        from managed_launch import bind
-        spec = bind(spec, profile, args['target']['host'])
-        save(folder / 'launch.json', spec)
-        save(folder / 'transfer.json', metadata)
-        return {'cwd': imported['cwd'], 'root': imported['root'], 'nativeSource': spec.get('nativeSource'), 'connectionMode': spec.get('connectionMode'), 'warnings': spec.get('warnings', []), 'summary': imported.get('summary', {})}
+        return prepare(args, profiles, import_workspace)
     if op == 'cleanup':
         folder = job(args['transferId'])
         return cleanup_archives(folder)
@@ -252,7 +292,10 @@ def _main():
         print(json.dumps({'ok': True, 'result': result, 'runtime': sys.argv[0]}, ensure_ascii=False))
     except (ValueError, OSError, RuntimeError, KeyError, RpcError) as exc:
         from launch import scrub_text
-        print(json.dumps({'ok': False, 'error': scrub_text(str(exc))[:1000]}, ensure_ascii=False))
+        reply = {'ok': False, 'error': scrub_text(str(exc))[:1000]}
+        if isinstance(getattr(exc, 'transfer_stage', None), str):
+            reply['stage'] = exc.transfer_stage
+        print(json.dumps(reply, ensure_ascii=False))
 
 
 def main():

@@ -1,20 +1,34 @@
+import base64
+import contextlib
+import io
 import json
 import hashlib
 import concurrent.futures
+import os
+import shutil
+import subprocess
+import sys
 import threading
+import time
 from contextlib import contextmanager, ExitStack
 from pathlib import Path
 import tempfile
 import unittest
 from unittest.mock import patch
+import zipfile
 
 import server
-from transfer import Transfers
+import transfer
+from transfer import Transfers, WorkerError
 import transfer_worker
 
 PROFILE = {'id':'codex:.codex-isolated','agent':'codex','home':'.codex-isolated','label':'격리 환경','environment':'isolated','available':True}
 HOSTS = [{'name':'remote','label':'원격 기기','local':True},
          {'name':'local','label':'로컬 기기','local':False,'ssh':'local','python':'/usr/bin/python3'}]
+
+
+def raised_id(request):
+    return hashlib.sha256(request.encode()).hexdigest()[:32]
 
 
 class CoordinatorTest(unittest.TestCase):
@@ -199,23 +213,88 @@ class CoordinatorTest(unittest.TestCase):
         result=self.flow.cleanup_pending(record['id'])
         self.assertFalse(result['archiveCleanupPending'])
         self.assertEqual(json.loads(path.read_text())['status'],'failed')
-    def test_unknown_prepare_defers_target_until_explicit_prepared_readback(self):
+    def test_unknown_prepare_defers_target_until_status_confirms_no_active_prepare(self):
         original=self.flow.rpc
+        status=[WorkerError('이전 파일을 사용 중입니다.')]
         def lost(host,op,args=None,timeout=30):
             if op=='prepare':raise RuntimeError('fixture response lost')
-            if op=='status':return {'prepared':False,'started':False}
+            if op=='status':
+                if isinstance(status[0],Exception):raise status[0]
+                return status[0]
             return original(host,op,args,timeout)
         self.flow.rpc=lost
         with self.assertRaises(RuntimeError):self.execute()
         path=next((Path(self.temp.name)/'transfers').glob('*/transfer.json'))
         record=json.loads(path.read_text())
         self.assertEqual([host for host,op in self.calls if op=='cleanup'],['local'])
-        result=self.flow.cleanup_pending(record['id'])
-        self.assertEqual(result['deferredHosts'],['remote'])
-        self.assertTrue(result['archiveCleanupPending'])
-        self.flow.rpc=lambda host,op,args=None,timeout=30: {'prepared':True,'started':False} if op=='status' else original(host,op,args,timeout)
+        # A busy helper lock or an inconsistent receipt keeps the archive.
+        for reply in (WorkerError('이전 파일을 사용 중입니다.'),RuntimeError('fixture ssh down'),{'prepared':False,'started':True},{'prepared':'no'}):
+            status[0]=reply
+            result=self.flow.cleanup_pending(record['id'])
+            self.assertEqual(result['deferredHosts'],['remote'],reply)
+            self.assertTrue(result['archiveCleanupPending'])
+        # Status succeeded with no launch or start receipt: no prepare holds the archive.
+        status[0]={'prepared':False,'started':False}
         self.assertFalse(self.flow.cleanup_pending(record['id'])['archiveCleanupPending'])
+        self.assertEqual([host for host,op in self.calls if op=='cleanup'],['local','remote'])
         self.assertEqual(json.loads(path.read_text())['targetPreparation'],'unknown')
+    def test_pre_bind_worker_failure_is_failed_with_reason_and_cleans_target(self):
+        original=self.flow.rpc
+        for stage in ('validate','import','build'):
+            self.calls.clear()
+            def fail(host,op,args=None,timeout=30):
+                if op=='prepare':
+                    self.calls.append((host['name'],op))
+                    raise WorkerError('fixture 대상 기기에 native CLI가 없습니다. ('+stage+')',stage)
+                return original(host,op,args,timeout)
+            self.flow.rpc=fail
+            with self.subTest(stage=stage):
+                with self.assertRaisesRegex(WorkerError,'native CLI가 없습니다') as raised:self.execute('pre-bind-'+stage)
+                self.assertEqual(raised.exception.stage,stage)
+                record=json.loads((Path(self.temp.name)/'transfers'/raised_id('pre-bind-'+stage)/'transfer.json').read_text())
+                self.assertEqual(record['status'],'failed')
+                self.assertEqual(record['targetPreparation'],'failed')
+                self.assertIn('native CLI가 없습니다',record['error'])
+                self.assertEqual([host for host,op in self.calls if op=='cleanup'],['local','remote'])
+                self.assertFalse(record['archiveCleanupPending'])
+    def test_bind_untagged_and_transport_prepare_failures_stay_unknown(self):
+        original=self.flow.rpc
+        for index,error in enumerate((WorkerError('fixture bind failed','bind'),WorkerError('fixture save failed','save'),
+                                      WorkerError('fixture lock busy'),WorkerError('fixture earlier receipt','prepared'),
+                                      RuntimeError('원격 실행 오류: fixture crash'))):
+            self.calls.clear()
+            def fail(host,op,args=None,timeout=30):
+                if op=='prepare':raise error
+                return original(host,op,args,timeout)
+            self.flow.rpc=fail
+            with self.subTest(error=error):
+                with self.assertRaisesRegex(RuntimeError,'대상 준비 결과를 확인하지 못했습니다') as raised:self.execute('unknown-%d'%index)
+                self.assertNotIsInstance(raised.exception,WorkerError)
+                record=json.loads((Path(self.temp.name)/'transfers'/raised_id('unknown-%d'%index)/'transfer.json').read_text())
+                self.assertEqual(record['targetPreparation'],'unknown')
+                self.assertEqual([host for host,op in self.calls if op=='cleanup'],['local'])
+    def test_profile_failure_expires_after_bounded_time(self):
+        def fail(*a,**k):self.calls.append(('host','probe'));raise RuntimeError('offline')
+        self.flow.rpc=fail
+        with patch('transfer.time.monotonic',return_value=1000.0):
+            for _ in range(2):
+                with self.assertRaisesRegex(RuntimeError,'offline'):self.flow.profiles(HOSTS[1])
+        self.assertEqual(len(self.calls),1)
+        with patch('transfer.time.monotonic',return_value=1000.0+transfer.PROFILE_FAILURE_TTL+1):
+            with self.assertRaises(RuntimeError):self.flow.profiles(HOSTS[1])
+        self.assertEqual(len(self.calls),2)
+    def test_handoff_metadata_omits_preview_size_listing(self):
+        original=self.flow.rpc
+        seen={}
+        def rpc(host,op,args=None,timeout=30):
+            if op=='export':return {'sha256':'b'*64,'summary':{'fingerprint':'snapshot1','head':'c'*40,'sourceEnvironment':'isolated',
+                                    'largestFiles':[{'path':'big.bin','bytes':9}],'excludedSensitive':['token.json']}}
+            if op=='prepare':seen.update(args['metadata']['workspace'])
+            return original(host,op,args,timeout)
+        self.flow.rpc=rpc
+        self.execute()
+        self.assertNotIn('largestFiles',seen)
+        self.assertEqual(seen['excludedSensitive'],['token.json'])
     def test_active_copy_cannot_be_cleaned_in_rpc_gap(self):
         entered,release=threading.Event(),threading.Event()
         identifier=hashlib.sha256(b'active-copy-fixture').hexdigest()[:32]
@@ -405,6 +484,259 @@ class WorkerCleanupTest(unittest.TestCase):
     def test_export_without_receipt_is_still_cleaned_after_source_verification_failure(self):
         self.assertFalse((self.folder/'export.json').exists())
         self.assertEqual(self.cleanup()['removed'],2)
+
+
+class RpcOutcomeTest(unittest.TestCase):
+    """Explicit helper failures are distinguishable from transport failures."""
+    def setUp(self):
+        self.temp=tempfile.TemporaryDirectory();self.addCleanup(self.temp.cleanup)
+        self.flow=Transfers(HOSTS,self.temp.name)
+    def reply(self,returncode,stdout=b'',stderr=b'',host=HOSTS[1]):
+        done=subprocess.CompletedProcess([],returncode,stdout,stderr)
+        with patch('transfer.subprocess.run',return_value=done):
+            return self.flow.rpc(host,'prepare',{'transferId':'a'*32})
+    def test_completed_helper_failure_is_worker_error_with_scrubbed_reason_and_stage(self):
+        secret='sk-ant-api03-'+'x'*40
+        stdout=json.dumps({'ok':False,'error':'준비 실패 '+secret,'stage':'import'}).encode()
+        with self.assertRaises(WorkerError) as raised:self.reply(0,stdout)
+        self.assertIsInstance(raised.exception,RuntimeError)
+        self.assertEqual(raised.exception.stage,'import')
+        self.assertIn('준비 실패',str(raised.exception));self.assertNotIn(secret,str(raised.exception))
+        with self.assertRaises(WorkerError) as untagged:self.reply(0,b'{"ok":false,"error":"busy"}')
+        self.assertIsNone(untagged.exception.stage)
+    def test_ssh_exit_255_is_a_connection_failure_not_a_worker_error(self):
+        with self.assertRaisesRegex(RuntimeError,'SSH 연결을 확인') as raised:self.reply(255,b'',b'ssh: connect to host local port 22: Connection refused\n')
+        self.assertNotIsInstance(raised.exception,WorkerError)
+    def test_other_exit_reports_scrubbed_last_stderr_line(self):
+        secret='ghp_'+'a'*36
+        stderr=('Traceback (most recent call last):\n  File "x", line 1\nValueError: boom '+secret+'\n').encode()
+        with self.assertRaises(RuntimeError) as raised:self.reply(1,b'',stderr)
+        self.assertNotIsInstance(raised.exception,WorkerError)
+        self.assertTrue(str(raised.exception).startswith('원격 실행 오류: ValueError: boom'))
+        self.assertNotIn(secret,str(raised.exception))
+        with self.assertRaisesRegex(RuntimeError,'원격 실행 오류: 종료 코드 3'):self.reply(3)
+        # A local helper has no SSH layer; 255 is an ordinary exit status there.
+        with self.assertRaisesRegex(RuntimeError,'원격 실행 오류') as local:self.reply(255,b'',b'fatal\n',host=HOSTS[0])
+        self.assertNotIsInstance(local.exception,WorkerError)
+    def test_unreadable_reply_is_not_a_worker_error(self):
+        for stdout in (b'not json',b'[]'):
+            with self.assertRaisesRegex(RuntimeError,'읽지 못했') as raised:self.reply(0,stdout)
+            self.assertNotIsInstance(raised.exception,WorkerError)
+
+
+class WorkerPrepareStageTest(unittest.TestCase):
+    """The helper reports which prepare step failed; pre-bind failures leave nothing behind."""
+    def setUp(self):
+        self.temp=tempfile.TemporaryDirectory();self.addCleanup(self.temp.cleanup)
+        self.home=Path(self.temp.name).resolve()
+        for context in (patch.object(Path,'home',return_value=self.home),patch('transfer_native.profiles',return_value=[PROFILE])):
+            context.start();self.addCleanup(context.stop)
+        self.identifier='d'*32
+        self.workspaces=self.home/'.local/share/sessionholic/workspaces'
+    def main(self,args=None):
+        request={'op':'prepare','args':{'transferId':self.identifier,'sha256':'e'*64,'metadata':{},'messages':[],
+                 'source':{},'target':{'account':PROFILE['id'],'agent':'codex','host':'remote'},**(args or {})}}
+        output=io.StringIO()
+        stdin=io.TextIOWrapper(io.BytesIO(json.dumps(request).encode()))
+        with patch.object(sys,'argv',['worker.pyz']),patch.object(sys,'stdin',stdin),contextlib.redirect_stdout(output):
+            transfer_worker.main()
+        return json.loads(output.getvalue())
+    def imported(self,*args):
+        project=self.workspaces/self.identifier/'project';project.mkdir(parents=True)
+        return {'cwd':str(project),'root':str(project)}
+    def test_validate_and_import_failures_are_tagged(self):
+        reply=self.main({'target':{'account':'codex:.codex-missing','agent':'codex','host':'remote'}})
+        self.assertEqual((reply['ok'],reply['stage']),(False,'validate'))
+        reply=self.main()
+        self.assertEqual((reply['ok'],reply['stage']),(False,'import'))
+        self.assertIn('번들',reply['error'])
+    def test_build_failure_is_tagged_and_discards_the_fresh_import(self):
+        with patch('transfer_workspace.import_workspace',side_effect=self.imported),\
+             patch('launch.build_transferred_launch',side_effect=ValueError('이 호스트에 native CLI가 없습니다.')):
+            reply=self.main()
+        self.assertEqual((reply['ok'],reply['stage']),(False,'build'))
+        self.assertIn('native CLI',reply['error'])
+        self.assertFalse((self.workspaces/self.identifier).exists())
+        self.assertTrue(self.workspaces.is_dir())
+    def test_bind_failure_is_tagged_and_keeps_the_import(self):
+        spec={'mode':'transfer','argv':['/fixture/codex','prompt'],'cwd':'/fixture','env':{}}
+        with patch('transfer_workspace.import_workspace',side_effect=self.imported),\
+             patch('launch.build_transferred_launch',return_value=spec),\
+             patch('managed_launch.bind',side_effect=RuntimeError('fixture native thread result unknown')):
+            reply=self.main()
+        self.assertEqual((reply['ok'],reply['stage']),(False,'bind'))
+        self.assertTrue((self.workspaces/self.identifier/'project').is_dir())
+        self.assertFalse((transfer_worker.job(self.identifier)/'launch.json').exists())
+    def test_existing_launch_receipt_is_never_reported_as_pre_bind(self):
+        transfer_worker.save(transfer_worker.job(self.identifier)/'launch.json',{'argv':['/fixture']})
+        reply=self.main()
+        self.assertEqual((reply['ok'],reply['stage']),(False,'prepared'))
+        self.assertNotIn(reply['stage'],transfer.PRE_BIND_STAGES)
+
+
+class RuntimeInstallTest(unittest.TestCase):
+    """The helper archive is reproducible and installed atomically on the host."""
+    def setUp(self):
+        self.temp=tempfile.TemporaryDirectory();self.addCleanup(self.temp.cleanup)
+        self.home=Path(self.temp.name).resolve()
+        env=patch.dict(os.environ,{'HOME':str(self.home)});env.start();self.addCleanup(env.stop)
+        self.host={'name':'self','label':'이 기기','local':True}
+        self.flow=Transfers([self.host],self.home/'board-state')
+        self.root=self.home/'.local/state/sessionholic-transfer-runtime'
+    def status(self):
+        return self.flow.rpc(self.host,'status',{'transferId':'f'*32},timeout=30)
+    def test_same_sources_produce_the_same_runtime_sha_at_any_time(self):
+        first=Transfers([],self.home/'one').runtime()
+        with patch('time.time',return_value=time.time()+10**8):
+            second=Transfers([],self.home/'two').runtime()
+        self.assertEqual(first['sha256'],second['sha256'])
+        archive=zipfile.ZipFile(io.BytesIO(base64.b64decode(first['runtime'])))
+        self.assertEqual({info.date_time for info in archive.infolist()},{(1980,1,1,0,0,0)})
+        self.assertIn('__main__.py',archive.namelist())
+    def test_helper_is_reused_reinstalled_when_corrupt_and_stale_versions_removed(self):
+        self.assertEqual(self.status(),{'prepared':False,'started':False})
+        current=self.root/('worker-'+self.flow.runtime()['sha256']+'.pyz')
+        self.assertEqual(self.flow.runtime_paths['self'],str(current))
+        self.status()
+        self.assertEqual(sorted(p.name for p in self.root.iterdir()),[current.name])
+        current.write_bytes(b'corrupt helper')
+        self.assertEqual(self.status(),{'prepared':False,'started':False})
+        self.assertEqual(hashlib.sha256(current.read_bytes()).hexdigest(),self.flow.runtime()['sha256'])
+        current.unlink();current.symlink_to(self.home/'elsewhere.pyz')
+        self.status()
+        self.assertFalse(current.is_symlink())
+        self.assertEqual(current.stat().st_mode&0o777,0o600)
+        stale,fresh=self.root/('worker-'+'0'*64+'.pyz'),self.root/('worker-'+'1'*64+'.pyz')
+        leftover=self.root/('.worker-'+'2'*64+'.'+'3'*12+'.tmp')
+        unrelated=self.root/'notes.txt'
+        for path in (stale,fresh,leftover,unrelated):
+            path.write_bytes(b'fixture');path.chmod(0o600)
+        old=time.time()-3*86400
+        for path in (stale,leftover,unrelated):os.utime(path,(old,old))
+        self.status()
+        self.assertFalse(stale.exists());self.assertFalse(leftover.exists())
+        self.assertTrue(fresh.exists());self.assertTrue(unrelated.exists());self.assertTrue(current.exists())
+
+
+class SshReuseTest(unittest.TestCase):
+    def setUp(self):
+        # macOS limits socket paths to 104 bytes, so the reusable case needs a short base.
+        self.base=Path(tempfile.mkdtemp(prefix='sh',dir='/tmp'))
+        self.addCleanup(shutil.rmtree,self.base,True)
+    def options(self,command):
+        return [command[index+1] for index,value in enumerate(command[:-2]) if value=='-o']
+    def test_private_control_socket_is_shared_by_rpc_and_terminal_commands(self):
+        flow=Transfers(HOSTS,self.base)
+        for tty in (False,True):
+            command=flow.command(HOSTS[1],['-I','/fixture/worker.pyz','exec','f'*32],tty=tty)
+            options=self.options(command)
+            self.assertIn('ControlMaster=auto',options);self.assertIn('ControlPersist=60',options)
+            self.assertIn('ControlPath='+str(self.base/'ssh'/'cm-%C'),options)
+            self.assertLess(command.index('ControlPath='+str(self.base/'ssh'/'cm-%C')),command.index('--'))
+        self.assertEqual((self.base/'ssh').stat().st_mode&0o777,0o700)
+        (self.base/'ssh').chmod(0o755)
+        flow.command(HOSTS[1],['x'])
+        self.assertEqual((self.base/'ssh').stat().st_mode&0o777,0o700)
+        self.assertEqual(flow.command(HOSTS[0],['x']),[sys.executable,'x'])
+    def test_control_socket_is_omitted_when_unsafe_too_long_or_missing(self):
+        long_base=self.base/('d'*60);long_base.mkdir()
+        missing=self.base/'missing'
+        linked=self.base/'linked';linked.mkdir();(linked/'ssh').symlink_to(self.base)
+        for base in (long_base,missing,linked):
+            with self.subTest(base=base.name[:8]):
+                command=Transfers(HOSTS,base).command(HOSTS[1],['x'])
+                self.assertFalse(any(value.startswith('Control') for value in self.options(command)))
+                self.assertIn('BatchMode=yes',self.options(command))
+        self.assertFalse(missing.exists());self.assertFalse((long_base/'ssh').exists())
+
+
+@unittest.skipUnless(shutil.which('git'),'requires local git')
+class LocalTransferEndToEndTest(unittest.TestCase):
+    """preview→export→send→receive→prepare with real local helpers; only bind is synthetic.
+
+    Native session state and turn interruption need a live CLI, so those replies
+    and export/inspect/prepare run in-process with the real worker code. The
+    helper install, profile probe, archive streaming and cleanup are real processes.
+    """
+    def setUp(self):
+        self.temp=tempfile.TemporaryDirectory();self.addCleanup(self.temp.cleanup)
+        self.home=Path(self.temp.name).resolve()
+        env=patch.dict(os.environ,{'HOME':str(self.home)});env.start();self.addCleanup(env.stop)
+        config=self.home/'.config/sessionholic/config.json';config.parent.mkdir(parents=True)
+        config.write_text(json.dumps({'version':1,'environments':{'isolated':{}},'profiles':[
+            {'agent':'codex','home':'.codex-isolated','label':'격리','environment':'isolated'}]}))
+        (self.home/'.codex-isolated').mkdir();(self.home/'.codex-isolated/auth.json').write_text('fixture-only-never-read')
+        binary=self.home/'.local/bin/codex';binary.parent.mkdir(parents=True)
+        binary.write_text('#!/bin/sh\nexit 1\n');binary.chmod(0o700)
+        self.repo=self.home/'work/project';self.repo.mkdir(parents=True)
+        def git(*args):subprocess.run(['git','-C',str(self.repo),*args],check=True,capture_output=True,env=transfer_workspace_env())
+        git('init','-q','-b','main');git('config','user.name','Fixture');git('config','user.email','fixture@example.invalid')
+        for name in ('README.md','.claude/agents/reviewer.md','.claude/settings.json','.codex/AGENTS.md','.gitignore'):
+            path=self.repo/name;path.parent.mkdir(parents=True,exist_ok=True)
+            path.write_text('target/\n' if name=='.gitignore' else 'shared '+name+'\n')
+        git('add','.');git('commit','-qm','initial')
+        (self.repo/'notes.txt').write_text('untracked work\n')
+        (self.repo/'client_secret_x.json').write_text('fixture-secret-never-transport')
+        (self.repo/'.claude/settings.local.json').write_text('fixture-personal-never-transport')
+        (self.repo/'target/debug').mkdir(parents=True);(self.repo/'target/debug/app').write_text('build output')
+        self.hosts=[{'name':'source','label':'원본','local':True},{'name':'target','label':'대상','local':True}]
+        self.flow=Transfers(self.hosts,self.home/'board-state')
+        self.source={'host':'source','agent':'codex','home':'.codex-isolated','id':'019aaaaa-0000-7000-8000-000000000001','cwd':str(self.repo)}
+        self.target={'host':'target','agent':'codex','account':PROFILE['id']}
+        self.ops=[]
+        real=self.real=self.flow.rpc
+        def rpc(host,op,args=None,timeout=30):
+            self.ops.append((host['name'],op))
+            if op=='interrupt':return {'confirmed':True,'safeToTransfer':True,'phase':'idle','revision':'r1'}
+            if op=='state':return {'safeToTransfer':True,'revision':'r1'}
+            if op in ('export','inspect','prepare'):
+                return json.loads(json.dumps(transfer_worker.rpc({'op':op,'args':args})))
+            return real(host,op,args,timeout)
+        self.flow.rpc=rpc
+        self.bound=[]
+        def bind(spec,profile,host,**kwargs):
+            self.bound.append(spec['cwd'])
+            return {**spec,'nativeSource':{'host':host,'agent':'codex','id':'019bbbbb-0000-7000-8000-000000000002'},'connectionMode':'attach'}
+        for context in (patch('transfer_worker.source_ready',return_value={'safeToTransfer':True,'revision':'r1'}),
+                        patch('managed_launch.bind',side_effect=bind)):
+            context.start();self.addCleanup(context.stop)
+    def test_workspace_moves_through_real_helper_processes(self):
+        preview=self.flow.preview(self.source,self.target,self.hosts[0],self.hosts[1])
+        workspace=preview['workspace']
+        self.assertEqual(workspace['excludedSensitive'],['client_secret_x.json'])
+        self.assertIn('.claude/settings.local.json',workspace['excluded'])
+        self.assertIn('target/',workspace['excluded'])
+        self.assertIn('README.md',[row['path'] for row in workspace['largestFiles']])
+        # In real use the source helper path is known from an earlier poll.
+        self.real(self.hosts[0],'status',{'transferId':'0'*32})
+        result=self.flow.execute(self.source,self.target,self.hosts[0],self.hosts[1],{'environment':'isolated'},
+                                 'e2e-request',lambda:[{'role':'user','text':'이어가기'}])
+        destination=Path(result['destinationCwd'])
+        self.assertEqual(destination,self.home/'.local/share/sessionholic/workspaces'/result['transferId']/'project')
+        self.assertEqual(self.bound,[str(destination)])
+        for name in ('README.md','.claude/agents/reviewer.md','.claude/settings.json','.codex/AGENTS.md','notes.txt'):
+            self.assertEqual((destination/name).read_text(),(self.repo/name).read_text(),name)
+        for name in ('client_secret_x.json','.claude/settings.local.json','target'):
+            self.assertFalse((destination/name).exists(),name)
+        self.assertIn(('target','profiles'),self.ops)
+        self.assertEqual([host for host,op in self.ops if op=='cleanup'],['source','target'])
+        job=self.home/'.local/state/sessionholic-transfers'/result['transferId']
+        self.assertTrue((job/'launch.json').exists())
+        self.assertFalse((job/'incoming.tar.gz').exists())
+        self.assertEqual(list((job/'export').glob('workspace-*.tar.gz')),[])
+        record=json.loads((self.home/'board-state/transfers'/result['transferId']/'transfer.json').read_text())
+        self.assertEqual((record['status'],record['archiveCleanupPending']),('ready',False))
+        handoff=next(job.glob('handoff-*.md')).read_text()
+        self.assertNotIn('largestFiles',handoff);self.assertNotIn('fixture-secret-never-transport',handoff)
+        installed=list((self.home/'.local/state/sessionholic-transfer-runtime').glob('worker-*.pyz'))
+        self.assertEqual([path.name for path in installed],['worker-'+self.flow.runtime()['sha256']+'.pyz'])
+        self.assertEqual(result['argv'][:2],[sys.executable,'-I'])
+        self.assertEqual(result['argv'][-2:],['exec',result['transferId']])
+
+
+def transfer_workspace_env():
+    import transfer_workspace
+    return transfer_workspace._git_env()
 
 
 if __name__=='__main__':unittest.main()

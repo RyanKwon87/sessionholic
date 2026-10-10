@@ -120,7 +120,7 @@ function client(
   vm.runInContext(messageSource, context);
   vm.runInContext(source, context);
   const api = vm.runInContext(
-    "({state,api,sourceOf,accountOf,sendInput,pasteDraft,prepareDraftPaste,startDraftComposition,endDraftComposition,inputDraft,stopTerminalReader,startTerminalReader,closePlan,navigateView,backToList,backFromTerminal,closeTerminal,cancelTerminalClose,confirmTerminalClose,populateAccount,populateRoute,updateContinue,renderPlan,launchPlan,openTerminal,saveDraft,draftKey,refreshTerminals,renderTerminals,renderTerminalReturn,renderFilters,terminalCloseCopy,warnDraftUnload,preparePlan,renderGroups,renderMessages,loadDetail,chatKey,chatEntry,currentChat,chatSupported,chatAttachmentsSupported,buildChatComposer,sendChat,loadChatState,applyChatReceipt,uploadChatFiles,pasteChat,scheduleChatPoll,stopChatPolling,openNativeChat,allSessions,buildContinuePanel,chatReceiptCopy,returnToBoard,readChatClipboard,accountDisplay,sessionAccountLabel,closeChatToolsOutside,closeChatToolsEscape,drawDetail,refreshDetail,loadCapabilities,matches,recoverConnection,networkOffline,poll,select,focusDetailBack,restoreSelectedCardFocus,showLogin,lock,beginAuthEpoch,resizeChatInput,updateViewport,draftKeydown,configureTerminalKeyboard,queueTerminalScroll,flushTerminalScroll,terminalScrollEnd,renderAttention,chatPollDelay,pullRefresh})",
+    "({state,api,sourceOf,accountOf,sendInput,pasteDraft,prepareDraftPaste,startDraftComposition,endDraftComposition,inputDraft,stopTerminalReader,startTerminalReader,closePlan,navigateView,backToList,backFromTerminal,closeTerminal,cancelTerminalClose,confirmTerminalClose,populateAccount,populateRoute,updateContinue,renderPlan,launchPlan,openTerminal,saveDraft,draftKey,refreshTerminals,renderTerminals,renderTerminalReturn,renderFilters,terminalCloseCopy,warnDraftUnload,preparePlan,renderGroups,renderMessages,loadDetail,chatKey,chatEntry,currentChat,chatSupported,chatAttachmentsSupported,buildChatComposer,sendChat,loadChatState,applyChatReceipt,uploadChatFiles,pasteChat,scheduleChatPoll,stopChatPolling,openNativeChat,allSessions,buildContinuePanel,chatReceiptCopy,returnToBoard,readChatClipboard,accountDisplay,sessionAccountLabel,closeChatToolsOutside,closeChatToolsEscape,drawDetail,refreshDetail,loadCapabilities,matches,recoverConnection,networkOffline,poll,select,focusDetailBack,restoreSelectedCardFocus,showLogin,lock,beginAuthEpoch,resizeChatInput,updateViewport,draftKeydown,configureTerminalKeyboard,queueTerminalScroll,flushTerminalScroll,terminalScrollEnd,renderAttention,chatPollDelay,pullRefresh,readingScroll,renderJump,pullDistance,listScroll,setReading,renderPrompt,promptAction})",
     context,
   );
   api.state.csrf = "csrf-test";
@@ -3200,7 +3200,7 @@ test('pull to refresh reloads the board once and never overlaps a running refres
     requests.push(url);
     if (url === '/api/refresh') await new Promise((resolve) => { release = resolve; });
     return { ok: true, status: 200, json: async () => ({ ok: true, hosts: [], terminals: [] }) };
-  }, noChatTimers);
+  }, { setTimeout: (callback, delay) => (delay === 700 ? setImmediate(callback) : 1), clearTimeout() {} });
   c.state.authenticated = true;
   const first = c.pullRefresh();
   const second = c.pullRefresh();
@@ -3208,7 +3208,162 @@ test('pull to refresh reloads the board once and never overlaps a running refres
   assert.equal(requests.filter((url) => url === '/api/refresh').length, 1);
   assert.equal(c.state.pullRefreshing, true);
   release();
+  await new Promise((resolve) => setImmediate(resolve));
+  // A short confirmation is shown before the indicator slides away.
+  assert.match(c.get('pull-refresh-label').textContent, /업데이트됨|오프라인/);
   await Promise.all([first, second]);
   assert.equal(c.state.pullRefreshing, false);
   assert.equal(requests[0], '/api/refresh');
+});
+
+function classes() {
+  const set = new Set();
+  return { set, add: (name) => set.add(name), remove: (name) => set.delete(name), contains: (name) => set.has(name),
+    toggle: (name, force) => { const on = force ?? !set.has(name); on ? set.add(name) : set.delete(name); return on; } };
+}
+
+test('reading mode folds only after a deliberate upward read and unfolds at the newest message', () => {
+  const c = client(undefined, noChatTimers);
+  const pane = c.get('detail'); pane.classList = classes();
+  const list = c.get('messages'); Object.assign(list, { scrollHeight: 3000, clientHeight: 600, scrollTop: 2400 });
+  c.get('jump-bottom');
+  c.readingScroll(list);
+  list.scrollTop = 2390; c.readingScroll(list);
+  assert.equal(pane.classList.contains('is-reading'), false, 'a 10px wobble keeps the chrome');
+  list.scrollTop = 2350; c.readingScroll(list);
+  assert.equal(pane.classList.contains('is-reading'), true, 'a 50px upward read folds it');
+  assert.equal(c.get('jump-bottom').hidden, true, 'the jump appears only once the end is out of reach');
+  list.scrollTop = 1500; c.readingScroll(list);
+  assert.equal(c.get('jump-bottom').hidden, false);
+  list.scrollTop = 2300; c.readingScroll(list);
+  assert.equal(pane.classList.contains('is-reading'), true, 'reading downward keeps the space');
+  list.scrollTop = 2395; c.readingScroll(list);
+  assert.equal(pane.classList.contains('is-reading'), false, 'the newest message restores the chrome');
+  assert.equal(c.get('jump-bottom').hidden, true);
+});
+
+test('messages arriving while reading back are counted on the jump button and cleared at the bottom', () => {
+  const c = client(undefined, noChatTimers);
+  const { s } = selectChat(c);
+  const list = c.get('messages'); const jump = c.get('jump-bottom'); jump.classList = classes();
+  c.renderMessages(s, [{ role: 'assistant', text: '첫 답', ts: 1 }], '', true);
+  Object.assign(list, { scrollHeight: 3000, clientHeight: 600, scrollTop: 100 });
+  c.renderMessages(s, [{ role: 'assistant', text: '첫 답', ts: 1 }, { role: 'user', text: '질문', ts: 2 },
+    { role: 'tool', text: '$ ls', ts: 3 }, { role: 'assistant', text: '둘째 답', ts: 4 }]);
+  assert.equal(list.unread, 2, 'tool rows are not counted');
+  assert.match(jump.textContent, /새 메시지 2/);
+  assert.equal(jump.classList.contains('has-unread'), true);
+  list.scrollTop = 2400; c.readingScroll(list);
+  assert.equal(list.unread, 0);
+  assert.equal(jump.textContent, '↓');
+});
+
+test('pull distance is elastic and the list app bar slides away only on phones', () => {
+  const c = client(undefined, noChatTimers);
+  assert.equal(c.pullDistance(0), 0);
+  assert.ok(c.pullDistance(80) < 80 && c.pullDistance(300) < 110 && c.pullDistance(300) > c.pullDistance(150));
+  const bar = { style: {}, offsetHeight: 52 };
+  c.context.document.querySelector = (selector) => (selector === '.top' ? bar : null);
+  c.context.document.body.classList = classes();
+  c.context.window.matchMedia = (query) => ({ matches: query === '(max-width: 700px)' });
+  const pane = { scrollTop: 0 };
+  for (const top of [20, 40, 80]) { pane.scrollTop = top; c.listScroll(pane); }
+  assert.equal(c.context.document.body.classList.contains('top-hidden'), true);
+  assert.equal(bar.style.marginTop, '-52px');
+  for (const top of [60, 20]) { pane.scrollTop = top; c.listScroll(pane); }
+  assert.equal(c.context.document.body.classList.contains('top-hidden'), false);
+  assert.equal(bar.style.marginTop, '');
+  c.context.window.matchMedia = () => ({ matches: false });
+  pane.scrollTop = 400; c.listScroll(pane); pane.scrollTop = 800; c.listScroll(pane);
+  assert.equal(c.context.document.body.classList.contains('top-hidden'), false, 'desktop keeps its bar');
+});
+
+test('an app that owns its screen scrolls in both directions, while tmux history stops at the live screen', async () => {
+  const calls = [];
+  let mode = 'app';
+  const c = client(async (url, opts) => {
+    calls.push(JSON.parse(opts.body).lines);
+    return { ok: true, status: 200, json: async () => (mode === 'app' ? { ok: true, mode: 'app', position: null }
+      : { ok: true, mode: 'history', position: 7 }) };
+  }, { setTimeout: () => 1, clearTimeout() {} });
+  c.state.connected = true; c.state.terminal = { id: 'term-1' };
+  c.state.terminalScrollPending = 6; await c.flushTerminalScroll();
+  assert.deepEqual(calls, [6], 'app mode can scroll down from the live screen');
+  assert.equal(c.state.terminalScrollLines, 0);
+  mode = 'history'; c.state.terminalScrollMode = null;
+  c.state.terminalScrollPending = -9; await c.flushTerminalScroll();
+  assert.equal(c.state.terminalScrollLines, 7, 'the server position is shown');
+  assert.equal(c.get('terminal-live').hidden, false);
+  assert.match(c.get('terminal-live').textContent, /7줄 위/);
+  c.state.terminalScrollPending = 20; await c.flushTerminalScroll();
+  assert.equal(calls.at(-1), 7, 'history never scrolls below the live screen');
+});
+
+function findClass(root, name, out = []) {
+  if (typeof root?.className === 'string' && root.className.split(' ').includes(name)) out.push(root);
+  for (const child of root?.children || []) findClass(child, name, out);
+  return out;
+}
+
+test('a question card selects first and sends only on the second tap, with the exact menu fingerprint', async () => {
+  const requests = [];
+  const c = client(async (url, opts) => {
+    requests.push([url, JSON.parse(opts.body)]);
+    return { ok: true, status: 200, json: async () => (url === '/api/chat/prompt' ? { status: 'answered', prompt: null } : { messages: [] }) };
+  }, noChatTimers);
+  const { s, entry } = selectChat(c);
+  c.drawDetail(s);
+  const prompt = { agent: 'claude', fingerprint: 'f'.repeat(64), current: 1, multi: false, terminalId: 'a'.repeat(32),
+    question: 'Bash command\n  rm -rf build\nDo you want to proceed?',
+    options: [{ number: 1, label: 'Yes', detail: '' }, { number: 2, label: "Yes, and don't ask again", detail: '' },
+      { number: 3, label: 'No, and tell Claude what to do differently (esc)', detail: '' }] };
+  entry.data = { ...entry.data, prompt, phase: 'needs_input' };
+  c.renderPrompt(s, entry.data);
+  const card = c.get('chat-prompt');
+  assert.equal(card.hidden, false);
+  assert.match(textOf(card), /Claude가 답을 기다려요/);
+  assert.match(textOf(card), /rm -rf build/);
+  const options = findClass(card, 'chat-prompt-option');
+  assert.equal(options.length, 3);
+  options[2].events.click();
+  assert.equal(requests.length, 0, 'choosing alone sends nothing');
+  assert.equal(entry.promptChoice.number, 3);
+  const again = c.get('chat-prompt');
+  const send = findClass(again, 'primary')[0];
+  assert.match(send.textContent, /3번 보내기/);
+  // A poll with the same menu keeps the selection instead of resetting it.
+  c.renderPrompt(s, entry.data);
+  assert.equal(entry.promptChoice.number, 3);
+  await send.events.click();
+  await new Promise((resolve) => setImmediate(resolve));
+  const [url, body] = requests[0];
+  assert.equal(url, '/api/chat/prompt');
+  assert.deepEqual({ action: body.action, fingerprint: body.fingerprint, number: body.number },
+    { action: 'answer', fingerprint: prompt.fingerprint, number: 3 });
+  assert.equal(entry.promptChoice, null);
+});
+
+test('menus the web cannot drive stay readable with disabled options, and a waiting session can load its question', async () => {
+  const requests = [];
+  const c = client(async (url, opts) => {
+    requests.push([url, JSON.parse(opts.body)]);
+    return { ok: true, status: 200, json: async () => ({ prompt: null, messages: [] }) };
+  }, noChatTimers);
+  const { s, entry } = selectChat(c);
+  c.drawDetail(s);
+  entry.data = { ...entry.data, phase: 'needs_input', prompt: { agent: 'codex', fingerprint: 'e'.repeat(64), current: 1, multi: true,
+    question: '고를 항목', options: [{ number: 1, label: '[ ] A', detail: '' }, { number: 2, label: '[ ] B', detail: '' }] } };
+  c.renderPrompt(s, entry.data);
+  assert.ok(findClass(c.get('chat-prompt'), 'chat-prompt-option').every((option) => option.disabled));
+  assert.match(textOf(c.get('chat-prompt')), /터미널에서 선택/);
+  entry.data = { ...entry.data, prompt: null, promptOpenable: true };
+  c.renderPrompt(s, entry.data);
+  const open = findClass(c.get('chat-prompt'), 'primary')[0];
+  assert.match(open.textContent, /질문 불러오기/);
+  await open.events.click();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(requests[0][1].action, 'open');
+  entry.data = { ...entry.data, promptOpenable: false, phase: 'working' };
+  c.renderPrompt(s, entry.data);
+  assert.equal(c.get('chat-prompt').hidden, true);
 });

@@ -90,6 +90,9 @@ const state = {
   terminalScrollLines: 0,
   terminalScrollPending: 0,
   terminalScrollTimer: null,
+  terminalScrollMode: null,
+  terminalScrollInFlight: false,
+  terminalMomentum: null,
   toastTimer: null,
   chats: new Map(),
   nativeSessions: new Map(),
@@ -718,10 +721,7 @@ function drawDetail(s) {
   const bar = el("div", "conversation-bar");
   bar.append(
     el("strong", null, "최근 대화"),
-    button("맨 아래 ↓", "", () => {
-      const list = $("messages");
-      list.scrollTop = list.scrollHeight;
-    }),
+    button("맨 아래 ↓", "", () => scrollMessagesToEnd()),
   );
   const list = el("div", "messages");
   list.id = "messages";
@@ -731,31 +731,181 @@ function drawDetail(s) {
   sync.id = "conversation-sync-notice";
   sync.hidden = true;
   sync.setAttribute("role", "status");
-  const jump = button("↓", "jump-bottom", () => {
-    list.scrollTop = list.scrollHeight;
-    setReading(false);
-  });
+  const jump = button("↓", "jump-bottom", () => scrollMessagesToEnd());
+  jump.id = "jump-bottom";
+  jump.hidden = true;
   jump.setAttribute("aria-label", "대화 맨 아래로");
   list.addEventListener("scroll", () => readingScroll(list), { passive: true });
+  // The folded one-line header unfolds when tapped (the back button keeps its job).
+  head.addEventListener("click", (event) => {
+    if (pane.classList?.contains?.("is-reading") && !event.target?.closest?.(".back")) setReading(false);
+  });
   pane.classList?.remove("is-reading");
-  pane.append(bar, sync, list, jump, buildChatComposer(s), buildContinuePanel(s));
+  const prompt = el("section", "chat-prompt");
+  prompt.id = "chat-prompt";
+  prompt.hidden = true;
+  prompt.setAttribute("aria-live", "polite");
+  pane.append(bar, sync, list, jump, prompt, buildChatComposer(s), buildContinuePanel(s));
+}
+// Questions and approvals drawn by the CLI in the board's terminal, answered
+// here with the same keys a person would press. Nothing is sent until the
+// second, explicit tap, and the server rechecks the exact menu first.
+const AGENT_NAMES = { claude: "Claude", codex: "Codex" };
+function renderPrompt(s, data) {
+  const card = $("chat-prompt");
+  if (!card || !currentChat(chatEntry(s))) return;
+  const entry = chatEntry(s);
+  const prompt = data?.prompt && Array.isArray(data.prompt.options) && data.prompt.options.length ? data.prompt : null;
+  const openable = !prompt && data?.promptOpenable === true && data?.phase === "needs_input";
+  if (!prompt && !openable) {
+    card.hidden = true;
+    card.dataset.fingerprint = "";
+    entry.promptChoice = null;
+    return;
+  }
+  const revision = prompt ? `${prompt.fingerprint}|${prompt.current}|${entry.promptChoice?.number || ""}|${entry.promptBusy ? 1 : 0}`
+    : `open|${entry.promptBusy ? 1 : 0}`;
+  card.hidden = false;
+  if (card.dataset.fingerprint === revision) return;
+  card.dataset.fingerprint = revision;
+  if (entry.promptChoice && entry.promptChoice.fingerprint !== prompt?.fingerprint) entry.promptChoice = null;
+  const head = el("div", "chat-prompt-head");
+  head.append(el("strong", null, prompt ? `${AGENT_NAMES[prompt.agent] || "에이전트"}가 답을 기다려요` : "답이 필요한 상태입니다"));
+  const terminal = button("터미널", "chat-prompt-terminal", () => openChatTerminal(s));
+  head.append(terminal);
+  const nodes = [head];
+  if (!prompt) {
+    nodes.push(el("p", "chat-prompt-note", "질문 화면을 불러오면 여기서 바로 고를 수 있습니다."));
+    const open = button(entry.promptBusy ? "불러오는 중…" : "질문 불러오기", "primary", () => promptAction(s, { action: "open" }));
+    open.disabled = !!entry.promptBusy || networkOffline();
+    nodes.push(open);
+    card.replaceChildren(...nodes);
+    return;
+  }
+  if (prompt.question) {
+    const question = el("pre", "chat-prompt-question", prompt.question);
+    nodes.push(question);
+  }
+  const selectable = !prompt.multi && Number.isInteger(prompt.current);
+  const options = el("div", "chat-prompt-options");
+  options.setAttribute("role", "radiogroup");
+  for (const option of prompt.options) {
+    const chosen = entry.promptChoice?.number === option.number;
+    const item = button("", `chat-prompt-option${chosen ? " is-chosen" : ""}${option.number === prompt.current ? " is-current" : ""}`, () => {
+      if (!selectable || entry.promptBusy) return;
+      entry.promptChoice = { fingerprint: prompt.fingerprint, number: option.number };
+      renderPrompt(s, entry.data);
+    });
+    item.setAttribute("role", "radio");
+    item.setAttribute("aria-checked", String(chosen));
+    item.disabled = !selectable || !!entry.promptBusy;
+    item.append(el("span", "chat-prompt-number", String(option.number)), el("span", "chat-prompt-label", option.label));
+    if (option.detail) item.append(el("span", "chat-prompt-detail", option.detail));
+    options.append(item);
+  }
+  nodes.push(options);
+  if (!selectable) {
+    nodes.push(el("p", "chat-prompt-note", prompt.multi ? "여러 개를 고르는 메뉴는 터미널에서 선택해 주세요."
+      : "현재 선택 위치를 확인하지 못했습니다. 터미널에서 선택해 주세요."));
+  } else {
+    const choice = prompt.options.find((option) => option.number === entry.promptChoice?.number);
+    const send = button(entry.promptBusy ? "보내는 중…" : choice ? `${choice.number}번 보내기` : "선택지를 고르세요", "primary", () => {
+      if (!choice) return;
+      promptAction(s, { action: "answer", fingerprint: prompt.fingerprint, number: choice.number });
+    });
+    send.disabled = !choice || !!entry.promptBusy || networkOffline();
+    nodes.push(send);
+  }
+  if (entry.promptNote) nodes.push(el("p", "chat-prompt-note", entry.promptNote));
+  card.replaceChildren(...nodes);
+}
+async function promptAction(s, body) {
+  const entry = chatEntry(s);
+  if (entry.promptBusy || !currentChat(entry)) return;
+  entry.promptBusy = true;
+  entry.promptNote = "";
+  renderPrompt(s, entry.data);
+  try {
+    const result = await api("/api/chat/prompt", { method: "POST", body: {
+      source: entry.source, requestId: requestId(), ...body } });
+    if (!currentChat(entry)) return;
+    entry.promptChoice = null;
+    if (body.action === "answer")
+      entry.promptNote = result.status === "answered" ? "" : "선택이 반영됐는지 확인하지 못했습니다. 터미널에서 확인해 주세요.";
+    if (body.action === "answer" && result.status === "answered") toast("선택을 보냈습니다.");
+    entry.data = { ...entry.data, prompt: result.prompt || null, promptOpenable: false };
+  } catch (err) {
+    if (!err.unauthorized && currentChat(entry)) entry.promptNote = err.message;
+  } finally {
+    entry.promptBusy = false;
+    if (currentChat(entry)) {
+      renderPrompt(s, entry.data);
+      state.chatPollCount = 0;
+      loadChatState(s, true);
+    }
+  }
 }
 // While reading back through a conversation the header and composer chrome
 // fold away; returning to the newest message or the input restores them.
-function setReading(reading) {
+function setReading(reading, { stickBottom = false } = {}) {
   const pane = $("detail");
   if (!pane?.classList || pane.classList.contains?.("is-reading") === reading) return;
+  const list = $("messages");
+  const before = list?.getBoundingClientRect?.().top;
   pane.classList.toggle?.("is-reading", reading);
+  if (list && typeof before === "number") {
+    if (stickBottom) list.scrollTop = list.scrollHeight;
+    else {
+      // The header folding moves the list; shift its scroll by the same amount
+      // so the line being read stays exactly where it was.
+      const shift = list.getBoundingClientRect().top - before;
+      if (shift) list.scrollTop += shift;
+    }
+    list.lastScrollTop = list.scrollTop;
+  }
+  renderJump();
 }
 function readingScroll(list) {
-  if (document.activeElement?.id === "chat-input") return;
-  // Direction, not distance: folding the chrome enlarges the list, which must
-  // not read as "back at the bottom" and unfold it again.
   const top = list.scrollTop;
   const previous = list.lastScrollTop ?? top;
   list.lastScrollTop = top;
-  if (list.scrollHeight - top - list.clientHeight < 24) setReading(false);
-  else if (top < previous - 4) setReading(true);
+  const typing = document.activeElement?.id === "chat-input";
+  if (list.scrollHeight - top - list.clientHeight < 24) {
+    list.upTravel = 0;
+    list.unread = 0;
+    if (!typing) setReading(false, { stickBottom: true });
+  } else if (!typing) {
+    // A deliberate upward read folds the chrome; a small wobble does not.
+    list.upTravel = top < previous ? (list.upTravel || 0) + previous - top : 0;
+    if (list.upTravel > 32) setReading(true);
+  }
+  renderJump();
+}
+function scrollMessagesToEnd() {
+  const list = $("messages");
+  if (!list) return;
+  list.unread = 0;
+  if (typeof list.scrollTo === "function") list.scrollTo({ top: list.scrollHeight, behavior: "smooth" });
+  else list.scrollTop = list.scrollHeight;
+  renderJump();
+}
+function renderJump() {
+  const list = $("messages");
+  const jump = $("jump-bottom");
+  if (!list || !jump) return;
+  const far = list.scrollHeight - list.scrollTop - list.clientHeight > 160;
+  const unread = list.unread || 0;
+  jump.hidden = !far && !unread;
+  const label = unread ? `↓ 새 메시지 ${unread}` : "↓";
+  if (jump.textContent !== label) jump.textContent = label;
+  jump.classList?.toggle?.("has-unread", unread > 0);
+  jump.setAttribute("aria-label", unread ? `새 메시지 ${unread}개, 맨 아래로` : "대화 맨 아래로");
+  // Float just above the conversation's bottom edge, whatever the composer height.
+  const pane = $("detail");
+  if (jump.style && pane?.clientHeight && Number.isFinite(list.offsetTop)) {
+    const bottom = pane.clientHeight - list.offsetTop - list.clientHeight + 12;
+    if (bottom > 0) jump.style.bottom = `${bottom}px`;
+  }
 }
 
 // Drafts and attachment handles stay in memory and are keyed by the actual
@@ -1160,7 +1310,7 @@ function scheduleChatPoll(s, entry) {
   if (!currentChat(entry)) return;
   clearTimeout(state.chatPollTimer);
   if (networkOffline() || !currentChat(entry) || !chatVisible() || state.chatPollCount >= CHAT_POLL_MAX ||
-      (!entry.pending && !entry.error && !["working", "needs_input"].includes(entry.data?.phase))) return;
+      (!entry.pending && !entry.error && !entry.data?.prompt && !["working", "needs_input"].includes(entry.data?.phase))) return;
   const run = state.chatPollRun;
   state.chatPollTimer = setTimeout(() => {
     if (run !== state.chatPollRun || !currentChat(entry) || !chatVisible()) return;
@@ -1228,6 +1378,7 @@ async function loadChatState(s, manual = false, { join = false } = {}) {
           (entry.receipt?.dispatchState !== "not_started" && receipt.requestId === entry.receipt?.requestId))
         applyChatReceipt(entry, receipt);
     }
+    renderPrompt(s, data);
     if (chatReadSupported(entry, data)) {
       rememberConversation(s, data.messages, data);
       if (currentChat(entry)) {
@@ -1537,6 +1688,7 @@ function renderMessages(s, messages, error = "", fresh = false) {
   const stick = !readingSelection &&
     (fresh || list.scrollHeight - list.scrollTop - list.clientHeight < 50);
   const scroll = list.scrollTop;
+  const previousKeys = new Set(previous.map((item) => item.key));
   const oldWarningHeight = list.conversationError && [...list.children].includes(list.conversationError)
     ? list.conversationError.offsetHeight || 0 : 0;
   const available = new Map();
@@ -1639,6 +1791,12 @@ function renderMessages(s, messages, error = "", fresh = false) {
   list.conversationRows = rows;
   const warningHeight = error ? list.conversationError.offsetHeight || 0 : 0;
   list.scrollTop = stick ? list.scrollHeight : scroll + warningHeight - oldWarningHeight;
+  // While reading back, count what arrived below instead of jumping to it.
+  if (!stick && previous.length) {
+    const added = rows.filter((item) => !previousKeys.has(item.key) && item.message.role !== "tool").length;
+    if (added) list.unread = (list.unread || 0) + added;
+  } else if (stick) list.unread = 0;
+  renderJump();
 }
 
 function updateReadNotice(data) {
@@ -2432,8 +2590,11 @@ async function openTerminal(terminal, { recordHistory = true } = {}) {
     state.term.loadAddon(state.fit);
     state.term.open($("terminal-viewport"));
     configureTerminalKeyboard();
-    // tmux owns the history, so a wheel would otherwise reach the CLI as arrow keys.
+    // An app that asked for the mouse gets the wheel from xterm itself (tmux
+    // forwards it); otherwise the wheel scrolls tmux history instead of
+    // reaching the CLI as arrow keys.
     state.term.attachCustomWheelEventHandler?.((event) => {
+      if ((state.term?.modes?.mouseTrackingMode || "none") !== "none") return true;
       queueTerminalScroll(event.deltaY / terminalLineHeight());
       return false;
     });
@@ -2638,11 +2799,19 @@ function renderTerminalScroll() {
   const scrolled = state.terminalScrollLines > 0;
   $("terminal-bottom")?.classList?.toggle?.("is-active", scrolled);
   $("terminal-screen")?.classList?.toggle?.("is-scrolled", scrolled);
+  const live = $("terminal-live");
+  if (!live) return;
+  live.hidden = !scrolled;
+  if (scrolled) {
+    live.textContent = `실시간으로 ↓ · ${state.terminalScrollLines}줄 위`;
+    const tools = $("terminal-tools") || document.querySelector?.(".terminal-tools");
+    if (live.style && tools?.offsetHeight) live.style.bottom = `${tools.offsetHeight + 12}px`;
+  }
 }
 function queueTerminalScroll(lines) {
   if (!state.connected || !state.terminal || !Number.isFinite(lines) || !lines) return;
   state.terminalScrollPending += lines;
-  if (state.terminalScrollTimer) return;
+  if (state.terminalScrollTimer || state.terminalScrollInFlight) return;
   state.terminalScrollTimer = setTimeout(flushTerminalScroll, 60);
 }
 async function flushTerminalScroll() {
@@ -2650,21 +2819,36 @@ async function flushTerminalScroll() {
   const whole = Math.trunc(state.terminalScrollPending);
   if (!whole || !state.terminal) return;
   state.terminalScrollPending -= whole;
-  // Negative scrolls back through history; nothing lies below the live screen.
+  // Up reveals older output. Below the live screen there is nothing in tmux
+  // history, but an app that owns its screen (alternate screen) scrolls itself.
   let lines = Math.max(-200, Math.min(200, whole));
-  if (lines > 0) lines = Math.min(lines, state.terminalScrollLines);
+  if (lines > 0 && state.terminalScrollMode === "history") lines = Math.min(lines, state.terminalScrollLines);
   if (!lines) return;
-  state.terminalScrollLines = Math.max(0, state.terminalScrollLines - lines);
-  renderTerminalScroll();
+  const estimate = Math.max(0, state.terminalScrollLines - lines);
+  state.terminalScrollInFlight = true;
   try {
-    await api(`/api/terminal/${encodeURIComponent(state.terminal.id)}/scroll`,
+    const result = await api(`/api/terminal/${encodeURIComponent(state.terminal.id)}/scroll`,
       { method: "POST", body: { lines } });
+    if (result?.mode === "app") {
+      state.terminalScrollMode = "app";
+      state.terminalScrollLines = 0;
+    } else {
+      state.terminalScrollMode = "history";
+      state.terminalScrollLines = Number.isInteger(result?.position) ? result.position : estimate;
+    }
   } catch {
     state.terminalScrollLines = 0;
+    stopTerminalMomentum();
+  } finally {
+    state.terminalScrollInFlight = false;
     renderTerminalScroll();
+    // Swipes that arrived during the request are sent next, never dropped or doubled.
+    if (Math.trunc(state.terminalScrollPending) && !state.terminalScrollTimer)
+      state.terminalScrollTimer = setTimeout(flushTerminalScroll, 30);
   }
 }
 async function terminalScrollEnd() {
+  stopTerminalMomentum();
   state.terminalScrollPending = 0;
   state.terminalScrollLines = 0;
   renderTerminalScroll();
@@ -2676,20 +2860,60 @@ async function terminalScrollEnd() {
     /* typing also returns to the live screen */
   }
 }
+function stopTerminalMomentum() {
+  if (state.terminalMomentum) globalThis.cancelAnimationFrame?.(state.terminalMomentum);
+  state.terminalMomentum = null;
+}
+// A flick keeps scrolling and slows down, like any native list.
+function startTerminalMomentum(velocity) {
+  stopTerminalMomentum();
+  let speed = velocity;
+  let last = Date.now();
+  const started = last;
+  const step = () => {
+    const now = Date.now();
+    const elapsed = Math.max(1, now - last);
+    last = now;
+    queueTerminalScroll((-speed * elapsed) / terminalLineHeight());
+    speed *= Math.pow(0.94, elapsed / 16);
+    if (Math.abs(speed) < 0.03 || now - started > 1600 || !state.connected) {
+      state.terminalMomentum = null;
+      return;
+    }
+    state.terminalMomentum = requestAnimationFrame(step);
+  };
+  state.terminalMomentum = requestAnimationFrame(step);
+}
 function bindTerminalTouchScroll(node) {
   let lastY = null;
+  let samples = [];
+  // Capture phase: xterm's own layers must not swallow the gesture first.
   node.addEventListener("touchstart", (event) => {
+    stopTerminalMomentum();
     lastY = event.touches.length === 1 ? event.touches[0].clientY : null;
-  }, { passive: true });
+    samples = lastY === null ? [] : [[Date.now(), lastY]];
+  }, { passive: true, capture: true });
   node.addEventListener("touchmove", (event) => {
     if (lastY === null || event.touches.length !== 1) return;
     const y = event.touches[0].clientY;
     // Dragging down reveals older lines, as in any scrolling list.
     queueTerminalScroll((lastY - y) / terminalLineHeight());
     lastY = y;
-    event.preventDefault();
-  }, { passive: false });
-  node.addEventListener("touchend", () => { lastY = null; }, { passive: true });
+    samples.push([Date.now(), y]);
+    if (samples.length > 6) samples.shift();
+    if (event.cancelable) event.preventDefault();
+  }, { passive: false, capture: true });
+  node.addEventListener("touchend", () => {
+    const recent = samples.filter(([time]) => Date.now() - time < 100);
+    if (recent.length >= 2) {
+      const [t0, y0] = recent[0];
+      const [t1, y1] = recent[recent.length - 1];
+      const velocity = (y1 - y0) / Math.max(1, t1 - t0);
+      if (Math.abs(velocity) > 0.35) startTerminalMomentum(velocity);
+    }
+    lastY = null;
+    samples = [];
+  }, { passive: true, capture: true });
 }
 function resizeDraft() {
   const input = $("terminal-draft");
@@ -3060,6 +3284,26 @@ async function manualRefresh() {
     if (authEpoch === state.authEpoch) $("refresh").disabled = false;
   }
 }
+// On phones the app bar slides away while the list is scrolled down and
+// returns as soon as the list moves back up.
+function setTopHidden(hidden) {
+  const bar = document.querySelector?.(".top");
+  const body = document.body;
+  if (!bar?.style || !body?.classList || body.classList.contains?.("top-hidden") === hidden) return;
+  bar.style.marginTop = hidden ? `-${bar.offsetHeight || 0}px` : "";
+  body.classList.toggle?.("top-hidden", hidden);
+}
+function listScroll(pane) {
+  if (!window.matchMedia?.("(max-width: 700px)").matches) { setTopHidden(false); return; }
+  const top = pane.scrollTop;
+  const previous = pane.lastScrollTop ?? top;
+  pane.lastScrollTop = top;
+  if (top < 12) { pane.travel = 0; setTopHidden(false); return; }
+  const delta = top - previous;
+  pane.travel = Math.sign(delta) === Math.sign(pane.travel || 0) ? (pane.travel || 0) + delta : delta;
+  if (pane.travel > 48) setTopHidden(true);
+  else if (pane.travel < -48) setTopHidden(false);
+}
 // Pull to refresh: the installed app has no browser gesture (overscroll is off),
 // so a downward pull from the top of the list or conversation reloads both.
 const PULL_TRIGGER = 64;
@@ -3070,12 +3314,19 @@ function scrollParent(node) {
   }
   return null;
 }
+function pullDistance(pulled) {
+  // Elastic: the indicator follows the finger less and less, like a rubber band.
+  return 110 * (1 - Math.exp(-Math.max(0, pulled) / 160));
+}
 function showPull(distance, label = "당겨서 새로고침", ready = false) {
   const indicator = $("pull-refresh");
   if (!indicator?.style) return;
   indicator.style.transform = `translate(-50%, ${Math.round(distance - 48)}px)`;
   indicator.style.opacity = distance > 4 ? "1" : "0";
   indicator.classList?.toggle?.("is-ready", ready);
+  const icon = indicator.querySelector?.(".pull-refresh-icon");
+  if (icon?.style && !indicator.classList?.contains?.("is-loading"))
+    icon.style.transform = `rotate(${Math.round(Math.min(1, distance / PULL_TRIGGER) * 180)}deg)`;
   $("pull-refresh-label").textContent = label;
 }
 async function pullRefresh() {
@@ -3083,13 +3334,22 @@ async function pullRefresh() {
   state.pullRefreshing = true;
   showPull(PULL_TRIGGER, "새로고침 중…", true);
   $("pull-refresh")?.classList?.add("is-loading");
+  let label = "업데이트됨";
   try {
     await manualRefresh();
     const selected = selectedSession();
     if (selected && chatVisible()) await loadChatState(selected, true);
+    if (networkOffline()) label = "오프라인입니다";
+  } catch {
+    label = "새로고침하지 못했습니다";
   } finally {
-    state.pullRefreshing = false;
     $("pull-refresh")?.classList?.remove("is-loading");
+    showPull(PULL_TRIGGER, label, false);
+    $("pull-refresh")?.classList?.add("is-done");
+    // A short confirmation, then the indicator slides away.
+    await new Promise((resolve) => setTimeout(resolve, 700));
+    $("pull-refresh")?.classList?.remove("is-done");
+    state.pullRefreshing = false;
     showPull(0);
   }
 }
@@ -3109,8 +3369,11 @@ function bindPullToRefresh(root) {
     if (start === null || event.touches.length !== 1) return;
     const pulled = event.touches[0].clientY - start;
     if (pulled <= 0) { distance = 0; showPull(0); return; }
-    distance = Math.min(pulled * 0.5, 96);
+    const wasReady = distance >= PULL_TRIGGER;
+    distance = pullDistance(pulled);
     const ready = distance >= PULL_TRIGGER;
+    // A light tick when release would refresh (devices without vibration ignore it).
+    if (ready && !wasReady) globalThis.navigator?.vibrate?.(8);
     showPull(distance, ready ? "놓으면 새로고침" : "당겨서 새로고침", ready);
     if (event.cancelable) event.preventDefault();
   }, { passive: false });
@@ -3341,7 +3604,9 @@ window.addEventListener("DOMContentLoaded", () => {
     startTerminalReader();
   });
   $("terminal-bottom").addEventListener("click", terminalScrollEnd);
+  $("terminal-live").addEventListener("click", terminalScrollEnd);
   bindPullToRefresh($("app"));
+  $("task-list-pane").addEventListener("scroll", (event) => listScroll(event.currentTarget || $("task-list-pane")), { passive: true });
   bindTerminalTouchScroll($("terminal-viewport"));
   $("terminal-copy").addEventListener("click", async () => {
     const text = state.term?.getSelection();

@@ -2,14 +2,25 @@
 import base64
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
+import stat
 import threading
 import time
 
 MAX_FILE = 20 * 1024 * 1024
 REQUEST = re.compile(r'[A-Za-z0-9_-]{8,100}\Z')
 STATE_REQUEST = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.:-]{7,127}\Z')
+CLAUDE_BLOCKED = ('Claude 터미널에 승인·선택 메뉴가 떠 있어 보내지 않았습니다. '
+                  '입력이 메뉴 선택으로 처리될 수 있으니 터미널에서 먼저 선택해 주세요.')
+# A numbered option under the selection cursor ("❯ 1. Yes") marks a permission or
+# question menu, where Enter would confirm the highlighted choice.
+CLAUDE_MENU = re.compile(r'^\s*[│|]?\s*[❯›>]\s*\d+\.\s', re.M)
+CLAUDE_EXTERNAL = ('이 Claude 세션은 보드 밖 터미널에서 실행 중이라 웹에서 입력할 수 없습니다. '
+                   '그 터미널에서 입력하거나 백그라운드 세션(claude --bg)으로 실행해 주세요.')
+CLAUDE_READY_SECONDS = 12
+CLAUDE_PROBE = 160
 
 
 class SendRejected(ValueError):
@@ -28,6 +39,7 @@ class Chat:
         self.cache_epoch = 0
         self.read_sequence = 0
         self.upload_gate = threading.BoundedSemaphore(2)
+        self.claude_lock = threading.Lock()
 
     @staticmethod
     def identity(source):
@@ -72,56 +84,9 @@ class Chat:
                 'readbackConfirmed': result.get('readbackConfirmed', False),
                 'currentSnapshotConfirmed': result.get('currentSnapshotConfirmed', result.get('readbackConfirmed', False)),
                 'acknowledged': result.get('acknowledged', False),
-                'turnId': result.get('turnId'), 'queueId': result.get('queueId'),
+                'turnId': result.get('turnId'),
                 'reason': result.get('reason'),
                 'attachments': Chat.attachment_history(result.get('attachments', []))}
-
-    @staticmethod
-    def queue_history(result):
-        """Old/malformed workers must not report an authoritative empty queue."""
-        unknown = {'available': False, 'complete': False, 'total': None, 'truncated': False,
-                   'reason': '예약 대기열을 확인하지 못했습니다.'}
-        state, rows = result.get('queueState'), result.get('queuedMessages')
-        if (not isinstance(state, dict) or not isinstance(rows, list) or len(rows) > 50
-                or not {'available', 'complete', 'total', 'truncated'} <= state.keys()
-                or any(type(state.get(key)) is not bool for key in ('available', 'complete', 'truncated'))
-                or (state.get('total') is not None and (type(state['total']) is not int or state['total'] < len(rows)))
-                or (state['available'] and state.get('total') is None)
-                or (not state['available'] and (rows or state['total'] is not None))
-                or (state['complete'] and (not state['available'] or state['truncated'] or state['total'] != len(rows)))):
-            return [], unknown
-        out, total_bytes = [], 0
-        for row in rows:
-            if (not isinstance(row, dict) or not isinstance(row.get('queueId'), str) or not row['queueId'] or len(row['queueId']) > 256
-                    or (row.get('requestId') is not None and (not isinstance(row['requestId'], str) or len(row['requestId']) > 128))
-                    or not isinstance(row.get('text'), str) or len(row['text']) > 32768
-                    or not isinstance(row.get('attachments'), list)
-                    or row.get('status') != 'queued' or row.get('confirmed') is not True
-                    or row.get('readbackConfirmed') is not True
-                    or (state['complete'] and (row.get('textTruncated') is True or row.get('contentAvailable') is not True))):
-                return [], unknown
-            total_bytes += len(row['text'].encode())
-            if total_bytes > 256 * 1024:
-                return [], unknown
-            attached = []
-            for item in row['attachments'][:40]:
-                if not isinstance(item, dict):
-                    continue
-                if item.get('source') == 'sessionholic':
-                    attached.extend(Chat.attachment_history([item]))
-                elif item.get('source') == 'native' and item.get('kind') in ('image', 'file'):
-                    image = item['kind'] == 'image'
-                    attached.append({'id': None, 'name': '이미지' if image else '파일',
-                                     'type': 'image/*' if image else 'application/octet-stream',
-                                     'size': None, 'kind': item['kind'], 'source': 'native'})
-            out.append({'queueId': row['queueId'], 'requestId': row.get('requestId'), 'text': row['text'],
-                        'textTruncated': row.get('textTruncated') is True, 'contentAvailable': row.get('contentAvailable') is True,
-                        'attachments': attached, 'status': 'queued', 'confirmed': True,
-                        'readbackConfirmed': True, 'currentSnapshotConfirmed': True, 'acknowledged': row.get('acknowledged') is True})
-        from launch import scrub_text
-        reason = state.get('reason')
-        return out, {key: state[key] for key in ('available', 'complete', 'total', 'truncated')} | {
-            'reason': scrub_text(reason[:1000]) if isinstance(reason, str) else None}
 
     def state(self, data):
         source, host = self.source(data.get('source'))
@@ -151,31 +116,36 @@ class Chat:
         caps = result.get('capabilities', {})
         phase = result.get('phase', 'unavailable')
         if phase in ('unknown', 'notLoaded'): phase = 'unavailable'
-        receipts = []
-        for request_id in request_ids:
-            receipt = next((receipt for receipt in result.get('receipts', [])
-                            if isinstance(receipt, dict) and receipt.get('requestId') == request_id),
-                           {'delivery': 'unknown', 'reason': '전송 결과를 확인하지 못했습니다. 상태를 다시 확인해 주세요.'})
-            receipts.append(self.receipt(receipt, request_id))
         from server import scrub_payload
         messages = scrub_payload(result.get('messages', []))
-        queued, queue_state = self.queue_history(result)
-        queued = scrub_payload(queued)
-        for message in messages + queued:
+        claude = source.get('agent') == 'claude'
+        receipts = []
+        for request_id in request_ids:
+            if claude:
+                receipt = self._claude_receipt(source, request_id, messages)
+            else:
+                receipt = next((receipt for receipt in result.get('receipts', [])
+                                if isinstance(receipt, dict) and receipt.get('requestId') == request_id),
+                               {'delivery': 'unknown', 'reason': '전송 결과를 확인하지 못했습니다. 상태를 다시 확인해 주세요.'})
+            receipts.append(self.receipt(receipt, request_id))
+        for message in messages:
             if isinstance(message, dict) and isinstance(message.get('attachments'), list):
                 from launch import scrub_text
                 message['attachments'] = [{**item, 'name': scrub_text(item['name'])}
                                           if isinstance(item, dict) and isinstance(item.get('name'), str) else item
                                           for item in message['attachments']]
+        if claude:
+            supported, reason = self._claude_capability(source, phase)
+        else:
+            supported, reason = bool(caps.get('canSend')), caps.get('reason') or result.get('reason')
         response = {'route': identity, 'phase': phase,
-                    'capability': {'supported': bool(caps.get('canSend')),
+                    'capability': {'supported': supported,
                                    'attachments': bool(source.get('cwd')),
-                                   'reason': caps.get('reason') or result.get('reason')},
+                                   'reason': None if supported else reason},
                     'messages': messages,
-                    'queuedMessages': queued,
-                    'queueState': queue_state,
                     'receipts': receipts, 'maxAttachmentBytes': MAX_FILE,
-                    'requiresNativeTerminal': result.get('requiresNativeTerminal', phase == 'needs_input')}
+                    'requiresNativeTerminal': phase == 'needs_input' if claude else
+                    result.get('requiresNativeTerminal', phase == 'needs_input')}
         with self.lock:
             cached = self.cache.get(key)
             # Receipt reads are request-specific. A send or a newer read must
@@ -186,6 +156,175 @@ class Chat:
                     self.cache.pop(next(iter(self.cache)))
                 self.cache[key] = (time.monotonic(), response, sequence, source.get('cwd'))
         return response
+
+    # ---------- Claude: input through a board-owned terminal ----------
+    @staticmethod
+    def _same_claude(native, source):
+        if not isinstance(native, dict) or native.get('agent') != 'claude' or native.get('host') != source.get('host'):
+            return False
+        ids = {source.get('id'), source.get('sessionId')} - {None}
+        return native.get('id') in ids or native.get('sessionId') in ids
+
+    def _claude_terminal(self, source):
+        for terminal in self.workflow.terminals.list():
+            native = terminal.get('nativeSource') or terminal.get('metadata', {}).get('nativeSource')
+            if terminal.get('alive') and not terminal.get('closed') and self._same_claude(native, source):
+                return terminal
+        return None
+
+    def _claude_capability(self, source, phase):
+        # A session waiting for the user can still take a reply; a menu on its
+        # screen is checked at send time, right before anything is pasted.
+        try:
+            if self._claude_terminal(source):
+                return True, None
+        except (RuntimeError, OSError):
+            return False, '보드 터미널 상태를 확인하지 못했습니다. 잠시 뒤 다시 시도해 주세요.'
+        if source.get('kind') == 'background':
+            return True, None
+        return False, CLAUDE_EXTERNAL
+
+    def _open_claude_terminal(self, ref, source, request_id):
+        """Attach the exact background session in a board terminal, never a new session."""
+        plan = self.workflow.plan({'source': ref, 'target': {
+            'host': source['host'], 'agent': 'claude', 'account': 'claude:default'}})
+        if not plan.get('allowed'):
+            raise SendRejected(plan.get('reason') or CLAUDE_EXTERNAL, 409)
+        launch_id = 'chat_' + hashlib.sha256(request_id.encode()).hexdigest()[:40]
+        terminal = self.workflow.launch(plan['id'], launch_id)['terminal']
+        # The attach UI redraws while it loads; paste only after it settles.
+        deadline, after, seen, quiet = time.monotonic() + CLAUDE_READY_SECONDS, 0, False, time.monotonic()
+        while time.monotonic() < deadline:
+            chunk = self.workflow.terminals.read(terminal['id'], after, 0.25)
+            if chunk['after'] != after:
+                after, seen, quiet = chunk['after'], True, time.monotonic()
+            elif seen and time.monotonic() - quiet >= 0.8:
+                return terminal
+            if not chunk.get('alive', True):
+                break
+        if not seen:
+            raise SendRejected('Claude 터미널이 준비되지 않았습니다. 터미널을 열어 상태를 확인해 주세요.', 409)
+        return terminal
+
+    def _claude_record_path(self, source, request_id):
+        folder = self.root / 'claude-sends'
+        folder.mkdir(mode=0o700, parents=True, exist_ok=True)
+        info = folder.lstat()
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
+            raise ValueError('메시지 전송 기록 경로가 안전하지 않습니다.')
+        key = hashlib.sha256(json.dumps([self.identity(source), request_id], sort_keys=True).encode()).hexdigest()
+        return folder / (key + '.json')
+
+    @staticmethod
+    def _probe(text):
+        # A hash of the collapsed opening text; the message body itself is never stored.
+        collapsed = ' '.join(str(text or '').split())[:CLAUDE_PROBE]
+        return collapsed, hashlib.sha256(collapsed.encode()).hexdigest()
+
+    def _claude_read_record(self, source, request_id):
+        try:
+            path = self._claude_record_path(source, request_id)
+            fd = os.open(str(path), os.O_RDONLY | os.O_NOFOLLOW)
+        except (OSError, ValueError):
+            return None
+        with os.fdopen(fd, 'rb') as file:
+            try:
+                record = json.loads(file.read(16384))
+            except ValueError:
+                return None
+        return record if isinstance(record, dict) else None
+
+    def _claude_receipt(self, source, request_id, messages):
+        record = self._claude_read_record(source, request_id)
+        if not record:
+            return {'delivery': 'unknown', 'reason': '전송 결과를 확인하지 못했습니다. 상태를 다시 확인해 주세요.'}
+        receipt = dict(record.get('receipt') or {})
+        probe, length = record.get('probe'), record.get('probeLength')
+        if receipt.get('acknowledged') and isinstance(probe, str) and isinstance(length, int):
+            for message in messages:
+                if (isinstance(message, dict) and message.get('role') == 'user'
+                        and (message.get('ts') or 0) >= record.get('sentAt', 0) - 5):
+                    collapsed = ' '.join(str(message.get('text') or '').split())[:length]
+                    if hashlib.sha256(collapsed.encode()).hexdigest() == probe:
+                        receipt.update(readbackConfirmed=True, currentSnapshotConfirmed=True,
+                                       reason=None)
+                        break
+        return receipt
+
+    def _send_claude(self, ref, source, host, request_id, text, ids, manifest):
+        if not self.claude_lock.acquire(timeout=30):
+            raise SendRejected('다른 메시지를 전달하고 있습니다. 잠시 뒤 다시 보내 주세요.', 409)
+        try:
+            previous = self._claude_read_record(source, request_id)
+            if previous:
+                return {**(previous.get('receipt') or {}), 'attachments': manifest}
+            try:
+                current = self.rpc(host, 'capabilities', source)
+            except (RuntimeError, OSError):
+                raise SendRejected('Claude 세션 상태를 확인하지 못해 보내지 않았습니다. 다시 시도해 주세요.', 409) from None
+            if current.get('phase') == 'done' and source.get('kind') != 'background':
+                raise SendRejected(CLAUDE_EXTERNAL, 409)
+            try:
+                terminal = self._claude_terminal(source)
+            except (RuntimeError, OSError):
+                raise SendRejected('보드 터미널 상태를 확인하지 못해 보내지 않았습니다. 잠시 뒤 다시 시도해 주세요.', 409) from None
+            if terminal is None:
+                if source.get('kind') != 'background':
+                    raise SendRejected(CLAUDE_EXTERNAL, 409)
+                try:
+                    terminal = self._open_claude_terminal(ref, source, request_id)
+                except SendRejected:
+                    raise
+                except (ValueError, RuntimeError, OSError) as exc:
+                    raise SendRejected(str(exc) if isinstance(exc, (ValueError, RuntimeError)) else
+                                       'Claude 터미널을 열지 못했습니다.', 409) from None
+            try:
+                screen = self.workflow.terminals.capture(terminal['id'])
+            except (RuntimeError, ValueError, KeyError, OSError):
+                raise SendRejected('Claude 터미널 화면을 확인하지 못해 보내지 않았습니다. 다시 시도해 주세요.', 409) from None
+            if CLAUDE_MENU.search(screen):
+                raise SendRejected(CLAUDE_BLOCKED, 409)
+            lines = [text.strip()] if text.strip() else []
+            for aid in ids:
+                record = json.loads((self.root / 'attachments' / (aid + '.json')).read_text())
+                lines.append('첨부 파일: ' + record['attachment']['path'])
+            body = '\n'.join(lines)
+            probe, digest = self._probe(body)
+            path = self._claude_record_path(source, request_id)
+            base = {'source': self.identity(source), 'requestId': request_id, 'turnId': None,
+                    'canRetry': False, 'terminalId': terminal['id']}
+            unknown = {**base, 'delivery': 'unknown', 'confirmed': False, 'readbackConfirmed': False,
+                       'acknowledged': False,
+                       'reason': '전달 결과를 확인하지 못했습니다. 같은 입력을 자동으로 다시 보내지 않습니다.'}
+            # Reserve the request before any byte reaches the CLI (at-most-once).
+            try:
+                fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+            except FileExistsError:
+                saved = self._claude_read_record(source, request_id) or {}
+                return {**(saved.get('receipt') or unknown), 'attachments': manifest}
+            record = {'requestId': request_id, 'sentAt': time.time(), 'probe': digest,
+                      'probeLength': len(probe), 'receipt': unknown}
+            with os.fdopen(fd, 'w', encoding='utf-8') as file:
+                json.dump(record, file)
+            from terminal import InputNotSent
+            try:
+                self.workflow.terminals.paste(terminal['id'], body, submit=True)
+                receipt = {**base, 'delivery': 'accepted', 'confirmed': True, 'acknowledged': True,
+                           'readbackConfirmed': False,
+                           'reason': 'Claude 터미널에 입력했습니다. 대화 기록 반영은 아직 확인되지 않았습니다.'}
+            except InputNotSent as exc:
+                path.unlink(missing_ok=True)
+                raise SendRejected(str(exc), 409) from None
+            except (RuntimeError, ValueError, OSError):
+                receipt = unknown
+            from server import private_json
+            try:
+                private_json(path, {**record, 'receipt': receipt})
+            except (OSError, ValueError):
+                receipt = {**receipt, 'ledgerPending': True}
+            return {**receipt, 'attachments': manifest}
+        finally:
+            self.claude_lock.release()
 
     def upload(self, ref, name, content):
         source, host = self.source(ref)
@@ -244,12 +383,15 @@ class Chat:
         except (ValueError, RuntimeError, OSError, KeyError) as exc:
             reason = str(exc) if isinstance(exc, (ValueError, RuntimeError)) else '메시지와 첨부 정보를 다시 확인해 주세요.'
             raise SendRejected(reason, 409 if isinstance(exc, RuntimeError) else 400) from None
-        try:
-            result = self.rpc(host, 'send', source, requestId=request_id,
-                              input=[{'type': 'text', 'text': text}] if text.strip() else [], attachmentIds=ids)
-        except (RuntimeError, OSError):
-            # A broken SSH/HTTP response is not evidence that submission failed.
-            result = {'delivery': 'unknown', 'reason': '전송 결과를 확인하지 못했습니다. 상태를 다시 확인해 주세요.'}
+        if source.get('agent') == 'claude':
+            result = self._send_claude(data.get('source'), source, host, request_id, text, ids, manifest)
+        else:
+            try:
+                result = self.rpc(host, 'send', source, requestId=request_id,
+                                  input=[{'type': 'text', 'text': text}] if text.strip() else [], attachmentIds=ids)
+            except (RuntimeError, OSError):
+                # A broken SSH/HTTP response is not evidence that submission failed.
+                result = {'delivery': 'unknown', 'reason': '전송 결과를 확인하지 못했습니다. 상태를 다시 확인해 주세요.'}
         if manifest and not result.get('attachments'):
             result = {**result, 'attachments': manifest}
         receipt = self.receipt(result, request_id)

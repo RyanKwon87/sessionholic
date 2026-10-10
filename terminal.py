@@ -31,7 +31,13 @@ SOCKET = re.compile(r"^[A-Za-z0-9_-]{1,60}$")
 BUFFER_LIMIT = 1024 * 1024
 INPUT_LIMIT = 32 * 1024
 MAX_TERMINALS = 4
+HISTORY_LIMIT = 20000
+SCROLL_LIMIT = 200
 DEFAULT_STATE = Path.home() / ".local/state/sessionholic/terminals"
+
+
+class InputNotSent(RuntimeError):
+    """tmux refused the paste before any byte reached the CLI."""
 
 
 def _metadata(value):
@@ -107,6 +113,7 @@ class _Terminal:
         self.generation = 0
         self.alive = not record.get("closed", False)
         self.epoch = secrets.token_hex(16)
+        self.scrolled = False
 
     def append(self, data):
         with self.condition:
@@ -172,8 +179,10 @@ class TerminalManager:
         return [self.tmux, "-L", self.socket_name, "-f", "/dev/null"] + list(args)
 
     def _run(self, *args, **kwargs):
+        if "input" not in kwargs:
+            kwargs["stdin"] = subprocess.DEVNULL
         try:
-            return subprocess.run(self._command(*args), stdin=subprocess.DEVNULL,
+            return subprocess.run(self._command(*args),
                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                                   timeout=10, **kwargs)
         except (OSError, subprocess.TimeoutExpired):
@@ -279,7 +288,10 @@ class TerminalManager:
             launch_env.setdefault("TERM", "xterm-256color")
             _private_json(launch_path, {"argv": list(argv), "cwd": str(cwd), "env": launch_env})
             try:
-                done = self._run("new-session", "-d", "-s", record["name"], "-c", str(cwd),
+                # The option applies to panes created after it, so it precedes new-session
+                # in one command list on this board-only tmux socket.
+                done = self._run("set-option", "-g", "history-limit", str(HISTORY_LIMIT), ";",
+                                 "new-session", "-d", "-s", record["name"], "-c", str(cwd),
                                  sys.executable, "-I", str(Path(__file__).resolve()),
                                  "--launch", str(launch_path))
                 if done.returncode != 0:
@@ -408,6 +420,7 @@ class TerminalManager:
         with self.lock:
             terminal = self._get(terminal_id)
             self._attach(terminal)
+        self._leave_scroll(terminal)
         with terminal.io_lock:
             if (terminal.record.get("closed", False) or terminal.fd is None
                     or terminal.process.poll() is not None):
@@ -423,6 +436,85 @@ class TerminalManager:
                     sent += os.write(terminal.fd, data[sent:sent + 1024])
                 except OSError:
                     raise RuntimeError("터미널에 입력하지 못했습니다.") from None
+        return {"ok": True}
+
+    def _leave_scroll(self, terminal):
+        # Keys typed while tmux shows history would drive copy-mode instead of the CLI.
+        if terminal.scrolled:
+            terminal.scrolled = False
+            self._run("send-keys", "-t", terminal.record["name"], "-X", "cancel")
+
+    def scroll(self, terminal_id, lines):
+        """Move through tmux history; the CLI itself never receives these keys."""
+        if isinstance(lines, bool) or not isinstance(lines, int) or not 0 < abs(lines) <= SCROLL_LIMIT:
+            raise ValueError("스크롤 범위가 올바르지 않습니다.")
+        with self.lock:
+            terminal = self._get(terminal_id)
+        if terminal.record.get("closed", False) or not terminal.alive:
+            raise RuntimeError("터미널 연결이 종료되었습니다.")
+        name = terminal.record["name"]
+        if lines < 0:
+            # -e leaves history automatically once the view returns to the bottom.
+            done = self._run("copy-mode", "-e", "-t", name, ";",
+                             "send-keys", "-t", name, "-X", "-N", str(-lines), "scroll-up")
+            if done.returncode != 0:
+                raise RuntimeError("터미널 기록을 스크롤하지 못했습니다.")
+            terminal.scrolled = True
+        elif terminal.scrolled:
+            # Outside history there is nothing below the live screen to scroll to.
+            done = self._run("send-keys", "-t", name, "-X", "-N", str(lines), "scroll-down")
+            if done.returncode != 0:
+                terminal.scrolled = False
+        return {"ok": True}
+
+    def capture(self, terminal_id):
+        """Visible screen text of the live pane (no history, no escape sequences)."""
+        with self.lock:
+            terminal = self._get(terminal_id)
+        if terminal.record.get("closed", False) or not terminal.alive:
+            raise RuntimeError("터미널 연결이 종료되었습니다.")
+        try:
+            done = subprocess.run(self._command("capture-pane", "-p", "-t", terminal.record["name"]),
+                                  stdin=subprocess.DEVNULL, capture_output=True, timeout=10)
+        except (OSError, subprocess.TimeoutExpired):
+            raise RuntimeError("터미널 화면을 확인하지 못했습니다.") from None
+        if done.returncode != 0:
+            raise RuntimeError("터미널 화면을 확인하지 못했습니다.")
+        return done.stdout.decode("utf-8", "replace")
+
+    def scroll_end(self, terminal_id):
+        with self.lock:
+            terminal = self._get(terminal_id)
+        self._leave_scroll(terminal)
+        return {"ok": True}
+
+    def paste(self, terminal_id, text, submit=True):
+        """Paste text as one bracketed paste (when the CLI asked for it), then Enter."""
+        if not isinstance(text, str) or not text or "\0" in text:
+            raise ValueError("입력 형식이 올바르지 않습니다.")
+        data = text.encode("utf-8")
+        if len(data) > INPUT_LIMIT:
+            raise ValueError("입력은 32KiB 이하여야 합니다.")
+        with self.lock:
+            terminal = self._get(terminal_id)
+            self._attach(terminal)
+        if terminal.record.get("closed", False) or not terminal.alive:
+            raise InputNotSent("터미널 연결이 종료되었습니다.")
+        self._leave_scroll(terminal)
+        name, buffer = terminal.record["name"], "sh-" + secrets.token_hex(8)
+        with terminal.io_lock:
+            done = self._run("load-buffer", "-b", buffer, "-", ";",
+                             "paste-buffer", "-p", "-d", "-b", buffer, "-t", name, input=data)
+            if done.returncode != 0:
+                # load-buffer may have succeeded; never leave the message text in tmux.
+                self._run("delete-buffer", "-b", buffer)
+                raise InputNotSent("터미널에 붙여넣지 못했습니다.")
+            if submit:
+                # Let the TUI finish its paste handling before the separate Enter key.
+                time.sleep(0.15)
+                done = self._run("send-keys", "-t", name, "Enter")
+                if done.returncode != 0:
+                    raise RuntimeError("붙여넣은 뒤 Enter를 보내지 못했습니다.")
         return {"ok": True}
 
     def resize(self, terminal_id, cols, rows):

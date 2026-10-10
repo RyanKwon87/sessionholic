@@ -46,6 +46,7 @@ STATIC = re.compile(r"^(?:vendor/)?[a-z0-9_-]{1,40}\.(html|js|css|svg|png|webman
 REMOTE_PATH = "/opt/homebrew/bin:$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin"
 SOCKET_PATH_LIMIT = 104
 CONTROL_PREFIX = re.compile(r"^/[A-Za-z0-9_./+@-]+$")
+SSH_FALLBACK_ROOT = Path("/tmp")
 TYPES = {".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8",
          ".css": "text/css; charset=utf-8", ".svg": "image/svg+xml", ".png": "image/png",
          ".webmanifest": "application/manifest+json"}
@@ -93,24 +94,42 @@ def load_hosts(path):
     return hosts
 
 
-def ssh_control_path(state_dir):
-    """Pure path rule for shared SSH connections: `<state_dir>/ssh/cm-%C`, or None.
+def _control_prefix(directory):
+    prefix = str(directory) + "/cm-"
+    if not CONTROL_PREFIX.fullmatch(prefix) or len(os.fsencode(prefix)) + 40 + 17 >= SOCKET_PATH_LIMIT:
+        return None
+    return prefix
+
+
+def ssh_control_dir(state_dir):
+    """`<state_dir>/ssh`, or a private `/tmp/sessionholic-<uid>` when that is too long.
 
     ssh expands %C to a 40 character hash and first binds a master socket at
     `<path>.<16 random characters>`, so that longest form must fit the macOS
     104 byte socket path (including NUL). Paths ssh would re-tokenize are refused.
+    A typical home such as /Users/<name>/.local/state/sessionholic is too long
+    for names over five characters, hence the short per-user fallback.
     """
     if not state_dir:
         return None
-    prefix = str(Path(state_dir).expanduser().absolute() / "ssh") + "/cm-"
-    if not CONTROL_PREFIX.fullmatch(prefix) or len(os.fsencode(prefix)) + 40 + 17 >= SOCKET_PATH_LIMIT:
-        return None
-    return prefix + "%C"
+    preferred = Path(state_dir).expanduser().absolute() / "ssh"
+    if _control_prefix(preferred):
+        return preferred
+    fallback = SSH_FALLBACK_ROOT / ("sessionholic-%d" % os.getuid())
+    return fallback if _control_prefix(fallback) else None
+
+
+def ssh_control_path(state_dir):
+    """Pure path rule for shared SSH connections: `<socket dir>/cm-%C`, or None."""
+    directory = ssh_control_dir(state_dir)
+    return _control_prefix(directory) + "%C" if directory else None
 
 
 def prepare_ssh_control_dir(state_dir):
     """Create the private socket folder; a failure only disables connection sharing."""
-    directory = Path(state_dir).expanduser().absolute() / "ssh"
+    directory = ssh_control_dir(state_dir)
+    if directory is None:
+        return
     try:
         directory.mkdir(mode=0o700, exist_ok=True)
         info = os.lstat(directory)
@@ -934,7 +953,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_json(200, self.server.workflow.plan(data))
             if path == "/api/launch":
                 return self.send_json(200, self.server.workflow.launch(data.get("planId"), data.get("requestId")))
-            match = re.fullmatch(r"/api/terminal/([a-f0-9]{32})/(input|resize|detach|close)", path)
+            match = re.fullmatch(r"/api/terminal/([a-f0-9]{32})/(input|resize|scroll|scroll-end|detach|close)", path)
             if match:
                 tid, action = match.groups()
                 if action == "input":
@@ -947,6 +966,10 @@ class Handler(BaseHTTPRequestHandler):
                     self.server.terminal_inputs.submit(tid, request_id, text, self.server.terminals.write)
                 elif action == "resize":
                     self.server.terminals.resize(tid, data.get("cols"), data.get("rows"))
+                elif action == "scroll":
+                    self.server.terminals.scroll(tid, data.get("lines"))
+                elif action == "scroll-end":
+                    self.server.terminals.scroll_end(tid)
                 elif action == "close":
                     self.server.terminals.close_terminal(tid)
                     try:

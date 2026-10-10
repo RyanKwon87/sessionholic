@@ -194,6 +194,131 @@ class ValidationTest(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "화면 설정"):
                 self.manager._configure(stream)
 
+    def fake_terminal(self):
+        row = {"id": "b" * 32, "name": "sb-" + "b" * 32, "key": "fixture", "metadata": {}}
+        stream = terminal._Terminal(row, 1024)
+        self.manager.terminals[row["id"]] = stream
+        self.addCleanup(self.manager.terminals.clear)
+        return stream
+
+    def test_new_session_sets_history_limit_in_the_same_tmux_call(self):
+        self.assertEqual(terminal.HISTORY_LIMIT, 20000)
+        with patch.object(self.manager, "_run") as run:
+            run.return_value.returncode = 1
+            with self.assertRaisesRegex(RuntimeError, "시작하지"):
+                self.manager.create("history", ["/bin/cat"], self.directory.name, {})
+        run.assert_called_once()
+        self.assertEqual(run.call_args.args[:6], ("set-option", "-g", "history-limit", "20000", ";", "new-session"))
+
+    def test_run_keeps_stdin_closed_unless_input_is_supplied(self):
+        self.manager.tmux = "/fixture/tmux"
+        with patch.object(terminal.subprocess, "run") as run:
+            self.manager._run("has-session", "-t", "=sb-fixture")
+            self.assertIs(run.call_args.kwargs["stdin"], subprocess.DEVNULL)
+            self.assertNotIn("input", run.call_args.kwargs)
+            self.manager._run("load-buffer", "-", input=b"fixture")
+            self.assertEqual(run.call_args.kwargs["input"], b"fixture")
+            self.assertNotIn("stdin", run.call_args.kwargs)
+            self.assertEqual(run.call_args.args[0][:5], ["/fixture/tmux", "-L", "sb-fixture-unused", "-f", "/dev/null"])
+
+    def test_paste_and_scroll_validate_before_tmux(self):
+        with patch.object(self.manager, "_run") as run:
+            for text in ("", "a\0b", "x" * (terminal.INPUT_LIMIT + 1), "가" * 11000, b"bytes", None):
+                with self.subTest(text=str(text)[:8]), self.assertRaises(ValueError):
+                    self.manager.paste("a" * 32, text)
+            for lines in (0, terminal.SCROLL_LIMIT + 1, -terminal.SCROLL_LIMIT - 1, True, 1.5, "5", None):
+                with self.subTest(lines=lines), self.assertRaises(ValueError):
+                    self.manager.scroll("a" * 32, lines)
+            for call in (lambda: self.manager.paste("a" * 32, "ok"), lambda: self.manager.scroll("a" * 32, 5),
+                         lambda: self.manager.scroll_end("a" * 32)):
+                with self.assertRaises(KeyError):
+                    call()
+            with self.assertRaises(ValueError):
+                self.manager.scroll("../x", 5)
+            run.assert_not_called()
+
+    def test_paste_uses_one_private_buffer_then_a_separate_enter(self):
+        stream = self.fake_terminal()
+        name = stream.record["name"]
+        ok, failed = subprocess.CompletedProcess([], 0), subprocess.CompletedProcess([], 1)
+        with patch.object(self.manager, "_attach"), patch.object(terminal.time, "sleep") as sleep, \
+                patch.object(self.manager, "_run", return_value=ok) as run:
+            self.assertEqual(self.manager.paste(stream.record["id"], "한글 본문\n둘째 줄"), {"ok": True})
+            self.manager.paste(stream.record["id"], "draft", submit=False)
+        first, enter, draft = run.call_args_list
+        buffer = first.args[2]
+        self.assertRegex(buffer, r"^sh-[0-9a-f]{16}$")
+        self.assertEqual(first.args, ("load-buffer", "-b", buffer, "-", ";",
+                                      "paste-buffer", "-p", "-d", "-b", buffer, "-t", name))
+        self.assertEqual(first.kwargs, {"input": "한글 본문\n둘째 줄".encode()})
+        self.assertEqual(enter.args, ("send-keys", "-t", name, "Enter"))
+        sleep.assert_called_once_with(0.15)
+        self.assertEqual(draft.args[0], "load-buffer")
+        self.assertNotEqual(draft.args[2], buffer)
+        # tmux refused the paste: nothing reached the CLI, so no Enter either, and
+        # a buffer that load-buffer may have filled is deleted rather than left behind.
+        with patch.object(self.manager, "_attach"), patch.object(self.manager, "_run", return_value=failed) as run:
+            with self.assertRaises(terminal.InputNotSent):
+                self.manager.paste(stream.record["id"], "fixture")
+        refused, cleanup = run.call_args_list
+        self.assertEqual(refused.args[0], "load-buffer")
+        self.assertEqual(cleanup.args, ("delete-buffer", "-b", refused.args[2]))
+        # The text was pasted but Enter failed: this is not a pre-send failure.
+        with patch.object(self.manager, "_attach"), patch.object(terminal.time, "sleep"), \
+                patch.object(self.manager, "_run", side_effect=[ok, failed]):
+            with self.assertRaises(RuntimeError) as caught:
+                self.manager.paste(stream.record["id"], "fixture")
+        self.assertNotIsInstance(caught.exception, terminal.InputNotSent)
+        # A terminal shown in history first leaves copy-mode so the paste reaches the CLI.
+        stream.scrolled = True
+        with patch.object(self.manager, "_attach"), patch.object(terminal.time, "sleep"), \
+                patch.object(self.manager, "_run", return_value=ok) as run:
+            self.manager.paste(stream.record["id"], "fixture")
+        self.assertEqual(run.call_args_list[0].args, ("send-keys", "-t", name, "-X", "cancel"))
+        self.assertEqual(run.call_args_list[1].args[0], "load-buffer")
+        self.assertFalse(stream.scrolled)
+        for change in ({"alive": False}, {"closed": True}):
+            with self.subTest(change=change):
+                stream.alive = "alive" not in change
+                stream.record["closed"] = "closed" in change
+                with patch.object(self.manager, "_attach"), patch.object(self.manager, "_run") as run:
+                    with self.assertRaises(terminal.InputNotSent):
+                        self.manager.paste(stream.record["id"], "fixture")
+                run.assert_not_called()
+
+    def test_scroll_drives_tmux_history_never_the_cli(self):
+        stream = self.fake_terminal()
+        tid, name = stream.record["id"], stream.record["name"]
+        ok, failed = subprocess.CompletedProcess([], 0), subprocess.CompletedProcess([], 1)
+        with patch.object(self.manager, "_run", return_value=ok) as run:
+            self.assertEqual(self.manager.scroll(tid, 5), {"ok": True})
+            run.assert_not_called()
+            self.manager.scroll(tid, -12)
+            self.assertEqual(run.call_args.args, ("copy-mode", "-e", "-t", name, ";",
+                                                  "send-keys", "-t", name, "-X", "-N", "12", "scroll-up"))
+            self.assertTrue(stream.scrolled)
+            self.manager.scroll(tid, 7)
+            self.assertEqual(run.call_args.args, ("send-keys", "-t", name, "-X", "-N", "7", "scroll-down"))
+            self.assertEqual(self.manager.scroll_end(tid), {"ok": True})
+            self.assertEqual(run.call_args.args, ("send-keys", "-t", name, "-X", "cancel"))
+            self.assertFalse(stream.scrolled)
+            calls = run.call_count
+            self.manager.scroll_end(tid)
+            self.assertEqual(run.call_count, calls)
+        with patch.object(self.manager, "_run", return_value=failed):
+            with self.assertRaisesRegex(RuntimeError, "스크롤"):
+                self.manager.scroll(tid, -3)
+            self.assertFalse(stream.scrolled)
+            # tmux already left history (-e at the bottom); the stale flag is cleared without an error.
+            stream.scrolled = True
+            self.assertEqual(self.manager.scroll(tid, 3), {"ok": True})
+            self.assertFalse(stream.scrolled)
+        stream.record["closed"] = True
+        with patch.object(self.manager, "_run") as run:
+            with self.assertRaises(RuntimeError):
+                self.manager.scroll(tid, -1)
+            run.assert_not_called()
+
 
 @unittest.skipUnless(shutil.which("tmux"), "tmux fixture requires installed tmux")
 class TmuxFixtureTest(unittest.TestCase):
@@ -413,6 +538,79 @@ class TmuxFixtureTest(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             self.manager.write(created["id"], "after-close\n")
         self.assertFalse(self.manager.read(created["id"], wait=20)["alive"])
+
+    def tmux(self, *args):
+        return subprocess.run([shutil.which("tmux"), "-L", self.socket] + list(args),
+                              capture_output=True, text=True, timeout=5)
+
+    def mode(self, terminal_id):
+        done = self.tmux("display-message", "-p", "-t", "sb-" + terminal_id, "#{pane_in_mode} #{scroll_position}")
+        self.assertEqual(done.returncode, 0)
+        return done.stdout.strip()
+
+    def output_since(self, terminal_id, after):
+        return base64.b64decode(self.manager.read(terminal_id, after, 0)["data"])
+
+    def test_history_limit_paste_and_scroll_use_real_tmux(self):
+        code = ("import sys\n"
+                "for i in range(300): print('HISTORY-%03d' % i)\n"
+                "print('FIXTURE_READY', flush=True)\n"
+                "for line in sys.stdin:\n"
+                " print('FIXTURE_REPLY:' + line.strip(), flush=True)\n")
+        created = self.manager.create("scroll-fixture", [sys.executable, "-u", "-c", code], self.directory.name,
+                                      {"PATH": os.environ.get("PATH", ""), "LANG": "en_US.UTF-8"},
+                                      {"agent": "fixture", "host": "local"})
+        tid = created["id"]
+        cursor = self.wait_for(self.manager, tid, b"FIXTURE_READY")
+        self.assertEqual(self.tmux("show-options", "-g", "-v", "history-limit").stdout.strip(), "20000")
+        self.assertEqual(self.tmux("display-message", "-p", "-t", "sb-" + tid, "#{history_limit}").stdout.strip(), "20000")
+
+        self.assertEqual(self.manager.paste(tid, "pasted-fixture"), {"ok": True})
+        cursor = self.wait_for(self.manager, tid, b"FIXTURE_REPLY:pasted-fixture", cursor)
+        before = cursor
+        self.manager.paste(tid, "line-one\nline-two")
+        cursor = self.wait_for(self.manager, tid, b"FIXTURE_REPLY:line-two", cursor)
+        self.assertIn(b"FIXTURE_REPLY:line-one", self.output_since(tid, before))
+        # paste-buffer -d removed every private buffer.
+        buffers = self.tmux("list-buffers", "-F", "#{buffer_name}").stdout.split()
+        self.assertFalse([name for name in buffers if name.startswith("sh-")])
+        # Without submit the text waits in the CLI input until the user's own Enter.
+        before = cursor
+        self.manager.paste(tid, "draft-fixture", submit=False)
+        time.sleep(0.6)
+        self.assertNotIn(b"FIXTURE_REPLY:draft-fixture", self.output_since(tid, before))
+        self.manager.write(tid, "\n")
+        cursor = self.wait_for(self.manager, tid, b"FIXTURE_REPLY:draft-fixture", cursor)
+
+        self.manager.scroll(tid, -10)
+        self.assertEqual(self.mode(tid), "1 10")
+        self.manager.scroll(tid, 4)
+        self.assertEqual(self.mode(tid), "1 6")
+        # copy-mode -e leaves history once the view is back at the live screen.
+        self.manager.scroll(tid, 6)
+        self.assertEqual(self.mode(tid).split()[0], "0")
+        self.manager.scroll(tid, 5)
+        self.assertFalse(self.manager.terminals[tid].scrolled)
+        self.assertEqual(self.mode(tid).split()[0], "0")
+        # Typed input and pasted input both leave history first and reach the CLI.
+        self.manager.scroll(tid, -3)
+        self.assertEqual(self.mode(tid), "1 3")
+        self.manager.write(tid, "typed-after-scroll\n")
+        cursor = self.wait_for(self.manager, tid, b"FIXTURE_REPLY:typed-after-scroll", cursor)
+        self.assertEqual(self.mode(tid).split()[0], "0")
+        self.manager.scroll(tid, -3)
+        self.manager.paste(tid, "pasted-after-scroll")
+        cursor = self.wait_for(self.manager, tid, b"FIXTURE_REPLY:pasted-after-scroll", cursor)
+        self.assertEqual(self.mode(tid).split()[0], "0")
+        self.manager.scroll(tid, -5)
+        self.assertEqual(self.manager.scroll_end(tid), {"ok": True})
+        self.assertEqual(self.mode(tid).split()[0], "0")
+
+        self.manager.close_terminal(tid)
+        with self.assertRaises(terminal.InputNotSent):
+            self.manager.paste(tid, "after-close")
+        with self.assertRaises(RuntimeError):
+            self.manager.scroll(tid, -1)
 
     def test_immediate_exit_and_missing_executable_are_reported_as_failed(self):
         for key, command in (("exit", [sys.executable, "-c", "raise SystemExit(9)"]),

@@ -29,7 +29,7 @@ class FakeNative:
                               'kind': 'image', 'source': 'native'}]},
             {'role': 'tool', 'text': '검증용 파일 읽기\n선택한 텍스트와 펼친 기록은 상태 갱신 중에도 유지됩니다.', 'ts': time.time() - 15},
             {'role': 'assistant', 'text': (
-                '**검증 화면**입니다. 실제 모델 호출 없이 접수와 대기열을 확인할 수 있습니다.\n\n'
+                '**검증 화면**입니다. 실제 모델 호출 없이 메시지 접수 상태를 확인할 수 있습니다.\n\n'
                 '아래 문구를 복사해 보세요.\n\n'
                 '> 미리보기 화면의 안내 문구를 쉽게 바꿔주세요.\n>\n'
                 '> 제목은 **작업 미리보기**로 바꾸고, 휴대폰에서도 잘 읽히게 해주세요.\n\n'
@@ -40,27 +40,25 @@ class FakeNative:
             ), 'ts': time.time() - 10},
         ] for row in rows}
         self.receipts = {}
-        self.queued = {row['id']: [] for row in rows}
+        self.pending = {row['id']: 0 for row in rows}
+        self.running = {row['id']: 'running-' + row['id'] for row in rows if row['phase'] == 'working'}
         self.lock = threading.RLock()
 
     def finish(self, identifier, request_id, text):
         with self.lock:
-            queued = next((item for item in self.queued[identifier] if item['requestId'] == request_id), None)
-            if queued:
-                self.queued[identifier].remove(queued)
-                self.messages[identifier].append({'role': 'user', 'text': queued['text'], 'ts': time.time(),
-                                                 'clientId': request_id, 'turnId': request_id, 'turnStatus': 'completed',
-                                                 'attachments': queued['attachments']})
-            for message in self.messages[identifier]:
-                if message.get('clientId') == request_id:
-                    message['turnStatus'] = 'completed'
             self.messages[identifier].append({'role': 'assistant', 'text': '검증 응답: ' + text, 'ts': time.time()})
-            self.rows[identifier]['phase'] = 'working' if self.queued[identifier] else 'idle'
-            self.receipts[request_id]['delivery'] = 'completed'
-            self.receipts[request_id]['readbackConfirmed'] = True
-            self.receipts[request_id]['currentSnapshotConfirmed'] = True
-            self.receipts[request_id]['turnId'] = request_id
-            self.receipts[request_id]['queueId'] = None
+            self.pending[identifier] -= 1
+            if self.pending[identifier]:
+                return
+            # The running turn ends only after every input it absorbed was answered.
+            turn_id = self.running.pop(identifier, None)
+            self.rows[identifier]['phase'] = 'idle'
+            for message in self.messages[identifier]:
+                if message.get('turnId') == turn_id:
+                    message['turnStatus'] = 'completed'
+            for receipt in self.receipts.values():
+                if receipt.get('turnId') == turn_id:
+                    receipt['delivery'] = 'completed'
 
     def rpc(self, host, command, payload, timeout=20):
         if command == 'attachment':
@@ -71,15 +69,14 @@ class FakeNative:
         row = self.rows[source['id']]
         action = payload['action']
         with self.lock:
+            if action == 'capabilities':
+                return {'phase': row['phase'], 'cwd': row['cwd'], 'kind': row.get('kind')}
             if action == 'read':
                 supported = row['agent'] == 'codex'
                 ids = list(dict.fromkeys(([payload['requestId']] if payload.get('requestId') else []) + payload.get('requestIds', [])))
                 return {'phase': row['phase'], 'cwd': row['cwd'], 'messages': list(self.messages[row['id']]),
-                        'queuedMessages': list(self.queued[row['id']]),
-                        'queueState': {'available': supported, 'complete': supported, 'total': len(self.queued[row['id']]) if supported else None,
-                                       'truncated': False, 'reason': None if supported else 'Native 예약 읽기를 지원하지 않습니다.'},
                         'receipts': [{**self.receipts.get(identifier, {'delivery': 'unknown'}), 'requestId': identifier} for identifier in ids],
-                        'capabilities': {'canSend': supported, 'reason': None if supported else '이 Claude 실행은 실제 터미널에서 입력해 주세요.'}}
+                        'capabilities': {'canSend': supported, 'reason': None if supported else 'Claude 입력은 보드가 연결한 터미널로 전달합니다.'}}
             if action == 'receipt':
                 return self.receipts.get(payload['requestId'], {'delivery': 'unknown'})
             if action != 'send':
@@ -98,21 +95,18 @@ class FakeNative:
                                    'size': record['size'], 'kind': kind, 'source': 'sessionholic'})
                 if kind == 'file':
                     text += '\n첨부 파일: ' + record['path']
-            queued = row['phase'] == 'working'
-            if queued:
-                self.queued[row['id']].append({'queueId': 'queue-' + rid, 'requestId': rid, 'text': text,
-                                              'textTruncated': False, 'contentAvailable': True, 'attachments': sent_files,
-                                              'status': 'queued', 'confirmed': True, 'readbackConfirmed': True,
-                                              'currentSnapshotConfirmed': True, 'acknowledged': True})
-            else:
-                self.messages[row['id']].append({'role': 'user', 'text': text, 'ts': time.time(),
-                                                 'clientId': rid, 'turnId': rid, 'turnStatus': 'inProgress', 'attachments': sent_files})
-            self.receipts[rid] = {'delivery': 'queued' if queued else 'accepted', 'confirmed': True,
-                                  'turnId': None if queued else rid, 'queueId': 'queue-' + rid if queued else None,
+            # Like native turn/start: a running turn absorbs the input, otherwise a new turn starts.
+            joined = row['phase'] == 'working'
+            turn_id = self.running.setdefault(row['id'], 'running-' + row['id']) if joined else rid
+            self.running[row['id']] = turn_id
+            self.messages[row['id']].append({'role': 'user', 'text': text, 'ts': time.time(), 'clientId': rid,
+                                             'turnId': turn_id, 'turnStatus': 'inProgress', 'attachments': sent_files})
+            self.receipts[rid] = {'delivery': 'accepted', 'confirmed': True, 'turnId': turn_id,
                                   'readbackConfirmed': True, 'currentSnapshotConfirmed': True,
                                   'acknowledged': True, 'attachments': sent_files}
             row['phase'] = 'working'
-            timer = threading.Timer(8 if queued else 5, self.finish, args=(row['id'], rid, text))
+            self.pending[row['id']] += 1
+            timer = threading.Timer(8 if joined else 5, self.finish, args=(row['id'], rid, text))
             timer.daemon = True
             timer.start()
             if '[unknown]' in text:
@@ -146,7 +140,7 @@ def main(argv=None):
     rows = []
     for index, (agent, home, title, phase) in enumerate([
         ('codex', '.codex-isolated', '실제 세션 입력 · 한글과 첨부 검증', 'idle'),
-        ('codex', '.codex-isolated', '진행 중인 작업 · 대기열 검증', 'working'),
+        ('codex', '.codex-isolated', '진행 중인 작업 · 실행 중 입력 검증', 'working'),
         ('claude', '.claude', 'Claude · 터미널 입력과 첨부 경로 검증', 'needs_input'),
     ], 1):
         cwd = directory / ('workspace-' + str(index))

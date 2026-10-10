@@ -225,9 +225,13 @@ class HelperTest(unittest.TestCase):
         # "/" + 37 + "/ssh/cm-" is 46 bytes; with %C (40) and the bind suffix (17) it is 103.
         fits = "/" + "s" * 37
         self.assertEqual(server.ssh_control_path(fits), fits + "/ssh/cm-%C")
-        self.assertIsNone(server.ssh_control_path(fits + "s"))
+        fallback = "/tmp/sessionholic-%d/cm-%%C" % os.getuid()
+        # Too long or re-tokenized state paths use the short private fallback instead.
+        self.assertEqual(server.ssh_control_path(fits + "s"), fallback)
         for unsafe in ("/tmp/with space", "/tmp/100%", "/tmp/quote'", "/tmp/hash#x"):
-            self.assertIsNone(server.ssh_control_path(unsafe), unsafe)
+            self.assertEqual(server.ssh_control_path(unsafe), fallback, unsafe)
+        with patch.object(server, "SSH_FALLBACK_ROOT", Path("/" + "f" * 60)):
+            self.assertIsNone(server.ssh_control_path(fits + "s"))
 
     def test_ssh_control_options_need_private_prepared_folder(self):
         directory = tempfile.mkdtemp(prefix="sh", dir="/tmp")
@@ -254,14 +258,20 @@ class HelperTest(unittest.TestCase):
         socket_dir.symlink_to(directory)
         self.assertEqual(server.ssh_control_options(directory), [])
 
-    def test_ssh_control_options_are_omitted_for_long_state_paths(self):
+    def test_long_state_paths_share_connections_through_private_fallback(self):
         directory = tempfile.mkdtemp(prefix="sh", dir="/tmp")
         self.addCleanup(shutil.rmtree, directory)
         state = Path(directory) / ("long-state-" + "x" * 60)
-        server.Board(HOSTS, 60, state_dir=state)
-        self.assertTrue((state / "ssh").is_dir())
-        self.assertEqual(server.ssh_control_options(state), [])
-        self.assertNotIn("ControlMaster=auto", server.collector_command(HOSTS[0], ["snapshot"], state))
+        with patch.object(server, "SSH_FALLBACK_ROOT", Path(directory)):
+            server.Board(HOSTS, 60, state_dir=state)
+            socket_dir = Path(directory) / ("sessionholic-%d" % os.getuid())
+            self.assertFalse((state / "ssh").exists())
+            self.assertEqual(socket_dir.stat().st_mode & 0o777, 0o700)
+            self.assertIn("ControlPath=" + str(socket_dir) + "/cm-%C", server.ssh_control_options(state))
+            self.assertIn("ControlMaster=auto", server.collector_command(HOSTS[0], ["snapshot"], state))
+            # Another owner's or a widened folder disables sharing rather than trusting it.
+            socket_dir.chmod(0o755)
+            self.assertEqual(server.ssh_control_options(state), [])
 
     def test_load_hosts_validates(self):
         with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:

@@ -1,4 +1,5 @@
 import json
+import os
 import struct
 from pathlib import Path
 import sys
@@ -214,6 +215,139 @@ class MessageTest(unittest.TestCase):
             collector.read("codex", "019a0000-0000-7000-8000-000000000000", "../x")
         with self.assertRaises(ValueError):
             collector.read("gemini", "019a0000-0000-7000-8000-000000000000")
+
+    def test_clipped_rows_report_truncation_and_original_length(self):
+        long_answer, long_request = "답" * 5000, "요" * 4001
+        rows = collector.codex_messages([{"items": [
+            {"type": "userMessage", "content": [{"type": "text", "text": long_request}]},
+            {"type": "agentMessage", "text": long_answer},
+            {"type": "agentMessage", "text": "짧은 답"},
+            {"type": "agentMessage", "text": "x" * collector.TEXT_LIMIT}]}])
+        self.assertEqual([(r.get("truncated"), r.get("fullLength")) for r in rows],
+                         [(True, 4001), (True, 5000), (None, None), (None, None)])
+        self.assertEqual(rows[1]["text"], "답" * collector.TEXT_LIMIT + " …")
+        self.assertNotIn("truncated", rows[2])
+        self.assertNotIn("fullLength", rows[3])
+
+        hidden = "<system-reminder>" + "숨김" * 100 + "</system-reminder>"
+        rows = collector.claude_messages([
+            {"type": "user", "message": {"content": hidden + "u" * 4100}},
+            {"type": "assistant", "message": {"content": [{"type": "text", "text": "a" * 4500},
+                                                          {"type": "text", "text": "끝"}]}}])
+        self.assertEqual([(r["role"], r.get("truncated"), r.get("fullLength")) for r in rows],
+                         [("user", True, 4100), ("assistant", True, 4500), ("assistant", None, None)])
+        self.assertEqual(len(rows[1]["text"]), collector.TEXT_LIMIT + 2)
+
+    def test_malformed_history_rows_are_skipped(self):
+        rows = collector.codex_messages([None, "turn", {"items": [None, "item", {"type": "fileChange", "changes": 5},
+                                                                  {"type": "userMessage", "content": "text"},
+                                                                  {"type": "agentMessage", "text": "남은 답"}]}])
+        self.assertEqual([(r["role"], r["text"]) for r in rows], [("tool", "파일 수정 · "), ("assistant", "남은 답")])
+        rows = collector.claude_messages([{"type": "assistant", "message": "not-a-dict"},
+                                          {"type": "assistant", "message": {"content": [{"type": "text", "text": "ok"}]}}])
+        self.assertEqual([r["text"] for r in rows], ["ok"])
+
+    def test_read_reports_transcript_race_instead_of_failing(self):
+        with patch.object(collector, "claude_transcript", return_value=Path("/nonexistent/fixture.jsonl")):
+            result = collector.read("claude", "019a0000-0000-7000-8000-000000000000")
+        self.assertEqual(result["messages"], [])
+        self.assertIn("읽지 못했습니다", result["error"])
+
+
+class SnapshotIsolationTest(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.home = Path(self.temp.name)
+        self.projects = self.home / ".claude/projects"
+        patcher = patch.object(collector, "HOME", self.home)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def transcript(self, session_id, entries, project="example"):
+        path = self.projects / project / (session_id + ".jsonl")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("".join(json.dumps(entry) + "\n" for entry in entries))
+        return path
+
+    @staticmethod
+    def answer(text):
+        return {"type": "assistant", "message": {"content": [{"type": "text", "text": text}]}}
+
+    def sessions(self, rows):
+        errors = []
+        with patch.object(collector, "which", return_value="/fixture/claude"), \
+             patch.object(collector, "run", return_value=json.dumps(rows)):
+            return collector.claude_sessions(errors, []), errors
+
+    def test_one_source_failure_keeps_the_other_sources(self):
+        with patch.object(collector, "load_projects", return_value=[]), \
+             patch.object(collector, "claude_sessions", return_value=[{"id": "fixture"}]), \
+             patch.object(collector, "codex_threads", side_effect=AttributeError("fixture")), \
+             patch.object(collector, "tmux_sessions", side_effect=PermissionError("fixture")):
+            result = collector.snapshot()
+        self.assertEqual(result["claude"], [{"id": "fixture"}])
+        self.assertEqual((result["codex"], result["tmux"]), ([], []))
+        self.assertEqual(len(result["errors"]), 2)
+        self.assertNotIn("fixture", json.dumps(result["errors"]))
+
+    def test_broken_claude_rows_and_transcript_races_are_isolated(self):
+        good, unreadable, gone = ("a0000000-0000-4000-8000-00000000000" + str(i) for i in range(3))
+        self.transcript(good, [self.answer("정상 미리보기")])
+        locked = self.transcript(unreadable, [self.answer("읽지 못함")])
+        locked.chmod(0)
+        self.addCleanup(locked.chmod, 0o600)
+        index = collector.claude_transcript_index()
+        index[gone] = self.projects / "example" / (gone + ".jsonl")
+        rows = ["not-a-dict", ["list"],
+                {"id": "row-good", "sessionId": good, "name": "정상", "startedAt": 1791334800},
+                {"id": "row-locked", "sessionId": unreadable, "startedAt": 1791334800},
+                {"id": "row-gone", "sessionId": gone, "startedAt": 1791334800}]
+        with patch.object(collector, "claude_transcript_index", return_value=index):
+            out, errors = self.sessions(rows)
+        self.assertEqual([row["id"] for row in out], ["row-good", "row-locked", "row-gone"])
+        self.assertEqual(out[0]["snippet"], "정상 미리보기")
+        self.assertEqual([row["snippet"] for row in out[1:]], ["", ""])
+        self.assertEqual(out[2]["updatedAt"], 1791334800)
+        self.assertEqual(errors, ["Claude 세션 2건을 읽지 못했습니다."])
+
+    def test_snapshot_scans_transcripts_once_and_widens_tail_only_when_needed(self):
+        near, far, other = ("b0000000-0000-4000-8000-00000000000" + str(i) for i in range(3))
+        self.transcript(near, [{"type": "user", "message": {"content": "질문"}}, self.answer("가까운 답")])
+        filler = [{"type": "user", "message": {"content": "x" * 1000}} for _ in range(40)]
+        self.transcript(far, [self.answer("먼 답")] + filler)
+        self.transcript(other, [self.answer("오래된 답")], project="older")
+        newer = self.transcript(other, [self.answer("최신 답")], project="newer")
+        os.utime(newer, (2000000000, 2000000000))
+        rows = [{"id": "n", "sessionId": near}, {"id": "f", "sessionId": far}, {"id": "o", "sessionId": other}]
+        with patch.object(collector.glob, "glob", wraps=collector.glob.glob) as scan, \
+             patch.object(collector, "tail_entries", wraps=collector.tail_entries) as tail:
+            out, errors = self.sessions(rows)
+        self.assertEqual(scan.call_count, 1)
+        self.assertEqual([row["snippet"] for row in out], ["가까운 답", "먼 답", "최신 답"])
+        self.assertEqual(errors, [])
+        sizes = [(Path(call.args[0]).stem, call.args[1]) for call in tail.call_args_list]
+        self.assertEqual(sizes, [(near, 32 * 1024), (far, 32 * 1024), (far, 128 * 1024), (other, 32 * 1024)])
+
+    def test_codex_rows_are_isolated(self):
+        class Server:
+            def __init__(self, path):
+                pass
+            def __enter__(self):
+                return self
+            def __exit__(self, *exc):
+                return False
+            def call(self, method, params):
+                if method == "thread/list":
+                    return {"data": ["bad", {"id": "t1", "name": "작업", "status": {"type": "idle"}},
+                                     {"id": ["unhashable"]}]}
+                return {"data": ["t1"]}
+        errors = []
+        with patch.object(collector, "codex_homes", return_value=[(".codex", self.home / ".codex")]), \
+             patch.object(collector, "AppServer", Server):
+            rows = collector.codex_threads(errors, [])
+        self.assertEqual([(row["id"], row["loaded"]) for row in rows], [("t1", True)])
+        self.assertEqual(errors, ["Codex(기본) 작업 2건을 읽지 못했습니다."])
 
 
 if __name__ == "__main__":

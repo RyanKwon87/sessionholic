@@ -710,6 +710,47 @@ class NativeChatTests(unittest.TestCase):
         self.assertEqual(len(run.call_args_list), 4)
         self.assertTrue(all(call.args[1] == ['agents', '--json', '--all'] for call in run.call_args_list))
 
+    def test_native_read_times_answers_by_their_whole_turn_and_reports_the_running_turn_start(self):
+        thread = self.thread('active')
+        thread['turns'] = [
+            {'id': 'done', 'status': 'completed', 'startedAt': 1000, 'completedAt': 1600, 'items': [
+                {'type': 'userMessage', 'id': 'u1', 'content': [{'type': 'text', 'text': '질문'}]},
+                {'type': 'agentMessage', 'id': 'a1', 'text': '중간 보고'},
+                {'type': 'commandExecution', 'id': 'c1', 'command': 'ls'},
+                {'type': 'agentMessage', 'id': 'a2', 'text': '최종 답'}]},
+            {'id': 'live', 'status': 'inProgress', 'startedAt': 2000, 'items': [
+                {'type': 'userMessage', 'id': 'u2', 'content': [{'type': 'text', 'text': '다음 질문'}]},
+                {'type': 'agentMessage', 'id': 'a3', 'text': '진행 중'}]}]
+        result = self.handle(FakeClient(thread), {'action': 'read', 'source': self.source})
+        self.assertEqual([(m['itemId'], m['ts']) for m in result['messages']],
+                         [('u1', 1000), ('a1', None), ('c1', None), ('a2', 1600), ('u2', 2000), ('a3', None)])
+        self.assertEqual(result['messages'][2]['toolKind'], 'command')
+        self.assertEqual(result['workingSince'], 2000)
+        thread['turns'] = thread['turns'][:1]
+        thread['status'] = {'type': 'idle', 'activeFlags': []}
+        self.assertNotIn('workingSince', self.handle(FakeClient(thread), {'action': 'read', 'source': self.source}))
+
+    def test_working_claude_read_counts_from_the_newest_prompt_as_an_approximation(self):
+        source = {'agent': 'claude', 'home': '.claude', 'id': 'back1234'}
+        sid = 'session-12345'
+        folder = self.home / '.claude/projects/p'
+        folder.mkdir(parents=True)
+        lines = [{'type': 'user', 'timestamp': '2026-10-11T01:00:00Z', 'message': {'content': '시작해 주세요'}},
+                 {'type': 'assistant', 'timestamp': '2026-10-11T01:05:00Z', 'message': {'content': [
+                     {'type': 'tool_use', 'name': 'Bash', 'input': {'command': 'ls'}}]}},
+                 {'type': 'user', 'timestamp': '2026-10-11T01:05:01Z', 'message': {'content': [
+                     {'type': 'tool_result', 'content': 'ok'}]}}]
+        (folder / (sid + '.jsonl')).write_text(''.join(json.dumps(line) + '\n' for line in lines))
+        for state, expected in (('working', collector.to_epoch('2026-10-11T01:00:00Z')), ('idle', None)):
+            row = {'id': source['id'], 'sessionId': sid, 'kind': 'background',
+                   'state': state, 'status': 'busy' if state == 'working' else 'idle', 'cwd': str(self.cwd)}
+            with patch.object(chat.native, '_claude_binary', return_value='/fixture/claude'), \
+                    patch.object(chat.native, '_claude_run', return_value=json.dumps([row]).encode()):
+                read = chat.handle({'action': 'read', 'source': source}, home=self.home)
+            self.assertEqual(read.get('workingSince'), expected, state)
+            self.assertEqual(read.get('workingSinceApprox'), True if expected else None)
+            self.assertEqual([m['role'] for m in read['messages']], ['user', 'tool'])
+
 
 if __name__ == '__main__':
     unittest.main()

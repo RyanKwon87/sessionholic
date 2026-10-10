@@ -58,7 +58,13 @@ const MessageFormat = (() => {
         end = find(marker, end + marker.length);
       return end;
     };
-    const markedEnd = (marker, start) => {
+    const runAt = (cursor) => text.slice(cursor).match(text[cursor] === "*" ? /^\*+/ : /^_+/)[0];
+    const wordChar = (char) => /[\p{L}\p{N}]/u.test(char || "");
+    // Where the closing `marker` of a span opened just before `start` begins.
+    // A run that opens an inner span (`*a **b** c*`) is skipped up to its own
+    // closer; a closing run longer than the marker (`***`) closes with its
+    // first characters and leaves the rest to the enclosing span.
+    const markedEnd = (marker, start, nest = 0) => {
       for (let cursor = start; cursor < text.length;) {
         spend(budget, "work");
         if (text[cursor] === "\\") { cursor += 2; continue; }
@@ -68,13 +74,47 @@ const MessageFormat = (() => {
           cursor = end < 0 ? cursor + codeMarker.length : end + codeMarker.length;
           continue;
         }
-        if (text[cursor] === marker[0]) {
-          const run = text.slice(cursor).match(marker[0] === "*" ? /^\*+/ : /^_+/)[0];
-          const end = cursor + run.length - marker.length;
-          if (run.length >= marker.length && run.length <= 3 && !/\s/.test(text[cursor - 1] || " ") &&
-              !(marker[0] === "_" && /[\p{L}\p{N}]/u.test(text[cursor + run.length] || ""))) return end;
-          cursor += run.length;
-        } else cursor++;
+        if (text[cursor] !== marker[0]) { cursor++; continue; }
+        const run = runAt(cursor);
+        const underscore = marker[0] === "_";
+        const canClose = run.length <= 3 && !/\s/.test(text[cursor - 1] || " ") &&
+          !(underscore && wordChar(text[cursor + run.length]));
+        if (canClose && run.length === marker.length) return cursor;
+        const canOpen = nest < 3 && run.length <= 3 && !/\s/.test(text[cursor + run.length] || " ") &&
+          !(underscore && wordChar(text[cursor - 1]));
+        if (canOpen && (run.length !== marker.length || !canClose)) {
+          const inner = markedEnd(run, cursor + run.length, nest + 1);
+          if (inner >= 0) {
+            const runEnd = inner + runAt(inner).length;
+            if (runEnd - (inner + run.length) >= marker.length && !(underscore && wordChar(text[runEnd])))
+              return inner + run.length;
+            cursor = runEnd;
+            continue;
+          }
+        }
+        if (canClose && run.length > marker.length) return cursor;
+        cursor += run.length;
+      }
+      return -1;
+    };
+    // The "]" that closes a link label opened just before `start`: nested
+    // brackets are counted, escapes and code spans skipped.
+    const lastClose = text.lastIndexOf("]");
+    const labelEnd = (start) => {
+      if (start > lastClose) return -1;
+      let nesting = 0;
+      for (let cursor = start; cursor < text.length && cursor - start < 1000; cursor++) {
+        spend(budget, "work");
+        const value = text[cursor];
+        if (value === "\\") { cursor++; continue; }
+        if (value === "`") {
+          const codeMarker = text.slice(cursor).match(/^`+/)[0];
+          const end = codeEnd(codeMarker, cursor + codeMarker.length);
+          cursor = (end < 0 ? cursor : end) + codeMarker.length - 1;
+          continue;
+        }
+        if (value === "[") nesting++;
+        else if (value === "]" && !nesting--) return cursor;
       }
       return -1;
     };
@@ -101,9 +141,11 @@ const MessageFormat = (() => {
         buffer += marker; index += marker.length; continue;
       }
       if (char === "[" && text[index - 1] !== "!") {
-        const labelEnd = find("](", index + 1);
-        if (labelEnd >= 0) {
-          let cursor = labelEnd + 2;
+        // Only "[label](" with this bracket's own "]" is a link; "[P1] … [a](url)"
+        // keeps "[P1] … " as text.
+        const close = labelEnd(index + 1);
+        if (close >= 0 && text[close + 1] === "(") {
+          let cursor = close + 2;
           let nesting = 1;
           for (; cursor < text.length && nesting; cursor++) {
             spend(budget, "work");
@@ -111,14 +153,15 @@ const MessageFormat = (() => {
             if (text[cursor] === ")") nesting--;
           }
           if (!nesting) {
-            const destination = text.slice(labelEnd + 2, cursor - 1);
+            const destination = text.slice(close + 2, cursor - 1);
             flush(); out.push(make(budget, "link", {
-              children: inline(text.slice(index + 1, labelEnd), budget, depth + 1),
+              children: inline(text.slice(index + 1, close), budget, depth + 1),
               destination, href: safeHref(destination),
             }));
             index = cursor; continue;
           }
         }
+        buffer += char; index++; continue;
       }
       if (char === "*" || char === "_") {
         const run = text.slice(index).match(char === "*" ? /^\*+/ : /^_+/)[0];
@@ -139,31 +182,118 @@ const MessageFormat = (() => {
     }
     flush(); return out;
   }
-  function fence(line) { return line.match(/^ {0,3}(`{3,}|~{3,})(.*)$/); }
+  // Columns of leading whitespace (a tab advances to the next multiple of 4).
+  function leadWidth(text) {
+    let width = 0;
+    for (const char of text) {
+      if (char === " ") width++;
+      else if (char === "\t") width += 4 - (width % 4);
+      else break;
+    }
+    return width;
+  }
+  // The line without up to `width` columns of leading whitespace.
+  function dedent(text, width) {
+    let column = 0; let index = 0;
+    while (index < text.length && column < width) {
+      if (text[index] === " ") column++;
+      else if (text[index] === "\t") {
+        const next = column + 4 - (column % 4);
+        if (next > width) return " ".repeat(next - width) + text.slice(index + 1);
+        column = next;
+      } else break;
+      index++;
+    }
+    return text.slice(index);
+  }
+  // A fence may be indented (it often is inside list items); its content loses
+  // the same indentation. Backtick fences take no backticks in their info.
+  function fence(line) {
+    const match = line.match(/^([ \t]*)(?:(`{3,})([^`]*)|(~{3,})(.*))$/);
+    return match ? { indent: leadWidth(match[1]), marker: match[2] || match[4], info: match[3] ?? match[5] ?? "" } : null;
+  }
   function quote(line) { return line.match(/^ {0,3}>[ \t]?(.*)$/); }
   function heading(line) { return line.match(/^ {0,3}(#{1,6})[ \t]+(.*)$/); }
+  // "2026. 10. 10. 회의" is a Korean date, not the 2026th item of a list.
+  const DATE_LINE = /^[ \t]*\d{4}\.[ \t]+\d{1,2}\.(?:[ \t]|$)/;
   function listItem(line) {
-    const unordered = line.match(/^([ \t]*)([-+*])[ \t]+(.*)$/);
-    const ordered = line.match(/^([ \t]*)(\d{1,9})[.)][ \t]+(.*)$/);
+    if (DATE_LINE.test(line)) return null;
+    const unordered = line.match(/^([ \t]*)([-+*])([ \t]+)(.*)$/);
+    const ordered = unordered ? null : line.match(/^([ \t]*)(\d{1,9})[.)]([ \t]+)(.*)$/);
     const match = unordered || ordered;
-    return match ? { indent: match[1], depth: match[1].replace(/\t/g, "    ").length,
-      ordered: !!ordered, number: ordered ? Number(match[2]) : null, text: match[3] } : null;
+    if (!match) return null;
+    const depth = leadWidth(match[1]);
+    const marker = ordered ? match[2].length + 1 : 1;
+    // Where the item's own text starts; deeper lines belong to the item.
+    const gap = leadWidth(" ".repeat(depth + marker) + match[3]) - depth - marker;
+    return { indent: match[1], depth, ordered: !!ordered, number: ordered ? Number(match[2]) : null,
+      content: depth + marker + (gap > 4 ? 1 : gap), text: match[4] };
   }
-  function special(line) { return !line.trim() || fence(line) || quote(line) || heading(line) || listItem(line); }
+  // Whether a line ends the paragraph above it. As in CommonMark, only a list
+  // starting at 1 (or a bullet) interrupts a paragraph: "…\n2026. 10. 10." and
+  // "…\n1000. 항목" stay text.
+  function interrupts(line) {
+    if (!line.trim() || fence(line) || quote(line) || heading(line)) return true;
+    const item = listItem(line);
+    return !!item && !!item.text.trim() && (!item.ordered || item.number === 1);
+  }
+  // An item's lines: its first line, then every line indented to its text,
+  // blank lines followed by more of it, and lazy continuations of its
+  // paragraph. The body is parsed again as blocks (sub-lists, paragraphs,
+  // fences); its first paragraph stays inline next to the marker.
   function parseList(lines, start, budget, depth) {
     if (depth > MAX_DEPTH) throw new Error("format limit");
     const first = listItem(lines[start].text);
     const items = [];
     let index = start;
+    const sibling = (line) => {
+      const item = listItem(line.text);
+      return !!item && item.depth === first.depth && item.ordered === first.ordered;
+    };
     while (index < lines.length) {
       const item = listItem(lines[index].text);
       if (!item || item.depth !== first.depth || item.ordered !== first.ordered) break;
-      const value = make(budget, "item", { ...item, children: inline(item.text, budget), eol: lines[index].eol, nested: [] });
-      items.push(value); index++;
-      while (index < lines.length && listItem(lines[index].text)?.depth > first.depth) {
-        const nested = parseList(lines, index, budget, depth + 1);
-        value.nested.push(nested.node); index = nested.next;
+      const content = [{ text: item.text, eol: lines[index].eol }];
+      let blank = 0;
+      let fenced = fence(item.text);
+      let paragraph = !fenced && !!item.text.trim();
+      index++;
+      while (index < lines.length) {
+        spend(budget, "work");
+        const line = lines[index];
+        if (!line.text.trim()) { blank++; index++; continue; }
+        const width = leadWidth(line.text);
+        const nested = listItem(line.text);
+        const inside = width >= item.content || (!!nested && nested.depth > item.depth && !sibling(line));
+        // Inside a list any marker line ("5) …" too) starts an item, never continues one.
+        const lazy = !blank && paragraph && !fenced && !nested && !interrupts(line.text);
+        if (!inside && !lazy) break;
+        for (; blank; blank--) content.push({ text: "", eol: lines[index - blank].eol });
+        const text = dedent(line.text, Math.min(width, item.content));
+        content.push({ text, eol: line.eol });
+        const opened = fence(text);
+        if (fenced) {
+          const close = text.match(/^[ \t]*(`+|~+)[ \t]*$/);
+          if (close && close[1][0] === fenced.marker[0] && close[1].length >= fenced.marker.length) fenced = null;
+          paragraph = false;
+        } else if (opened) { fenced = opened; paragraph = false; } else paragraph = !heading(text);
+        index++;
       }
+      if (blank) {
+        // Blank lines between two items keep the list going (a loose list);
+        // otherwise they are left to whatever follows the list.
+        if (index < lines.length && sibling(lines[index]))
+          for (; blank; blank--) content.push({ text: "", eol: lines[index - blank].eol });
+        else index -= blank;
+      }
+      let lead = 0;
+      if (content[0].text.trim() && !interrupts(content[0].text) && !listItem(content[0].text)) {
+        lead = 1;
+        while (lead < content.length && !interrupts(content[lead].text)) lead++;
+      }
+      items.push(make(budget, "item", { ...item,
+        lines: content.slice(0, lead).map((line) => ({ children: inline(line.text, budget), eol: line.eol })),
+        nested: blocks(content.slice(lead), budget, depth + 1) }));
     }
     return { node: make(budget, "list", { ordered: first.ordered, items }), next: index };
   }
@@ -175,14 +305,15 @@ const MessageFormat = (() => {
       if (!line.text.trim()) { out.push(make(budget, "blank", { text: line.text + line.eol })); index++; continue; }
       const opened = fence(line.text);
       if (opened) {
-        const marker = opened[1]; const body = [];
+        const body = [];
         index++;
         while (index < lines.length) {
-          const close = lines[index].text.match(/^ {0,3}(`+|~+)[ \t]*$/);
-          if (close && close[1][0] === marker[0] && close[1].length >= marker.length) { index++; break; }
-          body.push(lines[index]); index++;
+          const close = lines[index].text.match(/^([ \t]*)(`+|~+)[ \t]*$/);
+          if (close && leadWidth(close[1]) <= Math.max(3, opened.indent) && close[2][0] === opened.marker[0] &&
+              close[2].length >= opened.marker.length) { index++; break; }
+          body.push({ text: dedent(lines[index].text, opened.indent), eol: lines[index].eol }); index++;
         }
-        out.push(make(budget, "fence", { text: lineText(body), language: opened[2].trim().match(/^[A-Za-z0-9_+-]{1,32}(?:\s|$)/)?.[0].trim() || "" }));
+        out.push(make(budget, "fence", { text: lineText(body), language: opened.info.trim().match(/^[A-Za-z0-9_+-]{1,32}(?:\s|$)/)?.[0].trim() || "" }));
         continue;
       }
       if (quote(line.text)) {
@@ -203,7 +334,7 @@ const MessageFormat = (() => {
       const paragraph = [];
       do {
         paragraph.push({ children: inline(lines[index].text, budget), eol: lines[index].eol }); index++;
-      } while (index < lines.length && !special(lines[index].text));
+      } while (index < lines.length && !interrupts(lines[index].text));
       out.push(make(budget, "paragraph", { lines: paragraph }));
     }
     return out;
@@ -226,8 +357,15 @@ const MessageFormat = (() => {
       if (node.kind === "heading") return inlinePlain(node.children) + node.eol;
       if (node.kind === "paragraph") return node.lines.map((line) => inlinePlain(line.children) + line.eol).join("");
       if (node.kind === "quote") return blockPlain(node.children);
-      if (node.kind === "list") return node.items.map((item) => item.indent + (node.ordered ? `${item.number}. ` : "• ") +
-        inlinePlain(item.children) + item.eol + blockPlain(item.nested)).join("");
+      if (node.kind === "list") return node.items.map((item) => {
+        // The item's further lines keep the indentation they had under the marker.
+        const pad = " ".repeat(item.content);
+        const head = item.lines.map((line, index) => (index ? pad : "") + inlinePlain(line.children) + line.eol).join("");
+        const rest = blockPlain(item.nested).replace(/(^|\r\n|\r|\n)(?=[^\r\n])/g, `$1${pad}`);
+        // An item that starts with a block (a fence, a sub-list) starts it after the marker.
+        return item.indent + (node.ordered ? `${item.number}. ` : "• ") +
+          (head ? head + rest : rest.startsWith(pad) ? rest.slice(pad.length) : rest);
+      }).join("");
       return "";
     }).join("");
   }
@@ -293,9 +431,17 @@ const MessageFormat = (() => {
         const foldAfter = Number.isInteger(options?.foldAfter) ? options.foldAfter : FOLD_LINES;
         const foldable = lines > foldAfter;
         const block = element("div", `message-code-block${foldable ? " is-foldable is-folded" : ""}`);
+        // A header row above the code holds the language and the copy icon, so
+        // a long first line scrolls under neither.
+        if (value.language || typeof options?.onCopy === "function") {
+          const head = element("div", "message-code-head");
+          head.append(element("span", "message-code-lang", value.language));
+          copyButton(head, value.text, "code", options);
+          block.append(head);
+        }
         const pre = element("pre", "message-code");
         const code = element("code", "", value.text); if (value.language) code.setAttribute("data-language", value.language);
-        pre.append(code); block.append(pre); copyButton(block, value.text, "code", options);
+        pre.append(code); block.append(pre);
         if (foldable) foldToggle(block, lines);
         container.append(block); continue;
       }
@@ -306,10 +452,16 @@ const MessageFormat = (() => {
       }
       if (value.kind === "list") {
         const list = element(value.ordered ? "ol" : "ul");
-        if (value.ordered) list.setAttribute("start", String(value.items[0].number));
+        if (value.ordered) {
+          list.setAttribute("start", String(value.items[0].number));
+          // Room for long numbers ("1000.") inside the bubble (style.css: ol[data-digits]).
+          const digits = Math.max(...value.items.map((item) => String(item.number).length));
+          if (digits > 2) list.setAttribute("data-digits", String(Math.min(digits, 6)));
+        }
         for (const item of value.items) {
           const li = element("li"); if (value.ordered) li.setAttribute("value", String(item.number));
-          appendInline(li, item.children); appendBlocks(li, item.nested, options); list.append(li);
+          item.lines.forEach((line, index) => { if (index) li.append(element("br")); appendInline(li, line.children); });
+          appendBlocks(li, item.nested, options); list.append(li);
         }
         container.append(list); continue;
       }

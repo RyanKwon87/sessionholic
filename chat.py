@@ -17,6 +17,8 @@ CLAUDE_BLOCKED = ('Claude 터미널에 승인·선택 메뉴가 떠 있어 보�
                   '입력이 메뉴 선택으로 처리될 수 있으니 터미널에서 먼저 선택해 주세요.')
 CLAUDE_EXTERNAL = ('이 Claude 세션은 보드 밖 터미널에서 실행 중이라 웹에서 입력할 수 없습니다. '
                    '그 터미널에서 입력하거나 백그라운드 세션(claude --bg)으로 실행해 주세요.')
+# A background session takes web input only through a board terminal the user opened.
+CLAUDE_OPEN_TERMINAL = '보내려면 먼저 터미널을 여세요.'
 CONTROL = re.compile(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]')
 CLAUDE_READY_SECONDS = 12
 CLAUDE_PROBE = 160
@@ -65,9 +67,9 @@ class StateRead:
 
 class SendRejected(ValueError):
     """Validation failed before the native send boundary was entered."""
-    def __init__(self, reason, status=400):
+    def __init__(self, reason, status=400, code=None):
         super().__init__(reason)
-        self.status = status
+        self.status, self.code = status, code
 
 
 class PromptRejected(ValueError):
@@ -373,14 +375,18 @@ class Chat:
             terminal, terminal_failed = self._board_terminal(source), False
         except (RuntimeError, OSError, ValueError):
             terminal, terminal_failed = None, True
+        action = None
         if claude:
-            supported, reason = self._claude_capability(source, terminal, terminal_failed)
+            supported, reason, action = self._claude_capability(source, terminal, terminal_failed)
         else:
             supported, reason = bool(caps.get('canSend')), caps.get('reason') or result.get('reason')
+        capability = {'supported': supported, 'attachments': bool(source.get('cwd')),
+                      'reason': None if supported else reason}
+        if action:
+            # What the user can do to make sending possible ("open_terminal": the board's terminal button).
+            capability['action'] = action
         response = {'route': identity, 'phase': phase,
-                    'capability': {'supported': supported,
-                                   'attachments': bool(source.get('cwd')),
-                                   'reason': None if supported else reason},
+                    'capability': capability,
                     'messages': messages,
                     'receipts': receipts, 'maxAttachmentBytes': MAX_FILE,
                     'requiresNativeTerminal': phase == 'needs_input' if claude else
@@ -390,6 +396,14 @@ class Chat:
                     # A background Claude session can be attached to read its menu.
                     'promptOpenable': bool(claude and source.get('kind') == 'background'
                                            and terminal is None and not terminal_failed)}
+        # Since when the agent works (epoch seconds), for "작업 중 · 12분 34초": Codex sends its
+        # running turn's startedAt; Claude, which records no turn start, its newest prompt's
+        # time (workingSinceApprox). Nothing while the agent is not working.
+        since = result.get('workingSince')
+        valid = (phase == 'working' and isinstance(since, (int, float)) and not isinstance(since, bool)
+                 and since > 0)
+        response['workingSince'] = int(since) if valid else None
+        response['workingSinceApprox'] = bool(valid and result.get('workingSinceApprox'))
         with self.lock:
             cached = self.cache.get(key)
             # The ids whose receipts this read carries are kept with it: a later read may
@@ -462,13 +476,18 @@ class Chat:
         return None
 
     def _claude_capability(self, source, terminal, failed):
+        """(supported, reason, action). Only a live board terminal takes input; the board never
+        opens one by itself, so a background session without one asks the user to open it."""
         # A session waiting for the user can still take a reply; a menu on its
         # screen is checked at send time, right before anything is pasted.
         if failed:
-            return False, TERMINAL_STATE
-        if terminal or source.get('kind') == 'background':
-            return True, None
-        return False, CLAUDE_EXTERNAL
+            return False, TERMINAL_STATE, None
+        if terminal:
+            return True, None, None
+        if source.get('kind') == 'background':
+            return False, CLAUDE_OPEN_TERMINAL, 'open_terminal'
+        # An interactive session cannot be attached (launch.build_launch), so no button is offered.
+        return False, CLAUDE_EXTERNAL, None
 
     # ---------- approval / question menus answered from the web ----------
     @staticmethod
@@ -612,7 +631,8 @@ class Chat:
             self._forget_state(source)
 
     def _open_claude_terminal(self, ref, source, request_id):
-        """Attach the exact background session in a board terminal, never a new session."""
+        """Attach the exact background session in a board terminal, never a new session.
+        Used only by the question card's "질문 불러오기", a button the user presses; sending never opens one."""
         plan = self.workflow.plan({'source': ref, 'target': {
             'host': source['host'], 'agent': 'claude', 'account': 'claude:default'}})
         if not plan.get('allowed'):
@@ -698,13 +718,9 @@ class Chat:
             if terminal is None:
                 if source.get('kind') != 'background':
                     raise SendRejected(CLAUDE_EXTERNAL, 409)
-                try:
-                    terminal = self._open_claude_terminal(ref, source, request_id)
-                except SendRejected:
-                    raise
-                except (ValueError, RuntimeError, OSError) as exc:
-                    raise SendRejected(str(exc) if isinstance(exc, (ValueError, RuntimeError)) else
-                                       'Claude 터미널을 열지 못했습니다.', 409) from None
+                # Terminals open only when the user asks (the composer's "터미널 열기");
+                # nothing was reserved or pasted, so the draft stays and may be sent later.
+                raise SendRejected(CLAUDE_OPEN_TERMINAL, 409, code='terminal_required')
             try:
                 screen = self.workflow.terminals.capture(terminal['id'])
             except (RuntimeError, ValueError, KeyError, OSError):

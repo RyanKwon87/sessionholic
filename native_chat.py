@@ -185,10 +185,9 @@ def _messages(thread, identity=None, home=None):
     out = []
     # Only the retained history window may read attachment metadata from disk.
     for turn in reversed(thread["turns"]):
-        for item in reversed(turn.get("items") or []):
-            if not isinstance(item, dict):
-                continue
-            rows = collector.codex_messages([{**turn, "items": [item]}])
+        # Rows of a whole turn at once: which answer is final (and so carries the turn's
+        # completion time) depends on the turn's other items.
+        for item, rows in reversed(collector.codex_turn_rows(turn)):
             manifest = _history_attachments(identity, item.get("clientId"), home, item.get("content")) if rows and identity and item.get("type") == "userMessage" else []
             group = []
             for row in rows:
@@ -485,7 +484,14 @@ def _claude(identity, action, home, deadline, args):
         paths = [p for p in root.glob("*/" + sid + ".jsonl") if p.is_file() and not p.is_symlink()]
         if len(paths) != 1:
             raise ValueError("정확한 원본 Claude 대화 기록을 확인하지 못했습니다.")
-        result["messages"] = collector.claude_messages(collector.tail_entries(paths[0], 2 * 1024 * 1024))
+        entries = list(collector.tail_entries(paths[0], 2 * 1024 * 1024))
+        result["messages"] = collector.claude_messages(entries)
+        if result["phase"] == "working":
+            # Claude Code records no turn start: "작업 중" counts from the newest user prompt
+            # in the transcript, an approximation the board labels as such (workingSinceApprox).
+            since = collector.claude_prompt_at(entries)
+            if since:
+                result.update(workingSince=since, workingSinceApprox=True)
     if action in ("send", "receipt"):
         result.update({"requestId": _request(args.get("requestId")), "delivery": "rejected",
                        "confirmed": False, "readbackConfirmed": False, "canRetry": False,
@@ -508,6 +514,11 @@ def handle(args, *, home=None, timeout=10):
                   "capabilities": _capabilities(thread)}
         if action == "read":
             result["messages"] = _messages(thread, identity, home)
+            # "작업 중" counts from the running turn's own start (Turn.startedAt, epoch seconds).
+            active = [t for t in thread["turns"] if t.get("status") == "inProgress"]
+            since = collector.to_epoch(active[-1].get("startedAt")) if active else None
+            if since:
+                result["workingSince"] = since
             if request_ids:
                 result["receipts"] = [_read_receipt(identity, identifier, thread, home) for identifier in request_ids]
         elif action == "receipt":

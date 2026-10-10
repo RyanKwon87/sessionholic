@@ -16,6 +16,38 @@ const BADGES = {
 const AGENTS = { claude: "Claude Code", codex: "Codex" };
 const POLL_MS = 60000;
 const RECENT_SECONDS = 3 * 24 * 3600;
+// Every touch decision reads its thresholds here, so tuning on a real phone
+// changes only this object (distances in CSS px, times in ms, speeds in px/ms).
+const GESTURE = Object.freeze({
+  longPressMs: 450, // a press held this long opens the menu (cards, messages)
+  pressSlopPx: 10, // drift allowed before a press becomes a drag (long press, swipe, pull)
+  tapSlopPx: 10, // a tap moves at most this far between finger down and up
+  tapMaxMs: 300, // and lifts within this time
+  scrollSettleMs: 120, // a touch this soon after the list moved only stops the scroll
+  swipeRatio: 1.7, // |dx| ≥ |dy| × this (within about 30° of horizontal) swipes a card
+  swipeRevealPx: 96, // width of the action a card swipe reveals
+  swipeActionRatio: 0.6, // a swipe past this share of the card runs its action
+  swipeFlickSpeed: 0.4, // a flick this fast opens (left) or closes (right) the swipe
+  pullTriggerPx: 64, // pull to refresh fires past this (elastic) distance
+  pullMaxPx: 110, // the indicator never travels further
+  pullResistPx: 160, // larger: the indicator follows the finger longer
+  readingHideTravelPx: 32, // scrolling this far one way hides the conversation's top and bottom bars
+  readingBottomPx: 24, // mouse layouts: this close to the end shows them again
+  jumpShowPx: 160, // the "맨 아래" button appears this far above the end
+  largeTitleCollapsePx: 36, // the list's large title folds into the bar past this
+  pinchMinFont: 10, // terminal text size range (pinch and A−/A+)
+  pinchMaxFont: 24,
+  momentumMinSpeed: 0.35, // a terminal flick at least this fast keeps scrolling
+  momentumDecay: 0.94, // share of the speed kept per 16 ms frame
+  momentumStopSpeed: 0.03, // below this the scroll stops
+  momentumMaxMs: 1600, // and it never runs longer
+  sheetDismissRatio: 0.25, // a sheet dragged down past this share of its height closes
+  sheetDismissSpeed: 0.5, // or flicked down this fast
+  sheetFarRatio: 0.5, // past this (or this fast) a large sheet closes instead of shrinking
+  sheetFarSpeed: 1.4,
+  sheetExpandPx: 48, // a medium sheet dragged up this far (or flicked) grows
+  sheetExpandSpeed: 0.5,
+});
 const INPUT_CLEANUP_NOTICE = "터미널은 닫혔지만 입력 기록 정리가 남았습니다. 목록을 새로고침해 다시 확인해 주세요.";
 const $ = (id) => document.getElementById(id);
 const prefs = {
@@ -109,6 +141,10 @@ const state = {
   // Board text size (UI preference only); the terminal has its own size.
   textSize: normalizeTextSize(prefs.get("textSize", "default")),
   detailShown: false,
+  // The conversation's top and bottom bars (phones: a tap shows or hides them).
+  chromeVisible: true,
+  tapHintShown: false,
+  tapHintTimer: null,
   terminalOpenRun: 0,
   assetVersions: null,
   // Live updates (/api/events) and the snapshot version they announce.
@@ -117,6 +153,7 @@ const state = {
   snapshotVersion: null,
   eventsSnapshotVersion: null,
   snapshotPending: false,
+  snapshotEventTimer: null,
 };
 
 // --- UI foundation: theme, haptics, screen transitions, bottom sheet -------
@@ -229,6 +266,8 @@ function navTransition(direction, update) {
 function setDetailShown(shown, { direction = null, focus = false } = {}) {
   const changed = state.detailShown !== shown;
   state.detailShown = shown;
+  // Entering a conversation (again) always starts with its bars shown.
+  if (shown && changed) setChromeVisible(true);
   const apply = () => {
     if (shown) document.body.classList.add("show-detail");
     else document.body.classList.remove("show-detail");
@@ -253,12 +292,13 @@ function sheetRelease({ offset = 0, velocity = 0, height = 0, detent = "medium",
   // offset: px dragged (down is positive); velocity: px/ms at release.
   const size = Math.max(1, height);
   if (offset > 0) {
-    const dismiss = offset > size * 0.25 || velocity > 0.5;
-    const far = offset > size * 0.5 || velocity > 1.4;
+    const dismiss = offset > size * GESTURE.sheetDismissRatio || velocity > GESTURE.sheetDismissSpeed;
+    const far = offset > size * GESTURE.sheetFarRatio || velocity > GESTURE.sheetFarSpeed;
     if (dismiss && !far && detent === "large" && detents.includes("medium")) return "medium";
     return dismiss ? "close" : detent;
   }
-  if (offset < 0 && detent !== "large" && detents.includes("large") && (offset < -48 || velocity < -0.5)) return "large";
+  if (offset < 0 && detent !== "large" && detents.includes("large") &&
+      (offset < -GESTURE.sheetExpandPx || velocity < -GESTURE.sheetExpandSpeed)) return "large";
   return detent;
 }
 class BottomSheet {
@@ -524,7 +564,9 @@ function allSessions() {
         hostLabel: host.label,
         stale: !host.ok,
         fetchedAt: host.fetchedAt,
-        key: [host.name, s.agent, s.home || "", s.id].join("|"),
+        // A Claude row listed without an id is told apart by its process (or folder and start).
+        key: [host.name, s.agent, s.home || "", s.id || (s.agent === "claude"
+          ? `~${s.pid ?? ""}:${s.sessionId || ""}:${s.cwd || ""}:${s.startedAt ?? ""}` : "")].join("|"),
       });
     }
   }
@@ -1086,34 +1128,30 @@ function updateCard(node, s, now, folderHint = "") {
 // --- Gestures: long press menus and card swipes --------------------------------
 // A long press (or a right click) opens the same action sheet as the visible
 // controls; a left swipe on a card reveals its terminal action. The decisions
-// are pure functions so their timing and angles are testable.
-const LONG_PRESS_MS = 450;
-const PRESS_SLOP = 10; // px a finger may drift before a press becomes a drag
-const SWIPE_RATIO = 1.7; // |dx|/|dy| above this (within ~30° of horizontal) swipes
-const SWIPE_REVEAL = 96; // px of the revealed action button
+// are pure functions so their timing and angles are testable (thresholds: GESTURE).
 // What a drag is once it passes the slop: "swipe" (sideways: leftward, or
 // either way on an open row), "scroll" (anything steeper, or rightward on a
 // closed row), or null while still undecided.
 function swipeIntent(dx, dy, open = false) {
   const ax = Math.abs(dx);
   const ay = Math.abs(dy);
-  if (Math.max(ax, ay) < PRESS_SLOP) return null;
-  if (ax < ay * SWIPE_RATIO) return "scroll";
+  if (Math.max(ax, ay) < GESTURE.pressSlopPx) return null;
+  if (ax < ay * GESTURE.swipeRatio) return "scroll";
   return dx < 0 || open ? "swipe" : "scroll";
 }
 // Where a released swipe settles. offset: px from rest (left is negative);
 // velocity: px/ms (left is negative). "action" runs it (a pull past 60% of
 // the card), "open" keeps the button revealed, "close" springs back.
-function swipeRelease({ offset = 0, velocity = 0, width = 0, reveal = SWIPE_REVEAL } = {}) {
+function swipeRelease({ offset = 0, velocity = 0, width = 0, reveal = GESTURE.swipeRevealPx } = {}) {
   const size = Math.max(1, width);
-  if (offset <= -size * 0.6) return "action";
-  if (velocity > 0.4) return "close";
-  if (offset <= -reveal * 0.5 || (velocity < -0.4 && offset < -PRESS_SLOP)) return "open";
+  if (offset <= -size * GESTURE.swipeActionRatio) return "action";
+  if (velocity > GESTURE.swipeFlickSpeed) return "close";
+  if (offset <= -reveal * 0.5 || (velocity < -GESTURE.swipeFlickSpeed && offset < -GESTURE.pressSlopPx)) return "open";
   return "close";
 }
-// One press at a time: fires onPress after LONG_PRESS_MS unless the pointer
-// moved past PRESS_SLOP, lifted or was cancelled (scrolling) first. Mouse
-// buttons use the context menu instead.
+// One press at a time: fires onPress after GESTURE.longPressMs unless the
+// pointer moved past GESTURE.pressSlopPx, lifted or was cancelled (scrolling)
+// first. Mouse buttons use the context menu instead.
 function createLongPress(onPress) {
   let press = null;
   const tracker = {
@@ -1126,11 +1164,11 @@ function createLongPress(onPress) {
         if (press !== current || current.fired) return;
         current.fired = true;
         onPress(current.target, current);
-      }, LONG_PRESS_MS);
+      }, GESTURE.longPressMs);
     },
     move(event) {
       if (!press || press.fired || event?.pointerId !== press.id) return;
-      if (Math.hypot((event.clientX || 0) - press.x, (event.clientY || 0) - press.y) > PRESS_SLOP) tracker.cancel();
+      if (Math.hypot((event.clientX || 0) - press.x, (event.clientY || 0) - press.y) > GESTURE.pressSlopPx) tracker.cancel();
     },
     // True when this press already opened its menu: its click is ignored.
     end(event) {
@@ -1158,6 +1196,7 @@ function createLongPress(onPress) {
   };
   return tracker;
 }
+const PRESS_MENU_SKIP = "button:not(.card):not(.tool-group-toggle):not(.tool-item), input, textarea, select, summary";
 // Long press, right click and the context-menu key open `open(row, point)`;
 // the click a long press leaves behind is swallowed.
 function bindPressMenu(root, rowOf, open, { onDown = null, onMove = null, onUp = null } = {}) {
@@ -1168,7 +1207,8 @@ function bindPressMenu(root, rowOf, open, { onDown = null, onMove = null, onUp =
   });
   root.addEventListener("pointerdown", (event) => {
     onDown?.(event);
-    if (event.target?.closest?.("button:not(.card), input, textarea, select, summary")) return;
+    // Cards and tool records are buttons that also take a long press (their menu).
+    if (event.target?.closest?.(PRESS_MENU_SKIP)) return;
     press.start(event, rowOf(event.target));
   });
   root.addEventListener("pointermove", (event) => {
@@ -1176,8 +1216,10 @@ function bindPressMenu(root, rowOf, open, { onDown = null, onMove = null, onUp =
     if (onMove?.(event)) press.cancel();
   });
   root.addEventListener("pointerup", (event) => {
-    if (press.end(event)) root.pressedAt = Date.now();
-    onUp?.(event, false);
+    // `fired`: this press already opened its menu, so it was not a tap.
+    const fired = press.end(event);
+    if (fired) root.pressedAt = Date.now();
+    onUp?.(event, false, fired);
   });
   root.addEventListener("pointercancel", (event) => {
     press.cancel();
@@ -1275,7 +1317,7 @@ function settleSwipe(row, outcome) {
   setClass(row, "is-swiping", false);
   if (outcome === "open") {
     if (state.swipeOpen && state.swipeOpen !== row) closeSwipe();
-    setSwipeOffset(row, -SWIPE_REVEAL);
+    setSwipeOffset(row, -GESTURE.swipeRevealPx);
     setClass(row, "is-open", true);
     state.swipeOpen = row;
     haptic("select");
@@ -1324,7 +1366,7 @@ function bindCardGestures(root) {
       drag = null;
       if (!row || event.pointerType === "mouse" || event.target?.closest?.(".card-swipe-action")) return;
       drag = { row, id: event.pointerId, x: event.clientX, y: event.clientY, intent: null, offset: 0,
-        base: state.swipeOpen === row ? -SWIPE_REVEAL : 0, samples: [[Date.now(), event.clientX]] };
+        base: state.swipeOpen === row ? -GESTURE.swipeRevealPx : 0, samples: [[Date.now(), event.clientX]] };
     },
     // Returns true once the drag is a swipe, which ends the long press.
     onMove(event) {
@@ -1494,6 +1536,13 @@ async function loadDetail(s, fresh = false) {
   const viewCurrent = () => run === state.detailRun && authEpoch === state.authEpoch &&
     state.authenticated && state.selected === s.key && conversationIdentity(selectedSession()) === identity &&
     stateEpoch === entry.stateEpoch;
+  if (claudeWithoutId(s) && !s.sessionId) {
+    // Nothing to read yet: one notice, no request that can only fail.
+    renderMessages(s, [], "", fresh);
+    conversationSyncNotice(s, "");
+    updateChatComposer(entry);
+    return;
+  }
   const cached = entry.conversation;
   const usableCache = cached && cached.authEpoch === authEpoch && cached.identity === identity;
   if (usableCache) {
@@ -1579,15 +1628,21 @@ function drawDetail(s) {
   bindMessageGestures(list);
   // The folded one-line header unfolds when tapped (the back button keeps its job).
   head.addEventListener("click", (event) => {
-    if (pane.classList?.contains?.("is-reading") && !event.target?.closest?.(".back")) setReading(false);
+    if (!state.chromeVisible && !event.target?.closest?.(".back")) setChromeVisible(true, { stickBottom: messagesAtEnd(list) });
   });
+  state.chromeVisible = true;
   pane.classList?.remove("is-reading");
   pane.classList?.remove("is-typing");
+  // Shown once, the first time scrolling hides the bars on a phone.
+  const hint = el("p", "tap-hint", "화면을 탭하면 메뉴가 나타나요");
+  hint.id = "tap-hint";
+  hint.hidden = true;
+  hint.setAttribute("role", "status");
   const prompt = el("section", "chat-prompt");
   prompt.id = "chat-prompt";
   prompt.hidden = true;
   prompt.setAttribute("aria-live", "polite");
-  pane.append(bar, sync, list, jump, prompt, buildChatComposer(s), buildContinuePanel(s));
+  pane.append(bar, sync, list, jump, hint, prompt, buildChatComposer(s), buildContinuePanel(s));
 }
 // Questions and approvals drawn by the CLI in the board's terminal, answered
 // here with the same keys a person would press. Nothing is sent until the
@@ -1603,12 +1658,19 @@ function renderPrompt(s, data) {
   if (!prompt && !openable) {
     card.hidden = true;
     card.dataset.fingerprint = "";
+    card.dataset.question = "";
     entry.promptChoice = null;
     return;
   }
   const revision = prompt ? `${prompt.fingerprint}|${prompt.current}|${entry.promptChoice?.number || ""}|${entry.promptBusy ? 1 : 0}`
     : `open|${entry.promptBusy ? 1 : 0}`;
+  // A question that just appeared (or a different one) must not be missed:
+  // the bars come back. Re-renders of the same question leave them alone.
+  const question = prompt ? prompt.fingerprint : "open";
+  const appeared = card.hidden || card.dataset.question !== question;
   card.hidden = false;
+  card.dataset.question = question;
+  if (appeared) revealChrome();
   if (card.dataset.fingerprint === revision) return;
   card.dataset.fingerprint = revision;
   if (entry.promptChoice && entry.promptChoice.fingerprint !== prompt?.fingerprint) entry.promptChoice = null;
@@ -1711,8 +1773,71 @@ async function promptAction(s, body) {
     }
   }
 }
-// While reading back through a conversation the header and composer chrome
-// fold away; returning to the newest message or the input restores them.
+// --- Conversation bars (header and composer tools, "chrome") ------------------
+// Reading and typing are different intents, so they are separate states:
+// state.chromeVisible is the reader's choice, "is-typing" the input's own
+// folded layout. Phones (coarse pointer): scrolling either way hides the bars,
+// reaching the end does not bring them back, and a tap on the conversation
+// shows or hides them; a new question, a send result or a connection problem
+// shows them. Mouse layouts keep the older rule: an upward read hides them and
+// the newest message restores them.
+const CHROME_TAP_IGNORE = "a, button, input, textarea, select, label, summary, [role=button], " +
+  ".msg-more, .message-block-copy, .message-code-toggle, .chat-prompt, .msg-attachment, .chat-attachment, img, video";
+const TAP_HINT_MS = 2500;
+function chatTyping() {
+  return document.activeElement?.id === "chat-input";
+}
+function messagesAtEnd(list, slack = 50) {
+  return !!list && list.scrollHeight - list.scrollTop - list.clientHeight < slack;
+}
+// Applies the reader's choice; while a phone is typing it waits for the blur.
+function setChromeVisible(visible, { stickBottom = false } = {}) {
+  state.chromeVisible = !!visible;
+  if (chatTyping() && touchDevice()) return;
+  setReading(!visible, { stickBottom });
+}
+function toggleChrome() {
+  const hint = $("tap-hint");
+  if (hint && !hint.hidden) hint.hidden = true;
+  setChromeVisible(!state.chromeVisible, { stickBottom: messagesAtEnd($("messages")) });
+}
+// Something the reader must not miss shows the bars on phones; mouse layouts
+// are left as they were.
+function revealChrome() {
+  if (state.chromeVisible || !touchDevice()) return;
+  setChromeVisible(true, { stickBottom: messagesAtEnd($("messages")) });
+}
+// Whether a finger's down → up toggles the bars: short and still, not on a
+// control (which keeps its own tap), no text selected, no long-press menu.
+function isChromeTap(down, up, { now = Date.now(), fired = false } = {}) {
+  if (!down || !up || fired || up.pointerId !== down.id) return false;
+  const dx = (Number.isFinite(up.clientX) ? up.clientX : down.x) - down.x;
+  const dy = (Number.isFinite(up.clientY) ? up.clientY : down.y) - down.y;
+  if (Math.hypot(dx, dy) > GESTURE.tapSlopPx || now - down.at > GESTURE.tapMaxMs) return false;
+  if (down.target?.closest?.(CHROME_TAP_IGNORE)) return false;
+  const selection = window.getSelection?.();
+  return !(selection && selection.isCollapsed === false);
+}
+function showTapHint() {
+  if (state.tapHintShown || prefs.get("tapHint", false) === true) return;
+  state.tapHintShown = true;
+  prefs.set("tapHint", true);
+  const hint = $("tap-hint");
+  if (!hint) return;
+  const list = $("messages");
+  if (hint.style && Number.isFinite(list?.offsetTop)) hint.style.top = `${list.offsetTop + 12}px`;
+  hint.hidden = false;
+  clearTimeout(state.tapHintTimer);
+  state.tapHintTimer = setTimeout(() => { hint.hidden = true; }, TAP_HINT_MS);
+}
+// The board's own scroll of the conversation (new messages, layout changes):
+// the next scroll event sees no travel, so it never hides the bars.
+function setMessagesScroll(list, top) {
+  list.scrollTop = top;
+  list.lastScrollTop = list.scrollTop;
+}
+// The class mirror of state.chromeVisible (and of the input's focus):
+// "is-reading" folds the header and the composer tools.
 function setReading(reading, { stickBottom = false } = {}) {
   const pane = $("detail");
   if (!pane?.classList || pane.classList.contains?.("is-reading") === reading) return;
@@ -1738,10 +1863,10 @@ function setTyping(typing) {
   const pane = $("detail");
   if (!pane?.classList || !!pane.classList.contains?.("is-typing") === typing) return;
   const list = $("messages");
-  const atBottom = !!list && list.scrollHeight - list.scrollTop - list.clientHeight < 50;
+  const atBottom = messagesAtEnd(list);
   if (typing) pane.classList.add("is-typing");
   else pane.classList.remove("is-typing");
-  if (list && atBottom) list.scrollTop = list.scrollHeight;
+  if (list && atBottom) setMessagesScroll(list, list.scrollHeight);
   renderJump();
 }
 function readingScroll(list) {
@@ -1749,31 +1874,58 @@ function readingScroll(list) {
   const previous = list.lastScrollTop ?? top;
   list.lastScrollTop = top;
   // While typing, the chrome is already folded (setTyping) and stays put.
-  const typing = document.activeElement?.id === "chat-input";
-  if (list.scrollHeight - top - list.clientHeight < 24) {
+  const typing = chatTyping();
+  if (touchDevice()) phoneReadingScroll(list, top - previous, typing);
+  else if (list.scrollHeight - top - list.clientHeight < GESTURE.readingBottomPx) {
     list.upTravel = 0;
     list.unread = 0;
-    if (!typing) setReading(false, { stickBottom: true });
+    if (!typing) setChromeVisible(true, { stickBottom: true });
   } else if (!typing) {
     // A deliberate upward read folds the chrome; a small wobble does not.
     list.upTravel = top < previous ? (list.upTravel || 0) + previous - top : 0;
-    if (list.upTravel > 32) setReading(true);
+    if (list.upTravel > GESTURE.readingHideTravelPx) setChromeVisible(false);
   }
   renderJump();
+}
+// Phones: a deliberate scroll either way hides the bars; only a tap (or
+// something that needs attention) shows them again, even at the end.
+function phoneReadingScroll(list, delta, typing) {
+  if (messagesAtEnd(list, GESTURE.readingBottomPx)) list.unread = 0;
+  const height = list.clientHeight;
+  const resized = Number.isFinite(list.lastClientHeight) && list.lastClientHeight !== height;
+  list.lastClientHeight = height;
+  if (!delta) return;
+  list.lastScrollAt = Date.now();
+  // A keyboard, the bars themselves, a growing composer or the board's smooth
+  // "맨 아래" also move the list: that is not reading.
+  if (typing || resized || Date.now() < (list.autoScrollUntil || 0)) {
+    list.travel = 0;
+    return;
+  }
+  const direction = Math.sign(delta);
+  list.travel = direction === list.travelDirection ? (list.travel || 0) + Math.abs(delta) : Math.abs(delta);
+  list.travelDirection = direction;
+  if (list.travel <= GESTURE.readingHideTravelPx || !state.chromeVisible) return;
+  list.travel = 0;
+  setChromeVisible(false);
+  showTapHint();
 }
 function scrollMessagesToEnd() {
   const list = $("messages");
   if (!list) return;
   list.unread = 0;
-  if (typeof list.scrollTo === "function") list.scrollTo({ top: list.scrollHeight, behavior: "smooth" });
-  else list.scrollTop = list.scrollHeight;
+  if (typeof list.scrollTo === "function") {
+    // The smooth scroll's own events do not hide the bars; a touch ends this.
+    list.autoScrollUntil = Date.now() + 1000;
+    list.scrollTo({ top: list.scrollHeight, behavior: "smooth" });
+  } else setMessagesScroll(list, list.scrollHeight);
   renderJump();
 }
 function renderJump() {
   const list = $("messages");
   const jump = $("jump-bottom");
   if (!list || !jump) return;
-  const far = list.scrollHeight - list.scrollTop - list.clientHeight > 160;
+  const far = list.scrollHeight - list.scrollTop - list.clientHeight > GESTURE.jumpShowPx;
   const unread = list.unread || 0;
   jump.hidden = !far && !unread;
   const label = unread ? `↓ 새 메시지 ${unread}` : "↓";
@@ -1905,6 +2057,10 @@ function chatSupported(entry) {
   return entry.data?.capability?.supported === true &&
     chatKey(entry.data.route || {}) === chatKey(entry.source);
 }
+// The server's capability says sending needs a board terminal the user opens.
+function terminalRequired(entry) {
+  return entry.data?.capability?.action === "open_terminal" && chatKey(entry.data.route || {}) === chatKey(entry.source);
+}
 function chatAttachmentsSupported(entry) {
   return !!entry.data && chatKey(entry.data.route || {}) === chatKey(entry.source) &&
     entry.data.phase !== "unavailable" && entry.data.capability?.attachments !== false;
@@ -1927,6 +2083,17 @@ function buildChatComposer(s) {
   status.id = "chat-status";
   status.setAttribute("role", "status");
   status.setAttribute("aria-live", "polite");
+  // A Claude background session takes input only through a board terminal; the
+  // board never opens one by itself, so the user opens it here (the same plan
+  // flow as "터미널·승인") and sends after coming back.
+  const gate = el("div", "chat-terminal-gate");
+  gate.id = "chat-terminal-gate";
+  gate.hidden = true;
+  const gateText = el("span", "chat-terminal-gate-text");
+  gateText.id = "chat-terminal-gate-text";
+  const openTerminal = button("터미널 열기", "primary", () => { if (editorCurrent()) openChatTerminal(s); });
+  openTerminal.id = "chat-open-terminal";
+  gate.append(gateText, openTerminal);
   const evidence = el("div", "chat-delivery-evidence");
   evidence.id = "chat-delivery-evidence";
   evidence.hidden = true;
@@ -1949,11 +2116,17 @@ function buildChatComposer(s) {
     entry.revision++;
     updateChatComposer(entry);
   });
+  // Phones fold the bars for typing and return to the reader's choice on blur
+  // (hidden stays hidden); mouse layouts show them for the input, as before.
   input.addEventListener("focus", () => {
+    if (!touchDevice()) state.chromeVisible = true;
     setReading(false);
     setTyping(touchDevice());
   });
-  input.addEventListener("blur", () => setTyping(false));
+  input.addEventListener("blur", () => {
+    setTyping(false);
+    if (!state.chromeVisible) setReading(true, { stickBottom: messagesAtEnd($("messages")) });
+  });
   input.addEventListener("compositionstart", () => {
     if (!editorCurrent()) return;
     entry.composing = true;
@@ -2068,7 +2241,7 @@ function buildChatComposer(s) {
   actions.append(attach, expand, terminal, tools);
   const main = el("div", "chat-main");
   main.append(input, send);
-  box.append(heading, status, evidence, attachmentsLabel, attachments, main, files, actions, hint);
+  box.append(heading, status, gate, evidence, attachmentsLabel, attachments, main, files, actions, hint);
   queueMicrotask(() => {
     if (!editorCurrent()) return;
     updateChatComposer(entry);
@@ -2104,7 +2277,7 @@ function resizeChatInput(entry) {
   const toggle = $("chat-expand");
   toggle.textContent = height > base + 1 || entry.expanded ? "접기" : "펼치기";
   toggle.setAttribute("aria-expanded", String(height > base + 1 || entry.expanded));
-  if (atBottom) list.scrollTop = list.scrollHeight;
+  if (atBottom) setMessagesScroll(list, list.scrollHeight);
 }
 // While a send is in flight or unconfirmed, its text already shows as the
 // bubble; the editor keeps it (a rejected send leaves it there) but hides it.
@@ -2155,7 +2328,14 @@ function updateChatComposer(entry) {
   setClass($("chat-composer"), "is-sent-draft", sentDraftHidden(entry));
   const offline = networkOffline();
   const blocked = offline || !supported || entry.sending || !!entry.pending || !!entry.uploads;
-  $("chat-input").disabled = !supported || entry.sending || !!entry.pending;
+  // No board terminal yet (Claude background): the draft can be written now and
+  // sent once the user opened the terminal from the gate.
+  const gateOn = !supported && terminalRequired(entry);
+  const gateReason = entry.data?.capability?.reason || "보내려면 먼저 터미널을 여세요.";
+  $("chat-terminal-gate").hidden = !gateOn;
+  $("chat-terminal-gate-text").textContent = gateOn ? gateReason : "";
+  $("chat-open-terminal").disabled = offline || state.launchBusy;
+  $("chat-input").disabled = (!supported && !gateOn) || entry.sending || !!entry.pending;
   $("chat-attach").disabled = offline || !chatAttachmentsSupported(entry) || entry.sending || !!entry.pending || !!entry.uploads;
   $("chat-clipboard").disabled = $("chat-attach").disabled;
   $("chat-send").disabled = blocked || entry.composing || (!entry.text.trim() && !entry.attachments.length);
@@ -2171,10 +2351,13 @@ function updateChatComposer(entry) {
   const phase = entry.data?.phase;
   const phaseCopy = phase === "working" ? "작업 중 · 지금 보내도 CLI가 이어서 반영합니다." : phase === "needs_input" ? (entry.data?.prompt ? "답변·승인 필요 · 위 카드에서 답해 주세요." : "답변·승인 필요 · 터미널에서 처리해 주세요.") : entry.expanded ? "위의 실제 세션에 메시지를 전달합니다." : "";
   const budgetNote = state.chatPollCount >= CHAT_POLL_MAX ? " 자동 상태 확인을 잠시 멈췄습니다. 상태 다시 확인을 눌러 주세요." : "";
-  const unsupportedCopy = !supported && entry.attachments.length
+  // The gate itself says what to do; the status line only adds that a refused
+  // message was not sent.
+  const unsupportedCopy = gateOn ? (entry.receipt?.dispatchState === "not_started"
+    ? "메시지는 전송되지 않았습니다. 초안과 첨부는 유지됩니다." : "") : !supported && entry.attachments.length
     ? "첨부는 이 작업 폴더에 저장됐습니다. 첨부의 ‘경로’를 복사해 터미널에 붙여넣으세요."
     : entry.data?.capability?.reason || "직접 입력을 지원하지 않습니다. 터미널을 사용해 주세요.";
-  $("chat-status").textContent = (offline ? "오프라인입니다. 초안은 유지됩니다. 연결 후 상태를 확인하고 보내 주세요." : entry.error || entry.notice || (entry.uploads ? `첨부 ${entry.uploads}개를 올리고 있습니다…` : !entry.data ? "메시지 전송 환경을 확인하고 있습니다…" : !supported ? unsupportedCopy : chatReceiptCopy(entry.receipt) || phaseCopy)) + budgetNote;
+  $("chat-status").textContent = (offline ? "오프라인입니다. 초안은 유지됩니다. 연결 후 상태를 확인하고 보내 주세요." : entry.error || entry.notice || (entry.uploads ? `첨부 ${entry.uploads}개를 올리고 있습니다…` : !entry.data ? (claudeWithoutId(selectedSession()) ? CLAUDE_NO_SEND : "메시지 전송 환경을 확인하고 있습니다…") : !supported ? unsupportedCopy : chatReceiptCopy(entry.receipt) || phaseCopy)) + budgetNote;
   const deliveryVisible = updateChatDeliveryEvidence(entry);
   const chips = $("chat-attachments");
   // While a bubble resends its own message, another draft's files stay as they are.
@@ -2360,6 +2543,8 @@ function applyChatReceipt(entry, receipt) {
 async function loadChatState(s, manual = false, { join = false } = {}) {
   const entry = chatEntry(s);
   if (!currentChat(entry) || !chatVisible() || networkOffline()) return;
+  // Without an id the session has no chat state; its transcript (if named) is read directly.
+  if (claudeWithoutId(s)) return { status: "skipped" };
   const identity = conversationIdentity(s);
   if (entry.checking) {
     if (join) {
@@ -2416,7 +2601,11 @@ async function loadChatState(s, manual = false, { join = false } = {}) {
     if (!err.unauthorized && !err.staleAuth && epoch === entry.stateEpoch &&
         currentChat(entry) && conversationIdentity(selectedSession()) === identity)
       conversationSyncNotice(s, "failed");
-    if (!err.unauthorized && !err.staleAuth && epoch === entry.stateEpoch) entry.error = `${err.message} 상태 다시 확인을 눌러 주세요.`;
+    if (!err.unauthorized && !err.staleAuth && epoch === entry.stateEpoch) {
+      // A connection problem that just started shows the bars (its notice is in them).
+      if (!entry.error && currentChat(entry)) revealChrome();
+      entry.error = `${err.message} 상태 다시 확인을 눌러 주세요.`;
+    }
     // A transient failure keeps following the session with the same backoff.
     if (currentChat(entry) && pollRun === state.chatPollRun && !err.unauthorized && !err.staleAuth)
       scheduleChatPoll(s, entry);
@@ -2485,6 +2674,10 @@ async function sendChat(entry, message = null) {
         applyChatReceipt(entry, { requestId: pending.requestId, status: "failed", confirmed: false,
           dispatchState: "not_started", reason: err.message });
         entry.error = `${err.message} 메시지는 전송되지 않았습니다. 초안과 첨부는 유지됩니다.`;
+        // The terminal closed since the last read: offer the button at once
+        // (the read that follows says the same).
+        if (err.code === "terminal_required" && entry.data)
+          entry.data = { ...entry.data, capability: { ...(entry.data.capability || {}), supported: false, action: "open_terminal" } };
         if (err.code === "csrf_expired") {
           try {
             // Refresh credentials once; keep the current editor mounted and
@@ -2513,6 +2706,8 @@ async function sendChat(entry, message = null) {
     else if (entry.pending?.requestId === pending.requestId) markOutbox(entry, pending.requestId, { status: "unknown" });
     updateChatComposer(entry);
     refreshConversationView(entry);
+    // The result (sent, refused or unknown) is read in the composer's status.
+    if (currentChat(entry)) revealChrome();
     const s = selectedSession();
     if (currentChat(entry) && s) { state.chatPollCount = 0; loadChatState(s, true); }
   }
@@ -2717,7 +2912,8 @@ function outboxRows(list, entry) {
   for (const key of [...list.outboxNodes.keys()]) if (!keep.has(key)) list.outboxNodes.delete(key);
   return rows;
 }
-// "··· 작업 중" at the end of a conversation whose agent is working.
+// "··· 작업 중 · 12분 34초" at the end of a conversation whose agent is
+// working, counted from the server's workingSince (epoch seconds).
 function workingRow(list) {
   if (list.workingRow) return list.workingRow;
   const row = el("article", "msg assistant msg-working");
@@ -2726,10 +2922,54 @@ function workingRow(list) {
   const dots = el("span", "working-dots");
   dots.setAttribute("aria-hidden", "true");
   dots.append(el("i"), el("i"), el("i"));
-  bubble.append(dots, el("span", "working-label", "작업 중"));
+  // The ticking time is not announced every second; the status is.
+  row.workingTime = el("span", "working-time");
+  row.workingTime.setAttribute("aria-live", "off");
+  const label = el("span", "working-label", "작업 중");
+  label.append(row.workingTime);
+  bubble.append(dots, label);
   row.append(bubble);
   list.workingRow = row;
   return row;
+}
+// Under an hour minutes and seconds ("12분 34초"), then hours and minutes.
+function formatElapsed(seconds) {
+  const total = Math.max(0, Math.floor(Number(seconds) || 0));
+  if (total < 60) return `${total}초`;
+  if (total < 3600) return `${Math.floor(total / 60)}분 ${total % 60}초`;
+  const minutes = Math.floor((total % 3600) / 60);
+  return `${Math.floor(total / 3600)}시간${minutes ? ` ${minutes}분` : ""}`;
+}
+function workingElapsedText(since, now = Date.now()) {
+  return Number.isFinite(since) && since > 0 ? ` · ${formatElapsed(now / 1000 - since)}` : "";
+}
+function stopWorkingClock() {
+  clearTimeout(state.workingTimer);
+  state.workingTimer = null;
+}
+// Updates the shown working time, then once a second while the page is
+// visible (visibilitychange stops and restarts it). Reduced motion stops only
+// the dots; the time keeps counting.
+function tickWorking() {
+  stopWorkingClock();
+  const list = $("messages");
+  const row = list?.workingRow;
+  if (!row || ![...(list.children || [])].includes(row)) return;
+  const text = workingElapsedText(list.workingSince);
+  if (row.workingTime.textContent !== text) row.workingTime.textContent = text;
+  // Claude records no turn start: its time counts from the newest prompt.
+  row.title = text && list.workingApprox ? "마지막 요청부터 잰 시간입니다." : "";
+  if (!text || document.hidden) return;
+  state.workingTimer = setTimeout(tickWorking, 1000 - (Date.now() % 1000) + 20);
+}
+// `claude agents` can list a working interactive session without an id (and
+// then often without its transcript's session id too): the board can neither
+// send to it nor, without a session id, read it.
+const CLAUDE_UNREADABLE = "이 Claude 세션은 아직 대화 기록 ID를 알 수 없어 여기서 읽을 수 없습니다. " +
+  "잠시 뒤 다시 열거나 터미널에서 확인해 주세요.";
+const CLAUDE_NO_SEND = "이 Claude 세션은 세션 ID가 없어 여기서 보낼 수 없습니다. 터미널에서 이어가 주세요.";
+function claudeWithoutId(s) {
+  return s?.agent === "claude" && !s.nativeSource && !s.id;
 }
 // Re-renders the open conversation from what is already on screen (new
 // bubble states, the working indicator), optionally scrolling to the end.
@@ -2963,6 +3203,145 @@ function openNativeChat(terminal) {
   if (state.terminalVisible) returnToBoard({ selectLaunchedSource: false });
   select(key);
 }
+// --- Tool records: consecutive tool rows fold into one line -----------------
+// "도구 실행 7개 · 명령 4 · 파일 수정 2" opens to one line per record, and a
+// record opens once more to its full text. Groups and records are reused
+// across reads, so what is open stays open while a turn adds records.
+const TOOL_KIND_LABELS = { command: "명령", edit: "파일 수정", read: "파일 읽기", search: "검색",
+  mcp: "MCP", agent: "에이전트", other: "기타" };
+const CLAUDE_TOOL_KINDS = { Bash: "command", BashOutput: "command", KillShell: "command", KillBash: "command",
+  Edit: "edit", MultiEdit: "edit", Write: "edit", NotebookEdit: "edit", Read: "read", NotebookRead: "read",
+  Grep: "search", Glob: "search", LS: "search", WebSearch: "search", WebFetch: "search", ToolSearch: "search",
+  Task: "agent", Agent: "agent" };
+// The collector names each record's kind (toolKind); a read without it is
+// told apart by the text the collector writes ("$ …", "파일 수정 · …", "Bash · …").
+function toolKindOf(message) {
+  if (Object.prototype.hasOwnProperty.call(TOOL_KIND_LABELS, message?.toolKind)) return message.toolKind;
+  const text = String(message?.text || "");
+  if (text.startsWith("$ ")) return "command";
+  if (text.startsWith("파일 수정")) return "edit";
+  if (text.startsWith("웹 검색")) return "search";
+  const name = text.split(" · ")[0].trim();
+  if (name.startsWith("mcp__")) return "mcp";
+  return CLAUDE_TOOL_KINDS[name] || "other";
+}
+function toolItemNode(message) {
+  const node = button("", "tool-item", () => {
+    node.full = !node.full;
+    setClass(node, "is-full", node.full);
+    node.setAttribute("aria-expanded", String(node.full));
+  });
+  node.setAttribute("aria-expanded", "false");
+  node.append(el("span", "tool-item-text", String(message.text || "")));
+  return node;
+}
+function toolGroupTitle(items) {
+  return `도구 실행 ${items.length}개`;
+}
+function toolGroupKinds(items) {
+  const counts = new Map();
+  for (const item of items) counts.set(item.kind, (counts.get(item.kind) || 0) + 1);
+  const order = Object.keys(TOOL_KIND_LABELS);
+  return [...counts].sort((a, b) => b[1] - a[1] || order.indexOf(a[0]) - order.indexOf(b[0]))
+    .map(([kind, count]) => `${TOOL_KIND_LABELS[kind] || TOOL_KIND_LABELS.other} ${count}`).join(" · ");
+}
+function setToolGroupOpen(row, open) {
+  row.open = !!open;
+  setClass(row, "is-open", row.open);
+  row.toolToggle.setAttribute("aria-expanded", String(row.open));
+  row.toolList.hidden = !row.open;
+}
+function toolGroupNode() {
+  const row = el("article", "msg tool tool-group");
+  const toggle = button("", "tool-group-toggle", () => setToolGroupOpen(row, !row.open));
+  const icon = el("span", "tool-group-icon");
+  icon.setAttribute("aria-hidden", "true");
+  const chevron = el("span", "tool-group-chevron");
+  chevron.setAttribute("aria-hidden", "true");
+  row.toolTitle = el("span", "tool-group-title");
+  row.toolKinds = el("span", "tool-group-kinds");
+  toggle.append(icon, row.toolTitle, row.toolKinds, chevron);
+  row.toolToggle = toggle;
+  row.toolList = el("div", "tool-group-list");
+  row.append(toggle, row.toolList);
+  setToolGroupOpen(row, false);
+  // The long-press menu copies every record of the group.
+  row.messageItem = { key: "", message: { role: "tool", text: "", ts: null }, row, role: "tool", truncated: false,
+    group: true, items: [] };
+  const more = button("", "msg-more", () => openMessageMenu(row));
+  more.setAttribute("aria-label", "도구 실행 기록 메뉴");
+  more.setAttribute("aria-haspopup", "dialog");
+  more.title = "도구 실행 기록 메뉴";
+  row.moreButton = more;
+  row.append(more);
+  return row;
+}
+function updateToolGroup(row, items) {
+  const title = toolGroupTitle(items);
+  const kinds = toolGroupKinds(items);
+  if (row.toolTitle.textContent !== title) row.toolTitle.textContent = title;
+  if (row.toolKinds.textContent !== `· ${kinds}`) row.toolKinds.textContent = `· ${kinds}`;
+  row.toolToggle.setAttribute("aria-label", `${title}, ${kinds}`);
+  // Records already shown stay mounted, so their own open state survives.
+  const nodes = items.map((item) => item.row);
+  const box = row.toolList;
+  for (const child of [...box.children]) if (!nodes.includes(child)) box.removeChild(child);
+  nodes.forEach((node, index) => {
+    if (box.children[index] !== node) box.insertBefore(node, box.children[index] || null);
+  });
+  Object.assign(row.messageItem, { key: items[0].key, items, message: { role: "tool",
+    text: items.map((item) => item.message.text || "").join("\n"), ts: items[0].message.ts ?? null } });
+}
+// The conversation's rows with each run of tool records as one group. A group
+// belongs to its first record (the same object while later records join it).
+function toolGroupRows(list, rows) {
+  const desired = [];
+  for (let index = 0; index < rows.length;) {
+    if (rows[index].role !== "tool") { desired.push(rows[index++].row); continue; }
+    const items = [];
+    while (index < rows.length && rows[index].role === "tool") items.push(rows[index++]);
+    items[0].toolGroup ||= toolGroupNode();
+    updateToolGroup(items[0].toolGroup, items);
+    desired.push(items[0].toolGroup);
+  }
+  return desired;
+}
+// What a user bubble shows: the board's own "첨부 파일: <경로>" lines (added
+// when it sends files) become chips named by the file, and "[이미지 첨부]"
+// alone is left out when chips say it. No attachment path is drawn.
+const ATTACHMENT_PATH_LINE = /^첨부 파일: (.+)$/;
+const IMAGE_NAME = /\.(png|jpe?g|gif|webp|heic|heif|bmp|svg)$/i;
+function userMessageParts(message) {
+  const text = String(message?.text || "");
+  const chips = attachmentMetadata(message?.attachments);
+  const lines = text.split("\n");
+  const names = [];
+  while (lines.length) {
+    const match = lines[lines.length - 1].trim().match(ATTACHMENT_PATH_LINE);
+    if (!match) break;
+    let path = match[1].trim();
+    if (path.startsWith('"')) {
+      try { path = String(JSON.parse(path)); } catch { path = path.replace(/^"|"$/g, ""); }
+    }
+    // Only the board's attachment store; a typed "첨부 파일: …" line stays text.
+    if (!path.includes("/.sessionholic-attachments/")) break;
+    names.unshift(path.slice(path.lastIndexOf("/") + 1) || "첨부파일");
+    lines.pop();
+  }
+  for (const name of names) {
+    if (chips.some((file) => file.name === name)) continue;
+    const kind = IMAGE_NAME.test(name) ? "image" : "file";
+    const chip = { id: null, name, type: "", size: null, kind, source: "sessionholic" };
+    // A transcript chip that could not name its file takes the name from the path.
+    const unnamed = chips.findIndex((file) => file.source === "native" && file.kind === kind &&
+      GENERIC_ATTACHMENT_NAMES.has(String(file.name).trim().toLowerCase()));
+    if (unnamed >= 0) chips[unnamed] = chip;
+    else chips.push(chip);
+  }
+  let body = names.length ? lines.join("\n").replace(/\s+$/, "") : text;
+  if (chips.length && OUTBOX_ATTACHMENT_ONLY.has(body.trim())) body = "";
+  return { body, attachments: chips };
+}
 function renderMessages(s, messages, error = "", fresh = false) {
   const list = $("messages");
   if (!list) return;
@@ -2992,33 +3371,30 @@ function renderMessages(s, messages, error = "", fresh = false) {
     const retained = available.get(key)?.shift();
     if (retained) return retained;
     const role = ["user", "assistant", "tool", "system"].includes(message.role) ? message.role : "system";
+    // A tool record is one line of its group (toolGroupNode), not a row of its own.
+    if (role === "tool") return { key, message, row: toolItemNode(message), role, truncated: false, kind: toolKindOf(message) };
     const row = el("article", `msg ${role}`);
-    if (role === "tool") {
-      const more = el("details");
-      more.append(el("summary", null, "도구 실행 기록"), el("div", "bubble", message.text));
-      row.append(more);
-    } else {
-      if (role !== "system") {
-        const label = el("div", "msg-label");
-        label.append(el("strong", null, role === "user" ? "나" : AGENTS[s.agent] || "에이전트"));
-        if (message.ts) label.append(el("span", null, clock(message.ts)));
-        row.append(label);
-        row.msgLabel = label;
-      }
-      const bubble = el("div", "bubble");
-      if (role === "assistant" && typeof MessageFormat !== "undefined") {
-        MessageFormat.render(bubble, message.text || "", {
-          onCopy: (text) => copyText(text, "코드를 복사했습니다."),
-        });
-      } else {
-        const text = message.text || "";
-        if (role === "user" && attachments.length) {
-          if (text) bubble.append(el("span", "msg-body", text));
-          bubble.append(attachmentGroup(attachments, `첨부 ${attachments.length}개`, { showCaption: false }));
-        } else bubble.textContent = text;
-      }
-      row.append(bubble);
+    if (role !== "system") {
+      const label = el("div", "msg-label");
+      label.append(el("strong", null, role === "user" ? "나" : AGENTS[s.agent] || "에이전트"));
+      if (message.ts) label.append(el("span", null, clock(message.ts)));
+      row.append(label);
+      row.msgLabel = label;
     }
+    const bubble = el("div", "bubble");
+    if (role === "assistant" && typeof MessageFormat !== "undefined") {
+      MessageFormat.render(bubble, message.text || "", {
+        onCopy: (text) => copyText(text, "코드를 복사했습니다."),
+      });
+    } else if (role === "user") {
+      // The board's own "첨부 파일: <경로>" lines become chips, never paths.
+      const shown = userMessageParts(message);
+      if (shown.attachments.length) {
+        if (shown.body) bubble.append(el("span", "msg-body", shown.body));
+        bubble.append(attachmentGroup(shown.attachments, `첨부 ${shown.attachments.length}개`, { showCaption: false }));
+      } else bubble.textContent = shown.body;
+    } else bubble.textContent = message.text || "";
+    row.append(bubble);
     // The server keeps at most 4,000 characters per message; say so instead of
     // letting a partial copy pass for the whole answer.
     const truncated = message.truncated === true;
@@ -3041,14 +3417,20 @@ function renderMessages(s, messages, error = "", fresh = false) {
     return item;
   });
   groupMessageRows(rows);
-  const desired = rows.map((item) => item.row);
+  const desired = toolGroupRows(list, rows);
   // This board's own sends that the transcript does not show yet, then the
   // working indicator, always after the transcript.
   let tail = [];
+  let working = false;
   if (entry) {
     settleOutbox(entry, messages);
     tail = outboxRows(list, entry);
-    if (entry.data?.phase === "working" && chatKey(entry.data.route || {}) === source) tail.push(workingRow(list));
+    const live = entry.data && chatKey(entry.data.route || {}) === source ? entry.data : null;
+    // A Claude row without an id is never read; its listed phase still says it works.
+    working = live ? live.phase === "working" : claudeWithoutId(s) && s.phase === "working";
+    list.workingSince = live?.workingSince ?? null;
+    list.workingApprox = live?.workingSinceApprox === true;
+    if (working) tail.push(workingRow(list));
   }
   if (error) {
     if (!list.conversationError || list.conversationErrorText !== error || list.conversationSource !== source) {
@@ -3065,16 +3447,37 @@ function renderMessages(s, messages, error = "", fresh = false) {
   } else {
     list.conversationError = null;
     list.conversationErrorText = "";
-    if (!rows.length && !tail.length) {
+    if (claudeWithoutId(s) && !s.sessionId) {
+      // One explanation instead of a read error here and another in the composer.
+      list.conversationUnreadable ||= el("p", "group-empty conversation-unreadable", CLAUDE_UNREADABLE);
+      desired.unshift(list.conversationUnreadable);
+    } else if (!rows.length && !tail.length) {
       list.conversationEmpty ||= el("p", "group-empty", "저장된 대화를 아직 찾지 못했습니다.");
       desired.push(list.conversationEmpty);
     }
   }
   desired.push(...tail);
+  // While reading back, the first row on screen that stays keeps its place:
+  // rows dropped above it (the server's 80-row window moving during a turn) or
+  // a grown tool group no longer push the text being read up.
+  const keep = new Set(desired);
+  let anchor = null;
+  let anchorOffset = 0;
+  if (!stick) {
+    for (const child of [...list.children]) {
+      if (!keep.has(child)) continue;
+      if (!Number.isFinite(child.offsetTop) || !Number.isFinite(child.offsetHeight)) break;
+      if (child.offsetTop + child.offsetHeight > list.scrollTop) {
+        anchor = child;
+        anchorOffset = child.offsetTop - list.scrollTop;
+        break;
+      }
+    }
+  }
   // Keep unchanged text nodes mounted: mobile selections and expanded tool
   // records survive reads, including new messages appended during a turn.
   for (const child of [...list.children]) {
-    if (!desired.includes(child)) list.removeChild(child);
+    if (!keep.has(child)) list.removeChild(child);
   }
   for (let index = 0; index < desired.length; index++) {
     if (list.children[index] !== desired[index])
@@ -3083,7 +3486,11 @@ function renderMessages(s, messages, error = "", fresh = false) {
   list.conversationSource = source;
   list.conversationRows = rows;
   const warningHeight = error ? list.conversationError.offsetHeight || 0 : 0;
-  list.scrollTop = stick ? list.scrollHeight : scroll + warningHeight - oldWarningHeight;
+  if (stick) setMessagesScroll(list, list.scrollHeight);
+  else if (anchor && Number.isFinite(anchor.offsetTop)) setMessagesScroll(list, anchor.offsetTop - anchorOffset);
+  else setMessagesScroll(list, scroll + warningHeight - oldWarningHeight);
+  if (working) tickWorking();
+  else stopWorkingClock();
   // While reading back, count what arrived below instead of jumping to it.
   if (!stick && previous.length) {
     const added = rows.filter((item) => !previousKeys.has(item.key) && item.message.role !== "tool").length;
@@ -3100,6 +3507,9 @@ function sameSpeaker(a, b) {
   if (!a || !b || a.role !== b.role || !["user", "assistant"].includes(a.role)) return false;
   const first = a.message?.ts;
   const next = b.message?.ts;
+  // A timed row after untimed ones (Codex's final answer after its progress
+  // notes, which have no time of their own) shows its name and time again.
+  if (!Number.isFinite(first) && Number.isFinite(next)) return false;
   return !(Number.isFinite(first) && Number.isFinite(next) && next - first > GROUP_GAP_SECONDS);
 }
 function groupMessageRows(rows) {
@@ -3120,12 +3530,15 @@ async function copyText(text, done) {
 }
 function messagePlainText(item) {
   const text = item?.message?.text || "";
+  if (item?.role === "user") return userMessageParts(item.message).body;
   return item?.role === "assistant" && typeof MessageFormat !== "undefined" ? MessageFormat.plainText(text) : text;
 }
 function messageActions(s, item) {
   const actions = [];
   const text = messagePlainText(item);
-  if (text.trim()) {
+  if (item.group && text.trim()) {
+    actions.push({ label: `도구 기록 ${item.items.length}개 모두 복사`, run: () => copyText(text, "도구 실행 기록을 복사했습니다.") });
+  } else if (text.trim()) {
     actions.push({ label: item.truncated ? "표시된 부분 복사" : "복사", run: () => copyText(text, item.truncated
       ? "표시된 부분만 복사했습니다. 전체 내용은 터미널에서 확인해 주세요." : "메시지 본문을 복사했습니다.") });
   }
@@ -3135,7 +3548,7 @@ function messageActions(s, item) {
     actions.push({ label: code.length > 1 ? `코드 ${code.length}개 모두 복사` : "코드 복사",
       run: () => copyText(code.join("\n"), "코드를 복사했습니다.") });
   }
-  if (text.trim()) actions.push({ label: "텍스트 선택", run: () => selectMessageText(item.row) });
+  if (text.trim() && !item.group) actions.push({ label: "텍스트 선택", run: () => selectMessageText(item.row) });
   if (chatEntry(s).data && !state.launchBusy && (!s.nativeSource || terminalForSession(s)))
     actions.push({ label: "터미널에서 보기", run: () => openChatTerminal(s) });
   return actions;
@@ -3144,8 +3557,8 @@ function openMessageMenu(row, at = null) {
   const item = row?.messageItem;
   const s = selectedSession();
   if (!item || !s || chatKey(sourceOf(s)) !== $("messages")?.conversationSource) return;
-  const speaker = item.role === "user" ? "내 메시지" : item.role === "tool" ? "도구 실행 기록"
-    : `${AGENTS[s.agent] || "에이전트"}의 답변`;
+  const speaker = item.role === "user" ? "내 메시지" : item.group ? toolGroupTitle(item.items)
+    : item.role === "tool" ? "도구 실행 기록" : `${AGENTS[s.agent] || "에이전트"}의 답변`;
   const preview = messagePlainText(item).replace(/\s+/g, " ").trim().slice(0, 140);
   openActionSheet({ eyebrow: item.message.ts ? clock(item.message.ts) : "", title: speaker, preview,
     actions: messageActions(s, item), at, trigger: row.moreButton || null });
@@ -3166,17 +3579,38 @@ function selectMessageText(row) {
     /* the bubble stays selectable by hand */
   }
 }
+// Long press opens a message's menu; on phones a tap on the conversation shows
+// or hides its bars. Both share the list's one set of pointer listeners.
 function bindMessageGestures(list) {
   const rowOf = (target) => {
     const row = target?.closest?.(".msg");
     return row?.messageItem ? row : null;
   };
+  let tap = null;
   bindPressMenu(list, rowOf, openMessageMenu, {
     onDown(event) {
       // A selection made from the menu ends when another message is touched.
       const row = rowOf(event.target);
       for (const item of list.conversationRows || [])
         if (item.row !== row && String(item.row.className || "").includes("is-selecting")) setClass(item.row, "is-selecting", false);
+      // A finger on the list ends the board's own smooth scroll.
+      list.autoScrollUntil = 0;
+      // A touch that stops a moving list only stops it.
+      const settled = Date.now() - (list.lastScrollAt || 0) >= GESTURE.scrollSettleMs;
+      tap = touchDevice() && event.pointerType !== "mouse" && event.isPrimary !== false && settled
+        ? { id: event.pointerId, x: event.clientX, y: event.clientY, at: Date.now(), target: event.target } : null;
+    },
+    onMove(event) {
+      if (tap && event.pointerId === tap.id &&
+          Math.hypot((event.clientX || 0) - tap.x, (event.clientY || 0) - tap.y) > GESTURE.tapSlopPx) tap = null;
+      return false;
+    },
+    onUp(event, cancelled, fired) {
+      const down = tap;
+      tap = null;
+      // While typing, the input's folded layout stays; a scroll ends in pointercancel.
+      if (cancelled || chatTyping() || !isChromeTap(down, event, { fired })) return;
+      toggleChrome();
     },
   });
 }
@@ -3869,10 +4303,8 @@ function bindDraftInput(node) {
 // fonts already on the device are named; no web font is bundled.
 const TERMINAL_FONT = 'ui-monospace, SFMono-Regular, Menlo, Consolas, D2Coding, "D2Coding ligature", ' +
   '"Nanum Gothic Coding", NanumGothicCoding, "Noto Sans Mono CJK KR", "Source Han Mono K", "Sarasa Mono K", monospace';
-const FONT_MIN = 10;
-const FONT_MAX = 24;
 function clampFontSize(size) {
-  return Math.max(FONT_MIN, Math.min(FONT_MAX, Math.round(Number(size) || 14)));
+  return Math.max(GESTURE.pinchMinFont, Math.min(GESTURE.pinchMaxFont, Math.round(Number(size) || 14)));
 }
 // A−/A+ and the pinch share one range and one stored preference.
 function setTerminalFontSize(size, { persist = true } = {}) {
@@ -4385,8 +4817,8 @@ function startTerminalMomentum(velocity) {
     const elapsed = Math.max(1, now - last);
     last = now;
     queueTerminalScroll((-speed * elapsed) / terminalLineHeight());
-    speed *= Math.pow(0.94, elapsed / 16);
-    if (Math.abs(speed) < 0.03 || now - started > 1600 || !state.connected) {
+    speed *= Math.pow(GESTURE.momentumDecay, elapsed / 16);
+    if (Math.abs(speed) < GESTURE.momentumStopSpeed || now - started > GESTURE.momentumMaxMs || !state.connected) {
       state.terminalMomentum = null;
       return;
     }
@@ -4451,7 +4883,7 @@ function bindTerminalTouchScroll(node) {
       const [t0, y0] = recent[0];
       const [t1, y1] = recent[recent.length - 1];
       const velocity = (y1 - y0) / Math.max(1, t1 - t0);
-      if (Math.abs(velocity) > 0.35) startTerminalMomentum(velocity);
+      if (Math.abs(velocity) > GESTURE.momentumMinSpeed) startTerminalMomentum(velocity);
     }
     lastY = null;
     samples = [];
@@ -4781,7 +5213,7 @@ function syncEvents() {
     return;
   }
   const s = selectedSession();
-  const chat = s && chatVisible() ? sourceOf(s) : null;
+  const chat = s && chatVisible() && !claudeWithoutId(s) ? sourceOf(s) : null;
   const key = chat ? chatKey(chat) : "";
   if (state.events?.key === key) return;
   closeEvents();
@@ -4814,7 +5246,7 @@ function syncEvents() {
   source.addEventListener("hello", (event) => {
     if (!current()) return;
     healthy();
-    snapshotAnnounced(parse(event).snapshotVersion);
+    snapshotAnnounced(parse(event).snapshotVersion, { immediate: true });
   });
   source.addEventListener("snapshot", (event) => {
     if (current()) snapshotAnnounced(parse(event).version);
@@ -4843,12 +5275,34 @@ function syncEvents() {
     if (wasHealthy) rescheduleAfterEvents();
   });
 }
-function snapshotAnnounced(version) {
+// A resident collector can announce many versions in a burst: they are read
+// together, at most once per SNAPSHOT_EVENT_BATCH_MS, and only the snapshot
+// (host and account settings come from the regular reads).
+const SNAPSHOT_EVENT_BATCH_MS = 300;
+function snapshotBehind() {
+  return Number.isInteger(state.eventsSnapshotVersion) &&
+    !(Number.isInteger(state.snapshotVersion) && state.eventsSnapshotVersion <= state.snapshotVersion);
+}
+function readAnnouncedSnapshot() {
+  if (!state.authenticated || !snapshotBehind()) return;
+  if (state.pollBusy) state.snapshotPending = true;
+  else poll(false, { capabilities: false });
+}
+// immediate: the stream's one "hello" after connecting is read at once.
+function snapshotAnnounced(version, { immediate = false } = {}) {
   if (!Number.isInteger(version)) return;
   state.eventsSnapshotVersion = Math.max(version, state.eventsSnapshotVersion ?? version);
   if (Number.isInteger(state.snapshotVersion) && version <= state.snapshotVersion) return;
-  if (state.pollBusy) state.snapshotPending = true;
-  else poll(false);
+  if (state.snapshotEventTimer) return;
+  if (immediate) {
+    readAnnouncedSnapshot();
+    return;
+  }
+  const authEpoch = state.authEpoch;
+  state.snapshotEventTimer = setTimeout(() => {
+    state.snapshotEventTimer = null;
+    if (authEpoch === state.authEpoch) readAnnouncedSnapshot();
+  }, SNAPSHOT_EVENT_BATCH_MS);
 }
 function schedule() {
   clearTimeout(state.pollTimer);
@@ -4884,7 +5338,16 @@ async function loadCapabilities(authEpoch = state.authEpoch, { refreshView = tru
   const s = selectedSession();
   if (s && $("route-host")) populateRoute(s);
 }
-async function poll(refresh = false) {
+// What /api/capabilities depends on: each host's reachability (a host that
+// recovers is read again) and the Codex accounts it lists. A resident
+// collector's new snapshot (another fetchedAt) alone never changes it.
+function capabilitiesRevision(snapshot) {
+  return JSON.stringify((snapshot?.hosts || []).map((host) => [host.name, !!host.ok,
+    [...new Set((host.data?.codex || []).map((s) => s.home || ".codex"))].sort()]));
+}
+// capabilities: false (a read announced by a snapshot event) reads the
+// snapshot only; the next regular read catches the capabilities up.
+async function poll(refresh = false, { capabilities = true } = {}) {
   if (networkOffline() || state.loginBusy || state.pollBusy || document.hidden || state.terminalVisible) return;
   const authEpoch = state.authEpoch;
   state.pollBusy = true;
@@ -4900,10 +5363,8 @@ async function poll(refresh = false) {
     $("app").hidden = false;
     notice();
     render();
-    const revision = JSON.stringify(
-      state.snapshot.hosts.map((host) => [host.name, host.ok, host.fetchedAt]),
-    );
-    if (!state.capabilities || state.capabilitiesRevision !== revision) {
+    const revision = capabilitiesRevision(state.snapshot);
+    if (!state.capabilities || (capabilities && state.capabilitiesRevision !== revision)) {
       await loadCapabilities(authEpoch);
       assertAuthEpoch(authEpoch);
       state.capabilitiesRevision = revision;
@@ -4932,11 +5393,11 @@ async function poll(refresh = false) {
   } finally {
     if (authEpoch === state.authEpoch) {
       state.pollBusy = false;
-      // A version announced during this read: read once more if still behind.
+      // A version announced during this read: read once more if still behind
+      // (batched like any other announcement).
       if (state.snapshotPending) {
         state.snapshotPending = false;
-        if (Number.isInteger(state.eventsSnapshotVersion) &&
-            !(state.eventsSnapshotVersion <= state.snapshotVersion)) setTimeout(() => poll(false), 0);
+        if (snapshotBehind()) snapshotAnnounced(state.eventsSnapshotVersion);
       }
     }
   }
@@ -4965,7 +5426,6 @@ async function manualRefresh() {
 // Phones (iOS large title): "작업" scrolls with the list. Once it has passed
 // under the bar, the bar turns translucent (blurred) and shows the small
 // centered title; scrolling back to the top restores the large title.
-const LARGE_TITLE_COLLAPSE = 36;
 function setListCollapsed(collapsed) {
   const body = document.body;
   if (state.listCollapsed === collapsed && body?.classList?.contains?.("list-collapsed") === collapsed) return;
@@ -4975,7 +5435,7 @@ function setListCollapsed(collapsed) {
   else body.classList.remove("list-collapsed");
 }
 function listScroll(pane) {
-  setListCollapsed(phoneLayout() && (pane?.scrollTop || 0) > LARGE_TITLE_COLLAPSE);
+  setListCollapsed(phoneLayout() && (pane?.scrollTop || 0) > GESTURE.largeTitleCollapsePx);
   if (state.swipeOpen) closeSwipe();
 }
 function scrollListToTop() {
@@ -4985,7 +5445,6 @@ function scrollListToTop() {
 }
 // Pull to refresh: the installed app has no browser gesture (overscroll is off),
 // so a downward pull from the top of the list or conversation reloads both.
-const PULL_TRIGGER = 64;
 function scrollParent(node) {
   for (let item = node; item && item !== document.body; item = item.parentElement) {
     const overflow = window.getComputedStyle?.(item)?.overflowY || "";
@@ -4995,7 +5454,7 @@ function scrollParent(node) {
 }
 function pullDistance(pulled) {
   // Elastic: the indicator follows the finger less and less, like a rubber band.
-  return 110 * (1 - Math.exp(-Math.max(0, pulled) / 160));
+  return GESTURE.pullMaxPx * (1 - Math.exp(-Math.max(0, pulled) / GESTURE.pullResistPx));
 }
 function showPull(distance, label = "당겨서 새로고침", ready = false) {
   const indicator = $("pull-refresh");
@@ -5005,13 +5464,13 @@ function showPull(distance, label = "당겨서 새로고침", ready = false) {
   indicator.classList?.toggle?.("is-ready", ready);
   const icon = indicator.querySelector?.(".pull-refresh-icon");
   if (icon?.style && !indicator.classList?.contains?.("is-loading"))
-    icon.style.transform = `rotate(${Math.round(Math.min(1, distance / PULL_TRIGGER) * 180)}deg)`;
+    icon.style.transform = `rotate(${Math.round(Math.min(1, distance / GESTURE.pullTriggerPx) * 180)}deg)`;
   $("pull-refresh-label").textContent = label;
 }
 async function pullRefresh() {
   if (state.pullRefreshing) return;
   state.pullRefreshing = true;
-  showPull(PULL_TRIGGER, "새로고침 중…", true);
+  showPull(GESTURE.pullTriggerPx, "새로고침 중…", true);
   $("pull-refresh")?.classList?.add("is-loading");
   let label = "업데이트됨";
   try {
@@ -5023,7 +5482,7 @@ async function pullRefresh() {
     label = "새로고침하지 못했습니다";
   } finally {
     $("pull-refresh")?.classList?.remove("is-loading");
-    showPull(PULL_TRIGGER, label, false);
+    showPull(GESTURE.pullTriggerPx, label, false);
     $("pull-refresh")?.classList?.add("is-done");
     // A short confirmation, then the indicator slides away.
     await new Promise((resolve) => setTimeout(resolve, 700));
@@ -5052,24 +5511,24 @@ function bindPullToRefresh(root) {
     // card swipe) is never a pull, and a small wobble waits for direction.
     if (distance === 0) {
       const sideways = Math.abs((event.touches[0].clientX || 0) - startX);
-      if (sideways > PRESS_SLOP && sideways >= Math.abs(pulled)) {
+      if (sideways > GESTURE.pressSlopPx && sideways >= Math.abs(pulled)) {
         start = null;
         showPull(0);
         return;
       }
-      if (pulled > 0 && pulled < PRESS_SLOP && sideways > pulled) return;
+      if (pulled > 0 && pulled < GESTURE.pressSlopPx && sideways > pulled) return;
     }
     if (pulled <= 0) { distance = 0; showPull(0); return; }
-    const wasReady = distance >= PULL_TRIGGER;
+    const wasReady = distance >= GESTURE.pullTriggerPx;
     distance = pullDistance(pulled);
-    const ready = distance >= PULL_TRIGGER;
+    const ready = distance >= GESTURE.pullTriggerPx;
     // A light tick when release would refresh (devices without vibration ignore it).
     if (ready && !wasReady) haptic("select");
     showPull(distance, ready ? "놓으면 새로고침" : "당겨서 새로고침", ready);
     if (event.cancelable) event.preventDefault();
   }, { passive: false });
   const finish = () => {
-    if (start !== null && distance >= PULL_TRIGGER) pullRefresh();
+    if (start !== null && distance >= GESTURE.pullTriggerPx) pullRefresh();
     else if (!state.pullRefreshing) showPull(0);
     start = null;
     distance = 0;
@@ -5086,6 +5545,8 @@ function showLogin() {
   $("running-refresh").disabled = false;
   $("login-submit").disabled = false;
   clearTimeout(state.pollTimer);
+  clearTimeout(state.snapshotEventTimer);
+  state.snapshotEventTimer = null;
   stopTerminalReader();
   stopChatPolling();
   // Object URLs of picked images are released with their drafts.
@@ -5174,6 +5635,8 @@ function renderConnectivity() {
   const failing = !offline && (state.pollFailures || 0) >= 2;
   const text = !state.authenticated && !state.snapshot ? ""
     : offline ? "오프라인 · 다시 연결 중" : failing ? "연결 끊김 · 다시 연결 중" : "";
+  // A connection problem that just started shows a conversation's bars.
+  if (text && !$("offline-text").textContent) revealChrome();
   if ($("offline-text").textContent !== text) $("offline-text").textContent = text;
   box.dataset.kind = offline ? "offline" : failing ? "retrying" : "";
   box.hidden = !text || state.terminalVisible;
@@ -5419,6 +5882,9 @@ window.addEventListener("DOMContentLoaded", () => {
   document.addEventListener("visibilitychange", () => {
     clearTimeout(state.pollTimer);
     stopChatPolling();
+    // The working time stops counting while the page is hidden and catches up when shown.
+    if (document.hidden) stopWorkingClock();
+    else tickWorking();
     if (document.hidden) {
       // Live updates stop with the page; a visible page reconnects after its read.
       closeEvents();

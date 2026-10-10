@@ -63,6 +63,13 @@ ASSET_META = re.compile(r'(<meta\b[^>]*?\bname="sessionholic-assets"[^>]*?\bcont
 ASSET_REF = re.compile(r'\b(src|href)="(/[^"?#]*)"')
 # A stalled event-stream reader is dropped after this many seconds of a blocked write.
 STREAM_WRITE_TIMEOUT = 30
+# Board identity of resident watchers: in their shell command and their lock file name.
+BOARD_ID = re.compile(r"^[0-9a-f]{8,32}$")
+# Reads `<byte length>\n<program>` from stdin and runs it; the rest of stdin stays for pings.
+WATCH_LOADER = ('import sys;b=sys.stdin.buffer;n=int(b.readline());'
+                'exec(compile(b.read(n),"<collector>","exec"),{"__name__":"__main__"})')
+# A watcher line (one full snapshot) longer than this ends the stream.
+WATCH_LINE_LIMIT = 16 * 1024 * 1024
 SECURITY_HEADERS = {
     "Content-Security-Policy": "default-src 'self'; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; script-src 'self'; "
                                "connect-src 'self'; manifest-src 'self'; worker-src 'self'; "
@@ -170,25 +177,57 @@ def ssh_control_options(state_dir):
     return ["-o", "ControlMaster=auto", "-o", "ControlPersist=60", "-o", "ControlPath=" + path]
 
 
+def ssh_command(host, remote, state_dir=None):
+    return (["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=6", "-o", "ServerAliveInterval=5"]
+            + ssh_control_options(state_dir) + ["--", host["ssh"], remote])
+
+
 def collector_command(host, args, state_dir=None):
     """Local hosts run the file; SSH hosts read it from stdin so nothing is left on the remote."""
     if host["local"]:
         return [sys.executable, "-I", str(COLLECTOR)] + list(args)
     remote = (f"PATH={REMOTE_PATH} {shlex.quote(host['python'])} -I - "
               + " ".join(shlex.quote(a) for a in args))
-    return (["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=6", "-o", "ServerAliveInterval=5"]
-            + ssh_control_options(state_dir) + ["--", host["ssh"], remote])
+    return ssh_command(host, remote, state_dir)
+
+
+def remote_program():
+    """The collector as one self-contained program for a remote Python's stdin, with
+    settings imported from this reviewed bundle rather than a remote Python path."""
+    module = (HERE / "settings.py").read_text(encoding="utf-8")
+    prefix = "import types,sys\nm=types.ModuleType('settings')\nexec(" + repr(module) + ",m.__dict__)\nsys.modules['settings']=m\n"
+    return (b"from __future__ import annotations\n" + prefix.encode()
+            + COLLECTOR.read_bytes().replace(b"from __future__ import annotations\n", b"", 1))
+
+
+def watch_command(host, board_id, state_dir=None):
+    """`collector.py watch` for one host. A remote watcher reads its program from stdin as
+    `<byte length>\\n<program>` and keeps reading stdin for pings, so nothing is left on disk."""
+    if not isinstance(board_id, str) or not BOARD_ID.fullmatch(board_id):
+        raise ValueError("보드 식별자가 올바르지 않습니다.")
+    args = ["watch", "--board", board_id]
+    if host["local"]:
+        return [sys.executable, "-I", str(COLLECTOR)] + args
+    remote = (f"PATH={REMOTE_PATH} {shlex.quote(host['python'])} -I -c {shlex.quote(WATCH_LOADER)} "
+              + " ".join(args))
+    return ssh_command(host, remote, state_dir)
+
+
+def start_watch(host, board_id, state_dir=None):
+    """(process, bytes to write first) of one host's watcher; stderr is discarded."""
+    process = subprocess.Popen(watch_command(host, board_id, state_dir), stdin=subprocess.PIPE,
+                               stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    if host["local"]:
+        return process, None
+    program = remote_program()
+    return process, str(len(program)).encode() + b"\n" + program
 
 
 def run_collector(host, args, timeout, state_dir=None):
     stdin = None
     if not host["local"]:
-        # Remote stdin remains a single self-contained program, with settings
-        # imported from this reviewed bundle rather than a remote Python path.
-        module = (HERE / "settings.py").read_text(encoding="utf-8")
-        prefix = "import types,sys\nm=types.ModuleType('settings')\nexec(" + repr(module) + ",m.__dict__)\nsys.modules['settings']=m\n"
-        stdin = (b"from __future__ import annotations\n" + prefix.encode()
-                 + COLLECTOR.read_bytes().replace(b"from __future__ import annotations\n", b"", 1))
+        # Remote stdin remains a single self-contained program.
+        stdin = remote_program()
     try:
         done = subprocess.run(collector_command(host, args, state_dir), input=stdin, capture_output=True,
                               timeout=timeout)
@@ -335,16 +374,161 @@ class StaticAssets:
         return entry
 
 
+class HostStream:
+    """One host's resident `collector.py watch` process.
+
+    Its own thread starts the process, reads its JSON lines and hands snapshots to the
+    board; the board's live manager pings it and ends it. It stays registered on the
+    board until its process is gone, so a host never has two watchers at once.
+    """
+    def __init__(self, board, host):
+        self.board, self.host, self.name = board, host, host["name"]
+        self.process = None
+        self.write_lock = threading.Lock()
+        self.began = time.monotonic()
+        self.last_line = self.began
+        self.next_ping = self.began + board.live_ping
+        self.delivered = False
+        self.stopping = False
+        self.thread = threading.Thread(target=self.run, daemon=True, name="sessionholic-live-" + self.name)
+
+    def send(self, line, wait=False):
+        """Write one control line; a busy or closed pipe skips it."""
+        if not (self.write_lock.acquire(timeout=1.0) if wait else self.write_lock.acquire(blocking=False)):
+            return False
+        try:
+            process = self.process
+            if process is None or process.stdin is None:
+                return False
+            process.stdin.write(line)
+            process.stdin.flush()
+            return True
+        except (OSError, ValueError):
+            return False
+        finally:
+            self.write_lock.release()
+
+    def run(self):
+        reason = "eof"
+        try:
+            process, preface = self.board.streamer(self.host)
+            with self.write_lock:
+                self.process = process
+            if self.stopping:
+                return
+            if preface:
+                with self.write_lock:
+                    process.stdin.write(preface)
+                    process.stdin.flush()
+            while True:
+                line = process.stdout.readline(WATCH_LINE_LIMIT)
+                if not line:
+                    break
+                if not line.endswith(b"\n"):
+                    reason = "overflow"
+                    break
+                try:
+                    message = json.loads(line)
+                except ValueError:
+                    continue
+                if not isinstance(message, dict):
+                    continue
+                self.last_line = time.monotonic()
+                if message.get("type") == "snapshot" and isinstance(message.get("data"), dict):
+                    self.board.apply_live(self, message["data"])
+                elif message.get("type") == "busy":
+                    # The same board's previous watcher still holds that host.
+                    reason = "busy"
+                    break
+        except Exception as exc:
+            reason = "error"
+            if not isinstance(exc, (OSError, ValueError)):
+                log_failure("상주 수집기 연결", exc)
+        finally:
+            self.reap()
+            self.board.stream_ended(self, reason)
+
+    def reap(self):
+        """stdin EOF lets the watcher say bye; then terminate, then kill. Never left running."""
+        process = self.process
+        if process is None:
+            return
+        with self.write_lock:
+            self.close_input(process)
+        for action in (None, "terminate", "kill"):
+            try:
+                if action:
+                    getattr(process, action)()
+                process.wait(timeout=self.board.live_exit_wait)
+                break
+            except subprocess.TimeoutExpired:
+                continue
+            except OSError:
+                break
+        try:
+            if process.stdout is not None:
+                process.stdout.close()
+        except (OSError, ValueError):
+            pass
+
+    def end(self, force=False):
+        """Make a silent watcher's output end; its thread then reaps it as a failure."""
+        process = self.process
+        if process is not None:
+            try:
+                process.kill() if force else process.terminate()
+            except OSError:
+                pass
+
+    @staticmethod
+    def close_input(process):
+        try:
+            if process.stdin is not None:
+                process.stdin.close()
+        except (OSError, ValueError):
+            pass
+
+    def stop(self):
+        """An intended stop: not a failure, no fallback collection."""
+        self.stopping = True
+        process = self.process
+        if process is not None:
+            if self.write_lock.acquire(blocking=False):
+                try:
+                    self.close_input(process)
+                finally:
+                    self.write_lock.release()
+            else:
+                # Still sending its program: closing that pipe would wait for the write.
+                self.end()
+        for force in (None, False, True):
+            if force is not None:
+                self.end(force)
+            if self.thread.ident is not None:
+                self.thread.join(self.board.live_exit_wait)
+            if not self.thread.is_alive():
+                return
+
+
 class Board:
     """Visible-client driven collection.
 
     Hosts are collected in parallel, one collection per host at a time. A failed
     host is paused and retried automatically after an increasing backoff, or at
     once on an explicit refresh.
+
+    While an event stream is open, each host also runs one resident watcher that
+    prints a full snapshot whenever something changes; those snapshots take the same
+    `changed()` path. The watchers stop a grace period after the last stream closes.
     """
     RETRY_BACKOFF = (120, 300, 900)
+    # Resident watcher restarts, apart from the one-shot collection backoff above.
+    STREAM_BACKOFF = (5, 30, 120, 600)
+    # Three failed watchers in a row, each within STREAM_HEALTHY of its start: pause it this long.
+    STREAM_TRIP = 900
+    STREAM_HEALTHY = 60.0
 
-    def __init__(self, hosts, interval, runner=None, state_dir=None):
+    def __init__(self, hosts, interval, runner=None, state_dir=None, streamer=None, live=True):
         self.hosts, self.interval = hosts, max(interval, 60)
         self.clock = time.time
         self.lock = threading.RLock()
@@ -354,10 +538,22 @@ class Board:
         self.save_lock = threading.Lock()
         self.state = {h["name"]: {"name": h["name"], "label": h["label"], "ok": False,
                      "error": "아직 수집하지 않았어요", "data": None, "fetchedAt": None,
-                     "durationMs": None, "paused": False, "refreshing": False} for h in hosts}
+                     "durationMs": None, "paused": False, "refreshing": False, "live": False} for h in hosts}
         self.reads, self.attempted, self.backoff = {}, {}, {}
         self.state_dir = Path(state_dir) if state_dir else None
         self.runner = runner or (lambda host, args, timeout: run_collector(host, args, timeout, self.state_dir))
+        # Resident watchers run on a real board, or with a streamer a caller hands in;
+        # a board with its own runner (a fixture) never starts host processes by itself.
+        if streamer is None and runner is None and live:
+            streamer = lambda host: start_watch(host, self.live_board_id(), self.state_dir)  # noqa: E731
+        self.streamer = streamer
+        self.streams, self.stream_backoff, self.live_at, self.live_saved = {}, {}, {}, {}
+        self.viewers, self.viewers_left = 0, None
+        self.live_manager, self.live_closed, self.board_id = None, False, None
+        self.live_wake = threading.Event()
+        # Seconds; instance values so a test can shorten them.
+        self.live_grace, self.live_ping, self.live_silence = 60.0, 10.0, 30.0
+        self.live_tick, self.live_exit_wait = 0.5, 2.0
         if self.state_dir:
             self.state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
             prepare_ssh_control_dir(self.state_dir)
@@ -410,7 +606,8 @@ class Board:
         # Kept for old callers; no background polling without a visible client.
         return None
 
-    def poll(self, host):
+    def poll(self, host, full=False):
+        """One-shot collection; `full` also asks Codex to scan and repair its rollouts."""
         name = host["name"]
         # Only one collection per host; other hosts are collected concurrently.
         with self.host_locks[name]:
@@ -421,7 +618,7 @@ class Board:
                     self.state[name]["refreshing"] = True
                     self.attempted[name] = started
                     self.changed()
-                data = scrub_payload(self.runner(host, ["snapshot"], 45))
+                data = scrub_payload(self.runner(host, ["snapshot", "--full"] if full else ["snapshot"], 45))
                 update = {"ok": True, "paused": False, "error": None, "data": data,
                           "fetchedAt": int(self.clock())}
             except RuntimeError as exc:
@@ -433,13 +630,18 @@ class Board:
                 finished = self.clock()
                 update.update(durationMs=int((finished - started) * 1000), refreshing=False)
                 with self.lock:
-                    self.state[name].update(update)
-                    if update["ok"]:
-                        self.backoff.pop(name, None)
+                    if self.live_at.get(name, started) > started:
+                        # A resident watcher delivered newer data while this one ran.
+                        update = {"ok": True, "durationMs": update["durationMs"], "refreshing": False}
+                        self.state[name].update(durationMs=update["durationMs"], refreshing=False)
                     else:
-                        failures = self.backoff.get(name, (0, 0))[0] + 1
-                        delay = self.RETRY_BACKOFF[min(failures, len(self.RETRY_BACKOFF)) - 1]
-                        self.backoff[name] = (failures, finished + delay)
+                        self.state[name].update(update)
+                        if update["ok"]:
+                            self.backoff.pop(name, None)
+                        else:
+                            failures = self.backoff.get(name, (0, 0))[0] + 1
+                            delay = self.RETRY_BACKOFF[min(failures, len(self.RETRY_BACKOFF)) - 1]
+                            self.backoff[name] = (failures, finished + delay)
                     self.changed()
             self.persist("snapshot.json", self.snapshot)
             return update["ok"]
@@ -459,13 +661,19 @@ class Board:
             raise ValueError("기기 이름 형식이 올바르지 않습니다.")
         if host_name is not None and host_name not in self.state:
             raise ValueError("등록되지 않은 기기입니다.")
-        queued = []
+        queued, asked = [], []
         with self.lock:
             now = self.clock()
             for host in self.hosts:
                 name = host["name"]
                 row = self.state[name]
                 if host_name and name != host_name:
+                    continue
+                stream = self.streams.get(name)
+                if row["live"] and stream is not None and not stream.stopping:
+                    # A resident watcher keeps this host current; a manual refresh asks it to read now.
+                    if force:
+                        asked.append(stream)
                     continue
                 delay = 5 if force else self.interval
                 if row["refreshing"] or now - self.attempted.get(name, 0) < delay:
@@ -476,15 +684,206 @@ class Board:
                 row["refreshing"] = True
                 queued.append(host)
             self.changed()
+        asked = [stream for stream in asked if stream.send(b"refresh\n", wait=True)]
+        self.start_polls(queued, full=force)
+        return bool(queued or asked)
+
+    def start_polls(self, queued, full=False):
         for host in queued:
             try:
-                threading.Thread(target=self.poll, args=(host,), daemon=True,
+                threading.Thread(target=self.poll, args=(host, full), daemon=True,
                                  name="sessionholic-collect-" + host["name"]).start()
             except RuntimeError:
                 with self.lock:
                     self.state[host["name"]].update(refreshing=False, error="수집을 시작하지 못했습니다.")
                     self.changed()
-        return bool(queued)
+
+    # ---------- resident watchers ----------
+    def live_board_id(self):
+        """This board's watcher identity, kept in the state folder so a restarted board
+        meets its own previous watchers' locks instead of running beside them."""
+        with self.lock:
+            if self.board_id:
+                return self.board_id
+        value = None
+        if self.state_dir:
+            path = self.state_dir / "board-id"
+            for _ in range(2):
+                try:
+                    descriptor = os.open(str(path), os.O_RDONLY | os.O_NOFOLLOW)
+                    with os.fdopen(descriptor, "r", encoding="utf-8") as stream:
+                        text = stream.read(64).strip()
+                    value = text if BOARD_ID.fullmatch(text) else None
+                    break
+                except FileNotFoundError:
+                    try:
+                        descriptor = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+                        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+                            stream.write(secrets.token_hex(8) + "\n")
+                    except FileExistsError:
+                        continue
+                    except OSError:
+                        break
+                except (OSError, UnicodeError):
+                    break
+        with self.lock:
+            self.board_id = self.board_id or value or secrets.token_hex(8)
+            return self.board_id
+
+    def viewer_joined(self):
+        """An event stream opened: watchers start (once per host) while anyone watches."""
+        start = None
+        with self.lock:
+            self.viewers += 1
+            self.viewers_left = None
+            if self.streamer is None or self.live_closed:
+                return
+            if self.live_manager is None:
+                start = self.live_manager = threading.Thread(target=self.manage_live, daemon=True,
+                                                             name="sessionholic-live")
+        if start is not None:
+            try:
+                start.start()
+            except RuntimeError:
+                with self.lock:
+                    self.live_manager = None
+        self.live_wake.set()
+
+    def viewer_left(self):
+        with self.lock:
+            self.viewers = max(0, self.viewers - 1)
+            if not self.viewers:
+                self.viewers_left = time.monotonic()
+        self.live_wake.set()
+
+    def live_wanted(self, now):
+        """Caller holds self.lock."""
+        return not self.live_closed and (self.viewers > 0 or (
+            self.viewers_left is not None and now - self.viewers_left < self.live_grace))
+
+    def manage_live(self):
+        """Start, ping, stop and replace watchers; process work happens outside self.lock."""
+        try:
+            while True:
+                starts, stops, pings, silent = [], [], [], []
+                with self.lock:
+                    now = time.monotonic()
+                    wanted = self.live_wanted(now)
+                    for host in self.hosts:
+                        name = host["name"]
+                        stream = self.streams.get(name)
+                        if stream is not None:
+                            if not wanted:
+                                if not stream.stopping:
+                                    stream.stopping = True
+                                    stops.append(stream)
+                            elif now - stream.last_line >= self.live_silence:
+                                silent.append((stream, now - stream.last_line >= self.live_silence + 5))
+                            elif now >= stream.next_ping:
+                                stream.next_ping = now + self.live_ping
+                                pings.append(stream)
+                        elif (wanted and not self.state[name]["paused"]
+                              and now >= self.stream_backoff.get(name, (0, 0.0))[1]):
+                            # A paused host waits for a successful one-shot collection first.
+                            self.streams[name] = HostStream(self, host)
+                            starts.append(self.streams[name])
+                    if not wanted and not self.streams:
+                        self.live_manager = None
+                        return
+                for stream in stops:
+                    stream.stop()
+                for stream in starts:
+                    try:
+                        stream.thread.start()
+                    except RuntimeError:
+                        with self.lock:
+                            if self.streams.get(stream.name) is stream:
+                                del self.streams[stream.name]
+                for stream, force in silent:
+                    stream.end(force)
+                for stream in pings:
+                    stream.send(b"ping\n")
+                self.live_wake.wait(self.live_tick)
+                self.live_wake.clear()
+        except BaseException:
+            with self.lock:
+                if self.live_manager is threading.current_thread():
+                    self.live_manager = None
+            raise
+
+    def apply_live(self, stream, data):
+        """A watcher's snapshot through the same state path as a one-shot collection.
+
+        The host lock is not taken: a one-shot collection may hold it for many seconds.
+        """
+        data = scrub_payload(data)
+        save = False
+        with self.lock:
+            if self.streams.get(stream.name) is not stream or stream.stopping or self.live_closed:
+                return False
+            stream.delivered = True
+            row = self.state[stream.name]
+            now = self.clock()
+            self.live_at[stream.name] = now
+            same = (isinstance(row["data"], dict) and {k: v for k, v in row["data"].items() if k != "collectedAt"}
+                    == {k: v for k, v in data.items() if k != "collectedAt"})
+            if not (same and row["ok"] and row["live"] and not row["paused"] and row["error"] is None):
+                row.update(data=data, ok=True, paused=False, error=None, fetchedAt=int(now), live=True)
+                self.backoff.pop(stream.name, None)
+                self.changed()
+            moment = time.monotonic()
+            if moment - self.live_saved.get(stream.name, moment - 30) >= 30:
+                self.live_saved[stream.name] = moment
+                save = True
+        if save:
+            self.persist("snapshot.json", self.snapshot)
+        return True
+
+    def stream_ended(self, stream, reason):
+        """A watcher's process is gone. An unintended end backs off its restart and
+        falls back to one one-shot collection while someone is watching."""
+        fallback = None
+        with self.lock:
+            if self.streams.get(stream.name) is not stream:
+                return
+            del self.streams[stream.name]
+            row = self.state[stream.name]
+            if row["live"]:
+                row["live"] = False
+                self.changed()
+            now = time.monotonic()
+            if not stream.stopping and not self.live_closed:
+                failures = self.stream_backoff.get(stream.name, (0, 0.0))[0]
+                failures = 1 if stream.delivered and now - stream.began >= self.STREAM_HEALTHY else failures + 1
+                delay = self.STREAM_BACKOFF[min(failures, len(self.STREAM_BACKOFF)) - 1]
+                if failures >= 3:
+                    delay = max(delay, self.STREAM_TRIP)
+                self.stream_backoff[stream.name] = (failures, now + delay)
+                if self.live_wanted(now) and not row["refreshing"]:
+                    paused_until = self.backoff.get(stream.name, (0, 0))[1]
+                    if not row["paused"] or self.clock() >= paused_until:
+                        row["refreshing"] = True
+                        self.changed()
+                        fallback = stream.host
+        self.live_wake.set()
+        if stream.delivered:
+            self.persist("snapshot.json", self.snapshot)
+        if fallback is not None:
+            self.start_polls([fallback])
+
+    def close_live(self):
+        """Server shutdown: stop every watcher and its manager."""
+        with self.lock:
+            self.live_closed = True
+            streams = list(self.streams.values())
+            manager = self.live_manager
+            for stream in streams:
+                stream.stopping = True
+        self.live_wake.set()
+        for stream in streams:
+            stream.stop()
+        if manager is not None and manager is not threading.current_thread() and manager.ident is not None:
+            manager.join(5)
 
     def snapshot(self):
         with self.lock:
@@ -1079,6 +1478,7 @@ class Handler(BaseHTTPRequestHandler):
             # Only this answer means "every stream or watcher place is taken".
             return self.send_json(503, {"error": "실시간 연결이 너무 많습니다. 잠시 뒤 다시 연결합니다.",
                                         "code": "events_busy"}, {"Retry-After": "10"})
+        watching = False
         try:
             self.send_response(200)
             for key, value in SECURITY_HEADERS.items():
@@ -1091,9 +1491,14 @@ class Handler(BaseHTTPRequestHandler):
             if self.command == "HEAD":
                 return
             self.connection.settimeout(STREAM_WRITE_TIMEOUT)
+            # Counted outside the hub lock: resident watchers run while anyone watches.
+            self.server.board.viewer_joined()
+            watching = True
             hub.pump(stream, self.stream_write, self.peer_closed)
         finally:
             hub.close_stream(stream)
+            if watching:
+                self.server.board.viewer_left()
 
     def events_unavailable(self):
         return self.send_json(503, {"error": "실시간 연결을 준비하지 못했습니다. 잠시 뒤 다시 연결합니다.",
@@ -1237,7 +1642,11 @@ class Handler(BaseHTTPRequestHandler):
                     self.server.terminals.detach(tid)
                 return self.send_json(200, {"ok": True})
         except SendRejected as exc:
-            return self.send_json(exc.status, {"error": str(exc), "dispatchState": "not_started"})
+            # A refusal with a code (e.g. "terminal_required") lets the composer act on it at once.
+            payload = {"error": str(exc), "dispatchState": "not_started"}
+            if exc.code:
+                payload["code"] = exc.code
+            return self.send_json(exc.status, payload)
         except PromptRejected as exc:
             # No key reached the terminal; "prompt_changed" means read the screen again.
             return self.send_json(exc.status, {"error": str(exc), "code": exc.code})
@@ -1295,6 +1704,9 @@ class BoardHTTPServer(ThreadingHTTPServer):
         events = getattr(self, "events", None)
         if events is not None:
             events.close()
+        board = getattr(self, "board", None)
+        if board is not None and hasattr(board, "close_live"):
+            board.close_live()
         manager = getattr(self, "terminals", None)
         if manager is not None and hasattr(manager, "close"):
             manager.close()
@@ -1350,6 +1762,8 @@ def main(argv=None):
     parser.add_argument("--max-terminals", type=int, choices=range(1, 5), default=4, help="동시에 유지할 보드 터미널 수(1~4)")
     parser.add_argument("--local-only", action="store_true", help="이 기기만 수집·검증")
     parser.add_argument("--state-dir", type=Path, default=STATE_DIR)
+    parser.add_argument("--no-live", action="store_true",
+                        help="상주 수집기를 쓰지 않고 화면 요청 때만 일회성으로 수집")
     parser.add_argument("--tailscale-user-file", type=Path,
                         help="비공개 파일에 적힌 Tailscale 사용자에게 HTTPS Serve 자동 인증 허용")
     parser.add_argument("--open", action="store_true",
@@ -1370,7 +1784,7 @@ def main(argv=None):
         parser.error(str(exc))
     if args.local_only:
         hosts = [h for h in hosts if h["local"]]
-    board = Board(hosts, max(args.interval, 60), state_dir=args.state_dir)
+    board = Board(hosts, max(args.interval, 60), state_dir=args.state_dir, live=not args.no_live)
     httpd = make_server(args.bind, args.port, board, token, state_dir=args.state_dir,
                         max_terminals=args.max_terminals, tailscale_user=tailscale_user)
     print(f"세션홀릭: http://127.0.0.1:{args.port}/ · 화면을 열 때만 수집합니다.", file=sys.stderr)

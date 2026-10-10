@@ -2,7 +2,9 @@ import http.client
 import io
 import json
 import os
+import shlex
 import shutil
+import subprocess
 from pathlib import Path
 import sys
 import tempfile
@@ -643,6 +645,23 @@ class EventStreamTest(unittest.TestCase):
              patch.object(self.httpd.chat, "send", side_effect=SendRejected("fixture")):
             self.assertEqual(post("/api/chat/send", {"source": source, "requestId": "r", "text": "hi"}), 400)
             boost.assert_not_called()
+        # The refusal's code reaches the composer, so "터미널 열기" can appear at once.
+        def refusal(body):
+            conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+            conn.request("POST", "/api/chat/send", json.dumps(body), {"Content-Type": "application/json",
+                         "Authorization": "Bearer " + TOKEN, "X-CSRF-Token": self.httpd.csrf})
+            res = conn.getresponse()
+            data = json.loads(res.read())
+            conn.close()
+            return res.status, data
+        with patch.object(self.httpd.chat, "send",
+                          side_effect=SendRejected("보내려면 먼저 터미널을 여세요.", 409, code="terminal_required")):
+            self.assertEqual(refusal({"source": source, "requestId": "r", "text": "hi"}),
+                             (409, {"error": "보내려면 먼저 터미널을 여세요.", "dispatchState": "not_started",
+                                    "code": "terminal_required"}))
+        with patch.object(self.httpd.chat, "send", side_effect=SendRejected("fixture")):
+            self.assertEqual(refusal({"source": source, "requestId": "r", "text": "hi"}),
+                             (400, {"error": "fixture", "dispatchState": "not_started"}))
         # A failing hint never turns a delivered message into an error.
         with patch.object(self.httpd.events, "boost", side_effect=TypeError("fixture")), \
              patch.object(self.httpd.chat, "send", return_value={"status": "accepted"}), \
@@ -948,6 +967,351 @@ class BoardCollectionTest(unittest.TestCase):
         outcome["fail"] = True
         self.assertFalse(board.poll(HOSTS[0]))
         self.assertEqual(board.backoff["remote"], (1, self.now[0] + 120))
+
+
+class FakeWatcher:
+    """A Popen-like stand-in for one `collector.py watch` process: the test speaks its
+    output lines; control lines written to its stdin are recorded."""
+
+    class Input:
+        def __init__(self, owner):
+            self.owner, self.closed = owner, False
+
+        def write(self, data):
+            if self.closed:
+                raise ValueError("closed")
+            self.owner.lines.append(data)
+
+        def flush(self):
+            pass
+
+        def close(self):
+            if not self.closed:
+                self.closed = True
+                if self.owner.leave_on_eof:
+                    self.owner.say({"type": "bye", "reason": "stdin-closed"})
+                    self.owner.exit(0)
+
+    def __init__(self, leave_on_eof=True):
+        read, write = os.pipe()
+        self.stdout, self.out = os.fdopen(read, "rb"), os.fdopen(write, "wb", buffering=0)
+        self.stdin = self.Input(self)
+        self.leave_on_eof = leave_on_eof
+        self.lines, self.signals = [], []
+        self.exited, self.returncode = threading.Event(), None
+
+    def say(self, message):
+        try:
+            self.out.write((json.dumps(message, ensure_ascii=False) + "\n").encode())
+        except (OSError, ValueError):
+            pass
+
+    def exit(self, code):
+        if not self.exited.is_set():
+            self.returncode = code
+            self.out.close()
+            self.exited.set()
+
+    def wait(self, timeout=None):
+        if not self.exited.wait(timeout):
+            raise subprocess.TimeoutExpired("watch", timeout)
+        return self.returncode
+
+    def terminate(self):
+        self.signals.append("terminate")
+        self.exit(-15)
+
+    def kill(self):
+        self.signals.append("kill")
+        self.exit(-9)
+
+
+class Watchers:
+    """Board streamer: one FakeWatcher per started host watcher."""
+    def __init__(self, **options):
+        self.options, self.started, self.lock = options, [], threading.Lock()
+
+    def __call__(self, host):
+        watcher = FakeWatcher(**self.options)
+        with self.lock:
+            self.started.append((host["name"], watcher))
+        return watcher, None
+
+    def __len__(self):
+        with self.lock:
+            return len(self.started)
+
+    def __getitem__(self, index):
+        with self.lock:
+            return self.started[index][1]
+
+
+def live_data(title="정산", collected=1):
+    return {"host": "remote", "collectedAt": collected, "claude": [{"id": "a1b2c3d4", "title": title}],
+            "codex": [], "tmux": [], "errors": []}
+
+
+class BoardLiveTest(unittest.TestCase):
+    """Resident watchers: started by viewers, one per host, through the board's state path."""
+
+    def setUp(self):
+        self.calls = []
+
+    def live_board(self, runner=None, **options):
+        watchers = Watchers(**options)
+        board = server.Board(HOSTS, 60, runner=runner or fake_runner(self.calls), streamer=watchers)
+        board.live_grace, board.live_ping, board.live_silence = 0.3, 0.1, 5.0
+        board.live_tick, board.live_exit_wait = 0.02, 0.5
+        self.addCleanup(self.finish, board, watchers)
+        return board, watchers
+
+    def finish(self, board, watchers):
+        board.close_live()
+        for _, watcher in watchers.started:
+            self.assertTrue(watcher.exited.wait(3), "a watcher process was left running")
+        # Neither the manager, a stream reader nor a fallback collection outlives the board.
+        wait_for(lambda: not [t for t in threading.enumerate()
+                              if t.name.startswith(("sessionholic-live", "sessionholic-collect"))])
+
+    @staticmethod
+    def live(board):
+        return board.state["remote"]["live"]
+
+    def test_one_watcher_per_host_only_while_someone_watches(self):
+        board, watchers = self.live_board()
+        seen = []
+        board.add_listener(seen.append)
+        joins = [threading.Thread(target=board.viewer_joined) for _ in range(5)]
+        for thread in joins:
+            thread.start()
+        for thread in joins:
+            thread.join()
+        wait_for(lambda: len(watchers) == 1)
+        watcher = watchers[0]
+        watcher.say({"type": "hello", "proto": 1})
+        watcher.say({"type": "snapshot", "seq": 1, "reason": "initial", "data": live_data()})
+        wait_for(lambda: self.live(board))
+        row = board.state["remote"]
+        self.assertEqual((row["ok"], row["paused"], row["error"]), (True, False, None))
+        self.assertEqual(row["data"]["claude"][0]["title"], "정산")
+        version = board.version
+        self.assertEqual(seen[-1], version)
+        # The same content (only collectedAt moved) and heartbeats leave the version alone.
+        watcher.say({"type": "snapshot", "seq": 2, "reason": "initial", "data": live_data(collected=2)})
+        watcher.say({"type": "heartbeat", "seq": 2, "t": 1})
+        wait_for(lambda: b"ping\n" in watcher.lines)
+        time.sleep(0.1)
+        self.assertEqual(board.version, version)
+        watcher.say({"type": "snapshot", "seq": 3, "reason": "change", "data": live_data("정산 완료", 3)})
+        wait_for(lambda: board.state["remote"]["data"]["claude"][0]["title"] == "정산 완료")
+        self.assertEqual(board.version, version + 1)
+        # Leaving and coming back within the grace period keeps the same watcher.
+        for _ in range(5):
+            board.viewer_left()
+        time.sleep(0.1)
+        board.viewer_joined()
+        board.viewer_left()
+        self.assertFalse(watcher.exited.is_set())
+        wait_for(lambda: watcher.exited.is_set())
+        wait_for(lambda: board.live_manager is None and not board.streams)
+        # An intended stop: stdin closed, no signal, no fallback collection, one watcher in all.
+        self.assertTrue(watcher.stdin.closed)
+        self.assertEqual(watcher.signals, [])
+        self.assertEqual((len(watchers), self.calls, self.live(board)), (1, [], False))
+
+    def test_a_failed_watcher_falls_back_once_and_restarts_after_its_own_backoff(self):
+        board, watchers = self.live_board()
+        board.STREAM_BACKOFF, board.STREAM_TRIP = (0.3, 0.3, 0.3, 0.3), 60
+        board.viewer_joined()
+        wait_for(lambda: len(watchers) == 1)
+        watchers[0].say({"type": "snapshot", "seq": 1, "data": live_data()})
+        wait_for(lambda: self.live(board))
+        watchers[0].exit(1)
+        wait_for(lambda: not self.live(board) and self.calls == [("remote", ["snapshot"])])
+        wait_for(lambda: not board.state["remote"]["refreshing"])
+        self.assertEqual(board.stream_backoff["remote"][0], 1)
+        # The one-shot backoff is separate and untouched.
+        self.assertEqual(board.backoff, {})
+        time.sleep(0.1)
+        self.assertEqual(len(watchers), 1)
+        wait_for(lambda: len(watchers) == 2)
+        # A watcher whose board lock is still held by an orphan ends as "busy".
+        watchers[1].say({"type": "busy"})
+        wait_for(lambda: len(watchers) == 3)
+        self.assertEqual(watchers[1].signals, [])
+        watchers[2].exit(1)
+        # Three quick failures in a row pause this host's watcher for the long trip delay.
+        wait_for(lambda: board.stream_backoff["remote"][0] == 3)
+        self.assertGreater(board.stream_backoff["remote"][1] - time.monotonic(), 30)
+        time.sleep(0.4)
+        self.assertEqual(len(watchers), 3)
+        board.viewer_left()
+
+    def test_refresh_goes_to_the_live_watcher_instead_of_a_one_shot_collection(self):
+        board, watchers = self.live_board()
+        board.viewer_joined()
+        wait_for(lambda: len(watchers) == 1)
+        watchers[0].say({"type": "snapshot", "seq": 1, "data": live_data()})
+        wait_for(lambda: self.live(board))
+        self.assertFalse(board.request_refresh())
+        self.assertTrue(board.request_refresh(force=True))
+        self.assertIn(b"refresh\n", watchers[0].lines)
+        time.sleep(0.1)
+        self.assertEqual(self.calls, [])
+        board.viewer_left()
+
+    def test_paused_host_starts_its_watcher_after_a_successful_collection(self):
+        outcome, calls = {"fail": True}, []
+        def runner(host, args, timeout):
+            calls.append(list(args))
+            if outcome["fail"]:
+                raise RuntimeError("SSH 연결 실패")
+            return live_data()
+        board, watchers = self.live_board(runner)
+        now = [1_000_000.0]
+        board.clock = lambda: now[0]
+        self.assertFalse(board.poll(HOSTS[0]))
+        board.viewer_joined()
+        time.sleep(0.2)
+        self.assertEqual(len(watchers), 0)
+        outcome["fail"] = False
+        now[0] += 10
+        self.assertTrue(board.request_refresh(force=True))
+        wait_for(lambda: board.state["remote"]["ok"] and not board.state["remote"]["refreshing"])
+        # A manual one-shot refresh also lets Codex scan and repair its thread metadata.
+        self.assertEqual(calls, [["snapshot"], ["snapshot", "--full"]])
+        wait_for(lambda: len(watchers) == 1)
+        board.viewer_left()
+
+    def test_one_shot_result_older_than_a_live_snapshot_is_not_applied(self):
+        entered, release, result = threading.Event(), threading.Event(), []
+        def runner(host, args, timeout):
+            entered.set()
+            release.wait(5)
+            return live_data("오래된 목록")
+        board, watchers = self.live_board(runner)
+        poller = threading.Thread(target=lambda: result.append(board.poll(HOSTS[0])))
+        poller.start()
+        self.assertTrue(entered.wait(5))
+        board.viewer_joined()
+        wait_for(lambda: len(watchers) == 1)
+        watchers[0].say({"type": "snapshot", "seq": 1, "data": live_data("실시간 목록")})
+        wait_for(lambda: self.live(board))
+        release.set()
+        poller.join(5)
+        row = board.state["remote"]
+        self.assertEqual(result, [True])
+        self.assertEqual(row["data"]["claude"][0]["title"], "실시간 목록")
+        self.assertEqual((row["refreshing"], row["live"]), (False, True))
+        self.assertIsNotNone(row["durationMs"])
+        board.viewer_left()
+
+    def test_silent_watcher_is_ended_and_replaced(self):
+        board, watchers = self.live_board(leave_on_eof=False)
+        board.live_silence, board.STREAM_BACKOFF = 0.3, (0.1, 0.1, 0.1, 0.1)
+        board.viewer_joined()
+        wait_for(lambda: len(watchers) == 1)
+        wait_for(lambda: "terminate" in watchers[0].signals)
+        wait_for(lambda: self.calls == [("remote", ["snapshot"])])
+        wait_for(lambda: len(watchers) == 2)
+        # A stubborn watcher that ignores stdin EOF is terminated on an intended stop.
+        board.viewer_left()
+        wait_for(lambda: watchers[1].exited.is_set())
+        self.assertEqual(watchers[1].signals, ["terminate"])
+
+    def test_event_streams_start_watchers_and_server_close_stops_them(self):
+        import socket
+        board, watchers = self.live_board()
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        httpd = server.make_server("127.0.0.1", 0, board, TOKEN, state_dir=temp.name)
+        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+        port = httpd.server_address[1]
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        conn.request("HEAD", "/api/events", headers={"Authorization": "Bearer " + TOKEN})
+        self.assertEqual(conn.getresponse().status, 200)
+        conn.close()
+        time.sleep(0.1)
+        self.assertEqual((len(watchers), board.viewers), (0, 0))
+        sock = socket.create_connection(("127.0.0.1", port), timeout=5)
+        self.addCleanup(sock.close)
+        sock.sendall(("GET /api/events HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer %s\r\n\r\n" % TOKEN).encode())
+        received = b""
+        while b"event: hello" not in received:
+            received += sock.recv(65536)
+        wait_for(lambda: len(watchers) == 1 and board.viewers == 1)
+        httpd.shutdown()
+        httpd.server_close()
+        wait_for(lambda: watchers[0].exited.is_set())
+        self.assertTrue(watchers[0].stdin.closed)
+        wait_for(lambda: board.live_manager is None and board.viewers == 0)
+        # A closed board never starts another watcher.
+        board.viewer_joined()
+        time.sleep(0.1)
+        self.assertEqual(len(watchers), 1)
+        board.viewer_left()
+
+    def test_boards_with_their_own_runner_never_start_processes(self):
+        board = server.Board(HOSTS, 60, runner=fake_runner([]))
+        self.assertIsNone(board.streamer)
+        board.viewer_joined()
+        self.assertIsNone(board.live_manager)
+        board.viewer_left()
+        self.assertIsNotNone(server.Board(HOSTS, 60).streamer)
+        self.assertIsNone(server.Board(HOSTS, 60, live=False).streamer)
+
+    def test_board_id_is_private_and_kept(self):
+        directory = tempfile.mkdtemp(prefix="sh", dir="/tmp")
+        self.addCleanup(shutil.rmtree, directory)
+        first = server.Board(HOSTS, 60, runner=fake_runner([]), state_dir=directory).live_board_id()
+        self.assertRegex(first, r"^[0-9a-f]{16}$")
+        path = Path(directory) / "board-id"
+        self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(server.Board(HOSTS, 60, runner=fake_runner([]), state_dir=directory).live_board_id(), first)
+        path.write_text("../not-an-id\n")
+        replaced = server.Board(HOSTS, 60, runner=fake_runner([]), state_dir=directory).live_board_id()
+        self.assertRegex(replaced, r"^[0-9a-f]{16}$")
+        self.assertRegex(server.Board(HOSTS, 60, runner=fake_runner([])).live_board_id(), r"^[0-9a-f]{16}$")
+
+    def test_watch_commands(self):
+        remote = server.watch_command(HOSTS[0], "0123456789abcdef")
+        self.assertEqual(remote[:6], ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=6", "-o"])
+        self.assertEqual(remote[-2], "remote")
+        self.assertIn("/usr/bin/python3 -I -c " + shlex.quote(server.WATCH_LOADER), remote[-1])
+        self.assertTrue(remote[-1].endswith(" watch --board 0123456789abcdef"))
+        local = server.watch_command({"local": True}, "0123456789abcdef")
+        self.assertEqual(local[1:], ["-I", str(server.COLLECTOR), "watch", "--board", "0123456789abcdef"])
+        for bad in ("../x", "0123", "0123456789ABCDEF", "a; rm -rf ~", None):
+            with self.assertRaises(ValueError):
+                server.watch_command(HOSTS[0], bad)
+
+    def test_length_prefixed_program_runs_a_real_watcher_through_the_board(self):
+        """The remote bootstrap without SSH: the same loader reads `<length>\\n<program>`
+        from stdin, then keeps stdin for pings; the board reads its snapshot and stops it."""
+        home = Path(tempfile.mkdtemp(prefix="sh", dir="/tmp")).resolve()
+        self.addCleanup(shutil.rmtree, home)
+        loader = [sys.executable, "-I", "-c", server.WATCH_LOADER, "watch"]
+        processes = []
+        def streamer(host):
+            process, preface = server.start_watch(host, "0123456789abcdef")
+            processes.append(process)
+            return process, preface
+        environment = {"HOME": str(home), "PATH": "/usr/bin:/bin", "TMUX_TMPDIR": str(home)}
+        board = server.Board(HOSTS, 60, runner=fake_runner(self.calls), streamer=streamer)
+        board.live_grace, board.live_tick = 0.2, 0.05
+        self.addCleanup(board.close_live)
+        with patch.object(server, "watch_command", return_value=loader), patch.dict(os.environ, environment):
+            board.viewer_joined()
+            wait_for(lambda: self.live(board), timeout=20)
+        preface = server.remote_program()
+        self.assertTrue(preface.startswith(b"from __future__ import annotations\n"))
+        data = board.state["remote"]["data"]
+        self.assertEqual(set(data), {"host", "collectedAt", "claude", "codex", "tmux", "errors"})
+        self.assertEqual(data["codex"], [])
+        board.viewer_left()
+        wait_for(lambda: board.live_manager is None and not board.streams, timeout=10)
+        self.assertEqual(processes[0].returncode, 0)
+        self.assertEqual((len(processes), self.calls, self.live(board)), (1, [], False))
 
 
 if __name__ == "__main__":

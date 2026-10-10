@@ -70,6 +70,23 @@ finally:
 '''
 
 
+def working_turn(now):
+    """A long running turn: a question, runs of tool records and a progress note."""
+    tools = [('$ npm test -- --watch=false', 'command'), ('Read · web/app.js', 'read'),
+             ('$ rg -n "renderMessages" web tests', 'command'), ('파일 수정 · web/app.js', 'edit'),
+             ('$ npm test -- --watch=false', 'command'), ('웹 검색 · scroll anchoring overflow-anchor', 'search'),
+             ('github get_issue', 'mcp')]
+    later = [('파일 수정 · web/app.js, web/style.css, tests/test_frontend.cjs', 'edit'),
+             ('$ node tests/test_frontend.cjs && node tests/test_message_format.cjs && '
+              'python3 -m unittest discover -s tests 2>&1 | tail -20', 'command')]
+    rows = [{'role': 'user', 'text': '테스트가 실패하는 원인을 찾아서 고쳐 줘.', 'ts': now - 754}]
+    rows += [{'role': 'tool', 'text': text, 'ts': None, 'toolKind': kind} for text, kind in tools]
+    rows.append({'role': 'assistant', 'text': '원인을 찾았습니다. 스크롤 위치를 숫자로만 되돌리고 있었어요. 고친 뒤 다시 확인합니다.',
+                 'ts': None})
+    rows += [{'role': 'tool', 'text': text, 'ts': None, 'toolKind': kind} for text, kind in later]
+    return rows
+
+
 class FakeNative:
     def __init__(self, rows):
         self.rows = {row['id']: row for row in rows}
@@ -89,10 +106,30 @@ class FakeNative:
                 '- [프로젝트 문서](https://example.com/docs)를 참고하세요.'
             ), 'ts': time.time() - 10},
         ] for row in rows}
+        now = time.time()
+        # A working session shows a long turn: many tool records (folded into one line on the
+        # board) and "작업 중 · 12분 34초" counted from workingSince.
+        self.since = {}
+        for row in rows:
+            if row['phase'] == 'working':
+                self.messages[row['id']] += working_turn(now)
+                self.since[row['id']] = int(now) - 754
         self.receipts = {}
         self.pending = {row['id']: 0 for row in rows}
         self.running = {row['id']: 'running-' + row['id'] for row in rows if row['phase'] == 'working'}
         self.lock = threading.RLock()
+
+    def add_tool_records(self, seconds):
+        """--live-tools: a working session gets one more tool record every `seconds`."""
+        count = 0
+        while count < 60:
+            time.sleep(seconds)
+            with self.lock:
+                for identifier, row in self.rows.items():
+                    if row['phase'] == 'working':
+                        count += 1
+                        self.messages[identifier].append({'role': 'tool', 'text': f'$ npm test -- --shard={count}',
+                                                          'ts': None, 'toolKind': 'command'})
 
     def finish(self, identifier, request_id, text):
         with self.lock:
@@ -103,6 +140,7 @@ class FakeNative:
             # The running turn ends only after every input it absorbed was answered.
             turn_id = self.running.pop(identifier, None)
             self.rows[identifier]['phase'] = 'idle'
+            self.since.pop(identifier, None)
             for message in self.messages[identifier]:
                 if message.get('turnId') == turn_id:
                     message['turnStatus'] = 'completed'
@@ -126,7 +164,8 @@ class FakeNative:
                 ids = list(dict.fromkeys(([payload['requestId']] if payload.get('requestId') else []) + payload.get('requestIds', [])))
                 return {'phase': row['phase'], 'cwd': row['cwd'], 'messages': list(self.messages[row['id']]),
                         'receipts': [{**self.receipts.get(identifier, {'delivery': 'unknown'}), 'requestId': identifier} for identifier in ids],
-                        'capabilities': {'canSend': supported, 'reason': None if supported else 'Claude 입력은 보드가 연결한 터미널로 전달합니다.'}}
+                        'capabilities': {'canSend': supported, 'reason': None if supported else 'Claude 입력은 보드가 연결한 터미널로 전달합니다.'},
+                        'workingSince': self.since.get(row['id'])}
             if action == 'receipt':
                 return self.receipts.get(payload['requestId'], {'delivery': 'unknown'})
             if action != 'send':
@@ -154,6 +193,8 @@ class FakeNative:
             self.receipts[rid] = {'delivery': 'accepted', 'confirmed': True, 'turnId': turn_id,
                                   'readbackConfirmed': True, 'currentSnapshotConfirmed': True,
                                   'acknowledged': True, 'attachments': sent_files}
+            if not joined:
+                self.since[row['id']] = int(time.time())
             row['phase'] = 'working'
             self.pending[row['id']] += 1
             timer = threading.Timer(8 if joined else 5, self.finish, args=(row['id'], rid, text))
@@ -172,6 +213,8 @@ def main(argv=None):
     parser.add_argument('--tailscale-user-file', type=Path)
     parser.add_argument('--menu-demo', action='store_true',
                         help='보드 터미널을 방향키·Enter로 답하는 번호 메뉴로 실행하고 Claude 백그라운드 세션을 추가')
+    parser.add_argument('--live-tools', type=float, metavar='SECONDS',
+                        help='작업 중인 세션에 이 간격(초)마다 도구 실행 기록을 하나씩 추가')
     args = parser.parse_args(argv)
     if not 0 <= args.port <= 65535:
         parser.error('포트는 0~65535 범위여야 합니다.')
@@ -206,6 +249,8 @@ def main(argv=None):
                      'account': '검증 계정', 'project': '메시지 검증', 'updatedAt': now - index,
                      'snippet': '모델·SSH 호출 없는 검증용 세션입니다.'})
     fake = FakeNative(rows)
+    if args.live_tools:
+        threading.Thread(target=fake.add_tool_records, args=(max(args.live_tools, 1.0),), daemon=True).start()
     hosts = [{'name': 'local', 'label': '입력 검증용', 'local': True}]
 
     def runner(host, command, timeout):

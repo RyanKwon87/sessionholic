@@ -1,9 +1,14 @@
+import io
 import json
 import os
+import shutil
+import socket
 import struct
 from pathlib import Path
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from unittest.mock import patch
 
@@ -191,6 +196,87 @@ class MessageTest(unittest.TestCase):
         got = [(m["role"], m["text"]) for m in collector.codex_messages(turns)]
         self.assertEqual(got, [("user", "배포해"), ("tool", "$ git status"), ("tool", "파일 수정 · a.py, b.py"),
                                ("tool", "slack send"), ("assistant", "완료했습니다.")])
+        # Every tool row names its kind for the board's "도구 실행 N개 · 명령 1 · …" line.
+        self.assertEqual([m.get("toolKind") for m in collector.codex_messages(turns) if m["role"] == "tool"],
+                         ["command", "edit", "mcp"])
+        searched = collector.codex_messages([{"items": [{"type": "webSearch", "query": "x"},
+                                                        {"type": "dynamicToolCall", "tool": "t"}]}])
+        self.assertEqual([m["toolKind"] for m in searched], ["search", "other"])
+
+    def test_codex_times_come_from_the_turn_start_and_completion_only(self):
+        # Items carry no time: the question shows the turn's start, the final answer its
+        # completion, and progress notes, tools and inputs sent mid-turn show none.
+        turn = {"id": "t1", "status": "completed", "startedAt": 1000, "completedAt": 2500, "items": [
+            {"type": "userMessage", "content": [{"type": "text", "text": "질문"}]},
+            {"type": "agentMessage", "text": "살펴볼게요", "phase": "commentary"},
+            {"type": "commandExecution", "command": "ls"},
+            {"type": "userMessage", "content": [{"type": "text", "text": "중간 추가 지시"}]},
+            {"type": "agentMessage", "text": "최종 답", "phase": "final_answer"},
+            {"type": "agentMessage", "text": "덧붙임", "phase": "commentary"},
+        ]}
+        self.assertEqual([(m["text"], m["ts"]) for m in collector.codex_messages([turn])],
+                         [("질문", 1000), ("살펴볼게요", None), ("$ ls", None), ("중간 추가 지시", None),
+                          ("최종 답", 2500), ("덧붙임", None)])
+        # Without phases, a finished turn's last answer is its final one.
+        plain = {**turn, "items": [turn["items"][0], {"type": "agentMessage", "text": "하나"},
+                                   {"type": "agentMessage", "text": "둘"}]}
+        self.assertEqual([m["ts"] for m in collector.codex_messages([plain])], [1000, None, 2500])
+        # A running turn has no completion yet; older history without times shows none.
+        running = {**plain, "status": "inProgress", "completedAt": None}
+        self.assertEqual([m["ts"] for m in collector.codex_messages([running])], [1000, None, None])
+        self.assertEqual([m["ts"] for m in collector.codex_messages([{"items": plain["items"]}])], [None, None, None])
+        # The same rows per item for the native read path, which pairs them with item ids.
+        pairs = collector.codex_turn_rows(turn)
+        self.assertEqual(len(pairs), 6)
+        self.assertIs(pairs[4][0], turn["items"][4])
+        self.assertEqual(pairs[4][1][0]["ts"], 2500)
+
+    def test_claude_harness_lines_are_notes_not_user_bubbles(self):
+        entries = [
+            {"type": "user", "isCompactSummary": True, "timestamp": 1791334800,
+             "message": {"content": "This session is being continued from a previous conversation…"}},
+            {"type": "user", "timestamp": 1791334801, "message": {"content": [{"type": "text", "text": "[Request interrupted by user]"}]}},
+            {"type": "user", "timestamp": 1791334802,
+             "message": {"content": [{"type": "text", "text": "[Request interrupted by user for tool use]"}]}},
+            {"type": "user", "timestamp": 1791334803, "message": {"content": "<bash-input>git status</bash-input>"}},
+            {"type": "user", "timestamp": 1791334804, "message": {"content": "<bash-stdout>clean</bash-stdout><bash-stderr></bash-stderr>"}},
+            {"type": "assistant", "timestamp": 1791334805, "message": {"content": [
+                {"type": "tool_use", "name": "Edit", "input": {"file_path": "a.py"}},
+                {"type": "tool_use", "name": "mcp__slack__send", "input": {}},
+                {"type": "tool_use", "name": "Read", "input": {"file_path": "b.py"}},
+                {"type": "tool_use", "name": "Grep", "input": {"pattern": "x"}},
+                {"type": "tool_use", "name": "TodoWrite", "input": {}}]}},
+        ]
+        got = [(m["role"], m["text"], m.get("toolKind")) for m in collector.claude_messages(entries)]
+        self.assertEqual(got, [("system", "이전 대화 요약으로 이어짐", None), ("system", "사용자가 중단함", None),
+                               ("system", "사용자가 중단함", None), ("tool", "$ git status", "command"),
+                               ("tool", "Edit · a.py", "edit"), ("tool", "mcp__slack__send", "mcp"),
+                               ("tool", "Read · b.py", "read"), ("tool", "Grep · x", "search"),
+                               ("tool", "TodoWrite", "other")])
+        self.assertNotIn("continued", json.dumps(collector.claude_messages(entries)))
+
+    def test_claude_prompt_time_skips_tool_results_and_harness_lines(self):
+        entries = [
+            {"type": "user", "timestamp": 100, "message": {"content": "첫 질문"}},
+            {"type": "user", "timestamp": 200, "message": {"content": "두 번째 질문"}},
+            {"type": "assistant", "timestamp": 210, "message": {"content": [{"type": "tool_use", "name": "Bash", "input": {}}]}},
+            {"type": "user", "timestamp": 220, "message": {"content": [{"type": "tool_result", "content": "ok"}]}},
+            {"type": "user", "timestamp": 230, "isMeta": True, "message": {"content": "meta"}},
+            {"type": "user", "timestamp": 240, "message": {"content": "[Request interrupted by user]"}},
+            {"type": "user", "timestamp": 250, "message": {"content": "<task-notification>x</task-notification>"}},
+            {"type": "user", "timestamp": 260, "isCompactSummary": True, "message": {"content": "요약"}},
+        ]
+        self.assertEqual(collector.claude_prompt_at(entries), 200)
+        image = {"type": "user", "timestamp": 300, "message": {"content": [{"type": "image", "source": {}}]}}
+        self.assertEqual(collector.claude_prompt_at(entries + [image]), 300)
+        self.assertIsNone(collector.claude_prompt_at(entries[2:]))
+
+    def test_claude_row_without_an_id_keeps_its_process_id_apart(self):
+        rows = [{"id": "", "sessionId": "", "pid": 4242, "kind": "interactive", "state": "working", "cwd": "/w"},
+                {"id": "agent123", "sessionId": "s" * 8, "pid": 7, "kind": "background", "state": "idle", "cwd": "/w"}]
+        out = collector.claude_session_rows(rows, [], [], transcripts={})
+        self.assertEqual((out[0]["id"], out[0]["pid"]), ("", 4242))
+        self.assertNotIn("pid", out[1])
 
     def test_tail_entries_drops_cut_first_line(self):
         with tempfile.NamedTemporaryFile("wb", suffix=".jsonl", delete=False) as f:
@@ -391,6 +477,494 @@ class SnapshotIsolationTest(unittest.TestCase):
         # One independent connection per home, never more than four at a time.
         self.assertEqual(sorted(sockets), sorted(keys))
         self.assertEqual(peak[0], 4)
+
+
+class StateDbListingTest(unittest.TestCase):
+    """`thread/list` asks for the state DB, and retries once without it only on a reply error."""
+
+    class Server:
+        def __init__(self, calls, reject=False, broken=False):
+            self.calls, self.reject, self.broken = calls, reject, broken
+        def __enter__(self):
+            return self
+        def __exit__(self, *exc):
+            return False
+        def call(self, method, params):
+            self.calls.append((method, dict(params)))
+            if self.broken:
+                raise collector.RpcError("연결 끊김")
+            if method == "thread/list" and params.get("useStateDbOnly") and self.reject:
+                raise collector.RpcReplyError("unknown field `useStateDbOnly`", -32602)
+            return {"data": [{"id": "t1", "status": {"type": "idle"}}]} if method == "thread/list" else {"data": []}
+
+    def home_threads(self, full=False, **options):
+        calls = []
+        with patch.object(collector, "AppServer", lambda path: self.Server(calls, **options)):
+            reply = collector.codex_home_threads(Path("/synthetic/.codex"), full)
+        return reply, [(method, params.get("useStateDbOnly")) for method, params in calls]
+
+    def test_state_db_listing_and_one_retry_without_the_argument(self):
+        reply, calls = self.home_threads()
+        self.assertEqual(reply[2], None)
+        self.assertEqual(calls, [("thread/list", True), ("thread/loaded/list", None)])
+        reply, calls = self.home_threads(reject=True)
+        self.assertEqual([row["id"] for row in reply[0]["data"]], ["t1"])
+        self.assertEqual(calls, [("thread/list", True), ("thread/list", None), ("thread/loaded/list", None)])
+
+    def test_connection_failures_and_full_listing_are_not_retried(self):
+        reply, calls = self.home_threads(broken=True)
+        self.assertEqual(reply, (None, None, "connect"))
+        self.assertEqual(calls, [("thread/list", True)])
+        reply, calls = self.home_threads(full=True)
+        self.assertEqual(calls, [("thread/list", None), ("thread/loaded/list", None)])
+
+    def test_reply_errors_keep_their_code_and_remain_rpc_errors(self):
+        wire = (b'HTTP/1.1 101 Switching Protocols\r\n\r\n' + SocketBufferTest.frame(b'{"id":1,"result":{}}')
+                + SocketBufferTest.frame(b'{"id":2,"error":{"code":-32603,"message":"state db"}}'))
+        sock = SocketBufferTest.Socket(wire)
+        with patch.object(collector.socket, 'socket', return_value=sock):
+            with collector.AppServer('/synthetic/socket') as client:
+                with self.assertRaises(collector.RpcReplyError) as caught:
+                    client.call('thread/list', {})
+        self.assertIsInstance(caught.exception, collector.RpcError)
+        self.assertEqual(caught.exception.code, -32603)
+
+    def test_snapshot_full_flag_is_the_only_snapshot_option(self):
+        with patch.object(collector, "snapshot", return_value={"ok": 1}) as snap, \
+             patch("sys.stdout", new_callable=io.StringIO) as out:
+            collector.main(["snapshot", "--full"])
+            collector.main(["snapshot"])
+            collector.main(["snapshot", "--other"])
+        self.assertEqual([call.kwargs for call in snap.call_args_list], [{"full": True}, {"full": False}])
+        self.assertIn("사용법", out.getvalue().splitlines()[-1])
+
+
+class LinkedHomeTest(unittest.TestCase):
+    def test_symlinked_codex_homes_are_listed_once(self):
+        home = Path(tempfile.mkdtemp(prefix="sh", dir="/tmp")).resolve()
+        self.addCleanup(shutil.rmtree, home)
+        for key in (".codex", ".codex-work", ".codex-router/0123456789abcdef"):
+            socket_path = home / key / collector.SOCKET_REL
+            socket_path.parent.mkdir(parents=True)
+            socket_path.write_text("")
+        # An alias folder and a router entry pointing at an existing home are the same daemon.
+        (home / ".codex-alias").symlink_to(home / ".codex-work")
+        (home / ".codex-router/fedcba9876543210").symlink_to(home / ".codex-work")
+        with patch.object(collector, "HOME", home), patch.object(collector, "ROUTER", home / ".codex-router"):
+            keys = [key for key, _ in collector.codex_homes()]
+        self.assertEqual(keys, [".codex", ".codex-work", ".codex-router/0123456789abcdef"])
+
+
+class FakeDaemon:
+    """A Codex app-server stand-in on a real Unix socket: WebSocket upgrade, JSON-RPC
+    replies from `threads`, and notifications pushed to every initialized client."""
+
+    def __init__(self, path, threads=None, loaded=(), reject_state_db=False):
+        self.path = str(path)
+        self.threads = list(threads or [])
+        self.loaded = list(loaded)
+        self.reject_state_db = reject_state_db
+        self.lock = threading.Lock()
+        self.calls, self.clients, self.workers = [], [], []
+        self.capabilities = []
+        self.listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.listener.bind(self.path)
+        self.listener.listen(8)
+        # A close from another thread does not wake a blocked accept on every platform.
+        self.listener.settimeout(0.05)
+        self.closed = False
+        self.acceptor = threading.Thread(target=self.accept, daemon=True)
+        self.acceptor.start()
+
+    @staticmethod
+    def recv_exact(conn, size):
+        data = b""
+        while len(data) < size:
+            chunk = conn.recv(size - len(data))
+            if not chunk:
+                raise ConnectionError("closed")
+            data += chunk
+        return data
+
+    def accept(self):
+        while not self.closed:
+            try:
+                conn, _ = self.listener.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                return
+            conn.settimeout(None)
+            worker = threading.Thread(target=self.serve, args=(conn,), daemon=True)
+            self.workers.append(worker)
+            worker.start()
+
+    def serve(self, conn):
+        try:
+            request = b""
+            while b"\r\n\r\n" not in request:
+                request += self.recv_exact(conn, 1)
+            conn.sendall(b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n")
+            while True:
+                head = self.recv_exact(conn, 2)
+                opcode, size = head[0] & 0x0F, head[1] & 0x7F
+                if size == 126:
+                    size = struct.unpack(">H", self.recv_exact(conn, 2))[0]
+                elif size == 127:
+                    size = struct.unpack(">Q", self.recv_exact(conn, 8))[0]
+                mask = self.recv_exact(conn, 4)
+                payload = bytes(b ^ mask[i % 4] for i, b in enumerate(self.recv_exact(conn, size)))
+                if opcode == 0x8:
+                    return
+                message = json.loads(payload)
+                if "id" in message:
+                    self.answer(conn, message)
+                elif message.get("method") == "initialized":
+                    with self.lock:
+                        self.clients.append(conn)
+        except (OSError, ValueError, ConnectionError):
+            pass
+        finally:
+            with self.lock:
+                if conn in self.clients:
+                    self.clients.remove(conn)
+            conn.close()
+
+    def answer(self, conn, message):
+        method, params = message.get("method"), message.get("params") or {}
+        with self.lock:
+            self.calls.append((method, params.get("useStateDbOnly")))
+            if method == "initialize":
+                self.capabilities.append(params.get("capabilities"))
+                reply = {"result": {"userAgent": "fake"}}
+            elif method == "thread/list" and params.get("useStateDbOnly") and self.reject_state_db:
+                reply = {"error": {"code": -32602, "message": "unknown field"}}
+            elif method == "thread/list":
+                reply = {"result": {"data": json.loads(json.dumps(self.threads))}}
+            elif method == "thread/loaded/list":
+                reply = {"result": {"data": list(self.loaded)}}
+            else:
+                reply = {"error": {"code": -32601, "message": "not here"}}
+        self.send(conn, dict(reply, id=message["id"]))
+
+    @staticmethod
+    def send(conn, message):
+        data = json.dumps(message).encode()
+        header = bytes([0x81, len(data)]) if len(data) < 126 else bytes([0x81, 126]) + struct.pack(">H", len(data))
+        conn.sendall(header + data)
+
+    def notify(self, method, params):
+        with self.lock:
+            clients = list(self.clients)
+        for conn in clients:
+            try:
+                self.send(conn, {"method": method, "params": params})
+            except OSError:
+                pass
+
+    def count(self, method, state_db="any"):
+        """Calls of `method`; `state_db` True or None (argument absent) narrows thread/list."""
+        with self.lock:
+            return sum(1 for m, flag in self.calls if m == method and (state_db == "any" or flag == state_db))
+
+    def close(self):
+        self.closed = True
+        try:
+            self.listener.close()
+        except OSError:
+            pass
+        with self.lock:
+            clients = list(self.clients)
+        for conn in clients:
+            try:
+                conn.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+        try:
+            os.unlink(self.path)
+        except OSError:
+            pass
+        self.acceptor.join(2)
+        for worker in self.workers:
+            worker.join(2)
+
+
+class Lines:
+    """The watcher's stdout: whole JSON lines, available as they are written."""
+    def __init__(self):
+        self.buffer, self.condition, self.items = b"", threading.Condition(), []
+
+    def write(self, data):
+        with self.condition:
+            self.buffer += data
+            while b"\n" in self.buffer:
+                line, self.buffer = self.buffer.split(b"\n", 1)
+                self.items.append(json.loads(line))
+            self.condition.notify_all()
+
+    def flush(self):
+        pass
+
+    def wait(self, predicate, timeout=5.0, start=0):
+        """The first line from index `start` matching `predicate`, and its index."""
+        deadline = time.monotonic() + timeout
+        with self.condition:
+            while True:
+                for index in range(start, len(self.items)):
+                    if predicate(self.items[index]):
+                        return self.items[index], index
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise AssertionError("no matching line in %r" % [item.get("type") for item in self.items])
+                self.condition.wait(remaining)
+
+    def snapshots(self):
+        with self.condition:
+            return [item for item in self.items if item.get("type") == "snapshot"]
+
+
+def thread_row(thread_id, status="idle", name="작업", updated=1791334800):
+    return {"id": thread_id, "name": name, "status": {"type": status, "activeFlags": []},
+            "createdAt": 1791334000, "updatedAt": updated, "cwd": "/example"}
+
+
+class WatchTest(unittest.TestCase):
+    FAST = {"WATCH_DEBOUNCE": 0.05, "WATCH_CODEX_POLL": 30.0, "WATCH_FULL": 60.0, "WATCH_CLAUDE_STAT": 0.05,
+            "WATCH_CLAUDE_GAP": 0.1, "WATCH_CLAUDE_REFRESH": 60.0, "WATCH_TMUX": 60.0, "WATCH_HOMES": 60.0,
+            "WATCH_RECONNECT": (0.05, 0.1), "WATCH_READY": 3.0, "WATCH_GAP": 0.05, "WATCH_MINOR_GAP": 0.05,
+            "WATCH_HEARTBEAT": 60.0, "WATCH_PING_TIMEOUT": 30.0, "WATCH_LOCK_WAIT": 0.3}
+
+    def setUp(self):
+        self.baseline = set(threading.enumerate())
+        self.home = Path(tempfile.mkdtemp(prefix="sh", dir="/tmp")).resolve()
+        self.addCleanup(shutil.rmtree, self.home, True)
+        patches = {"HOME": self.home, "ROUTER": self.home / ".codex-router", "WATCH_LOCK_ROOT": self.home}
+        patches.update(self.FAST)
+        for name, value in patches.items():
+            patcher = patch.object(collector, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.agents = None
+        self.agent_calls = 0
+        def agent_rows(errors):
+            self.agent_calls += 1
+            return json.loads(json.dumps(self.agents)) if self.agents is not None else None
+        for name, value in (("claude_agent_rows", agent_rows), ("tmux_sessions", lambda: []),
+                            ("load_projects", lambda path=None: [])):
+            patcher = patch.object(collector, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.daemons = []
+        self.watches = []
+
+    def tearDown(self):
+        for watch, writer, runner in self.watches:
+            try:
+                writer.close()
+            except OSError:
+                pass
+            runner.join(5)
+            self.assertFalse(runner.is_alive(), "watch did not end")
+        for daemon in self.daemons:
+            daemon.close()
+        # No watcher, home, input or fake daemon thread outlives its test.
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline and set(threading.enumerate()) - self.baseline:
+            time.sleep(0.02)
+        self.assertEqual(set(threading.enumerate()) - self.baseline, set())
+        for watch, _, _ in self.watches:
+            watch.stdin.close()
+
+    def daemon(self, key=".codex", target="d1", **options):
+        """A daemon whose socket is reached through the home's symlink, like Codex's own."""
+        socket_path = self.home / key / collector.SOCKET_REL
+        socket_path.parent.mkdir(parents=True, exist_ok=True)
+        daemon = FakeDaemon(self.home / (target + ".sock"), **options)
+        self.daemons.append(daemon)
+        if socket_path.is_symlink():
+            socket_path.unlink()
+        socket_path.symlink_to(daemon.path)
+        return daemon
+
+    def start(self, board_id=None):
+        reader, writer = os.pipe()
+        stdin, writer = os.fdopen(reader, "rb"), os.fdopen(writer, "wb", buffering=0)
+        out = Lines()
+        watch = collector.Watch(stdin, out, board_id)
+        runner = threading.Thread(target=watch.run)
+        self.watches.append((watch, writer, runner))
+        runner.start()
+        return watch, writer, out
+
+    @staticmethod
+    def codex(snapshot):
+        return [(row["id"], row["phase"], row["title"]) for row in snapshot["data"]["codex"]]
+
+    def test_notification_triggers_one_quick_list_and_no_change_prints_nothing(self):
+        daemon = self.daemon(threads=[thread_row("t1")])
+        watch, writer, out = self.start()
+        first, index = out.wait(lambda m: m.get("type") == "snapshot")
+        self.assertEqual(out.items[0]["type"], "hello")
+        self.assertEqual((first["seq"], first["reason"]), (1, "initial"))
+        self.assertEqual(self.codex(first), [("t1", "idle", "작업")])
+        self.assertEqual(set(first["data"]), {"host", "collectedAt", "claude", "codex", "tmux", "errors"})
+        caps = daemon.capabilities[0]
+        self.assertTrue(caps["experimentalApi"])
+        self.assertIn("account/rateLimits/updated", caps["optOutNotificationMethods"])
+        lists = daemon.count("thread/list", True)
+        # Nothing changes and the backup poll is far away: no second snapshot.
+        time.sleep(0.4)
+        self.assertEqual(len(out.snapshots()), 1)
+        self.assertEqual(daemon.count("thread/list"), lists)
+        with daemon.lock:
+            daemon.threads = [thread_row("t1", "active")]
+        daemon.notify("thread/status/changed", {"threadId": "t1", "status": {"type": "active", "activeFlags": []}})
+        daemon.notify("thread/status/changed", {"threadId": "t1", "status": {"type": "active", "activeFlags": []}})
+        changed, _ = out.wait(lambda m: m.get("type") == "snapshot" and m["seq"] == 2, timeout=3)
+        self.assertEqual(self.codex(changed), [("t1", "working", "작업")])
+        self.assertEqual(changed["reason"], "change")
+        # Two notifications within the debounce window made one quick (state DB) list.
+        self.assertEqual(daemon.count("thread/list", True), lists + 1)
+        self.assertEqual(daemon.count("thread/list", None), 0)
+        self.assertEqual(watch.homes[".codex"].notices, 2)
+        writer.close()
+        bye, _ = out.wait(lambda m: m.get("type") == "bye")
+        self.assertEqual(bye["reason"], "stdin-closed")
+
+    def test_backup_polls_and_minor_changes_wait_longer(self):
+        daemon = self.daemon(threads=[thread_row("t1")])
+        with patch.object(collector, "WATCH_CODEX_POLL", 0.1), patch.object(collector, "WATCH_MINOR_GAP", 0.8):
+            watch, writer, out = self.start()
+            out.wait(lambda m: m.get("type") == "snapshot")
+            # A rename without any notification is found by the backup poll.
+            with daemon.lock:
+                daemon.threads = [thread_row("t1", name="새 이름")]
+            renamed, _ = out.wait(lambda m: m.get("type") == "snapshot" and m["seq"] == 2, timeout=3)
+            renamed_at = time.monotonic()
+            self.assertEqual(self.codex(renamed), [("t1", "idle", "새 이름")])
+            # Only a time moved: batched behind the longer gap.
+            with daemon.lock:
+                daemon.threads = [thread_row("t1", name="새 이름", updated=1791334900)]
+            moved, _ = out.wait(lambda m: m.get("type") == "snapshot" and m["seq"] == 3, timeout=3)
+            self.assertGreaterEqual(time.monotonic() - renamed_at, 0.7)
+            self.assertEqual(moved["data"]["codex"][0]["updatedAt"], 1791334900)
+            writer.close()
+            out.wait(lambda m: m.get("type") == "bye")
+
+    def test_state_db_rejection_is_asked_once_per_connection(self):
+        daemon = self.daemon(threads=[thread_row("t1")], reject_state_db=True)
+        with patch.object(collector, "WATCH_CODEX_POLL", 0.05):
+            watch, writer, out = self.start()
+            first, _ = out.wait(lambda m: m.get("type") == "snapshot")
+            self.assertEqual(self.codex(first), [("t1", "idle", "작업")])
+            deadline = time.monotonic() + 3
+            while daemon.count("thread/list", None) < 4 and time.monotonic() < deadline:
+                time.sleep(0.02)
+            self.assertGreaterEqual(daemon.count("thread/list", None), 4)
+            self.assertEqual(daemon.count("thread/list", True), 1)
+            writer.close()
+            out.wait(lambda m: m.get("type") == "bye")
+
+    def test_reconnects_through_the_symlink_after_a_daemon_restart(self):
+        old = self.daemon(threads=[thread_row("t1")])
+        watch, writer, out = self.start()
+        out.wait(lambda m: m.get("type") == "snapshot")
+        # The daemon restarts behind a new socket target with a new thread.
+        new = self.daemon(target="d2", threads=[thread_row("t1"), thread_row("t2", "active")])
+        old.close()
+        changed, index = out.wait(lambda m: m.get("type") == "snapshot" and m["seq"] == 2, timeout=5)
+        self.assertEqual(self.codex(changed), [("t1", "idle", "작업"), ("t2", "working", "작업")])
+        self.assertEqual(changed["data"]["errors"], [])
+        self.assertEqual(new.count("initialize"), 1)
+        # A daemon that stays away is reported, as a one-shot collection would.
+        new.close()
+        gone, _ = out.wait(lambda m: m.get("type") == "snapshot" and m["seq"] == 3, timeout=5)
+        self.assertEqual(gone["data"]["codex"], [])
+        self.assertEqual(gone["data"]["errors"], ["Codex daemon(기본)에 연결하지 못했습니다."])
+        writer.close()
+        out.wait(lambda m: m.get("type") == "bye")
+
+    def test_ping_timeout_ends_the_watch_and_pings_keep_it(self):
+        self.daemon(threads=[thread_row("t1")])
+        with patch.object(collector, "WATCH_PING_TIMEOUT", 0.6):
+            watch, writer, out = self.start()
+            out.wait(lambda m: m.get("type") == "snapshot")
+            for _ in range(6):
+                writer.write(b"ping\n")
+                time.sleep(0.2)
+            self.assertFalse(any(m.get("type") == "bye" for m in out.items))
+            bye, _ = out.wait(lambda m: m.get("type") == "bye", timeout=3)
+        self.assertEqual(bye["reason"], "ping-timeout")
+        runner = self.watches[-1][2]
+        runner.join(3)
+        self.assertFalse(runner.is_alive())
+
+    def test_refresh_reads_everything_now_with_a_full_codex_listing(self):
+        daemon = self.daemon(threads=[thread_row("t1")])
+        self.agents = []
+        watch, writer, out = self.start()
+        out.wait(lambda m: m.get("type") == "snapshot")
+        calls = self.agent_calls
+        writer.write(b"refresh\n")
+        deadline = time.monotonic() + 3
+        while (daemon.count("thread/list", None) < 1 or self.agent_calls == calls) and time.monotonic() < deadline:
+            time.sleep(0.02)
+        self.assertEqual(daemon.count("thread/list", None), 1)
+        self.assertGreater(self.agent_calls, calls)
+        writer.close()
+        out.wait(lambda m: m.get("type") == "bye")
+
+    def test_claude_transcript_append_updates_the_preview_without_the_cli(self):
+        session = "c0000000-0000-4000-8000-000000000001"
+        transcript = self.home / ".claude/projects/example" / (session + ".jsonl")
+        transcript.parent.mkdir(parents=True)
+        answer = lambda text: json.dumps({"type": "assistant", "message": {"content": [{"type": "text", "text": text}]}}) + "\n"
+        transcript.write_text(answer("첫 답"))
+        registry = self.home / ".claude/sessions/123.json"
+        registry.parent.mkdir(parents=True)
+        registry.write_text("{}")
+        self.agents = [{"id": "row-1", "sessionId": session, "name": "정산", "state": "working", "status": "busy"}]
+        watch, writer, out = self.start()
+        first, _ = out.wait(lambda m: m.get("type") == "snapshot")
+        self.assertEqual(first["data"]["claude"][0]["snippet"], "첫 답")
+        calls = self.agent_calls
+        with open(transcript, "a") as stream:
+            stream.write(answer("두 번째 답"))
+        changed, _ = out.wait(lambda m: m.get("type") == "snapshot" and m["seq"] == 2, timeout=3)
+        self.assertEqual(changed["data"]["claude"][0]["snippet"], "두 번째 답")
+        self.assertEqual(self.agent_calls, calls)
+        # A registry change (a status flip) asks `claude agents` again.
+        self.agents[0]["status"] = "idle"
+        self.agents[0]["state"] = "done"
+        registry.write_text('{"status": "idle"}')
+        done, _ = out.wait(lambda m: m.get("type") == "snapshot" and m["seq"] == 3, timeout=3)
+        self.assertEqual(done["data"]["claude"][0]["phase"], "done")
+        self.assertGreater(self.agent_calls, calls)
+        writer.close()
+        out.wait(lambda m: m.get("type") == "bye")
+
+    def test_one_watcher_per_board_holds_the_lock(self):
+        import fcntl
+        folder = self.home / ("sessionholic-watch-%d" % os.getuid())
+        folder.mkdir(mode=0o700)
+        holder = os.open(str(folder / "0123456789abcdef.lock"), os.O_RDWR | os.O_CREAT, 0o600)
+        fcntl.flock(holder, fcntl.LOCK_EX)
+        watch, writer, out = self.start("0123456789abcdef")
+        busy, _ = out.wait(lambda m: m.get("type") in ("busy", "snapshot"))
+        self.assertEqual(busy["type"], "busy")
+        os.close(holder)
+        # Once the previous watcher is gone, the next one starts normally.
+        watch, writer, out = self.start("0123456789abcdef")
+        out.wait(lambda m: m.get("type") == "snapshot")
+        self.assertEqual(oct(folder.stat().st_mode & 0o777), oct(0o700))
+        writer.close()
+        out.wait(lambda m: m.get("type") == "bye")
+
+    def test_watch_rejects_bad_board_ids(self):
+        with patch("sys.stdout", new_callable=io.StringIO) as out:
+            self.assertEqual(collector.watch_main(["--board", "../x"]), 2)
+            self.assertEqual(collector.watch_main(["extra"]), 2)
+        self.assertEqual([json.loads(line)["reason"] for line in out.getvalue().splitlines()], ["usage", "usage"])
 
 
 if __name__ == "__main__":

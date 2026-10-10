@@ -120,7 +120,7 @@ function client(
   vm.runInContext(messageSource, context);
   vm.runInContext(source, context);
   const api = vm.runInContext(
-    "({state,api,sourceOf,accountOf,sendInput,pasteDraft,prepareDraftPaste,startDraftComposition,endDraftComposition,inputDraft,stopTerminalReader,startTerminalReader,closePlan,navigateView,backToList,backFromTerminal,closeTerminal,cancelTerminalClose,confirmTerminalClose,populateAccount,populateRoute,updateContinue,renderPlan,launchPlan,openTerminal,saveDraft,draftKey,refreshTerminals,renderTerminals,renderTerminalReturn,renderFilters,terminalCloseCopy,warnDraftUnload,preparePlan,renderGroups,renderMessages,loadDetail,chatKey,chatEntry,currentChat,chatSupported,chatAttachmentsSupported,buildChatComposer,sendChat,loadChatState,applyChatReceipt,uploadChatFiles,pasteChat,scheduleChatPoll,stopChatPolling,openNativeChat,allSessions,buildContinuePanel,chatReceiptCopy,returnToBoard,readChatClipboard,accountDisplay,sessionAccountLabel,closeChatToolsOutside,closeChatToolsEscape,drawDetail,refreshDetail,loadCapabilities,matches,recoverConnection,networkOffline,poll,select,focusDetailBack,restoreSelectedCardFocus,showLogin,lock,beginAuthEpoch,resizeChatInput,updateViewport,draftKeydown,configureTerminalKeyboard,queueTerminalScroll,flushTerminalScroll,terminalScrollEnd,renderAttention,chatPollDelay,pullRefresh,readingScroll,renderJump,pullDistance,listScroll,setReading,renderPrompt,promptAction,renderUsage,loadUsage,applyTheme,setTheme,updateThemeColor,haptic,navTransition,setDetailShown,chatVisible,sheetRelease,BottomSheet,sheet,openSettings,closeSettings,setTyping,pinchFontSize,setTerminalFontSize,loadXterm,assetUrl,syncEvents,closeEvents,eventsHealthy,renderFreshness,schedule,touchDevice,togglePhaseFilter,renderCounts,createLongPress,swipeIntent,swipeRelease,groupMessageRows,setTextSize,applyTextSize,renderConnectivity,terminalForSession,swipeActionFor,openMessageMenu,openCardMenu,messageActions,outboxShape,outboxMatches,outboxOrigin,settleOutbox,retryOutbox,renderAttachmentTiles,attachmentThumb,sendUpload,openActionSheet,closeActionSheet,setListCollapsed,closeSwipe,settleSwipe,prepareSwipe,runSwipeAction,LONG_PRESS_MS,PRESS_SLOP,SWIPE_REVEAL})",
+    "({state,api,sourceOf,accountOf,sendInput,pasteDraft,prepareDraftPaste,startDraftComposition,endDraftComposition,inputDraft,stopTerminalReader,startTerminalReader,closePlan,navigateView,backToList,backFromTerminal,closeTerminal,cancelTerminalClose,confirmTerminalClose,populateAccount,populateRoute,updateContinue,renderPlan,launchPlan,openTerminal,saveDraft,draftKey,refreshTerminals,renderTerminals,renderTerminalReturn,renderFilters,terminalCloseCopy,warnDraftUnload,preparePlan,renderGroups,renderMessages,loadDetail,chatKey,chatEntry,currentChat,chatSupported,chatAttachmentsSupported,buildChatComposer,sendChat,loadChatState,applyChatReceipt,uploadChatFiles,pasteChat,scheduleChatPoll,stopChatPolling,openNativeChat,allSessions,buildContinuePanel,chatReceiptCopy,returnToBoard,readChatClipboard,accountDisplay,sessionAccountLabel,closeChatToolsOutside,closeChatToolsEscape,drawDetail,refreshDetail,loadCapabilities,matches,recoverConnection,networkOffline,poll,select,focusDetailBack,restoreSelectedCardFocus,showLogin,lock,beginAuthEpoch,resizeChatInput,updateViewport,draftKeydown,configureTerminalKeyboard,queueTerminalScroll,flushTerminalScroll,terminalScrollEnd,renderAttention,chatPollDelay,pullRefresh,readingScroll,renderJump,pullDistance,listScroll,setReading,renderPrompt,promptAction,renderUsage,loadUsage,applyTheme,setTheme,updateThemeColor,haptic,navTransition,setDetailShown,chatVisible,sheetRelease,BottomSheet,sheet,openSettings,closeSettings,setTyping,pinchFontSize,setTerminalFontSize,loadXterm,assetUrl,syncEvents,closeEvents,eventsHealthy,renderFreshness,schedule,touchDevice,togglePhaseFilter,renderCounts,createLongPress,swipeIntent,swipeRelease,groupMessageRows,setTextSize,applyTextSize,renderConnectivity,terminalForSession,swipeActionFor,openMessageMenu,openCardMenu,messageActions,outboxShape,outboxMatches,outboxOrigin,settleOutbox,retryOutbox,renderAttachmentTiles,attachmentThumb,sendUpload,openActionSheet,closeActionSheet,setListCollapsed,closeSwipe,settleSwipe,prepareSwipe,runSwipeAction,GESTURE,setChromeVisible,toggleChrome,revealChrome,isChromeTap,snapshotAnnounced,updateChatComposer,capabilitiesRevision,toolKindOf,userMessageParts,formatElapsed,tickWorking})",
     context,
   );
   api.state.csrf = "csrf-test";
@@ -1807,14 +1807,14 @@ test('unchanged and appended conversations retain selected nodes and expanded to
   const messages = [{ role: 'tool', text: '도구 본문' }, { role: 'assistant', text: '답변 본문', ts: 123 }];
   c.renderMessages(s, messages);
   const list = c.get('messages'); const tool = list.children[0]; const answer = list.children[1];
-  tool.children[0].open = true;
+  tool.toolToggle.events.click();
   list.contains = (node) => node === answer;
   c.context.window.getSelection = () => ({ isCollapsed: false, anchorNode: answer, focusNode: answer });
   list.scrollHeight = 500; list.clientHeight = 100; list.scrollTop = 395;
   c.renderMessages(s, messages);
   c.renderMessages(s, [...messages, { role: 'user', text: '새 답변' }]);
   assert.equal(list.children[0], tool); assert.equal(list.children[1], answer);
-  assert.equal(tool.children[0].open, true); assert.equal(list.scrollTop, 395);
+  assert.equal(tool.open, true); assert.equal(tool.toolList.hidden, false); assert.equal(list.scrollTop, 395);
   let copied;
   c.context.navigator = { clipboard: { writeText: async (text) => { copied = text; } } };
   assert.equal(answer.moreButton.attributes['aria-label'], '메시지 메뉴');
@@ -1927,7 +1927,7 @@ test('online recovery reads one selected state and snapshot without resending un
   const { s, entry } = selectChat(c); snapshot = c.state.snapshot;
   c.state.detailFor = s.key; c.state.detailUpdatedAt = s.updatedAt;
   c.state.detailRevision = JSON.stringify([false, undefined, undefined, undefined, '현재 계정 설정', 'Workstation', undefined, null, null]);
-  c.state.capabilities = {}; c.state.capabilitiesRevision = JSON.stringify([['workstation', true, undefined]]);
+  c.state.capabilities = {}; c.state.capabilitiesRevision = c.capabilitiesRevision(c.state.snapshot);
   entry.pending = { requestId: 'unknown-request', revision: entry.revision }; entry.text = '전송 결과 모르는 초안';
   c.state.offline = true; c.context.navigator = { onLine: true };
   c.recoverConnection(); await new Promise((resolve) => setImmediate(resolve));
@@ -2028,7 +2028,7 @@ test('offline visibility and return-online events restart only bounded reads and
   const { s, entry } = selectChat(c);
   c.state.detailFor = s.key; c.state.detailUpdatedAt = s.updatedAt;
   c.state.detailRevision = JSON.stringify([false, undefined, undefined, undefined, '현재 계정 설정', 'Workstation', undefined, null, null]);
-  c.state.capabilities = {}; c.state.capabilitiesRevision = JSON.stringify([['workstation', true, undefined]]);
+  c.state.capabilities = {}; c.state.capabilitiesRevision = c.capabilitiesRevision(c.state.snapshot);
   entry.text = '미전송 초안';
   c.windowEvents.offline(); assert.equal(c.state.offline, true);
   c.context.document.hidden = true; c.documentEvents.visibilitychange();
@@ -2614,13 +2614,13 @@ test('attachment metadata refresh replaces only changed message rows and preserv
   list.scrollHeight = 500; list.clientHeight = 100; list.scrollTop = 70;
   c.renderMessages(s, messages);
   const [tool, user] = list.children;
-  tool.children[0].open = true;
+  tool.toolToggle.events.click();
   c.renderMessages(s, JSON.parse(JSON.stringify(messages)));
   assert.equal(list.children[0], tool); assert.equal(list.children[1], user);
   const renamed = structuredClone(messages);
   renamed[1].attachments[0].name = '서버에서 복원된 이름.txt';
   c.renderMessages(s, renamed);
-  assert.equal(list.children[0], tool); assert.equal(tool.children[0].open, true);
+  assert.equal(list.children[0], tool); assert.equal(tool.open, true);
   assert.notEqual(list.children[1], user);
   assert.match(textOf(list.children[1]), /서버에서 복원된 이름.txt/);
   assert.equal(list.scrollTop, 70);
@@ -3952,13 +3952,17 @@ test('live updates follow the open conversation, reread only on newer events, sl
     requests.push(url);
     return { ok: true, status: 200, json: async () => (url.startsWith('/api/snapshot') ? { hosts: c.state.snapshot.hosts, version: 7 }
       : { route: JSON.parse(options.body).source, capability: { supported: true }, phase: 'working', messages: [] }) };
-  }, { setTimeout: (callback, ms) => { timers.push(ms); return timers.length; }, clearTimeout() {} });
+  }, { setTimeout: (callback, ms) => {
+    // Announced snapshots are read after a 300ms batch; run that one at once.
+    if (ms === 300) { setImmediate(callback); return 'batch'; }
+    timers.push(ms); return timers.length;
+  }, clearTimeout() {} });
   const { FakeEventSource, sources } = fakeEventSource();
   c.context.EventSource = FakeEventSource;
   const { s } = selectChat(c);
   c.state.detailShown = true;
   c.state.capabilities = {};
-  c.state.capabilitiesRevision = JSON.stringify(c.state.snapshot.hosts.map((host) => [host.name, host.ok, host.fetchedAt]));
+  c.state.capabilitiesRevision = c.capabilitiesRevision(c.state.snapshot);
   c.state.usageAt = Date.now();
   c.state.detailFor = s.key; c.state.detailUpdatedAt = s.updatedAt;
   c.state.detailRevision = JSON.stringify([false, undefined, undefined, undefined, '현재 계정 설정', 'Workstation', undefined, null, null]);
@@ -4528,7 +4532,7 @@ test('a long press opens its menu after 450ms, while a drag, an early release or
   const timers = [];
   const c = client(undefined, { setTimeout: (callback, delay) => { timers.push({ callback, delay }); return timers.length; },
     clearTimeout(id) { if (timers[id - 1]) timers[id - 1].cleared = true; } });
-  assert.equal(c.LONG_PRESS_MS, 450); assert.equal(c.PRESS_SLOP, 10);
+  assert.equal(c.GESTURE.longPressMs, 450); assert.equal(c.GESTURE.pressSlopPx, 10);
   const fired = [];
   const press = c.createLongPress((target) => fired.push(target));
   const down = (extra = {}) => ({ pointerId: 1, pointerType: 'touch', clientX: 100, clientY: 200, ...extra });
@@ -4623,7 +4627,7 @@ test('a swipe offers 터미널 열기, or 연결 닫기 when the session has a b
   assert.equal(prevented, 1, 'a swiping finger does not also scroll the list');
   assert.equal(row.swipeAction.textContent, '실행 종료');
   groups.events.pointerup({ pointerId: 3 });
-  assert.equal(c.state.swipeOpen, row); assert.equal(row.swipeOffset, -c.SWIPE_REVEAL);
+  assert.equal(c.state.swipeOpen, row); assert.equal(row.swipeOffset, -c.GESTURE.swipeRevealPx);
   assert.match(row.className, /is-open/);
   // The revealed button takes its first tap right after the swipe.
   let swallowed = 0;
@@ -4891,4 +4895,621 @@ test('a long question menu keeps its first choices inline and lists every choice
   c.renderPrompt(s, entry.data);
   assert.equal(findClass(c.get('chat-prompt'), 'chat-prompt-option').length, 5);
   assert.equal(findClass(c.get('chat-prompt'), 'chat-prompt-more').length, 0);
+});
+
+// --- Phone conversation bars, explicit terminals, gesture thresholds, batched snapshot events ---
+
+// A phone conversation (coarse pointer) with a scrolled transcript and a controllable clock.
+function phoneConversation({ coarse = true, timers = noChatTimers, fetchImpl } = {}) {
+  const c = client(fetchImpl, timers);
+  const { s, entry } = selectChat(c);
+  c.drawDetail(s);
+  const pane = c.get('detail'); pane.classList = classes();
+  const list = c.get('messages');
+  // As after the first render (renderMessages keeps the position it set).
+  Object.assign(list, { scrollHeight: 3000, clientHeight: 600, scrollTop: 2400, offsetTop: 80, lastScrollTop: 2400 });
+  c.context.window.matchMedia = (query) => ({ matches: coarse && query === '(pointer: coarse)' });
+  const clock = { now: 1e13 };
+  c.context.Date = class extends Date { static now() { return clock.now; } };
+  const plain = { closest: () => null };
+  const pointer = (type, { id = 1, x = 200, y = 400, target = plain, pointerType = 'touch' } = {}) =>
+    list.events[type]({ pointerId: id, pointerType, isPrimary: true, clientX: x, clientY: y, target, cancelable: true, preventDefault() {} });
+  // `after` ms since the last scroll: down, `ms` later up `dx` px away.
+  const tap = (options = {}, { ms = 80, dx = 0, after = 200 } = {}) => {
+    clock.now += after;
+    pointer('pointerdown', options);
+    clock.now += ms;
+    if (dx) pointer('pointermove', { ...options, x: (options.x ?? 200) + dx });
+    pointer('pointerup', { ...options, x: (options.x ?? 200) + dx });
+    clock.now += 400;
+  };
+  const scrollTo = (top) => { list.scrollTop = top; list.events.scroll(); clock.now += 16; };
+  return { c, s, entry, pane, list, clock, pointer, tap, scrollTo, reading: () => pane.classList.contains('is-reading') };
+}
+
+test('gesture thresholds live in one frozen object with the values the board used before', () => {
+  const c = client(undefined, noChatTimers);
+  assert.equal(Object.isFrozen(c.GESTURE), true);
+  const expected = { longPressMs: 450, pressSlopPx: 10, tapSlopPx: 10, tapMaxMs: 300, swipeRatio: 1.7, swipeRevealPx: 96,
+    swipeActionRatio: 0.6, swipeFlickSpeed: 0.4, pullTriggerPx: 64, pullMaxPx: 110, pullResistPx: 160, readingHideTravelPx: 32,
+    readingBottomPx: 24, jumpShowPx: 160, largeTitleCollapsePx: 36, pinchMinFont: 10, pinchMaxFont: 24, momentumMinSpeed: 0.35,
+    momentumDecay: 0.94, momentumStopSpeed: 0.03, momentumMaxMs: 1600, sheetDismissRatio: 0.25, sheetDismissSpeed: 0.5,
+    sheetFarRatio: 0.5, sheetFarSpeed: 1.4, sheetExpandPx: 48, sheetExpandSpeed: 0.5 };
+  for (const [key, value] of Object.entries(expected)) assert.equal(c.GESTURE[key], value, key);
+  // The decisions read them: the pull is elastic up to pullMaxPx, the swipe angle and slop are unchanged.
+  assert.ok(c.pullDistance(10000) <= c.GESTURE.pullMaxPx);
+  assert.equal(c.swipeIntent(-9, 0), null);
+  assert.equal(c.swipeIntent(-17, 10), 'swipe');
+  assert.equal(c.swipeIntent(-16, 10), 'scroll');
+  assert.equal(c.pinchFontSize(14, 100, 1000), c.GESTURE.pinchMaxFont);
+  // No stray copies of the old constants remain in the app.
+  assert.doesNotMatch(source, /\b(LONG_PRESS_MS|PRESS_SLOP|SWIPE_RATIO|SWIPE_REVEAL|PULL_TRIGGER|FONT_MIN|FONT_MAX|LARGE_TITLE_COLLAPSE)\b/);
+});
+
+test('on a phone a tap on the conversation shows or hides its bars; scrolling hides them and the end does not bring them back', () => {
+  const { c, pane, list, tap, scrollTo, reading } = phoneConversation();
+  assert.equal(c.state.chromeVisible, true, 'a conversation opens with its bars');
+  scrollTo(2390);
+  assert.equal(reading(), false, 'a 10px wobble keeps them');
+  scrollTo(2420); scrollTo(2440);
+  assert.equal(reading(), true, 'a 40px downward scroll hides them (the same 32px as upward)');
+  assert.equal(c.state.chromeVisible, false);
+  scrollTo(2400);
+  assert.equal(reading(), true, 'reaching the end keeps them hidden');
+  assert.equal(list.unread || 0, 0, 'the end still clears the new-message count');
+  tap();
+  assert.equal(reading(), false, 'a tap shows them');
+  assert.equal(c.state.chromeVisible, true);
+  tap();
+  assert.equal(reading(), true, 'another tap hides them');
+  tap();
+  scrollTo(2350);
+  assert.equal(reading(), true, 'scrolling up hides them again');
+  assert.equal(pane.classList.contains('is-typing'), false);
+});
+
+test('a drag, a slow press, a long press, a control, a selection or a touch that stops the list never toggles the bars', () => {
+  const callbacks = [];
+  const timers = { setTimeout: (callback, ms) => { callbacks.push({ callback, ms }); return callbacks.length; },
+    clearTimeout(id) { if (callbacks[id - 1]) callbacks[id - 1].cleared = true; } };
+  const { c, list, clock, pointer, tap, reading } = phoneConversation({ timers });
+  tap({}, { dx: 11 });
+  assert.equal(reading(), false, 'moving past tapSlopPx is a drag');
+  tap({}, { dx: 9 });
+  assert.equal(reading(), true, 'within tapSlopPx it is a tap');
+  tap({}, { ms: 301 });
+  assert.equal(reading(), true, 'held past tapMaxMs it is not a tap');
+  pointer('pointerdown'); clock.now += 60; pointer('pointercancel'); clock.now += 400;
+  assert.equal(reading(), true, 'a scroll ends in pointercancel, not a tap');
+  // Long press wins: its menu opens and the release is not a tap.
+  const row = { className: 'msg', messageItem: { role: 'assistant', message: { text: '답' } } };
+  const onRow = { closest: (selector) => (selector === '.msg' ? row : null) };
+  pointer('pointerdown', { target: onRow });
+  const press = callbacks.find((item) => item.ms === c.GESTURE.longPressMs && !item.cleared);
+  assert.ok(press, 'a long press is armed');
+  clock.now += 100; press.callback();
+  pointer('pointerup', { target: onRow }); clock.now += 400;
+  assert.equal(reading(), true, 'the long press opened the menu instead');
+  // Controls keep their own tap.
+  for (const selector of ['button', 'a', '.msg-more', '.message-block-copy', '.chat-prompt', '.msg-attachment', 'summary']) {
+    const control = { closest: (query) => (query.split(/,\s*/).includes(selector) ? {} : null) };
+    tap({ target: control });
+    assert.equal(reading(), true, selector);
+  }
+  c.context.window.getSelection = () => ({ isCollapsed: false });
+  tap();
+  assert.equal(reading(), true, 'a text selection is kept');
+  c.context.window.getSelection = () => ({ isCollapsed: true });
+  // A touch right after the list moved only stops its momentum.
+  list.scrollTop = 2200; list.events.scroll();
+  tap({}, { after: 50 });
+  assert.equal(reading(), true);
+  tap({}, { after: 200 });
+  assert.equal(reading(), false, 'once the list settled a tap works again');
+  // Mouse layouts keep their own rules: no tap toggle there.
+  c.context.window.matchMedia = () => ({ matches: false });
+  tap({ pointerType: 'mouse' });
+  assert.equal(reading(), false);
+  assert.equal(c.isChromeTap(null, {}), false);
+});
+
+test('the board\'s own scrolling, layout changes and typing never hide the bars on a phone', () => {
+  const { c, s, list, clock, scrollTo, reading } = phoneConversation();
+  // New messages at the end keep the reader at the end without hiding anything.
+  c.renderMessages(s, [{ role: 'assistant', text: '첫 답', ts: 1 }], '', true);
+  list.scrollHeight = 3400;
+  c.renderMessages(s, [{ role: 'assistant', text: '첫 답', ts: 1 }, { role: 'assistant', text: '새 답', ts: 2 }]);
+  assert.equal(list.scrollTop, 3400);
+  list.events.scroll();
+  assert.equal(reading(), false, 'a stick-to-end jump is not reading');
+  // A keyboard or the bars resizing the list moves it too.
+  list.clientHeight = 300; list.scrollTop = 3000; list.events.scroll();
+  assert.equal(reading(), false, 'a resize is not reading');
+  list.clientHeight = 600;
+  // The smooth "맨 아래" scroll is the board's, until a finger touches the list.
+  list.scrollTo = () => {};
+  list.scrollTop = 1000; list.lastScrollTop = 1000; list.events.scroll(); list.lastClientHeight = 600;
+  c.get('jump-bottom').events.click();
+  for (const top of [1400, 1900, 2400]) scrollTo(top);
+  assert.equal(reading(), false, 'the jump to the end does not hide the bars');
+  clock.now += 2000;
+  scrollTo(2350); scrollTo(2300);
+  assert.equal(reading(), true, 'the reader\'s own scroll still does');
+  // Typing: the input's folded layout; leaving it restores the reader's choice.
+  const input = c.get('chat-input');
+  const pane = c.get('detail');
+  c.context.document.activeElement = input;
+  input.events.focus();
+  assert.equal(pane.classList.contains('is-typing'), true);
+  assert.equal(reading(), false, 'typing shows only the typing layout');
+  assert.equal(c.state.chromeVisible, false, 'the reader\'s choice is kept for later');
+  scrollTo(1500);
+  c.revealChrome();
+  assert.equal(c.state.chromeVisible, true);
+  assert.equal(reading(), false, 'nothing unfolds under the keyboard');
+  c.setChromeVisible(false);
+  c.context.document.activeElement = null;
+  input.events.blur();
+  assert.equal(pane.classList.contains('is-typing'), false);
+  assert.equal(reading(), true, 'hidden before typing: hidden again after');
+  c.setChromeVisible(true);
+  c.context.document.activeElement = input; input.events.focus();
+  c.context.document.activeElement = null; input.events.blur();
+  assert.equal(reading(), false, 'shown before typing: shown again after');
+});
+
+test('a new question, a send result and a connection problem show the bars; re-renders of the same question do not', async () => {
+  const { c, s, entry, tap, reading } = phoneConversation({ fetchImpl: async (url) => {
+    if (url === '/api/chat/send') return { ok: false, status: 409, json: async () => ({ error: '지금은 보낼 수 없습니다.', dispatchState: 'not_started' }) };
+    if (url === '/api/chat/state') return { ok: false, status: 503, json: async () => ({ error: '연결 실패' }) };
+    return { ok: true, status: 200, json: async () => ({}) };
+  } });
+  tap();
+  assert.equal(reading(), true);
+  const prompt = { agent: 'codex', fingerprint: 'a'.repeat(64), current: 1, multi: false, question: '진행할까요?',
+    options: [{ number: 1, label: 'Yes', detail: '' }, { number: 2, label: 'No', detail: '' }] };
+  entry.data = { ...entry.data, prompt, phase: 'needs_input' };
+  c.renderPrompt(s, entry.data);
+  assert.equal(reading(), false, 'a question that appears is never missed');
+  tap();
+  c.renderPrompt(s, entry.data);
+  c.renderPrompt(s, { ...entry.data, prompt: { ...prompt, current: 2 } });
+  assert.equal(reading(), true, 'the same question re-rendered by polling leaves the bars hidden');
+  c.renderPrompt(s, { ...entry.data, prompt: { ...prompt, fingerprint: 'b'.repeat(64) } });
+  assert.equal(reading(), false, 'a different question shows them');
+  tap();
+  c.renderPrompt(s, { ...entry.data, prompt: null, promptOpenable: false });
+  c.renderPrompt(s, { ...entry.data, prompt: { ...prompt, fingerprint: 'b'.repeat(64) } });
+  assert.equal(reading(), false, 'a question that comes back after the card was gone shows them');
+  // A send that was refused: the result is in the composer, so the bars come back.
+  entry.data = { capability: { supported: true }, phase: 'idle', route: c.sourceOf(s) };
+  tap();
+  assert.equal(reading(), true);
+  entry.text = '안녕하세요';
+  await c.sendChat(entry);
+  assert.equal(reading(), false, 'a send result shows the bars');
+  assert.equal(entry.text, '안녕하세요', 'the refused draft is kept');
+  await settle();
+  // A failing conversation read (connection problem) shows them once.
+  tap();
+  entry.error = '';
+  await c.loadChatState(s, false);
+  assert.equal(reading(), false);
+  tap();
+  await c.loadChatState(s, false);
+  assert.equal(reading(), true, 'the same ongoing problem does not keep unfolding them');
+  // The board's offline notice.
+  c.context.navigator = { onLine: false };
+  c.get('offline-text').textContent = '';
+  c.renderConnectivity();
+  assert.equal(c.get('offline-text').textContent, '오프라인 · 다시 연결 중');
+  assert.equal(reading(), false, 'going offline shows them');
+});
+
+test('entering a conversation shows its bars, and the first hide on a phone explains the tap once', () => {
+  const writes = [];
+  const { c, list, scrollTo, reading } = phoneConversation();
+  c.context.localStorage = { getItem: () => null, setItem: (key, value) => writes.push([key, value]) };
+  const hint = c.get('tap-hint');
+  assert.equal(hint.hidden, true);
+  scrollTo(2350);
+  assert.equal(reading(), true);
+  assert.equal(hint.hidden, false, 'the first hide shows the hint');
+  assert.equal(hint.textContent, '화면을 탭하면 메뉴가 나타나요');
+  assert.equal(hint.style.top, '92px', 'just below the folded header');
+  assert.deepEqual(writes, [['sessionholic:ui:tapHint', 'true']], 'remembered as a UI preference only');
+  c.toggleChrome();
+  assert.equal(hint.hidden, true, 'a tap clears it');
+  scrollTo(2300); scrollTo(2250);
+  assert.equal(reading(), true);
+  assert.equal(hint.hidden, true, 'shown once');
+  assert.equal(writes.length, 1);
+  // A board that saw it before (another page load) never shows it.
+  const other = phoneConversation();
+  other.c.context.localStorage = { getItem: (key) => (key === 'sessionholic:ui:tapHint' ? 'true' : null), setItem() { throw new Error('no write'); } };
+  other.scrollTo(2350);
+  assert.equal(other.reading(), true);
+  assert.equal(other.c.get('tap-hint').hidden, true);
+  // Leaving and entering again starts with the bars.
+  c.setDetailShown(false);
+  c.setDetailShown(true);
+  assert.equal(c.state.chromeVisible, true);
+  assert.equal(reading(), false);
+  // Reduced motion: the bars switch without transitions; the gate folds with them.
+  const css = styleSheet();
+  assert.match(css, /\.jump-bottom, \.tap-hint, \.detail-head, \.conversation-bar,\s*\.detail-pane\.is-reading \.detail-head \{ transition: none; animation: none; \}/);
+  assert.match(css, /\.detail-pane\.is-reading \.chat-terminal-gate/);
+  // The jump button and the new-message badge stay usable while hidden.
+  assert.doesNotMatch(css, /\.detail-pane\.is-reading \.jump-bottom/);
+  assert.equal(list.unread || 0, 0);
+});
+
+test('a Claude conversation without a board terminal offers "터미널 열기" and never opens one by itself', async () => {
+  const requests = [];
+  const c = client(async (url, options) => {
+    requests.push({ url, body: options?.body ? JSON.parse(options.body) : null });
+    return { ok: true, status: 200, json: async () => ({ allowed: true, id: 'plan-1', mode: 'attach' }) };
+  }, noChatTimers);
+  const { s, entry } = selectChat(c, { agent: 'claude', home: '' });
+  c.drawDetail(s);
+  await settle();
+  requests.length = 0;
+  entry.data = { route: c.sourceOf(s), phase: 'idle', capability: { supported: false, attachments: true,
+    reason: '보내려면 먼저 터미널을 여세요.', action: 'open_terminal' } };
+  entry.text = '먼저 써 둔 초안';
+  c.updateChatComposer(entry);
+  assert.equal(c.get('chat-terminal-gate').hidden, false);
+  assert.equal(c.get('chat-terminal-gate-text').textContent, '보내려면 먼저 터미널을 여세요.');
+  assert.equal(c.get('chat-open-terminal').textContent, '터미널 열기');
+  assert.equal(c.get('chat-status').textContent, '', 'the gate says it; the status line stays for errors');
+  assert.equal(c.get('chat-input').disabled, false, 'a draft can be written before opening the terminal');
+  assert.equal(c.get('chat-send').disabled, true, 'but not sent');
+  await c.sendChat(entry);
+  assert.deepEqual(requests, [], 'nothing is sent and no terminal is opened in the background');
+  c.get('chat-open-terminal').events.click();
+  await settle();
+  assert.equal(requests[0].url, '/api/plan', 'the button reuses the reviewed plan sheet');
+  assert.deepEqual(requests[0].body.target, { host: 'workstation', agent: 'claude', account: 'claude:default' });
+  // Returning to the same session's own terminal (attach) opens it right after the plan,
+  // as "터미널·승인" always did: only because the user pressed the button.
+  assert.deepEqual(requests.map((request) => request.url).slice(0, 2), ['/api/plan', '/api/launch']);
+  // With the terminal open the composer sends as before.
+  entry.data = { ...entry.data, capability: { supported: true, attachments: true, reason: null } };
+  c.updateChatComposer(entry);
+  assert.equal(c.get('chat-terminal-gate').hidden, true);
+  assert.equal(c.get('chat-send').disabled, false);
+  // An interactive session (no attach possible) gets no button.
+  entry.data = { ...entry.data, capability: { supported: false, attachments: true, reason: '보드 밖 터미널' } };
+  c.updateChatComposer(entry);
+  assert.equal(c.get('chat-terminal-gate').hidden, true);
+  assert.equal(c.get('chat-input').disabled, true);
+  assert.equal(c.get('chat-status').textContent, '보드 밖 터미널');
+});
+
+test('a send refused because the terminal closed keeps the draft and offers the button', async () => {
+  let reads = 0;
+  let c;
+  c = client(async (url, options) => {
+    if (url === '/api/chat/send')
+      return { ok: false, status: 409, json: async () => ({ error: '보내려면 먼저 터미널을 여세요.', dispatchState: 'not_started', code: 'terminal_required' }) };
+    if (url === '/api/chat/state' && ++reads === 1) return { ok: false, status: 503, json: async () => ({ error: '연결 실패' }) };
+    return { ok: true, status: 200, json: async () => ({ route: JSON.parse(options.body).source, phase: 'idle', messages: [],
+      capability: { supported: false, attachments: true, reason: '보내려면 먼저 터미널을 여세요.', action: 'open_terminal' } }) };
+  }, noChatTimers);
+  const { s, entry } = selectChat(c, { agent: 'claude', home: '' });
+  c.drawDetail(s);
+  await settle();
+  reads = 0;
+  entry.data = { route: c.sourceOf(s), phase: 'idle', capability: { supported: true, attachments: true } };
+  entry.text = '보낼 내용';
+  await c.sendChat(entry);
+  await settle();
+  assert.equal(entry.text, '보낼 내용', 'nothing was sent: the draft stays');
+  assert.equal(entry.receipt.dispatchState, 'not_started');
+  // Even when the next read fails, the refusal's code already offers the button.
+  assert.equal(entry.data.capability.action, 'open_terminal');
+  c.updateChatComposer(entry);
+  assert.equal(c.get('chat-terminal-gate').hidden, false);
+  // The next good read says the same, and the status line adds that nothing was sent.
+  entry.error = '';
+  await c.loadChatState(s, false);
+  assert.equal(c.get('chat-terminal-gate').hidden, false);
+  assert.equal(c.get('chat-status').textContent, '메시지는 전송되지 않았습니다. 초안과 첨부는 유지됩니다.');
+});
+
+test('snapshot events are read together after 300ms and never reload capabilities', async () => {
+  const requests = [];
+  const pending = [];
+  let version = 7;
+  const c = client(async (url) => {
+    requests.push(url);
+    return { ok: true, status: 200, json: async () => (url.startsWith('/api/snapshot')
+      ? { hosts: [{ name: 'workstation', ok: true, fetchedAt: 1000 + requests.length, data: {} }], version }
+      : url === '/api/capabilities' ? { hosts: [], csrfToken: 'csrf-test' } : {}) };
+  }, { setTimeout: (callback, ms) => { if (ms === 300) pending.push(callback); return pending.length; }, clearTimeout() {} });
+  c.state.authenticated = true;
+  c.state.snapshot = { hosts: [{ name: 'workstation', ok: true, fetchedAt: 1, data: {} }] };
+  c.state.snapshotVersion = 6;
+  c.state.capabilities = { hosts: [] };
+  c.state.capabilitiesRevision = 'old';
+  c.state.usageAt = Date.now();
+  for (const announced of [7, 8, 9]) c.snapshotAnnounced(announced);
+  assert.equal(pending.length, 1, 'a burst arms one read');
+  assert.deepEqual(requests, [], 'nothing is read before the batch window ends');
+  version = 9;
+  pending.shift()();
+  await settle();
+  assert.deepEqual(requests, ['/api/snapshot'], 'one snapshot read, no /api/capabilities even though the hosts changed');
+  assert.equal(c.state.snapshotVersion, 9);
+  c.snapshotAnnounced(9);
+  assert.equal(pending.length, 0, 'a version already shown reads nothing');
+  // An announcement during a read is batched again once that read ends.
+  c.state.pollBusy = true;
+  c.snapshotAnnounced(10);
+  pending.shift()();
+  assert.equal(c.state.snapshotPending, true);
+  c.state.pollBusy = false;
+  requests.length = 0;
+  await c.poll(false, { capabilities: false });
+  assert.deepEqual(requests, ['/api/snapshot']);
+  assert.equal(pending.length, 1, 'still behind (version 9 < 10): one more batched read');
+  version = 10;
+  pending.shift()();
+  await settle();
+  assert.equal(c.state.snapshotVersion, 10);
+  assert.equal(requests.filter((url) => url === '/api/capabilities').length, 0);
+  // A regular read still catches capabilities up.
+  requests.length = 0;
+  await c.poll(false);
+  assert.deepEqual(requests.slice(0, 2), ['/api/snapshot', '/api/capabilities']);
+});
+
+test('the 60s safety poll reads /api/capabilities only when a host recovers or its accounts change, never for a new fetchedAt', async () => {
+  const requests = [];
+  const hosts = [{ name: 'workstation', ok: true, fetchedAt: 1, data: { codex: [{ id: 'a', home: '.codex' }] } }];
+  const c = client(async (url) => {
+    requests.push(url);
+    return { ok: true, status: 200, json: async () => (url.startsWith('/api/snapshot')
+      ? { hosts: JSON.parse(JSON.stringify(hosts)) } : url === '/api/capabilities' ? { hosts: [], csrfToken: 'csrf-test' } : {}) };
+  }, noChatTimers);
+  c.state.usageAt = Date.now();
+  const reads = async () => { requests.length = 0; await c.poll(false); return requests.filter((url) => url === '/api/capabilities').length; };
+  assert.equal(await reads(), 1, 'the first read loads capabilities');
+  hosts[0].fetchedAt = 2;
+  assert.equal(await reads(), 0, 'a watch snapshot (new fetchedAt) is not an account change');
+  hosts[0].ok = false;
+  assert.equal(await reads(), 1);
+  hosts[0].ok = true; hosts[0].fetchedAt = 3;
+  assert.equal(await reads(), 1, 'a host recovering from a failure is read again');
+  hosts[0].data.codex.push({ id: 'b', home: '.codex-work' });
+  assert.equal(await reads(), 1, 'a new Codex account home is read again');
+  hosts[0].data.codex.push({ id: 'c', home: '.codex-work' });
+  assert.equal(await reads(), 0);
+});
+
+test('consecutive tool records fold into one "도구 실행 N개" line that opens to one line per record and once more to the full text', async () => {
+  const c = client(undefined, noChatTimers); const { s } = selectChat(c);
+  const list = c.get('messages');
+  const turn = [{ role: 'user', text: '고쳐 주세요', ts: 1000 },
+    { role: 'tool', text: '$ npm test', toolKind: 'command' }, { role: 'tool', text: '파일 수정 · a.py', toolKind: 'edit' },
+    { role: 'tool', text: '$ git status\n두 번째 줄', toolKind: 'command' }];
+  c.renderMessages(s, turn);
+  assert.equal(list.children.length, 2, 'three records are one line');
+  const group = list.children[1];
+  assert.match(group.className, /msg tool tool-group/);
+  assert.equal(group.toolTitle.textContent, '도구 실행 3개');
+  assert.equal(group.toolKinds.textContent, '· 명령 2 · 파일 수정 1');
+  assert.equal(group.toolToggle.tagName, 'BUTTON', 'a control, so a tap on it never toggles the bars');
+  assert.equal(group.toolToggle.attributes['aria-expanded'], 'false'); assert.equal(group.toolList.hidden, true);
+  group.toolToggle.events.click();
+  assert.equal(group.toolToggle.attributes['aria-expanded'], 'true'); assert.equal(group.toolList.hidden, false);
+  assert.deepEqual(group.toolList.children.map((item) => textOf(item).trim()), ['$ npm test', '파일 수정 · a.py', '$ git status\n두 번째 줄']);
+  const record = group.toolList.children[2];
+  assert.equal(record.attributes['aria-expanded'], 'false');
+  record.events.click();
+  assert.match(record.className, /is-full/); assert.equal(record.attributes['aria-expanded'], 'true');
+  // The running turn adds a record: the same group counts it, still open, the record still full.
+  list.scrollHeight = 900; list.clientHeight = 200; list.scrollTop = 100;
+  const more = [...turn, { role: 'tool', text: 'Grep · TODO' }];
+  c.renderMessages(s, more);
+  assert.equal(list.children[1], group); assert.equal(group.toolTitle.textContent, '도구 실행 4개');
+  assert.equal(group.toolKinds.textContent, '· 명령 2 · 파일 수정 1 · 검색 1');
+  assert.equal(group.open, true); assert.equal(group.toolList.children[2], record); assert.match(record.className, /is-full/);
+  assert.equal(list.unread || 0, 0, 'a new tool record raises no "새 메시지" badge');
+  // An answer ends the group; tools after it start another one.
+  c.renderMessages(s, [...more, { role: 'assistant', text: '테스트를 고쳤습니다.', ts: 1500 }, { role: 'tool', text: '$ ls' }]);
+  assert.equal(list.children.length, 4); assert.equal(list.children[1], group);
+  assert.notEqual(list.children[3], group); assert.equal(list.children[3].toolTitle.textContent, '도구 실행 1개');
+  assert.equal(list.children[3].open, false); assert.equal(list.unread, 1, 'only the answer counts');
+  // The long-press menu copies the whole group.
+  let copied; c.context.navigator = { clipboard: { writeText: async (text) => { copied = text; } } };
+  const labels = menuLabels(c, group);
+  assert.equal(labels.includes('텍스트 선택'), false);
+  await menuAction(c, group, '도구 기록 4개 모두 복사');
+  assert.equal(copied, '$ npm test\n파일 수정 · a.py\n$ git status\n두 번째 줄\nGrep · TODO');
+  assert.match(styleSheet(), /\.tool-item\.is-full \.tool-item-text \{[^}]*white-space: pre-wrap;/);
+});
+
+test('a tool record without toolKind is classified from the collector text', () => {
+  const c = client(undefined, noChatTimers);
+  const kinds = ['$ npm test', '파일 수정 · a.py', '웹 검색 · 날씨', 'Bash · 목록', 'Edit · a.py', 'Write · b', 'Read · c',
+    'Glob · *.js', 'WebFetch · https://e.com', 'mcp__slack__send', 'Task · 조사', 'slack send', 'TodoWrite']
+    .map((text) => c.toolKindOf({ role: 'tool', text }));
+  assert.deepEqual(kinds, ['command', 'edit', 'search', 'command', 'edit', 'edit', 'read', 'search', 'search', 'mcp',
+    'agent', 'other', 'other']);
+  assert.equal(c.toolKindOf({ text: '$ ls', toolKind: 'mcp' }), 'mcp', 'the collector kind wins');
+  assert.equal(c.toolKindOf({ text: '$ ls', toolKind: 'nonsense' }), 'command');
+});
+
+test('B2: reading back, the row on screen keeps its place when rows above it leave the 80-row window', () => {
+  const c = client(undefined, noChatTimers); const { s } = selectChat(c);
+  const list = c.get('messages');
+  const rows = (from, to) => Array.from({ length: to - from }, (_, i) =>
+    ({ role: 'assistant', text: `답변 ${from + i}`, ts: 1000 + (from + i) * 600 }));
+  c.renderMessages(s, rows(0, 10));
+  const layout = (node) => Object.defineProperties(node, {
+    offsetTop: { configurable: true, get: () => list.children.indexOf(node) * 100 },
+    offsetHeight: { configurable: true, get: () => 100 } });
+  list.children.forEach(layout);
+  Object.assign(list, { scrollHeight: 1000, clientHeight: 300, scrollTop: 450 });
+  const reading = list.children[4];
+  // Two rows leave at the top and two arrive below while the reader is at "답변 4".
+  c.renderMessages(s, rows(2, 12));
+  assert.equal(list.children[2], reading);
+  assert.equal(list.scrollTop, 250, 'the row the reader was on stays 50px above the top edge');
+  assert.equal(list.unread, 2);
+  // Without layout (or once the row itself left), the old position is kept.
+  const plain = client(undefined, noChatTimers); const other = selectChat(plain);
+  plain.renderMessages(other.s, rows(0, 3));
+  Object.assign(plain.get('messages'), { scrollHeight: 900, clientHeight: 200, scrollTop: 45 });
+  plain.renderMessages(other.s, rows(1, 4));
+  assert.equal(plain.get('messages').scrollTop, 45);
+});
+
+test('B4: the board\'s own attachment path lines become file chips and "[이미지 첨부]" alone is not shown', async () => {
+  const c = client(undefined, noChatTimers); const { s } = selectChat(c);
+  const codexLine = '첨부 파일: "/w/project/.sessionholic-attachments/0a1b/보고서.pdf"';
+  const claudeLine = '첨부 파일: /w/project/.sessionholic-attachments/0c2d/화면.png';
+  c.renderMessages(s, [
+    { role: 'user', text: '검토해 주세요\n' + codexLine + '\n' + claudeLine, ts: 1 },
+    { role: 'user', text: '[이미지 첨부]', ts: 2, attachments: [{ id: null, name: '이미지', kind: 'image', source: 'native' }] },
+    { role: 'user', text: '첨부 파일: 메모로 남긴 줄', ts: 3 },
+    { role: 'user', text: codexLine, ts: 4, attachments: [{ id: 'f', name: '보고서.pdf', kind: 'file', source: 'sessionholic' }] }]);
+  const rows = c.get('messages').children;
+  assert.doesNotMatch(textOf(rows[0]), /sessionholic-attachments|첨부 파일:/);
+  assert.match(textOf(rows[0]), /검토해 주세요/);
+  assert.deepEqual(byClass(rows[0], 'attachment-name').map((node) => node.textContent), ['보고서.pdf', '화면.png']);
+  assert.match(byClass(rows[0], 'msg-attachment')[1].className, /is-image/);
+  assert.doesNotMatch(textOf(rows[1]), /\[이미지 첨부\]/);
+  assert.equal(byClass(rows[1], 'msg-attachment').length, 1);
+  assert.match(textOf(rows[2]), /첨부 파일: 메모로 남긴 줄/, 'a typed line is not an attachment');
+  assert.deepEqual(byClass(rows[3], 'attachment-name').map((node) => node.textContent), ['보고서.pdf'], 'one chip per file');
+  assert.equal(byClass(rows[3], 'msg-body').length, 0);
+  let copied; c.context.navigator = { clipboard: { writeText: async (text) => { copied = text; } } };
+  await menuAction(c, rows[0], '복사'); assert.equal(copied, '검토해 주세요');
+  assert.equal(menuLabels(c, rows[3]).includes('복사'), false);
+  // A transcript image chip without a name takes the name from its path line.
+  assert.deepEqual(c.userMessageParts({ text: claudeLine, attachments: [{ name: '이미지', kind: 'image', source: 'native' }] })
+    .attachments.map((file) => file.name), ['화면.png']);
+});
+
+test('B5: a timed final answer after untimed progress notes shows its own name and time', () => {
+  const c = client(undefined, noChatTimers); const { s } = selectChat(c);
+  c.renderMessages(s, [{ role: 'user', text: '질문', ts: 1000 }, { role: 'assistant', text: '살펴볼게요', ts: null },
+    { role: 'assistant', text: '조금 더', ts: null }, { role: 'assistant', text: '최종 답', ts: 2500 }]);
+  const rows = c.get('messages').children;
+  assert.deepEqual(rows.map((row) => row.msgLabel?.hidden ?? null), [false, false, true, false]);
+  assert.equal(rows[1].msgLabel.children.length, 1, 'no time on a progress note');
+  assert.equal(rows[3].msgLabel.children.length, 2, 'the final answer shows when the turn completed');
+});
+
+test('B8: Claude summary and interruption notes render as system lines, not "나" bubbles', () => {
+  const c = client(undefined, noChatTimers); const { s } = selectChat(c, { agent: 'claude', home: '', id: 'claude-row' });
+  c.renderMessages(s, [{ role: 'system', text: '이전 대화 요약으로 이어짐', ts: 1 }, { role: 'system', text: '사용자가 중단함', ts: 2 }]);
+  const rows = c.get('messages').children;
+  assert.deepEqual(rows.map((row) => row.className), ['msg system', 'msg system']);
+  assert.equal(rows.some((row) => row.msgLabel), false);
+});
+
+test('the working row counts "작업 중 · 12분 34초" from workingSince once a second, and stops while the page is hidden', () => {
+  const armed = [];
+  const c = client(undefined, { setTimeout: (callback, ms) => { armed.push({ callback, ms }); return armed.length; },
+    clearTimeout: (id) => { if (armed[id - 1]) armed[id - 1].cleared = true; } });
+  const clock = armed.filter.bind(armed);
+  const ticking = () => clock((timer) => timer.callback === c.context.tickWorking && !timer.cleared);
+  // The page's own visibility handler (registered at start; offline, so nothing is fetched).
+  c.context.navigator = { onLine: false }; c.windowEvents.DOMContentLoaded();
+  const { s, entry } = selectChat(c);
+  const now = Date.now();
+  entry.data.phase = 'working';
+  entry.data.workingSince = Math.floor(now / 1000) - 754;
+  c.renderMessages(s, [{ role: 'user', text: '시작해 주세요' }]);
+  const list = c.get('messages'); const row = list.children.at(-1);
+  assert.match(row.className, /msg-working/);
+  assert.match(row.workingTime.textContent, /^ · 12분 3[45]초$/);
+  assert.match(textOf(row), /작업 중/);
+  assert.equal(row.workingTime.attributes['aria-live'], 'off', 'the second count is not announced');
+  assert.equal(ticking().length, 1); assert.ok(ticking()[0].ms > 0 && ticking()[0].ms <= 1020);
+  // Repeated renders keep one timer.
+  c.renderMessages(s, [{ role: 'user', text: '시작해 주세요' }]);
+  assert.equal(ticking().length, 1);
+  c.context.document.hidden = true; c.documentEvents.visibilitychange();
+  assert.equal(ticking().length, 0, 'no ticking while hidden');
+  c.context.document.hidden = false; c.tickWorking();
+  assert.equal(ticking().length, 1);
+  assert.deepEqual([0, 59, 60, 754, 3599, 3600, 3900, 7200].map(c.formatElapsed),
+    ['0초', '59초', '1분 0초', '12분 34초', '59분 59초', '1시간', '1시간 5분', '2시간']);
+  // Claude's time is approximate; no workingSince leaves the label alone.
+  entry.data.workingSinceApprox = true; c.renderMessages(s, [{ role: 'user', text: '시작해 주세요' }]);
+  assert.equal(row.title, '마지막 요청부터 잰 시간입니다.');
+  entry.data.workingSince = null; c.renderMessages(s, [{ role: 'user', text: '시작해 주세요' }]);
+  assert.equal(row.workingTime.textContent, ''); assert.equal(ticking().length, 0);
+  entry.data.phase = 'idle'; entry.data.workingSince = Math.floor(now / 1000) - 10;
+  c.renderMessages(s, [{ role: 'user', text: '시작해 주세요' }, { role: 'assistant', text: '끝' }]);
+  assert.equal(list.children.includes(row), false); assert.equal(ticking().length, 0);
+  assert.match(styleSheet(), /@media \(prefers-reduced-motion: reduce\) \{[^@]*\.working-dots i \{\s*animation: none;/);
+});
+
+test('B10: a Claude row listed without an id gets its own key, one notice and no request that can only fail', async () => {
+  const requests = [];
+  const c = client(async (url) => { requests.push(url); return { ok: true, status: 200, json: async () => ({ messages: [] }) }; }, noChatTimers);
+  const { FakeEventSource, sources } = fakeEventSource();
+  c.context.EventSource = FakeEventSource;
+  const rows = [{ agent: 'claude', id: '', sessionId: '', pid: 11, cwd: '/w', phase: 'working', title: 'A', kind: 'interactive' },
+    { agent: 'claude', id: '', sessionId: '', pid: 12, cwd: '/w', phase: 'idle', title: 'B', kind: 'interactive' }];
+  c.state.snapshot = { hosts: [{ name: 'workstation', label: 'Workstation', ok: true, data: { claude: rows } }] };
+  c.state.authenticated = true;
+  const sessions = c.allSessions();
+  assert.equal(new Set(sessions.map((session) => session.key)).size, 2, 'two rows without ids never share a key');
+  const s = sessions[0];
+  c.state.selected = s.key;
+  c.get('chat-composer').dataset.source = c.chatKey(c.sourceOf(s));
+  await c.loadDetail(s, true);
+  await c.loadChatState(s, true);
+  c.syncEvents();
+  assert.deepEqual(requests, [], 'neither /api/chat/state nor /api/read');
+  assert.deepEqual(sources.map((source) => source.url), ['/api/events'], 'the list stream only, no conversation subscription');
+  const list = c.get('messages');
+  assert.match(textOf(list), /대화 기록 ID를 알 수 없어 여기서 읽을 수 없습니다/);
+  assert.doesNotMatch(textOf(list), /저장된 대화를 아직|올바르지 않습니다/);
+  assert.match(list.children.at(-1).className, /msg-working/, 'the listed phase still shows it works');
+  assert.match(c.get('chat-status').textContent, /세션 ID가 없어 여기서 보낼 수 없습니다/);
+  // With a session id the transcript is read directly, still without chat state.
+  const named = { ...s, sessionId: 'session-1234', key: 'workstation|claude||~named' };
+  rows.push({ ...rows[0], sessionId: 'session-1234', pid: 13 });
+  const withSession = c.allSessions().find((session) => session.sessionId === 'session-1234');
+  c.state.selected = withSession.key;
+  await c.loadDetail(withSession, true);
+  assert.deepEqual(requests.map((url) => url.split('?')[0]), ['/api/read']);
+  assert.match(requests[0], /id=session-1234/);
+  assert.ok(named);
+});
+
+test('a long press on a tool group line (a button) opens the group menu and its tap then does not toggle the group', () => {
+  const timers = [];
+  const c = client(undefined, { setTimeout: (callback, delay) => { timers.push({ callback, delay }); return timers.length; },
+    clearTimeout(id) { if (timers[id - 1]) timers[id - 1].cleared = true; } });
+  const { s } = selectChat(c);
+  c.renderMessages(s, [{ role: 'tool', text: '$ ls', toolKind: 'command' }, { role: 'tool', text: 'Read · a.py' }]);
+  const list = c.get('messages');
+  const group = list.children[0];
+  vm.runInContext('bindMessageGestures', c.context)(list);
+  // The toggle matches a bare "button" but not the long-press skip list.
+  const skip = vm.runInContext('PRESS_MENU_SKIP', c.context);
+  assert.match(skip, /button:not\(\.card\):not\(\.tool-group-toggle\):not\(\.tool-item\)/);
+  const onToggle = { closest: (selector) => (selector === '.msg' ? group : selector === skip ? null : null) };
+  list.events.pointerdown({ pointerId: 1, pointerType: 'touch', clientX: 50, clientY: 50, target: onToggle });
+  timers.filter((timer) => timer.delay === c.GESTURE.longPressMs && !timer.cleared).at(-1).callback();
+  assert.equal(c.get('action-sheet').open, true);
+  assert.equal(c.get('action-list').children[0].textContent, '도구 기록 2개 모두 복사');
+  list.events.pointerup({ pointerId: 1 });
+  let stopped = 0;
+  list.events.click({ preventDefault() { stopped++; }, stopPropagation() { stopped++; } });
+  assert.equal(stopped, 2, 'the click the long press leaves behind is swallowed');
+  // Any other button (code copy, message menu) still keeps its own tap only.
+  const onCopy = { closest: (selector) => (selector === '.msg' ? group : selector === skip ? {} : null) };
+  c.closeActionSheet();
+  const before = timers.length;
+  list.events.pointerdown({ pointerId: 2, pointerType: 'touch', clientX: 50, clientY: 50, target: onCopy });
+  assert.equal(timers.slice(before).some((timer) => timer.delay === c.GESTURE.longPressMs), false);
 });

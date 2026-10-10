@@ -329,7 +329,7 @@ class ChatTest(unittest.TestCase):
         self.flow.transfers.rpc=lambda *a,**k:result
         state=self.chat.state({'source':REF,'requestId':'request-0001'})
         self.assertEqual(set(state),{'route','phase','capability','messages','receipts','maxAttachmentBytes','requiresNativeTerminal',
-                                     'prompt','promptOpenable'})
+                                     'prompt','promptOpenable','workingSince','workingSinceApprox'})
         self.assertIsNone(state['prompt'])
         self.assertFalse(state['promptOpenable'])
         self.assertEqual(set(state['capability']),{'supported','attachments','reason'})
@@ -337,6 +337,19 @@ class ChatTest(unittest.TestCase):
         self.assertNotIn('PRIVATE',json.dumps(state))
         self.assertNotIn('queueId',state['receipts'][0])
         self.assertFalse(hasattr(chat.Chat,'queue_history'))
+    def test_state_says_since_when_the_agent_works_only_while_it_works(self):
+        result={'phase':'working','capabilities':{'canSend':True},'messages':[],'workingSince':1791334800}
+        self.flow.transfers.rpc=lambda *a,**k:result
+        def read(**changes):
+            result.update(changes); self.chat.cache.clear()
+            state=self.chat.state({'source':REF})
+            return state['workingSince'],state['workingSinceApprox']
+        self.assertEqual(read(),(1791334800,False))
+        self.assertEqual(read(workingSinceApprox=True),(1791334800,True))
+        self.assertEqual(read(phase='needs_input'),(None,False))
+        self.assertEqual(read(phase='working',workingSince=True),(None,False))
+        self.assertEqual(read(workingSince='1791334800'),(None,False))
+        result.pop('workingSince'); self.assertEqual(read(),(None,False))
     def test_message_attachment_names_are_scrubbed_and_raw_native_fields_stay_metadata(self):
         result={'phase':'idle','capabilities':{'canSend':True},'messages':[{'role':'user','text':'본문',
                 'attachments':[{'source':'native','kind':'image','name':'owner@example.com 사진.png','id':None}]}]}
@@ -895,6 +908,8 @@ class ChatClaudeTest(unittest.TestCase):
         state = self.state()
         self.assertFalse(state['capability']['supported'])
         self.assertEqual(state['capability']['reason'], chat.CLAUDE_EXTERNAL)
+        # An interactive session cannot be attached, so no "open the terminal" action is offered.
+        self.assertNotIn('action', state['capability'])
         for key in ('queuedMessages', 'queueState'):
             self.assertNotIn(key, state)
         for native in ({'host': 'other'}, {'id': 'other12345'}, {'agent': 'codex'}):
@@ -915,10 +930,17 @@ class ChatClaudeTest(unittest.TestCase):
                 state = self.state()
                 self.assertTrue(state['capability']['supported'])
                 self.assertIsNone(state['capability']['reason'])
+                self.assertNotIn('action', state['capability'])
                 self.assertFalse(state['requiresNativeTerminal'])
         self.terms.rows = []
         self.kind('background')
-        self.assertTrue(self.state()['capability']['supported'])
+        # Without a board terminal even a background session cannot take input: the board
+        # never opens one by itself, it asks the user to (the composer's button).
+        capability = self.state()['capability']
+        self.assertFalse(capability['supported'])
+        self.assertEqual(capability['reason'], chat.CLAUDE_OPEN_TERMINAL)
+        self.assertEqual(capability['reason'], '보내려면 먼저 터미널을 여세요.')
+        self.assertEqual(capability['action'], 'open_terminal')
         # A session waiting for the user still takes a reply; menus are checked at send time.
         self.phase = 'needs_input'
         self.terminal()
@@ -960,31 +982,28 @@ class ChatClaudeTest(unittest.TestCase):
         self.assertEqual(len(self.terms.pastes), 1)
         self.assertEqual(self.calls, [('chat', 'capabilities')])
 
-    def test_background_without_terminal_attaches_exact_session_then_pastes(self):
-        self.terms.chunks = [{'after': 10, 'alive': True}, {'after': 25, 'alive': True}, {'after': 25, 'alive': True}]
-        def launch(plan_id, request_id):
-            self.terms.log.append('launch')
-            self.terminal()
-            return {'terminal': {'id': TERMINAL_ID}}
-        with patch.object(self.flow, 'plan', return_value={'allowed': True, 'id': 'plan-1'}) as plan, \
-                patch.object(self.flow, 'launch', side_effect=launch) as launched:
-            result = self.send(rid='request-0002', text='백그라운드 확인')
-            plan.assert_called_once_with({'source': CLAUDE_REF, 'target': {
-                'host': 'local', 'agent': 'claude', 'account': 'claude:default'}})
-            launched.assert_called_once_with('plan-1', 'chat_' + hashlib.sha256(b'request-0002').hexdigest()[:40])
-            self.assertEqual(result['status'], 'accepted')
-            self.assertEqual(self.terms.pastes, [(TERMINAL_ID, '백그라운드 확인', True)])
-            # The attach output must settle before the paste; paste is the last terminal action.
-            self.assertEqual(self.terms.log[0], 'launch')
-            self.assertGreaterEqual(self.terms.log.count('read'), 3)
-            self.assertEqual(self.terms.log[-1], 'paste')
-            # The attached terminal is reused for the next message.
-            self.send(rid='request-0003', text='두 번째')
-            plan.assert_called_once()
-            launched.assert_called_once()
-        self.assertEqual([text for _, text, _ in self.terms.pastes], ['백그라운드 확인', '두 번째'])
+    def test_background_without_terminal_is_refused_and_never_opens_one(self):
+        # Sending never opens a terminal: only the user's own "터미널 열기" (or the question
+        # card's "질문 불러오기") does. The refusal is before any reservation, so the draft stays.
+        with patch.object(self.chat, '_open_claude_terminal',
+                          side_effect=AssertionError('sending must not open a terminal')) as opened, \
+                patch.object(self.flow, 'plan') as plan, patch.object(self.flow, 'launch') as launched:
+            with self.assertRaises(chat.SendRejected) as caught:
+                self.send(rid='request-0002', text='백그라운드 확인')
+        self.assertEqual((caught.exception.status, caught.exception.code), (409, 'terminal_required'))
+        self.assertEqual(str(caught.exception), chat.CLAUDE_OPEN_TERMINAL)
+        opened.assert_not_called(); plan.assert_not_called(); launched.assert_not_called()
+        self.assertEqual(self.terms.pastes, [])
+        self.assertEqual(self.terms.log, [])
+        self.assertEqual(self.records(), [])
+        # Once the user opened the terminal, the same request is delivered into it, once.
+        self.terminal()
+        self.assertEqual(self.send(rid='request-0002', text='백그라운드 확인')['status'], 'accepted')
+        self.send(rid='request-0003', text='두 번째')
+        self.assertEqual(self.terms.pastes, [(TERMINAL_ID, '백그라운드 확인', True), (TERMINAL_ID, '두 번째', True)])
 
-    def test_background_attach_failures_reject_without_reservation(self):
+    def test_question_card_attach_failures_type_nothing(self):
+        # "질문 불러오기" still attaches a background session; its failures reach the card.
         cases = [({'allowed': False, 'reason': '연결 계획을 만들 수 없습니다.'}, None, '연결 계획을 만들 수 없습니다.'),
                  ({'allowed': True, 'id': 'plan-1'}, RuntimeError('터미널 실행 실패'), '터미널 실행 실패'),
                  ({'allowed': True, 'id': 'plan-1'}, None, '준비되지 않았습니다')]
@@ -993,8 +1012,11 @@ class ChatClaudeTest(unittest.TestCase):
             with self.subTest(reason=reason):
                 launch = {'side_effect': error} if error else {'return_value': {'terminal': {'id': TERMINAL_ID}}}
                 with patch.object(self.flow, 'plan', return_value=plan), patch.object(self.flow, 'launch', **launch):
-                    self.assertIn(reason, self.rejected())
-                self.assertEqual(self.terms.pastes, [])
+                    with self.assertRaises(chat.PromptRejected) as caught:
+                        self.chat.prompt({'source': CLAUDE_REF, 'action': 'open', 'requestId': 'prompt-0003'})
+                self.assertIn(reason, str(caught.exception))
+                self.assertEqual(caught.exception.code, 'terminal_unavailable')
+                self.assertEqual((self.terms.pastes, self.terms.keys), ([], []))
                 self.assertEqual(self.records(), [])
 
     def test_interactive_without_board_terminal_is_external_and_not_reserved(self):

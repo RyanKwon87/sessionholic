@@ -71,6 +71,14 @@ class ChatTest(unittest.TestCase):
         self.flow.transfers.rpc=lambda *a,**k: (_ for _ in ()).throw(RuntimeError('timeout'))
         result=self.chat.send({'source':REF,'requestId':'request-0001','text':'hello'})
         self.assertEqual(result['status'],'unknown')
+    def test_helper_refusal_is_a_known_pre_send_rejection(self):
+        import transfer
+        refusal=transfer.WorkerError('실제 세션의 작업 폴더가 변경되었습니다. 목록을 다시 읽어 주세요.')
+        self.flow.transfers.rpc=lambda *a,**k: (_ for _ in ()).throw(refusal)
+        with self.assertRaises(chat.SendRejected) as caught:
+            self.chat.send({'source':REF,'requestId':'request-0001','text':'hello'})
+        self.assertEqual(caught.exception.status,409)
+        self.assertIn('작업 폴더가 변경', str(caught.exception))
     def test_attachment_receipt_survives_transport_unknown_without_claiming_delivery(self):
         uploaded=self.chat.upload(REF,'fixture.txt',b'fixture')['attachment']
         self.flow.transfers.rpc=lambda *a,**k: (_ for _ in ()).throw(RuntimeError('timeout'))

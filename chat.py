@@ -386,9 +386,14 @@ class Chat:
         if source.get('agent') == 'claude':
             result = self._send_claude(data.get('source'), source, host, request_id, text, ids, manifest)
         else:
+            from transfer import WorkerError
             try:
                 result = self.rpc(host, 'send', source, requestId=request_id,
                                   input=[{'type': 'text', 'text': text}] if text.strip() else [], attachmentIds=ids)
+            except WorkerError as exc:
+                # The helper finished and reported a refusal; native_chat keeps every
+                # failure after turn/start inside its receipt, so nothing was sent.
+                raise SendRejected(str(exc) or '메시지를 보내지 못했습니다. 초안은 유지됩니다.', 409) from None
             except (RuntimeError, OSError):
                 # A broken SSH/HTTP response is not evidence that submission failed.
                 result = {'delivery': 'unknown', 'reason': '전송 결과를 확인하지 못했습니다. 상태를 다시 확인해 주세요.'}

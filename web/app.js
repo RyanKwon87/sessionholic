@@ -2694,9 +2694,12 @@ function bindTerminalTouchScroll(node) {
 function resizeDraft() {
   const input = $("terminal-draft");
   if (!input?.style) return;
+  const before = input.style.height;
   input.style.height = "auto";
   const line = parseFloat(window.getComputedStyle?.(input)?.lineHeight) || 22;
   input.style.height = `${Math.min(input.scrollHeight, line * 4 + 20)}px`;
+  // A taller or shorter input bar changes the terminal's rows; refit so no line is hidden.
+  if (input.style.height !== before) requestAnimationFrame(fitTerminal);
 }
 function draftKeydown(event) {
   // Enter sends like a chat box; Shift+Enter keeps a newline in the draft.

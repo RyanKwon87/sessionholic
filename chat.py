@@ -19,6 +19,7 @@ CLAUDE_BLOCKED = ('Claude 터미널에 승인·선택 메뉴가 떠 있어 보�
 CLAUDE_MENU = re.compile(r'^\s*[│|]?\s*[❯›>]\s*\d+\.\s', re.M)
 CLAUDE_EXTERNAL = ('이 Claude 세션은 보드 밖 터미널에서 실행 중이라 웹에서 입력할 수 없습니다. '
                    '그 터미널에서 입력하거나 백그라운드 세션(claude --bg)으로 실행해 주세요.')
+CONTROL = re.compile(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]')
 CLAUDE_READY_SECONDS = 12
 CLAUDE_PROBE = 160
 
@@ -289,6 +290,9 @@ class Chat:
                 record = json.loads((self.root / 'attachments' / (aid + '.json')).read_text())
                 lines.append('첨부 파일: ' + record['attachment']['path'])
             body = '\n'.join(lines)
+            # ESC and other controls would end the bracketed paste and act as keys.
+            if CONTROL.search(body):
+                raise SendRejected('메시지에 터미널 제어 문자가 있어 보내지 않았습니다. 일반 텍스트만 보낼 수 있습니다.', 400)
             probe, digest = self._probe(body)
             path = self._claude_record_path(source, request_id)
             base = {'source': self.identity(source), 'requestId': request_id, 'turnId': None,

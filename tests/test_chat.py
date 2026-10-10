@@ -491,6 +491,17 @@ class ChatClaudeTest(unittest.TestCase):
         self.assertEqual(self.terms.pastes, [])
         self.assertEqual(self.records(), [])
 
+    def test_terminal_control_characters_are_rejected_before_any_paste(self):
+        self.terminal()
+        for text in ('앞\x1b[201~뒤', '종료\x03', '지우기\x7f'):
+            with self.subTest(text=repr(text)):
+                with self.assertRaises(chat.SendRejected) as caught:
+                    self.send(rid='request-ctrl-' + str(len(text)), text=text)
+                self.assertEqual(caught.exception.status, 400)
+        self.assertEqual(self.terms.pastes, [])
+        self.assertEqual(self.records(), [])
+        self.assertEqual(self.send(rid='request-tabs', text='첫 줄\n\t둘째 줄')['status'], 'accepted')
+
     def test_waiting_session_without_menu_takes_a_reply(self):
         self.terminal()
         self.phase = 'needs_input'

@@ -560,7 +560,6 @@ class ManagedLaunchTest(unittest.TestCase):
             def call(self,method,args):
                 self.calls.append((method,args))
                 if method=='thread/start': return {'thread':{'id':SID,'cwd':'/tmp/fixture'}}
-                if method=='thread/queue/add': return {'queuedSubmission':{'id':'q1','clientUserMessageId':args['clientUserMessageId']}}
                 if method=='thread/read': return {'thread':{'id':SID,'turns':[{'id':'t1'}]}}
                 return {'turn':{'id':'t1'}}
         client=Client()
@@ -569,9 +568,11 @@ class ManagedLaunchTest(unittest.TestCase):
             receipt=Path(folder)/'receipt.json'
             out=managed_launch.bind(spec,{'agent':'codex','home':'.codex'},'remote',receipt_path=receipt)
             reopened=managed_launch.bind(spec,{'agent':'codex','home':'.codex'},'remote',receipt_path=receipt)
-            self.assertEqual(len(client.calls),4)
+            # The first prompt goes straight to turn/start; no board-side queue is involved.
+            self.assertEqual([method for method,_ in client.calls],['thread/start','turn/start','thread/read'])
             self.assertEqual(client.calls[0],('thread/start',{'cwd':'/tmp/fixture','historyMode':'legacy'}))
             self.assertEqual(client.calls[1][1]['input'],[{'type':'text','text':'prompt'}])
+            self.assertEqual(json.loads(receipt.read_text())['delivery'],'accepted')
             self.assertEqual(out['nativeSource']['id'],SID)
             self.assertEqual(out['argv'],reopened['argv'])
             self.assertNotIn('prompt',out['argv'])
@@ -594,7 +595,7 @@ class ManagedLaunchTest(unittest.TestCase):
             managed_launch.mark_attached(out,'terminal1')
             self.assertNotIn('terminalId',json.loads(receipt.read_text()))
             again=managed_launch.bind(spec,{'agent':'codex','home':'.codex'},'remote',receipt_path=receipt)
-            self.assertEqual(client.calls,['thread/start','thread/queue/add'])
+            self.assertEqual(client.calls,['thread/start','turn/start'])
             self.assertEqual(out['nativeSource'],again['nativeSource'])
     def test_claude_fixed_uuid_and_attach_unchanged(self):
         spec={'mode':'handoff','argv':['claude','prompt'],'cwd':'/tmp','env':{}}

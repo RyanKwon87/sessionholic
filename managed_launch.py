@@ -84,16 +84,12 @@ def bind(spec, profile, host, *, home=None, receipt_path=None):
         # Empty threads cannot yet be resumed by these CLI versions. Materialize
         # the already-authorized handoff prompt natively before attaching the TUI.
         try:
-            queued = client.call('thread/queue/add', {'threadId': identity['id'],
-                'clientUserMessageId': request_id, 'input': [{'type': 'text', 'text': prompt}]}).get('queuedSubmission', {})
-            if queued.get('clientUserMessageId') != request_id or not queued.get('id'):
+            # turn/start submits the prompt directly; there is no board-side queue.
+            started = client.call('turn/start', {'threadId': identity['id'],
+                'clientUserMessageId': request_id, 'input': [{'type': 'text', 'text': prompt}]}).get('turn', {})
+            if not started.get('id'):
                 raise ValueError('첫 메시지 접수 결과를 확인하지 못했습니다.')
-            record.update(delivery='queued', queueId=queued['id']); _save(receipt_path, record)
-            try:
-                client.call('thread/queue/start', {'threadId': identity['id'], 'queuedSubmissionId': queued['id']})
-            except NativeRejected:
-                # Automatic dispatch can already have started this exact queue item.
-                pass
+            record.update(delivery='accepted', turnId=started['id']); _save(receipt_path, record)
             # Wait for a resumable history without resubmitting the prompt.
             # Empty-thread reads can briefly reject before the first user item.
             deadline = time.monotonic() + 2

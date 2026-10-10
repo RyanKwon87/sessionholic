@@ -113,28 +113,10 @@ class Transfers:
         return self._runtime
 
     def control_options(self):
-        """Reuse one SSH connection per host through a private socket, when one fits."""
-        directory = self.base_dir / 'ssh'
-        # OpenSSH first binds "<path>.<16 random chars>"; macOS sun_path holds 103
-        # bytes plus NUL, and %C expands to 40 hex digits. Omit rather than fail.
-        if len(os.fsencode(str(directory / 'cm-'))) + 40 + 17 > 103:
-            return []
-        try:
-            info = os.lstat(self.base_dir)
-            if not stat.S_ISDIR(info.st_mode):
-                return []
-            try:
-                os.mkdir(directory, 0o700)
-            except FileExistsError:
-                pass
-            info = os.lstat(directory)
-            if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
-                return []
-            if info.st_mode & 0o077:
-                os.chmod(directory, 0o700)
-        except OSError:
-            return []
-        return ['-o', 'ControlMaster=auto', '-o', 'ControlPersist=60', '-o', 'ControlPath=' + str(directory / 'cm-%C')]
+        """Reuse one SSH connection per host; the socket folder rule is shared with collection."""
+        from server import prepare_ssh_control_dir, ssh_control_options
+        prepare_ssh_control_dir(self.base_dir)
+        return ssh_control_options(self.base_dir)
 
     def command(self, host, args, tty=False):
         python = host.get('python') or '/usr/bin/python3'

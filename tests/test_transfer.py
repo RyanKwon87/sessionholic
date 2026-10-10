@@ -70,8 +70,6 @@ class CoordinatorTest(unittest.TestCase):
             def call(self,method,params):
                 calls.append((method,params))
                 if method=='thread/start':return {'thread':{'id':native_id,'cwd':str(destination)}}
-                if method=='thread/queue/add':return {'queuedSubmission':{
-                    'id':'fixture-queue','clientUserMessageId':params['clientUserMessageId']}}
                 if method=='thread/read':return {'thread':{'id':native_id,'turns':[{'id':'fixture-turn'}]}}
                 return {'turn':{'id':'fixture-turn'}}
         original=self.flow.rpc
@@ -114,7 +112,7 @@ class CoordinatorTest(unittest.TestCase):
     def test_real_prepare_materializes_native_initial_input_only_after_source_revalidation(self):
         with self.native_prepare() as calls:
             result=self.execute()
-        self.assertEqual([method for method,_ in calls],['thread/start','thread/queue/add','thread/queue/start','thread/read'])
+        self.assertEqual([method for method,_ in calls],['thread/start','turn/start','thread/read'])
         self.assertEqual(calls[1][1]['input'],[{'type':'text','text':'fixture initial prompt'}])
         self.assertEqual(result['connectionMode'],'attach')
         operations=[op for _,op in self.calls]
@@ -136,16 +134,16 @@ class CoordinatorTest(unittest.TestCase):
             original=self.flow.rpc
             def rpc(host,op,args=None,timeout=30):
                 result=original(host,op,args,timeout)
-                if op=='prepare':raise RuntimeError('fixture response lost after native queue start')
+                if op=='prepare':raise RuntimeError('fixture response lost after native turn start')
                 return result
             self.flow.rpc=rpc
             with self.assertRaisesRegex(RuntimeError,'대상.*확인'):self.execute()
             record=json.loads(next((Path(self.temp.name)/'transfers').glob('*/transfer.json')).read_text())
             self.assertEqual(record['targetPreparation'],'unknown')
             self.assertTrue(record['sourceStopped'])
-            self.assertEqual(sum(method=='thread/queue/add' for method,_ in calls),1)
+            self.assertEqual(sum(method=='turn/start' for method,_ in calls),1)
             with self.assertRaises(ValueError):self.execute()
-            self.assertEqual(sum(method=='thread/queue/add' for method,_ in calls),1)
+            self.assertEqual(sum(method=='turn/start' for method,_ in calls),1)
     def test_source_resumes_during_final_file_inspection_blocks_native_preparation(self):
         with self.native_prepare() as calls:
             original=self.flow.rpc
@@ -638,16 +636,24 @@ class SshReuseTest(unittest.TestCase):
         flow.command(HOSTS[1],['x'])
         self.assertEqual((self.base/'ssh').stat().st_mode&0o777,0o700)
         self.assertEqual(flow.command(HOSTS[0],['x']),[sys.executable,'x'])
-    def test_control_socket_is_omitted_when_unsafe_too_long_or_missing(self):
-        long_base=self.base/('d'*60);long_base.mkdir()
+    def test_control_socket_is_omitted_when_unsafe_or_missing(self):
         missing=self.base/'missing'
         linked=self.base/'linked';linked.mkdir();(linked/'ssh').symlink_to(self.base)
-        for base in (long_base,missing,linked):
+        for base in (missing,linked):
             with self.subTest(base=base.name[:8]):
                 command=Transfers(HOSTS,base).command(HOSTS[1],['x'])
                 self.assertFalse(any(value.startswith('Control') for value in self.options(command)))
                 self.assertIn('BatchMode=yes',self.options(command))
-        self.assertFalse(missing.exists());self.assertFalse((long_base/'ssh').exists())
+        self.assertFalse(missing.exists())
+    def test_long_state_paths_share_the_collection_fallback_socket_folder(self):
+        import server
+        long_base=self.base/('d'*60);long_base.mkdir()
+        with patch.object(server,'SSH_FALLBACK_ROOT',self.base):
+            options=self.options(Transfers(HOSTS,long_base).command(HOSTS[1],['x']))
+        fallback=self.base/('sessionholic-%d'%os.getuid())
+        self.assertIn('ControlPath='+str(fallback/'cm-%C'),options)
+        self.assertEqual(fallback.stat().st_mode&0o777,0o700)
+        self.assertFalse((long_base/'ssh').exists())
 
 
 @unittest.skipUnless(shutil.which('git'),'requires local git')

@@ -3926,3 +3926,130 @@ body.top-hidden .top {
 .chat-prompt .primary {
   min-height: 44px;
 }
+
+/* Agent usage strip under the work counts. */
+.usage {
+  margin: -4px 4px 12px;
+}
+.usage[hidden] {
+  display: none;
+}
+.usage > summary {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  min-height: 32px;
+  cursor: pointer;
+  list-style: none;
+}
+.usage > summary::-webkit-details-marker {
+  display: none;
+}
+.usage-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 26px;
+  padding: 0 10px;
+  border-radius: 13px;
+  background: var(--surface);
+  color: var(--label-2);
+  font-size: var(--fs-cap);
+}
+.usage-pill strong {
+  color: var(--label);
+  font-size: var(--fs-sub);
+}
+.usage-short {
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+.usage-pill.green strong { color: #1f8a3c; }
+.usage-pill.orange strong { color: #c56a00; }
+.usage-pill.red strong { color: var(--red); }
+.usage-pill.muted strong { color: var(--label-3); }
+.usage-state {
+  color: var(--label-2);
+  font-size: var(--fs-cap);
+}
+.usage-body {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-top: 8px;
+  padding: 12px;
+  border-radius: 12px;
+  background: var(--surface);
+}
+.usage-provider h3 {
+  margin: 0 0 6px;
+  font-size: var(--fs-sub);
+}
+.usage-row {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 6px 0;
+  border-top: 1px solid var(--sep);
+}
+.usage-row-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: var(--fs-sub);
+}
+.usage-credits,
+.usage-note,
+.usage-window-reset,
+.usage-foot {
+  color: var(--label-2);
+  font-size: var(--fs-cap);
+}
+.usage-note {
+  margin: 0;
+}
+.usage-window {
+  display: grid;
+  grid-template-columns: 44px minmax(0, 1fr) 40px;
+  align-items: center;
+  gap: 2px 8px;
+  font-size: var(--fs-cap);
+}
+.usage-window-reset {
+  grid-column: 2 / -1;
+}
+.usage-window-value {
+  text-align: right;
+  font-weight: 600;
+}
+.usage-bar {
+  height: 6px;
+  overflow: hidden;
+  border-radius: 3px;
+  background: var(--fill-soft);
+}
+.usage-fill {
+  display: block;
+  height: 100%;
+  border-radius: 3px;
+  background: #1f8a3c;
+}
+.usage-fill.orange { background: #e08a00; }
+.usage-fill.red { background: var(--red); }
+.usage-fill.muted { background: var(--label-3); }
+.usage-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.usage-refresh {
+  min-height: 32px;
+  padding: 0 10px;
+  border: 0;
+  border-radius: var(--radius-s);
+  background: transparent;
+  color: var(--accent);
+  font-size: var(--fs-sub);
+}

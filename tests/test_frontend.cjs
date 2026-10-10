@@ -120,7 +120,7 @@ function client(
   vm.runInContext(messageSource, context);
   vm.runInContext(source, context);
   const api = vm.runInContext(
-    "({state,api,sourceOf,accountOf,sendInput,pasteDraft,prepareDraftPaste,startDraftComposition,endDraftComposition,inputDraft,stopTerminalReader,startTerminalReader,closePlan,navigateView,backToList,backFromTerminal,closeTerminal,cancelTerminalClose,confirmTerminalClose,populateAccount,populateRoute,updateContinue,renderPlan,launchPlan,openTerminal,saveDraft,draftKey,refreshTerminals,renderTerminals,renderTerminalReturn,renderFilters,terminalCloseCopy,warnDraftUnload,preparePlan,renderGroups,renderMessages,loadDetail,chatKey,chatEntry,currentChat,chatSupported,chatAttachmentsSupported,buildChatComposer,sendChat,loadChatState,applyChatReceipt,uploadChatFiles,pasteChat,scheduleChatPoll,stopChatPolling,openNativeChat,allSessions,buildContinuePanel,chatReceiptCopy,returnToBoard,readChatClipboard,accountDisplay,sessionAccountLabel,closeChatToolsOutside,closeChatToolsEscape,drawDetail,refreshDetail,loadCapabilities,matches,recoverConnection,networkOffline,poll,select,focusDetailBack,restoreSelectedCardFocus,showLogin,lock,beginAuthEpoch,resizeChatInput,updateViewport,draftKeydown,configureTerminalKeyboard,queueTerminalScroll,flushTerminalScroll,terminalScrollEnd,renderAttention,chatPollDelay,pullRefresh,readingScroll,renderJump,pullDistance,listScroll,setReading,renderPrompt,promptAction})",
+    "({state,api,sourceOf,accountOf,sendInput,pasteDraft,prepareDraftPaste,startDraftComposition,endDraftComposition,inputDraft,stopTerminalReader,startTerminalReader,closePlan,navigateView,backToList,backFromTerminal,closeTerminal,cancelTerminalClose,confirmTerminalClose,populateAccount,populateRoute,updateContinue,renderPlan,launchPlan,openTerminal,saveDraft,draftKey,refreshTerminals,renderTerminals,renderTerminalReturn,renderFilters,terminalCloseCopy,warnDraftUnload,preparePlan,renderGroups,renderMessages,loadDetail,chatKey,chatEntry,currentChat,chatSupported,chatAttachmentsSupported,buildChatComposer,sendChat,loadChatState,applyChatReceipt,uploadChatFiles,pasteChat,scheduleChatPoll,stopChatPolling,openNativeChat,allSessions,buildContinuePanel,chatReceiptCopy,returnToBoard,readChatClipboard,accountDisplay,sessionAccountLabel,closeChatToolsOutside,closeChatToolsEscape,drawDetail,refreshDetail,loadCapabilities,matches,recoverConnection,networkOffline,poll,select,focusDetailBack,restoreSelectedCardFocus,showLogin,lock,beginAuthEpoch,resizeChatInput,updateViewport,draftKeydown,configureTerminalKeyboard,queueTerminalScroll,flushTerminalScroll,terminalScrollEnd,renderAttention,chatPollDelay,pullRefresh,readingScroll,renderJump,pullDistance,listScroll,setReading,renderPrompt,promptAction,renderUsage,loadUsage})",
     context,
   );
   api.state.csrf = "csrf-test";
@@ -2015,7 +2015,8 @@ test('offline visibility and return-online events restart only bounded reads and
   assert.equal(requests.length, 0);
   c.context.navigator.onLine = true; c.windowEvents.online();
   await new Promise((resolve) => setImmediate(resolve));
-  assert.deepEqual(requests, ['/api/snapshot', '/api/chat/state']);
+  // The usage strip is another bounded read alongside the list.
+  assert.deepEqual(requests.filter((url) => url !== '/api/usage'), ['/api/snapshot', '/api/chat/state']);
   assert.equal(entry.text, '미전송 초안'); assert.equal(entry.pending, null);
 });
 
@@ -2128,13 +2129,13 @@ test('an offline first launch restores authentication and already-open terminal 
   assert.equal(requests.length, 0);
   c.context.navigator.onLine = true; c.windowEvents.online();
   await new Promise((resolve) => setImmediate(resolve));
-  assert.deepEqual(requests, ['/api/snapshot', '/api/capabilities', '/api/terminals']);
+  assert.deepEqual(requests.filter((url) => url !== '/api/usage'), ['/api/snapshot', '/api/capabilities', '/api/terminals']);
   assert.match(textOf(c.get('running-list')), /이미 열린 작업/);
   assert.equal(c.state.terminal, null); assert.equal(c.state.terminalVisible, false);
   assert.equal(c.get('app').hidden, false); assert.equal(c.get('login').hidden, true);
   assert.equal(c.get('login-submit').disabled, false);
   c.windowEvents.online(); await new Promise((resolve) => setImmediate(resolve));
-  assert.deepEqual(requests, ['/api/snapshot', '/api/capabilities', '/api/terminals', '/api/snapshot']);
+  assert.deepEqual(requests.filter((url) => url !== '/api/usage'), ['/api/snapshot', '/api/capabilities', '/api/terminals', '/api/snapshot']);
 });
 
 test('returning to a first-launch tab after online recovery while hidden reads login state without transmitting a token', async () => {
@@ -3366,4 +3367,28 @@ test('menus the web cannot drive stay readable with disabled options, and a wait
   entry.data = { ...entry.data, promptOpenable: false, phase: 'working' };
   c.renderPrompt(s, entry.data);
   assert.equal(c.get('chat-prompt').hidden, true);
+});
+
+test('the usage strip shows remaining limits per provider and hides on boards without the endpoint', async () => {
+  const c = client(undefined, noChatTimers);
+  const box = c.get('usage');
+  c.renderUsage({ available: true, refreshing: false, fetchedAt: 1791600000, providers: [
+    { id: 'codex', short: 'CX', label: 'Codex', remaining: 45, status: 'ready', rows: [
+      { name: '업무', credits: '1,250', windows: [{ label: '5시간', remaining: null, resetsAt: null },
+        { label: '주간', remaining: 68, resetsAt: '2026-10-14T13:00:00Z' }] }] },
+    { id: 'claude', short: 'CC', label: 'Claude', remaining: 10, status: 'ready', rows: [
+      { name: 'Claude Code', windows: [{ label: '5시간', remaining: 86, resetsAt: '2026-10-10T06:29:59Z' }] }] }] });
+  assert.equal(box.hidden, false);
+  const summary = textOf(c.get('usage-summary'));
+  assert.match(summary, /CX\s*45%/); assert.match(summary, /CC\s*10%/);
+  const body = textOf(c.get('usage-body'));
+  assert.match(body, /크레딧 1,250/); assert.match(body, /68%/); assert.match(body, /10\/14 22:00 초기화/);
+  assert.match(body, /—/);
+  c.renderUsage({ available: false });
+  assert.equal(box.hidden, true);
+  const missing = client(async () => ({ ok: false, status: 404, json: async () => ({ error: '없는 경로입니다.' }) }), noChatTimers);
+  missing.state.authenticated = true;
+  await missing.loadUsage();
+  assert.equal(missing.state.usageUnsupported, true);
+  assert.equal(missing.get('usage').hidden, true);
 });

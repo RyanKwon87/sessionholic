@@ -337,6 +337,94 @@ function renderHosts(now) {
     box.append(chip);
   }
 }
+// Agent usage (remaining limits) when the board host provides it; a board
+// without the endpoint simply never shows the strip.
+function usageTone(remaining) {
+  return !Number.isFinite(remaining) ? "muted" : remaining < 15 ? "red" : remaining < 40 ? "orange" : "green";
+}
+function kstShort(iso) {
+  const time = Date.parse(iso || "");
+  if (!Number.isFinite(time)) return "";
+  const date = new Date(time + 9 * 3600 * 1000);
+  const pad = (value) => String(value).padStart(2, "0");
+  return `${date.getUTCMonth() + 1}/${date.getUTCDate()} ${pad(date.getUTCHours())}:${pad(date.getUTCMinutes())}`;
+}
+function renderUsage(data) {
+  const box = $("usage");
+  if (!box) return;
+  const providers = data?.available && Array.isArray(data.providers) ? data.providers.filter((item) => item && typeof item === "object") : [];
+  if (!providers.length) { box.hidden = true; box.dataset.revision = ""; return; }
+  box.hidden = false;
+  const revision = JSON.stringify([providers, data.refreshing, data.fetchedAt, data.error]);
+  if (box.dataset.revision === revision) return;
+  box.dataset.revision = revision;
+  const summary = $("usage-summary");
+  const pills = providers.map((provider) => {
+    const remaining = Number.isFinite(provider.remaining) ? provider.remaining : null;
+    const pill = el("span", `usage-pill ${provider.status === "ready" ? usageTone(remaining) : "muted"}`);
+    pill.append(el("span", "usage-short", provider.short || provider.label || ""), el("strong", null, remaining === null ? "—" : `${remaining}%`));
+    return pill;
+  });
+  if (data.refreshing) pills.push(el("span", "usage-state", "조회 중"));
+  summary.replaceChildren(...pills);
+  summary.setAttribute("aria-label", `남은 사용량 ${providers.map((provider) =>
+    `${provider.label || provider.short} ${Number.isFinite(provider.remaining) ? provider.remaining + "%" : "확인 불가"}`).join(", ")}`);
+  const body = $("usage-body");
+  const sections = providers.map((provider) => {
+    const section = el("section", "usage-provider");
+    section.append(el("h3", null, provider.label || provider.short || "사용량"));
+    if (provider.note) section.append(el("p", "usage-note", provider.note));
+    for (const row of Array.isArray(provider.rows) ? provider.rows : []) {
+      const item = el("div", "usage-row");
+      const head = el("div", "usage-row-head");
+      head.append(el("strong", null, row.name || ""));
+      if (row.credits) head.append(el("span", "usage-credits", `크레딧 ${row.credits}`));
+      item.append(head);
+      if (row.note) item.append(el("p", "usage-note", row.note));
+      for (const window of Array.isArray(row.windows) ? row.windows : []) {
+        const remaining = Number.isFinite(window.remaining) ? Math.max(0, Math.min(100, window.remaining)) : null;
+        const line = el("div", "usage-window");
+        const bar = el("div", "usage-bar");
+        const fill = el("span", `usage-fill ${usageTone(remaining)}`);
+        if (fill.style) fill.style.width = `${remaining ?? 0}%`;
+        bar.append(fill);
+        const reset = kstShort(window.resetsAt);
+        line.append(el("span", "usage-window-label", window.label || ""), bar,
+          el("span", "usage-window-value", remaining === null ? "—" : `${remaining}%`),
+          el("span", "usage-window-reset", reset ? `${reset} 초기화` : ""));
+        item.append(line);
+      }
+      section.append(item);
+    }
+    return section;
+  });
+  const foot = el("div", "usage-foot");
+  const fetched = Number.isFinite(data.fetchedAt) ? clock(data.fetchedAt) : "";
+  foot.append(el("span", null, data.error ? data.error : fetched ? `마지막 조회 ${fetched} · 남은 비율` : "남은 비율"));
+  const refresh = button(data.refreshing ? "조회 중…" : "새로고침", "usage-refresh", () => loadUsage(true));
+  refresh.disabled = !!data.refreshing;
+  foot.append(refresh);
+  body.replaceChildren(...sections, foot);
+}
+async function loadUsage(force = false) {
+  if (state.usageUnsupported || !state.authenticated || networkOffline() || document.hidden) return;
+  if (state.usageBusy) return;
+  state.usageBusy = true;
+  state.usageAt = Date.now();
+  try {
+    const data = force ? await api("/api/usage/refresh", { method: "POST", body: {} }) : await api("/api/usage");
+    state.usage = data;
+    renderUsage(data);
+    // Follow a refresh the server is running, without polling forever.
+    if (data?.refreshing && (state.usageFollow = (state.usageFollow || 0) + 1) <= 15)
+      setTimeout(() => loadUsage(false), 4000);
+    else if (!data?.refreshing) state.usageFollow = 0;
+  } catch (err) {
+    if (err.status === 404) { state.usageUnsupported = true; renderUsage(null); }
+  } finally {
+    state.usageBusy = false;
+  }
+}
 const BASE_TITLE = "세션홀릭 - 에이전트 세션 매니저";
 function renderAttention(sessions) {
   // The tab title and app icon say when work waits for an answer while this view is elsewhere.
@@ -3241,6 +3329,7 @@ async function poll(refresh = false) {
       state.capabilitiesRevision = revision;
     }
     state.pollFailures = 0;
+    if (Date.now() - (state.usageAt || 0) > 55000) loadUsage();
     schedule();
   } catch (err) {
     if (!err.unauthorized && !err.staleAuth) {

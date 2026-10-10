@@ -3057,6 +3057,68 @@ async function manualRefresh() {
     if (authEpoch === state.authEpoch) $("refresh").disabled = false;
   }
 }
+// Pull to refresh: the installed app has no browser gesture (overscroll is off),
+// so a downward pull from the top of the list or conversation reloads both.
+const PULL_TRIGGER = 64;
+function scrollParent(node) {
+  for (let item = node; item && item !== document.body; item = item.parentElement) {
+    const overflow = window.getComputedStyle?.(item)?.overflowY || "";
+    if (/(auto|scroll)/.test(overflow) && item.scrollHeight > item.clientHeight) return item;
+  }
+  return null;
+}
+function showPull(distance, label = "당겨서 새로고침", ready = false) {
+  const indicator = $("pull-refresh");
+  if (!indicator?.style) return;
+  indicator.style.transform = `translate(-50%, ${Math.round(distance - 48)}px)`;
+  indicator.style.opacity = distance > 4 ? "1" : "0";
+  indicator.classList?.toggle?.("is-ready", ready);
+  $("pull-refresh-label").textContent = label;
+}
+async function pullRefresh() {
+  if (state.pullRefreshing) return;
+  state.pullRefreshing = true;
+  showPull(PULL_TRIGGER, "새로고침 중…", true);
+  $("pull-refresh")?.classList?.add("is-loading");
+  try {
+    await manualRefresh();
+    const selected = selectedSession();
+    if (selected && chatVisible()) await loadChatState(selected, true);
+  } finally {
+    state.pullRefreshing = false;
+    $("pull-refresh")?.classList?.remove("is-loading");
+    showPull(0);
+  }
+}
+function bindPullToRefresh(root) {
+  let start = null, distance = 0;
+  root.addEventListener("touchstart", (event) => {
+    start = null;
+    distance = 0;
+    if (event.touches.length !== 1 || state.terminalVisible || state.pullRefreshing) return;
+    if (event.target?.closest?.("textarea, input, select, dialog[open]")) return;
+    const scroller = scrollParent(event.target);
+    if (scroller && scroller.scrollTop > 0) return;
+    start = event.touches[0].clientY;
+  }, { passive: true });
+  root.addEventListener("touchmove", (event) => {
+    if (start === null || event.touches.length !== 1) return;
+    const pulled = event.touches[0].clientY - start;
+    if (pulled <= 0) { distance = 0; showPull(0); return; }
+    distance = Math.min(pulled * 0.5, 96);
+    const ready = distance >= PULL_TRIGGER;
+    showPull(distance, ready ? "놓으면 새로고침" : "당겨서 새로고침", ready);
+    if (event.cancelable) event.preventDefault();
+  }, { passive: false });
+  const finish = () => {
+    if (start !== null && distance >= PULL_TRIGGER) pullRefresh();
+    else if (!state.pullRefreshing) showPull(0);
+    start = null;
+    distance = 0;
+  };
+  root.addEventListener("touchend", finish, { passive: true });
+  root.addEventListener("touchcancel", () => { start = null; distance = 0; if (!state.pullRefreshing) showPull(0); }, { passive: true });
+}
 function showLogin() {
   beginAuthEpoch();
   state.loginBusy = false;
@@ -3275,6 +3337,7 @@ window.addEventListener("DOMContentLoaded", () => {
     startTerminalReader();
   });
   $("terminal-bottom").addEventListener("click", terminalScrollEnd);
+  bindPullToRefresh($("app"));
   bindTerminalTouchScroll($("terminal-viewport"));
   $("terminal-copy").addEventListener("click", async () => {
     const text = state.term?.getSelection();

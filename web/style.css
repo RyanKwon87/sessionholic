@@ -3710,3 +3710,39 @@ select:disabled {
   font-size: var(--fs-cap);
   line-height: 1.4;
 }
+
+/* Pull to refresh indicator, slid in from above the board. */
+.pull-refresh {
+  position: fixed;
+  top: max(8px, env(safe-area-inset-top));
+  left: 50%;
+  z-index: 40;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 14px;
+  border-radius: 999px;
+  background: var(--surface);
+  box-shadow: 0 2px 12px rgba(0, 0, 0, 0.16);
+  color: var(--label-2);
+  font-size: var(--fs-cap);
+  opacity: 0;
+  pointer-events: none;
+  transform: translate(-50%, -48px);
+  transition: opacity 0.15s ease;
+}
+.pull-refresh-icon {
+  display: inline-block;
+  color: var(--accent);
+  font-size: 15px;
+  transition: transform 0.15s ease;
+}
+.pull-refresh.is-ready .pull-refresh-icon {
+  transform: rotate(180deg);
+}
+.pull-refresh.is-loading .pull-refresh-icon {
+  animation: pull-spin 0.8s linear infinite;
+}
+@keyframes pull-spin {
+  to { transform: rotate(360deg); }
+}

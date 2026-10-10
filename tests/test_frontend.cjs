@@ -120,7 +120,7 @@ function client(
   vm.runInContext(messageSource, context);
   vm.runInContext(source, context);
   const api = vm.runInContext(
-    "({state,api,sourceOf,accountOf,sendInput,pasteDraft,prepareDraftPaste,startDraftComposition,endDraftComposition,inputDraft,stopTerminalReader,startTerminalReader,closePlan,navigateView,backToList,backFromTerminal,closeTerminal,cancelTerminalClose,confirmTerminalClose,populateAccount,populateRoute,updateContinue,renderPlan,launchPlan,openTerminal,saveDraft,draftKey,refreshTerminals,renderTerminals,renderTerminalReturn,renderFilters,terminalCloseCopy,warnDraftUnload,preparePlan,renderGroups,renderMessages,loadDetail,chatKey,chatEntry,currentChat,chatSupported,chatAttachmentsSupported,buildChatComposer,sendChat,loadChatState,applyChatReceipt,uploadChatFiles,pasteChat,scheduleChatPoll,stopChatPolling,openNativeChat,allSessions,buildContinuePanel,chatReceiptCopy,returnToBoard,readChatClipboard,accountDisplay,sessionAccountLabel,closeChatToolsOutside,closeChatToolsEscape,drawDetail,refreshDetail,loadCapabilities,matches,recoverConnection,networkOffline,poll,select,focusDetailBack,restoreSelectedCardFocus,showLogin,lock,beginAuthEpoch,resizeChatInput,updateViewport,openChatQueue,closeChatQueue,chatQueueCount})",
+    "({state,api,sourceOf,accountOf,sendInput,pasteDraft,prepareDraftPaste,startDraftComposition,endDraftComposition,inputDraft,stopTerminalReader,startTerminalReader,closePlan,navigateView,backToList,backFromTerminal,closeTerminal,cancelTerminalClose,confirmTerminalClose,populateAccount,populateRoute,updateContinue,renderPlan,launchPlan,openTerminal,saveDraft,draftKey,refreshTerminals,renderTerminals,renderTerminalReturn,renderFilters,terminalCloseCopy,warnDraftUnload,preparePlan,renderGroups,renderMessages,loadDetail,chatKey,chatEntry,currentChat,chatSupported,chatAttachmentsSupported,buildChatComposer,sendChat,loadChatState,applyChatReceipt,uploadChatFiles,pasteChat,scheduleChatPoll,stopChatPolling,openNativeChat,allSessions,buildContinuePanel,chatReceiptCopy,returnToBoard,readChatClipboard,accountDisplay,sessionAccountLabel,closeChatToolsOutside,closeChatToolsEscape,drawDetail,refreshDetail,loadCapabilities,matches,recoverConnection,networkOffline,poll,select,focusDetailBack,restoreSelectedCardFocus,showLogin,lock,beginAuthEpoch,resizeChatInput,updateViewport,draftKeydown,configureTerminalKeyboard,queueTerminalScroll,flushTerminalScroll,terminalScrollEnd,renderAttention,chatPollDelay})",
     context,
   );
   api.state.csrf = "csrf-test";
@@ -1220,15 +1220,21 @@ test('Claude terminal fallback permits same-session attachment paths but blocks 
   assert.equal(c.chatAttachmentsSupported(entry), false);
 });
 
-test('selected native polling has a fixed request budget and stops while hidden or in terminal', () => {
+test('selected native polling backs off during long turns, stays bounded and stops while hidden or in terminal', () => {
   const timers = [];
   const c = client(undefined, { setTimeout: (callback, delay) => { timers.push({ callback, delay }); return timers.length; }, clearTimeout() {} });
   const { s, entry } = selectChat(c);
   entry.data.phase = 'working';
   c.scheduleChatPoll(s, entry);
   assert.equal(timers.at(-1).delay, 3000);
+  // A turn longer than two minutes is still followed, just less often.
+  for (const [count, delay] of [[10, 5000], [30, 10000], [90, 20000], [239, 20000]]) {
+    c.state.chatPollCount = count;
+    c.scheduleChatPoll(s, entry);
+    assert.equal(timers.at(-1).delay, delay);
+  }
   const count = timers.length;
-  c.state.chatPollCount = 40;
+  c.state.chatPollCount = 240;
   c.scheduleChatPoll(s, entry);
   assert.equal(timers.length, count);
   c.state.chatPollCount = 0;
@@ -1888,7 +1894,7 @@ test('offline drafts remain editable but send, uploads, clipboard reads and term
   assert.equal(c.get('chat-send').disabled, true); assert.match(c.get('chat-status').textContent, /오프라인.*초안/);
 });
 
-test('online recovery reads one selected state and snapshot without resending unknown work or reconnecting terminal input', async () => {
+test('online recovery reads one selected state and snapshot without resending unknown work or terminal input', async () => {
   const requests = [];
   let snapshot;
   const c = client(async (url, options) => {
@@ -1909,8 +1915,12 @@ test('online recovery reads one selected state and snapshot without resending un
   assert.equal(JSON.parse(requests.find((r) => r.url === '/api/chat/state').options.body).requestId, 'unknown-request');
   assert.equal(entry.pending.requestId, 'unknown-request');
   c.state.terminalVisible = true; c.state.terminal = { id: 'visible-terminal' }; c.state.offline = true;
-  const before = requests.length; c.recoverConnection();
-  assert.equal(requests.length, before); assert.equal(c.state.connected, false);
+  const before = requests.length; c.recoverConnection(); await new Promise((resolve) => setImmediate(resolve));
+  // Output is re-read from its cursor; input is never replayed and stays locked until a valid read.
+  const after = requests.slice(before);
+  assert.ok(after.length >= 1);
+  assert.ok(after.every((r) => /\/api\/terminal\/visible-terminal\/events\?/.test(r.url) && (r.options?.method || 'GET') === 'GET'));
+  assert.equal(c.state.connected, false);
   assert.match(c.get('terminal-status').textContent, /다시 연결/);
 });
 
@@ -2638,7 +2648,7 @@ test('queued attachment delivery keeps server metadata evidence after clearing t
   assert.equal(Object.hasOwn(outbound.body, 'attachmentDetails'), false);
   const evidence = c.get('chat-delivery-evidence');
   assert.equal(evidence.hidden, false);
-  assert.match(textOf(evidence), /대기열 접수.*세션 기록 확인.*전송에 포함한 첨부 1개.*authoritative.png/);
+  assert.match(textOf(evidence), /전송 접수.*세션 기록 확인.*전송에 포함한 첨부 1개.*authoritative.png/);
   assert.doesNotMatch(textOf(evidence), /local.png|not-for-evidence|모델.*읽|동기화 완료/);
   assert.equal(c.get('chat-attachments-label').hidden, true);
   const retained = evidence.children[0];
@@ -2939,221 +2949,6 @@ function queueItem(requestId, text, attachments = [], extra = {}) {
     attachments, status: 'queued', confirmed: true, ...extra };
 }
 
-test('queued send snapshots keep multiple original bodies visible after draft clearing, and readonly dialog refresh preserves new Korean input', async () => {
-  const requests = []; const queued = []; const stored = []; let copied;
-  const c = client(async (url, options) => {
-    const body = JSON.parse(options.body); requests.push({ url, body });
-    if (url === '/api/chat/send') {
-      queued.push(queueItem(body.requestId, body.text + '\n첨부 파일: [native-added-path]', body.attachments.map((id) => ({ id, name: '사진.png', type: 'image/png', kind: 'image', size: 3, source: 'sessionholic' }))));
-      return { ok: true, status: 200, json: async () => ({ status: 'queued', receipt: { requestId: body.requestId,
-        queueId: queued.at(-1).queueId, confirmed: true, currentSnapshotConfirmed: true } }) };
-    }
-    return { ok: true, status: 200, json: async () => queueStateReply(body.source, queued,
-      queued.map((item) => ({ requestId: item.requestId, status: 'queued', confirmed: true, currentSnapshotConfirmed: true }))) };
-  }, noChatTimers);
-  c.context.navigator = { clipboard: { writeText: async (text) => { copied = text; } } };
-  c.context.localStorage.setItem = (...args) => stored.push(args);
-  const { s, entry } = selectChat(c); entry.data.phase = 'working';
-  c.buildChatComposer(s);
-  const original = '첫 요청 **원문**\n> 인용 기호도 원문입니다.';
-  entry.text = original; entry.attachments = [{ id: 'photo-id', name: '사진.png', type: 'image/png', size: 3 }];
-  await c.sendChat(entry); await new Promise((resolve) => setImmediate(resolve));
-  assert.equal(entry.text, ''); assert.equal(entry.pending, null);
-  c.get('chat-input').value = '두 번째 요청 전체 본문'; c.get('chat-input').events.input();
-  await c.sendChat(entry); await new Promise((resolve) => setImmediate(resolve));
-  assert.equal(c.chatQueueCount(entry), 2); assert.equal(c.get('chat-queue-open').textContent, '예약 2개');
-  const beforeOpen = requests.length;
-  c.get('chat-queue-open').events.click();
-  assert.equal(c.get('chat-queue-dialog').open, true); assert.equal(requests.length, beforeOpen);
-  const list = c.get('chat-queue-list'); const firstRow = list.children[0];
-  assert.equal(byClass(firstRow, 'queued-message-body')[0].textContent, original);
-  assert.match(textOf(firstRow), /이 탭에서 보낸 원문.*사진.png/s);
-  assert.doesNotMatch(textOf(firstRow), /native-added-path/);
-  await byClass(firstRow, 'queued-message-copy')[0].events.click(); assert.equal(copied, original);
-  assert.equal(byClass(firstRow, 'queued-message-copy')[0].attributes['aria-label'], '표시된 메시지 본문 복사');
-  c.closeChatQueue();
-  const input = c.get('chat-input'); input.value = '보낸 후 새 한글 초안'; input.events.compositionstart(); input.events.input();
-  c.get('chat-queue-open').events.click();
-  assert.equal(c.get('chat-queue-dialog').open, false); assert.equal(entry.composing, true);
-  input.events.compositionend(); c.openChatQueue(entry);
-  const bodyNode = byClass(c.get('chat-queue-list').children[0], 'queued-message-body')[0];
-  c.get('chat-queue-list').scrollTop = 45;
-  await c.loadChatState(s, true);
-  assert.equal(byClass(c.get('chat-queue-list').children[0], 'queued-message-body')[0], bodyNode);
-  assert.equal(c.get('chat-queue-list').scrollTop, 45);
-  assert.equal(c.get('chat-input'), input); assert.equal(entry.text, '보낸 후 새 한글 초안');
-  assert.equal(requests.filter((request) => request.url === '/api/chat/send').length, 2);
-  assert.equal(requests.filter((request) => request.url === '/api/chat/state').length, 3);
-  assert.deepEqual(stored, []);
-});
-
-test('an uncertain send exposes its original content for review but is never counted as a reservation or retransmitted', async () => {
-  let sends = 0; let copied;
-  const c = client(async (url, options) => {
-    const body = JSON.parse(options.body);
-    if (url === '/api/chat/send') { sends++; throw new Error('lost response'); }
-    return { ok: true, status: 200, json: async () => queueStateReply(body.source, [],
-      [{ requestId: body.requestId, status: 'unknown', confirmed: false, currentSnapshotConfirmed: false }]) };
-  }, noChatTimers);
-  const { entry } = selectChat(c); c.buildChatComposer(c.state.snapshot.hosts[0].data.codex[0]);
-  c.context.navigator = { clipboard: { writeText: async (text) => { copied = text; } } };
-  entry.text = '전송 결과를 모르는 원문\n둘째 줄';
-  await c.sendChat(entry); await new Promise((resolve) => setImmediate(resolve));
-  assert.ok(entry.pending); assert.equal(c.chatQueueCount(entry), 0);
-  assert.equal(c.get('chat-queue-open').textContent, '미확인 내역');
-  c.openChatQueue(entry); const row = c.get('chat-queue-list').children[0];
-  assert.match(textOf(row), /전송 결과 미확인/);
-  assert.equal(byClass(row, 'queued-message-body')[0].textContent, entry.pending.text);
-  await byClass(row, 'queued-message-copy')[0].events.click(); assert.equal(copied, entry.pending.text);
-  await c.sendChat(entry); assert.equal(sends, 1);
-});
-
-test('a fresh page restores native queue contents, generic attachments and missing-content warnings without adding an API call', async () => {
-  const calls = [];
-  const native = [queueItem('native.request:001', '<script>literal</script>\nfull native request', [], { textTruncated: true }),
-    queueItem(null, '', [{ id: null, name: '이미지', kind: 'image', type: 'image/*', size: null, source: 'native' }], { queueId: 'native-queue-two' }),
-    queueItem(null, '', [], { queueId: 'native-queue-three', contentAvailable: false })];
-  const c = client(async (url, options) => { calls.push(url); return { ok: true, status: 200,
-    json: async () => queueStateReply(JSON.parse(options.body).source, native) }; }, noChatTimers);
-  const { s, entry } = selectChat(c); c.buildChatComposer(s);
-  await c.loadChatState(s, true); c.openChatQueue(entry);
-  assert.deepEqual(calls, ['/api/chat/state']); assert.equal(c.chatQueueCount(entry), 3);
-  const rows = c.get('chat-queue-list').children;
-  assert.equal(byClass(rows[0], 'queued-message-body')[0].textContent, '<script>literal</script>\nfull native request');
-  assert.match(textOf(rows[0]), /원본 세션 대기열에서 확인한 내용.*일부만 표시/s);
-  assert.equal(byClass(rows[0], 'queued-message-time')[0].textContent, '');
-  assert.match(textOf(rows[1]), /첨부만 보낸 메시지.*이미지/);
-  assert.equal(byClass(rows[1], 'queued-message-copy')[0].hidden, true);
-  assert.match(textOf(rows[2]), /메시지 내용을 확인하지 못했습니다/);
-  assert.equal(byClass(rows[2], 'queued-message-copy')[0].hidden, true);
-});
-
-test('queueId aliases prevent duplicate reservations when a native row lacks its client request ID', async () => {
-  let queued; let requestId;
-  const c = client(async (url, options) => {
-    const body = JSON.parse(options.body);
-    if (url === '/api/chat/send') {
-      requestId = body.requestId; queued = queueItem(null, body.text, [], { queueId: 'shared-queue-id' });
-      return { ok: true, status: 200, json: async () => ({ status: 'queued', receipt: { requestId,
-        queueId: 'shared-queue-id', confirmed: true, currentSnapshotConfirmed: true } }) };
-    }
-    return { ok: true, status: 200, json: async () => queueStateReply(body.source, [queued],
-      [{ requestId, status: 'queued', confirmed: true, currentSnapshotConfirmed: false }]) };
-  }, noChatTimers);
-  const { s, entry } = selectChat(c); c.buildChatComposer(s); entry.text = 'only one request';
-  await c.sendChat(entry); await new Promise((resolve) => setImmediate(resolve));
-  assert.equal(entry.submissions.length, 1); assert.equal(c.chatQueueCount(entry), 1);
-  c.openChatQueue(entry); assert.equal(c.get('chat-queue-list').children.length, 1);
-  assert.match(textOf(c.get('chat-queue-list')), /대기 중.*only one request/);
-});
-
-test('queue absence and historical queued receipts remain uncertain, while exact fresh receipts alone advance execution and completion', async () => {
-  let phase = 'queued';
-  const c = client(async (url, options) => {
-    const body = JSON.parse(options.body);
-    const item = queueItem('known-request-001', '내용이 남아야 하는 예약');
-    return { ok: true, status: 200, json: async () => queueStateReply(body.source, phase === 'queued' ? [item] : [],
-      phase === 'queued' ? [] : [{ requestId: item.requestId, status: phase === 'historical' ? 'queued' : phase,
-        confirmed: true, currentSnapshotConfirmed: phase !== 'historical' }]) };
-  }, noChatTimers);
-  const { s, entry } = selectChat(c); c.buildChatComposer(s);
-  await c.loadChatState(s, true); c.openChatQueue(entry);
-  phase = 'historical'; await c.loadChatState(s, true);
-  assert.equal(c.chatQueueCount(entry), 0);
-  assert.match(textOf(c.get('chat-queue-list')), /접수 후 상태 미확인.*내용이 남아야/);
-  assert.doesNotMatch(textOf(c.get('chat-queue-list')), /완료|실행 시작/);
-  phase = 'accepted'; await c.loadChatState(s, true); assert.match(textOf(c.get('chat-queue-list')), /실행 시작/);
-  phase = 'completed'; await c.loadChatState(s, true); assert.match(textOf(c.get('chat-queue-list')), /완료.*내용이 남아야/);
-});
-
-test('partial queue totals never double-count a local queued message outside the returned window and unavailable snapshots stay uncertain', async () => {
-  let receipt; let available = true;
-  const c = client(async (url, options) => {
-    const body = JSON.parse(options.body);
-    if (url === '/api/chat/send') {
-      receipt = { requestId: body.requestId, status: 'queued', confirmed: true, currentSnapshotConfirmed: true };
-      return { ok: true, status: 200, json: async () => ({ status: 'queued', receipt }) };
-    }
-    return { ok: true, status: 200, json: async () => queueStateReply(body.source, [],
-      [{ ...receipt, currentSnapshotConfirmed: available }], { available, complete: false, truncated: true, total: available ? 60 : null }) };
-  }, noChatTimers);
-  const { s, entry } = selectChat(c); c.buildChatComposer(s); entry.text = 'window 밖 새 예약';
-  await c.sendChat(entry); await new Promise((resolve) => setImmediate(resolve));
-  assert.equal(c.chatQueueCount(entry), 60);
-  c.openChatQueue(entry); assert.match(c.get('chat-queue-note').textContent, /일부 내역/);
-  available = false; await c.loadChatState(s, true);
-  assert.equal(c.chatQueueCount(entry), 0);
-  assert.match(textOf(c.get('chat-queue-list')), /접수 후 상태 미확인/);
-  assert.match(c.get('chat-queue-note').textContent, /대기열을 확인하지 못했습니다/);
-});
-
-test('submission memory and batched receipt requests are bounded, native IDs remain valid and completed records stop requesting readback', async () => {
-  const bodies = []; let complete = false;
-  const items = Array.from({ length: 25 }, (_, index) => queueItem('native.request:' + String(index).padStart(3, '0'), '한'.repeat(32768)));
-  const c = client(async (url, options) => {
-    const body = JSON.parse(options.body); bodies.push(body);
-    return { ok: true, status: 200, json: async () => queueStateReply(body.source, complete ? [] : items,
-      complete ? (body.requestIds || []).map((requestId) => ({ requestId, status: 'completed', confirmed: true, currentSnapshotConfirmed: true })) : [],
-      { total: complete ? 0 : 25 }) };
-  }, noChatTimers);
-  const { s, entry } = selectChat(c); c.buildChatComposer(s);
-  await c.loadChatState(s, true);
-  assert.ok(entry.submissions.length <= 20);
-  assert.ok(entry.submissions.reduce((bytes, item) => bytes + Buffer.byteLength(item.text || ''), 0) <= 256 * 1024);
-  c.openChatQueue(entry); assert.match(c.get('chat-queue-note').textContent, /일부 내역/);
-  entry.pending = { requestId: 'last-pending-001', revision: entry.revision };
-  await c.loadChatState(s, true);
-  const selected = bodies.at(-1);
-  assert.ok(new Set([selected.requestId, ...selected.requestIds]).size <= 20);
-  assert.ok(selected.requestIds.includes('last-pending-001'));
-  assert.ok(selected.requestIds.some((id) => id.includes('.request:')));
-  entry.pending = null; entry.receipt = null;
-  complete = true; await c.loadChatState(s, true); await c.loadChatState(s, true);
-  assert.equal(bodies.at(-1).requestIds, undefined); assert.equal(bodies.at(-1).requestId, undefined);
-});
-
-test('queue details purge on auth, session and cwd boundaries; close and Escape return focus to the shortcut without editing drafts', async () => {
-  for (const boundary of ['auth', 'session', 'cwd', 'removed']) {
-    const c = client(async (url, options) => ({ ok: true, status: 200,
-      json: async () => queueStateReply(JSON.parse(options.body).source, [queueItem('private-request-001', 'private queue body')]) }), noChatTimers);
-    const { s, entry } = selectChat(c); s.cwd = '/example/original'; c.buildChatComposer(s);
-    await c.loadChatState(s, true); entry.text = '새 초안'; c.openChatQueue(entry);
-    assert.match(textOf(c.get('chat-queue-list')), /private queue body/);
-    if (boundary === 'auth') c.showLogin();
-    if (boundary === 'session') { const other = selectChat(c, { id: 'different-session' }); c.buildChatComposer(other.s); c.get('chat-input').events.input(); }
-    if (boundary === 'cwd') { s.cwd = '/example/changed'; c.get('chat-input').events.input(); }
-    if (boundary === 'removed') { c.state.snapshot.hosts[0].data.codex = []; vm.runInContext('render()', c.context); }
-    assert.equal(c.get('chat-queue-dialog').open, false, boundary);
-    assert.equal(c.get('chat-queue-list').children.length, 0, boundary);
-  }
-  const c = client(undefined, noChatTimers); c.context.navigator = { onLine: false }; c.windowEvents.DOMContentLoaded();
-  const { s, entry } = selectChat(c); c.buildChatComposer(s); entry.text = '닫기 후 남을 초안';
-  c.openChatQueue(entry); c.get('chat-queue-dismiss').events.click();
-  assert.equal(c.get('chat-queue-dialog').open, false); assert.equal(entry.text, '닫기 후 남을 초안');
-  assert.ok(c.get('chat-queue-open').focusCount > 0);
-  c.openChatQueue(entry); let prevented = false;
-  c.get('chat-queue-dialog').events.cancel({ preventDefault() { prevented = true; } });
-  assert.equal(prevented, true); assert.equal(c.get('chat-queue-dialog').open, false);
-  assert.equal(c.get('chat-input').focusCount, undefined);
-});
-
-test('confirmed queued work keeps the existing bounded poll alive while idle, but unknown-only work and offline or hidden views do not', async () => {
-  const timers = []; let mode = 'queued';
-  const c = client(async (url, options) => ({ ok: true, status: 200, json: async () => ({
-    ...queueStateReply(JSON.parse(options.body).source, mode === 'queued' ? [queueItem('poll-request-001', '대기 중 본문')] : [],
-      mode === 'queued' ? [] : [{ requestId: 'poll-request-001', status: 'unknown', confirmed: true, currentSnapshotConfirmed: false }]), phase: 'idle',
-  }) }), { setTimeout: (callback, delay) => { timers.push({ callback, delay }); return timers.length; }, clearTimeout() {} });
-  const { s, entry } = selectChat(c); c.buildChatComposer(s);
-  await c.loadChatState(s, true);
-  assert.equal(timers.at(-1).delay, 3000);
-  let count = timers.length;
-  c.state.chatPollCount = 40; c.scheduleChatPoll(s, entry); assert.equal(timers.length, count);
-  c.state.chatPollCount = 0; c.context.document.hidden = true; c.scheduleChatPoll(s, entry); assert.equal(timers.length, count);
-  c.context.document.hidden = false; c.state.offline = true; c.scheduleChatPoll(s, entry); assert.equal(timers.length, count);
-  c.state.offline = false; mode = 'unknown'; await c.loadChatState(s, false);
-  assert.equal(c.chatQueueCount(entry), 0); assert.equal(timers.length, count);
-});
-
 function recentSession(id, fields = {}) {
   const s = { host: 'workstation', hostLabel: 'Workstation', agent: 'codex', home: '.codex-example', id,
     title: '검토할 작업', project: 'Sample project', account: 'Sample profile', phase: 'idle', updatedAt: 1000, ...fields };
@@ -3278,4 +3073,122 @@ test('changing list filters removes hidden cards without changing the selected s
   assert.equal(byClass(c.get('groups'), 'card').length, 1);
   assert.equal(c.state.selected, first.key);
   assert.equal(byClass(c.get('groups'), 'card')[0].dataset.sessionKey, second.key);
+});
+
+test('terminal keys sit in two rows with an inverted-T arrow cluster and the requested control keys', () => {
+  const html = fs.readFileSync(path.join(__dirname, '../web/index.html'), 'utf8');
+  const css = fs.readFileSync(path.join(__dirname, '../web/style.css'), 'utf8');
+  for (const key of ['escape', 'tab', 'backtab', 'interrupt', 'ctrl-j', 'ctrl-u', 'ctrl-x', 'ctrl-l', 'up', 'left', 'down', 'right', 'enter'])
+    assert.match(html, new RegExp(`data-key="${key}"`));
+  assert.match(css, /"k1 k2 k3 k4 \.\s+up\s+\.\s+enter"/);
+  assert.match(css, /"k5 k6 k7 k8 left down right enter"/);
+  for (const [key, bytes] of [['backtab', '\\x1b[Z'], ['"ctrl-j"', '\\n'], ['"ctrl-u"', '\\x15'], ['"ctrl-x"', '\\x18'], ['"ctrl-l"', '\\x0c']])
+    assert.ok(source.includes(`${key}: "${bytes}"`), key);
+});
+
+test('the input bar sends a paste then a separate Enter, while input-only never adds Enter', async () => {
+  const calls = [];
+  const c = client(async (url, opts) => {
+    calls.push(JSON.parse(opts.body).text);
+    return { ok: true, status: 200, json: async () => ({ ok: true }) };
+  });
+  c.state.connected = true;
+  c.state.terminal = { id: 'term-1' };
+  c.state.term = { modes: { bracketedPasteMode: true }, scrollToBottom() {} };
+  c.get('terminal-draft').value = '테스트 돌려줘';
+  await c.pasteDraft(true);
+  assert.deepEqual(calls, ['\x1b[200~테스트 돌려줘\x1b[201~', '\r']);
+  assert.equal(c.get('terminal-draft').value, '');
+  calls.length = 0;
+  c.get('terminal-draft').value = '1';
+  await c.pasteDraft(false);
+  assert.deepEqual(calls, ['\x1b[200~1\x1b[201~']);
+  assert.match(c.get('draft-note').textContent, /Enter/);
+});
+
+test('Enter in the input bar sends; Shift+Enter and IME composition keep editing', async () => {
+  const calls = [];
+  const c = client(async (url, opts) => {
+    calls.push(JSON.parse(opts.body).text);
+    return { ok: true, status: 200, json: async () => ({ ok: true }) };
+  });
+  c.state.connected = true;
+  c.state.terminal = { id: 'term-1' };
+  c.state.term = { modes: { bracketedPasteMode: true }, scrollToBottom() {} };
+  c.get('terminal-draft').value = '계속해';
+  let prevented = 0;
+  const key = (extra) => ({ key: 'Enter', preventDefault() { prevented++; }, ...extra });
+  c.draftKeydown(key({ shiftKey: true }));
+  c.draftKeydown(key({ isComposing: true }));
+  c.draftKeydown(key({ keyCode: 229 }));
+  assert.equal(prevented, 0);
+  c.draftKeydown(key({}));
+  assert.equal(prevented, 1);
+  await new Promise((resolve) => setTimeout(resolve, 250));
+  assert.deepEqual(calls, ['\x1b[200~계속해\x1b[201~', '\r']);
+});
+
+test('touch devices keep the xterm keyboard closed unless direct terminal input is chosen', () => {
+  const c = client();
+  c.context.window.matchMedia = (query) => ({ matches: query === '(pointer: coarse)' });
+  const field = node(); field.removeAttribute = function (name) { delete this.attributes[name]; };
+  c.state.term = { textarea: field };
+  c.configureTerminalKeyboard();
+  assert.equal(field.attributes.inputmode, 'none');
+  c.state.directTerminalInput = true;
+  c.configureTerminalKeyboard();
+  assert.equal(field.attributes.inputmode, undefined);
+  c.context.window.matchMedia = () => ({ matches: false });
+  c.state.directTerminalInput = null;
+  c.configureTerminalKeyboard();
+  assert.equal(field.attributes.inputmode, undefined);
+});
+
+test('terminal swipes coalesce into tmux history scrolls that never pass below the live screen', async () => {
+  const calls = [];
+  const timers = [];
+  const c = client(async (url, opts) => {
+    calls.push([url, JSON.parse(opts.body)]);
+    return { ok: true, status: 200, json: async () => ({ ok: true }) };
+  }, { setTimeout: (callback) => { timers.push(callback); return timers.length; }, clearTimeout() {} });
+  c.state.connected = true;
+  c.state.terminal = { id: 'term-1' };
+  c.queueTerminalScroll(-2.5); c.queueTerminalScroll(-1);
+  assert.equal(timers.length, 1);
+  await c.flushTerminalScroll();
+  assert.deepEqual(calls.at(-1), ['/api/terminal/term-1/scroll', { lines: -3 }]);
+  assert.equal(c.state.terminalScrollLines, 3);
+  c.state.terminalScrollPending = 0;
+  c.queueTerminalScroll(10);
+  await c.flushTerminalScroll();
+  assert.deepEqual(calls.at(-1), ['/api/terminal/term-1/scroll', { lines: 3 }]);
+  assert.equal(c.state.terminalScrollLines, 0);
+  const count = calls.length;
+  c.state.terminalScrollPending = 0;
+  c.queueTerminalScroll(5);
+  await c.flushTerminalScroll();
+  assert.equal(calls.length, count);
+  c.state.terminalScrollLines = 4;
+  await c.terminalScrollEnd();
+  assert.deepEqual(calls.at(-1), ['/api/terminal/term-1/scroll-end', {}]);
+  assert.equal(c.state.terminalScrollLines, 0);
+});
+
+test('waiting answers are counted in the tab title for every visible session', () => {
+  const c = client();
+  c.renderAttention([{ phase: 'needs_input' }, { phase: 'needs_input' }, { phase: 'working' }]);
+  assert.equal(c.context.document.title, '(2) 답 필요 · 세션홀릭');
+  c.renderAttention([{ phase: 'working' }]);
+  assert.equal(c.context.document.title, '세션홀릭 - 에이전트 세션 매니저');
+});
+
+test('a message cut at the server limit says so and copies as a visible part only', () => {
+  const c = client(undefined, noChatTimers);
+  const { s } = selectChat(c);
+  c.renderMessages(s, [{ role: 'assistant', text: '앞부분 …', ts: 1, truncated: true, fullLength: 12000 },
+    { role: 'assistant', text: '짧은 답변', ts: 2 }]);
+  const text = textOf(c.get('messages'));
+  assert.match(text, /긴 메시지라 앞부분만 표시합니다 · 전체 12,000자/);
+  assert.match(text, /표시된 부분 복사/);
+  assert.equal((text.match(/앞부분만 표시/g) || []).length, 1);
 });

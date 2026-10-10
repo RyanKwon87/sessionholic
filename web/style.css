@@ -166,8 +166,7 @@ summary::-webkit-details-marker {
 .running-terminals > summary::after,
 .resume-fallback > summary::after,
 .login-help > summary::after,
-.msg.tool summary::after,
-.draft-panel > summary::after {
+.msg.tool summary::after {
   content: "";
   flex: none;
   width: 7px;
@@ -181,9 +180,6 @@ summary::-webkit-details-marker {
 }
 details:not([open]) > summary::after {
   transform: rotate(-45deg);
-}
-.draft-panel:not([open]) > summary::after {
-  transform: translateY(2px) rotate(-135deg);
 }
 
 /* 3. Controls ------------------------------------------------------------ */
@@ -1113,11 +1109,65 @@ select:disabled {
 
 /* 7. Detail -------------------------------------------------------------- */
 .detail-pane {
+  position: relative;
   display: flex;
   flex-direction: column;
   min-height: 0;
   min-width: 0;
   background: var(--surface);
+}
+/* Reading mode: the conversation takes the space while scrolled back. */
+.detail-head,
+.conversation-bar {
+  transition: padding 0.18s ease;
+}
+.detail-pane.is-reading .detail-head {
+  flex-wrap: nowrap;
+  align-items: center;
+  padding-top: 2px;
+  padding-bottom: 2px;
+}
+.detail-pane.is-reading .detail-titles {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.detail-pane.is-reading .back::after {
+  content: none;
+}
+.detail-pane.is-reading .detail-head .eyebrow,
+.detail-pane.is-reading .detail-meta,
+.detail-pane.is-reading .conversation-bar,
+.detail-pane.is-reading .stale-notice,
+.detail-pane.is-reading .continue-disclosure,
+.detail-pane.is-reading .continue-panel,
+.detail-pane.is-reading .chat-toolbar,
+.detail-pane.is-reading .chat-heading,
+.detail-pane.is-reading .chat-hint,
+.detail-pane.is-reading .chat-status:not(:empty) {
+  display: none;
+}
+.detail-pane.is-reading .detail-title {
+  -webkit-line-clamp: 1;
+  margin: 0;
+  font-size: var(--fs-body);
+}
+.jump-bottom {
+  position: absolute;
+  right: 16px;
+  bottom: 96px;
+  z-index: 5;
+  display: none;
+  width: 44px;
+  height: 44px;
+  border: 0;
+  border-radius: 22px;
+  background: var(--surface);
+  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.18);
+  color: var(--accent);
+  font-size: 20px;
+}
+.detail-pane.is-reading .jump-bottom {
+  display: block;
 }
 .welcome {
   max-width: 380px;
@@ -1991,20 +2041,21 @@ select:disabled {
   border-top: 1px solid var(--t-sep);
   background: var(--t-bg);
 }
+/* Two rows like a real keyboard: control keys, an inverted-T arrow cluster
+   and a tall Enter, all within one thumb's reach. */
 .terminal-keys {
-  display: flex;
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr)) repeat(3, minmax(0, 1fr)) minmax(0, 1.3fr);
+  grid-template-rows: repeat(2, 38px);
+  grid-template-areas:
+    "k1 k2 k3 k4 .    up   .     enter"
+    "k5 k6 k7 k8 left down right enter";
   gap: 5px;
-  overflow-x: auto;
-  scrollbar-width: none;
-}
-.terminal-keys::-webkit-scrollbar {
-  display: none;
+  max-width: 560px;
 }
 .terminal-keys button {
-  flex: 1 0 auto;
-  min-width: 40px;
-  min-height: var(--tap);
-  padding: 0 8px;
+  min-width: 0;
+  padding: 0 2px;
   border: 0;
   border-radius: 8px;
   background: var(--t-key);
@@ -2012,16 +2063,40 @@ select:disabled {
   color: var(--t-label);
   font-family: var(--mono);
   font-size: 13px;
+  touch-action: manipulation;
 }
-.terminal-keys button[data-key="up"],
-.terminal-keys button[data-key="down"],
-.terminal-keys button[data-key="left"],
-.terminal-keys button[data-key="right"] {
+.terminal-keys [data-key="escape"] { grid-area: k1; }
+.terminal-keys [data-key="tab"] { grid-area: k2; }
+.terminal-keys [data-key="backtab"] { grid-area: k3; }
+.terminal-keys [data-key="interrupt"] { grid-area: k4; }
+.terminal-keys [data-key="ctrl-j"] { grid-area: k5; }
+.terminal-keys [data-key="ctrl-u"] { grid-area: k6; }
+.terminal-keys [data-key="ctrl-x"] { grid-area: k7; }
+.terminal-keys [data-key="ctrl-l"] { grid-area: k8; }
+.terminal-keys [data-key="up"] { grid-area: up; }
+.terminal-keys [data-key="left"] { grid-area: left; }
+.terminal-keys [data-key="down"] { grid-area: down; }
+.terminal-keys [data-key="right"] { grid-area: right; }
+.terminal-keys [data-key="enter"] { grid-area: enter; }
+.terminal-keys [data-key="up"],
+.terminal-keys [data-key="left"] {
+  /* A small gap separates the arrow cluster from the control keys. */
+  margin-left: 4px;
+}
+.terminal-keys [data-key="up"] {
+  margin-left: 0;
+}
+.terminal-keys [data-key="interrupt"] {
+  color: #ff9f97;
+}
+.terminal-keys .arrow-key {
+  background: var(--t-key-press);
   font-family: var(--font);
-  font-size: 16px;
+  font-size: 17px;
 }
 .terminal-keys button:active:not(:disabled) {
   background: var(--t-key-press);
+  transform: translateY(1px);
 }
 .terminal-keys .enter-key {
   background: var(--t-blue);
@@ -2038,46 +2113,25 @@ select:disabled {
 .draft-panel {
   margin-top: 8px;
 }
-.draft-body {
-  min-width: 0;
-}
-.draft-panel > summary {
+.draft-row {
   display: flex;
-  align-items: center;
-  gap: 8px;
-  min-height: var(--tap);
-  padding: 0 10px 0 12px;
-  border-radius: 10px;
-  background: var(--t-bg-2);
-  color: var(--t-label);
-  font-size: var(--fs-body);
-  font-weight: 500;
-}
-.draft-panel > summary span {
-  flex: 1;
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  color: var(--t-label-2);
-  font-size: var(--fs-cap);
-  font-weight: 400;
+  align-items: flex-end;
+  gap: 6px;
 }
 .draft-panel textarea {
-  display: block;
-  width: 100%;
-  min-height: 84px;
+  flex: 1;
+  min-width: 0;
+  min-height: 40px;
   max-height: calc(var(--app-height, 100dvh) * 0.26);
-  margin-top: 8px;
-  padding: 10px 12px;
+  padding: 9px 12px;
   border: 1px solid var(--t-sep);
   border-radius: 10px;
   outline-offset: 0;
   background: var(--t-bg-2);
   color: var(--t-label);
   font-size: 16px;
-  line-height: 1.5;
-  resize: vertical;
+  line-height: 1.4;
+  resize: none;
 }
 .draft-panel textarea:focus {
   border-color: var(--t-blue);
@@ -2085,35 +2139,39 @@ select:disabled {
 .draft-panel textarea::placeholder {
   color: rgba(235, 235, 245, 0.35);
 }
-.draft-actions {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  margin-top: 8px;
+.draft-row button {
+  flex: none;
+  min-height: 40px;
+  padding: 0 12px;
+  border: 0;
+  border-radius: 10px;
+  font-size: var(--fs-sub);
+  font-weight: 600;
 }
-.draft-actions span {
-  min-width: 0;
+.draft-row .draft-type {
+  background: var(--t-key);
+  color: var(--t-label);
+}
+.draft-row .draft-send {
+  background: var(--t-blue);
+  color: #fff;
+}
+.draft-row button:disabled {
+  opacity: 0.4;
+}
+.draft-note {
+  margin: 6px 2px 0;
   color: var(--t-label-2);
   font-size: var(--fs-cap);
   line-height: 1.4;
   overflow-wrap: anywhere;
 }
-.draft-actions button {
-  flex: none;
-  min-height: var(--tap);
-  padding: 0 16px;
-  border: 0;
-  border-radius: 10px;
+.draft-note:empty {
+  display: none;
+}
+#terminal-bottom.is-active {
   background: var(--t-blue);
   color: #fff;
-  font-size: var(--fs-body);
-  font-weight: 600;
-}
-.draft-actions button:disabled {
-  opacity: 1;
-  background: var(--t-key);
-  color: rgba(235, 235, 245, 0.45);
 }
 .terminal-screen :focus-visible {
   outline-color: rgba(77, 163, 255, 0.85);
@@ -2596,66 +2654,24 @@ select:disabled {
     padding-top: 4px;
     padding-bottom: max(4px, env(safe-area-inset-bottom));
   }
-  .terminal-keys button {
-    min-height: var(--tap-short);
-  }
-  .draft-panel {
-    margin-top: 4px;
-  }
-  .draft-panel > summary {
-    min-height: var(--tap-short);
-  }
-  /* Draft: textarea and paste button share a row; the note runs below. */
-  .draft-body {
-    display: grid;
-    grid-template-columns: minmax(0, 1fr) auto;
-    align-items: end;
-    gap: 4px 8px;
-    margin-top: 6px;
-  }
-  .draft-panel textarea {
-    grid-column: 1;
-    grid-row: 1;
-    min-height: 44px;
-    height: 56px;
-    max-height: 56px;
-    margin-top: 0;
-    resize: none;
-  }
-  .draft-actions {
-    display: contents;
-  }
-  .draft-actions button {
-    grid-column: 2;
-    grid-row: 1;
-    min-height: var(--tap);
-  }
-  .draft-actions span {
-    grid-column: 1 / -1;
-    grid-row: 2;
-  }
 }
 
-/* Short and wide (phone landscape): the draft toggle shares the key row
-   while closed, and takes its own full-width row once opened. */
+/* Short and wide (phone landscape): keys and the input bar share one band. */
 @media (max-height: 520px) and (min-width: 600px) {
   .terminal-tools {
     display: flex;
-    flex-wrap: wrap;
-    align-items: flex-start;
-    gap: 4px 8px;
+    align-items: flex-end;
+    gap: 8px;
   }
   .terminal-keys {
-    flex: 1 1 360px;
+    flex: 1 1 380px;
     min-width: 0;
+    grid-template-rows: repeat(2, 32px);
   }
   .draft-panel {
-    flex: 0 1 280px;
+    flex: 1 1 280px;
     min-width: 0;
     margin-top: 0;
-  }
-  .draft-panel[open] {
-    flex-basis: 100%;
   }
 }
 
@@ -3687,23 +3703,10 @@ select:disabled {
 .chat-delivery-evidence .msg-attachments { gap: 3px; margin: 0; }
 .chat-delivery-evidence .msg-attachment { padding-top: 2px; padding-bottom: 2px; }
 
-/* Reservation details use the existing dialog / mobile sheet. The toolbar
-   shortcut stays in the compact composer's existing action row. */
-.chat-toolbar > #chat-queue-open {
-  padding: 0 8px;
-  gap: 0;
-  color: var(--accent);
+
+.msg-truncated {
+  margin: 4px 0 0;
+  color: var(--label-2);
   font-size: var(--fs-cap);
+  line-height: 1.4;
 }
-.chat-queue-list { display: flex; flex-direction: column; gap: 12px; padding: 8px 0; }
-.queued-message { min-width: 0; padding: 12px; border: 1px solid var(--sep); border-radius: var(--radius-s); background: var(--fill-soft); }
-.queued-message-meta { display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px 12px; margin-bottom: 8px; }
-.queued-message-status { color: var(--label); font-size: var(--fs-sub); }
-.queued-message-time,
-.queued-message-origin,
-.queued-message-note { color: var(--label-2); font-size: var(--fs-cap); line-height: 1.5; }
-.queued-message-origin { margin: 0 0 6px; }
-.queued-message-body { white-space: pre-wrap; overflow-wrap: anywhere; font-size: var(--fs-body); line-height: 1.5; user-select: text; }
-.queued-message-note { margin: 8px 0; }
-.queued-message-copy { margin-top: 10px; min-height: var(--tap); font-size: var(--fs-sub); }
-.chat-queue-dialog .dialog-actions { padding-top: 12px; }

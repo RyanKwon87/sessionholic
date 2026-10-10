@@ -114,6 +114,10 @@ def load(home=None, path=None):
                 "environments": {"default": {"label": "기본 환경", "variables": {}}}, **defaults()}
     if path.is_symlink() or path.parent.is_symlink() or path.stat().st_size > 65536:
         _error()
+    # The file names programs the board runs (usage.python, helpers, GIT_SSH_COMMAND):
+    # nobody but its owner may change it. 0600 is recommended.
+    if path.stat().st_mode & 0o022:
+        raise ValueError("config.json을 다른 사용자가 수정할 수 있습니다. 권한을 600으로 바꿔 주세요.")
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError, UnicodeError):

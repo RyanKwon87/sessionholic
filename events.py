@@ -94,8 +94,10 @@ class EventHub:
     def __init__(self, board, chat, heartbeat=HEARTBEAT, max_streams=MAX_STREAMS, grace=GRACE,
                  fast=FAST_INTERVAL, idle=IDLE_INTERVALS, error=ERROR_INTERVAL,
                  peer_check=PEER_CHECK, clock=time.monotonic, max_watchers=MAX_WATCHERS,
-                 room_wait=ROOM_WAIT):
+                 room_wait=ROOM_WAIT, boot_id=None):
         self.board, self.chat = board, chat
+        # The server process's bootId, sent with hello: snapshot versions restart with it.
+        self.boot_id = boot_id
         self.heartbeat, self.max_streams, self.grace = heartbeat, max_streams, grace
         self.max_watchers, self.room_wait = max_watchers, room_wait
         self.fast, self.idle, self.error = fast, tuple(idle), error
@@ -235,7 +237,10 @@ class EventHub:
     def pump(self, stream, write, peer_closed):
         """Write hello, then changes and heartbeats until the client leaves or the hub closes."""
         try:
-            write(("retry: %d\n\n" % RETRY_MS).encode() + encode_event("hello", {"snapshotVersion": stream.hello}))
+            hello = {"snapshotVersion": stream.hello}
+            if self.boot_id is not None:
+                hello["bootId"] = self.boot_id
+            write(("retry: %d\n\n" % RETRY_MS).encode() + encode_event("hello", hello))
             sent_version, sent_digest = stream.hello, stream.sent_digest
             next_ping = self.clock() + self.heartbeat
             while True:

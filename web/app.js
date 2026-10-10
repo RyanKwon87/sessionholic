@@ -103,6 +103,8 @@ const state = {
   snapshot: null,
   capabilities: null,
   capabilitiesRevision: null,
+  // The server process (bootId) the capabilities and their CSRF token were read from.
+  capabilitiesBoot: null,
   refreshDeadline: 0,
   csrf: "",
   selected: null,
@@ -183,6 +185,8 @@ const state = {
   eventsRetryAt: 0,
   snapshotVersion: null,
   eventsSnapshotVersion: null,
+  // The server process those versions count in: a restart counts from 0 again.
+  serverBoot: null,
   snapshotPending: false,
   snapshotEventTimer: null,
 };
@@ -309,6 +313,8 @@ function setDetailShown(shown, { direction = null, focus = false } = {}) {
   };
   const transition = direction && changed && phoneLayout() ? navTransition(direction, apply) : (apply(), null);
   syncEvents();
+  if (chatVisible()) tickWorking();
+  else stopWorkingClock();
   return transition;
 }
 
@@ -545,7 +551,13 @@ function beginAuthEpoch() {
   state.terminalsRefreshing = false;
   return state.authEpoch;
 }
-async function api(path, { method = "GET", body, signal, authEpoch = state.authEpoch } = {}) {
+// After a server restart the CSRF token held here is stale (403 csrf_expired),
+// and the server refused before doing anything. Reads, and requests it
+// deduplicates by requestId, are sent once more with a fresh token. A chat send
+// never is: it waits for a new press (sendChat).
+const CSRF_RETRY = new Set(["/api/chat/state", "/api/chat/prompt", "/api/plan", "/api/launch",
+  "/api/refresh", "/api/usage/refresh"]);
+async function api(path, { method = "GET", body, signal, authEpoch = state.authEpoch, csrfRetry = true } = {}) {
   assertAuthEpoch(authEpoch);
   const headers = {};
   if (body !== undefined) headers["Content-Type"] = "application/json";
@@ -566,6 +578,18 @@ async function api(path, { method = "GET", body, signal, authEpoch = state.authE
   }
   const data = await response.json().catch(() => ({}));
   assertAuthEpoch(authEpoch);
+  if (!response.ok && response.status === 403 && data.code === "csrf_expired" && csrfRetry &&
+      method !== "GET" && CSRF_RETRY.has(path)) {
+    let refreshed = false;
+    try {
+      await loadCapabilities(authEpoch, { refreshView: false });
+      refreshed = true;
+    } catch (err) {
+      if (err.unauthorized || err.staleAuth) throw err;
+    }
+    assertAuthEpoch(authEpoch);
+    if (refreshed) return api(path, { method, body, signal, authEpoch, csrfRetry: false });
+  }
   if (!response.ok) {
     const err = new Error(
       typeof data.error === "string"
@@ -2978,9 +3002,10 @@ function stopWorkingClock() {
   clearTimeout(state.workingTimer);
   state.workingTimer = null;
 }
-// Updates the shown working time, then once a second while the page is
-// visible (visibilitychange stops and restarts it). Reduced motion stops only
-// the dots; the time keeps counting.
+// Updates the shown working time, then once a second while the conversation
+// is on screen: not on a phone's list, behind a terminal or on a hidden page
+// (visibilitychange and setDetailShown stop and restart it). Reduced motion
+// stops only the dots; the time keeps counting.
 function tickWorking() {
   stopWorkingClock();
   const list = $("messages");
@@ -2990,7 +3015,7 @@ function tickWorking() {
   if (row.workingTime.textContent !== text) row.workingTime.textContent = text;
   // Claude records no turn start: its time counts from the newest prompt.
   row.title = text && list.workingApprox ? "마지막 요청부터 잰 시간입니다." : "";
-  if (!text || document.hidden) return;
+  if (!text || !chatVisible()) return;
   state.workingTimer = setTimeout(tickWorking, 1000 - (Date.now() % 1000) + 20);
 }
 // `claude agents` can list a working interactive session without an id (and
@@ -3322,16 +3347,30 @@ function updateToolGroup(row, items) {
   });
   Object.assign(row.messageItem, { key: items[0].key, items, message: { role: "tool",
     text: items.map((item) => item.message.text || "").join("\n"), ts: items[0].message.ts ?? null } });
+  // Every record remembers its group, for when the group's first record leaves.
+  for (const item of items) item.inGroup = row;
 }
 // The conversation's rows with each run of tool records as one group. A group
 // belongs to its first record (the same object while later records join it).
+// When the server's 80-row window moves past that record, the group of a record
+// still shown carries on, opened or not; one group is never drawn twice.
 function toolGroupRows(list, rows) {
   const desired = [];
+  const used = new Set();
   for (let index = 0; index < rows.length;) {
     if (rows[index].role !== "tool") { desired.push(rows[index++].row); continue; }
     const items = [];
     while (index < rows.length && rows[index].role === "tool") items.push(rows[index++]);
-    items[0].toolGroup ||= toolGroupNode();
+    if (!items[0].toolGroup || used.has(items[0].toolGroup)) {
+      const earlier = items.map((item) => item.inGroup).filter(Boolean);
+      let node = earlier.find((group) => !used.has(group));
+      if (!node) {
+        node = toolGroupNode();
+        if (earlier.some((group) => group.open)) setToolGroupOpen(node, true);
+      }
+      items[0].toolGroup = node;
+    }
+    used.add(items[0].toolGroup);
     updateToolGroup(items[0].toolGroup, items);
     desired.push(items[0].toolGroup);
   }
@@ -3497,10 +3536,11 @@ function renderMessages(s, messages, error = "", fresh = false) {
   if (!stick) {
     for (const child of [...list.children]) {
       if (!keep.has(child)) continue;
-      if (!Number.isFinite(child.offsetTop) || !Number.isFinite(child.offsetHeight)) break;
-      if (child.offsetTop + child.offsetHeight > list.scrollTop) {
+      const box = rowBox(list, child);
+      if (!box) break;
+      if (box.top + box.height > list.scrollTop) {
         anchor = child;
-        anchorOffset = child.offsetTop - list.scrollTop;
+        anchorOffset = box.top - list.scrollTop;
         break;
       }
     }
@@ -3517,8 +3557,9 @@ function renderMessages(s, messages, error = "", fresh = false) {
   list.conversationSource = source;
   list.conversationRows = rows;
   const warningHeight = error ? list.conversationError.offsetHeight || 0 : 0;
+  const anchorBox = anchor && !stick ? rowBox(list, anchor) : null;
   if (stick) setMessagesScroll(list, list.scrollHeight);
-  else if (anchor && Number.isFinite(anchor.offsetTop)) setMessagesScroll(list, anchor.offsetTop - anchorOffset);
+  else if (anchorBox) setMessagesScroll(list, anchorBox.top - anchorOffset);
   else setMessagesScroll(list, scroll + warningHeight - oldWarningHeight);
   if (working) tickWorking();
   else stopWorkingClock();
@@ -3528,6 +3569,19 @@ function renderMessages(s, messages, error = "", fresh = false) {
     if (added) list.unread = (list.unread || 0) + added;
   } else if (stick) list.unread = 0;
   renderJump();
+}
+
+// A row's top and height in the conversation's own scrolled content, or null
+// without layout. .messages is not positioned, so a row's offsetTop counts from
+// an ancestor above it; the distance between the two boxes on screen (plus the
+// list's scroll) does not. Without boxes (tests), offsetTop.
+function rowBox(list, row) {
+  const outer = list.getBoundingClientRect?.();
+  const inner = row.getBoundingClientRect?.();
+  if (Number.isFinite(outer?.top) && Number.isFinite(inner?.top) && Number.isFinite(inner?.height))
+    return { top: inner.top - outer.top - (list.clientTop || 0) + list.scrollTop, height: inner.height };
+  if (!Number.isFinite(row.offsetTop) || !Number.isFinite(row.offsetHeight)) return null;
+  return { top: row.offsetTop, height: row.offsetHeight };
 }
 
 // Consecutive messages of one speaker form a group: only the first keeps the
@@ -5277,7 +5331,10 @@ function syncEvents() {
   source.addEventListener("hello", (event) => {
     if (!current()) return;
     healthy();
-    snapshotAnnounced(parse(event).snapshotVersion, { immediate: true });
+    const hello = parse(event);
+    // A restarted server counts versions from 0 again: forget the old numbers first.
+    serverBooted(hello.bootId);
+    snapshotAnnounced(hello.snapshotVersion, { immediate: true });
   });
   source.addEventListener("snapshot", (event) => {
     if (current()) snapshotAnnounced(parse(event).version);
@@ -5369,12 +5426,23 @@ async function loadCapabilities(authEpoch = state.authEpoch, { refreshView = tru
   const s = selectedSession();
   if (s && $("route-host")) populateRoute(s);
 }
-// What /api/capabilities depends on: each host's reachability (a host that
-// recovers is read again) and the Codex accounts it lists. A resident
-// collector's new snapshot (another fetchedAt) alone never changes it.
+// What /api/capabilities depends on: the server process (bootId; a restarted
+// server has a new CSRF token), each host's reachability (a host that recovers
+// is read again) and the Codex accounts it lists. A resident collector's new
+// snapshot (another fetchedAt) alone never changes it.
 function capabilitiesRevision(snapshot) {
-  return JSON.stringify((snapshot?.hosts || []).map((host) => [host.name, !!host.ok,
-    [...new Set((host.data?.codex || []).map((s) => s.home || ".codex"))].sort()]));
+  return JSON.stringify([snapshot?.bootId ?? null, (snapshot?.hosts || []).map((host) => [host.name, !!host.ok,
+    [...new Set((host.data?.codex || []).map((s) => s.home || ".codex"))].sort()])]);
+}
+// Snapshot versions count within one server process. Another bootId (a
+// restart) forgets the numbers of the previous one, so its first versions are read.
+function serverBooted(bootId) {
+  if (typeof bootId !== "string" || !bootId || bootId === state.serverBoot) return;
+  if (state.serverBoot !== null) {
+    state.snapshotVersion = null;
+    state.eventsSnapshotVersion = null;
+  }
+  state.serverBoot = bootId;
 }
 // capabilities: false (a read announced by a snapshot event) reads the
 // snapshot only; the next regular read catches the capabilities up.
@@ -5388,6 +5456,7 @@ async function poll(refresh = false, { capabilities = true } = {}) {
     const snapshot = await api(`/api/snapshot${refresh ? "?refresh=1" : ""}`, { authEpoch });
     assertAuthEpoch(authEpoch);
     state.snapshot = snapshot;
+    serverBooted(snapshot?.bootId);
     if (Number.isInteger(snapshot?.version)) state.snapshotVersion = snapshot.version;
     state.authenticated = true;
     $("login").hidden = true;
@@ -5395,10 +5464,15 @@ async function poll(refresh = false, { capabilities = true } = {}) {
     notice();
     render();
     const revision = capabilitiesRevision(state.snapshot);
-    if (!state.capabilities || (capabilities && state.capabilitiesRevision !== revision)) {
+    const boot = typeof snapshot?.bootId === "string" ? snapshot.bootId : null;
+    // Another server process: its CSRF token is read at once, even on a read an
+    // event announced (capabilities: false), before any request needs it.
+    const restarted = boot !== null && boot !== state.capabilitiesBoot;
+    if (!state.capabilities || restarted || (capabilities && state.capabilitiesRevision !== revision)) {
       await loadCapabilities(authEpoch);
       assertAuthEpoch(authEpoch);
       state.capabilitiesRevision = revision;
+      state.capabilitiesBoot = boot;
     }
     state.pollFailures = 0;
     renderConnectivity();
@@ -5593,10 +5667,12 @@ function showLogin() {
   state.csrf = "";
   state.capabilities = null;
   state.capabilitiesRevision = null;
+  state.capabilitiesBoot = null;
   state.refreshDeadline = 0;
   state.snapshot = null;
   state.snapshotVersion = null;
   state.eventsSnapshotVersion = null;
+  state.serverBoot = null;
   state.snapshotPending = false;
   state.selected = null;
   navigateView("list", true);

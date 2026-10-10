@@ -99,6 +99,14 @@ class EventHubTest(unittest.TestCase):
                          {"host": "h", "agent": "claude", "id": "x"})
         self.assertEqual(events.chat_ref(REF), REF)
 
+    def test_hello_names_the_server_process_when_given(self):
+        hub = events.EventHub(self.board, self.chat, heartbeat=0.1, peer_check=0.02, boot_id="boot-fixture")
+        self.addCleanup(hub.close)
+        self.board.version = 2
+        reader = Reader(hub, hub.open())
+        wait_for(lambda: reader.events("hello"))
+        self.assertEqual(reader.events("hello"), [{"snapshotVersion": 2, "bootId": "boot-fixture"}])
+
     def test_hello_heartbeat_and_snapshot_versions(self):
         self.board.version = 4
         stream = self.hub.open()

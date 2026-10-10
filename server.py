@@ -261,13 +261,17 @@ def watch_command(host, board_id, state_dir=None):
 
 
 def start_watch(host, board_id, state_dir=None):
-    """(process, bytes to write first) of one host's watcher; stderr is discarded."""
-    process = subprocess.Popen(watch_command(host, board_id, state_dir), stdin=subprocess.PIPE,
-                               stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-    if host["local"]:
-        return process, None
-    program = remote_program()
-    return process, str(len(program)).encode() + b"\n" + program
+    """(process, bytes to write first) of one host's watcher; stderr is discarded.
+
+    A remote watcher's program is read before ssh starts: a file that cannot be read
+    leaves no ssh process behind."""
+    command = watch_command(host, board_id, state_dir)
+    preface = None
+    if not host["local"]:
+        program = remote_program()
+        preface = str(len(program)).encode() + b"\n" + program
+    process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    return process, preface
 
 
 def run_collector(host, args, timeout, state_dir=None):
@@ -549,6 +553,10 @@ class StaticAssets:
                 raise ValueError("화면 파일 %s을 찾지 못했습니다. 설치 파일을 확인해 주세요." % name)
         if self.index() is None:
             raise ValueError("화면 파일 index.html을 찾지 못했습니다. 설치 파일을 확인해 주세요.")
+        # The public names leave sw.js as it is, but its cache name always follows the
+        # assets: a worker without its one CACHE line would keep serving an old shell.
+        if len(SW_CACHE.findall(self.source("sw.js")["body"].decode("utf-8"))) != 1:
+            raise ValueError("화면 파일 sw.js에서 CACHE 위치를 찾지 못했습니다. 설치 파일을 확인해 주세요.")
 
 
 class HostStream:
@@ -1601,7 +1609,7 @@ class Handler(BaseHTTPRequestHandler):
                 if url.path == "/api/snapshot":
                     if query.get("refresh") == "1":
                         self.server.board.request_refresh()
-                    return self.send_json(200, self.server.board.snapshot())
+                    return self.send_json(200, self.snapshot())
                 if url.path == "/api/read":
                     result = self.server.board.read(query.get("host"), query.get("agent"), query.get("id"), query.get("home"))
                     return self.send_json(200, result)
@@ -1635,6 +1643,10 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_json(503, {"error": "실행 연결을 준비하지 못했어요. 설정을 확인해 주세요."})
             return self.send_json(404, {"error": "없는 경로입니다."})
         return self.static(url.path, url.query)
+
+    def snapshot(self):
+        """The board's snapshot with this server process's bootId."""
+        return {**self.server.board.snapshot(), "bootId": self.server.boot_id}
 
     def stream_events(self, query):
         """Server-sent events; the same cookie login as other reads, no CSRF for a GET."""
@@ -1781,7 +1793,7 @@ class Handler(BaseHTTPRequestHandler):
                 if host is not None and not isinstance(host, str):
                     raise ValueError("기기 이름 형식이 올바르지 않습니다.")
                 self.server.board.request_refresh(host, force=True)
-                return self.send_json(200, self.server.board.snapshot())
+                return self.send_json(200, self.snapshot())
             if path == "/api/usage/refresh" and self.server.usage is not None:
                 return self.send_json(200, self.server.usage.snapshot(force=True))
             if path == "/api/chat/state":
@@ -1916,6 +1928,9 @@ def make_server(bind, port, board, token, terminals=None, workflow=None, state_d
     server.once, server.once_lock = ("", 0), threading.Lock()
     server.sessions, server.auth_lock = {}, threading.Lock()
     server.csrf = secrets.token_urlsafe(32)
+    # Names this server process (and so its CSRF token): a client that sees another
+    # bootId reads /api/capabilities again instead of sending a token from before a restart.
+    server.boot_id = secrets.token_urlsafe(12)
     server.upload_gate = threading.BoundedSemaphore(2)
     server.assets = StaticAssets(WEB)
     try:
@@ -1929,7 +1944,7 @@ def make_server(bind, port, board, token, terminals=None, workflow=None, state_d
     from chat import Chat
     server.chat = Chat(board, server.workflow, state_dir)
     from events import EventHub
-    server.events = EventHub(board, server.chat)
+    server.events = EventHub(board, server.chat, boot_id=server.boot_id)
     return server
 
 

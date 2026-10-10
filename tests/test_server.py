@@ -137,6 +137,23 @@ class ServerTest(unittest.TestCase):
         res, _ = self.request("GET", "/api/snapshot", headers={"Cookie": cookie})
         self.assertEqual(res.status, 200)
 
+    def test_snapshots_name_the_server_process_and_a_restart_names_another(self):
+        # H3: a client that sees another bootId reads /api/capabilities (its CSRF token) again.
+        cookie, csrf = self.csrf_session()
+        res, data = self.request("GET", "/api/snapshot", headers={"Cookie": cookie})
+        boot = json.loads(data)["bootId"]
+        self.assertEqual(boot, self.httpd.boot_id)
+        self.assertRegex(boot, r"^[A-Za-z0-9_-]{16}$")
+        res, data = self.post_json("/api/refresh", {}, cookie, csrf)
+        self.assertEqual((res.status, json.loads(data)["bootId"]), (200, boot))
+        with tempfile.TemporaryDirectory() as directory:
+            restarted = server.make_server("127.0.0.1", 0, self.board, TOKEN, state_dir=directory)
+            try:
+                self.assertNotEqual(restarted.boot_id, boot)
+                self.assertNotEqual(restarted.csrf, self.httpd.csrf)
+            finally:
+                restarted.server_close()
+
     def test_refresh_host_must_be_a_string(self):
         cookie, csrf = self.csrf_session()
         for host in (["remote"], 5, {"name": "remote"}):
@@ -204,11 +221,12 @@ class ServerTest(unittest.TestCase):
             self.assertEqual(res.getheader("Vary"), "Accept-Encoding")
             self.assertEqual(res.getheader("Cache-Control"), "no-store")
             self.assertEqual(int(res.getheader("Content-Length")), len(data))
-            self.assertEqual(json.loads(gzip.decompress(data)), large)
+            served = {**large, "bootId": self.httpd.boot_id}
+            self.assertEqual(json.loads(gzip.decompress(data)), served)
             for header in ({}, {"Accept-Encoding": "gzip;q=0"}, {"Accept-Encoding": "identity"}):
                 res, data = self.request("GET", "/api/snapshot", headers={"Authorization": "Bearer " + TOKEN, **header})
                 self.assertIsNone(res.getheader("Content-Encoding"), header)
-                self.assertEqual(json.loads(data), large)
+                self.assertEqual(json.loads(data), served)
         # Small replies stay plain even for gzip clients.
         res, data = self.request("GET", "/api/snapshot", headers={
             "Authorization": "Bearer " + TOKEN, "Accept-Encoding": "gzip"})
@@ -512,7 +530,8 @@ class EventStreamTest(unittest.TestCase):
         self.assertNotIn("content-encoding", headers)
         body = received.split(b"\r\n\r\n", 1)[1]
         version = self.board.version
-        self.assertTrue(body.startswith(b'retry: 3000\n\nevent: hello\ndata: {"snapshotVersion":%d}\n\n' % version))
+        self.assertTrue(body.startswith(b'retry: 3000\n\nevent: hello\ndata: {"snapshotVersion":%d,"bootId":"%s"}\n\n'
+                                        % (version, self.httpd.boot_id.encode())))
         self.data = {"claude": [{"id": "a1b2c3d4", "title": "정산 완료", "phase": "done"}], "codex": []}
         self.board.poll(HOSTS[0])
         received = self.read_until(sock, b'event: snapshot\ndata: {"version":%d}\n\n' % self.board.version, received)
@@ -1272,6 +1291,25 @@ class BoardLiveTest(unittest.TestCase):
         replaced = server.Board(HOSTS, 60, runner=fake_runner([]), state_dir=directory).live_board_id()
         self.assertRegex(replaced, r"^[0-9a-f]{16}$")
         self.assertRegex(server.Board(HOSTS, 60, runner=fake_runner([])).live_board_id(), r"^[0-9a-f]{16}$")
+
+    def test_a_remote_watch_reads_its_program_before_starting_ssh(self):
+        order = []
+        def popen(command, **options):
+            order.append("ssh")
+            return "process"
+        with patch.object(server.subprocess, "Popen", side_effect=popen), \
+                patch.object(server, "remote_program", side_effect=OSError("fixture unreadable")):
+            with self.assertRaises(OSError):
+                server.start_watch(HOSTS[0], "0123456789abcdef")
+        self.assertEqual(order, [], "no ssh process is left without a program to send")
+        def program():
+            order.append("program")
+            return b"print(1)\n"
+        with patch.object(server.subprocess, "Popen", side_effect=popen), \
+                patch.object(server, "remote_program", side_effect=program):
+            self.assertEqual(server.start_watch(HOSTS[0], "0123456789abcdef"), ("process", b"9\nprint(1)\n"))
+            self.assertEqual(server.start_watch({"local": True}, "0123456789abcdef"), ("process", None))
+        self.assertEqual(order, ["program", "ssh", "ssh"])
 
     def test_watch_commands(self):
         remote = server.watch_command(HOSTS[0], "0123456789abcdef")

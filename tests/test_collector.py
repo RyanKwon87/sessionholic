@@ -865,6 +865,83 @@ class WatchTest(unittest.TestCase):
             writer.close()
             out.wait(lambda m: m.get("type") == "bye")
 
+    def test_a_refused_state_db_list_is_asked_again_after_a_while(self):
+        # M6: one refusal no longer means a scan on every list for the whole connection.
+        daemon = self.daemon(threads=[thread_row("t1")], reject_state_db=True)
+        with patch.object(collector, "WATCH_CODEX_POLL", 0.05), patch.object(collector, "WATCH_QUICK_RETRY", 0.3):
+            watch, writer, out = self.start()
+            out.wait(lambda m: m.get("type") == "snapshot")
+            deadline = time.monotonic() + 3
+            while daemon.count("thread/list", True) < 2 and time.monotonic() < deadline:
+                time.sleep(0.02)
+            self.assertGreaterEqual(daemon.count("thread/list", True), 2, "asked again after the retry interval")
+            # Between the two, every list scanned as before.
+            self.assertGreater(daemon.count("thread/list", None), daemon.count("thread/list", True))
+            # The daemon answers from its state DB again: quick lists from then on, no more scans.
+            with daemon.lock:
+                daemon.reject_state_db = False
+            quick = daemon.count("thread/list", True)
+            deadline = time.monotonic() + 3
+            while daemon.count("thread/list", True) < quick + 4 and time.monotonic() < deadline:
+                time.sleep(0.02)
+            self.assertGreaterEqual(daemon.count("thread/list", True), quick + 4)
+            scans = daemon.count("thread/list", None)
+            time.sleep(0.4)
+            self.assertEqual(daemon.count("thread/list", None), scans)
+            writer.close()
+            out.wait(lambda m: m.get("type") == "bye")
+
+    def test_an_unexpected_failure_ends_the_watch_cleanly_with_bye(self):
+        self.agents = []
+        with patch.object(collector.Watch, "compose", side_effect=RuntimeError("fixture failure")), \
+                patch("sys.stderr", new_callable=io.StringIO) as log:
+            watch, writer, out = self.start()
+            bye, _ = out.wait(lambda m: m.get("type") == "bye")
+            runner = self.watches[-1][2]
+            runner.join(3)
+        self.assertFalse(runner.is_alive())
+        self.assertEqual(bye["reason"], "error")
+        self.assertIn("watch watch: RuntimeError: fixture failure", log.getvalue())
+        self.assertNotIn("Traceback", log.getvalue())
+
+    def test_a_failure_in_the_local_sources_is_logged_and_read_again_next_round(self):
+        self.agents = []
+        failures = [RuntimeError("fixture registry"), RuntimeError("fixture registry")]
+        real = collector.claude_registry_fingerprint
+        def fingerprint():
+            if failures:
+                raise failures.pop()
+            return real()
+        with patch.object(collector, "claude_registry_fingerprint", fingerprint), \
+                patch("sys.stderr", new_callable=io.StringIO) as log:
+            watch, writer, out = self.start()
+            first, _ = out.wait(lambda m: m.get("type") == "snapshot")
+            self.assertEqual(first["data"]["claude"], [])
+            self.assertEqual(first["data"]["errors"], [])
+            self.assertTrue(watch.local.is_alive())
+            writer.close()
+            out.wait(lambda m: m.get("type") == "bye")
+        self.assertEqual(log.getvalue().count("watch local: RuntimeError: fixture registry"), 2)
+
+    def test_the_first_snapshot_names_a_source_not_read_yet(self):
+        release = threading.Event()
+        self.addCleanup(release.set)
+        def slow_agents(errors):
+            release.wait(5)
+            return []
+        with patch.object(collector, "claude_agent_rows", slow_agents), patch.object(collector, "WATCH_READY", 0.3):
+            watch, writer, out = self.start()
+            first, index = out.wait(lambda m: m.get("type") == "snapshot")
+            self.assertEqual(first["data"]["claude"], [])
+            # tmux is read after Claude on the same thread, so it is still unread too.
+            self.assertEqual(first["data"]["errors"], ["Claude 세션 목록을 아직 읽지 못했습니다.",
+                                                       "tmux 세션 목록을 아직 읽지 못했습니다."])
+            release.set()
+            read, _ = out.wait(lambda m: m.get("type") == "snapshot", start=index + 1)
+            self.assertEqual(read["data"]["errors"], [])
+            writer.close()
+            out.wait(lambda m: m.get("type") == "bye")
+
     def test_reconnects_through_the_symlink_after_a_daemon_restart(self):
         old = self.daemon(threads=[thread_row("t1")])
         watch, writer, out = self.start()

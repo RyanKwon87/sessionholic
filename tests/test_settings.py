@@ -31,6 +31,17 @@ class SettingsTest(unittest.TestCase):
         self.path.write_text(json.dumps({'version': 1, **fields}))
         return settings.load(self.home)
 
+    def test_a_config_others_can_change_is_refused(self):
+        # It names programs the board runs (usage.python): only its owner may change it.
+        self.config()
+        for mode in (0o664, 0o646, 0o666):
+            self.path.chmod(mode)
+            with self.assertRaisesRegex(ValueError, "다른 사용자가 수정할 수 있습니다"):
+                settings.load(self.home)
+        for mode in (0o600, 0o400, 0o644):
+            self.path.chmod(mode)
+            self.assertEqual(settings.load(self.home)['version'], 1)
+
     def test_empty_home_has_no_phantom_profiles_and_ignores_legacy_files(self):
         legacy = self.home / '.config/agent-router'
         legacy.mkdir()

@@ -5603,3 +5603,201 @@ test('theme-init reads the preference prefix from the installation meta above it
   assert.ok(html.indexOf('name="sessionholic-instance"') < html.indexOf('<script src="/theme-init.js"></script>'),
     'the meta is parsed before theme-init runs');
 });
+
+test('H3: a restarted server (another bootId) has its CSRF token read again, even on a read an event announced', async () => {
+  const requests = [];
+  let boot = 'boot-a'; let version = 5; let csrf = 'csrf-a';
+  const c = client(async (url) => {
+    requests.push(url);
+    return { ok: true, status: 200, json: async () => (url.startsWith('/api/snapshot')
+      ? { hosts: [{ name: 'workstation', ok: true, fetchedAt: 1, data: {} }], version, bootId: boot }
+      : url === '/api/capabilities' ? { hosts: [], csrfToken: csrf } : {}) };
+  }, noChatTimers);
+  c.state.usageAt = Date.now();
+  await c.poll(false);
+  assert.equal(c.state.csrf, 'csrf-a');
+  assert.equal(requests.filter((url) => url === '/api/capabilities').length, 1);
+  // The same process: an announced read and a regular read read only the snapshot.
+  requests.length = 0; version = 6;
+  await c.poll(false, { capabilities: false });
+  await c.poll(false);
+  assert.deepEqual(requests, ['/api/snapshot', '/api/snapshot']);
+  // The server restarts: its versions count from 0 again and its token is new.
+  boot = 'boot-b'; version = 0; csrf = 'csrf-b';
+  requests.length = 0;
+  await c.poll(false, { capabilities: false });
+  assert.deepEqual(requests, ['/api/snapshot', '/api/capabilities']);
+  assert.equal(c.state.csrf, 'csrf-b');
+  assert.equal(c.state.snapshotVersion, 0, 'the new process\'s first version is taken');
+  requests.length = 0; version = 1;
+  await c.poll(false);
+  assert.deepEqual(requests, ['/api/snapshot'], 'read once per restart');
+});
+
+test('H3: after a restart the reconnected stream\'s hello (another bootId) reads the new versions and token at once', async () => {
+  const requests = [];
+  let boot = 'boot-a'; let version = 40; let csrf = 'csrf-a';
+  const c = client(async (url) => {
+    requests.push(url);
+    return { ok: true, status: 200, json: async () => (url.startsWith('/api/snapshot')
+      ? { hosts: [{ name: 'workstation', ok: true, fetchedAt: 1, data: {} }], version, bootId: boot }
+      : url === '/api/capabilities' ? { hosts: [], csrfToken: csrf } : {}) };
+  }, { setTimeout: (callback, ms) => { if (ms === 300) setImmediate(callback); return 1; }, clearTimeout() {} });
+  const { FakeEventSource, sources } = fakeEventSource();
+  c.context.EventSource = FakeEventSource;
+  c.state.usageAt = Date.now();
+  await c.poll(false);
+  assert.equal(sources.length, 1);
+  sources[0].emit('hello', { snapshotVersion: 40, bootId: 'boot-a' });
+  await settle();
+  assert.deepEqual(requests, ['/api/snapshot', '/api/capabilities'], 'the same process: nothing new to read');
+  // The server restarts with version 2; the browser reconnects the same stream.
+  boot = 'boot-b'; version = 2; csrf = 'csrf-b';
+  requests.length = 0;
+  sources[0].emit('hello', { snapshotVersion: 2, bootId: 'boot-b' });
+  await settle();
+  assert.deepEqual(requests, ['/api/snapshot', '/api/capabilities']);
+  assert.equal(c.state.csrf, 'csrf-b');
+  assert.equal(c.state.snapshotVersion, 2);
+  // Later versions of the new process are read (below the old process's 40).
+  requests.length = 0; version = 3;
+  sources[0].emit('snapshot', { version: 3 });
+  await settle();
+  assert.deepEqual(requests, ['/api/snapshot']);
+  assert.equal(c.state.snapshotVersion, 3);
+});
+
+test('H3: a stale CSRF token is refreshed once and a read or a deduplicated request sent again; never a chat send', async () => {
+  const refused = { ok: false, status: 403, json: async () => ({ error: '보안 연결을 갱신한 뒤 다시 시도해 주세요.',
+    code: 'csrf_expired' }) };
+  const setup = ({ fresh = true, capabilities = 'ok' } = {}) => {
+    const requests = [];
+    const c = client(async (url, options) => {
+      requests.push([url, options?.headers?.['X-CSRF-Token']]);
+      if (url === '/api/capabilities') {
+        if (capabilities === 'network') throw new Error('network unavailable');
+        return { ok: true, status: 200, json: async () => ({ hosts: [], csrfToken: 'fresh-csrf' }) };
+      }
+      if (!fresh || options.headers['X-CSRF-Token'] !== 'fresh-csrf') return refused;
+      return { ok: true, status: 200, json: async () => ({ ok: true }) };
+    }, noChatTimers);
+    c.state.authenticated = true;
+    return { c, requests };
+  };
+  const retried = [['/api/chat/state', { source: {} }], ['/api/chat/prompt', { requestId: 'request-0001' }],
+    ['/api/plan', { source: {} }], ['/api/launch', { planId: 'plan', requestId: 'request-0002' }], ['/api/refresh', {}],
+    ['/api/usage/refresh', {}]];
+  for (const [path, body] of retried) {
+    const { c, requests } = setup();
+    assert.deepEqual(await c.api(path, { method: 'POST', body }), { ok: true }, path);
+    assert.deepEqual(requests, [[path, 'csrf-test'], ['/api/capabilities', undefined], [path, 'fresh-csrf']], path);
+    assert.equal(c.state.csrf, 'fresh-csrf');
+  }
+  // Only once: a second refusal is the caller's error.
+  {
+    const { c, requests } = setup({ fresh: false });
+    await assert.rejects(c.api('/api/chat/state', { method: 'POST', body: {} }), (err) => err.code === 'csrf_expired');
+    assert.deepEqual(requests.map(([url]) => url), ['/api/chat/state', '/api/capabilities', '/api/chat/state']);
+  }
+  // A failed refresh reports the refusal, without another attempt.
+  {
+    const { c, requests } = setup({ capabilities: 'network' });
+    await assert.rejects(c.api('/api/refresh', { method: 'POST', body: {} }), (err) => err.code === 'csrf_expired');
+    assert.deepEqual(requests.map(([url]) => url), ['/api/refresh', '/api/capabilities']);
+  }
+  // A chat send and a terminal input are never sent again, nor is the token read here.
+  for (const path of ['/api/chat/send', `/api/terminal/${'a'.repeat(32)}/input`]) {
+    const { c, requests } = setup();
+    await assert.rejects(c.api(path, { method: 'POST', body: { requestId: 'request-0003' } }),
+      (err) => err.code === 'csrf_expired', path);
+    assert.deepEqual(requests.map(([url]) => url), [path], path);
+  }
+});
+
+test('M5: an opened tool group stays open when the 80-row window moves past its first record', () => {
+  const c = client(undefined, noChatTimers); const { s } = selectChat(c);
+  const list = c.get('messages');
+  const tool = (n) => ({ role: 'tool', text: `$ step ${n}`, toolKind: 'command' });
+  c.renderMessages(s, [{ role: 'user', text: '시작', ts: 1000 }, tool(1), tool(2), tool(3)]);
+  const group = list.children[1];
+  group.toolToggle.events.click();
+  assert.equal(group.open, true);
+  // The question and the group's first two records leave the window; a record arrives.
+  c.renderMessages(s, [tool(3), tool(4)]);
+  assert.deepEqual(list.children, [group], 'the same group carries on');
+  assert.equal(group.open, true); assert.equal(group.toolList.hidden, false);
+  assert.equal(group.toolTitle.textContent, '도구 실행 2개');
+  c.renderMessages(s, [tool(4), { role: 'assistant', text: '끝', ts: 2000 }]);
+  assert.equal(list.children[0], group); assert.equal(group.open, true);
+  // A group never opened stays closed when its first record leaves.
+  const d = client(undefined, noChatTimers); const other = selectChat(d);
+  d.renderMessages(other.s, [tool(1), tool(2)]);
+  const closed = d.get('messages').children[0];
+  d.renderMessages(other.s, [tool(2)]);
+  assert.equal(d.get('messages').children[0], closed); assert.equal(closed.open, false);
+  // A group split in two by a new row is drawn once; the second part opens like it.
+  const e = client(undefined, noChatTimers); const third = selectChat(e);
+  e.renderMessages(third.s, [tool(1), tool(2), tool(3)]);
+  const whole = e.get('messages').children[0];
+  whole.toolToggle.events.click();
+  e.renderMessages(third.s, [tool(1), { role: 'assistant', text: '중간 답', ts: 3000 }, tool(3)]);
+  const rows = e.get('messages').children;
+  assert.equal(rows.length, 3); assert.equal(rows[0], whole); assert.notEqual(rows[2], whole);
+  assert.equal(rows[2].open, true); assert.equal(rows[2].toolTitle.textContent, '도구 실행 1개');
+});
+
+test('reading back, the row kept in place is measured in the list\'s own coordinates, not by an ancestor\'s offsetTop', () => {
+  const c = client(undefined, noChatTimers); const { s } = selectChat(c);
+  const list = c.get('messages');
+  const rows = (from, to) => Array.from({ length: to - from }, (_, i) =>
+    ({ role: 'assistant', text: `답변 ${from + i}`, ts: 1000 + (from + i) * 600 }));
+  c.renderMessages(s, rows(0, 10));
+  // Like a browser: .messages is 200px below the page top and not positioned, so a
+  // row's offsetTop counts from the page and moves with the list's scroll; removing
+  // rows above the one on screen lowers scrollTop by itself (scroll anchoring).
+  const LIST_TOP = 200;
+  const top = (node) => list.children.indexOf(node) * 100;
+  const screen = (node) => LIST_TOP + top(node) - list.scrollTop;
+  const layout = (node) => Object.defineProperties(node, {
+    offsetTop: { configurable: true, get: () => screen(node) },
+    offsetHeight: { configurable: true, get: () => 100 },
+    getBoundingClientRect: { configurable: true, value: () => ({ top: screen(node), height: 100 }) } });
+  list.children.forEach(layout);
+  list.getBoundingClientRect = () => ({ top: LIST_TOP, height: 300 });
+  const remove = list.removeChild.bind(list);
+  list.removeChild = (child) => {
+    const above = top(child) + 100 <= list.scrollTop;
+    remove(child);
+    if (above) list.scrollTop -= 100;
+    return child;
+  };
+  Object.assign(list, { scrollHeight: 1000, clientHeight: 300, scrollTop: 450 });
+  const reading = list.children[4];
+  // Two rows leave at the top and two arrive below while the reader is at "답변 4".
+  c.renderMessages(s, rows(2, 12));
+  assert.equal(list.children[2], reading);
+  assert.equal(list.scrollTop, 250, 'the row the reader was on stays 50px above the top edge');
+});
+
+test('the working time does not tick on a phone\'s list or behind a terminal, and counts again when the conversation shows', () => {
+  const armed = [];
+  const c = client(undefined, { setTimeout: (callback, ms) => { armed.push({ callback, ms }); return armed.length; },
+    clearTimeout: (id) => { if (armed[id - 1]) armed[id - 1].cleared = true; } });
+  const ticking = () => armed.filter((timer) => timer.callback === c.context.tickWorking && !timer.cleared);
+  c.context.window.matchMedia = () => ({ matches: true });
+  const { s, entry } = selectChat(c);
+  c.state.detailShown = true;
+  entry.data.phase = 'working';
+  entry.data.workingSince = Math.floor(Date.now() / 1000) - 30;
+  c.renderMessages(s, [{ role: 'user', text: '시작해 주세요' }]);
+  assert.equal(ticking().length, 1);
+  c.setDetailShown(false);
+  assert.equal(ticking().length, 0, 'the list is on screen');
+  c.tickWorking();
+  assert.equal(ticking().length, 0);
+  c.setDetailShown(true);
+  assert.equal(ticking().length, 1, 'the conversation shows again');
+  c.state.terminalVisible = true;
+  ticking()[0].callback();
+  assert.equal(ticking().length, 0, 'a terminal covers the conversation');
+});

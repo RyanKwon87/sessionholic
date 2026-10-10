@@ -97,7 +97,8 @@ class ValidationTest(unittest.TestCase):
             self.assertEqual(run.call_count, 1)
 
     def test_natural_exit_tombstone_is_not_exposed_before_it_is_saved(self):
-        row = {'id': 'a'*32, 'name': 'sb-'+'a'*32, 'key': 'fixture', 'metadata': {}}
+        row = {'id': 'a'*32, 'name': 'sb-'+'a'*32, 'key': 'fixture', 'metadata': {},
+               'socket': self.manager.socket_name}
         instance = terminal._Terminal(row, 1024)
         self.manager.terminals[row['id']] = instance
         with patch.object(self.manager, '_exists', return_value=False), \
@@ -500,11 +501,36 @@ class SocketRecordTest(unittest.TestCase):
         self.assertEqual(manager.socket_name, terminal.DEFAULT_SOCKET)
         self.assertEqual(terminal.DEFAULT_SOCKET, terminal.instance.current()["names"]["tmuxSocket"])
 
-    def test_rows_saved_without_a_socket_record_the_current_one_at_load(self):
+    def test_rows_saved_without_a_socket_are_neither_given_this_socket_nor_closed_when_not_found(self):
+        # M3: the first start after sockets were recorded may run on a new socket name while
+        # these rows still live on the old one; not finding them here proves nothing.
         (self.state / "sessions.json").write_text(json.dumps(self.rows()))
-        self.manager()
-        self.assertEqual([row["socket"] for row in self.saved()], ["sb-fixture-current"] * 2)
+        before = (self.state / "sessions.json").read_bytes()
+        manager = self.manager()
+        self.assertEqual((self.state / "sessions.json").read_bytes(), before, "nothing is written at load")
+        listed = manager.list()
+        manager.list()
+        self.assertEqual([(row["alive"], row["closed"]) for row in listed], [(False, False)] * 2)
+        self.assertEqual((self.state / "sessions.json").read_bytes(), before)
+        self.assertTrue(all("socket" not in row and "closed" not in row for row in self.saved()))
+        # An explicit close or reopen cannot tombstone it either.
+        with self.assertRaisesRegex(RuntimeError, "소켓 기록 없이"):
+            manager.close_terminal("a" * 32)
+        with self.assertRaisesRegex(RuntimeError, "소켓 기록 없이"):
+            manager.create("fixture-a", ["/bin/echo"], self.directory.name, {})
+        self.assertEqual((self.state / "sessions.json").read_bytes(), before)
+        # Found on this socket, the row joins it (and is judged like any other from then on).
+        with patch.object(manager, "_exists", side_effect=lambda t: t.record["id"] == "a" * 32):
+            listed = manager.list()
+        self.assertEqual([(row["alive"], row["closed"]) for row in listed], [(True, False), (False, False)])
+        self.assertEqual([row.get("socket") for row in self.saved()], ["sb-fixture-current", None])
         self.assertTrue(all("closed" not in row for row in self.saved()))
+        # A failed save leaves the row unrecorded.
+        with patch.object(manager, "_exists", return_value=True), \
+                patch.object(manager, "_save", side_effect=OSError("fixture full disk")):
+            with self.assertRaises(OSError):
+                manager.list()
+        self.assertNotIn("socket", manager.terminals["b" * 32].record)
 
     def test_rows_of_another_socket_are_not_closed_by_listing_closing_or_reopening(self):
         (self.state / "sessions.json").write_text(json.dumps(self.rows(socket="sb-fixture-old")))
@@ -584,6 +610,27 @@ class TmuxFixtureTest(unittest.TestCase):
             if expected in collected:
                 return after
         self.fail("synthetic fixture terminal output did not arrive")
+
+    def test_a_row_saved_without_a_socket_joins_the_socket_it_is_found_on(self):
+        created = self.create()
+        self.wait_for(self.manager, created["id"], b"FIXTURE_READY")
+        self.manager.close()
+        state = Path(self.directory.name) / "sessions.json"
+        rows = json.loads(state.read_text())
+        for row in rows:
+            row.pop("socket")
+        state.write_text(json.dumps(rows))
+        # Another socket name first: not found there, nothing is recorded (M3).
+        other = terminal.TerminalManager(state_dir=self.directory.name, socket_name=self.socket + "-other")
+        self.assertEqual([(row["alive"], row["closed"]) for row in other.list()], [(False, False)])
+        other.close()
+        self.assertNotIn("socket", json.loads(state.read_text())[0])
+        replacement = terminal.TerminalManager(state_dir=self.directory.name, socket_name=self.socket)
+        self.managers.append(replacement)
+        self.assertEqual([(row["alive"], row["closed"]) for row in replacement.list()], [(True, False)])
+        self.assertEqual(json.loads(state.read_text())[0]["socket"], self.socket)
+        replacement.write(created["id"], "after-adoption\n")
+        self.wait_for(replacement, created["id"], b"FIXTURE_REPLY:after-adoption")
 
     def test_real_pty_echo_resize_reuse_detach_and_server_restart(self):
         created = self.create()

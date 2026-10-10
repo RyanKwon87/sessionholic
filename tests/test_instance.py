@@ -419,6 +419,19 @@ class StaticRenderTest(unittest.TestCase):
     def tearDown(self):
         self.directory.cleanup()
 
+    def test_check_fails_when_the_worker_has_no_cache_line(self):
+        # The public names leave sw.js as it is when rendering, but the install check
+        # does not pass a worker whose cache name cannot follow the assets.
+        server.StaticAssets(self.web).check()
+        worker = (WEB / "sw.js").read_text(encoding="utf-8")
+        for broken in (worker.replace('const CACHE = "sessionholic-shell-v13";\n', ""),
+                       worker.replace('const CACHE = "sessionholic-shell-v13";', 'let CACHE = "x";'),
+                       worker + '\nconst CACHE = "again";\n'):
+            self.assertNotEqual(broken, worker)
+            (self.web / "sw.js").write_text(broken, encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "CACHE 위치를 찾지 못했습니다"):
+                server.StaticAssets(self.web).check()
+
     def test_cache_name_tracks_assets_and_rendered_hashes_are_served(self):
         assets = server.StaticAssets(self.web, names=self.demo)
         worker = assets.file("sw.js")

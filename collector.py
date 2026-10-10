@@ -865,6 +865,7 @@ WATCH_OPT_OUT = ["account/updated", "account/rateLimits/updated", "remoteControl
 WATCH_DEBOUNCE = 0.25        # notifications are gathered this long before one quick list
 WATCH_CODEX_POLL = 5.0       # quick (state DB) list without a notification
 WATCH_FULL = 120.0           # Codex scan-and-repair list
+WATCH_QUICK_RETRY = 600.0    # a daemon that refused a state DB list is asked again after this long
 WATCH_CLAUDE_STAT = 1.0      # Claude registry and transcript stat fingerprint
 WATCH_CLAUDE_GAP = 2.0       # at most one `claude agents` per this many seconds
 WATCH_CLAUDE_REFRESH = 60.0  # `claude agents` even without a visible change
@@ -960,6 +961,16 @@ def watch_signatures(data):
     return digest(body), digest({**body, **{key: major(body.get(key) or []) for key in ("claude", "codex", "tmux")}})
 
 
+def watch_log(where, exc):
+    """One stderr line (the error's type and its first line), never its traceback or data."""
+    try:
+        text = str(exc).splitlines()[0][:200] if str(exc) else ""
+        sys.stderr.write("watch %s: %s%s\n" % (where, type(exc).__name__, ": " + text if text else ""))
+        sys.stderr.flush()
+    except Exception:
+        pass
+
+
 class CodexHome:
     """One Codex home: a kept daemon connection, notifications mark it dirty, quick lists follow."""
 
@@ -1012,7 +1023,8 @@ class CodexHome:
 
     def serve(self, client, listed):
         clock = self.watch.clock
-        quick = True
+        # When a refused state DB list may be asked again (None: it was not refused).
+        quick_retry = None
         self.dirty_at = None
         now = clock()
         next_poll, next_full = now, now + WATCH_FULL
@@ -1025,10 +1037,12 @@ class CodexHome:
                     self.full_requested = False
                 # Notifications that arrive during these calls mark the home dirty again.
                 self.dirty_at = None
-                result, used = list_threads(client, quick=quick and not full)
-                if not full and not used:
-                    # This daemon does not answer from its state DB; stop asking on this connection.
-                    quick = False
+                quick = not full and (quick_retry is None or now >= quick_retry)
+                result, used = list_threads(client, quick=quick)
+                if quick:
+                    # A refusal (an older daemon, or a state DB it cannot use now) is asked
+                    # again only after a while; meanwhile each list scans as before.
+                    quick_retry = None if used else now + WATCH_QUICK_RETRY
                 self.publish((result, loaded_threads(client), None))
                 listed[0] = True
                 now = clock()
@@ -1153,45 +1167,50 @@ class Watch:
                 refresh, self.local_refresh = self.local_refresh, False
             now = self.clock()
             try:
-                seen = claude_registry_fingerprint()
-            except OSError:
-                seen = None
-            call = (refresh or last_agents is None or now - last_agents >= WATCH_CLAUDE_REFRESH
-                    or (seen != registry and now - last_agents >= WATCH_CLAUDE_GAP))
-            if call:
-                agent_errors = []
                 try:
-                    agents = claude_agent_rows(agent_errors)
-                except Exception:
-                    agents, agent_errors = [], ["Claude 세션 목록을 읽는 중 오류가 발생했습니다."]
-                registry, last_agents = seen, self.clock()
-            try:
-                watched = claude_transcript_fingerprint(agents, index) if agents else None
-            except OSError:
-                watched = None
-            if call or watched != transcripts:
-                errors = list(agent_errors)
-                rows = []
-                if agents:
+                    seen = claude_registry_fingerprint()
+                except OSError:
+                    seen = None
+                call = (refresh or last_agents is None or now - last_agents >= WATCH_CLAUDE_REFRESH
+                        or (seen != registry and now - last_agents >= WATCH_CLAUDE_GAP))
+                if call:
+                    agent_errors = []
                     try:
-                        index = claude_transcript_index()
-                    except OSError:
-                        index = {}
-                        errors.append("Claude 대화 기록 폴더를 읽지 못했습니다.")
-                    try:
-                        rows = claude_session_rows(agents, errors, self.projects, index)
+                        agents = claude_agent_rows(agent_errors)
                     except Exception:
-                        rows, errors = [], errors + ["Claude 세션 목록을 읽는 중 오류가 발생했습니다."]
-                    try:
-                        watched = claude_transcript_fingerprint(agents, index)
-                    except OSError:
-                        watched = None
-                transcripts = watched
-                self.publish("claude", rows, errors)
-            if refresh or now >= next_tmux:
-                errors = []
-                self.publish("tmux", section(errors, "tmux 세션 목록", tmux_sessions), errors)
-                next_tmux = now + WATCH_TMUX
+                        agents, agent_errors = [], ["Claude 세션 목록을 읽는 중 오류가 발생했습니다."]
+                    registry, last_agents = seen, self.clock()
+                try:
+                    watched = claude_transcript_fingerprint(agents, index) if agents else None
+                except OSError:
+                    watched = None
+                if call or watched != transcripts:
+                    errors = list(agent_errors)
+                    rows = []
+                    if agents:
+                        try:
+                            index = claude_transcript_index()
+                        except OSError:
+                            index = {}
+                            errors.append("Claude 대화 기록 폴더를 읽지 못했습니다.")
+                        try:
+                            rows = claude_session_rows(agents, errors, self.projects, index)
+                        except Exception:
+                            rows, errors = [], errors + ["Claude 세션 목록을 읽는 중 오류가 발생했습니다."]
+                        try:
+                            watched = claude_transcript_fingerprint(agents, index)
+                        except OSError:
+                            watched = None
+                    transcripts = watched
+                    self.publish("claude", rows, errors)
+                if refresh or now >= next_tmux:
+                    errors = []
+                    self.publish("tmux", section(errors, "tmux 세션 목록", tmux_sessions), errors)
+                    next_tmux = now + WATCH_TMUX
+            except Exception as exc:
+                # One unexpected failure ends neither this thread nor the watcher: the
+                # sources are read again on the next round.
+                watch_log("local", exc)
             self.local_wake.wait(WATCH_CLAUDE_STAT)
             self.local_wake.clear()
 
@@ -1200,15 +1219,19 @@ class Watch:
             return all(key in self.parts for key in ["claude", "tmux"] + [("codex", k) for k in self.order])
 
     def compose(self):
+        """The snapshot from every source read so far. A source still unread (the first
+        snapshot waits at most WATCH_READY) is named in errors, never shown as empty."""
         with self.lock:
-            claude = self.parts.get("claude", ([], []))
-            tmux = self.parts.get("tmux", ([], []))
-            codex = [self.parts.get(("codex", key)) for key in self.order]
+            claude = self.parts.get("claude", ([], ["Claude 세션 목록을 아직 읽지 못했습니다."]))
+            tmux = self.parts.get("tmux", ([], ["tmux 세션 목록을 아직 읽지 못했습니다."]))
+            codex = [self.parts.get(("codex", key)) or
+                     ([], ["Codex daemon(%s) 목록을 아직 읽지 못했습니다." % self.homes[key].label[1]
+                           if key in self.homes else "Codex 작업 목록을 아직 읽지 못했습니다."])
+                     for key in self.order]
         codex_rows, codex_errors = [], []
         for part in codex:
-            if part:
-                codex_rows.extend(part[0])
-                codex_errors.extend(part[1])
+            codex_rows.extend(part[0])
+            codex_errors.extend(part[1])
         return {"host": self.hostname, "collectedAt": int(time.time()), "claude": claude[0],
                 "codex": codex_rows, "tmux": tmux[0], "errors": claude[1] + codex_errors + tmux[1]}
 
@@ -1261,6 +1284,15 @@ class Watch:
         except OSError:
             # The board closed its end (BrokenPipe): nobody reads this watcher any more.
             pass
+        except Exception as exc:
+            # Anything unexpected ends this watcher cleanly; the board starts another or
+            # collects one-shot meanwhile.
+            watch_log("watch", exc)
+            try:
+                self.emit({"type": "bye", "reason": "error"})
+            except (OSError, ValueError):
+                pass
+            return 1
         finally:
             self.stop()
             if descriptor is not None:
@@ -1317,10 +1349,15 @@ def watch_main(argv):
     if (argv and board_id is None) or (board_id is not None and not BOARD_ID.fullmatch(board_id)):
         sys.stdout.write(json.dumps({"type": "bye", "reason": "usage"}) + "\n")
         return 2
-    code = Watch(sys.stdin.buffer, sys.stdout.buffer, board_id).run()
+    try:
+        code = Watch(sys.stdin.buffer, sys.stdout.buffer, board_id).run()
+    except BaseException as exc:
+        # Never unwind into an interpreter shutdown (see below).
+        watch_log("watch", exc)
+        code = 1
     try:
         sys.stdout.flush()
-    except OSError:
+    except (OSError, ValueError):
         pass
     # The stdin reader thread is still blocked in a read that holds the stdin buffer's
     # lock; a normal interpreter shutdown would abort on it. Everything is written.

@@ -216,7 +216,29 @@ class TerminalManager:
 
     def _foreign(self, terminal):
         """True for a row created on another tmux socket: this board cannot see or end it."""
-        return terminal.record.get("socket", self.socket_name) != self.socket_name
+        socket = terminal.record.get("socket")
+        return socket is not None and socket != self.socket_name
+
+    @staticmethod
+    def _unrecorded(terminal):
+        """A row saved before sockets were recorded: its socket is not known yet. It is
+        looked up on this board's socket and joins it only once found there."""
+        return "socket" not in terminal.record
+
+    def _unrecorded_message(self):
+        return ("이 터미널은 소켓 기록 없이 저장됐고 현재 tmux 소켓(%s)에서 찾지 못했습니다. "
+                "이전 소켓 이름에서 열린 터미널일 수 있어 종료로 기록하지 않았습니다." % self.socket_name)
+
+    def _adopt(self, terminal):
+        """Record this socket on an unrecorded row found on it; the caller holds self.lock."""
+        if not self._unrecorded(terminal):
+            return
+        terminal.record["socket"] = self.socket_name
+        try:
+            self._save()
+        except (ValueError, RuntimeError, OSError):
+            terminal.record.pop("socket", None)
+            raise
 
     def _exists(self, terminal):
         if terminal.record.get("closed", False) or self._foreign(terminal):
@@ -235,7 +257,6 @@ class TerminalManager:
             raise RuntimeError("터미널 상태 파일을 읽지 못했습니다.") from None
         if not isinstance(rows, list):
             raise RuntimeError("터미널 상태 파일 형식이 올바르지 않습니다.")
-        unrecorded = False
         for row in rows:
             if (not isinstance(row, dict) or not ID.fullmatch(str(row.get("id", "")))
                     or row.get("name") != "sb-" + row["id"] or not isinstance(row.get("key"), str)
@@ -248,13 +269,9 @@ class TerminalManager:
                 row["metadata"] = _metadata(row["metadata"])
             except ValueError:
                 raise RuntimeError("터미널 상태 파일 형식이 올바르지 않습니다.") from None
-            if "socket" not in row:
-                # Rows saved before sockets were recorded belong to this board's socket.
-                row["socket"] = self.socket_name
-                unrecorded = True
+            # A row without "socket" was saved before sockets were recorded. It is not
+            # given this socket here: it may belong to the socket of an earlier name.
             self.terminals[row["id"]] = _Terminal(row, self.buffer_limit)
-        if unrecorded:
-            self._save()
 
     def _save(self):
         _private_json(self.state_path, [t.record for t in self.terminals.values()])
@@ -314,7 +331,10 @@ class TerminalManager:
                         raise RuntimeError(self._foreign_message(terminal))
                     terminal.alive = self._exists(terminal)
                     if not terminal.alive:
+                        if self._unrecorded(terminal) and not terminal.record.get("closed", False):
+                            raise RuntimeError(self._unrecorded_message())
                         raise RuntimeError("이 터미널의 CLI가 종료되었습니다. 새 작업으로 시작하세요.")
+                    self._adopt(terminal)
                     self._attach(terminal)
                     return self._public(terminal)
             live = sum(self._exists(t) for t in self.terminals.values())
@@ -651,24 +671,32 @@ class TerminalManager:
     def list(self):
         with self.lock:
             result = []
-            changed = []
+            changed, adopted = [], []
             for terminal in self.terminals.values():
                 terminal.alive = self._exists(terminal)
                 if self._foreign(terminal):
                     # Another socket's session is not visible here, not ended: no tombstone.
                     self._warn_foreign(terminal)
+                elif self._unrecorded(terminal):
+                    # Found on this socket, the row joins it. Not found, it may still run on
+                    # the socket of an earlier name: neither a socket nor a tombstone.
+                    if terminal.alive:
+                        terminal.record["socket"] = self.socket_name
+                        adopted.append(terminal)
                 elif not terminal.alive and not terminal.record.get("closed", False):
                     # A generated tmux session that ended is never restarted by
                     # this ID. Persist that fact before input receipts are pruned.
                     terminal.record["closed"] = True
                     changed.append(terminal)
                 result.append(self._public(terminal))
-            if changed:
+            if changed or adopted:
                 try:
                     self._save()
                 except (ValueError, RuntimeError, OSError):
                     for terminal in changed:
                         terminal.record.pop("closed", None)
+                    for terminal in adopted:
+                        terminal.record.pop("socket", None)
                     raise
             return result
 
@@ -707,15 +735,23 @@ class TerminalManager:
                 if not terminal.record.get("closed", False):
                     if self._foreign(terminal):
                         raise RuntimeError(self._foreign_message(terminal))
+                    unrecorded = self._unrecorded(terminal)
                     if self._exists(terminal):
                         done = self._run("kill-session", "-t", "=" + terminal.record["name"])
                         if done.returncode != 0 and self._exists(terminal):
                             raise RuntimeError("터미널을 닫지 못했습니다.")
+                    elif unrecorded:
+                        # Possibly alive on an earlier socket: like a foreign row, never tombstoned.
+                        raise RuntimeError(self._unrecorded_message())
                     terminal.record["closed"] = True
+                    if unrecorded:
+                        terminal.record["socket"] = self.socket_name
                     try:
                         self._save()
                     except (ValueError, RuntimeError, OSError):
                         terminal.record.pop("closed", None)
+                        if unrecorded:
+                            terminal.record.pop("socket", None)
                         raise
                 with terminal.condition:
                     terminal.alive = False

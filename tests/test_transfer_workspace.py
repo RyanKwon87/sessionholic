@@ -138,6 +138,141 @@ class WorkspaceTest(unittest.TestCase):
         with self.assertRaisesRegex(workspace.WorkspaceTransferError, '이력'):
             workspace.export_workspace(self.repo, self.output)
 
+    def write(self, relative, data='fixture\n', root=None):
+        path = (root or self.repo) / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data if isinstance(data, bytes) else data.encode())
+        return path
+
+    def test_shared_agent_config_transfers_but_personal_agent_state_is_refused(self):
+        shared = ['.claude/agents/reviewer.md', '.claude/commands/ship.md', '.claude/skills/qa/SKILL.md',
+                  '.claude/hooks/check.sh', '.claude/settings.json', '.codex/AGENTS.md',
+                  'tokens/colors.json', 'src/tokenizer.py', 'Deck.key/Index.zip', 'android/app/debug.keystore']
+        for name in shared:
+            self.write(name)
+        self.git('add', '.')
+        self.git('commit', '-qm', 'shared agent config')
+        personal = ['.claude/settings.local.json', '.claude/projects/p/session.jsonl',
+                    '.codex/sessions/2026/rollout.jsonl', '.codex/history.jsonl']
+        for name in personal:
+            self.write(name, 'fixture personal state never transport\n')
+        exported, imported = self.transfer()
+        target = Path(imported['root'])
+        for name in shared:
+            self.assertEqual((target / name).read_text(), 'fixture\n', name)
+        for name in personal:
+            self.assertFalse((target / name).exists(), name)
+            self.assertIn(name, exported['summary']['excluded'])
+        self.assertEqual(exported['summary']['excludedSensitive'], [])
+        self.assertNotIn(b'personal state', Path(exported['archivePath']).read_bytes())
+        for name in ('.claude/settings.local.json', '.codex/auth.json', '.claude/.credentials.json'):
+            self.write(name)
+            self.git('add', '-f', name)
+            with self.subTest(name=name), self.assertRaisesRegex(workspace.WorkspaceTransferError, '추적.*' + name):
+                workspace.inspect_workspace(self.repo)
+            self.git('rm', '-q', '--cached', name)
+        self.git('add', '-f', '.claude/settings.local.json')
+        self.git('commit', '-qm', 'personal settings fixture')
+        self.git('rm', '-q', '--cached', '.claude/settings.local.json')
+        self.git('commit', '-qm', 'untrack personal settings fixture')
+        with self.assertRaisesRegex(workspace.WorkspaceTransferError, '이력.*settings.local.json'):
+            workspace.export_workspace(self.repo, self.output)
+
+    def test_credential_lookalikes_are_excluded_with_warning_or_refused_when_tracked(self):
+        lookalikes = ['client_secret_x.json', 'config/token_official.json', 'secrets/service.txt',
+                      'service_account.json', 'deploy/server.key', '.envrc', 'infra/prod.tfvars']
+        for name in lookalikes:
+            self.write(name, 'fixture-lookalike-content\n')
+        self.write('secrets.example.json', '{}\n')
+        summary = workspace.inspect_workspace(self.repo)
+        self.assertEqual(summary['excludedSensitive'], sorted(lookalikes))
+        self.assertEqual(summary['excludedSensitiveCount'], len(lookalikes))
+        self.assertTrue(any('자격증명처럼' in warning and str(len(lookalikes)) in warning for warning in summary['warnings']))
+        exported, imported = self.transfer()
+        target = Path(imported['root'])
+        self.assertTrue((target / 'secrets.example.json').exists())
+        for name in lookalikes:
+            self.assertFalse((target / name).exists(), name)
+        self.assertNotIn(b'fixture-lookalike-content', Path(exported['archivePath']).read_bytes())
+        with patch('transfer_workspace.MAX_LISTED_SENSITIVE', 2):
+            capped = workspace.inspect_workspace(self.repo)
+        self.assertEqual(capped['excludedSensitive'], sorted(lookalikes)[:2])
+        self.assertEqual(capped['excludedSensitiveCount'], len(lookalikes))
+        self.git('add', 'client_secret_x.json')
+        with self.assertRaisesRegex(workspace.WorkspaceTransferError, '추적.*client_secret_x.json'):
+            workspace.inspect_workspace(self.repo)
+        self.git('commit', '-qm', 'lookalike fixture')
+        self.git('rm', '-q', 'client_secret_x.json')
+        self.git('commit', '-qm', 'remove lookalike fixture')
+        with self.assertRaisesRegex(workspace.WorkspaceTransferError, '이력.*client_secret_x.json'):
+            workspace.export_workspace(self.repo, self.output)
+
+    def test_preview_lists_largest_included_files_by_path_and_size_only(self):
+        self.write('large.bin', b'L' * 5000)
+        self.write('nested/medium.txt', 'M' * 300)
+        self.write('client_secret_x.json', 'S' * 9000)
+        summary = workspace.inspect_workspace(self.repo)
+        largest = summary['largestFiles']
+        self.assertEqual(largest[:2], [{'path': 'large.bin', 'bytes': 5000}, {'path': 'nested/medium.txt', 'bytes': 300}])
+        self.assertEqual([row['bytes'] for row in largest], sorted((row['bytes'] for row in largest), reverse=True))
+        self.assertTrue(all(set(row) == {'path', 'bytes'} for row in largest))
+        self.assertNotIn('client_secret_x.json', [row['path'] for row in largest])
+        with patch('transfer_workspace.MAX_LISTED_LARGEST', 1):
+            self.assertEqual(workspace.inspect_workspace(self.repo)['largestFiles'], [{'path': 'large.bin', 'bytes': 5000}])
+
+    def test_gitignored_build_directories_and_nested_worktrees_do_not_count_toward_limits(self):
+        (self.repo / '.gitignore').write_text('target/\nPods/\nbuild/\n')
+        for index in range(30):
+            self.write('target/debug/deps/file-%02d.o' % index)
+            self.write('Pods/Library/file-%02d.h' % index)
+        self.write('build/keep.txt', 'tracked under ignored\n')
+        self.git('add', '-f', 'build/keep.txt', '.gitignore')
+        self.git('commit', '-qm', 'tracked file below ignored folder')
+        self.write('build/generated.txt', 'ignored output\n')
+        self.git('worktree', 'add', '-q', '.claude/worktrees/agent-fixture')
+        self.write('.claude/agents/reviewer.md')
+        with patch('transfer_workspace.MAX_FILES', 12):
+            exported, imported = self.transfer()
+        target = Path(imported['root'])
+        self.assertEqual((target / 'build/keep.txt').read_text(), 'tracked under ignored\n')
+        self.assertTrue((target / '.claude/agents/reviewer.md').exists())
+        for name in ('target', 'Pods', 'build/generated.txt', '.claude/worktrees'):
+            self.assertFalse((target / name).exists(), name)
+        self.assertIn('.claude/worktrees/agent-fixture/', exported['summary']['excluded'])
+        self.assertTrue(any('중첩 Git' in warning for warning in exported['summary']['warnings']))
+        # Control: without the ignored-directory listing the same tree exceeds the limit.
+        original_git = workspace._git
+        with patch('transfer_workspace.MAX_FILES', 12), patch('transfer_workspace._git', side_effect=lambda root, *args, **kwargs:
+                original_git(root, *args, **kwargs) if args[:1] != ('ls-files',) or '--ignored' not in args
+                else subprocess.CompletedProcess(args, 0, b'', b'')):
+            with self.assertRaisesRegex(workspace.WorkspaceTransferError, '파일 수'):
+                workspace.inspect_workspace(self.repo)
+
+    def test_plain_folder_skips_regenerable_tool_output_but_keeps_user_target(self):
+        folder = self.base / 'plain-tools'
+        for name in ('Pods/A/a.h', '.gradle/cache.bin', '.terraform/providers/p', 'DerivedData/x.o',
+                     'rust/target/debug/app', 'rust/Cargo.toml', 'cache-marked/target/CACHEDIR.TAG',
+                     'documents/target/plan.txt', 'app.py'):
+            self.write(name, root=folder)
+        summary = workspace.inspect_workspace(folder)
+        for name in ('Pods', '.gradle', '.terraform', 'DerivedData', 'rust/target', 'cache-marked/target'):
+            self.assertIn(name, summary['excluded'])
+        exported, imported = self.transfer(folder)
+        target = Path(imported['root'])
+        self.assertTrue((target / 'documents/target/plan.txt').exists())
+        self.assertTrue((target / 'rust/Cargo.toml').exists())
+        self.assertFalse((target / 'rust/target').exists())
+
+    def test_attachment_lookalike_names_follow_uploads_but_credentials_do_not(self):
+        import attachments
+        record = attachments.store(self.repo, 'api_tokens.txt', b'uploaded on purpose')
+        exported, imported = self.transfer()
+        self.assertEqual(attachments.resolve(imported['cwd'], record['id'])['sha256'], record['sha256'])
+        self.assertNotIn(record['relativePath'], exported['summary']['excludedSensitive'])
+        attachments.store(self.repo, '.env', b'SECRET=fixture-never-transport')
+        with self.assertRaisesRegex(workspace.WorkspaceTransferError, '첨부.*\\.env'):
+            workspace.inspect_workspace(self.repo)
+
     def test_non_git_folder_and_default_exclusions(self):
         folder = self.base / 'plain'
         folder.mkdir()
@@ -280,6 +415,9 @@ class WorkspaceTest(unittest.TestCase):
         self.assertEqual(imported['attachmentsPathMap'][0]['from'], source['path'])
         self.assertEqual(imported['attachmentsPathMap'][0]['to'], received['path'])
         self.assertEqual(Path(received['path']).stat().st_mode & 0o777, 0o400)
+        # The fresh receiving repository also keeps uploads out of `git add -A`.
+        self.assertIn('.sessionholic-attachments/', (Path(imported['root']) / '.git/info/exclude').read_text().splitlines())
+        self.assertNotIn('.sessionholic-attachments', self.git('status', '--porcelain', '--untracked-files=all', root=Path(imported['root'])))
         returned_export = workspace.export_workspace(imported['cwd'], self.base / 'attachments-returned-export')
         returned = workspace.import_workspace(returned_export['archivePath'], self.base / 'attachments-returned',
                                                'attachment-return-0001', returned_export['sha256'])

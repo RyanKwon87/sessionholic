@@ -21,26 +21,62 @@ from launch import scrub_text
 import settings
 
 MAX_ARCHIVE = 128 * 1024 * 1024
+PROFILE_FAILURE_TTL = 120
+RUNTIME_MODULES = ('collector.py', 'launch.py', 'transfer_native.py', 'transfer_workspace.py', 'transfer_worker.py',
+                   'native_chat.py', 'attachments.py', 'managed_launch.py', 'settings.py')
+# Prepare stages before a native session is bound; a failure there started nothing.
+PRE_BIND_STAGES = frozenset(('validate', 'import', 'build'))
+UNKNOWN_PREPARE = ('대상 준비 결과를 확인하지 못했습니다. 이미 작업이 시작되었을 수 있으므로 '
+                   '대상 기기의 작업 목록과 이전 기록을 확인해 주세요.')
 # Only this versioned helper is installed. Credentials, dotfile profiles and hooks are not copied.
+# The helper is replaced atomically when missing or corrupt; other versions unused for a day are removed.
 BOOTSTRAP = r'''
-import base64,hashlib,io,json,os,pathlib,runpy,sys
-p=json.load(sys.stdin); data=base64.b64decode(p['runtime'],validate=True)
-assert len(data)<2*1024*1024 and hashlib.sha256(data).hexdigest()==p['sha256']
+import base64,hashlib,io,json,os,pathlib,re,runpy,stat,sys,time
+p=json.load(sys.stdin); data=base64.b64decode(p['runtime'],validate=True); sha=p['sha256']
+assert re.fullmatch('[0-9a-f]{64}',sha) and len(data)<2*1024*1024 and hashlib.sha256(data).hexdigest()==sha
 root=pathlib.Path.home()/'.local/state/sessionholic-transfer-runtime'
 for d in (root,)+tuple(root.parents):
  if d.exists(): assert not d.is_symlink() and d.is_dir()
 root.mkdir(parents=True,exist_ok=True,mode=0o700)
 assert root.stat().st_uid==os.getuid();root.chmod(0o700)
-path=root/('worker-'+p['sha256']+'.pyz')
-if path.exists():
- assert not path.is_symlink() and path.stat().st_uid==os.getuid()
- assert hashlib.sha256(path.read_bytes()).hexdigest()==p['sha256']
-else:
- fd=os.open(str(path),os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600)
- with os.fdopen(fd,'wb') as f:f.write(data)
+path=root/('worker-'+sha+'.pyz')
+def valid():
+ try: fd=os.open(str(path),os.O_RDONLY|os.O_NOFOLLOW)
+ except OSError: return False
+ with os.fdopen(fd,'rb') as f:
+  s=os.fstat(f.fileno())
+  return stat.S_ISREG(s.st_mode) and s.st_uid==os.getuid() and hashlib.sha256(f.read(len(data)+1)).hexdigest()==sha
+if not valid():
+ tmp=root/('.worker-'+sha+'.'+os.urandom(6).hex()+'.tmp')
+ fd=os.open(str(tmp),os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600)
+ try:
+  with os.fdopen(fd,'wb') as f: f.write(data);f.flush();os.fsync(f.fileno())
+  os.replace(str(tmp),str(path))
+ finally:
+  if os.path.lexists(str(tmp)): os.unlink(str(tmp))
+ assert valid()
+try:
+ os.utime(str(path));old=time.time()-86400
+ for n in os.listdir(str(root)):
+  if n!=path.name and re.fullmatch(r'worker-[0-9a-f]{64}\.pyz|\.worker-[0-9a-f]{64}\.[0-9a-f]{12}\.tmp',n):
+   s=os.lstat(str(root/n))
+   if stat.S_ISREG(s.st_mode) and s.st_uid==os.getuid() and s.st_mtime<old: os.unlink(str(root/n))
+except OSError: pass
 sys.argv=[str(path)];sys.path.insert(0,str(path));sys.stdin=io.TextIOWrapper(io.BytesIO(json.dumps(p['request']).encode()))
 runpy.run_path(str(path),run_name='__main__')
 '''
+
+
+class WorkerError(RuntimeError):
+    """The helper ran to completion and explicitly reported this failure.
+
+    Transport failures (SSH, timeouts, crashes, unreadable replies) are plain
+    RuntimeError: their remote effect is unknown. `stage` is the helper's
+    reported step, when it gives one.
+    """
+    def __init__(self, message, stage=None):
+        super().__init__(message)
+        self.stage = stage
 
 
 def _save(path, value):
@@ -51,7 +87,8 @@ def _save(path, value):
 class Transfers:
     def __init__(self, hosts, state_dir):
         self.hosts = {h['name']: h for h in hosts}
-        self.state_dir = Path(state_dir) / 'transfers'
+        self.base_dir = Path(state_dir)
+        self.state_dir = self.base_dir / 'transfers'
         self.runtime_paths = {}
         self.profile_cache = {}
         self.profile_failures = {}
@@ -62,22 +99,50 @@ class Transfers:
         if self._runtime is None:
             root = Path(__file__).resolve().parent
             output = io.BytesIO()
+            # Fixed timestamps and attributes: the same sources yield the same SHA,
+            # so restarts reuse the installed helper instead of adding versions.
             with zipfile.ZipFile(output, 'w', zipfile.ZIP_DEFLATED) as z:
-                for name in ('collector.py', 'launch.py', 'transfer_native.py', 'transfer_workspace.py', 'transfer_worker.py', 'native_chat.py', 'attachments.py', 'managed_launch.py', 'settings.py'):
-                    z.writestr(name, (root / name).read_bytes())
-                z.writestr('__main__.py', 'from transfer_worker import main\nmain()\n')
+                for name, data in [(name, (root / name).read_bytes()) for name in RUNTIME_MODULES] + [
+                        ('__main__.py', b'from transfer_worker import main\nmain()\n')]:
+                    info = zipfile.ZipInfo(name, date_time=(1980, 1, 1, 0, 0, 0))
+                    info.compress_type = zipfile.ZIP_DEFLATED
+                    info.external_attr = 0o644 << 16
+                    z.writestr(info, data)
             data = output.getvalue()
             self._runtime = {'runtime': base64.b64encode(data).decode('ascii'), 'sha256': hashlib.sha256(data).hexdigest()}
         return self._runtime
 
-    @staticmethod
-    def command(host, args, tty=False):
+    def control_options(self):
+        """Reuse one SSH connection per host through a private socket, when one fits."""
+        directory = self.base_dir / 'ssh'
+        # OpenSSH first binds "<path>.<16 random chars>"; macOS sun_path holds 103
+        # bytes plus NUL, and %C expands to 40 hex digits. Omit rather than fail.
+        if len(os.fsencode(str(directory / 'cm-'))) + 40 + 17 > 103:
+            return []
+        try:
+            info = os.lstat(self.base_dir)
+            if not stat.S_ISDIR(info.st_mode):
+                return []
+            try:
+                os.mkdir(directory, 0o700)
+            except FileExistsError:
+                pass
+            info = os.lstat(directory)
+            if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
+                return []
+            if info.st_mode & 0o077:
+                os.chmod(directory, 0o700)
+        except OSError:
+            return []
+        return ['-o', 'ControlMaster=auto', '-o', 'ControlPersist=60', '-o', 'ControlPath=' + str(directory / 'cm-%C')]
+
+    def command(self, host, args, tty=False):
         python = host.get('python') or '/usr/bin/python3'
         if host.get('local'):
             return [sys.executable] + args
         command = 'exec ' + shlex.join([python] + args)
         return [shutil.which('ssh') or '/usr/bin/ssh'] + (['-tt'] if tty else []) + ['-o', 'BatchMode=yes', '-o', 'ConnectTimeout=6',
-                '-o', 'ServerAliveInterval=10', '-o', 'ServerAliveCountMax=2', '--', host['ssh'], command]
+                '-o', 'ServerAliveInterval=10', '-o', 'ServerAliveCountMax=2'] + self.control_options() + ['--', host['ssh'], command]
 
     def rpc(self, host, op, args=None, timeout=30):
         payload = {**self.runtime(), 'request': {'op': op, 'args': args or {}}}
@@ -88,11 +153,19 @@ class Transfers:
                 timeout=timeout, env=collector.tool_env())
         except subprocess.TimeoutExpired:
             raise RuntimeError('기기 응답 시간이 초과됐습니다. 이전 상태를 확인한 뒤 다시 시도해 주세요.') from None
+        if result.returncode == 255 and not host.get('local'):
+            raise RuntimeError('기기의 이전 도우미에 연결하지 못했습니다. SSH 연결을 확인해 주세요.')
         if result.returncode:
-            raise RuntimeError('기기의 이전 도우미를 실행하지 못했습니다. SSH 연결을 확인해 주세요.')
+            lines = result.stderr.decode('utf-8', 'replace').strip().splitlines()
+            detail = ''.join(c if c.isprintable() else ' ' for c in lines[-1]).strip() if lines else ''
+            raise RuntimeError('원격 실행 오류: ' + (scrub_text(detail)[:300] or '종료 코드 %d' % result.returncode))
         try: data = json.loads(result.stdout)
         except (ValueError, UnicodeError): raise RuntimeError('기기 응답을 읽지 못했습니다.') from None
-        if not data.get('ok'): raise RuntimeError(data.get('error') or '기기의 이전 준비에 실패했습니다.')
+        if not isinstance(data, dict): raise RuntimeError('기기 응답을 읽지 못했습니다.')
+        if not data.get('ok'):
+            stage = data.get('stage')
+            raise WorkerError(scrub_text(data.get('error') or '기기의 이전 준비에 실패했습니다.')[:1000],
+                              stage if isinstance(stage, str) else None)
         runtime = data.get('runtime', '')
         if not runtime.startswith('/') or not runtime.endswith('.pyz') or any(ord(c)<32 for c in runtime):
             raise RuntimeError('기기 도우미 경로가 올바르지 않습니다.')
@@ -102,14 +175,16 @@ class Transfers:
     def profiles(self, host, refresh=False):
         with self.lock:
             cached = self.profile_cache.get(host['name'])
-            if not refresh and host['name'] in self.profile_failures:
-                raise RuntimeError(self.profile_failures[host['name']])
+            failure = self.profile_failures.get(host['name'])
+            # A failed probe is not retried automatically, but only for a bounded time.
+            if not refresh and failure and time.monotonic() - failure[0] < PROFILE_FAILURE_TTL:
+                raise RuntimeError(failure[1])
             if not refresh and cached and time.monotonic() - cached[0] < 120:
                 return cached[1]
         try:
             result = self.rpc(host, 'profiles', timeout=12)['profiles']
         except (RuntimeError, OSError, ValueError) as exc:
-            with self.lock: self.profile_failures[host['name']] = str(exc)
+            with self.lock: self.profile_failures[host['name']] = (time.monotonic(), str(exc))
             raise
         with self.lock:
             self.profile_cache[host['name']] = (time.monotonic(), result)
@@ -237,10 +312,12 @@ class Transfers:
                 raise ValueError('원본 작업의 실행 환경을 확인하지 못했습니다.')
             if source_environment != actual.get('environment', 'default'):
                 raise ValueError('원본과 대상의 실행 환경 경계가 다릅니다.')
+            # The preview-only size listing stays out of the handoff record.
+            workspace = {k: v for k, v in exported.get('summary', {}).items() if k != 'largestFiles'}
             metadata = {'transferId': transfer_id, 'sourceHost':source_host['name'], 'targetHost':target_host['name'],
                         'sourceCwd': source['cwd'], 'sourceStopped': True, 'originalHead': exported.get('summary',{}).get('head'),
                         'sourceEnvironment': source_environment,
-                        'archiveSha256':exported['sha256'], 'workspace':exported.get('summary',{})}
+                        'archiveSha256':exported['sha256'], 'workspace':workspace}
             # prepare can materialize the initial native input, before TUI exec.
             # Validate files first, then read native state at the last boundary.
             workspace_now = self.rpc(source_host, 'inspect', {'source':source}, timeout=45)
@@ -254,8 +331,15 @@ class Transfers:
             try:
                 prepared = self.rpc(target_host, 'prepare', {'source': source, 'target': target, 'messages': messages,
                                 'transferId':transfer_id, 'sha256':exported['sha256'], 'metadata':metadata}, timeout=180)
+            except WorkerError as exc:
+                if exc.stage not in PRE_BIND_STAGES:
+                    raise RuntimeError(UNKNOWN_PREPARE) from None
+                # The helper reported a failure before binding any native session:
+                # keep its reason and let the target archive be cleaned now.
+                record['targetPreparation'] = 'failed'
+                raise
             except (OSError, RuntimeError, ValueError):
-                raise RuntimeError('대상 준비 결과를 확인하지 못했습니다. 이미 작업이 시작되었을 수 있으므로 대상 기기의 작업 목록과 이전 기록을 확인해 주세요.') from None
+                raise RuntimeError(UNKNOWN_PREPARE) from None
             record['targetPreparation'] = 'prepared'
             record.update(destinationCwd=prepared['cwd'], sourceRevision=stopped.get('revision'))
             status('ready')
@@ -282,9 +366,13 @@ class Transfers:
                 if not explicit:
                     pending.append(name); deferred.append(name)
                     continue
+                # status takes the helper's per-transfer lock, so a successful reply
+                # means no prepare is still reading the archive. Cleanup removes only
+                # archives; an imported folder or bound native session is preserved.
                 try:
                     state = self.rpc(self.hosts[name], 'status', {'transferId': record['id']}, timeout=12)
-                    if not isinstance(state, dict) or state.get('prepared') is not True:
+                    if (not isinstance(state, dict) or type(state.get('prepared')) is not bool
+                            or type(state.get('started')) is not bool or (state['started'] and not state['prepared'])):
                         pending.append(name); deferred.append(name)
                         continue
                 except (OSError, RuntimeError, ValueError):

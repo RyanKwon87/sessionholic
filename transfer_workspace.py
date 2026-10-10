@@ -19,10 +19,34 @@ from urllib.parse import urlsplit, unquote
 MAX_BYTES = 128 * 1024 * 1024
 MAX_FILES = 20000
 SCHEMA_VERSION = 1
+MAX_LISTED_SENSITIVE = 50
+MAX_LISTED_LARGEST = 100
 _DEFAULT_EXCLUDED = {"node_modules", ".venv", "venv", "__pycache__", ".pytest_cache",
                      ".mypy_cache", ".ruff_cache", ".next", "dist", "build", ".DS_Store"}
+# Regenerable tool output, pruned only outside Git; Git ignore rules govern repositories.
+_BUILD_OUTPUTS = {"Pods", ".gradle", ".turbo", ".cache", "DerivedData", ".terraform", ".tox"}
 _ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,99}$")
 _NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,80}$")
+
+# Real credentials and personal agent state: never transported in any form.
+_CREDENTIAL_DIRS = {".git", ".ssh", ".aws", ".gnupg", ".azure", ".kube", ".docker"}
+_CREDENTIAL_FILES = {".credentials.json", "auth.json", ".claude.json", ".git-credentials", ".gitconfig",
+                     ".netrc", ".npmrc", ".pypirc", "id_rsa", "id_ed25519", "id_ecdsa", "id_dsa"}
+_PRIVATE_KEY_SUFFIXES = (".pem", ".p12", ".pfx", ".p8", ".jks", ".keystore")
+_PUBLIC_KEYSTORES = {"debug.keystore"}  # Android's published debug signing store.
+# Personal files directly beneath a project's .claude or .codex* folder. Shared
+# agents, commands, skills, hooks, settings.json and AGENTS.md remain project files.
+_AGENT_PRIVATE = {"settings.local.json", "history.jsonl", "sessions", "archived_sessions", "projects",
+                  "shell-snapshots", "shell_snapshots", "todos", "file-history", "session-env",
+                  "statsig", "log", "logs"}
+_EXAMPLE_WORDS = {"example", "examples", "sample", "template", "dist"}
+# Names that only look like credentials: excluded when untracked, refused when tracked.
+_SUSPICIOUS_WORDS = {"token", "tokens", "secret", "secrets", "credential", "credentials"}
+_SUSPICIOUS_PHRASES = ("apikey", "serviceaccount", "clientsecret", "accesstoken", "refreshtoken", "authtoken")
+_SUSPICIOUS_SUFFIXES = (".key", ".tfvars", ".tfvars.json", ".tfstate", ".tfstate.backup")
+# Source code such as tokenizer.py or secret_manager.ts is not a stored credential.
+_DATA_SUFFIXES = {"", ".json", ".txt", ".yaml", ".yml", ".toml", ".ini", ".cfg", ".conf",
+                  ".properties", ".pickle", ".pkl", ".dat"}
 
 
 class WorkspaceTransferError(ValueError):
@@ -43,25 +67,55 @@ def _safe_path(value):
     return value
 
 
-def _sensitive(value):
-    for part in PurePosixPath(value).parts:
-        name = part.lower()
-        if name in (".git", ".ssh", ".aws", ".gnupg", ".azure", ".kube", ".docker"):
-            return True
-        if name.startswith(".codex") or name == ".claude":
-            return True
-        if name == ".env" or name.startswith(".env."):
-            if name.split(".")[-1] not in ("example", "examples", "sample", "template", "dist"):
-                return True
-        if (name in ("auth.json", ".credentials.json", "credentials.json", "credentials",
-                     "token", "tokens", "id_rsa", "id_ed25519", ".npmrc", ".netrc", ".pypirc",
-                     ".git-credentials", ".gitconfig", ".claude.json", "secrets.json", "secret.json")
-                or re.fullmatch(r"(?:access[_-]?|refresh[_-]?|api[_-]?)?tokens?(?:\.(?:json|txt|yaml|yml|key))?", name)
-                or re.fullmatch(r"(?:api[_-]?key|client[_-]?secret)(?:\.(?:json|txt|yaml|yml))?", name)
-                or name.startswith("service-account") and name.endswith(".json")
-                or name.endswith((".pem", ".p12", ".pfx", ".key"))):
-            return True
-    return False
+def _suspicious_name(name):
+    if name == ".envrc" or name.endswith(_SUSPICIOUS_SUFFIXES):
+        return True
+    words = [word for word in re.split(r"[^a-z0-9]+", name) if word]
+    if PurePosixPath(name).suffix not in _DATA_SUFFIXES or _EXAMPLE_WORDS.intersection(words):
+        return False
+    compact = "".join(words)
+    return bool(_SUSPICIOUS_WORDS.intersection(words)) or any(p in compact for p in _SUSPICIOUS_PHRASES)
+
+
+def _classify(value, directory=False):
+    """Return "credential", "suspicious" or None for a root-relative path.
+
+    Directory names are matched on every component; extension and word rules
+    only on a final file name, so `tokens/` or a Keynote `Deck.key/` package
+    stays transferable while a single `server.key` file does not.
+    """
+    parts = [part.lower() for part in PurePosixPath(value).parts]
+    suspicious = False
+    for index, name in enumerate(parts):
+        is_file = index == len(parts) - 1 and not directory
+        if name in _CREDENTIAL_DIRS or name in _CREDENTIAL_FILES:
+            return "credential"
+        if (name == ".env" or name.startswith(".env.")) and name.split(".")[-1] not in _EXAMPLE_WORDS:
+            return "credential"
+        parent = parts[index - 1] if index else ""
+        if (parent == ".claude" or parent.startswith(".codex")) and name in _AGENT_PRIVATE:
+            return "credential"
+        if is_file:
+            if name.endswith(_PRIVATE_KEY_SUFFIXES) and name not in _PUBLIC_KEYSTORES:
+                return "credential"
+            suspicious = suspicious or _suspicious_name(name)
+        elif name in ("secrets", ".secrets"):
+            suspicious = True
+    return "suspicious" if suspicious else None
+
+
+def _sensitive(value, directory=False):
+    """Both tiers are refused when tracked: a Git bundle would carry their history."""
+    return _classify(value, directory) is not None
+
+
+def _credential_dir(value):
+    return _classify(value, directory=True) == "credential"
+
+
+def _listed(paths):
+    shown = ["".join(c if c.isprintable() else "?" for c in path)[:200] for path in paths[:3]]
+    return ", ".join(shown) + (" 외 %d개" % (len(paths) - 3) if len(paths) > 3 else "")
 
 
 def _git_env():
@@ -114,8 +168,9 @@ def _safe_remote(url):
 
 def _git_info(root, head, with_patch):
     tracked = _text(_git(root, "ls-files", "--cached", "-z").stdout).split("\x00")[:-1]
-    if any(_sensitive(path) for path in tracked):
-        _fail("Git 추적 파일에 인증·비밀 파일이 있어 전송을 거절했습니다.")
+    refused = [path for path in tracked if _sensitive(path)]
+    if refused:
+        _fail("Git 추적 파일에 인증·비밀 파일이 있어 전송을 거절했습니다: " + _listed(refused))
     if _git(root, "ls-files", "--unmerged", "-z").stdout:
         _fail("충돌 중인 Git index는 먼저 해결한 뒤 전송해 주세요.")
     stage_data = _git(root, "ls-files", "--stage", "-z").stdout
@@ -126,8 +181,9 @@ def _git_info(root, head, with_patch):
         # Names of every change in HEAD's reachable history, including deleted
         # and renamed credential paths. Never inspect or print their contents.
         history = _text(_git(root, "log", "--format=", "--name-only", "-z", head, "--").stdout)
-        if any(_sensitive(path) for path in history.split("\x00") if path):
-            _fail("HEAD Git 이력에 인증·비밀 파일이 있어 번들 전송을 거절했습니다.")
+        refused = sorted({path for path in history.split("\x00") if path and _sensitive(path)})
+        if refused:
+            _fail("HEAD Git 이력에 인증·비밀 파일이 있어 번들 전송을 거절했습니다: " + _listed(refused))
     others = _text(_git(root, "ls-files", "--others", "--exclude-standard", "-z").stdout).split("\x00")[:-1]
     branch_result = _git(root, "symbolic-ref", "--quiet", "--short", "HEAD", allow_failure=True)
     branch = _text(branch_result.stdout).strip() if branch_result.returncode == 0 else None
@@ -160,7 +216,7 @@ def _root(cwd):
     managed_root = home / ".local/share/sessionholic/workspaces"
     _check_managed_parents(path.absolute(), home)
     path = path.resolve()
-    if _sensitive(path.name):
+    if _credential_dir(path.name):
         _fail("인증·Git 메타데이터 폴더는 전송할 수 없습니다.")
     blocked = [Path("/"), home, Path("/Users"), Path("/home"), Path("/tmp"), Path("/private/tmp")]
     system = ("/System", "/Library", "/Applications", "/bin", "/sbin", "/usr", "/etc", "/var", "/private/etc", "/private/var")
@@ -184,7 +240,7 @@ def _root(cwd):
         relative = path.relative_to(root).as_posix()
     except ValueError:
         _fail("작업 폴더가 저장소 밖에 있습니다.")
-    if _sensitive(relative):
+    if _credential_dir(relative):
         _fail("인증·Git 메타데이터 폴더는 전송할 수 없습니다.")
     return root, relative, found.returncode == 0
 
@@ -241,19 +297,36 @@ def _symlink_target(root, path, target):
         relative = resolved.relative_to(root).as_posix()
     except (OSError, RuntimeError, ValueError):
         _fail("작업 폴더 밖으로 나가는 심볼릭 링크는 전송할 수 없습니다.")
-    if _sensitive(relative):
+    # Component rules only, so sender and receiver agree before the target exists;
+    # a linked look-alike file is itself excluded or refused as its own entry.
+    if _credential_dir(relative):
         _fail("인증·Git 메타데이터를 가리키는 링크는 전송할 수 없습니다.")
     return target
 
 
-def _reject_special_files(root):
+def _build_output(path, name):
+    """Regenerable tool output; `target` only beside a Cargo or Maven project."""
+    if name in _BUILD_OUTPUTS:
+        return True
+    return name == "target" and ((path / "CACHEDIR.TAG").is_file() or
+                                 any((path.parent / marker).is_file() for marker in ("Cargo.toml", "pom.xml")))
+
+
+def _within(relative, ancestor):
+    return relative == ancestor or relative.startswith(ancestor + "/")
+
+
+def _reject_special_files(root, pruned=frozenset()):
     # Git deliberately omits untracked FIFOs/devices from ls-files. Inspect
-    # their metadata without opening them, pruning known excluded directories.
+    # their metadata without opening them, pruning excluded directories and
+    # wholly Git-ignored ones (such as target/ or Pods/) from the file count.
     count = 0
     for directory, dirs, files in os.walk(root, followlinks=False):
         for name in list(dirs):
             path = Path(directory) / name
-            if _sensitive(path.relative_to(root).as_posix()) or name in _DEFAULT_EXCLUDED or path.is_symlink():
+            relative = path.relative_to(root).as_posix()
+            if (relative in pruned or _sensitive(relative, directory=True) or name in _DEFAULT_EXCLUDED
+                    or path.is_symlink()):
                 dirs.remove(name)
         for name in files:
             path = Path(directory) / name
@@ -270,8 +343,12 @@ def _reject_special_files(root):
                 _fail("FIFO·장치·소켓 파일은 전송할 수 없습니다.")
 
 
-def _managed_attachments(root):
-    """Validate and explicitly carry managed uploads that Git may ignore."""
+def _managed_attachments(root, pruned=frozenset(), cwd_relative="."):
+    """Validate and explicitly carry managed uploads that Git may ignore.
+
+    Ignored or regenerable directories are skipped unless they contain the
+    session working directory; the managed directory itself is never skipped.
+    """
     from attachments import DIRECTORY, AttachmentError, workspace_files
     roots, names, total = [], set(), 0
     for directory, dirs, unused in os.walk(root, followlinks=False):
@@ -291,7 +368,8 @@ def _managed_attachments(root):
                 if files:
                     roots.append(parent_relative)
                 names.update((path.parent / filename).relative_to(root).as_posix() for filename in files)
-            elif _sensitive(relative) or name in _DEFAULT_EXCLUDED or path.is_symlink():
+            elif ((relative in pruned and not _within(cwd_relative, relative))
+                    or _sensitive(relative, directory=True) or name in _DEFAULT_EXCLUDED or path.is_symlink()):
                 dirs.remove(name)
         # os.walk reports symlinks-to-files and corrupt non-directory roots as files.
         if DIRECTORY in unused:
@@ -301,19 +379,31 @@ def _managed_attachments(root):
 
 def _snapshot(cwd, hash_files=False):
     root, cwd_relative, is_git = _root(cwd)
-    git_info, patch, warnings, tracked, excluded = None, b"", [], [], []
+    git_info, patch, warnings, tracked, excluded, suspicious = None, b"", [], [], [], []
+    pruned = set()
     if is_git:
-        _reject_special_files(root)
+        ignored = _text(_git(root, "ls-files", "--others", "--ignored", "--exclude-standard",
+                            "--directory", "-z").stdout).split("\x00")[:-1]
         head_done = _git(root, "rev-parse", "--verify", "HEAD", allow_failure=True)
         head = _text(head_done.stdout).strip() if head_done.returncode == 0 else None
         git_info, tracked, others, warnings, patch = _git_info(root, head, hash_files)
-        ignored = _text(_git(root, "ls-files", "--others", "--ignored", "--exclude-standard",
-                            "--directory", "-z").stdout).split("\x00")[:-1]
-        excluded.extend(ignored)
+        # Untracked nested repositories and worktrees are reported as "path/".
+        nested = [name for name in others if name.endswith("/")]
+        # --directory only folds folders without tracked files, so tracked files win.
+        pruned = {name.rstrip("/") for name in ignored + nested if name.endswith("/")}
+        _reject_special_files(root, pruned)
+        excluded.extend(ignored + nested)
+        if nested:
+            warnings.append("중첩 Git 저장소·worktree %d개는 복사하지 않았습니다." % len(nested))
         candidates = set(tracked)
         for name in others:
-            if _sensitive(name) or any(p in _DEFAULT_EXCLUDED for p in PurePosixPath(name).parts):
+            if name.endswith("/"):
+                continue
+            tier = _classify(name)
+            if tier or any(p in _DEFAULT_EXCLUDED for p in PurePosixPath(name).parts):
                 excluded.append(name)
+                if tier == "suspicious":
+                    suspicious.append(name)
             else:
                 candidates.add(name)
         excluded.append(".git")
@@ -323,24 +413,36 @@ def _snapshot(cwd, hash_files=False):
             for name in list(dirs):
                 path = Path(directory) / name
                 rel = path.relative_to(root).as_posix()
-                if _sensitive(rel) or name in _DEFAULT_EXCLUDED:
+                tier = _classify(rel, directory=True)
+                if tier or name in _DEFAULT_EXCLUDED or _build_output(path, name):
                     dirs.remove(name)
                     excluded.append(rel)
+                    pruned.add(rel)
+                    if tier == "suspicious":
+                        suspicious.append(rel + "/")
                 elif path.is_symlink():
                     dirs.remove(name)
                     candidates.add(rel)
             for name in files:
                 rel = (Path(directory) / name).relative_to(root).as_posix()
-                if _sensitive(rel) or name in _DEFAULT_EXCLUDED:
+                tier = _classify(rel)
+                if tier or name in _DEFAULT_EXCLUDED:
                     excluded.append(rel)
+                    if tier == "suspicious":
+                        suspicious.append(rel)
                 else:
                     candidates.add(rel)
             if len(candidates) > MAX_FILES:
                 _fail("작업 파일 수가 전송 한도를 초과했습니다.")
-    attachment_roots, attachment_files = _managed_attachments(root)
+    attachment_roots, attachment_files = _managed_attachments(root, pruned, cwd_relative)
+    # Uploads are carried explicitly; only real credential names stop them.
+    refused = sorted(name for name in attachment_files if _classify(name) == "credential")
+    if refused:
+        _fail("첨부 파일 이름이 인증 파일 규칙에 해당해 이전할 수 없습니다: " + _listed(refused))
     candidates.update(attachment_files)
+    suspicious = sorted(set(suspicious) - attachment_files)
     # Validated uploads are included despite their Git ignore rule.
-    excluded = [name for name in excluded if not any(
+    excluded = [name for name in excluded if name not in attachment_files and not any(
         name.rstrip("/") == (PurePosixPath(parent) / ".sessionholic-attachments").as_posix()
         for parent in attachment_roots)]
     if len(candidates) > MAX_FILES:
@@ -383,10 +485,19 @@ def _snapshot(cwd, hash_files=False):
         if size > MAX_BYTES:
             _fail("작업 파일 크기가 전송 한도를 초과했습니다.")
         entries.append(entry)
+    if suspicious:
+        warnings.append("자격증명처럼 보이는 미추적 파일 %d개는 복사하지 않았습니다. "
+                        "필요하면 대상 기기에서 직접 준비해 주세요." % len(suspicious))
+    # Paths and sizes only, for review before the source is interrupted.
+    largest = sorted((entry for entry in entries if entry["kind"] == "file"),
+                     key=lambda entry: (-entry["size"], entry["path"]))[:MAX_LISTED_LARGEST]
     summary = {"root": str(root), "projectName": root.name, "cwdRelative": cwd_relative,
                "git": is_git, "head": git_info["head"] if git_info else None,
                "branch": git_info["branch"] if git_info else None,
                "fileCount": len(entries), "bytes": size, "excluded": sorted(set(excluded)),
+               "excludedSensitive": suspicious[:MAX_LISTED_SENSITIVE],
+               "excludedSensitiveCount": len(suspicious),
+               "largestFiles": [{"path": entry["path"], "bytes": entry["size"]} for entry in largest],
                "warnings": warnings, "attachmentCount": len(attachment_files) // 2}
     # This local revision deliberately uses inode/ctime as well as mtime/size:
     # an inexpensive read-only inspect can detect post-export writes, deletes,
@@ -510,24 +621,36 @@ def _validate_manifest(manifest, members):
         _fail("지원하지 않는 번들 형식입니다.")
     project = manifest.get("projectName")
     if (not isinstance(project, str) or len(project) > 255 or project in ("", ".", "..")
-            or "/" in project or "\\" in project or "\x00" in project or _sensitive(project)):
+            or "/" in project or "\\" in project or "\x00" in project or _credential_dir(project)):
         _fail("번들 프로젝트 이름이 안전하지 않습니다.")
     if not isinstance(manifest.get("summary"), dict):
         _fail("번들 작업 요약이 올바르지 않습니다.")
     cwd_relative = manifest.get("cwdRelative")
     if cwd_relative != ".":
         _safe_path(cwd_relative)
-        if _sensitive(cwd_relative):
+        if _credential_dir(cwd_relative):
             _fail("번들 작업 폴더가 인증·Git 메타데이터 경로입니다.")
     entries, deleted = manifest.get("entries"), manifest.get("deleted")
     if not isinstance(entries, list) or not isinstance(deleted, list) or len(entries) > MAX_FILES:
         _fail("번들 파일 목록이 올바르지 않습니다.")
+    attachment_roots = manifest.get("attachmentRoots", [])
+    if not isinstance(attachment_roots, list) or len(attachment_roots) > MAX_FILES or any(not isinstance(parent, str) for parent in attachment_roots) or len(set(attachment_roots)) != len(attachment_roots):
+        _fail("번들 첨부 저장 폴더 목록이 올바르지 않습니다.")
+    prefixes = []
+    for parent in attachment_roots:
+        if parent != ".":
+            _safe_path(parent)
+            if _credential_dir(parent):
+                _fail("번들 첨부 폴더가 인증 경로입니다.")
+        prefixes.append((PurePosixPath(parent) / ".sessionholic-attachments").as_posix() + "/")
     paths, expected = set(), {"manifest.json"}
     for entry in entries:
         if not isinstance(entry, dict):
             _fail("번들 파일 정보가 올바르지 않습니다.")
         path = _safe_path(entry.get("path"))
-        if path in paths or _sensitive(path):
+        tier = _classify(path)
+        # Mirrors the sender: explicit uploads are exempt only from look-alike names.
+        if path in paths or tier == "credential" or (tier and not any(path.startswith(p) for p in prefixes)):
             _fail("번들에 중복 또는 인증·비밀 파일 경로가 있습니다.")
         paths.add(path)
         expected.add("payload/" + path)
@@ -537,16 +660,6 @@ def _validate_manifest(manifest, members):
             _fail("번들 파일 정보가 올바르지 않습니다.")
         if entry["kind"] == "symlink" and not isinstance(entry.get("target"), str):
             _fail("번들 링크 정보가 올바르지 않습니다.")
-    attachment_roots = manifest.get("attachmentRoots", [])
-    if not isinstance(attachment_roots, list) or len(attachment_roots) > MAX_FILES or any(not isinstance(parent, str) for parent in attachment_roots) or len(set(attachment_roots)) != len(attachment_roots):
-        _fail("번들 첨부 저장 폴더 목록이 올바르지 않습니다.")
-    prefixes = []
-    for parent in attachment_roots:
-        if parent != ".":
-            _safe_path(parent)
-            if _sensitive(parent):
-                _fail("번들 첨부 폴더가 인증 경로입니다.")
-        prefixes.append((PurePosixPath(parent) / ".sessionholic-attachments").as_posix() + "/")
     for entry in entries:
         if ".sessionholic-attachments" in PurePosixPath(entry["path"]).parts:
             if (not any(entry["path"].startswith(prefix) for prefix in prefixes)
@@ -700,7 +813,7 @@ def import_workspace(archive_path, destination_root, transfer_id, expected_sha25
                 digest = _sha_file(path)
             if digest != entry["sha256"]:
                 _fail("복원된 작업 파일 SHA-256 검증에 실패했습니다.")
-        from attachments import DIRECTORY, AttachmentError, workspace_files, resolve
+        from attachments import DIRECTORY, AttachmentError, workspace_files, resolve, exclude_from_git
         imported_attachments = []
         for parent in manifest.get("attachmentRoots", []):
             attachment_cwd = root / parent
@@ -723,6 +836,9 @@ def import_workspace(archive_path, destination_root, transfer_id, expected_sha25
                     imported_attachments.append({"id": record["id"], "relativePath": (Path(parent) / record["relativePath"]).as_posix(), "sha256": record["sha256"]})
             except (AttachmentError, OSError):
                 _fail("복원된 첨부 파일 검증에 실패했습니다.")
+            if git:
+                # The new repository has no excludes yet; keep uploads out of `git add -A`.
+                exclude_from_git(attachment_cwd)
         cwd = root / manifest["cwdRelative"]
         if not cwd.resolve().is_relative_to(root):
             _fail("복원된 작업 폴더가 올바르지 않습니다.")

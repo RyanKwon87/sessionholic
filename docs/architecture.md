@@ -42,13 +42,28 @@ flowchart LR
 
 ## 로컬 설정 계약
 
-비밀값이 아닌 호스트별 설정은 `~/.config/sessionholic/config.json`에 둡니다. `settings.py`는 버전 1 JSON의 `profiles`, `projects`, `environments`만 허용하며, 파일이 없으면 빈 profile/project와 기본 환경을 사용합니다. 과거 계정 라우터 설정을 자동으로 읽거나 변환하지 않습니다.
+비밀값이 아닌 호스트별 설정은 `~/.config/sessionholic/config.json`에 둡니다. `settings.py`는 버전 1 JSON의 `profiles`, `projects`, `environments`만 허용하며, 파일이 없으면 빈 profile/project와 기본 환경을 사용합니다. 계정 라우터 파일은 버전 2의 `agentRouter`를 지정했을 때만 읽기 전용으로 읽고, 변환하거나 쓰지 않습니다.
 
 - `profiles`: `agent`, native 계정 경로 `home`, 사용자 표시 `label`, 실행 환경 `environment`를 지정합니다. 지원 agent는 `codex`와 `claude`입니다. Claude는 기본 `.claude` 환경만 지원하고, Codex profile 경로는 허용된 `.codex` 형식이어야 합니다.
 - `projects`: 프로젝트 식별자·표시 이름·절대 또는 홈 상대 `root`·실행 환경을 지정합니다. 작업 경로가 여러 프로젝트 root에 속하면 가장 구체적인(긴) root가 적용됩니다.
 - `environments`: 실행 환경의 label과 허용된 환경 변수만 지정합니다. 키는 `GH_CONFIG_DIR`, `GIT_CONFIG_GLOBAL`, `GIT_CONFIG_SYSTEM`, `GIT_CONFIG_NOSYSTEM`, `GIT_SSH_COMMAND`, `GIT_SSH`, `SSH_AUTH_SOCK`로 제한됩니다. 임의 키·환경변수 전체를 주입하는 기능이 아닙니다.
 - 작업공간이 project root에 매칭되지 않으면 native profile의 `environment`를 사용하고, 지정이 없으면 `default`를 사용합니다. 새 실행 또는 기기 이전에서는 실제 출발 작업의 환경과 선택한 대상 profile의 환경 이름이 맞아야 합니다.
 - 표시 label은 로그인 신원 검증 결과가 아닙니다. 설정에는 비밀값을 넣지 말고, 특히 SSH·Git 관련 경로와 명령은 사용자 권한으로 실행되는 설정으로 취급합니다.
+
+`"version": 2` 파일은 위 필드에 더해 다음 선택 필드를 받습니다. 빠진 필드는 버전 1 동작 그대로이고, 형식이 틀리면 버전 1처럼 기동·수집·실행을 멈춥니다(fail closed).
+
+- `environments.<g>`: `boundaryGroup`(경계 비교에 쓸 다른 그룹, 한 단계), `scope`·`description`(실행 설정 화면의 묶음 이름과 설명). 환경 변수 허용 키에 `CMUX_CODEX_HOOKS_DISABLED`가 추가됩니다(버전 1에서도 허용).
+- `profileRules`: `[{agent, homePrefix, environment, label, suffixLabel}]`. 목록에 없는 홈을 접두사로 분류합니다. 접두사는 이름 경계(`-`·`/`)에서만 맞고, 처음 맞는 규칙을 씁니다. `suffixLabel`이면 접두사 뒤 이름이 표시 이름이 됩니다.
+- `profiles[]`: `placeholder`(폴더가 없어도 사용 불가로 표시), `project`(이 홈의 세션을 프로젝트에 연결), `title`(전체 표시 이름).
+- `projects[].match: "component"`: `root`를 폴더 이름 하나로 보고, 해석한 작업 경로의 어느 구성요소든 같으면 그 환경을 씁니다. 긴 root 매칭이 먼저이고, 이름표에는 쓰지 않습니다.
+- `boundary`: `{agents, claude, priority}`. `agents`에 있는 대상 에이전트만 경계를 검사합니다(기본 둘 다). 빠진 에이전트는 원본 환경 변수로 실행합니다(`claude: "inherit-source"`). `priority` 그룹은 신호(원본 홈의 profile·규칙, 경로 구성요소·root project)가 하나라도 있으면 다른 판정과 이전받은 작업공간의 기록보다 먼저 적용되고, 이때 기록은 읽지 않습니다. 없으면 이전받은 작업공간은 기록만 따릅니다.
+- `legacy.sourcePersonal`: `{"true": g, "false": g}`. `sourceEnvironment`가 없는 옛 이전 기록의 boolean을 읽기만 합니다. 둘 다 없거나 boolean이 아니면 거절합니다.
+- `codexHomes`: `allowSymlinks`(링크 홈 수집), `excludeSuspended`(계정 정책의 중단 계정 `.codex-<a>`·`.codex-personal-<a>` 수집 제외), `requireMarker`(로그인·설정·소켓 파일이 있는 폴더만 실행 프로필로 표시).
+- `agentRouter`: `{projectsFile, workspacesRoot, accountPolicy}`. 수집기의 프로젝트 이름표, 작업공간 루트, `.codex-router/<hash>` 홈의 (프로젝트, 계정) 이름표에만 씁니다. 계정 정책은 키 이름만 읽습니다.
+- `tmux`: `{titleOption, taskOption}`. 기존 tmux 세션의 사용자 옵션을 제목·작업으로 표시합니다.
+- `transfer.agentConfig`: `"exclude-private"`(기본, `.claude`·`.codex*`의 개인 상태만 제외) 또는 `"exclude-all"`(이 이름의 폴더·파일 전체 제외).
+- `attachments.gitExclude`: 기본 `true`. `false`면 업로드 때 저장소의 `.git/info/exclude`를 쓰지 않습니다.
+- `usage`: 보드 호스트의 사용량 도우미(`usage.py`). `provider: "helper"`, `resources`·`python`·`path`, Codex(`codex`, `codexHelper`, `codexAccounts: [{key, label}]`)·Claude(`claude`, `claudeHelper`) 중 하나 이상, `intervalSeconds`(기본 300)·`manualIntervalSeconds`(기본 20). 없으면 `/api/usage`는 404이고 화면은 사용량을 숨깁니다.
 
 기기 목록·SSH 별칭과 HTTP 서버 실행 옵션은 설치 안내의 예시 설정을 따릅니다. 외부 주소, 호스트, 계정, 토큰을 코드나 문서 예시에 고정하지 않습니다.
 

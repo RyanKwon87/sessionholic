@@ -17,6 +17,7 @@ import tempfile
 from urllib.parse import urlsplit, unquote
 
 import instance
+import settings
 
 MAX_BYTES = 128 * 1024 * 1024
 MAX_FILES = 20000
@@ -43,6 +44,8 @@ _PUBLIC_KEYSTORES = {"debug.keystore"}  # Android's published debug signing stor
 _AGENT_PRIVATE = {"settings.local.json", "history.jsonl", "sessions", "archived_sessions", "projects",
                   "shell-snapshots", "shell_snapshots", "todos", "file-history", "session-env",
                   "statsig", "log", "logs"}
+# Host settings `transfer.agentConfig`, read again only when the settings file changes.
+_AGENT_CONFIG = {}
 _EXAMPLE_WORDS = {"example", "examples", "sample", "template", "dist"}
 # Names that only look like credentials: excluded when untracked, refused when tracked.
 _SUSPICIOUS_WORDS = {"token", "tokens", "secret", "secrets", "credential", "credentials"}
@@ -81,6 +84,23 @@ def _suspicious_name(name):
     return bool(_SUSPICIOUS_WORDS.intersection(words)) or any(p in compact for p in _SUSPICIOUS_PHRASES)
 
 
+def _agent_config_excluded():
+    """True when this host's settings keep every `.claude` and `.codex*` name out
+    (`transfer.agentConfig: "exclude-all"`); by default only their personal state is."""
+    home = Path.home()
+    path = settings.config_path(home)
+    try:
+        info = os.stat(str(path))
+        key = (str(path), info.st_ino, info.st_size, info.st_mtime_ns)
+    except OSError:
+        key = (str(path), None)
+    if key not in _AGENT_CONFIG:
+        excluded = settings.load(home)["transfer"]["agentConfig"] == "exclude-all"
+        _AGENT_CONFIG.clear()
+        _AGENT_CONFIG[key] = excluded
+    return _AGENT_CONFIG[key]
+
+
 def _classify(value, directory=False):
     """Return "credential", "suspicious" or None for a root-relative path.
 
@@ -90,9 +110,12 @@ def _classify(value, directory=False):
     """
     parts = [part.lower() for part in PurePosixPath(value).parts]
     suspicious = False
+    agent_config = _agent_config_excluded()
     for index, name in enumerate(parts):
         is_file = index == len(parts) - 1 and not directory
         if name in _CREDENTIAL_DIRS or name in _CREDENTIAL_FILES:
+            return "credential"
+        if agent_config and (name == ".claude" or name.startswith(".codex")):
             return "credential"
         if (name == ".env" or name.startswith(".env.")) and name.split(".")[-1] not in _EXAMPLE_WORDS:
             return "credential"

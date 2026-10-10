@@ -63,18 +63,24 @@ def _binary(agent, home):
 
 
 def profile_metadata(agent, key, home=None):
-    """Host-local display settings, never a verified authentication identity."""
+    """Host-local display settings, never a verified authentication identity.
+
+    The label comes from the profile row, else a matching profile rule; the group's
+    `scope` and `description` (optional) replace the group name and the generic text.
+    """
     if (agent not in ("codex", "claude") or not isinstance(key, str)
             or (agent == "codex" and not HOME_KEY.fullmatch(key))
             or (agent == "claude" and key != ".claude")):
         raise ValueError("프로필 설정 경로가 올바르지 않습니다.")
     config = settings.load(home)
-    configured = settings.profile(agent, key, home, config)
-    group = configured.get("environment", "default")
-    scope_label = config["environments"][group]["label"]
+    configured = settings.resolve_profile(agent, key, home, config)
+    group = configured["environment"]
+    environment = config["environments"][group]
+    scope_label = environment["label"]
     label = configured.get("label") or ("기본 Claude" if agent == "claude" else "기본 Codex" if key == ".codex" else key)
-    return {"label": scope_label + " · " + label, "scope": group, "environment": group,
-            "scopeLabel": scope_label, "scopeDescription": "이 호스트에 명시된 실행 환경을 사용합니다.",
+    return {"label": configured.get("title") or scope_label + " · " + label,
+            "scope": environment.get("scope", group), "environment": group, "scopeLabel": scope_label,
+            "scopeDescription": environment.get("description", "이 호스트에 명시된 실행 환경을 사용합니다."),
             "accountKey": key, "accountLabel": label, "identityVerified": False,
             "identityReason": "설정 디렉터리의 표시 이름입니다. 실제 로그인 신원과 유효성은 확인하지 않았습니다."}
 
@@ -99,14 +105,22 @@ def _profile(agent, key, home, binary):
 
 
 def discover_profiles(home=None):
-    """Discover existing supported directories without reading credentials."""
+    """Discover existing supported directories without reading credentials.
+
+    `profiles[].placeholder` rows are listed even when missing (available=False), and
+    `codexHomes.requireMarker` keeps only folders holding auth.json, config.toml or a socket.
+    """
     home = _home(home)
-    settings.load(home)  # Invalid explicit settings fail closed.
+    config = settings.load(home)  # Invalid explicit settings fail closed.
+    marker = config["codexHomes"]["requireMarker"]
     candidates = [home / ".codex"] + sorted(home.glob(".codex-*")) + sorted((home / ".codex-router").glob("*"))
     keys = [str(p.relative_to(home)) for p in candidates if p.is_dir()
-            and HOME_KEY.fullmatch(str(p.relative_to(home)))]
+            and HOME_KEY.fullmatch(str(p.relative_to(home)))
+            and (not marker or any((p / name).exists() for name in ("auth.json", "config.toml", SOCKET_REL)))]
+    placeholders = [(row["agent"], row["home"]) for row in config["profiles"] if row.get("placeholder")]
+    keys += [key for agent, key in placeholders if agent == "codex"]
     profiles = [_profile("codex", key, home, _binary("codex", home)) for key in sorted(set(keys))]
-    if (home / ".claude").is_dir():
+    if (home / ".claude").is_dir() or ("claude", ".claude") in placeholders:
         profiles.append(_profile("claude", ".claude", home, _binary("claude", home)))
     return profiles
 
@@ -127,10 +141,14 @@ def _environment(home, agent, key, environment):
 
 
 def source_environment(source, home=None):
-    """Resolve explicit host-local boundary; imported work retains its origin group."""
+    """Resolve explicit host-local boundary; imported work retains its origin group.
+
+    With `boundary.priority`, a signal for that group (the source home, a path component or
+    root project) decides first, also inside an imported workspace, whose record is then not
+    read. Otherwise an imported workspace follows its private transfer record only.
+    """
     if not isinstance(source, dict):
         raise ValueError("원본 세션 정보가 올바르지 않습니다.")
-    key = str(source.get("home") or "")
     raw_cwd = source.get("cwd")
     if not isinstance(raw_cwd, str) or not raw_cwd or any(ord(char) < 32 for char in raw_cwd):
         raise ValueError("원본 작업 경로가 올바르지 않습니다.")
@@ -139,16 +157,23 @@ def source_environment(source, home=None):
         raise ValueError("원본 작업 경로가 올바르지 않습니다.")
     resolved_cwd = cwd.resolve()
     home = _home(home)
+    config = settings.load(home)
+    priority = settings.priority_environment({**source, "cwd": str(resolved_cwd)}, home, config)
+    if priority is not None:
+        return priority
     workspaces = instance.remote_path("workspacesDir", home).resolve()
     try:
         parts = resolved_cwd.relative_to(workspaces).parts
     except ValueError:
-        return settings.source_environment({**source, "cwd": str(resolved_cwd)}, home)
+        return settings.source_environment({**source, "cwd": str(resolved_cwd)}, home, config)
     if len(parts) < 2 or not re.fullmatch(r"[a-f0-9]{32}", parts[0]):
-        return settings.source_environment({**source, "cwd": str(resolved_cwd)}, home)
+        return settings.source_environment({**source, "cwd": str(resolved_cwd)}, home, config)
     path = instance.remote_path("transfersDir", home) / parts[0] / "transfer.json"
     try:
-        path = settings.safe_path(path, private=True, home=home)
+        try:
+            path = settings.safe_path(path, private=True, home=home)
+        except ValueError:
+            raise ValueError("이전 기록의 위치·소유자·비공개 권한을 확인해 주세요.") from None
         parent = path.parent.stat()
         if parent.st_uid != os.getuid() or parent.st_mode & 0o022:
             raise ValueError("이전 기록 경로의 소유자와 권한을 확인해 주세요.")
@@ -161,11 +186,24 @@ def source_environment(source, home=None):
             if len(text) > 1024 * 1024:
                 raise ValueError("이전 기록이 허용 크기를 넘었습니다.")
             metadata = json.loads(text)
-        if not isinstance(metadata, dict) or not isinstance(metadata.get("sourceEnvironment"), str) or not settings.GROUP.fullmatch(metadata["sourceEnvironment"]):
+        if not isinstance(metadata, dict):
             raise ValueError("이전 기록에서 원본 실행 환경를 확인하지 못했습니다.")
-        return metadata["sourceEnvironment"]
+        return recorded_environment(metadata, config)
     except (OSError, RuntimeError, UnicodeError):
         raise ValueError("이전 기록에서 원본 실행 환경를 안전하게 확인하지 못했습니다.") from None
+
+
+def recorded_environment(metadata, config):
+    """A transfer record's origin group: `sourceEnvironment`, else an older record's boolean
+    `sourcePersonal` through `legacy.sourcePersonal`. Anything else is refused."""
+    if "sourceEnvironment" in metadata:
+        value = metadata["sourceEnvironment"]
+        if not isinstance(value, str) or not settings.GROUP.fullmatch(value):
+            raise ValueError("이전 기록에서 원본 실행 환경를 확인하지 못했습니다.")
+        return value
+    if "sourcePersonal" in metadata:
+        return settings.legacy_environment(metadata["sourcePersonal"], config)
+    raise ValueError("이전 기록에서 원본 실행 환경를 확인하지 못했습니다.")
 
 
 def _git_metadata(cwd, env):
@@ -324,10 +362,12 @@ def build_transferred_launch(source, targetProfile, messages, state_dir, cwd,
             raise ValueError("원본 Codex 세션 UUID가 올바르지 않습니다.") from None
     elif not isinstance(source.get("id"), str) or not CLAUDE_ID.fullmatch(source["id"]):
         raise ValueError("원본 Claude 세션 ID가 올바르지 않습니다.")
-    environment = metadata.get("sourceEnvironment")
-    if not isinstance(environment, str) or not settings.GROUP.fullmatch(environment):
-        raise ValueError("원본 실행 환경을 확인하지 못했습니다.")
-    if environment != known[target["id"]].get("environment", "default"):
+    config = settings.load(home)
+    try:
+        environment = recorded_environment(metadata, config)
+    except ValueError:
+        raise ValueError("원본 실행 환경을 확인하지 못했습니다.") from None
+    if settings.crosses_boundary(agent, environment, known[target["id"]].get("environment", "default"), config):
         raise ValueError("원본과 대상의 실행 환경 경계가 다릅니다.")
     if not isinstance(messages, list) or not any(isinstance(row, dict) and isinstance(row.get("text"), str)
                                                and row["text"].strip() for row in messages):
@@ -421,7 +461,8 @@ def build_launch(source, targetProfile, messages, state_dir, *, home=None):
     if source_agent == "codex" and (not isinstance(source_home, str) or not HOME_KEY.fullmatch(source_home)):
         raise ValueError("원본 Codex 계정 경로가 올바르지 않습니다.")
     same_route = source_agent == agent and source_home == key
-    if not same_route and environment != known[target["id"]].get("environment", "default"):
+    if not same_route and settings.crosses_boundary(agent, environment, known[target["id"]].get("environment", "default"),
+                                                    settings.load(home)):
         raise ValueError("원본과 대상의 실행 환경 경계가 다릅니다.")
     env = _environment(home, agent, key, environment)
     binary = _binary(agent, home)

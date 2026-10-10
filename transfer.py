@@ -24,7 +24,8 @@ import settings
 MAX_ARCHIVE = 128 * 1024 * 1024
 PROFILE_FAILURE_TTL = 120
 RUNTIME_MODULES = ('collector.py', 'launch.py', 'transfer_native.py', 'transfer_workspace.py', 'transfer_worker.py',
-                   'native_chat.py', 'attachments.py', 'managed_launch.py', 'settings.py', 'instance.py')
+                   'native_chat.py', 'attachments.py', 'managed_launch.py', 'settings.py', 'instance.py',
+                   'agent_router.py')
 # Prepare stages before a native session is bound; a failure there started nothing.
 PRE_BIND_STAGES = frozenset(('validate', 'import', 'build'))
 UNKNOWN_PREPARE = ('대상 준비 결과를 확인하지 못했습니다. 이미 작업이 시작되었을 수 있으므로 '
@@ -333,7 +334,8 @@ class Transfers:
             source_environment = exported.get('summary', {}).get('sourceEnvironment')
             if not isinstance(source_environment, str) or not settings.GROUP.fullmatch(source_environment):
                 raise ValueError('원본 작업의 실행 환경을 확인하지 못했습니다.')
-            if source_environment != actual.get('environment', 'default'):
+            config = settings.load()
+            if settings.crosses_boundary(target['agent'], source_environment, actual.get('environment', 'default'), config):
                 raise ValueError('원본과 대상의 실행 환경 경계가 다릅니다.')
             # The preview-only size listing stays out of the handoff record.
             workspace = {k: v for k, v in exported.get('summary', {}).items() if k != 'largestFiles'}
@@ -341,6 +343,11 @@ class Transfers:
                         'sourceCwd': source['cwd'], 'sourceStopped': True, 'originalHead': exported.get('summary',{}).get('head'),
                         'sourceEnvironment': source_environment,
                         'archiveSha256':exported['sha256'], 'workspace':workspace}
+            legacy = config['legacy'].get('sourcePersonal')
+            if legacy:
+                # Also the older boolean, so a previous release can still read this record.
+                metadata['sourcePersonal'] = (settings.boundary_group(source_environment, config)
+                                              == settings.boundary_group(legacy['true'], config))
             # prepare can materialize the initial native input, before TUI exec.
             # Validate files first, then read native state at the last boundary.
             workspace_now = self.rpc(source_host, 'inspect', {'source':source}, timeout=45)

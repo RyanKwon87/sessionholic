@@ -121,9 +121,13 @@ def exclude_from_git(cwd):
 
     Agents commonly run `git add -A`; uploads must not reach a remote. Nothing is
     written through links or into directories owned by another user, and any
-    failure is ignored so that it never blocks an upload.
+    failure is ignored so that it never blocks an upload. The host settings'
+    `attachments.gitExclude: false` turns this off: nothing is written.
     """
     try:
+        import settings
+        if not settings.load()["attachments"]["gitExclude"]:
+            return False
         git_dir = _git_dir(Path(cwd))
         if git_dir is None:
             return False

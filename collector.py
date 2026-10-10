@@ -35,6 +35,16 @@ except ModuleNotFoundError:
     settings = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(settings)
 import instance  # noqa: E402  (registered by settings, also under -I or the remote stdin program)
+try:
+    import agent_router
+except ModuleNotFoundError as missing:
+    # Same sibling rule as settings; the remote stdin program registers it beforehand.
+    if missing.name != "agent_router":
+        raise
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("agent_router", Path(__file__).resolve().with_name("agent_router.py"))
+    agent_router = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(agent_router)
 
 NAMES = instance.current()
 HOME = Path.home()
@@ -127,8 +137,12 @@ def to_epoch(value):
 # ---------- project and account labels ----------
 
 def load_projects(path=None):
-    """Labels come only from the explicit Sessionholic JSON settings."""
-    return settings.load(HOME, path)["projects"]
+    """Labels from the explicit Sessionholic JSON settings (root projects), then the optional
+    agent-router project list. Component projects only decide environments."""
+    config = settings.load(HOME, path)
+    router = agent_router.from_settings(config)
+    return ([p for p in config["projects"] if p.get("match") != "component"]
+            + (router.projects() if router is not None else []))
 
 
 def project_for(cwd, projects):
@@ -138,7 +152,7 @@ def project_for(cwd, projects):
     cwd = str(cwd)
     best = None
     for project in projects:
-        for root in (project["root"],):
+        for root in project.get("roots") or (project["root"],):
             if root.startswith("/") and (cwd == root or cwd.startswith(root.rstrip("/") + "/")):
                 if best is None or len(root) > best[0]:
                     best = (len(root), project["label"])
@@ -151,10 +165,19 @@ def project_label(project_id, projects):
     return next((p["label"] for p in projects if p["id"] == project_id), project_id or "")
 
 
-def home_label(key, path, labels=None):
-    """Configured display label only; never read external router scope records."""
-    configured = settings.profile("codex", key, HOME)
-    return None, configured.get("label") or ("기본" if key == ".codex" else key)
+def home_label(key, path, labels=None, config=None, router=None):
+    """(project id or None, account label): the profile row's label and project; with the
+    optional agent-router adapter, its names for homes the row does not label."""
+    config = config if config is not None else settings.load(HOME)
+    configured = settings.profile("codex", key, HOME, config)
+    project = configured.get("project")
+    if configured.get("label"):
+        return project, configured["label"]
+    router = router if router is not None else agent_router.from_settings(config)
+    if router is not None:
+        found, account = router.home_label(key, path, labels)
+        return project or found, account
+    return project, "기본" if key == ".codex" else key
 
 
 # ---------- phases shared by the board ----------
@@ -553,14 +576,28 @@ class AppServer:
 
 def codex_homes():
     # Symlinked homes (for example `.codex-alias` -> `.codex-work`) are skipped, so one
-    # daemon is never listed twice under two names.
+    # daemon is never listed twice under two names, unless `codexHomes.allowSymlinks`.
+    # `codexHomes.excludeSuspended` skips `.codex-<a>` and `.codex-personal-<a>` of the
+    # agent-router policy's suspended accounts.
+    try:
+        config = settings.load(HOME)
+    except ValueError:
+        config = None
+    options = config["codexHomes"] if config is not None else {}
+    skipped = set()
+    router = agent_router.from_settings(config) if config is not None else None
+    if options.get("excludeSuspended") and router is not None:
+        for account in router.suspended():
+            skipped.update((".codex-" + account, ".codex-personal-" + account))
     homes = []
     candidates = [HOME / ".codex"] + sorted(HOME.glob(".codex-*")) + sorted(ROUTER.glob("*"))
     for path in candidates:
-        if path == ROUTER or not path.is_dir() or path.resolve() != path.absolute():
+        if path == ROUTER or not path.is_dir():
+            continue
+        if not options.get("allowSymlinks") and path.resolve() != path.absolute():
             continue
         key = str(path.relative_to(HOME))
-        if HOME_KEY.match(key) and (path / SOCKET_REL).exists():
+        if key not in skipped and HOME_KEY.match(key) and (path / SOCKET_REL).exists():
             homes.append((key, path))
     return homes
 
@@ -602,10 +639,18 @@ def codex_home_threads(path, full=False):
 
 
 def codex_labels(homes):
+    try:
+        config = settings.load(HOME)
+        router = agent_router.from_settings(config)
+        hashes = router.labels() if router is not None else None
+    except Exception:
+        config = router = hashes = None
     labels = []
     for key, path in homes:
         try:
-            labels.append(home_label(key, path))
+            if config is None:
+                raise ValueError("settings")
+            labels.append(home_label(key, path, hashes, config, router))
         except Exception:
             labels.append((None, key))
     return labels
@@ -731,11 +776,18 @@ def codex_messages(turns):
 # ---------- tmux ----------
 
 def tmux_sessions():
+    """Sessions of the default tmux server; `tmux.titleOption` and `tmux.taskOption` name
+    user options (for example `@title`) that a launcher sets as the title and the task."""
     binary = which("tmux")
     if not binary:
         return []
-    fields = ["#{session_name}", "#{session_attached}", "#{session_activity}", "#{pane_current_command}",
-              "#{pane_title}"]
+    try:
+        options = settings.load(HOME)["tmux"]
+    except ValueError:
+        options = {}
+    title, task = options.get("titleOption"), options.get("taskOption")
+    fields = (["#{session_name}", "#{session_attached}", "#{session_activity}", "#{pane_current_command}"]
+              + ["#{%s}" % name for name in (title, task) if name] + ["#{pane_title}"])
     raw = run([binary, "list-panes", "-a", "-F", "\t".join(fields)], timeout=8)
     seen, out = set(), []
     for line in (raw or "").splitlines():
@@ -743,9 +795,11 @@ def tmux_sessions():
         if len(row) < len(fields) or row[0] in seen:
             continue
         seen.add(row[0])
+        title_value = row[4] if title else ""
+        task_value = row[4 + bool(title)] if task else ""
         out.append({"name": row[0], "attached": int(row[1] or 0) if row[1].isdigit() else 0,
                     "activity": int(row[2]) if row[2].isdigit() else None,
-                    "command": row[3], "title": row[4], "task": ""})
+                    "command": row[3], "title": title_value or row[len(fields) - 1], "task": task_value})
     return out
 
 

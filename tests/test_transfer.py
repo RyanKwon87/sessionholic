@@ -621,6 +621,18 @@ class RuntimeInstallTest(unittest.TestCase):
             sent.append('runtime' in json.loads(kwargs['input']))
             return real(*args,**kwargs)
         return sent,patch('transfer.subprocess.run',side_effect=run)
+    def test_helper_written_by_the_previous_bootstrap_is_reused(self):
+        # An earlier board wrote worker-<sha>.pyz directly with O_EXCL; the same bytes are accepted as is.
+        sha=self.flow.runtime()['sha256']
+        self.root.mkdir(parents=True,mode=0o700)
+        current=self.root/('worker-'+sha+'.pyz')
+        current.write_bytes(base64.b64decode(self.flow.runtime()['runtime']));current.chmod(0o600)
+        before=current.stat().st_ino
+        sent,recording=self.recorded()
+        with recording:
+            self.assertEqual(self.status(),{'prepared':False,'started':False})
+        self.assertEqual(sent,[False])
+        self.assertEqual(current.stat().st_ino,before)
     def test_installed_helper_is_reached_with_its_sha_only(self):
         sent,recording=self.recorded()
         with recording:

@@ -94,7 +94,12 @@ class SettingsTest(unittest.TestCase):
         self.assertEqual(settings.variables('team', self.home)['GH_CONFIG_DIR'], str(self.home / 'fixture-private-gh'))
 
     def test_malformed_settings_fail_closed_without_echoing_values(self):
-        bad = [{'version': True}, {'version': 2}, {'version': 1, 'unexpected': 'SENTINEL'},
+        bad = [{'version': True}, {'version': 3}, {'version': 1, 'unexpected': 'SENTINEL'},
+               # Version 2 fields are refused in a version 1 file.
+               {'version': 1, 'boundary': {'agents': ['codex']}},
+               {'version': 1, 'profiles': [{'agent': 'codex', 'home': '.codex', 'placeholder': True}]},
+               {'version': 1, 'projects': [{'id': 'p', 'label': 'P', 'root': 'Private', 'match': 'component'}]},
+               {'version': 1, 'environments': {'team': {'boundaryGroup': 'default'}}},
                {'version': 1, 'profiles': [{'agent': 'codex', 'home': '../other'}]},
                {'version': 1, 'profiles': [{'agent': 'claude', 'home': '.claude-other'}]},
                {'version': 1, 'profiles': [{'agent': 'codex', 'home': '.codex', 'environment': 'missing'}]},

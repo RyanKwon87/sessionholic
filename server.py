@@ -229,13 +229,16 @@ def collector_command(host, args, state_dir=None):
 def remote_prelude():
     """Modules for a remote Python's stdin, from this reviewed bundle rather than a remote
     Python path: `instance` carrying the board's names (the remote host never reads its own
-    instance file), then `settings`. Sources are ASCII literals: Python 3.9 rejects a UTF-8
-    character split across its 8KiB read of a long stdin line."""
+    instance file), then `settings` and the optional `agent_router` adapter. Sources are
+    ASCII literals: Python 3.9 rejects a UTF-8 character split across its 8KiB read of a
+    long stdin line."""
     names = (HERE / "instance.py").read_text(encoding="utf-8")
     module = (HERE / "settings.py").read_text(encoding="utf-8")
+    router = (HERE / "agent_router.py").read_text(encoding="utf-8")
     return ("import types,sys\nm=types.ModuleType('instance')\nm.INJECTED=" + ascii(instance.remote_blob())
             + "\nexec(" + ascii(names) + ",m.__dict__)\nsys.modules['instance']=m\n"
-            "m=types.ModuleType('settings')\nexec(" + ascii(module) + ",m.__dict__)\nsys.modules['settings']=m\n")
+            "m=types.ModuleType('settings')\nexec(" + ascii(module) + ",m.__dict__)\nsys.modules['settings']=m\n"
+            "m=types.ModuleType('agent_router')\nexec(" + ascii(router) + ",m.__dict__)\nsys.modules['agent_router']=m\n")
 
 
 def remote_program():
@@ -1227,11 +1230,15 @@ class Workflow:
             allowed, reason = False, "진행 중인 실행이나 승인 요청을 원래 터미널에서 마무리한 뒤 전환해 주세요."
         if same and source["agent"] == "claude" and source.get("kind") != "background":
             allowed, reason = False, "이 Claude 세션은 기존 터미널에서 실행 중입니다. 백그라운드 세션만 직접 연결할 수 있어요."
-        source_environment = None
+        config = settings.load()
         if source_host["local"]:
             from launch import source_environment as resolve_environment
             source_environment = resolve_environment(source)
-        if not same and not cross_host and profile and source_environment != profile.get("environment", "default"):
+        else:
+            # Another host's path is not resolved here: its names give a quick estimate.
+            source_environment = settings.quick_environment(source, config=config)
+        if not same and not cross_host and profile and settings.crosses_boundary(
+                target["agent"], source_environment, profile.get("environment", "default"), config):
             allowed, reason = False, "원본과 대상의 실행 환경 경계가 다릅니다."
         if not shutil.which("tmux", path=collector_path()):
             allowed, reason = False, "이 기기에 tmux를 설치한 뒤 터미널을 열 수 있어요."
@@ -1248,7 +1255,8 @@ class Workflow:
             try:
                 transfer_preview = self.transfers.preview(source, target, source_host, host)
                 source_environment = transfer_preview.get("workspace", {}).get("sourceEnvironment")
-                if not isinstance(source_environment, str) or source_environment != profile.get("environment", "default"):
+                if not isinstance(source_environment, str) or settings.crosses_boundary(
+                        target["agent"], source_environment, profile.get("environment", "default"), config):
                     allowed, reason = False, "원본과 대상의 실행 환경 경계가 다릅니다."
                 warnings.extend(transfer_preview.get("workspace", {}).get("warnings", []))
                 warnings.append("진행 중인 응답을 중단한 뒤 이전합니다. 승인 대기와 프로세스 자체는 새 기기로 이동하지 않습니다.")
@@ -1597,6 +1605,8 @@ class Handler(BaseHTTPRequestHandler):
                 if url.path == "/api/read":
                     result = self.server.board.read(query.get("host"), query.get("agent"), query.get("id"), query.get("home"))
                     return self.send_json(200, result)
+                if url.path == "/api/usage" and self.server.usage is not None:
+                    return self.send_json(200, self.server.usage.snapshot(refresh=True))
                 if url.path == "/api/capabilities":
                     result = self.server.workflow.capabilities()
                     return self.send_json(200, {**result, "csrfToken": self.server.csrf,
@@ -1772,6 +1782,8 @@ class Handler(BaseHTTPRequestHandler):
                     raise ValueError("기기 이름 형식이 올바르지 않습니다.")
                 self.server.board.request_refresh(host, force=True)
                 return self.send_json(200, self.server.board.snapshot())
+            if path == "/api/usage/refresh" and self.server.usage is not None:
+                return self.send_json(200, self.server.usage.snapshot(force=True))
             if path == "/api/chat/state":
                 return self.send_json(200, self.server.chat.state(data))
             if path == "/api/chat/send":
@@ -1888,7 +1900,8 @@ class BoardHTTPServer(ThreadingHTTPServer):
 
 
 def make_server(bind, port, board, token, terminals=None, workflow=None, state_dir=STATE_DIR, max_terminals=4,
-                tailscale_user=None):
+                tailscale_user=None, usage=None):
+    """`usage` (usage.UsageMeter) serves /api/usage; without it the routes stay 404."""
     if bind not in ("127.0.0.1", "::1"):
         raise ValueError("서버는 loopback에서만 실행할 수 있습니다.")
     if tailscale_user is not None and (not isinstance(tailscale_user, str) or not tailscale_user
@@ -1898,6 +1911,7 @@ def make_server(bind, port, board, token, terminals=None, workflow=None, state_d
     server = BoardHTTPServer((bind, port), Handler)
     server.daemon_threads = True
     server.board, server.token, server.tailscale_user = board, token, tailscale_user
+    server.usage = usage
     server.cookie_name = COOKIE + "_" + str(server.server_address[1])
     server.once, server.once_lock = ("", 0), threading.Lock()
     server.sessions, server.auth_lock = {}, threading.Lock()
@@ -1946,7 +1960,7 @@ def main(argv=None):
     if args.bind != "127.0.0.1":
         parser.error("127.0.0.1만 허용합니다. 원격 접속은 Tailscale Serve를 사용하세요.")
     try:
-        settings.load()
+        config = settings.load()
         for folder in dict.fromkeys((CONFIG_DIR, TOKEN_FILE.parent)):
             settings.safe_path(folder, directory=True, private=True, allow_missing=True)
         args.state_dir = settings.safe_path(args.state_dir, directory=True, private=True, allow_missing=True)
@@ -1962,8 +1976,12 @@ def main(argv=None):
     if args.local_only:
         hosts = [h for h in hosts if h["local"]]
     board = Board(hosts, max(args.interval, 60), state_dir=args.state_dir, live=not args.no_live)
+    meter = None
+    if config["usage"] is not None:
+        from usage import UsageMeter
+        meter = UsageMeter(config["usage"])
     httpd = make_server(args.bind, args.port, board, token, state_dir=args.state_dir,
-                        max_terminals=args.max_terminals, tailscale_user=tailscale_user)
+                        max_terminals=args.max_terminals, tailscale_user=tailscale_user, usage=meter)
     print(f"{LOG_PREFIX}: http://127.0.0.1:{args.port}/ · 화면을 열 때만 수집합니다.", file=sys.stderr)
     if args.open:
         print(issue_login_link(httpd), flush=True)

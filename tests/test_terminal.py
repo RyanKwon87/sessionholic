@@ -1,4 +1,5 @@
 import base64
+import io
 import json
 import os
 from pathlib import Path
@@ -467,6 +468,80 @@ class ValidationTest(unittest.TestCase):
 
 
 @unittest.skipUnless(shutil.which("tmux"), "tmux fixture requires installed tmux")
+class SocketRecordTest(unittest.TestCase):
+    """A board started on another tmux socket must never tombstone live sessions (R1)."""
+
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.state = Path(self.directory.name)
+        self.managers = []
+
+    def tearDown(self):
+        for manager in self.managers:
+            manager.close()
+        self.directory.cleanup()
+
+    def rows(self, **extra):
+        return [{"id": char * 32, "name": "sb-" + char * 32, "key": "fixture-" + char, "metadata": {}, **extra}
+                for char in "ab"]
+
+    def manager(self, socket="sb-fixture-current"):
+        # tmux is a program that always fails: no session exists on this socket.
+        manager = terminal.TerminalManager(state_dir=self.state, socket_name=socket, tmux="/usr/bin/false")
+        self.managers.append(manager)
+        return manager
+
+    def saved(self):
+        return json.loads((self.state / "sessions.json").read_text())
+
+    def test_default_socket_is_the_instance_name(self):
+        manager = terminal.TerminalManager(state_dir=self.state, tmux="/usr/bin/false")
+        self.managers.append(manager)
+        self.assertEqual(manager.socket_name, terminal.DEFAULT_SOCKET)
+        self.assertEqual(terminal.DEFAULT_SOCKET, terminal.instance.current()["names"]["tmuxSocket"])
+
+    def test_rows_saved_without_a_socket_record_the_current_one_at_load(self):
+        (self.state / "sessions.json").write_text(json.dumps(self.rows()))
+        self.manager()
+        self.assertEqual([row["socket"] for row in self.saved()], ["sb-fixture-current"] * 2)
+        self.assertTrue(all("closed" not in row for row in self.saved()))
+
+    def test_rows_of_another_socket_are_not_closed_by_listing_closing_or_reopening(self):
+        (self.state / "sessions.json").write_text(json.dumps(self.rows(socket="sb-fixture-old")))
+        before = (self.state / "sessions.json").read_bytes()
+        manager = self.manager()
+        with patch("sys.stderr", new_callable=io.StringIO) as log:
+            listed = manager.list()
+            manager.list()
+        self.assertEqual([(row["alive"], row["closed"]) for row in listed], [(False, False)] * 2)
+        self.assertEqual((self.state / "sessions.json").read_bytes(), before)
+        warnings = log.getvalue().splitlines()
+        self.assertEqual(len(warnings), 2, "one warning per terminal, not per listing")
+        self.assertIn("sb-fixture-old", warnings[0])
+        with self.assertRaisesRegex(RuntimeError, "다른 tmux 소켓"):
+            manager.close_terminal("a" * 32)
+        with self.assertRaisesRegex(RuntimeError, "다른 tmux 소켓"):
+            manager.create("fixture-a", ["/bin/echo"], self.directory.name, {})
+        self.assertEqual((self.state / "sessions.json").read_bytes(), before)
+        # Back on the recorded socket, the same rows are judged normally again.
+        manager.close()
+        self.managers.remove(manager)
+        again = self.manager("sb-fixture-old")
+        self.assertEqual([row["closed"] for row in again.list()], [True, True])
+
+    def test_rows_of_the_current_socket_that_ended_are_still_closed(self):
+        (self.state / "sessions.json").write_text(json.dumps(self.rows(socket="sb-fixture-current")))
+        manager = self.manager()
+        self.assertEqual([row["closed"] for row in manager.list()], [True, True])
+        self.assertEqual([row["closed"] for row in self.saved()], [True, True])
+
+    def test_invalid_socket_records_are_rejected(self):
+        for value in (5, "", "bad socket", "../x"):
+            (self.state / "sessions.json").write_text(json.dumps(self.rows(socket=value)))
+            with self.assertRaisesRegex(RuntimeError, "상태 파일 형식"):
+                self.manager()
+
+
 class TmuxFixtureTest(unittest.TestCase):
     """Only a Python echo fixture runs in a unique tmux server, never an agent."""
 
@@ -657,7 +732,8 @@ class TmuxFixtureTest(unittest.TestCase):
         saved = json.loads((Path(self.directory.name) / "sessions.json").read_text())
         closed = next(row for row in saved if row["id"] == first["id"])
         self.assertTrue(closed["closed"])
-        self.assertEqual(set(closed), {"id", "name", "key", "metadata", "closed"})
+        self.assertEqual(set(closed), {"id", "name", "key", "metadata", "closed", "socket"})
+        self.assertEqual(closed["socket"], self.socket)
         self.assertNotIn("FIXTURE_READY", json.dumps(saved))
 
     def test_close_with_concurrent_input_does_not_deadlock_or_accept_later_input(self):

@@ -11,6 +11,10 @@ import sys
 import threading
 import time
 
+import instance
+
+BRAND = instance.current()["brand"]
+
 HEARTBEAT = 15.0
 MAX_STREAMS = 8
 # Conversation watchers alive at once, including those waiting out their grace period
@@ -188,7 +192,7 @@ class EventHub:
         if start is not None:
             try:
                 threading.Thread(target=self._watch, args=(start,), daemon=True,
-                                 name="sessionholic-watch").start()
+                                 name=BRAND["threadPrefix"] + "-watch").start()
             except RuntimeError:
                 self.close_stream(stream)
                 with self.lock:
@@ -281,7 +285,7 @@ class EventHub:
             state = self.chat.state({"source": dict(watcher.ref)}, watching=True)
         except Exception as exc:
             if not isinstance(exc, EXPECTED):
-                sys.stderr.write("세션홀릭: 대화 변경 확인 중 예상하지 못한 오류 (%s)\n" % type(exc).__name__)
+                sys.stderr.write("%s: 대화 변경 확인 중 예상하지 못한 오류 (%s)\n" % (BRAND["logPrefix"], type(exc).__name__))
             return False, None
         if not isinstance(state, dict):
             return False, None

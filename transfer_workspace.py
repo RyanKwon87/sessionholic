@@ -16,6 +16,8 @@ import tarfile
 import tempfile
 from urllib.parse import urlsplit, unquote
 
+import instance
+
 MAX_BYTES = 128 * 1024 * 1024
 MAX_FILES = 20000
 SCHEMA_VERSION = 1
@@ -27,6 +29,8 @@ _DEFAULT_EXCLUDED = {"node_modules", ".venv", "venv", "__pycache__", ".pytest_ca
 _BUILD_OUTPUTS = {"Pods", ".gradle", ".turbo", ".cache", "DerivedData", ".terraform", ".tox"}
 _ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,99}$")
 _NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,80}$")
+# The board's attachment folder in each work folder (instance `remote.attachmentsDir`).
+_ATTACHMENTS = instance.current()["remote"]["attachmentsDir"]
 
 # Real credentials and personal agent state: never transported in any form.
 _CREDENTIAL_DIRS = {".git", ".ssh", ".aws", ".gnupg", ".azure", ".kube", ".docker"}
@@ -213,7 +217,7 @@ def _root(cwd):
     if not path.is_absolute() or not path.is_dir():
         _fail("전송할 작업 폴더의 절대 경로가 필요합니다.")
     home = Path.home().absolute().resolve()
-    managed_root = home / ".local/share/sessionholic/workspaces"
+    managed_root = instance.remote_path("workspacesDir", home)
     _check_managed_parents(path.absolute(), home)
     path = path.resolve()
     if _credential_dir(path.name):
@@ -251,7 +255,7 @@ def _check_managed_parents(path, home):
     # spelling and its canonical spelling, without resolving workspace links.
     matched_home = None
     for spelling in (home, Path.home().absolute()):
-        managed = spelling / ".local/share/sessionholic/workspaces"
+        managed = instance.remote_path("workspacesDir", spelling)
         if path == managed or managed in path.parents:
             matched_home = spelling
             break
@@ -443,7 +447,7 @@ def _snapshot(cwd, hash_files=False):
     suspicious = sorted(set(suspicious) - attachment_files)
     # Validated uploads are included despite their Git ignore rule.
     excluded = [name for name in excluded if name not in attachment_files and not any(
-        name.rstrip("/") == (PurePosixPath(parent) / ".sessionholic-attachments").as_posix()
+        name.rstrip("/") == (PurePosixPath(parent) / _ATTACHMENTS).as_posix()
         for parent in attachment_roots)]
     if len(candidates) > MAX_FILES:
         _fail("작업 파일 수가 전송 한도를 초과했습니다.")
@@ -642,7 +646,7 @@ def _validate_manifest(manifest, members):
             _safe_path(parent)
             if _credential_dir(parent):
                 _fail("번들 첨부 폴더가 인증 경로입니다.")
-        prefixes.append((PurePosixPath(parent) / ".sessionholic-attachments").as_posix() + "/")
+        prefixes.append((PurePosixPath(parent) / _ATTACHMENTS).as_posix() + "/")
     paths, expected = set(), {"manifest.json"}
     for entry in entries:
         if not isinstance(entry, dict):
@@ -661,7 +665,7 @@ def _validate_manifest(manifest, members):
         if entry["kind"] == "symlink" and not isinstance(entry.get("target"), str):
             _fail("번들 링크 정보가 올바르지 않습니다.")
     for entry in entries:
-        if ".sessionholic-attachments" in PurePosixPath(entry["path"]).parts:
+        if _ATTACHMENTS in PurePosixPath(entry["path"]).parts:
             if (not any(entry["path"].startswith(prefix) for prefix in prefixes)
                     or entry["kind"] != "file" or entry["mode"] != 0o400):
                 _fail("번들 첨부 경로 또는 권한이 올바르지 않습니다.")

@@ -17,13 +17,14 @@ import threading
 import time
 import zipfile
 
+import instance
 from launch import scrub_text
 import settings
 
 MAX_ARCHIVE = 128 * 1024 * 1024
 PROFILE_FAILURE_TTL = 120
 RUNTIME_MODULES = ('collector.py', 'launch.py', 'transfer_native.py', 'transfer_workspace.py', 'transfer_worker.py',
-                   'native_chat.py', 'attachments.py', 'managed_launch.py', 'settings.py')
+                   'native_chat.py', 'attachments.py', 'managed_launch.py', 'settings.py', 'instance.py')
 # Prepare stages before a native session is bound; a failure there started nothing.
 PRE_BIND_STAGES = frozenset(('validate', 'import', 'build'))
 UNKNOWN_PREPARE = ('대상 준비 결과를 확인하지 못했습니다. 이미 작업이 시작되었을 수 있으므로 '
@@ -32,14 +33,15 @@ UNKNOWN_PREPARE = ('대상 준비 결과를 확인하지 못했습니다. 이미
 # A call normally carries only the helper's SHA-256. When `worker-<sha>.pyz` is missing or
 # corrupt the bootstrap answers {"needRuntime": true} without running anything, and the
 # coordinator sends the full helper, which is verified and replaced atomically.
-# Other versions unused for a day are removed.
-BOOTSTRAP = r'''
+# Other versions unused for a day are removed. The runtime folder (instance
+# `remote.runtimeDir`, under the remote home) is filled in once at import.
+_BOOTSTRAP = r'''
 import base64,hashlib,io,json,os,pathlib,re,runpy,stat,sys,time
 p=json.load(sys.stdin); sha=p['sha256']; limit=2*1024*1024
 assert re.fullmatch('[0-9a-f]{64}',sha)
 data=base64.b64decode(p['runtime'],validate=True) if 'runtime' in p else None
 assert data is None or (len(data)<limit and hashlib.sha256(data).hexdigest()==sha)
-root=pathlib.Path.home()/'.local/state/sessionholic-transfer-runtime'
+root=pathlib.Path.home()/@RUNTIME_DIR@
 for d in (root,)+tuple(root.parents):
  if d.exists(): assert not d.is_symlink() and d.is_dir()
 root.mkdir(parents=True,exist_ok=True,mode=0o700)
@@ -72,6 +74,7 @@ except OSError: pass
 sys.argv=[str(path)];sys.path.insert(0,str(path));sys.stdin=io.TextIOWrapper(io.BytesIO(json.dumps(p['request']).encode()))
 runpy.run_path(str(path),run_name='__main__')
 '''
+BOOTSTRAP = _BOOTSTRAP.replace('@RUNTIME_DIR@', repr(instance.current()['remote']['runtimeDir']), 1)
 
 
 class WorkerError(RuntimeError):
@@ -110,8 +113,11 @@ class Transfers:
             output = io.BytesIO()
             # Fixed timestamps and attributes: the same sources yield the same SHA,
             # so restarts reuse the installed helper instead of adding versions.
+            # The helper carries the board's names as `instance.json`; remote hosts never
+            # read their own instance file.
             with zipfile.ZipFile(output, 'w', zipfile.ZIP_DEFLATED) as z:
                 for name, data in [(name, (root / name).read_bytes()) for name in RUNTIME_MODULES] + [
+                        (instance.FILENAME, instance.remote_blob().encode('utf-8')),
                         ('__main__.py', b'from transfer_worker import main\nmain()\n')]:
                     info = zipfile.ZipInfo(name, date_time=(1980, 1, 1, 0, 0, 0))
                     info.compress_type = zipfile.ZIP_DEFLATED

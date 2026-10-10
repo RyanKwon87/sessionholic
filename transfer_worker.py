@@ -11,6 +11,7 @@ import sys
 import stat
 from contextlib import contextmanager
 from collector import RpcError
+import instance
 
 MAX_ARCHIVE = 128 * 1024 * 1024
 ID = re.compile(r'[a-f0-9]{32}\Z')
@@ -29,7 +30,7 @@ def private_dir(path):
 
 
 def root():
-    return private_dir(Path.home() / '.local/state/sessionholic-transfers')
+    return private_dir(instance.remote_path('transfersDir', Path.home()))
 
 
 def job(transfer_id):
@@ -145,7 +146,7 @@ def prepare(args, profiles, import_workspace):
         profile = next((p for p in profiles() if p['id'] == args['target']['account'] and p['agent'] == args['target']['agent']), None)
         if not profile or not profile.get('available'):
             raise ValueError('대상 기기의 기존 계정을 사용할 수 없습니다.')
-        destination = private_dir(Path.home() / '.local/share/sessionholic/workspaces')
+        destination = private_dir(instance.remote_path('workspacesDir', Path.home()))
     with stage('import'):
         imported = import_workspace(folder / 'incoming.tar.gz', destination, args['transferId'], args['sha256'])
     try:
@@ -224,7 +225,7 @@ def attach(source):
         raise ValueError('원격 원본 실행 프로필을 확인하지 못했습니다.')
     normalized = {**source, **identity}
     spec = build_launch(normalized, {**profile, 'host': normalized.get('host')}, [],
-                        Path.home() / '.local/state/sessionholic')
+                        instance.remote_path('attachStateDir', Path.home()))
     if spec['mode'] != 'attach':
         raise ValueError('원격 기존 세션 연결만 지원합니다.')
     os.chdir(spec['cwd'])

@@ -27,6 +27,14 @@ import threading
 import time
 import uuid
 
+try:
+    import instance
+except ModuleNotFoundError as missing:
+    # `python3 -I terminal.py --launch` inside tmux runs only _launch(), which needs no names.
+    if missing.name != "instance":
+        raise
+    instance = None
+
 ID = re.compile(r"^[0-9a-f]{32}$")
 SOCKET = re.compile(r"^[A-Za-z0-9_-]{1,60}$")
 BUFFER_LIMIT = 1024 * 1024
@@ -42,7 +50,11 @@ KEY_LIMIT = 40
 PANE_FORMAT = ("#{alternate_on}|#{mouse_any_flag}|#{mouse_sgr_flag}|#{pane_width}|#{pane_height}"
                "|#{pane_in_mode}|#{scroll_position}|#{history_size}")
 PANE_FIELDS = ("alternate", "mouse", "sgr", "width", "height", "inMode", "position", "history")
-DEFAULT_STATE = Path.home() / ".local/state/sessionholic/terminals"
+DEFAULT_STATE = instance.path("stateDir") / "terminals" if instance is not None else None
+# The board's own tmux server (`tmux -L <name>`); each saved row records the socket it was
+# created on, so a renamed socket never turns live sessions into closed records.
+DEFAULT_SOCKET = instance.current()["names"]["tmuxSocket"] if instance is not None else None
+LOG_PREFIX = instance.current()["brand"]["logPrefix"] if instance is not None else None
 
 
 class InputNotSent(RuntimeError):
@@ -153,9 +165,10 @@ class _Terminal:
 
 
 class TerminalManager:
-    def __init__(self, state_dir=None, socket_name="sessionholic", tmux=None,
+    def __init__(self, state_dir=None, socket_name=None, tmux=None,
                  max_terminals=MAX_TERMINALS, buffer_limit=BUFFER_LIMIT):
-        if not SOCKET.fullmatch(socket_name):
+        socket_name = DEFAULT_SOCKET if socket_name is None else socket_name
+        if not isinstance(socket_name, str) or not SOCKET.fullmatch(socket_name):
             raise ValueError("터미널 소켓 이름이 올바르지 않습니다.")
         self.tmux = tmux or shutil.which("tmux")
         self.socket_name = socket_name
@@ -168,6 +181,7 @@ class TerminalManager:
         self.terminals = {}
         self.reservations = set()
         self._closed = False
+        self._warned = set()
         lock_path = self.state_dir / ".lock"
         try:
             self._lock_fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
@@ -200,8 +214,12 @@ class TerminalManager:
         except (OSError, subprocess.TimeoutExpired):
             raise RuntimeError("터미널 실행기에 연결하지 못했습니다.") from None
 
+    def _foreign(self, terminal):
+        """True for a row created on another tmux socket: this board cannot see or end it."""
+        return terminal.record.get("socket", self.socket_name) != self.socket_name
+
     def _exists(self, terminal):
-        if terminal.record.get("closed", False):
+        if terminal.record.get("closed", False) or self._foreign(terminal):
             return False
         return self._run("has-session", "-t", "=" + terminal.record["name"]).returncode == 0
 
@@ -217,17 +235,26 @@ class TerminalManager:
             raise RuntimeError("터미널 상태 파일을 읽지 못했습니다.") from None
         if not isinstance(rows, list):
             raise RuntimeError("터미널 상태 파일 형식이 올바르지 않습니다.")
+        unrecorded = False
         for row in rows:
             if (not isinstance(row, dict) or not ID.fullmatch(str(row.get("id", "")))
                     or row.get("name") != "sb-" + row["id"] or not isinstance(row.get("key"), str)
                     or not isinstance(row.get("metadata"), dict)
-                    or ("closed" in row and not isinstance(row["closed"], bool))):
+                    or ("closed" in row and not isinstance(row["closed"], bool))
+                    or ("socket" in row and (not isinstance(row["socket"], str)
+                                             or not SOCKET.fullmatch(row["socket"])))):
                 raise RuntimeError("터미널 상태 파일 형식이 올바르지 않습니다.")
             try:
                 row["metadata"] = _metadata(row["metadata"])
             except ValueError:
                 raise RuntimeError("터미널 상태 파일 형식이 올바르지 않습니다.") from None
+            if "socket" not in row:
+                # Rows saved before sockets were recorded belong to this board's socket.
+                row["socket"] = self.socket_name
+                unrecorded = True
             self.terminals[row["id"]] = _Terminal(row, self.buffer_limit)
+        if unrecorded:
+            self._save()
 
     def _save(self):
         _private_json(self.state_path, [t.record for t in self.terminals.values()])
@@ -283,6 +310,8 @@ class TerminalManager:
                 raise RuntimeError("터미널 연결 관리자가 종료되었습니다.")
             for terminal in self.terminals.values():
                 if terminal.record["key"] == key:
+                    if self._foreign(terminal):
+                        raise RuntimeError(self._foreign_message(terminal))
                     terminal.alive = self._exists(terminal)
                     if not terminal.alive:
                         raise RuntimeError("이 터미널의 CLI가 종료되었습니다. 새 작업으로 시작하세요.")
@@ -293,7 +322,7 @@ class TerminalManager:
                 raise RuntimeError("열 수 있는 터미널 수를 초과했습니다.")
             terminal_id = secrets.token_hex(16)
             record = {"id": terminal_id, "name": "sb-" + terminal_id, "key": key,
-                      "metadata": dict(metadata)}
+                      "metadata": dict(metadata), "socket": self.socket_name}
             terminal = _Terminal(record, self.buffer_limit)
             launch_path = self.state_dir / (terminal_id + ".launch.json")
             launch_env = dict(env)
@@ -625,7 +654,10 @@ class TerminalManager:
             changed = []
             for terminal in self.terminals.values():
                 terminal.alive = self._exists(terminal)
-                if not terminal.alive and not terminal.record.get("closed", False):
+                if self._foreign(terminal):
+                    # Another socket's session is not visible here, not ended: no tombstone.
+                    self._warn_foreign(terminal)
+                elif not terminal.alive and not terminal.record.get("closed", False):
                     # A generated tmux session that ended is never restarted by
                     # this ID. Persist that fact before input receipts are pruned.
                     terminal.record["closed"] = True
@@ -639,6 +671,18 @@ class TerminalManager:
                         terminal.record.pop("closed", None)
                     raise
             return result
+
+    def _foreign_message(self, terminal):
+        return ("이 터미널은 다른 tmux 소켓(%s)에서 열려 이 보드(%s)에서 다룰 수 없습니다. "
+                "인스턴스의 tmux 소켓 이름을 확인해 주세요." % (terminal.record["socket"], self.socket_name))
+
+    def _warn_foreign(self, terminal):
+        if terminal.record["id"] in self._warned:
+            return
+        self._warned.add(terminal.record["id"])
+        sys.stderr.write("%s: 터미널 %s의 기록 tmux 소켓(%s)이 현재 소켓(%s)과 달라 종료로 기록하지 않았습니다.\n"
+                         % (LOG_PREFIX or "terminal", terminal.record["id"][:8], terminal.record["socket"],
+                            self.socket_name))
 
     def detach(self, terminal_id):
         """Stop only this gateway's tmux client; never send keys or kill-session."""
@@ -661,6 +705,8 @@ class TerminalManager:
             terminal = self._get(terminal_id)
             with terminal.io_lock:
                 if not terminal.record.get("closed", False):
+                    if self._foreign(terminal):
+                        raise RuntimeError(self._foreign_message(terminal))
                     if self._exists(terminal):
                         done = self._run("kill-session", "-t", "=" + terminal.record["name"])
                         if done.returncode != 0 and self._exists(terminal):

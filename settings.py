@@ -1,43 +1,31 @@
 """Explicit non-secret host-local settings; no legacy configuration imports."""
 import json
-import os
 from pathlib import Path
 import re
-import stat
+import sys
 
+try:
+    import instance
+except ModuleNotFoundError as missing:
+    # `python3 -I collector.py` excludes the script directory; load only the sibling module.
+    if missing.name != "instance":
+        raise
+    import importlib.util
+    _spec = importlib.util.spec_from_file_location("instance", Path(__file__).resolve().with_name("instance.py"))
+    instance = importlib.util.module_from_spec(_spec)
+    sys.modules["instance"] = instance
+    try:
+        _spec.loader.exec_module(instance)
+    except BaseException:
+        del sys.modules["instance"]
+        raise
+
+# One link and owner rule for settings, state and the instance file itself.
+safe_path = instance.safe_path
 HOME_KEY = re.compile(r"(?:\.codex(?:-[A-Za-z0-9_-]{1,40})?|\.codex-router/[0-9a-f]{16})\Z")
 GROUP = re.compile(r"[A-Za-z0-9_-]{1,32}\Z")
 ENV_KEYS = {"GH_CONFIG_DIR", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM", "GIT_CONFIG_NOSYSTEM",
             "GIT_SSH_COMMAND", "GIT_SSH", "SSH_AUTH_SOCK"}
-
-
-def safe_path(path, *, directory=False, private=False, allow_missing=False, home=None):
-    """Reject user-controlled links; allow only macOS's fixed /tmp and /var aliases."""
-    path = Path(path).expanduser().absolute()
-    home = Path(home).absolute() if home is not None else Path.home().absolute()
-    aliases = {Path("/tmp"): Path("/private/tmp"), Path("/var"): Path("/private/var")}
-    try:
-        for node in reversed((path,) + tuple(path.parents)):
-            if node.is_symlink():
-                if node not in aliases or node.resolve() != aliases[node]:
-                    raise ValueError("사용자 설정과 상태 경로는 심볼릭 링크를 사용할 수 없습니다.")
-            if node != path and node.exists() and not node.is_dir():
-                raise ValueError("사용자 설정 또는 상태 경로의 상위 폴더가 올바르지 않습니다.")
-            if node.exists() and (node == path or home == node or home in node.parents):
-                if node.stat().st_uid != os.getuid():
-                    raise ValueError("사용자 설정과 상태 경로의 소유자가 올바르지 않습니다.")
-        if not path.exists():
-            if allow_missing:
-                return path
-            raise ValueError("사용자 설정 또는 상태 파일을 찾지 못했습니다.")
-        info = path.stat()
-        if not (stat.S_ISDIR(info.st_mode) if directory else stat.S_ISREG(info.st_mode)):
-            raise ValueError("사용자 설정 또는 상태 경로 형식이 올바르지 않습니다.")
-        if private and info.st_mode & 0o077:
-            raise ValueError("사용자 설정 또는 상태 파일의 비공개 권한을 확인해 주세요.")
-    except OSError:
-        raise ValueError("사용자 설정 또는 상태 경로를 안전하게 확인하지 못했습니다.") from None
-    return path
 
 
 def _error():
@@ -57,9 +45,14 @@ def _path(value, home):
     return str(path.resolve())
 
 
+def config_path(home=None):
+    """This host's settings file: the instance's `paths.hostConfig` under its home folder."""
+    return instance.path("hostConfig", Path(home) if home is not None else Path.home())
+
+
 def load(home=None, path=None):
     home = Path(home) if home is not None else Path.home()
-    path = safe_path(Path(path) if path is not None else home / ".config/sessionholic/config.json",
+    path = safe_path(Path(path) if path is not None else config_path(home),
                      allow_missing=True, home=home)
     if not path.exists() and not path.is_symlink():
         return {"version": 1, "profiles": [], "projects": [], "environments": {"default": {"label": "기본 환경", "variables": {}}}}

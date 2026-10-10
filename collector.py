@@ -34,7 +34,9 @@ except ModuleNotFoundError:
     spec = importlib.util.spec_from_file_location("settings", Path(__file__).resolve().with_name("settings.py"))
     settings = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(settings)
+import instance  # noqa: E402  (registered by settings, also under -I or the remote stdin program)
 
+NAMES = instance.current()
 HOME = Path.home()
 ROUTER = HOME / ".codex-router"
 SOCKET_REL = Path("app-server-control/app-server-control.sock")
@@ -455,7 +457,7 @@ class AppServer:
             head, self.buf = self.buf.split(b"\r\n\r\n", 1)
             if b" 101 " not in head.split(b"\r\n", 1)[0] + b" ":
                 raise RpcError("WebSocket 연결이 거부됐습니다.")
-            params = {"clientInfo": {"name": "sessionholic", "version": "1"}}
+            params = {"clientInfo": {"name": NAMES["brand"]["codexClientName"], "version": "1"}}
             if capabilities:
                 params["capabilities"] = capabilities
             self.call("initialize", params)
@@ -822,6 +824,8 @@ WATCH_HEARTBEAT = 10.0
 WATCH_PING_TIMEOUT = 30.0    # no stdin line for this long: the board is gone
 WATCH_LOCK_WAIT = 35.0       # longer than an orphan's ping timeout
 WATCH_LOCK_ROOT = Path("/tmp")
+# /tmp/<name>-watch-<uid>: the same short per-user name as the board's SSH socket folder.
+WATCH_LOCK_NAME = NAMES["names"]["sshFallback"] + "-watch-%d"
 BOARD_ID = re.compile(r"^[0-9a-f]{8,32}$")
 # Row fields that change while an agent works; such changes alone wait for WATCH_MINOR_GAP.
 MINOR_KEYS = ("updatedAt", "snippet", "activity")
@@ -911,7 +915,7 @@ class CodexHome:
         self.full_requested = False
         self.dirty_at = None
         self.notices = 0
-        self.thread = threading.Thread(target=self.run, daemon=True, name="sessionholic-watch-codex")
+        self.thread = threading.Thread(target=self.run, daemon=True, name=NAMES["brand"]["threadPrefix"] + "-watch-codex")
 
     def notice(self, method):
         # Called only from this home's own thread, the only reader of its socket.
@@ -1005,7 +1009,7 @@ class Watch:
         self.seq = 0
         self.last_output = clock()
         self.hostname = socket.gethostname()
-        self.local = threading.Thread(target=self.watch_local, daemon=True, name="sessionholic-watch-local")
+        self.local = threading.Thread(target=self.watch_local, daemon=True, name=NAMES["brand"]["threadPrefix"] + "-watch-local")
 
     # ---------- input and output ----------
     def emit(self, message):
@@ -1158,7 +1162,7 @@ class Watch:
     def acquire_lock(self):
         """(descriptor, None) with this board's watch lock held, or (None, reason)."""
         import fcntl
-        folder = WATCH_LOCK_ROOT / ("sessionholic-watch-%d" % os.getuid())
+        folder = WATCH_LOCK_ROOT / (WATCH_LOCK_NAME % os.getuid())
         try:
             folder.mkdir(mode=0o700, exist_ok=True)
             info = os.lstat(folder)
@@ -1187,7 +1191,7 @@ class Watch:
             self.wake.clear()
 
     def run(self):
-        threading.Thread(target=self.read_input, daemon=True, name="sessionholic-watch-input").start()
+        threading.Thread(target=self.read_input, daemon=True, name=NAMES["brand"]["threadPrefix"] + "-watch-input").start()
         descriptor = None
         try:
             self.emit({"type": "hello", "proto": WATCH_PROTO, "pid": os.getpid(),

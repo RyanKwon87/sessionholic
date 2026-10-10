@@ -2,14 +2,24 @@
 
 // Runs before the first paint (loaded in <head> without defer; the CSP blocks
 // inline scripts). It applies only the stored look of the board, the same
-// "sessionholic:ui:*" preferences app.js keeps, so a forced light or dark
-// board and a chosen text size never flash the device defaults first.
+// "<prefix>ui:*" preferences app.js keeps, so a forced light or dark
+// board and a chosen text size never flash the device defaults first. The
+// prefix comes from the server's <meta name="sessionholic-instance"> above it.
 (function () {
   var root = document.documentElement;
   if (!root) return;
+  var prefix = "sessionholic:";
+  try {
+    var meta = document.querySelector ? document.querySelector('meta[name="sessionholic-instance"]') : null;
+    var names = meta ? JSON.parse(meta.getAttribute("content") || "{}") : null;
+    if (names && typeof names.storagePrefix === "string" && /^[A-Za-z0-9_.:-]{1,32}$/.test(names.storagePrefix))
+      prefix = names.storagePrefix;
+  } catch (error) {
+    // a broken name list keeps the public prefix
+  }
   function read(key) {
     try {
-      return JSON.parse(window.localStorage.getItem("sessionholic:ui:" + key));
+      return JSON.parse(window.localStorage.getItem(prefix + "ui:" + key));
     } catch (error) {
       return null; // storage blocked or a malformed value: use the defaults
     }

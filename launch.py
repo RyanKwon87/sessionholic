@@ -15,6 +15,7 @@ import stat
 import subprocess
 import uuid
 
+import instance
 import settings
 
 
@@ -138,14 +139,14 @@ def source_environment(source, home=None):
         raise ValueError("원본 작업 경로가 올바르지 않습니다.")
     resolved_cwd = cwd.resolve()
     home = _home(home)
-    workspaces = (home / ".local/share/sessionholic/workspaces").resolve()
+    workspaces = instance.remote_path("workspacesDir", home).resolve()
     try:
         parts = resolved_cwd.relative_to(workspaces).parts
     except ValueError:
         return settings.source_environment({**source, "cwd": str(resolved_cwd)}, home)
     if len(parts) < 2 or not re.fullmatch(r"[a-f0-9]{32}", parts[0]):
         return settings.source_environment({**source, "cwd": str(resolved_cwd)}, home)
-    path = home / ".local/state/sessionholic-transfers" / parts[0] / "transfer.json"
+    path = instance.remote_path("transfersDir", home) / parts[0] / "transfer.json"
     try:
         path = settings.safe_path(path, private=True, home=home)
         parent = path.parent.stat()
@@ -217,7 +218,8 @@ def _handoff_text(source, target, messages, git, transfer=None):
                   "원본 응답을 멈춘 뒤 작업 파일의 사본과 최근 대화를 이 기기로 전달했습니다. "
                   "원본 클라이언트와 대화 기록은 보존하며, 이 실행은 새 native 세션입니다. "
                   "transfer 기록의 원본·목적 작업 경로와 Git 상태를 확인하세요. "
-                  "첨부 파일은 attachmentsPathMap의 from→to를 적용하고, .sessionholic-attachments 상대 경로는 목적 작업 폴더에서 읽으세요.\n\n") + header
+                  "첨부 파일은 attachmentsPathMap의 from→to를 적용하고, " + instance.current()["remote"]["attachmentsDir"]
+                  + " 상대 경로는 목적 작업 폴더에서 읽으세요.\n\n") + header
     rows = messages if isinstance(messages, list) else []
     record["omittedMessages"] = max(0, len(rows) - MAX_MESSAGES)
     record["truncated"] = len(rows) > MAX_MESSAGES

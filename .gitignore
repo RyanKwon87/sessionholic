@@ -11,6 +11,7 @@ venv/
 .env.*
 !.env.example
 /config.json
+/instance.json
 /hosts.json
 /state/
 /runtime/

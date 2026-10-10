@@ -47,6 +47,7 @@ function client(
     json: async () => ({ ok: true }),
   }),
   timers = { setTimeout, clearTimeout },
+  { instanceMeta } = {},
 ) {
   const nodes = new Map();
   const frames = [];
@@ -76,6 +77,11 @@ function client(
       return nodes.get(id);
     },
   };
+  // The server fills <meta name="sessionholic-instance">; app.js reads it once at load.
+  if (instanceMeta !== undefined) {
+    document.querySelector = (selector) => (selector === 'meta[name="sessionholic-instance"]'
+      ? { getAttribute: (name) => (name === 'content' ? instanceMeta : null) } : null);
+  }
   const context = vm.createContext({
     console,
     document,
@@ -5512,4 +5518,88 @@ test('a long press on a tool group line (a button) opens the group menu and its 
   const before = timers.length;
   list.events.pointerdown({ pointerId: 2, pointerType: 'touch', clientX: 50, clientY: 50, target: onCopy });
   assert.equal(timers.slice(before).some((timer) => timer.delay === c.GESTURE.longPressMs), false);
+});
+
+test('the installation meta names preferences, titles, history and attachment folders', () => {
+  const names = JSON.stringify({ title: '데모 보드', shortName: '데모', storagePrefix: 'db:', historyKey: 'demoBoard',
+    attachmentsDir: '.demo-board-attachments' });
+  const reads = []; const removed = []; const writes = [];
+  const c = client(undefined, noChatTimers, { instanceMeta: names });
+  c.context.navigator = { onLine: false };
+  c.context.localStorage = {
+    getItem: (key) => { reads.push(key); return null; },
+    removeItem: (key) => removed.push(key),
+    setItem: (key, value) => writes.push([key, value]),
+  };
+  vm.runInContext('prefs.get("fontSize", 14)', c.context);
+  c.windowEvents.DOMContentLoaded();
+  c.get('terminal-accessibility').events.change({ target: { checked: true } });
+  assert.deepEqual(reads, ['db:ui:fontSize']);
+  assert.deepEqual(removed, ['db:selected', 'db:filters', 'db:showOld'], 'legacy cleanup follows the prefix');
+  assert.deepEqual(writes, [['db:ui:screenReaderMode', 'true']]);
+  c.renderAttention([{ phase: 'needs_input' }, { phase: 'working' }]);
+  assert.equal(c.context.document.title, '(1) 답 필요 · 데모');
+  c.renderAttention([]);
+  assert.equal(c.context.document.title, '데모 보드');
+  c.navigateView('detail');
+  assert.deepEqual(Object.keys(c.context.window.history.state).sort(), ['demoBoard', 'view']);
+  c.backToList();
+  assert.equal(c.context.window.history.backCount, 1);
+  c.context.window.history.state = { sessionholic: true, view: 'detail' };
+  c.windowEvents.popstate({ state: { sessionholic: true, view: 'detail' } });
+  c.backToList();
+  assert.equal(c.context.window.history.backCount, 1, "another installation's history entry is not ours");
+  const own = c.userMessageParts({ text: '첨부 파일: /w/p/.demo-board-attachments/0a/화면.png', attachments: [] });
+  assert.deepEqual(own.attachments.map((file) => [file.name, file.source]), [['화면.png', 'sessionholic']]);
+  const other = c.userMessageParts({ text: '첨부 파일: /w/p/.sessionholic-attachments/0a/화면.png', attachments: [] });
+  assert.deepEqual(other.attachments, [], 'another folder name stays text');
+});
+
+test('a missing, broken or invalid installation meta keeps the public names', () => {
+  const cases = [undefined, '{not json', '[]', 'null',
+    JSON.stringify({ storagePrefix: 'has space', historyKey: '1bad', title: '', attachmentsDir: '../x', shortName: 7 })];
+  for (const instanceMeta of cases) {
+    const writes = [];
+    const c = client(undefined, noChatTimers, { instanceMeta });
+    c.context.localStorage = { getItem: () => null, setItem: (key, value) => writes.push([key, value]) };
+    vm.runInContext('prefs.set("fontSize", 15)', c.context);
+    assert.deepEqual(writes.at(-1), ['sessionholic:ui:fontSize', '15'], String(instanceMeta));
+    c.renderAttention([{ phase: 'needs_input' }]);
+    assert.equal(c.context.document.title, '(1) 답 필요 · 세션홀릭');
+    c.renderAttention([]);
+    assert.equal(c.context.document.title, '세션홀릭 - 에이전트 세션 매니저');
+    c.navigateView('detail');
+    assert.deepEqual(Object.keys(c.context.window.history.state).sort(), ['sessionholic', 'view']);
+  }
+  // One valid key is used even when another is not.
+  const c = client(undefined, noChatTimers, { instanceMeta: JSON.stringify({ storagePrefix: 'db:', historyKey: '1bad' }) });
+  const writes = [];
+  c.context.localStorage = { getItem: () => null, setItem: (key, value) => writes.push([key, value]) };
+  vm.runInContext('prefs.set("fontSize", 15)', c.context);
+  assert.deepEqual(writes, [['db:ui:fontSize', '15']]);
+  c.navigateView('detail');
+  assert.deepEqual(Object.keys(c.context.window.history.state).sort(), ['sessionholic', 'view']);
+});
+
+test('theme-init reads the preference prefix from the installation meta above it', () => {
+  const source = fs.readFileSync(path.join(__dirname, '../web/theme-init.js'), 'utf8');
+  const run = (content, stored) => {
+    const attributes = {};
+    const document = { documentElement: { setAttribute(name, value) { attributes[name] = String(value); } },
+      querySelectorAll: () => [],
+      querySelector: (selector) => (selector === 'meta[name="sessionholic-instance"]' && content !== undefined
+        ? { getAttribute: (name) => (name === 'content' ? content : null) } : null) };
+    const localStorage = { getItem: (key) => stored[key] ?? null };
+    vm.runInNewContext(source, { window: { localStorage }, document, JSON });
+    return attributes;
+  };
+  const stored = { 'db:ui:theme': '"dark"', 'db:ui:textSize': '"large"', 'sessionholic:ui:theme': '"light"' };
+  assert.deepEqual(run(JSON.stringify({ storagePrefix: 'db:' }), stored), { 'data-theme': 'dark', 'data-text-size': 'large' });
+  for (const content of [undefined, '{broken', JSON.stringify({ storagePrefix: 'bad prefix' }), '{}']) {
+    assert.deepEqual(run(content, stored), { 'data-theme': 'light' }, String(content));
+  }
+  const html = indexPage();
+  assert.ok(html.indexOf('name="sessionholic-instance"') > 0);
+  assert.ok(html.indexOf('name="sessionholic-instance"') < html.indexOf('<script src="/theme-init.js"></script>'),
+    'the meta is parsed before theme-init runs');
 });

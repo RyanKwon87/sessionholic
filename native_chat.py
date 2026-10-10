@@ -18,6 +18,7 @@ import uuid
 
 import attachments
 import collector
+import instance
 import launch
 import transfer_native as native
 
@@ -301,11 +302,16 @@ def _proven_manifest(manifest, evidence, content):
     return out
 
 
+def ledger_root(home=None):
+    """This host's chat ledger folder (instance `remote.chatLedgerDir` under its home)."""
+    return instance.remote_path("chatLedgerDir", launch._home(home))
+
+
 def _history_attachments(identity, request_id, home, content=None):
     """Atomic ledger read only; absent or unsafe history never writes or locks."""
     if not isinstance(request_id, str) or not REQUEST_ID.fullmatch(request_id):
         return []
-    root = launch._home(home) / ".sessionholic"
+    root = ledger_root(home)
     folder = root / "chat-receipts"
     try:
         for path in (root, folder):
@@ -329,7 +335,7 @@ def _history_attachments(identity, request_id, home, content=None):
 class _Ledger:
     """Deduplication and bounded attachment metadata, never message/file contents."""
     def __init__(self, identity, request_id, home):
-        root = launch._home(home) / ".sessionholic"
+        root = ledger_root(home)
         _private_dir(root)
         folder = root / "chat-receipts"
         _private_dir(folder)

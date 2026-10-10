@@ -30,15 +30,23 @@ import threading
 import time
 import traceback
 from urllib.parse import parse_qs, urlparse, unquote
+import instance
 import settings
 
 HERE = Path(__file__).resolve().parent
 WEB = HERE / "web"
 COLLECTOR = HERE / "collector.py"
-DEFAULT_HOSTS = Path.home() / ".config/sessionholic/hosts.json"
-STATE_DIR = Path.home() / ".local/state/sessionholic"
-TOKEN_FILE = Path.home() / ".config/sessionholic/token"
-COOKIE = "sessionholic_token"
+# Installation names (instance.json); without one these are the public names.
+NAMES = instance.current()
+BRAND = NAMES["brand"]
+CONFIG_DIR = instance.path("configDir")
+DEFAULT_HOSTS = instance.path("defaultHosts")
+STATE_DIR = instance.path("stateDir")
+TOKEN_FILE = instance.path("tokenFile")
+COOKIE = NAMES["names"]["cookie"]
+SSH_FALLBACK_NAME = NAMES["names"]["sshFallback"]
+LOG_PREFIX = BRAND["logPrefix"]
+THREAD_PREFIX = BRAND["threadPrefix"]
 ONCE_TTL = 120
 INTERNAL_ERROR = "서버 내부 오류가 발생했습니다. 다시 시도해 주세요."
 NAME = re.compile(r"^[A-Za-z0-9_.-]{1,40}$")
@@ -60,6 +68,33 @@ IMMUTABLE = "public, max-age=31536000, immutable"
 # Always revalidated: the page names every other asset's version, and the worker URL is fixed.
 REVALIDATED = ("index.html", "sw.js")
 ASSET_META = re.compile(r'(<meta\b[^>]*?\bname="sessionholic-assets"[^>]*?\bcontent=")([^"]*)(")')
+# The installation's browser names for app.js and theme-init.js (storage prefix, history key, titles).
+INSTANCE_META = re.compile(r'(<meta\b[^>]*?\bname="sessionholic-instance"[^>]*?\bcontent=")([^"]*)(")')
+# Page text named by the instance: (brand key, element pattern with the text in group 2, attribute?).
+# A value equal to the public default leaves the page as is; a changed value whose element is
+# missing stops rendering rather than serving public names.
+_WORDMARK = '<div class="wordmark"><span class="brand-icon" aria-hidden="true">↗</span> '
+PAGE_TEXT = (
+    ("shortName", re.compile(r'(<meta name="apple-mobile-web-app-title" content=")([^"]*)(")'), True),
+    ("title", re.compile(r"(<title>)([^<]*)(</title>)"), False),
+    ("shortName", re.compile("(" + re.escape(_WORDMARK) + ")([^<]*)(</div>)"), False),
+    ("loginHeadline", re.compile("(" + re.escape(_WORDMARK) + r"[^<]*</div>\s*<h1>)([^<]*)(</h1>)"), False),
+    ("loginLead", re.compile("(" + re.escape(_WORDMARK) + r"[^<]*</div>\s*<h1>[^<]*</h1>\s*<p>)([^<]*)(</p>)"), False),
+    ("shortName", re.compile(r'(<span class="home-label">)([^<]*)(</span>)'), False),
+)
+TOKEN_HELP = re.compile(r"(<summary>접속 토큰 찾기</summary>\s*<p>)(.*?)(</p>)", re.S)
+# Public product metadata, served only while brand.publicMeta is true.
+PUBLIC_META = (re.compile(r'\n[ \t]*<meta name="application-name" content="[^"]*" />'),
+               re.compile(r'\n[ \t]*<meta name="description" content="[^"]*" />'))
+MANIFEST_TEXT = (("id", "web", "manifestId"), ("name", "brand", "manifestName"),
+                 ("short_name", "brand", "shortName"), ("description", "brand", "description"))
+# The service worker's cache is `<cachePrefix>shell-<sha8 of the asset sources>`, so any
+# asset change installs a new worker that drops the older caches with the same prefix.
+SW_CACHE = re.compile(r'^(const CACHE = )("[^"\n]*")(;)$', re.M)
+SW_PREFIX = re.compile(r'(\.filter\(\(key\) => key\.startsWith\()("[^"\n]*")(\) && key !== CACHE\))')
+SW_HEADER = re.compile(r"^(// )(Sessionholic)( caches only public static assets\.)", re.M)
+SW_PRIVATE_SUBJECT = "A private PWA"
+RENDERED = ("manifest.webmanifest", "sw.js")
 ASSET_REF = re.compile(r'\b(src|href)="(/[^"?#]*)"')
 # A stalled event-stream reader is dropped after this many seconds of a blocked write.
 STREAM_WRITE_TIMEOUT = 30
@@ -122,7 +157,7 @@ def _control_prefix(directory):
 
 
 def ssh_control_dir(state_dir):
-    """`<state_dir>/ssh`, or a private `/tmp/sessionholic-<uid>` when that is too long.
+    """`<state_dir>/ssh`, or a private `/tmp/<instance name>-<uid>` when that is too long.
 
     ssh expands %C to a 40 character hash and first binds a master socket at
     `<path>.<16 random characters>`, so that longest form must fit the macOS
@@ -135,7 +170,7 @@ def ssh_control_dir(state_dir):
     preferred = Path(state_dir).expanduser().absolute() / "ssh"
     if _control_prefix(preferred):
         return preferred
-    fallback = SSH_FALLBACK_ROOT / ("sessionholic-%d" % os.getuid())
+    fallback = SSH_FALLBACK_ROOT / ("%s-%d" % (SSH_FALLBACK_NAME, os.getuid()))
     return fallback if _control_prefix(fallback) else None
 
 
@@ -191,12 +226,21 @@ def collector_command(host, args, state_dir=None):
     return ssh_command(host, remote, state_dir)
 
 
-def remote_program():
-    """The collector as one self-contained program for a remote Python's stdin, with
-    settings imported from this reviewed bundle rather than a remote Python path."""
+def remote_prelude():
+    """Modules for a remote Python's stdin, from this reviewed bundle rather than a remote
+    Python path: `instance` carrying the board's names (the remote host never reads its own
+    instance file), then `settings`. Sources are ASCII literals: Python 3.9 rejects a UTF-8
+    character split across its 8KiB read of a long stdin line."""
+    names = (HERE / "instance.py").read_text(encoding="utf-8")
     module = (HERE / "settings.py").read_text(encoding="utf-8")
-    prefix = "import types,sys\nm=types.ModuleType('settings')\nexec(" + repr(module) + ",m.__dict__)\nsys.modules['settings']=m\n"
-    return (b"from __future__ import annotations\n" + prefix.encode()
+    return ("import types,sys\nm=types.ModuleType('instance')\nm.INJECTED=" + ascii(instance.remote_blob())
+            + "\nexec(" + ascii(names) + ",m.__dict__)\nsys.modules['instance']=m\n"
+            "m=types.ModuleType('settings')\nexec(" + ascii(module) + ",m.__dict__)\nsys.modules['settings']=m\n")
+
+
+def remote_program():
+    """The collector as one self-contained program for a remote Python's stdin."""
+    return (b"from __future__ import annotations\n" + remote_prelude().encode()
             + COLLECTOR.read_bytes().replace(b"from __future__ import annotations\n", b"", 1))
 
 
@@ -259,7 +303,7 @@ def scrub_payload(value):
 def log_failure(context, exc):
     """Record where an unexpected error happened without echoing payload text."""
     frames = "".join(traceback.format_tb(exc.__traceback__))
-    sys.stderr.write(f"세션홀릭: {context} 중 예상하지 못한 오류 ({type(exc).__name__})\n{frames}")
+    sys.stderr.write(f"{LOG_PREFIX}: {context} 중 예상하지 못한 오류 ({type(exc).__name__})\n{frames}")
 
 
 def accepts_gzip(header):
@@ -290,16 +334,106 @@ def etag_matches(header, etag):
     return False
 
 
+def _fill(text, pattern, value, what):
+    """Replace group 2 of the one match of `pattern`; anything else is an error."""
+    found = list(pattern.finditer(text))
+    if len(found) != 1:
+        raise ValueError("화면 파일에서 %s 위치를 찾지 못했습니다. 설치 파일을 확인해 주세요." % what)
+    return text[:found[0].start(2)] + value + text[found[0].end(2):]
+
+
+def _help_html(text, current):
+    """Escaped help lines in place of `current`; `code` spans become <code>, and a
+    multi-line paragraph keeps its source indentation."""
+    def line(value):
+        return "".join(html.escape(part, quote=False) if index % 2 == 0
+                       else "<code>%s</code>" % html.escape(part, quote=False)
+                       for index, part in enumerate(value.split("`")))
+    lines = [line(value) for value in text.split("\n")]
+    if "\n" not in current:
+        return " ".join(lines)
+    indent = re.match(r"[ \t]*", current.split("\n", 1)[1]).group(0)
+    return "\n" + "".join(indent + value + "\n" for value in lines) + current[current.rfind("\n") + 1:]
+
+
+def page_names(names=None):
+    """What app.js and theme-init.js read from the page's instance meta."""
+    names = names if names is not None else NAMES
+    return {"title": names["brand"]["title"], "shortName": names["brand"]["shortName"],
+            "storagePrefix": names["web"]["storagePrefix"], "historyKey": names["web"]["historyKey"],
+            "attachmentsDir": names["remote"]["attachmentsDir"]}
+
+
+def render_page(text, names=None):
+    """index.html with this installation's names (before asset versions are filled in)."""
+    names = names if names is not None else NAMES
+    brand, public = names["brand"], instance.defaults()["brand"]
+    for key, pattern, attribute in PAGE_TEXT:
+        if brand[key] != public[key]:
+            text = _fill(text, pattern, html.escape(brand[key], quote=attribute), key)
+    if brand["loginTokenHelp"] != public["loginTokenHelp"]:
+        found = list(TOKEN_HELP.finditer(text))
+        current = found[0].group(2) if len(found) == 1 else ""
+        text = _fill(text, TOKEN_HELP, _help_html(brand["loginTokenHelp"], current), "loginTokenHelp")
+    if not brand["publicMeta"]:
+        for pattern in PUBLIC_META:
+            text, count = pattern.subn("", text)
+            if count != 1:
+                raise ValueError("화면 파일에서 공개 메타데이터 위치를 찾지 못했습니다. 설치 파일을 확인해 주세요.")
+    filled = html.escape(json.dumps(page_names(names), ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+                         quote=True)
+    if INSTANCE_META.search(text):
+        text = _fill(text, INSTANCE_META, filled, "sessionholic-instance")
+    elif page_names(names) != page_names(instance.defaults()):
+        raise ValueError("화면 파일에 인스턴스 이름 메타가 없습니다. 설치 파일을 확인해 주세요.")
+    return text
+
+
+def render_manifest(text, names=None):
+    """manifest.webmanifest with this installation's id, names and description."""
+    names = names if names is not None else NAMES
+    public = instance.defaults()
+    for field, section, key in MANIFEST_TEXT:
+        if names[section][key] != public[section][key]:
+            pattern = re.compile(r'^([ \t]*"%s":[ \t]*)("(?:[^"\\\n]|\\.)*")' % field, re.M)
+            text = _fill(text, pattern, json.dumps(names[section][key], ensure_ascii=False), "manifest " + field)
+    return text
+
+
+def shell_cache_name(sources, names=None):
+    """`<cachePrefix>shell-<sha8>` over the asset sources (path -> sha8 of the file)."""
+    names = names if names is not None else NAMES
+    digest = hashlib.sha256(json.dumps(sources, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    return names["web"]["cachePrefix"] + "shell-" + digest[:8]
+
+
+def render_service_worker(text, cache, names=None):
+    """sw.js with its cache name and the prefix of the older caches it removes."""
+    names = names if names is not None else NAMES
+    public = instance.defaults()
+    if SW_CACHE.search(text):
+        text = _fill(text, SW_CACHE, json.dumps(cache), "CACHE")
+    elif names["web"]["cachePrefix"] != public["web"]["cachePrefix"]:
+        raise ValueError("화면 파일에서 CACHE 위치를 찾지 못했습니다. 설치 파일을 확인해 주세요.")
+    if names["web"]["cachePrefix"] != public["web"]["cachePrefix"]:
+        text = _fill(text, SW_PREFIX, json.dumps(names["web"]["cachePrefix"]), "cachePrefix")
+    if not names["brand"]["publicMeta"]:
+        text = _fill(text, SW_HEADER, SW_PRIVATE_SUBJECT, "service worker header")
+    return text
+
+
 class StaticAssets:
     """Public web files with their hashes and gzip bodies, cached by (name, mtime_ns, size).
 
-    Only public assets are cached. index.html is rendered with the current asset
-    versions, so its hash is taken over the rendered page.
+    Only public assets are cached. index.html, manifest.webmanifest and sw.js are rendered
+    with this installation's names (and the page with the current asset versions), so their
+    hashes are taken over the rendered bytes.
     """
-    def __init__(self, root=WEB):
+    def __init__(self, root=WEB, names=None):
         self.root = Path(root)
+        self.names = names if names is not None else NAMES
         self.lock = threading.Lock()
-        self.files, self.page = {}, None
+        self.files, self.rendered, self.page = {}, {}, None
 
     @staticmethod
     def build(name, body):
@@ -311,7 +445,8 @@ class StaticAssets:
                 packed = None
         return {"body": body, "gzip": packed, "sha8": digest[:8], "etag": digest[:16]}
 
-    def file(self, name):
+    def source(self, name):
+        """One file exactly as installed."""
         if not STATIC.fullmatch(name):
             return None
         path = self.root / name
@@ -335,23 +470,54 @@ class StaticAssets:
             self.files[name] = (key, entry)
         return entry
 
-    def manifest(self):
-        """{"/app.js": "<sha8>", ...} for every servable file under web/."""
+    def file(self, name):
+        """One file as served: the manifest and the service worker carry this installation's names."""
+        entry = self.source(name)
+        if entry is None or name not in RENDERED:
+            return entry
+        cache = shell_cache_name(self.sources(), self.names) if name == "sw.js" else None
+        key = (entry["etag"], cache)
+        with self.lock:
+            cached = self.rendered.get(name)
+        if cached and cached[0] == key:
+            return cached[1]
+        text = entry["body"].decode("utf-8")
+        body = (render_service_worker(text, cache, self.names) if name == "sw.js"
+                else render_manifest(text, self.names))
+        rendered = self.build(name, body.encode("utf-8"))
+        with self.lock:
+            self.rendered[name] = (key, rendered)
+        return rendered
+
+    def names_served(self):
         names = []
         for folder, prefix in ((self.root, ""), (self.root / "vendor", "vendor/")):
             try:
                 names.extend(prefix + item for item in sorted(os.listdir(folder)) if STATIC.fullmatch(prefix + item))
             except OSError:
                 continue
+        return names
+
+    def sources(self):
+        """{"/app.js": "<sha8>", ...} of the installed files, before any rendering."""
         result = {}
-        for name in names:
+        for name in self.names_served():
+            entry = self.source(name)
+            if entry is not None:
+                result["/" + name] = entry["sha8"]
+        return result
+
+    def manifest(self):
+        """{"/app.js": "<sha8>", ...} for every servable file under web/, as served."""
+        result = {}
+        for name in self.names_served():
             entry = self.file(name)
             if entry is not None:
                 result["/" + name] = entry["sha8"]
         return result
 
     def index(self):
-        template = self.file("index.html")
+        template = self.source("index.html")
         if template is None:
             return None
         manifest = self.manifest()
@@ -359,7 +525,7 @@ class StaticAssets:
         with self.lock:
             if self.page is not None and self.page[0] == key:
                 return self.page[1]
-        text = template["body"].decode("utf-8")
+        text = render_page(template["body"].decode("utf-8"), self.names)
         filled = html.escape(json.dumps(manifest, sort_keys=True, separators=(",", ":")), quote=True)
         text = ASSET_META.sub(lambda match: match.group(1) + filled + match.group(3), text, count=1)
 
@@ -372,6 +538,14 @@ class StaticAssets:
         with self.lock:
             self.page = (key, entry)
         return entry
+
+    def check(self):
+        """Render the page, manifest and worker once; a missing or unfillable file is an error."""
+        for name in RENDERED:
+            if self.file(name) is None:
+                raise ValueError("화면 파일 %s을 찾지 못했습니다. 설치 파일을 확인해 주세요." % name)
+        if self.index() is None:
+            raise ValueError("화면 파일 index.html을 찾지 못했습니다. 설치 파일을 확인해 주세요.")
 
 
 class HostStream:
@@ -390,7 +564,7 @@ class HostStream:
         self.next_ping = self.began + board.live_ping
         self.delivered = False
         self.stopping = False
-        self.thread = threading.Thread(target=self.run, daemon=True, name="sessionholic-live-" + self.name)
+        self.thread = threading.Thread(target=self.run, daemon=True, name=THREAD_PREFIX + "-live-" + self.name)
 
     def send(self, line, wait=False):
         """Write one control line; a busy or closed pipe skips it."""
@@ -654,7 +828,7 @@ class Board:
             try:
                 private_json(self.state_dir / filename, build())
             except Exception as exc:
-                sys.stderr.write(f"세션홀릭: 상태 파일 {filename} 저장 실패 ({type(exc).__name__})\n")
+                sys.stderr.write(f"{LOG_PREFIX}: 상태 파일 {filename} 저장 실패 ({type(exc).__name__})\n")
 
     def request_refresh(self, host_name=None, force=False):
         if host_name is not None and not isinstance(host_name, str):
@@ -692,7 +866,7 @@ class Board:
         for host in queued:
             try:
                 threading.Thread(target=self.poll, args=(host, full), daemon=True,
-                                 name="sessionholic-collect-" + host["name"]).start()
+                                 name=THREAD_PREFIX + "-collect-" + host["name"]).start()
             except RuntimeError:
                 with self.lock:
                     self.state[host["name"]].update(refreshing=False, error="수집을 시작하지 못했습니다.")
@@ -740,7 +914,7 @@ class Board:
                 return
             if self.live_manager is None:
                 start = self.live_manager = threading.Thread(target=self.manage_live, daemon=True,
-                                                             name="sessionholic-live")
+                                                             name=THREAD_PREFIX + "-live")
         if start is not None:
             try:
                 start.start()
@@ -1260,7 +1434,7 @@ def host_allowed(value):
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "Sessionholic/1"
+    server_version = BRAND["serverVersion"]
     responded = False
 
     # ---------- plumbing ----------
@@ -1754,7 +1928,7 @@ def issue_login_link(httpd, ttl=ONCE_TTL):
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description="세션홀릭 - 에이전트 세션 매니저")
+    parser = argparse.ArgumentParser(description=BRAND["title"])
     parser.add_argument("--port", type=int, default=8790)
     parser.add_argument("--bind", default="127.0.0.1")
     parser.add_argument("--hosts", default=str(DEFAULT_HOSTS))
@@ -1773,13 +1947,16 @@ def main(argv=None):
         parser.error("127.0.0.1만 허용합니다. 원격 접속은 Tailscale Serve를 사용하세요.")
     try:
         settings.load()
-        settings.safe_path(TOKEN_FILE.parent, directory=True, private=True, allow_missing=True)
+        for folder in dict.fromkeys((CONFIG_DIR, TOKEN_FILE.parent)):
+            settings.safe_path(folder, directory=True, private=True, allow_missing=True)
         args.state_dir = settings.safe_path(args.state_dir, directory=True, private=True, allow_missing=True)
         for filename in ("snapshot.json", "conversations.json"):
             settings.safe_path(args.state_dir / filename, private=True, allow_missing=True)
         tailscale_user = load_tailscale_user(args.tailscale_user_file) if args.tailscale_user_file else None
         hosts = load_hosts(args.hosts)
         token = load_token()
+        # The page, manifest and worker carry this installation's names: fail before serving.
+        StaticAssets(WEB).check()
     except ValueError as exc:
         parser.error(str(exc))
     if args.local_only:
@@ -1787,7 +1964,7 @@ def main(argv=None):
     board = Board(hosts, max(args.interval, 60), state_dir=args.state_dir, live=not args.no_live)
     httpd = make_server(args.bind, args.port, board, token, state_dir=args.state_dir,
                         max_terminals=args.max_terminals, tailscale_user=tailscale_user)
-    print(f"세션홀릭: http://127.0.0.1:{args.port}/ · 화면을 열 때만 수집합니다.", file=sys.stderr)
+    print(f"{LOG_PREFIX}: http://127.0.0.1:{args.port}/ · 화면을 열 때만 수집합니다.", file=sys.stderr)
     if args.open:
         print(issue_login_link(httpd), flush=True)
         print(f"표준 출력의 일회용 로그인 링크를 {ONCE_TTL // 60}분 안에 개인 브라우저에서 여세요. 한 번만 사용할 수 있습니다.",

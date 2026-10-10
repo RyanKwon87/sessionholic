@@ -15,7 +15,10 @@ import re
 import stat
 import uuid
 
-DIRECTORY = '.sessionholic-attachments'
+import instance
+
+# The board's attachment folder name inside each work folder (instance `remote.attachmentsDir`).
+DIRECTORY = instance.current()['remote']['attachmentsDir']
 _EXCLUDE_LINE = DIRECTORY + '/'
 MAX_FILE_BYTES = 20 * 1024 * 1024
 MAX_FILES = 20000

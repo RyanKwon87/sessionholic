@@ -1,6 +1,37 @@
 "use strict";
 
 // Session content is rendered as text. No transcript, draft, auth or terminal data is persisted here.
+// The server names this installation in <meta name="sessionholic-instance">: titles, the
+// preference prefix, the history marker and the attachment folder. A missing or broken
+// value keeps the public name.
+const INSTANCE = (() => {
+  const names = {
+    title: "세션홀릭 - 에이전트 세션 매니저",
+    shortName: "세션홀릭",
+    storagePrefix: "sessionholic:",
+    historyKey: "sessionholic",
+    attachmentsDir: ".sessionholic-attachments",
+  };
+  const valid = {
+    title: (value) => value.length > 0 && value.length <= 256,
+    shortName: (value) => value.length > 0 && value.length <= 256,
+    storagePrefix: (value) => /^[A-Za-z0-9_.:-]{1,32}$/.test(value),
+    historyKey: (value) => /^[A-Za-z][A-Za-z0-9_]{0,31}$/.test(value),
+    attachmentsDir: (value) => /^[A-Za-z0-9._-]{1,64}$/.test(value) && value !== "." && value !== "..",
+  };
+  try {
+    const meta = document.querySelector?.('meta[name="sessionholic-instance"]');
+    const given = JSON.parse(meta?.getAttribute?.("content") || "{}");
+    if (given && typeof given === "object" && !Array.isArray(given)) {
+      for (const key of Object.keys(names)) {
+        if (typeof given[key] === "string" && valid[key](given[key])) names[key] = given[key];
+      }
+    }
+  } catch {
+    /* a broken name list keeps the public names */
+  }
+  return Object.freeze(names);
+})();
 const GROUPS = [
   { key: "needs_input", label: "내 답이 필요한 작업", tone: "red" },
   { key: "working", label: "진행 중", tone: "amber" },
@@ -53,14 +84,14 @@ const $ = (id) => document.getElementById(id);
 const prefs = {
   get(key, fallback) {
     try {
-      return JSON.parse(localStorage.getItem("sessionholic:ui:" + key)) ?? fallback;
+      return JSON.parse(localStorage.getItem(INSTANCE.storagePrefix + "ui:" + key)) ?? fallback;
     } catch {
       return fallback;
     }
   },
   set(key, value) {
     try {
-      localStorage.setItem("sessionholic:ui:" + key, JSON.stringify(value));
+      localStorage.setItem(INSTANCE.storagePrefix + "ui:" + key, JSON.stringify(value));
     } catch {
       /* optional preferences */
     }
@@ -802,11 +833,11 @@ async function loadUsage(force = false) {
     state.usageBusy = false;
   }
 }
-const BASE_TITLE = "세션홀릭 - 에이전트 세션 매니저";
+const BASE_TITLE = INSTANCE.title;
 function renderAttention(sessions) {
   // The tab title and app icon say when work waits for an answer while this view is elsewhere.
   const waiting = sessions.filter((s) => groupOf(s) === "needs_input").length;
-  const title = waiting ? `(${waiting}) 답 필요 · 세션홀릭` : BASE_TITLE;
+  const title = waiting ? `(${waiting}) 답 필요 · ${INSTANCE.shortName}` : BASE_TITLE;
   if (document.title !== title) document.title = title;
   try {
     if (waiting) navigator.setAppBadge?.(waiting)?.catch?.(() => {});
@@ -3324,7 +3355,7 @@ function userMessageParts(message) {
       try { path = String(JSON.parse(path)); } catch { path = path.replace(/^"|"$/g, ""); }
     }
     // Only the board's attachment store; a typed "첨부 파일: …" line stays text.
-    if (!path.includes("/.sessionholic-attachments/")) break;
+    if (!path.includes(`/${INSTANCE.attachmentsDir}/`)) break;
     names.unshift(path.slice(path.lastIndexOf("/") + 1) || "첨부파일");
     lines.pop();
   }
@@ -3627,16 +3658,16 @@ function updateReadNotice(data) {
 
 function navigateView(view, replace = false) {
   const current = window.history.state;
-  if (!replace && current?.sessionholic && current.view === view) return;
+  if (!replace && current?.[INSTANCE.historyKey] && current.view === view) return;
   window.history[replace ? "replaceState" : "pushState"](
-    { sessionholic: true, view },
+    { [INSTANCE.historyKey]: true, view },
     "",
   );
 }
 function backToList() {
   stopChatPolling();
   if (
-    window.history.state?.sessionholic &&
+    window.history.state?.[INSTANCE.historyKey] &&
     window.history.state.view === "detail"
   )
     window.history.back();
@@ -3644,7 +3675,7 @@ function backToList() {
 }
 function backFromTerminal() {
   if (
-    window.history.state?.sessionholic &&
+    window.history.state?.[INSTANCE.historyKey] &&
     window.history.state.view === "terminal"
   )
     window.history.back();
@@ -5682,7 +5713,7 @@ window.addEventListener("DOMContentLoaded", () => {
   document.addEventListener("pointerdown", closeChatToolsOutside);
   document.addEventListener("keydown", closeChatToolsEscape);
   window.addEventListener("popstate", (event) => {
-    const view = event.state?.sessionholic ? event.state.view : "list";
+    const view = event.state?.[INSTANCE.historyKey] ? event.state.view : "list";
     if (!state.authenticated) {
       navigateView("list", true);
       return;
@@ -5748,8 +5779,8 @@ window.addEventListener("DOMContentLoaded", () => {
   });
   bindCardGestures($("groups"));
   try {
-    for (const key of ["sessionholic:selected", "sessionholic:filters", "sessionholic:showOld"])
-      localStorage.removeItem(key);
+    for (const key of ["selected", "filters", "showOld"])
+      localStorage.removeItem(INSTANCE.storagePrefix + key);
   } catch {
     /* remove legacy session metadata where available */
   }

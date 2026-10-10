@@ -1,4 +1,5 @@
 import http.client
+import io
 import json
 import os
 from pathlib import Path
@@ -178,6 +179,13 @@ class HelperTest(unittest.TestCase):
         self.assertEqual(entry["error"], "SSH 연결 실패")
         self.assertEqual(entry["data"]["claude"][0]["title"], "정산")
 
+    def test_refresh_rejects_non_string_host(self):
+        board = server.Board(HOSTS, 60, runner=fake_runner([]))
+        for value in (["remote"], {"name": "remote"}, 5, ""):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                board.request_refresh(value, force=True)
+        self.assertFalse(board.state["remote"]["refreshing"])
+
     def test_host_allowed(self):
         self.assertTrue(server.host_allowed("127.0.0.1:8790"))
         self.assertTrue(server.host_allowed("localhost"))
@@ -185,6 +193,136 @@ class HelperTest(unittest.TestCase):
         self.assertTrue(server.host_allowed("remote.tailc1299f.ts.net"))
         self.assertFalse(server.host_allowed("ts.net.evil.com"))
         self.assertFalse(server.host_allowed(""))
+
+
+TWO_HOSTS = [{"name": "alpha", "label": "알파", "local": False, "ssh": "alpha", "python": "/usr/bin/python3"},
+             {"name": "beta", "label": "베타", "local": False, "ssh": "beta", "python": "/usr/bin/python3"}]
+
+
+def wait_for(predicate, timeout=5):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return
+        time.sleep(0.01)
+    raise AssertionError("background collection did not finish")
+
+
+class BoardCollectionTest(unittest.TestCase):
+    def board(self, runner, hosts=TWO_HOSTS, state_dir=None):
+        board = server.Board(hosts, 60, runner=runner, state_dir=state_dir)
+        self.now = [1_000_000.0]
+        board.clock = lambda: self.now[0]
+        return board
+
+    @staticmethod
+    def idle(board):
+        return not any(row["refreshing"] for row in board.snapshot()["hosts"])
+
+    def test_unexpected_error_clears_refreshing_and_other_hosts_continue(self):
+        secret = "fixture-private-" + "payload"
+        def runner(host, args, timeout):
+            return {"claude": [], "codex": [], "owner": host["name"]}
+        original = server.scrub_payload
+        def scrub(value):
+            if isinstance(value, dict) and value.get("owner") == "alpha":
+                raise ValueError(secret)
+            return original(value)
+        board = self.board(runner)
+        with patch("server.scrub_payload", side_effect=scrub), \
+             patch("sys.stderr", new_callable=io.StringIO) as log:
+            self.assertTrue(board.request_refresh())
+            wait_for(lambda: self.idle(board))
+        alpha, beta = board.state["alpha"], board.state["beta"]
+        self.assertEqual((alpha["ok"], alpha["paused"], alpha["refreshing"]), (False, True, False))
+        self.assertEqual(alpha["error"], "수집 결과를 처리하지 못했습니다.")
+        self.assertEqual((beta["ok"], beta["refreshing"]), (True, False))
+        self.assertIn("ValueError", log.getvalue())
+        self.assertNotIn(secret, log.getvalue())
+        # Manual refresh is not blocked by a stuck `refreshing` flag.
+        self.now[0] += 10
+        self.assertTrue(board.request_refresh("alpha", force=True))
+        wait_for(lambda: self.idle(board))
+        self.assertTrue(board.state["alpha"]["ok"])
+
+    def test_state_file_failure_is_only_a_warning(self):
+        with tempfile.TemporaryDirectory() as directory:
+            board = self.board(fake_runner([]), hosts=HOSTS, state_dir=directory)
+            with patch("server.private_json", side_effect=OSError("fixture")), \
+                 patch("sys.stderr", new_callable=io.StringIO) as log:
+                self.assertTrue(board.poll(HOSTS[0]))
+                result = board.read("remote", "claude", "a1b2c3d4-0000", None)
+            self.assertEqual(result["messages"][0]["text"], "hi")
+            entry = board.state["remote"]
+            self.assertEqual((entry["ok"], entry["refreshing"], entry["error"]), (True, False, None))
+            self.assertIn("snapshot.json", log.getvalue())
+            self.assertIn("conversations.json", log.getvalue())
+
+    def test_hosts_collect_in_parallel_but_never_twice_at_once(self):
+        release = threading.Event()
+        lock, running, peak, calls = threading.Lock(), {}, {}, []
+        def runner(host, args, timeout):
+            name = host["name"]
+            with lock:
+                calls.append(name)
+                running[name] = running.get(name, 0) + 1
+                peak[name] = max(peak.get(name, 0), running[name])
+            try:
+                if name == "alpha":
+                    release.wait(5)
+                return {"claude": [], "codex": []}
+            finally:
+                with lock:
+                    running[name] -= 1
+        board = self.board(runner)
+        self.assertTrue(board.request_refresh())
+        # beta finishes and is published while alpha is still collecting.
+        wait_for(lambda: board.state["beta"]["ok"])
+        self.assertTrue(board.state["alpha"]["refreshing"])
+        self.now[0] += 10
+        self.assertFalse(board.request_refresh("alpha", force=True))
+        direct = threading.Thread(target=board.poll, args=(TWO_HOSTS[0],))
+        direct.start()
+        time.sleep(0.1)
+        self.assertEqual(calls.count("alpha"), 1)
+        release.set()
+        direct.join(5)
+        wait_for(lambda: self.idle(board))
+        self.assertEqual(calls.count("alpha"), 2)
+        self.assertEqual(peak, {"alpha": 1, "beta": 1})
+        self.assertTrue(board.state["alpha"]["ok"])
+
+    def test_paused_host_retries_automatically_with_backoff(self):
+        outcome = {"fail": True}
+        calls = []
+        def runner(host, args, timeout):
+            calls.append(self.now[0])
+            if outcome["fail"]:
+                raise RuntimeError("SSH 연결 실패")
+            return {"claude": [], "codex": []}
+        board = self.board(runner, hosts=HOSTS)
+        self.assertFalse(board.poll(HOSTS[0]))
+        for delay in (120, 300, 900, 900):
+            failed_at = self.now[0]
+            self.now[0] = failed_at + 61
+            self.assertFalse(board.request_refresh(), "no repeated SSH right after a failure")
+            self.now[0] = failed_at + delay - 1
+            self.assertFalse(board.request_refresh())
+            self.now[0] = failed_at + delay
+            self.assertTrue(board.request_refresh())
+            wait_for(lambda: self.idle(board))
+            self.assertTrue(board.state["remote"]["paused"])
+        self.assertEqual(len(calls), 5)
+        outcome["fail"] = False
+        self.now[0] += 900
+        self.assertTrue(board.request_refresh())
+        wait_for(lambda: self.idle(board))
+        self.assertEqual((board.state["remote"]["ok"], board.state["remote"]["paused"]), (True, False))
+        self.assertEqual(board.backoff, {})
+        # A later failure starts again from the shortest delay.
+        outcome["fail"] = True
+        self.assertFalse(board.poll(HOSTS[0]))
+        self.assertEqual(board.backoff["remote"], (1, self.now[0] + 120))
 
 
 if __name__ == "__main__":

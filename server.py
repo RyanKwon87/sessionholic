@@ -25,6 +25,7 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 from urllib.parse import parse_qs, urlparse, unquote
 import settings
 
@@ -134,18 +135,34 @@ def scrub_payload(value):
     return value
 
 
-class Board:
-    """Visible-client driven collection. A failed host stays paused until explicit retry."""
+def log_failure(context, exc):
+    """Record where an unexpected error happened without echoing payload text."""
+    frames = "".join(traceback.format_tb(exc.__traceback__))
+    sys.stderr.write(f"세션홀릭: {context} 중 예상하지 못한 오류 ({type(exc).__name__})\n{frames}")
 
-    def __init__(self, hosts, interval, runner=run_collector, state_dir=None):
-        self.hosts, self.interval, self.runner = hosts, max(interval, 60), runner
+
+class Board:
+    """Visible-client driven collection.
+
+    Hosts are collected in parallel, one collection per host at a time. A failed
+    host is paused and retried automatically after an increasing backoff, or at
+    once on an explicit refresh.
+    """
+    RETRY_BACKOFF = (120, 300, 900)
+
+    def __init__(self, hosts, interval, runner=None, state_dir=None):
+        self.hosts, self.interval = hosts, max(interval, 60)
+        self.clock = time.time
         self.lock = threading.RLock()
-        self.collect_lock = threading.Lock()
+        # Lock order: a host lock, then save_lock, then self.lock; never the reverse.
+        self.host_locks = {h["name"]: threading.Lock() for h in hosts}
+        self.save_lock = threading.Lock()
         self.state = {h["name"]: {"name": h["name"], "label": h["label"], "ok": False,
                      "error": "아직 수집하지 않았어요", "data": None, "fetchedAt": None,
                      "durationMs": None, "paused": False, "refreshing": False} for h in hosts}
-        self.reads, self.attempted = {}, {}
+        self.reads, self.attempted, self.backoff = {}, {}, {}
         self.state_dir = Path(state_dir) if state_dir else None
+        self.runner = runner or run_collector
         if self.state_dir:
             self.state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
             try:
@@ -168,46 +185,75 @@ class Board:
         return None
 
     def poll(self, host):
-        started = time.time()
-        with self.collect_lock:
-            with self.lock:
-                self.state[host["name"]]["refreshing"] = True
-                self.attempted[host["name"]] = started
+        name = host["name"]
+        # Only one collection per host; other hosts are collected concurrently.
+        with self.host_locks[name]:
+            started = self.clock()
+            update = {"ok": False, "paused": True, "error": "수집 결과를 처리하지 못했습니다."}
             try:
+                with self.lock:
+                    self.state[name]["refreshing"] = True
+                    self.attempted[name] = started
                 data = scrub_payload(self.runner(host, ["snapshot"], 45))
                 update = {"ok": True, "paused": False, "error": None, "data": data,
-                          "fetchedAt": int(time.time())}
+                          "fetchedAt": int(self.clock())}
             except RuntimeError as exc:
                 update = {"ok": False, "paused": True, "error": str(exc)}
-            update.update(durationMs=int((time.time() - started) * 1000), refreshing=False)
-            with self.lock:
-                self.state[host["name"]].update(update)
-                if self.state_dir:
-                    private_json(self.state_dir / "snapshot.json", self.snapshot())
+            except Exception as exc:
+                log_failure("기기 수집", exc)
+            finally:
+                # Every outcome clears `refreshing`, so manual retry is never blocked.
+                finished = self.clock()
+                update.update(durationMs=int((finished - started) * 1000), refreshing=False)
+                with self.lock:
+                    self.state[name].update(update)
+                    if update["ok"]:
+                        self.backoff.pop(name, None)
+                    else:
+                        failures = self.backoff.get(name, (0, 0))[0] + 1
+                        delay = self.RETRY_BACKOFF[min(failures, len(self.RETRY_BACKOFF)) - 1]
+                        self.backoff[name] = (failures, finished + delay)
+            self.persist("snapshot.json", self.snapshot)
             return update["ok"]
 
+    def persist(self, filename, build):
+        """State files are only a cache; a failed write never changes a collection result."""
+        if not self.state_dir:
+            return
+        with self.save_lock:
+            try:
+                private_json(self.state_dir / filename, build())
+            except Exception as exc:
+                sys.stderr.write(f"세션홀릭: 상태 파일 {filename} 저장 실패 ({type(exc).__name__})\n")
+
     def request_refresh(self, host_name=None, force=False):
+        if host_name is not None and not isinstance(host_name, str):
+            raise ValueError("기기 이름 형식이 올바르지 않습니다.")
         if host_name is not None and host_name not in self.state:
             raise ValueError("등록되지 않은 기기입니다.")
         queued = []
         with self.lock:
-            now = time.time()
+            now = self.clock()
             for host in self.hosts:
-                row = self.state[host["name"]]
-                if host_name and host["name"] != host_name:
+                name = host["name"]
+                row = self.state[name]
+                if host_name and name != host_name:
                     continue
                 delay = 5 if force else self.interval
-                if row["refreshing"] or now - self.attempted.get(host["name"], 0) < delay:
+                if row["refreshing"] or now - self.attempted.get(name, 0) < delay:
                     continue
-                if row["paused"] and not force:
+                # A paused host retries by itself only after its backoff; explicit refresh skips it.
+                if row["paused"] and not force and now < self.backoff.get(name, (0, 0))[1]:
                     continue
                 row["refreshing"] = True
                 queued.append(host)
-        def collect():
-            for host in queued:
-                self.poll(host)
-        if queued:
-            threading.Thread(target=collect, daemon=True).start()
+        for host in queued:
+            try:
+                threading.Thread(target=self.poll, args=(host,), daemon=True,
+                                 name="sessionholic-collect-" + host["name"]).start()
+            except RuntimeError:
+                with self.lock:
+                    self.state[host["name"]].update(refreshing=False, error="수집을 시작하지 못했습니다.")
         return bool(queued)
 
     def snapshot(self):
@@ -254,9 +300,11 @@ class Board:
                 self.reads.pop(next(iter(self.reads)))
             if not result.get("error"):
                 self.reads[key] = (fetched, result)
-                if self.state_dir:
-                    private_json(self.state_dir / "conversations.json", [
-                        {"key": list(k), "at": v[0], "data": v[1]} for k, v in self.reads.items()])
+        if not result.get("error"):
+            def saved_reads():
+                with self.lock:
+                    return [{"key": list(k), "at": v[0], "data": v[1]} for k, v in self.reads.items()]
+            self.persist("conversations.json", saved_reads)
         return {**result, "fetchedAt": int(fetched), "stale": False}
 
 

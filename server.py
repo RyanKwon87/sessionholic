@@ -25,6 +25,7 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 from urllib.parse import parse_qs, urlparse, unquote
 import settings
 
@@ -35,12 +36,16 @@ DEFAULT_HOSTS = Path.home() / ".config/sessionholic/hosts.json"
 STATE_DIR = Path.home() / ".local/state/sessionholic"
 TOKEN_FILE = Path.home() / ".config/sessionholic/token"
 COOKIE = "sessionholic_token"
+ONCE_TTL = 120
+INTERNAL_ERROR = "서버 내부 오류가 발생했습니다. 다시 시도해 주세요."
 NAME = re.compile(r"^[A-Za-z0-9_.-]{1,40}$")
 PYTHON_PATH = re.compile(r"^/[A-Za-z0-9_./-]{1,120}$")
 SESSION_ID = re.compile(r"^[0-9A-Za-z-]{8,64}$")
 HOME_KEY = re.compile(r"^\.codex(-[A-Za-z0-9_-]{1,40})?$|^\.codex-router/[0-9a-f]{16}$")
 STATIC = re.compile(r"^(?:vendor/)?[a-z0-9_-]{1,40}\.(html|js|css|svg|png|webmanifest)$")
 REMOTE_PATH = "/opt/homebrew/bin:$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin"
+SOCKET_PATH_LIMIT = 104
+CONTROL_PREFIX = re.compile(r"^/[A-Za-z0-9_./+@-]+$")
 TYPES = {".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8",
          ".css": "text/css; charset=utf-8", ".svg": "image/svg+xml", ".png": "image/png",
          ".webmanifest": "application/manifest+json"}
@@ -88,17 +93,62 @@ def load_hosts(path):
     return hosts
 
 
-def collector_command(host, args):
+def ssh_control_path(state_dir):
+    """Pure path rule for shared SSH connections: `<state_dir>/ssh/cm-%C`, or None.
+
+    ssh expands %C to a 40 character hash and first binds a master socket at
+    `<path>.<16 random characters>`, so that longest form must fit the macOS
+    104 byte socket path (including NUL). Paths ssh would re-tokenize are refused.
+    """
+    if not state_dir:
+        return None
+    prefix = str(Path(state_dir).expanduser().absolute() / "ssh") + "/cm-"
+    if not CONTROL_PREFIX.fullmatch(prefix) or len(os.fsencode(prefix)) + 40 + 17 >= SOCKET_PATH_LIMIT:
+        return None
+    return prefix + "%C"
+
+
+def prepare_ssh_control_dir(state_dir):
+    """Create the private socket folder; a failure only disables connection sharing."""
+    directory = Path(state_dir).expanduser().absolute() / "ssh"
+    try:
+        directory.mkdir(mode=0o700, exist_ok=True)
+        info = os.lstat(directory)
+        if stat.S_ISDIR(info.st_mode) and info.st_uid == os.getuid():
+            os.chmod(directory, 0o700)
+    except OSError:
+        pass
+
+
+def ssh_control_options(state_dir):
+    """`ssh -o` options reusing one connection per host for 60 idle seconds, or [].
+
+    Without a state folder, a prepared 0700 socket folder owned by this user, or a
+    path within the socket limit, ssh runs exactly as before without sharing.
+    """
+    path = ssh_control_path(state_dir)
+    if path is None:
+        return []
+    try:
+        info = os.lstat(Path(path).parent)
+    except OSError:
+        return []
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
+        return []
+    return ["-o", "ControlMaster=auto", "-o", "ControlPersist=60", "-o", "ControlPath=" + path]
+
+
+def collector_command(host, args, state_dir=None):
     """Local hosts run the file; SSH hosts read it from stdin so nothing is left on the remote."""
     if host["local"]:
         return [sys.executable, "-I", str(COLLECTOR)] + list(args)
     remote = (f"PATH={REMOTE_PATH} {shlex.quote(host['python'])} -I - "
               + " ".join(shlex.quote(a) for a in args))
-    return ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=6", "-o", "ServerAliveInterval=5",
-            "--", host["ssh"], remote]
+    return (["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=6", "-o", "ServerAliveInterval=5"]
+            + ssh_control_options(state_dir) + ["--", host["ssh"], remote])
 
 
-def run_collector(host, args, timeout):
+def run_collector(host, args, timeout, state_dir=None):
     stdin = None
     if not host["local"]:
         # Remote stdin remains a single self-contained program, with settings
@@ -108,7 +158,8 @@ def run_collector(host, args, timeout):
         stdin = (b"from __future__ import annotations\n" + prefix.encode()
                  + COLLECTOR.read_bytes().replace(b"from __future__ import annotations\n", b"", 1))
     try:
-        done = subprocess.run(collector_command(host, args), input=stdin, capture_output=True, timeout=timeout)
+        done = subprocess.run(collector_command(host, args, state_dir), input=stdin, capture_output=True,
+                              timeout=timeout)
     except subprocess.TimeoutExpired:
         raise RuntimeError("응답 시간 초과") from None
     except OSError:
@@ -134,20 +185,37 @@ def scrub_payload(value):
     return value
 
 
-class Board:
-    """Visible-client driven collection. A failed host stays paused until explicit retry."""
+def log_failure(context, exc):
+    """Record where an unexpected error happened without echoing payload text."""
+    frames = "".join(traceback.format_tb(exc.__traceback__))
+    sys.stderr.write(f"세션홀릭: {context} 중 예상하지 못한 오류 ({type(exc).__name__})\n{frames}")
 
-    def __init__(self, hosts, interval, runner=run_collector, state_dir=None):
-        self.hosts, self.interval, self.runner = hosts, max(interval, 60), runner
+
+class Board:
+    """Visible-client driven collection.
+
+    Hosts are collected in parallel, one collection per host at a time. A failed
+    host is paused and retried automatically after an increasing backoff, or at
+    once on an explicit refresh.
+    """
+    RETRY_BACKOFF = (120, 300, 900)
+
+    def __init__(self, hosts, interval, runner=None, state_dir=None):
+        self.hosts, self.interval = hosts, max(interval, 60)
+        self.clock = time.time
         self.lock = threading.RLock()
-        self.collect_lock = threading.Lock()
+        # Lock order: a host lock, then save_lock, then self.lock; never the reverse.
+        self.host_locks = {h["name"]: threading.Lock() for h in hosts}
+        self.save_lock = threading.Lock()
         self.state = {h["name"]: {"name": h["name"], "label": h["label"], "ok": False,
                      "error": "아직 수집하지 않았어요", "data": None, "fetchedAt": None,
                      "durationMs": None, "paused": False, "refreshing": False} for h in hosts}
-        self.reads, self.attempted = {}, {}
+        self.reads, self.attempted, self.backoff = {}, {}, {}
         self.state_dir = Path(state_dir) if state_dir else None
+        self.runner = runner or (lambda host, args, timeout: run_collector(host, args, timeout, self.state_dir))
         if self.state_dir:
             self.state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+            prepare_ssh_control_dir(self.state_dir)
             try:
                 cached = json.loads((self.state_dir / "snapshot.json").read_text())
                 for row in cached.get("hosts", []):
@@ -168,46 +236,75 @@ class Board:
         return None
 
     def poll(self, host):
-        started = time.time()
-        with self.collect_lock:
-            with self.lock:
-                self.state[host["name"]]["refreshing"] = True
-                self.attempted[host["name"]] = started
+        name = host["name"]
+        # Only one collection per host; other hosts are collected concurrently.
+        with self.host_locks[name]:
+            started = self.clock()
+            update = {"ok": False, "paused": True, "error": "수집 결과를 처리하지 못했습니다."}
             try:
+                with self.lock:
+                    self.state[name]["refreshing"] = True
+                    self.attempted[name] = started
                 data = scrub_payload(self.runner(host, ["snapshot"], 45))
                 update = {"ok": True, "paused": False, "error": None, "data": data,
-                          "fetchedAt": int(time.time())}
+                          "fetchedAt": int(self.clock())}
             except RuntimeError as exc:
                 update = {"ok": False, "paused": True, "error": str(exc)}
-            update.update(durationMs=int((time.time() - started) * 1000), refreshing=False)
-            with self.lock:
-                self.state[host["name"]].update(update)
-                if self.state_dir:
-                    private_json(self.state_dir / "snapshot.json", self.snapshot())
+            except Exception as exc:
+                log_failure("기기 수집", exc)
+            finally:
+                # Every outcome clears `refreshing`, so manual retry is never blocked.
+                finished = self.clock()
+                update.update(durationMs=int((finished - started) * 1000), refreshing=False)
+                with self.lock:
+                    self.state[name].update(update)
+                    if update["ok"]:
+                        self.backoff.pop(name, None)
+                    else:
+                        failures = self.backoff.get(name, (0, 0))[0] + 1
+                        delay = self.RETRY_BACKOFF[min(failures, len(self.RETRY_BACKOFF)) - 1]
+                        self.backoff[name] = (failures, finished + delay)
+            self.persist("snapshot.json", self.snapshot)
             return update["ok"]
 
+    def persist(self, filename, build):
+        """State files are only a cache; a failed write never changes a collection result."""
+        if not self.state_dir:
+            return
+        with self.save_lock:
+            try:
+                private_json(self.state_dir / filename, build())
+            except Exception as exc:
+                sys.stderr.write(f"세션홀릭: 상태 파일 {filename} 저장 실패 ({type(exc).__name__})\n")
+
     def request_refresh(self, host_name=None, force=False):
+        if host_name is not None and not isinstance(host_name, str):
+            raise ValueError("기기 이름 형식이 올바르지 않습니다.")
         if host_name is not None and host_name not in self.state:
             raise ValueError("등록되지 않은 기기입니다.")
         queued = []
         with self.lock:
-            now = time.time()
+            now = self.clock()
             for host in self.hosts:
-                row = self.state[host["name"]]
-                if host_name and host["name"] != host_name:
+                name = host["name"]
+                row = self.state[name]
+                if host_name and name != host_name:
                     continue
                 delay = 5 if force else self.interval
-                if row["refreshing"] or now - self.attempted.get(host["name"], 0) < delay:
+                if row["refreshing"] or now - self.attempted.get(name, 0) < delay:
                     continue
-                if row["paused"] and not force:
+                # A paused host retries by itself only after its backoff; explicit refresh skips it.
+                if row["paused"] and not force and now < self.backoff.get(name, (0, 0))[1]:
                     continue
                 row["refreshing"] = True
                 queued.append(host)
-        def collect():
-            for host in queued:
-                self.poll(host)
-        if queued:
-            threading.Thread(target=collect, daemon=True).start()
+        for host in queued:
+            try:
+                threading.Thread(target=self.poll, args=(host,), daemon=True,
+                                 name="sessionholic-collect-" + host["name"]).start()
+            except RuntimeError:
+                with self.lock:
+                    self.state[host["name"]].update(refreshing=False, error="수집을 시작하지 못했습니다.")
         return bool(queued)
 
     def snapshot(self):
@@ -254,9 +351,11 @@ class Board:
                 self.reads.pop(next(iter(self.reads)))
             if not result.get("error"):
                 self.reads[key] = (fetched, result)
-                if self.state_dir:
-                    private_json(self.state_dir / "conversations.json", [
-                        {"key": list(k), "at": v[0], "data": v[1]} for k, v in self.reads.items()])
+        if not result.get("error"):
+            def saved_reads():
+                with self.lock:
+                    return [{"key": list(k), "at": v[0], "data": v[1]} for k, v in self.reads.items()]
+            self.persist("conversations.json", saved_reads)
         return {**result, "fetchedAt": int(fetched), "stale": False}
 
 
@@ -584,8 +683,31 @@ def host_allowed(value):
 
 class Handler(BaseHTTPRequestHandler):
     server_version = "Sessionholic/1"
+    responded = False
 
     # ---------- plumbing ----------
+    def send_response(self, code, message=None):
+        self.responded = True
+        super().send_response(code, message)
+
+    def guarded(self, route):
+        """An unexpected error becomes one generic JSON 500 without details.
+
+        It never claims a dispatch state: a chat send may already have started.
+        """
+        self.responded = False
+        try:
+            route()
+        except Exception as exc:
+            log_failure(f"{self.command} {urlparse(self.path).path} 처리", exc)
+            if self.responded:
+                self.close_connection = True
+                return
+            try:
+                self.send_json(500, {"error": INTERNAL_ERROR})
+            except OSError:
+                self.close_connection = True
+
     def log_message(self, fmt, *args):
         # Log the path only; query strings may carry a one-time login code.
         sys.stderr.write("%s %s %s\n" % (self.log_date_time_string(), self.command, urlparse(self.path).path))
@@ -682,6 +804,12 @@ class Handler(BaseHTTPRequestHandler):
         self.do_GET()
 
     def do_GET(self):
+        self.guarded(self.route_get)
+
+    def do_POST(self):
+        self.guarded(self.route_post)
+
+    def route_get(self):
         if not host_allowed(self.headers.get("Host")):
             return self.send_body(421, b"misdirected", "text/plain; charset=utf-8")
         url = urlparse(self.path)
@@ -728,7 +856,7 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_json(404, {"error": "없는 경로입니다."})
         return self.static(url.path)
 
-    def do_POST(self):
+    def route_post(self):
         from chat import SendRejected
         path = urlparse(self.path).path
         not_started = {"dispatchState": "not_started"} if path == "/api/chat/send" else {}
@@ -741,7 +869,7 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/chat/upload":
             if not self.authorized():
                 return self.send_json(401, {"error": "로그인이 필요합니다."})
-            if not hmac.compare_digest(self.headers.get("X-CSRF-Token", ""), self.server.csrf):
+            if not hmac.compare_digest(self.headers.get("X-CSRF-Token", "").encode(), self.server.csrf.encode()):
                 return self.send_json(403, {"error": "화면을 새로 열고 다시 시도해 주세요."})
             try:
                 from chat import MAX_FILE
@@ -782,7 +910,7 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_json(200, {"ok": True, "csrfToken": self.server.csrf}, {"Set-Cookie": self.session_cookie()})
         if not self.authorized():
             return self.send_json(401, {"error": "로그인이 필요합니다.", **not_started})
-        if not hmac.compare_digest(self.headers.get("X-CSRF-Token", ""), self.server.csrf):
+        if not hmac.compare_digest(self.headers.get("X-CSRF-Token", "").encode(), self.server.csrf.encode()):
             return self.send_json(403, {"error": "보안 연결을 갱신한 뒤 다시 시도해 주세요.",
                                         "code": "csrf_expired", **not_started})
         try:
@@ -793,7 +921,10 @@ class Handler(BaseHTTPRequestHandler):
                         self.server.sessions.pop(jar[self.server.cookie_name].value, None)
                 return self.send_json(200, {"ok": True}, {"Set-Cookie": self.session_cookie(clear=True)})
             if path == "/api/refresh":
-                self.server.board.request_refresh(data.get("host"), force=True)
+                host = data.get("host")
+                if host is not None and not isinstance(host, str):
+                    raise ValueError("기기 이름 형식이 올바르지 않습니다.")
+                self.server.board.request_refresh(host, force=True)
                 return self.send_json(200, self.server.board.snapshot())
             if path == "/api/chat/state":
                 return self.send_json(200, self.server.chat.state(data))
@@ -842,7 +973,8 @@ class Handler(BaseHTTPRequestHandler):
         """One-time code from `--open`; the long-lived token itself never appears in a URL."""
         with self.server.once_lock:
             expected, expires = self.server.once
-            valid = bool(code) and bool(expected) and time.time() < expires and hmac.compare_digest(code, expected)
+            valid = (bool(code) and bool(expected) and time.time() < expires
+                     and hmac.compare_digest(code.encode(), expected.encode()))
             if valid:
                 self.server.once = ("", 0)
         if not valid:
@@ -903,6 +1035,14 @@ def make_server(bind, port, board, token, terminals=None, workflow=None, state_d
     return server
 
 
+def issue_login_link(httpd, ttl=ONCE_TTL):
+    """Arm one single-use, short-lived login code; the long-lived token never enters a URL."""
+    code = secrets.token_urlsafe(24)
+    with httpd.once_lock:
+        httpd.once = (code, time.time() + ttl)
+    return f"http://127.0.0.1:{httpd.server_address[1]}/login?once={code}"
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description="세션홀릭 - 에이전트 세션 매니저")
     parser.add_argument("--port", type=int, default=8790)
@@ -914,7 +1054,8 @@ def main(argv=None):
     parser.add_argument("--state-dir", type=Path, default=STATE_DIR)
     parser.add_argument("--tailscale-user-file", type=Path,
                         help="비공개 파일에 적힌 Tailscale 사용자에게 HTTPS Serve 자동 인증 허용")
-    parser.add_argument("--open", action="store_true", help="개인 브라우저에서 주소를 직접 여세요")
+    parser.add_argument("--open", action="store_true",
+                        help=f"{ONCE_TTL // 60}분 동안 한 번만 쓸 수 있는 로그인 링크를 표준 출력에 표시")
     args = parser.parse_args(argv)
     if args.bind != "127.0.0.1":
         parser.error("127.0.0.1만 허용합니다. 원격 접속은 Tailscale Serve를 사용하세요.")
@@ -936,7 +1077,9 @@ def main(argv=None):
                         max_terminals=args.max_terminals, tailscale_user=tailscale_user)
     print(f"세션홀릭: http://127.0.0.1:{args.port}/ · 화면을 열 때만 수집합니다.", file=sys.stderr)
     if args.open:
-        print("개인 Chrome 프로필에서 위 주소를 여세요.", file=sys.stderr)
+        print(issue_login_link(httpd), flush=True)
+        print(f"표준 출력의 일회용 로그인 링크를 {ONCE_TTL // 60}분 안에 개인 브라우저에서 여세요. 한 번만 사용할 수 있습니다.",
+              file=sys.stderr)
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:

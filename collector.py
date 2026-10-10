@@ -40,6 +40,7 @@ SESSION_ID = re.compile(r"^[0-9A-Za-z-]{8,64}$")
 EXTRA_PATH = ["/opt/homebrew/bin", str(HOME / ".local/bin"), "/usr/local/bin", "/usr/bin", "/bin"]
 TEXT_LIMIT = 4000
 MESSAGE_LIMIT = 80
+SNIPPET_TAILS = (32 * 1024, 128 * 1024)
 CODEX_THREAD_LIMIT = 25
 REMINDER = re.compile(r"<system-reminder>.*?</system-reminder>", re.S)
 COMMAND_NAME = re.compile(r"<command-name>([^<]{1,60})</command-name>")
@@ -75,6 +76,15 @@ def run(args, timeout=20):
 def clip(text, limit=TEXT_LIMIT):
     text = str(text or "")
     return text if len(text) <= limit else text[:limit] + " …"
+
+
+def text_row(role, text, ts):
+    """A clipped message row; only cut rows carry `truncated` and the original `fullLength`."""
+    text = str(text or "")
+    row = {"role": role, "text": clip(text), "ts": ts}
+    if len(text) > TEXT_LIMIT:
+        row.update(truncated=True, fullLength=len(text))
+    return row
 
 
 def one_line(value, limit=160):
@@ -163,6 +173,26 @@ def claude_transcript(session_id):
     return Path(max(matches, key=os.path.getmtime)) if matches else None
 
 
+def claude_transcript_index():
+    """One directory scan for a whole snapshot: {session id: newest transcript path}."""
+    index = {}
+    for name in glob.glob(str(HOME / ".claude/projects" / "*" / "*.jsonl")):
+        path = Path(name)
+        if not SESSION_ID.match(path.stem):
+            continue
+        previous = index.get(path.stem)
+        if previous is not None:
+            try:
+                if path.stat().st_mtime <= previous.stat().st_mtime:
+                    continue
+            except OSError:
+                # A transcript removed during the scan loses to the one still present.
+                if not path.exists():
+                    continue
+        index[path.stem] = path
+    return index
+
+
 def tail_entries(path, max_bytes):
     with open(path, "rb") as stream:
         stream.seek(0, 2)
@@ -220,7 +250,8 @@ def claude_messages(entries):
         kind = entry.get("type")
         if kind not in ("user", "assistant") or entry.get("isMeta") or entry.get("isSidechain"):
             continue
-        content = (entry.get("message") or {}).get("content")
+        message = entry.get("message")
+        content = message.get("content") if isinstance(message, dict) else None
         blocks = [{"type": "text", "text": content}] if isinstance(content, str) else content
         ts = to_epoch(entry.get("timestamp"))
         attached = native_attachments(blocks) if kind == "user" else []
@@ -229,9 +260,9 @@ def claude_messages(entries):
             if not isinstance(block, dict):
                 continue
             if block.get("type") == "text" and str(block.get("text") or "").strip():
-                shown = user_text(block["text"]) if kind == "user" else ("assistant", block["text"])
+                shown = user_text(str(block["text"])) if kind == "user" else ("assistant", block["text"])
                 if shown:
-                    out.append({"role": shown[0], "text": clip(shown[1]), "ts": ts})
+                    out.append(text_row(shown[0], shown[1], ts))
                     if shown[0] == "user" and attachment_row is None:
                         attachment_row = out[-1]
             elif block.get("type") == "tool_use":
@@ -257,26 +288,58 @@ def claude_sessions(errors, projects):
     except ValueError:
         errors.append("Claude 세션 목록 형식이 예상과 다릅니다.")
         return []
-    out = []
+    try:
+        transcripts = claude_transcript_index()
+    except OSError:
+        transcripts = {}
+        errors.append("Claude 대화 기록 폴더를 읽지 못했습니다.")
+    out, skipped = [], 0
     for row in rows if isinstance(rows, list) else []:
-        session_id = str(row.get("sessionId") or "")
-        path = claude_transcript(session_id)
-        snippet = ""
-        if path:
-            messages = claude_messages(tail_entries(path, 128 * 1024))
-            last = next((m for m in reversed(messages) if m["role"] == "assistant"), None)
-            snippet = one_line(last["text"], 140) if last else ""
-        out.append({
-            "agent": "claude", "id": str(row.get("id") or ""), "sessionId": session_id,
-            "title": row.get("name") or "(이름 없음)", "cwd": row.get("cwd") or "",
-            "project": project_for(row.get("cwd"), projects), "account": "",
-            "kind": row.get("kind"), "state": row.get("state"), "status": row.get("status"),
-            "waitingFor": row.get("waitingFor"), "phase": claude_phase(row.get("state"), row.get("status")),
-            "startedAt": to_epoch(row.get("startedAt")),
-            "updatedAt": int(path.stat().st_mtime) if path else to_epoch(row.get("startedAt")),
-            "snippet": snippet, "resume": "claude attach " + str(row.get("id") or ""),
-        })
+        # One malformed or racing row never hides the other sessions.
+        try:
+            out.append(claude_row(row, transcripts, projects))
+        except Exception:
+            skipped += 1
+    if skipped:
+        errors.append(f"Claude 세션 {skipped}건을 읽지 못했습니다.")
     return out
+
+
+def claude_snippet(path, size):
+    """Last answer preview from a small tail first; widen only when the tail has none."""
+    for limit in SNIPPET_TAILS:
+        messages = claude_messages(tail_entries(path, limit))
+        last = next((m for m in reversed(messages) if m["role"] == "assistant"), None)
+        if last:
+            return one_line(last["text"], 140)
+        if size <= limit:
+            break
+    return ""
+
+
+def claude_row(row, transcripts, projects):
+    if not isinstance(row, dict):
+        raise TypeError("Claude 세션 행 형식이 올바르지 않습니다.")
+    session_id = str(row.get("sessionId") or "")
+    path = transcripts.get(session_id) if SESSION_ID.match(session_id) else None
+    snippet, updated = "", to_epoch(row.get("startedAt"))
+    if path:
+        try:
+            info = path.stat()
+            updated = int(info.st_mtime)
+            snippet = claude_snippet(path, info.st_size)
+        except OSError:
+            # Removed or unreadable transcripts keep the session row without a preview.
+            pass
+    return {
+        "agent": "claude", "id": str(row.get("id") or ""), "sessionId": session_id,
+        "title": row.get("name") or "(이름 없음)", "cwd": row.get("cwd") or "",
+        "project": project_for(row.get("cwd"), projects), "account": "",
+        "kind": row.get("kind"), "state": row.get("state"), "status": row.get("status"),
+        "waitingFor": row.get("waitingFor"), "phase": claude_phase(row.get("state"), row.get("status")),
+        "startedAt": to_epoch(row.get("startedAt")), "updatedAt": updated,
+        "snippet": snippet, "resume": "claude attach " + str(row.get("id") or ""),
+    }
 
 
 # ---------- Codex (app-server daemon over a Unix socket) ----------
@@ -398,55 +461,82 @@ def codex_homes():
 def codex_threads(errors, projects):
     out = []
     for key, path in codex_homes():
-        project_id, account = home_label(key, path)
+        try:
+            project_id, account = home_label(key, path)
+        except Exception:
+            project_id, account = None, key
         try:
             with AppServer(path / SOCKET_REL) as server:
                 listed = server.call("thread/list", {"limit": CODEX_THREAD_LIMIT, "archived": False,
                                                      "sortKey": "updated_at", "sortDirection": "desc"})
-                loaded = set(server.call("thread/loaded/list", {}).get("data") or [])
+                loaded = server.call("thread/loaded/list", {})
+                loaded = set(loaded.get("data") or []) if isinstance(loaded, dict) else set()
         except (OSError, RpcError):
             errors.append(f"Codex daemon({account})에 연결하지 못했습니다.")
             continue
-        for thread in listed.get("data") or []:
-            status = thread.get("status") or {}
-            cwd = str(thread.get("cwd") or "")
-            name = thread.get("name")
-            preview = one_line(thread.get("preview"), 140)
-            out.append({
-                "agent": "codex", "id": str(thread.get("id") or ""), "home": key,
-                "title": name or preview[:60] or "(제목 없음)", "named": bool(name), "cwd": cwd,
-                "project": project_label(project_id, projects) if project_id else project_for(cwd, projects),
-                "account": account, "state": status.get("type"),
-                "status": ",".join(status.get("activeFlags") or []), "phase": codex_phase(status),
-                "loaded": thread.get("id") in loaded,
-                "startedAt": to_epoch(thread.get("createdAt")), "updatedAt": to_epoch(thread.get("updatedAt")),
-                "snippet": preview if name else "", "resume": "codex resume " + str(thread.get("id") or ""),
-            })
+        except Exception:
+            errors.append(f"Codex daemon({account}) 응답을 읽지 못했습니다.")
+            continue
+        threads = listed.get("data") if isinstance(listed, dict) else None
+        skipped = 0
+        for thread in threads if isinstance(threads, list) else []:
+            # Each thread row is isolated so one unexpected shape keeps the rest visible.
+            try:
+                out.append(codex_row(thread, key, project_id, account, loaded, projects))
+            except Exception:
+                skipped += 1
+        if skipped:
+            errors.append(f"Codex({account}) 작업 {skipped}건을 읽지 못했습니다.")
     return out
+
+
+def codex_row(thread, key, project_id, account, loaded, projects):
+    if not isinstance(thread, dict):
+        raise TypeError("Codex 작업 행 형식이 올바르지 않습니다.")
+    status = thread.get("status") or {}
+    cwd = str(thread.get("cwd") or "")
+    name = thread.get("name")
+    preview = one_line(thread.get("preview"), 140)
+    return {
+        "agent": "codex", "id": str(thread.get("id") or ""), "home": key,
+        "title": name or preview[:60] or "(제목 없음)", "named": bool(name), "cwd": cwd,
+        "project": project_label(project_id, projects) if project_id else project_for(cwd, projects),
+        "account": account, "state": status.get("type"),
+        "status": ",".join(status.get("activeFlags") or []), "phase": codex_phase(status),
+        "loaded": thread.get("id") in loaded,
+        "startedAt": to_epoch(thread.get("createdAt")), "updatedAt": to_epoch(thread.get("updatedAt")),
+        "snippet": preview if name else "", "resume": "codex resume " + str(thread.get("id") or ""),
+    }
 
 
 def codex_messages(turns):
     out = []
     for turn in turns:
+        if not isinstance(turn, dict):
+            continue
         ts = to_epoch(turn.get("startedAt"))
         for item in turn.get("items") or []:
+            if not isinstance(item, dict):
+                continue
             kind = item.get("type")
             if kind == "userMessage":
-                text = "\n".join(str(c.get("text") or "") for c in item.get("content") or []
+                content = item.get("content") if isinstance(item.get("content"), list) else []
+                text = "\n".join(str(c.get("text") or "") for c in content
                                  if isinstance(c, dict) and c.get("type") == "text").strip()
-                attached = native_attachments(item.get("content"))
+                attached = native_attachments(content)
                 if text or attached:
                     fallback = "[이미지 첨부]" if all(a["kind"] == "image" for a in attached) else "[파일 첨부]"
-                    row = {"role": "user", "text": clip(text) if text else fallback, "ts": ts}
+                    row = text_row("user", text, ts) if text else {"role": "user", "text": fallback, "ts": ts}
                     if attached:
                         row["attachments"] = attached
                     out.append(row)
             elif kind == "agentMessage" and str(item.get("text") or "").strip():
-                out.append({"role": "assistant", "text": clip(item["text"]), "ts": ts})
+                out.append(text_row("assistant", item["text"], ts))
             elif kind == "commandExecution":
                 out.append({"role": "tool", "text": "$ " + one_line(item.get("command"), 160), "ts": ts})
             elif kind == "fileChange":
-                paths = [str(c.get("path")) for c in item.get("changes") or [] if isinstance(c, dict) and c.get("path")]
+                changes = item.get("changes") if isinstance(item.get("changes"), list) else []
+                paths = [str(c.get("path")) for c in changes if isinstance(c, dict) and c.get("path")]
                 out.append({"role": "tool", "text": "파일 수정 · " + one_line(", ".join(paths), 160), "ts": ts})
             elif kind in ("mcpToolCall", "dynamicToolCall"):
                 label = " ".join(str(v) for v in (item.get("server") or item.get("namespace"), item.get("tool")) if v)
@@ -479,12 +569,23 @@ def tmux_sessions():
 
 # ---------- entry points ----------
 
+def section(errors, label, collect, *args):
+    """Isolate one source; a failure is reported in `errors` and the others still return."""
+    try:
+        rows = collect(*args)
+    except Exception:
+        errors.append(f"{label}을 읽는 중 오류가 발생했습니다.")
+        return []
+    return rows if isinstance(rows, list) else []
+
+
 def snapshot():
     errors = []
     projects = load_projects()
     return {"host": socket.gethostname(), "collectedAt": int(time.time()),
-            "claude": claude_sessions(errors, projects), "codex": codex_threads(errors, projects),
-            "tmux": tmux_sessions(), "errors": errors}
+            "claude": section(errors, "Claude 세션 목록", claude_sessions, errors, projects),
+            "codex": section(errors, "Codex 작업 목록", codex_threads, errors, projects),
+            "tmux": section(errors, "tmux 세션 목록", tmux_sessions), "errors": errors}
 
 
 def read(agent, session_id, home_key=None):
@@ -494,16 +595,22 @@ def read(agent, session_id, home_key=None):
         path = claude_transcript(session_id)
         if not path:
             return {"messages": [], "error": "대화 기록 파일을 찾지 못했습니다."}
-        return {"messages": claude_messages(tail_entries(path, 2 * 1024 * 1024))}
+        try:
+            return {"messages": claude_messages(tail_entries(path, 2 * 1024 * 1024))}
+        except OSError:
+            # The transcript can move or lose permissions between lookup and read.
+            return {"messages": [], "error": "대화 기록 파일을 읽지 못했습니다."}
     if agent == "codex":
         if not HOME_KEY.match(home_key or ""):
             raise ValueError("Codex home 형식이 올바르지 않습니다.")
         try:
             with AppServer(HOME / home_key / SOCKET_REL, timeout=30) as server:
-                thread = server.call("thread/read", {"threadId": session_id, "includeTurns": True}).get("thread") or {}
+                result = server.call("thread/read", {"threadId": session_id, "includeTurns": True})
         except (OSError, RpcError) as exc:
             return {"messages": [], "error": "Codex 대화를 읽지 못했습니다: " + str(exc)}
-        return {"messages": codex_messages(thread.get("turns") or [])}
+        thread = result.get("thread") if isinstance(result, dict) else None
+        turns = thread.get("turns") if isinstance(thread, dict) else None
+        return {"messages": codex_messages(turns if isinstance(turns, list) else [])}
     raise ValueError("지원하지 않는 에이전트입니다.")
 
 

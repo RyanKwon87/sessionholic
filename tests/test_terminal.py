@@ -10,7 +10,7 @@ import tempfile
 import threading
 import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import terminal  # noqa: E402
@@ -286,18 +286,31 @@ class ValidationTest(unittest.TestCase):
                         self.manager.paste(stream.record["id"], "fixture")
                 run.assert_not_called()
 
+    @staticmethod
+    def pane(**values):
+        state = {"alternate": 0, "mouse": 0, "sgr": 0, "width": 120, "height": 30,
+                 "inMode": 0, "position": 0, "history": 300}
+        state.update(values)
+        return state
+
     def test_scroll_drives_tmux_history_never_the_cli(self):
         stream = self.fake_terminal()
         tid, name = stream.record["id"], stream.record["name"]
         ok, failed = subprocess.CompletedProcess([], 0), subprocess.CompletedProcess([], 1)
-        with patch.object(self.manager, "_run", return_value=ok) as run:
-            self.assertEqual(self.manager.scroll(tid, 5), {"ok": True})
+        history = {"ok": True, "mode": "history"}
+        with patch.object(self.manager, "_run", return_value=ok) as run, \
+                patch.object(self.manager, "_pane") as pane:
+            # Below the live screen there is nothing to scroll to.
+            pane.side_effect = [self.pane(), self.pane()]
+            self.assertEqual(self.manager.scroll(tid, 5), {**history, "position": 0})
             run.assert_not_called()
-            self.manager.scroll(tid, -12)
+            pane.side_effect = [self.pane(), self.pane(inMode=1, position=12)]
+            self.assertEqual(self.manager.scroll(tid, -12), {**history, "position": 12})
             self.assertEqual(run.call_args.args, ("copy-mode", "-e", "-t", name, ";",
                                                   "send-keys", "-t", name, "-X", "-N", "12", "scroll-up"))
             self.assertTrue(stream.scrolled)
-            self.manager.scroll(tid, 7)
+            pane.side_effect = [self.pane(inMode=1, position=12), self.pane(inMode=1, position=5)]
+            self.assertEqual(self.manager.scroll(tid, 7), {**history, "position": 5})
             self.assertEqual(run.call_args.args, ("send-keys", "-t", name, "-X", "-N", "7", "scroll-down"))
             self.assertEqual(self.manager.scroll_end(tid), {"ok": True})
             self.assertEqual(run.call_args.args, ("send-keys", "-t", name, "-X", "cancel"))
@@ -305,19 +318,152 @@ class ValidationTest(unittest.TestCase):
             calls = run.call_count
             self.manager.scroll_end(tid)
             self.assertEqual(run.call_count, calls)
-        with patch.object(self.manager, "_run", return_value=failed):
+            # The live pane, not the in-memory flag, decides: a pane left in copy-mode by an
+            # earlier gateway still scrolls down, and a stale flag is cleared without keys.
+            pane.side_effect = [self.pane(inMode=1, position=3), self.pane()]
+            self.assertEqual(self.manager.scroll(tid, 3), {**history, "position": 0})
+            self.assertEqual(run.call_args.args, ("send-keys", "-t", name, "-X", "-N", "3", "scroll-down"))
+            stream.scrolled = True
+            calls = run.call_count
+            pane.side_effect = [self.pane(), self.pane()]
+            self.assertEqual(self.manager.scroll(tid, 3), {**history, "position": 0})
+            self.assertEqual(run.call_count, calls)
+            self.assertFalse(stream.scrolled)
+            # An empty history never enters copy-mode, which would only trap later input.
+            pane.side_effect = [self.pane(history=0)]
+            self.assertEqual(self.manager.scroll(tid, -3), {**history, "position": 0})
+            self.assertEqual(run.call_count, calls)
+            self.assertFalse(stream.scrolled)
+        with patch.object(self.manager, "_run", return_value=failed), \
+                patch.object(self.manager, "_pane", return_value=self.pane()):
             with self.assertRaisesRegex(RuntimeError, "스크롤"):
                 self.manager.scroll(tid, -3)
             self.assertFalse(stream.scrolled)
-            # tmux already left history (-e at the bottom); the stale flag is cleared without an error.
-            stream.scrolled = True
-            self.assertEqual(self.manager.scroll(tid, 3), {"ok": True})
-            self.assertFalse(stream.scrolled)
         stream.record["closed"] = True
-        with patch.object(self.manager, "_run") as run:
+        with patch.object(self.manager, "_run") as run, patch.object(self.manager, "_pane") as pane:
             with self.assertRaises(RuntimeError):
                 self.manager.scroll(tid, -1)
             run.assert_not_called()
+            pane.assert_not_called()
+
+    def test_full_screen_mouse_app_receives_wheel_events_instead_of_history(self):
+        stream = self.fake_terminal()
+        tid, name = stream.record["id"], stream.record["name"]
+        ok, failed = subprocess.CompletedProcess([], 0), subprocess.CompletedProcess([], 1)
+        app = {"ok": True, "mode": "app", "position": None}
+        cases = [  # lines, pane, expected one -l argument
+            (-7, self.pane(alternate=1, mouse=1, sgr=1), "\x1b[<64;60;15M" * 3),
+            (1, self.pane(alternate=1, mouse=1, sgr=1, width=81, height=25), "\x1b[<65;40;12M"),
+            (200, self.pane(alternate=1, mouse=1, sgr=1), "\x1b[<65;60;15M" * 40),
+            (-3, self.pane(alternate=1, mouse=1, width=1, height=1), "\x1b[M" + chr(96) + chr(33) + chr(33)),
+            (6, self.pane(alternate=1, mouse=1, width=600, height=40), ("\x1b[M" + chr(97) + chr(255) + chr(52)) * 2),
+        ]
+        for lines, state, expected in cases:
+            with self.subTest(lines=lines, state=state):
+                with patch.object(self.manager, "_run", return_value=ok) as run, \
+                        patch.object(self.manager, "_pane", return_value=state) as pane:
+                    self.assertEqual(self.manager.scroll(tid, lines), app)
+                self.assertEqual([call.args for call in run.call_args_list], [("send-keys", "-t", name, "-l", expected)])
+                pane.assert_called_once_with(stream)
+        # A pane stuck in copy-mode is released first so the app itself gets the wheel.
+        stream.scrolled = True
+        with patch.object(self.manager, "_run", return_value=ok) as run, \
+                patch.object(self.manager, "_pane", return_value=self.pane(alternate=1, mouse=1, sgr=1, inMode=1)):
+            self.assertEqual(self.manager.scroll(tid, -3), app)
+        self.assertEqual([call.args for call in run.call_args_list],
+                         [("send-keys", "-t", name, "-X", "cancel"), ("send-keys", "-t", name, "-l", "\x1b[<64;60;15M")])
+        self.assertFalse(stream.scrolled)
+        # The alternate screen without mouse reporting keeps the tmux history path.
+        with patch.object(self.manager, "_run", return_value=ok) as run, \
+                patch.object(self.manager, "_pane", side_effect=[self.pane(alternate=1), self.pane(inMode=1, position=3)]):
+            self.assertEqual(self.manager.scroll(tid, -3), {"ok": True, "mode": "history", "position": 3})
+        self.assertEqual(run.call_args.args[0], "copy-mode")
+        with patch.object(self.manager, "_run", return_value=failed), \
+                patch.object(self.manager, "_pane", return_value=self.pane(alternate=1, mouse=1, sgr=1)):
+            with self.assertRaisesRegex(RuntimeError, "스크롤"):
+                self.manager.scroll(tid, -3)
+
+    def test_pane_state_is_one_captured_display_query(self):
+        stream = self.fake_terminal()
+        self.manager.tmux = "/fixture/tmux"
+        with patch.object(terminal.subprocess, "run") as run:
+            run.return_value = subprocess.CompletedProcess([], 0, stdout=b"1|1|0|100|30|0||0\n")
+            self.assertEqual(self.manager._pane(stream), {"alternate": 1, "mouse": 1, "sgr": 0, "width": 100,
+                                                          "height": 30, "inMode": 0, "position": 0, "history": 0})
+            self.assertEqual(run.call_args.args[0][5:], ["display-message", "-p", "-t", stream.record["name"],
+                                                         terminal.PANE_FORMAT])
+            self.assertIs(run.call_args.kwargs["stdin"], subprocess.DEVNULL)
+            for done in (subprocess.CompletedProcess([], 1, stdout=b"1|1|0|100|30|0||0"),
+                         subprocess.CompletedProcess([], 0, stdout=b"1|1|0"),
+                         subprocess.CompletedProcess([], 0, stdout=b"x|1|0|100|30|0||0")):
+                run.return_value = done
+                with self.subTest(done=done), self.assertRaisesRegex(RuntimeError, "상태"):
+                    self.manager._pane(stream)
+            run.side_effect = subprocess.TimeoutExpired("tmux", 10)
+            with self.assertRaisesRegex(RuntimeError, "상태"):
+                self.manager._pane(stream)
+
+    def test_send_keys_presses_only_named_navigation_keys_in_one_call(self):
+        stream = self.fake_terminal()
+        tid, name = stream.record["id"], stream.record["name"]
+        ok, failed = subprocess.CompletedProcess([], 0), subprocess.CompletedProcess([], 1)
+        with patch.object(self.manager, "_run", return_value=ok) as run:
+            for keys in ([], ["Left"], ["enter"], ["Down", "C-c"], ["Enter "], "Enter", ("Up", 1),
+                         [["Up"]], ["Down"] * (terminal.KEY_LIMIT + 1), None, {"Up": 1}):
+                with self.subTest(keys=keys), self.assertRaises(ValueError):
+                    self.manager.send_keys(tid, keys)
+            with self.assertRaises(KeyError):
+                self.manager.send_keys("c" * 32, ["Enter"])
+            with self.assertRaises(ValueError):
+                self.manager.send_keys("../x", ["Enter"])
+            run.assert_not_called()
+            self.assertEqual(self.manager.send_keys(tid, ["Down", "Down", "Enter"]), {"ok": True})
+            self.assertEqual(run.call_args_list[-1].args, ("send-keys", "-t", name, "Down", "Down", "Enter"))
+            self.manager.send_keys(tid, ("Up",) * terminal.KEY_LIMIT)
+            self.assertEqual(run.call_count, 2)
+            # A terminal shown in history first leaves copy-mode so the keys reach the CLI.
+            stream.scrolled = True
+            self.manager.send_keys(tid, ["Enter"])
+            self.assertEqual([call.args for call in run.call_args_list[-2:]],
+                             [("send-keys", "-t", name, "-X", "cancel"), ("send-keys", "-t", name, "Enter")])
+            self.assertFalse(stream.scrolled)
+        with patch.object(self.manager, "_run", return_value=failed):
+            with self.assertRaises(terminal.InputNotSent):
+                self.manager.send_keys(tid, ["Enter"])
+        for change in ({"alive": False}, {"closed": True}):
+            with self.subTest(change=change):
+                stream.alive = "alive" not in change
+                stream.record["closed"] = "closed" in change
+                with patch.object(self.manager, "_run") as run:
+                    with self.assertRaises(RuntimeError):
+                        self.manager.send_keys(tid, ["Enter"])
+                run.assert_not_called()
+
+    def test_new_attach_client_and_its_first_input_leave_stale_copy_mode(self):
+        stream = self.fake_terminal()
+        tid, name = stream.record["id"], stream.record["name"]
+        cancel = ("send-keys", "-t", name, "-X", "cancel")
+        process = Mock(pid=0)
+        process.poll.return_value = None
+        with patch.object(self.manager, "_exists", return_value=True), patch.object(self.manager, "_configure"), \
+                patch.object(self.manager, "_run", side_effect=RuntimeError("fixture tmux")) as run, \
+                patch.object(terminal.subprocess, "Popen", return_value=process), \
+                patch.object(terminal.threading, "Thread") as thread:
+            self.manager._attach(stream)
+        self.addCleanup(os.close, stream.fd)
+        # The cancel result is ignored: outside copy-mode tmux reports "not in a mode".
+        self.assertEqual([call.args for call in run.call_args_list], [cancel])
+        thread.return_value.start.assert_called_once()
+        self.assertTrue(stream.attached_fresh)
+        ok = subprocess.CompletedProcess([], 0)
+        with patch.object(self.manager, "_run", return_value=ok) as run:
+            self.manager.send_keys(tid, ["Enter"])
+            self.manager.send_keys(tid, ["Down"])
+            # A running attach client is reused, so nothing is cancelled again.
+            self.manager._attach(stream)
+        self.assertEqual([call.args for call in run.call_args_list],
+                         [cancel, ("send-keys", "-t", name, "Enter"), ("send-keys", "-t", name, "Down")])
+        self.assertFalse(stream.attached_fresh)
 
 
 @unittest.skipUnless(shutil.which("tmux"), "tmux fixture requires installed tmux")
@@ -582,9 +728,9 @@ class TmuxFixtureTest(unittest.TestCase):
         self.manager.write(tid, "\n")
         cursor = self.wait_for(self.manager, tid, b"FIXTURE_REPLY:draft-fixture", cursor)
 
-        self.manager.scroll(tid, -10)
+        self.assertEqual(self.manager.scroll(tid, -10), {"ok": True, "mode": "history", "position": 10})
         self.assertEqual(self.mode(tid), "1 10")
-        self.manager.scroll(tid, 4)
+        self.assertEqual(self.manager.scroll(tid, 4), {"ok": True, "mode": "history", "position": 6})
         self.assertEqual(self.mode(tid), "1 6")
         # copy-mode -e leaves history once the view is back at the live screen.
         self.manager.scroll(tid, 6)
@@ -611,6 +757,61 @@ class TmuxFixtureTest(unittest.TestCase):
             self.manager.paste(tid, "after-close")
         with self.assertRaises(RuntimeError):
             self.manager.scroll(tid, -1)
+
+    def test_full_screen_mouse_app_gets_wheel_and_menu_keys_through_real_tmux(self):
+        record = Path(self.directory.name) / "received.bin"
+        # Like a remote TUI over ssh: alternate screen, mouse reporting, raw input.
+        code = ("import os,sys,tty\n"
+                "out=open(sys.argv[1],'ab',buffering=0)\n"
+                "tty.setraw(0)\n"
+                "os.write(1,b'\\x1b[?1049h\\x1b[?1000h\\x1b[?1006hRECORDER_READY')\n"
+                "while True:\n"
+                " data=os.read(0,1024)\n"
+                " if not data: break\n"
+                " out.write(data)\n")
+        created = self.manager.create("wheel-fixture", [sys.executable, "-u", "-c", code, str(record)],
+                                      self.directory.name, {"PATH": os.environ.get("PATH", ""), "LANG": "en_US.UTF-8"},
+                                      {"agent": "fixture", "host": "local"})
+        tid = created["id"]
+        self.wait_for(self.manager, tid, b"RECORDER_READY")
+        deadline = time.monotonic() + 5
+        while self.tmux("display-message", "-p", "-t", "sb-" + tid,
+                        "#{alternate_on}|#{mouse_any_flag}|#{mouse_sgr_flag}").stdout.strip() != "1|1|1":
+            if time.monotonic() > deadline:
+                self.fail("fixture app did not enable alternate screen and mouse reporting")
+            time.sleep(0.05)
+        size = self.tmux("display-message", "-p", "-t", "sb-" + tid, "#{pane_width} #{pane_height}").stdout.split()
+        x, y = max(int(size[0]) // 2, 1), max(int(size[1]) // 2, 1)
+
+        def received(expected):
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                data = record.read_bytes() if record.exists() else b""
+                if expected in data:
+                    return data
+                time.sleep(0.05)
+            self.fail("fixture app did not receive the expected input")
+
+        self.assertEqual(self.manager.scroll(tid, -3), {"ok": True, "mode": "app", "position": None})
+        wheel = ("\x1b[<64;%d;%dM" % (x, y)).encode()
+        self.assertEqual(received(wheel), wheel)
+        self.assertEqual(self.mode(tid).split()[0], "0")
+        self.manager.scroll(tid, 6)
+        self.assertEqual(received(("\x1b[<65;%d;%dM" % (x, y)).encode() * 2), wheel + ("\x1b[<65;%d;%dM" % (x, y)).encode() * 2)
+        before = len(record.read_bytes())
+        self.assertEqual(self.manager.send_keys(tid, ["Down", "Up", "Enter"]), {"ok": True})
+        keys = received(b"\r")[before:]
+        self.assertIn(keys, (b"\x1b[B\x1b[A\r", b"\x1bOB\x1bOA\r"))
+
+    def test_empty_history_never_traps_input_in_copy_mode(self):
+        created = self.create()
+        tid = created["id"]
+        self.wait_for(self.manager, tid, b"FIXTURE_READY")
+        self.assertEqual(self.manager.scroll(tid, -3), {"ok": True, "mode": "history", "position": 0})
+        self.assertEqual(self.mode(tid).split()[0], "0")
+        self.assertFalse(self.manager.terminals[tid].scrolled)
+        self.manager.write(tid, "typed-after-empty-scroll\n")
+        self.wait_for(self.manager, tid, b"FIXTURE_REPLY:typed-after-empty-scroll")
 
     def test_immediate_exit_and_missing_executable_are_reported_as_failed(self):
         for key, command in (("exit", [sys.executable, "-c", "raise SystemExit(9)"]),

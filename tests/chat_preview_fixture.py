@@ -1,7 +1,9 @@
 """Loopback browser QA: native chat RPC is synthetic; attachments use the real store.
 
 No credentials, model process, native daemon or SSH is opened. The terminal is
-an ordinary local echo PTY. Never use this fixture as a production server.
+an ordinary local echo PTY, or with --menu-demo a small numbered menu that reads
+arrow keys and Enter like the agent TUIs' approval menus. Never use this fixture
+as a production server.
 """
 import argparse
 import base64
@@ -18,6 +20,54 @@ import attachments
 import launch
 import server
 from terminal import TerminalManager
+
+# Drawn like an approval menu ("❯ 1. Yes"), answered with ESC [ A / ESC [ B and Enter.
+# After a choice it shows the result and an input line, then asks the next question.
+MENU_DEMO = r'''
+import os, sys, termios, time, tty
+fd = sys.stdin.fileno()
+saved = termios.tcgetattr(fd)
+options = ['Yes', 'No']
+
+def draw(round_number, current):
+    rows = ['\x1b[2J\x1b[H', ' 검증 질문 #%d' % round_number, '', ' 계속 진행할까요?', '']
+    for index, label in enumerate(options):
+        rows.append((' ❯ ' if index == current else '   ') + '%d. %s' % (index + 1, label))
+    rows += ['', ' ↑/↓ 이동 · Enter 선택']
+    sys.stdout.write('\n'.join(rows))
+    sys.stdout.flush()
+
+try:
+    tty.setcbreak(fd)
+    round_number, current, pending = 1, 0, b''
+    draw(round_number, current)
+    while True:
+        data = os.read(fd, 64)
+        if not data:
+            break
+        pending += data
+        while pending:
+            if pending[:3] in (b'\x1b[A', b'\x1bOA'):
+                current, pending = max(current - 1, 0), pending[3:]
+            elif pending[:3] in (b'\x1b[B', b'\x1bOB'):
+                current, pending = min(current + 1, len(options) - 1), pending[3:]
+            elif pending[:1] in (b'\r', b'\n'):
+                pending = b''
+                sys.stdout.write('\x1b[2J\x1b[H 선택 결과: %d. %s (질문 #%d)\n\n> '
+                                 % (current + 1, options[current], round_number))
+                sys.stdout.flush()
+                time.sleep(4)
+                termios.tcflush(fd, termios.TCIFLUSH)
+                round_number, current = round_number + 1, 0
+                break
+            elif pending[:1] == b'\x1b' and len(pending) < 3:
+                break  # wait for the rest of the arrow sequence
+            else:
+                pending = pending[1:]
+        draw(round_number, current)
+finally:
+    termios.tcsetattr(fd, termios.TCSADRAIN, saved)
+'''
 
 
 class FakeNative:
@@ -120,6 +170,8 @@ def main(argv=None):
     parser.add_argument('--state-dir', type=Path)
     parser.add_argument('--token-file', type=Path)
     parser.add_argument('--tailscale-user-file', type=Path)
+    parser.add_argument('--menu-demo', action='store_true',
+                        help='보드 터미널을 방향키·Enter로 답하는 번호 메뉴로 실행하고 Claude 백그라운드 세션을 추가')
     args = parser.parse_args(argv)
     if not 0 <= args.port <= 65535:
         parser.error('포트는 0~65535 범위여야 합니다.')
@@ -138,15 +190,19 @@ def main(argv=None):
     tailscale_user = server.load_tailscale_user(args.tailscale_user_file) if args.tailscale_user_file else None
     now = int(time.time())
     rows = []
-    for index, (agent, home, title, phase) in enumerate([
-        ('codex', '.codex-isolated', '실제 세션 입력 · 한글과 첨부 검증', 'idle'),
-        ('codex', '.codex-isolated', '진행 중인 작업 · 실행 중 입력 검증', 'working'),
-        ('claude', '.claude', 'Claude · 터미널 입력과 첨부 경로 검증', 'needs_input'),
-    ], 1):
+    sessions = [
+        ('codex', '.codex-isolated', '실제 세션 입력 · 한글과 첨부 검증', 'idle', 'interactive'),
+        ('codex', '.codex-isolated', '진행 중인 작업 · 실행 중 입력 검증', 'working', 'interactive'),
+        ('claude', '.claude', 'Claude · 터미널 입력과 첨부 경로 검증', 'needs_input', 'interactive'),
+    ]
+    if args.menu_demo:
+        # No board terminal until "질문 불러오기" attaches it (promptOpenable).
+        sessions.append(('claude', '.claude', 'Claude 백그라운드 · 질문 응답 검증', 'needs_input', 'background'))
+    for index, (agent, home, title, phase, kind) in enumerate(sessions, 1):
         cwd = directory / ('workspace-' + str(index))
         cwd.mkdir(exist_ok=True, mode=0o700)
         rows.append({'id': f'019aaaaa-0000-7000-8000-{index:012d}', 'agent': agent, 'home': home,
-                     'title': title, 'phase': phase, 'cwd': str(cwd), 'kind': 'interactive',
+                     'title': title, 'phase': phase, 'cwd': str(cwd), 'kind': kind,
                      'account': '검증 계정', 'project': '메시지 검증', 'updatedAt': now - index,
                      'snippet': '모델·SSH 호출 없는 검증용 세션입니다.'})
     fake = FakeNative(rows)
@@ -178,7 +234,8 @@ def main(argv=None):
     flow.profiles = profiles
     flow.transfers.rpc = fake.rpc
     echo = "import sys\nprint('검증용 실제 PTY · 모델 호출 없음',flush=True)\nfor line in sys.stdin:\n print('받은 입력: '+line.rstrip(),flush=True)\n"
-    launch.build_launch = lambda *a, **kw: {'argv': [sys.executable, '-u', '-c', echo], 'cwd': str(directory), 'env': {'PATH': os.environ['PATH'], 'LANG': 'en_US.UTF-8'}}
+    program = MENU_DEMO if args.menu_demo else echo
+    launch.build_launch = lambda *a, **kw: {'argv': [sys.executable, '-u', '-c', program], 'cwd': str(directory), 'env': {'PATH': os.environ['PATH'], 'LANG': 'en_US.UTF-8'}}
     httpd = server.make_server('127.0.0.1', args.port, board, token, terminals=manager, workflow=flow,
                               state_dir=directory, tailscale_user=tailscale_user)
     print(f'메시지 검증용 보드: http://127.0.0.1:{httpd.server_address[1]}/ · 상태 경로: {directory}', flush=True)

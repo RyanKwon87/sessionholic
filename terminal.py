@@ -10,6 +10,7 @@ import copy
 from contextlib import contextmanager
 import fcntl
 import json
+import math
 import os
 from pathlib import Path
 import pty
@@ -33,6 +34,14 @@ INPUT_LIMIT = 32 * 1024
 MAX_TERMINALS = 4
 HISTORY_LIMIT = 20000
 SCROLL_LIMIT = 200
+WHEEL_LIMIT = 40
+KEY_NAMES = frozenset(("Up", "Down", "Enter"))
+KEY_LIMIT = 40
+# One display-message call; scroll_position is empty outside copy-mode, so the
+# fields are split on an explicit separator rather than on whitespace.
+PANE_FORMAT = ("#{alternate_on}|#{mouse_any_flag}|#{mouse_sgr_flag}|#{pane_width}|#{pane_height}"
+               "|#{pane_in_mode}|#{scroll_position}|#{history_size}")
+PANE_FIELDS = ("alternate", "mouse", "sgr", "width", "height", "inMode", "position", "history")
 DEFAULT_STATE = Path.home() / ".local/state/sessionholic/terminals"
 
 
@@ -114,6 +123,9 @@ class _Terminal:
         self.alive = not record.get("closed", False)
         self.epoch = secrets.token_hex(16)
         self.scrolled = False
+        # Set when a new attach client starts: the first input then also leaves any
+        # copy-mode, whose in-memory flag a gateway restart would have lost.
+        self.attached_fresh = False
 
     def append(self, data):
         with self.condition:
@@ -332,6 +344,8 @@ class TerminalManager:
                 terminal.alive = False
                 return
             self._configure(terminal)
+            # A copy-mode left behind by an earlier gateway would capture the keys.
+            self._cancel_mode(terminal)
             master, slave = pty.openpty()
             fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 30, 120, 0, 0))
             attach_env = dict(os.environ)
@@ -351,6 +365,7 @@ class TerminalManager:
             terminal.generation += 1
             generation = terminal.generation
             terminal.alive = True
+            terminal.attached_fresh = True
             threading.Thread(target=self._reader, args=(terminal, process, master, generation), daemon=True).start()
 
     def _configure(self, terminal):
@@ -438,34 +453,88 @@ class TerminalManager:
                     raise RuntimeError("터미널에 입력하지 못했습니다.") from None
         return {"ok": True}
 
+    def _cancel_mode(self, terminal):
+        # Outside a mode tmux answers "not in a mode" and sends nothing to the CLI.
+        try:
+            self._run("send-keys", "-t", terminal.record["name"], "-X", "cancel")
+        except RuntimeError:
+            pass
+
     def _leave_scroll(self, terminal):
         # Keys typed while tmux shows history would drive copy-mode instead of the CLI.
-        if terminal.scrolled:
-            terminal.scrolled = False
-            self._run("send-keys", "-t", terminal.record["name"], "-X", "cancel")
+        if terminal.scrolled or terminal.attached_fresh:
+            terminal.scrolled = terminal.attached_fresh = False
+            self._cancel_mode(terminal)
+
+    def _pane(self, terminal):
+        """Live pane flags; _run discards stdout, so this is its own bounded call."""
+        try:
+            done = subprocess.run(self._command("display-message", "-p", "-t", terminal.record["name"], PANE_FORMAT),
+                                  stdin=subprocess.DEVNULL, capture_output=True, timeout=10)
+        except (OSError, subprocess.TimeoutExpired):
+            raise RuntimeError("터미널 상태를 확인하지 못했습니다.") from None
+        values = done.stdout.decode("ascii", "replace").strip().split("|")
+        if done.returncode != 0 or len(values) != len(PANE_FIELDS):
+            raise RuntimeError("터미널 상태를 확인하지 못했습니다.")
+        try:
+            return {key: int(value or 0) for key, value in zip(PANE_FIELDS, values)}
+        except ValueError:
+            raise RuntimeError("터미널 상태를 확인하지 못했습니다.") from None
 
     def scroll(self, terminal_id, lines):
-        """Move through tmux history; the CLI itself never receives these keys."""
+        """Scroll the view: wheel events for a full-screen mouse app, tmux history otherwise.
+
+        A remote TUI on the alternate screen leaves tmux no history to show, so it
+        receives the wheel events a local terminal would send. History scrolling
+        itself never reaches the CLI.
+        """
         if isinstance(lines, bool) or not isinstance(lines, int) or not 0 < abs(lines) <= SCROLL_LIMIT:
             raise ValueError("스크롤 범위가 올바르지 않습니다.")
         with self.lock:
             terminal = self._get(terminal_id)
         if terminal.record.get("closed", False) or not terminal.alive:
             raise RuntimeError("터미널 연결이 종료되었습니다.")
+        pane = self._pane(terminal)
+        if pane["alternate"] and pane["mouse"]:
+            return self._wheel(terminal, pane, lines)
         name = terminal.record["name"]
         if lines < 0:
+            if not pane["history"]:
+                # Nothing above the screen: an empty copy-mode would only trap input.
+                return {"ok": True, "mode": "history", "position": 0}
             # -e leaves history automatically once the view returns to the bottom.
             done = self._run("copy-mode", "-e", "-t", name, ";",
                              "send-keys", "-t", name, "-X", "-N", str(-lines), "scroll-up")
             if done.returncode != 0:
                 raise RuntimeError("터미널 기록을 스크롤하지 못했습니다.")
             terminal.scrolled = True
-        elif terminal.scrolled:
+        elif pane["inMode"]:
             # Outside history there is nothing below the live screen to scroll to.
-            done = self._run("send-keys", "-t", name, "-X", "-N", str(lines), "scroll-down")
-            if done.returncode != 0:
-                terminal.scrolled = False
-        return {"ok": True}
+            self._run("send-keys", "-t", name, "-X", "-N", str(lines), "scroll-down")
+        try:
+            after = self._pane(terminal)
+        except RuntimeError:
+            return {"ok": True, "mode": "history", "position": None}
+        terminal.scrolled = bool(after["inMode"])
+        return {"ok": True, "mode": "history", "position": after["position"] if after["inMode"] else 0}
+
+    def _wheel(self, terminal, pane, lines):
+        # One wheel notch per three lines at the pane centre, in the app's mouse encoding.
+        count = min(max(math.ceil(abs(lines) / 3), 1), WHEEL_LIMIT)
+        button = 64 if lines < 0 else 65
+        x, y = max(pane["width"] // 2, 1), max(pane["height"] // 2, 1)
+        if pane["sgr"]:
+            event = "\x1b[<%d;%d;%dM" % (button, x, y)
+        else:
+            event = "\x1b[M" + chr(32 + button) + chr(32 + min(x, 223)) + chr(32 + min(y, 223))
+        with terminal.io_lock:
+            if pane["inMode"]:
+                self._cancel_mode(terminal)
+            terminal.scrolled = False
+            done = self._run("send-keys", "-t", terminal.record["name"], "-l", event * count)
+        if done.returncode != 0:
+            raise RuntimeError("터미널 화면을 스크롤하지 못했습니다.")
+        return {"ok": True, "mode": "app", "position": None}
 
     def capture(self, terminal_id):
         """Visible screen text of the live pane (no history, no escape sequences)."""
@@ -481,6 +550,22 @@ class TerminalManager:
         if done.returncode != 0:
             raise RuntimeError("터미널 화면을 확인하지 못했습니다.")
         return done.stdout.decode("utf-8", "replace")
+
+    def send_keys(self, terminal_id, keys):
+        """Press named navigation keys (a menu answer) in one tmux call; never text."""
+        if (not isinstance(keys, (list, tuple)) or not keys or len(keys) > KEY_LIMIT
+                or any(not isinstance(key, str) or key not in KEY_NAMES for key in keys)):
+            raise ValueError("보낼 수 없는 키 입력입니다.")
+        with self.lock:
+            terminal = self._get(terminal_id)
+        if terminal.record.get("closed", False) or not terminal.alive:
+            raise RuntimeError("터미널 연결이 종료되었습니다.")
+        self._leave_scroll(terminal)
+        with terminal.io_lock:
+            done = self._run("send-keys", "-t", terminal.record["name"], *keys)
+            if done.returncode != 0:
+                raise InputNotSent("터미널에 키를 보내지 못했습니다.")
+        return {"ok": True}
 
     def scroll_end(self, terminal_id):
         with self.lock:

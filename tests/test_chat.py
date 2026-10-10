@@ -2,13 +2,18 @@ import base64
 import hashlib
 import http.client
 import json
+import os
 from pathlib import Path
+import secrets
+import shutil
+import subprocess
+import sys
 import tempfile
 import threading
 import time
 import unittest
 from urllib.parse import quote
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import attachments
 import chat
@@ -22,6 +27,191 @@ REF = {'host':'local','agent':'codex','home':'.codex','id':SID}
 CLAUDE_SID = '019bbbbb-0000-7000-8000-000000000002'
 CLAUDE_REF = {'host':'local','agent':'claude','home':None,'id':'bg12345678'}
 TERMINAL_ID = 'a' * 32
+CODEX_TERMINAL_ID = 'c' * 32
+
+# Screens in the shapes Claude Code and Codex draw (wording from their binaries).
+CLAUDE_PERMISSION = """\
+● 빌드 폴더를 지우겠습니다.
+
+ Bash command
+
+   rm -rf build
+   Remove build dir
+
+ Do you want to proceed?
+ ❯ 1. Yes
+   2. Yes, and don't ask again for rm commands in /work
+   3. No, and tell Claude what to do differently (esc)
+"""
+CLAUDE_BOXED = """\
+> 빌드 폴더 정리해줘
+
+╭──────────────────────────────────────────────────────────╮
+│ Bash command                                             │
+│                                                          │
+│   rm -rf build                                           │
+│   Remove build dir                                       │
+│                                                          │
+│ Do you want to proceed?                                  │
+│ ❯ 1. Yes                                                 │
+│   2. Yes, and don't ask again for rm commands in /work   │
+│   3. No, and tell Claude what to do differently (esc)    │
+╰──────────────────────────────────────────────────────────╯
+"""
+CLAUDE_QUESTION = """\
+● 질문이 있습니다.
+
+ ☐ 방식
+
+어떤 방식으로 할까요?
+
+❯ 1. 옵션 A
+     A 설명
+  2. 옵션 B
+     B 설명
+     둘째 줄 설명
+  3. Type something.
+
+Enter to select · Tab/Arrow keys to navigate · Esc to cancel
+"""
+CODEX_APPROVAL = """\
+• Ran ls
+  └ build
+
+  Would you like to run the following command?
+
+  $ rm -rf build
+
+› 1. Yes, proceed (y)
+  2. Yes, and don't ask again for commands that start with `rm` (p)
+  3. No, and tell Codex what to do differently (esc)
+
+  Press enter to confirm or esc to cancel
+"""
+ANSWER_WITH_LIST = """\
+● 다음 단계 후보입니다.
+
+  1. 테스트 추가
+  2. 문서 정리
+  3. 배포 확인
+
+  원하는 번호를 알려 주세요.
+
+────────────────────────────────────────
+>
+────────────────────────────────────────
+  ? for shortcuts
+"""
+DEMO_MENU = """\
+ 검증 질문 #1
+
+ 계속 진행할까요?
+
+ ❯ 1. Yes
+   2. No
+
+ ↑/↓ 이동 · Enter 선택
+"""
+
+
+class MenuParserTest(unittest.TestCase):
+    def options(self, menu):
+        return [(o['number'], o['label'], o['detail']) for o in menu['options']]
+
+    def test_claude_permission_menu(self):
+        menu = chat.parse_menu(CLAUDE_PERMISSION)
+        self.assertEqual(menu['question'], '  rm -rf build\n  Remove build dir\n\nDo you want to proceed?')
+        self.assertEqual(self.options(menu), [
+            (1, 'Yes', ''), (2, "Yes, and don't ask again for rm commands in /work", ''),
+            (3, 'No, and tell Claude what to do differently (esc)', '')])
+        self.assertEqual(menu['current'], 1)
+        self.assertFalse(menu['multi'])
+        self.assertEqual(set(menu), {'question', 'options', 'current', 'multi', 'fingerprint'})
+        expected = hashlib.sha256(json.dumps(
+            [menu['question'], [list(option) for option in self.options(menu)]], ensure_ascii=False).encode()).hexdigest()
+        self.assertEqual(menu['fingerprint'], expected)
+
+    def test_box_borders_are_removed_and_the_frame_bounds_the_question(self):
+        menu = chat.parse_menu(CLAUDE_BOXED)
+        plain = chat.parse_menu(CLAUDE_PERMISSION)
+        self.assertEqual(menu['question'], plain['question'])
+        self.assertEqual(self.options(menu), self.options(plain))
+        self.assertEqual(menu['fingerprint'], plain['fingerprint'])
+        self.assertEqual(menu['current'], 1)
+        # Only the frame's own rows count: the user's earlier input above it is not the question.
+        framed = '> 빌드 폴더 정리해줘\n╭──────────────╮\n│ 계속할까요?  │\n│ ❯ 1. 예      │\n│   2. 아니요  │\n╰──────────────╯\n'
+        menu = chat.parse_menu(framed)
+        self.assertEqual(menu['question'], '계속할까요?')
+        self.assertEqual(self.options(menu), [(1, '예', ''), (2, '아니요', '')])
+
+    def test_claude_question_with_descriptions_and_guidance_below(self):
+        menu = chat.parse_menu(CLAUDE_QUESTION)
+        # Only the indentation common to every kept row is removed.
+        self.assertEqual(menu['question'], ' ☐ 방식\n\n어떤 방식으로 할까요?')
+        self.assertEqual(self.options(menu), [(1, '옵션 A', 'A 설명'), (2, '옵션 B', 'B 설명\n둘째 줄 설명'),
+                                              (3, 'Type something.', '')])
+        self.assertEqual(menu['current'], 1)
+        self.assertFalse(menu['multi'])
+
+    def test_codex_approval(self):
+        menu = chat.parse_menu(CODEX_APPROVAL)
+        self.assertEqual(menu['question'], 'Would you like to run the following command?\n\n$ rm -rf build')
+        self.assertEqual([o['label'] for o in menu['options']], [
+            'Yes, proceed (y)', "Yes, and don't ask again for commands that start with `rm` (p)",
+            'No, and tell Codex what to do differently (esc)'])
+        self.assertEqual(menu['current'], 1)
+
+    def test_cursor_position_is_not_part_of_the_fingerprint(self):
+        first = chat.parse_menu(CODEX_APPROVAL)
+        moved = chat.parse_menu(CODEX_APPROVAL.replace('› 1. Yes', '  1. Yes').replace('  2. Yes', '› 2. Yes'))
+        self.assertEqual(moved['current'], 2)
+        self.assertEqual(moved['fingerprint'], first['fingerprint'])
+        changed = chat.parse_menu(CODEX_APPROVAL.replace('rm -rf build', 'rm -rf dist'))
+        self.assertNotEqual(changed['fingerprint'], first['fingerprint'])
+
+    def test_without_exactly_one_cursor_current_is_unknown(self):
+        bare = CLAUDE_PERMISSION.replace('❯ 1.', '  1.')
+        self.assertIsNone(chat.parse_menu(bare)['current'])
+        both = CLAUDE_PERMISSION.replace('   2. Yes,', ' ❯ 2. Yes,')
+        self.assertIsNone(chat.parse_menu(both)['current'])
+
+    def test_multi_select_labels(self):
+        for mark in ('[ ]', '[x]', '☐', '☒', '◯', '◉'):
+            with self.subTest(mark=mark):
+                screen = CLAUDE_QUESTION.replace('1. 옵션 A', '1. ' + mark + ' 옵션 A')
+                self.assertTrue(chat.parse_menu(screen)['multi'])
+        # The "☐ 방식" header above the options is not an option label.
+        self.assertFalse(chat.parse_menu(CLAUDE_QUESTION)['multi'])
+
+    def test_answer_lists_and_input_prompts_are_not_menus(self):
+        self.assertIsNone(chat.parse_menu(ANSWER_WITH_LIST))
+        for prompt in ('> ', '❯ ', '› Ask Codex to do anything'):
+            with self.subTest(prompt=prompt):
+                screen = '● 후보\n\n  1. 첫째\n  2. 둘째\n\n' + prompt + '\n'
+                self.assertIsNone(chat.parse_menu(screen))
+        # A cursor-less list followed by more than six lines of answer text.
+        far = '  1. 첫째\n  2. 둘째\n' + ''.join('설명 %d\n' % i for i in range(7))
+        self.assertIsNone(chat.parse_menu(far))
+        for screen in ('', '\n\n', '> ', '❯ 1. Yes\n', '❯ 1. Yes\n  3. No\n', '  2. Yes\n❯ 3. No\n',
+                       '❯ 1. Yes\n────\n  2. No\n', '❯ 1. Yes\n설명 없는 줄\n  2. No\n'):
+            with self.subTest(screen=screen):
+                self.assertIsNone(chat.parse_menu(screen))
+
+    def test_guidance_lines_below_the_menu_are_allowed_within_six_lines(self):
+        hints = '\n'.join(['', '안내 1', '안내 2', '안내 3', '안내 4', '안내 5'])
+        self.assertIsNotNone(chat.parse_menu(CLAUDE_PERMISSION.rstrip('\n') + '\n' + hints))
+        self.assertIsNone(chat.parse_menu(CLAUDE_PERMISSION.rstrip('\n') + '\n' + hints + '\n안내 6'))
+        menu = chat.parse_menu(DEMO_MENU)
+        self.assertEqual(menu['question'], '검증 질문 #1\n\n계속 진행할까요?')
+        self.assertEqual(self.options(menu), [(1, 'Yes', ''), (2, 'No', '')])
+
+    def test_question_is_two_blocks_and_twelve_lines_at_most(self):
+        long_block = '\n'.join('줄 %02d' % i for i in range(20))
+        screen = '맨 위 블록\n\n' + long_block + '\n\n❯ 1. 예\n  2. 아니요\n'
+        question = chat.parse_menu(screen)['question'].split('\n')
+        self.assertEqual(question, ['줄 %02d' % i for i in range(8, 20)])
+        screen = '셋째\n\n둘째\n\n첫째\n❯ 1. 예\n  2. 아니요\n'
+        self.assertEqual(chat.parse_menu(screen)['question'], '둘째\n\n첫째')
 
 
 class ChatTest(unittest.TestCase):
@@ -137,7 +327,10 @@ class ChatTest(unittest.TestCase):
                 'queueState':{'available':True,'complete':True,'total':1,'truncated':False,'reason':'PRIVATE'}}
         self.flow.transfers.rpc=lambda *a,**k:result
         state=self.chat.state({'source':REF,'requestId':'request-0001'})
-        self.assertEqual(set(state),{'route','phase','capability','messages','receipts','maxAttachmentBytes','requiresNativeTerminal'})
+        self.assertEqual(set(state),{'route','phase','capability','messages','receipts','maxAttachmentBytes','requiresNativeTerminal',
+                                     'prompt','promptOpenable'})
+        self.assertIsNone(state['prompt'])
+        self.assertFalse(state['promptOpenable'])
         self.assertEqual(set(state['capability']),{'supported','attachments','reason'})
         self.assertTrue(state['capability']['supported'])
         self.assertNotIn('PRIVATE',json.dumps(state))
@@ -240,6 +433,71 @@ class ChatTest(unittest.TestCase):
             with self.assertRaises(ValueError):
                 self.chat.send({'source':REF,'requestId':'request-0001','text':'ok',**fields})
 
+    def codex_terminal(self, metadata=False, **native):
+        terms = FakeTerminals()
+        source = {**REF, 'cwd': str(self.project), **native}
+        row = {'id': CODEX_TERMINAL_ID, 'alive': True, 'closed': False}
+        row.update({'metadata': {'nativeSource': source}} if metadata else {'nativeSource': source})
+        terms.rows.append(row)
+        terms.screen = CODEX_APPROVAL
+        self.flow.terminals = terms
+        self.chat.cache.clear()
+        return terms
+
+    def test_codex_board_terminal_matches_exact_id_and_home(self):
+        for metadata in (False, True):
+            with self.subTest(metadata=metadata):
+                self.codex_terminal(metadata)
+                state = self.chat.state({'source': REF})
+                self.assertEqual(state['prompt']['agent'], 'codex')
+                self.assertEqual(state['prompt']['terminalId'], CODEX_TERMINAL_ID)
+                self.assertEqual(state['prompt']['current'], 1)
+                self.assertFalse(state['promptOpenable'])
+        for native in ({'home': '.codex-other'}, {'home': None}, {'id': SID[:-1] + '9'}, {'host': 'other'},
+                       {'agent': 'claude'}):
+            with self.subTest(native=native):
+                terms = self.codex_terminal(**native)
+                state = self.chat.state({'source': REF})
+                self.assertIsNone(state['prompt'])
+                self.assertFalse(state['promptOpenable'])
+                self.assertNotIn('capture', terms.log)
+        for change in ({'alive': False}, {'closed': True}):
+            with self.subTest(change=change):
+                terms = self.codex_terminal()
+                terms.rows[0].update(change)
+                self.assertIsNone(self.chat.state({'source': REF})['prompt'])
+                self.assertNotIn('capture', terms.log)
+        same = chat.Chat._same_native
+        codex = {'host': 'local', 'agent': 'codex', 'id': SID}
+        self.assertTrue(same({**codex, 'home': None}, codex))
+        self.assertTrue(same({**codex, 'home': ''}, {**codex, 'home': None}))
+        self.assertFalse(same({**codex, 'id': None}, {**codex, 'id': None}))
+        self.assertFalse(same({**codex, 'sessionId': SID, 'id': 'other'}, codex))
+        # A failing terminal list never breaks the Codex chat view.
+        terms = self.codex_terminal()
+        terms.list = lambda: (_ for _ in ()).throw(RuntimeError('fixture'))
+        state = self.chat.state({'source': REF})
+        self.assertIsNone(state['prompt'])
+        self.assertTrue(state['capability']['supported'])
+
+    def test_codex_menu_is_answered_through_its_board_terminal(self):
+        terms = self.codex_terminal()
+        fingerprint = chat.parse_menu(CODEX_APPROVAL)['fingerprint']
+        self.assertEqual(self.chat.prompt({'source': REF, 'action': 'open'})['prompt']['fingerprint'], fingerprint)
+        terms.screens = [CODEX_APPROVAL, '› Ask Codex to do anything\n']
+        with patch.object(chat.time, 'sleep'):
+            result = self.chat.prompt({'source': REF, 'action': 'answer', 'fingerprint': fingerprint,
+                                       'number': 2, 'requestId': 'answer-0001'})
+        self.assertEqual(result['status'], 'answered')
+        self.assertIsNone(result['prompt'])
+        self.assertEqual(terms.keys, [(CODEX_TERMINAL_ID, ['Down', 'Enter'])])
+        # The host chat RPC was never asked to send anything.
+        self.assertNotIn('send', [args.get('action') for _, _, args in self.calls])
+        self.flow.terminals = FakeTerminals()
+        with self.assertRaises(chat.PromptRejected) as caught:
+            self.chat.prompt({'source': REF, 'action': 'open'})
+        self.assertEqual(caught.exception.code, 'terminal_required')
+
 
 class ChatHttpTest(ChatTest):
     def setUp(self):
@@ -269,15 +527,45 @@ class ChatHttpTest(ChatTest):
         auth={'Authorization':'Bearer synthetic','X-CSRF-Token':self.httpd.csrf,
               'Content-Length':str(chat.MAX_FILE+1)}
         self.assertEqual(self.upload_request(auth,b'')[0],400)
+    def post(self, path, body):
+        c=http.client.HTTPConnection('127.0.0.1',self.port,timeout=5)
+        c.request('POST',path,json.dumps(body),{'Content-Type':'application/json','Authorization':'Bearer synthetic',
+                                                 'X-CSRF-Token':self.httpd.csrf})
+        r=c.getresponse(); data=json.loads(r.read()); c.close(); return r.status,data
+    def test_prompt_route_answers_and_reports_refusals_with_a_code(self):
+        terms=self.codex_terminal()
+        fingerprint=chat.parse_menu(CODEX_APPROVAL)['fingerprint']
+        answer={'source':REF,'action':'answer','fingerprint':fingerprint,'number':1}
+        status,data=self.post('/api/chat/state',{'source':REF})
+        self.assertEqual(status,200)
+        self.assertEqual(data['prompt']['fingerprint'],fingerprint)
+        status,data=self.post('/api/chat/prompt',{**answer,'fingerprint':'f'*64,'requestId':'answer-0001'})
+        self.assertEqual((status,data['code']),(409,'prompt_changed'))
+        self.assertEqual(data['error'],chat.PROMPT_CHANGED)
+        status,data=self.post('/api/chat/prompt',{**answer,'number':True,'requestId':'answer-0001'})
+        self.assertEqual(status,400)
+        self.assertNotIn('code',data)
+        self.assertEqual(terms.keys,[])
+        terms.screens=[CODEX_APPROVAL,'']
+        with patch.object(chat.time,'sleep'):
+            status,data=self.post('/api/chat/prompt',{**answer,'requestId':'answer-0002'})
+        self.assertEqual(status,200)
+        self.assertEqual((data['status'],data['prompt']),('answered',None))
+        self.assertEqual(terms.keys,[(CODEX_TERMINAL_ID,['Enter'])])
+        # The terminal scroll route returns the scroll mode instead of a bare ok.
+        self.httpd.terminals=terms
+        status,data=self.post('/api/terminal/'+CODEX_TERMINAL_ID+'/scroll',{'lines':-3})
+        self.assertEqual((status,data),(200,{'ok':True,'mode':'app','position':None}))
 
 
 class FakeTerminals:
     """Board terminal manager boundary: no tmux, no CLI, only recorded calls."""
     def __init__(self):
-        self.rows, self.pastes, self.log = [], [], []
-        self.paste_error = None
+        self.rows, self.pastes, self.log, self.keys = [], [], [], []
+        self.paste_error = self.keys_error = self.capture_error = None
         self.chunks = [{'after': 0, 'alive': True}]
         self.screen = '> '
+        self.screens = []  # captured in order first, then `screen`
     def list(self):
         return [json.loads(json.dumps(row)) for row in self.rows]
     def paste(self, terminal_id, text, submit=True):
@@ -288,7 +576,17 @@ class FakeTerminals:
         return {'ok': True}
     def capture(self, terminal_id):
         self.log.append('capture')
-        return self.screen
+        if self.capture_error:
+            raise self.capture_error
+        return self.screens.pop(0) if self.screens else self.screen
+    def send_keys(self, terminal_id, keys):
+        self.log.append('keys')
+        if self.keys_error:
+            raise self.keys_error
+        self.keys.append((terminal_id, list(keys)))
+        return {'ok': True}
+    def scroll(self, terminal_id, lines):
+        return {'ok': True, 'mode': 'app', 'position': None}
     def read(self, terminal_id, after=0, wait=20, epoch=None):
         self.log.append('read')
         time.sleep(min(wait, 0.02))
@@ -474,7 +772,9 @@ class ChatClaudeTest(unittest.TestCase):
     def test_selection_menu_on_screen_or_unknown_state_never_types_into_terminal(self):
         self.terminal()
         self.phase = 'needs_input'
-        for menu in ('Do you want to proceed?\n❯ 1. Yes\n  2. No', '│ ❯ 1. Yes, allow once'):
+        # The same parse_menu that feeds the web answers decides the block, with or without a cursor.
+        for menu in ('Do you want to proceed?\n❯ 1. Yes\n  2. No', CLAUDE_PERMISSION, CLAUDE_BOXED, CLAUDE_QUESTION,
+                     CLAUDE_PERMISSION.replace('❯ 1.', '  1.'), '│ ❯ 1. Yes, allow once │\n│   2. No │'):
             with self.subTest(menu=menu):
                 self.terms.screen = menu
                 with patch.object(self.flow, 'plan') as plan:
@@ -509,6 +809,11 @@ class ChatClaudeTest(unittest.TestCase):
         self.assertEqual(self.send(text='다음 단계 진행해')['status'], 'accepted')
         self.assertEqual(self.terms.pastes, [(TERMINAL_ID, '다음 단계 진행해', True)])
         self.assertEqual(self.terms.log[-2:], ['capture', 'paste'])
+        # A numbered list in the answer above the input line is not a menu (the old regex
+        # blocked any "> 1." on screen; only a menu ending the screen blocks now).
+        self.terms.screen = ANSWER_WITH_LIST.replace('  1. 테스트', '> 1. 테스트')
+        self.assertEqual(self.send(rid='request-0002', text='2번')['status'], 'accepted')
+        self.assertEqual(len(self.terms.pastes), 2)
 
     def test_input_not_sent_releases_reservation_and_rejects(self):
         self.terminal()
@@ -568,6 +873,336 @@ class ChatClaudeTest(unittest.TestCase):
         self.assertNotIn(uploaded['path'], self.records()[0].read_text())
         self.send(rid='request-0002', text='', attachments=[uploaded['id']])
         self.assertEqual(self.terms.pastes[1][1], '첨부 파일: ' + uploaded['path'])
+
+    # ---------- menus answered from the web ----------
+    def answer(self, number, fingerprint=None, rid='answer-0001', source=CLAUDE_REF):
+        if fingerprint is None:
+            fingerprint = chat.parse_menu(CLAUDE_PERMISSION)['fingerprint']
+        return self.chat.prompt({'source': source, 'action': 'answer', 'fingerprint': fingerprint,
+                                 'number': number, 'requestId': rid})
+
+    def refused(self, *args, **kwargs):
+        with self.assertRaises(chat.PromptRejected) as caught:
+            self.answer(*args, **kwargs)
+        self.assertEqual(caught.exception.status, 409)
+        return caught.exception
+
+    def test_state_reports_the_board_terminal_menu_and_whether_one_can_be_opened(self):
+        state = self.state()
+        self.assertIsNone(state['prompt'])
+        self.assertTrue(state['promptOpenable'])
+        self.terminal()
+        self.terms.screen = CLAUDE_PERMISSION
+        state = self.state()
+        self.assertFalse(state['promptOpenable'])
+        prompt = state['prompt']
+        self.assertEqual(prompt['terminalId'], TERMINAL_ID)
+        self.assertEqual(prompt['agent'], 'claude')
+        self.assertEqual(prompt['current'], 1)
+        self.assertFalse(prompt['multi'])
+        self.assertEqual(prompt['fingerprint'], chat.parse_menu(CLAUDE_PERMISSION)['fingerprint'])
+        self.assertEqual([o['number'] for o in prompt['options']], [1, 2, 3])
+        self.assertEqual(set(prompt), {'question', 'options', 'current', 'multi', 'fingerprint', 'terminalId', 'agent'})
+        # Displayed text is redacted like messages, while the fingerprint stays the screen's.
+        secret = CLAUDE_PERMISSION.replace('rm -rf build', 'curl -H "Authorization: Bearer abcdefghijklmnop"')
+        self.terms.screen = secret
+        prompt = self.state()['prompt']
+        self.assertIn('[redacted]', prompt['question'])
+        self.assertNotIn('abcdefghijklmnop', json.dumps(prompt))
+        self.assertEqual(prompt['fingerprint'], chat.parse_menu(secret)['fingerprint'])
+        for screen, error in (('● 완료했습니다.\n\n> ', None), (CLAUDE_PERMISSION, RuntimeError('fixture capture'))):
+            with self.subTest(screen=screen[:8], error=error):
+                self.terms.screen, self.terms.capture_error = screen, error
+                state = self.state()
+                self.assertIsNone(state['prompt'])
+                self.assertTrue(state['capability']['supported'])
+        self.terms.capture_error = None
+        self.terms.rows = []
+        self.kind('interactive')
+        state = self.state()
+        self.assertIsNone(state['prompt'])
+        self.assertFalse(state['promptOpenable'])
+        self.kind('background')
+        with patch.object(self.terms, 'list', side_effect=RuntimeError('fixture terminal state')):
+            state = self.state()
+        self.assertIsNone(state['prompt'])
+        self.assertFalse(state['promptOpenable'])
+        self.assertEqual(self.terms.keys, [])
+
+    def test_open_attaches_a_background_session_once_then_reads_its_menu(self):
+        self.terms.chunks = [{'after': 10, 'alive': True}, {'after': 25, 'alive': True}, {'after': 25, 'alive': True}]
+        self.terms.screen = CLAUDE_QUESTION
+        def launch(plan_id, request_id):
+            self.terms.log.append('launch')
+            self.terminal()
+            return {'terminal': {'id': TERMINAL_ID}}
+        with patch.object(self.flow, 'plan', return_value={'allowed': True, 'id': 'plan-1'}) as plan, \
+                patch.object(self.flow, 'launch', side_effect=launch) as launched:
+            self.assertTrue(self.state()['promptOpenable'])
+            result = self.chat.prompt({'source': CLAUDE_REF, 'action': 'open', 'requestId': 'prompt-0001'})
+            launched.assert_called_once_with('plan-1', 'chat_' + hashlib.sha256(b'prompt-0001').hexdigest()[:40])
+            self.assertEqual(result['prompt']['terminalId'], TERMINAL_ID)
+            self.assertEqual(result['prompt']['options'][0]['detail'], 'A 설명')
+            self.assertEqual(self.terms.log[-1], 'capture')
+            # The attached terminal is reused; a request id is optional for opening.
+            again = self.chat.prompt({'source': CLAUDE_REF, 'action': 'open'})
+            self.assertEqual(again['prompt']['fingerprint'], result['prompt']['fingerprint'])
+            plan.assert_called_once()
+            launched.assert_called_once()
+            self.assertFalse(self.state()['promptOpenable'])
+        self.terms.screen = '> '
+        self.assertEqual(self.chat.prompt({'source': CLAUDE_REF, 'action': 'open'}), {'prompt': None})
+        self.assertEqual(self.terms.keys, [])
+        self.assertEqual(self.terms.pastes, [])
+
+    def test_open_without_an_attachable_terminal_is_refused(self):
+        self.kind('interactive')
+        with patch.object(self.flow, 'plan') as plan:
+            with self.assertRaises(chat.PromptRejected) as caught:
+                self.chat.prompt({'source': CLAUDE_REF, 'action': 'open'})
+        plan.assert_not_called()
+        self.assertEqual((caught.exception.status, caught.exception.code), (409, 'terminal_required'))
+        self.kind('background')
+        with patch.object(self.flow, 'plan', return_value={'allowed': False, 'reason': '연결 계획 거절'}):
+            with self.assertRaises(chat.PromptRejected) as caught:
+                self.chat.prompt({'source': CLAUDE_REF, 'action': 'open', 'requestId': 'prompt-0002'})
+        self.assertEqual(str(caught.exception), '연결 계획 거절')
+        self.assertEqual(caught.exception.code, 'terminal_unavailable')
+        for data in ({'action': 'close'}, {'action': 'open', 'requestId': 'bad id'},
+                     {'action': 'answer', 'fingerprint': 'f' * 64, 'number': 1}):
+            with self.subTest(data=data), self.assertRaises(ValueError) as caught:
+                self.chat.prompt({'source': CLAUDE_REF, **data})
+            self.assertNotIsInstance(caught.exception, chat.PromptRejected)
+
+    def test_answer_moves_the_cursor_presses_enter_and_confirms_on_the_next_screen(self):
+        self.terminal()
+        cases = [  # screen before, number, keys, screen after, status
+            (CLAUDE_PERMISSION, 3, ['Down', 'Down', 'Enter'], '● 삭제했습니다.\n\n> ', 'answered'),
+            (CLAUDE_PERMISSION, 1, ['Enter'], '', 'answered'),
+            (CLAUDE_PERMISSION.replace('❯ 1.', '  1.').replace('   2. Yes,', ' ❯ 2. Yes,'), 1, ['Up', 'Enter'],
+             '> ', 'answered'),
+            (CLAUDE_PERMISSION, 2, ['Down', 'Enter'], CLAUDE_QUESTION, 'answered'),
+            (CLAUDE_PERMISSION, 2, ['Down', 'Enter'], CLAUDE_PERMISSION.replace('❯ 1.', '  1.').replace('   2. Yes,', ' ❯ 2. Yes,'),
+             'unconfirmed'),
+        ]
+        for index, (before, number, keys, after, status) in enumerate(cases):
+            with self.subTest(case=index):
+                self.terms.screens = [before, after]
+                with patch.object(chat.time, 'sleep') as sleep:
+                    result = self.answer(number, rid='answer-%04d' % index)
+                sleep.assert_called_once_with(0.6)
+                self.assertEqual(self.terms.keys[-1], (TERMINAL_ID, keys))
+                self.assertEqual(result['status'], status)
+                self.assertEqual(result['requestId'], 'answer-%04d' % index)
+                self.assertEqual(result['number'], number)
+                expected = chat.parse_menu(after)
+                if expected is None:
+                    self.assertIsNone(result['prompt'])
+                    self.assertIsNone(result['reason'])
+                else:
+                    self.assertEqual(result['prompt']['fingerprint'], expected['fingerprint'])
+                    self.assertEqual(result['prompt']['terminalId'], TERMINAL_ID)
+        self.assertEqual(chat.PROMPT_SETTLE, 0.6)
+        self.assertIsNotNone(result['reason'])
+        self.assertEqual(self.terms.pastes, [])
+
+    def test_same_request_id_returns_the_saved_answer_without_pressing_again(self):
+        self.terminal()
+        self.terms.screens = [CLAUDE_PERMISSION, '> ']
+        with patch.object(chat.time, 'sleep'):
+            first = self.answer(2)
+            log = list(self.terms.log)
+            self.assertEqual(self.answer(2), first)
+        self.assertEqual(len(self.terms.keys), 1)
+        self.assertEqual(self.terms.log, log)
+        with self.assertRaises(ValueError) as caught:
+            self.answer(3)
+        self.assertNotIsInstance(caught.exception, chat.PromptRejected)
+        self.assertEqual(len(self.terms.keys), 1)
+        # Bounded in memory: the oldest saved answer is dropped first.
+        with patch.object(chat, 'PROMPT_RESULTS', 2), patch.object(chat.time, 'sleep'):
+            for rid in ('answer-0002', 'answer-0003'):
+                self.terms.screens = [CLAUDE_PERMISSION, '> ']
+                self.answer(1, rid=rid)
+        self.assertEqual(len(self.chat.prompt_results), 2)
+
+    def test_changed_or_unanswerable_menus_never_press_keys(self):
+        self.terminal()
+        fingerprint = chat.parse_menu(CLAUDE_PERMISSION)['fingerprint']
+        cases = [
+            (CLAUDE_PERMISSION.replace('rm -rf build', 'rm -rf src'), 1, '질문이 바뀌었거나'),
+            ('● 완료했습니다.\n\n> ', 1, '질문이 바뀌었거나'),
+            (CLAUDE_PERMISSION, 4, '없는 선택지'),
+            (CLAUDE_PERMISSION, 0, '없는 선택지'),
+            (CLAUDE_PERMISSION.replace('❯ 1.', '  1.'), 2, '현재 선택 위치'),
+        ]
+        for screen, number, reason in cases:
+            with self.subTest(reason=reason, number=number):
+                self.terms.screen = screen
+                exc = self.refused(number, fingerprint)
+                self.assertIn(reason, str(exc))
+                self.assertEqual(exc.code, 'prompt_changed')
+        multi = CLAUDE_QUESTION.replace('1. 옵션 A', '1. [ ] 옵션 A')
+        self.terms.screen = multi
+        self.assertIn('여러 개', str(self.refused(1, chat.parse_menu(multi)['fingerprint'])))
+        self.terms.screen = CLAUDE_PERMISSION
+        self.terms.capture_error = RuntimeError('fixture capture')
+        exc = self.refused(1)
+        self.assertEqual(exc.code, 'terminal_unavailable')
+        self.assertNotIn('fixture', str(exc))
+        self.terms.capture_error = None
+        for value in ('F' * 64, 'f' * 63, None, 64):
+            with self.subTest(fingerprint=value), self.assertRaises(ValueError):
+                self.chat.prompt({'source': CLAUDE_REF, 'action': 'answer', 'fingerprint': value,
+                                  'number': 1, 'requestId': 'answer-0001'})
+        for value in (True, 1.0, '1', None):
+            with self.subTest(number=value), self.assertRaises(ValueError):
+                self.answer(value)
+        self.assertEqual(self.terms.keys, [])
+        self.assertNotIn('keys', self.terms.log)
+        # Nothing was stored for refused requests: the same id answers once the menu matches.
+        with patch.object(chat.time, 'sleep'):
+            self.terms.screens = [CLAUDE_PERMISSION, '> ']
+            self.assertEqual(self.answer(1)['status'], 'answered')
+        self.terms.rows = []
+        self.assertEqual(self.refused(1, rid='answer-0099').code, 'terminal_required')
+        self.assertEqual(len(self.terms.keys), 1)
+
+    def test_keys_refused_by_tmux_may_retry_but_an_unknown_delivery_never_repeats(self):
+        self.terminal()
+        self.terms.screen = CLAUDE_PERMISSION
+        self.terms.keys_error = terminal.InputNotSent('터미널에 키를 보내지 못했습니다.')
+        exc = self.refused(2)
+        self.assertEqual((str(exc), exc.code), ('터미널에 키를 보내지 못했습니다.', 'terminal_unavailable'))
+        self.assertEqual(self.chat.prompt_results, {})
+        self.terms.keys_error = RuntimeError('fixture tmux timeout')
+        with patch.object(chat.time, 'sleep') as sleep:
+            result = self.answer(2)
+        sleep.assert_not_called()
+        self.assertEqual(result['status'], 'unconfirmed')
+        self.assertNotIn('fixture', json.dumps(result))
+        self.terms.keys_error = None
+        self.assertEqual(self.answer(2), result)
+        self.assertEqual(self.terms.keys, [])
+        # A confirmation capture that fails after the keys were sent is unconfirmed too.
+        self.terms.screens = [CLAUDE_PERMISSION]
+        with patch.object(self.terms, 'capture', side_effect=[CLAUDE_PERMISSION, RuntimeError('fixture')]), \
+                patch.object(chat.time, 'sleep'):
+            self.assertEqual(self.answer(2, rid='answer-0002')['status'], 'unconfirmed')
+        self.assertEqual(len(self.terms.keys), 1)
+
+    def test_answer_waits_for_a_terminal_send_and_clears_the_cached_state(self):
+        self.terminal()
+        self.terms.screen = CLAUDE_PERMISSION
+        self.assertIsNotNone(self.chat.state({'source': CLAUDE_REF})['prompt'])
+        reads = len(self.calls)
+        self.chat.state({'source': CLAUDE_REF})
+        self.assertEqual(len(self.calls), reads)
+        self.terms.screens = [CLAUDE_PERMISSION, '> ']
+        with patch.object(chat.time, 'sleep'):
+            self.answer(1)
+        self.terms.screen = '> '
+        self.assertIsNone(self.chat.state({'source': CLAUDE_REF})['prompt'])
+        self.assertEqual(len(self.calls), reads + 1)
+        self.assertTrue(self.chat.claude_lock.acquire(blocking=False))
+        self.chat.claude_lock.release()
+        # A paste or another answer in progress holds the same terminal input lock.
+        lock = self.chat.claude_lock
+        self.chat.claude_lock = Mock(acquire=Mock(return_value=False))
+        try:
+            self.terms.screen = CLAUDE_PERMISSION
+            exc = self.refused(1, rid='answer-0002')
+            self.assertEqual(exc.code, 'busy')
+            with self.assertRaises(chat.PromptRejected):
+                self.chat.prompt({'source': CLAUDE_REF, 'action': 'open'})
+            self.chat.claude_lock.acquire.assert_called_with(timeout=30)
+        finally:
+            self.chat.claude_lock = lock
+        self.assertEqual(len(self.terms.keys), 1)
+
+
+@unittest.skipUnless(shutil.which('tmux'), 'tmux fixture requires installed tmux')
+class MenuDemoTmuxTest(unittest.TestCase):
+    """The --menu-demo program in a unique tmux server, read and answered through Chat."""
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        root = Path(temp.name)
+        project = root / 'project'
+        project.mkdir()
+        socket = 'sb-test-' + secrets.token_hex(8)
+        self.manager = terminal.TerminalManager(state_dir=root / 'terminals', socket_name=socket, max_terminals=1)
+        # This unique test socket is the only server this fixture may stop.
+        self.addCleanup(subprocess.run, [shutil.which('tmux'), '-L', socket, 'kill-server'],
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
+        self.addCleanup(self.manager.close)
+        codex = {**REF, 'cwd': str(project), 'phase': 'needs_input', 'title': 'Menu fixture'}
+        claude = {'agent': 'claude', 'id': CLAUDE_REF['id'], 'sessionId': CLAUDE_SID, 'kind': 'background',
+                  'cwd': str(project), 'phase': 'needs_input', 'title': 'Claude menu fixture'}
+        board = server.Board([HOST], 60, runner=lambda *a: {'codex': [codex], 'claude': [claude]})
+        board.poll(HOST)
+        self.flow = server.Workflow(board, self.manager, root)
+        self.flow.transfers.rpc = lambda *a, **k: {'phase': 'needs_input', 'cwd': str(project), 'messages': [],
+                                                   'capabilities': {'canSend': True}}
+        self.chat = chat.Chat(board, self.flow, root)
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            'chat_preview_fixture_for_test', str(Path(__file__).with_name('chat_preview_fixture.py')))
+        fixture = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(fixture)
+        self.demo = {'argv': [sys.executable, '-u', '-c', fixture.MENU_DEMO], 'cwd': str(project),
+                     'env': {'PATH': os.environ.get('PATH', ''), 'LANG': 'en_US.UTF-8'}}
+
+    def wait_prompt(self, predicate, source=REF):
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            self.chat.cache.clear()
+            prompt = self.chat.state({'source': source})['prompt']
+            if predicate(prompt):
+                return prompt
+            time.sleep(0.1)
+        self.fail('the demo menu did not reach the expected screen')
+
+    def test_background_claude_menu_opens_through_the_real_attach_path(self):
+        # The fixture's "질문 불러오기": plan, launch, nativeSource metadata, settle, capture.
+        self.flow.profiles = lambda: [{'id': 'claude:default', 'agent': 'claude', 'home': '.claude',
+                                       'label': 'Fixture Claude', 'available': True}]
+        state = self.chat.state({'source': CLAUDE_REF})
+        self.assertTrue(state['promptOpenable'])
+        self.assertIsNone(state['prompt'])
+        with patch('launch.build_launch', return_value=self.demo), \
+                patch('launch.source_environment', return_value='default'):
+            result = self.chat.prompt({'source': CLAUDE_REF, 'action': 'open', 'requestId': 'prompt-0001'})
+        prompt = result['prompt']
+        self.assertEqual((prompt['agent'], prompt['current']), ('claude', 1))
+        self.assertEqual(prompt['question'], '검증 질문 #1\n\n계속 진행할까요?')
+        native = self.manager.list()[0]['nativeSource']
+        self.assertEqual((native['id'], native['kind']), (CLAUDE_REF['id'], 'background'))
+        self.assertEqual(self.manager.list()[0]['id'], prompt['terminalId'])
+        state = self.chat.state({'source': CLAUDE_REF})
+        self.assertFalse(state['promptOpenable'])
+        self.assertEqual(state['prompt']['fingerprint'], prompt['fingerprint'])
+        result = self.chat.prompt({'source': CLAUDE_REF, 'action': 'answer', 'fingerprint': prompt['fingerprint'],
+                                   'number': 1, 'requestId': 'answer-0001'})
+        self.assertEqual(result['status'], 'answered')
+        self.assertIn('선택 결과: 1. Yes (질문 #1)', self.manager.capture(prompt['terminalId']))
+
+    def test_demo_menu_is_read_answered_with_arrow_keys_and_asks_again(self):
+        created = self.manager.create('menu-demo', self.demo['argv'], self.demo['cwd'], self.demo['env'],
+                                      {'nativeSource': {**REF, 'cwd': self.demo['cwd']}})
+        self.tid = created['id']
+        prompt = self.wait_prompt(lambda value: value is not None)
+        self.assertEqual(prompt['question'], '검증 질문 #1\n\n계속 진행할까요?')
+        self.assertEqual([(o['number'], o['label']) for o in prompt['options']], [(1, 'Yes'), (2, 'No')])
+        self.assertEqual((prompt['current'], prompt['multi'], prompt['agent']), (1, False, 'codex'))
+        self.assertEqual(prompt['terminalId'], self.tid)
+        result = self.chat.prompt({'source': REF, 'action': 'answer', 'fingerprint': prompt['fingerprint'],
+                                   'number': 2, 'requestId': 'answer-0001'})
+        self.assertEqual((result['status'], result['prompt']), ('answered', None))
+        self.assertIn('선택 결과: 2. No (질문 #1)', self.manager.capture(self.tid))
+        following = self.wait_prompt(lambda value: value is not None and value['fingerprint'] != prompt['fingerprint'])
+        self.assertIn('#2', following['question'])
+        self.assertEqual(following['current'], 1)
 
 
 class ManagedLaunchTest(unittest.TestCase):

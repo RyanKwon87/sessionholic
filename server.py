@@ -876,7 +876,7 @@ class Handler(BaseHTTPRequestHandler):
         return self.static(url.path)
 
     def route_post(self):
-        from chat import SendRejected
+        from chat import PromptRejected, SendRejected
         path = urlparse(self.path).path
         not_started = {"dispatchState": "not_started"} if path == "/api/chat/send" else {}
         if not host_allowed(self.headers.get("Host")):
@@ -949,6 +949,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_json(200, self.server.chat.state(data))
             if path == "/api/chat/send":
                 return self.send_json(200, self.server.chat.send(data))
+            if path == "/api/chat/prompt":
+                return self.send_json(200, self.server.chat.prompt(data))
             if path == "/api/plan":
                 return self.send_json(200, self.server.workflow.plan(data))
             if path == "/api/launch":
@@ -967,7 +969,8 @@ class Handler(BaseHTTPRequestHandler):
                 elif action == "resize":
                     self.server.terminals.resize(tid, data.get("cols"), data.get("rows"))
                 elif action == "scroll":
-                    self.server.terminals.scroll(tid, data.get("lines"))
+                    # mode "app" (wheel events to a full-screen TUI) or "history" (tmux copy-mode).
+                    return self.send_json(200, self.server.terminals.scroll(tid, data.get("lines")))
                 elif action == "scroll-end":
                     self.server.terminals.scroll_end(tid)
                 elif action == "close":
@@ -982,6 +985,9 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_json(200, {"ok": True})
         except SendRejected as exc:
             return self.send_json(exc.status, {"error": str(exc), "dispatchState": "not_started"})
+        except PromptRejected as exc:
+            # No key reached the terminal; "prompt_changed" means read the screen again.
+            return self.send_json(exc.status, {"error": str(exc), "code": exc.code})
         except LaunchFailure as exc:
             return self.send_json(409, {"error": str(exc), "recovery": exc.recovery})
         except (ValueError, KeyError) as exc:

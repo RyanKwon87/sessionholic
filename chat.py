@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import re
+import secrets
 import stat
 import threading
 import time
@@ -14,14 +15,32 @@ REQUEST = re.compile(r'[A-Za-z0-9_-]{8,100}\Z')
 STATE_REQUEST = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.:-]{7,127}\Z')
 CLAUDE_BLOCKED = ('Claude 터미널에 승인·선택 메뉴가 떠 있어 보내지 않았습니다. '
                   '입력이 메뉴 선택으로 처리될 수 있으니 터미널에서 먼저 선택해 주세요.')
-# A numbered option under the selection cursor ("❯ 1. Yes") marks a permission or
-# question menu, where Enter would confirm the highlighted choice.
-CLAUDE_MENU = re.compile(r'^\s*[│|]?\s*[❯›>]\s*\d+\.\s', re.M)
 CLAUDE_EXTERNAL = ('이 Claude 세션은 보드 밖 터미널에서 실행 중이라 웹에서 입력할 수 없습니다. '
                    '그 터미널에서 입력하거나 백그라운드 세션(claude --bg)으로 실행해 주세요.')
 CONTROL = re.compile(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]')
 CLAUDE_READY_SECONDS = 12
 CLAUDE_PROBE = 160
+
+# ---------- approval / question menus drawn by the agent TUIs ----------
+# "❯ 1. Yes" (Claude Code), "› 1. Yes, proceed (y)" (Codex): optional cursor, number, label.
+MENU_OPTION = re.compile(r'^(\s*)([❯›▸▶>])?\s*(\d{1,2})[.)]\s+(\S.*)$')
+# The normal input line ("> ", "❯ ", "› Ask Codex…") is hidden while a menu is open.
+INPUT_PROMPT = re.compile(r'^\s*[❯›>](?:\s|$)')
+BOX_LEAD = re.compile(r'^\s*[─-▟]+')
+BOX_TAIL = re.compile(r'\s*[─-▟]+$')
+BOX_VERTICAL = frozenset('│┃║╎╏┆┇┊┋▌▐▏▕')
+MULTI_MARKS = ('[ ]', '[x]', '[X]', '[✓]', '[✔]', '☐', '☑', '☒', '◯', '◉')
+MENU_TAIL = 6
+MENU_GAP = 12
+QUESTION_LINES = 12
+PROMPT_SETTLE = 0.6
+PROMPT_KEY_LIMIT = 40
+PROMPT_RESULTS = 256
+PROMPT_CHANGED = '질문이 바뀌었거나 웹에서 고를 수 없는 메뉴입니다. 다시 확인해 주세요.'
+PROMPT_NO_TERMINAL = ('이 세션에는 보드가 연결한 터미널이 없어 질문에 답할 수 없습니다. '
+                      '실행 중인 터미널에서 직접 선택해 주세요.')
+PROMPT_BUSY = '다른 입력을 전달하고 있습니다. 잠시 뒤 다시 시도해 주세요.'
+TERMINAL_STATE = '보드 터미널 상태를 확인하지 못했습니다. 잠시 뒤 다시 시도해 주세요.'
 
 
 class SendRejected(ValueError):
@@ -29,6 +48,130 @@ class SendRejected(ValueError):
     def __init__(self, reason, status=400):
         super().__init__(reason)
         self.status = status
+
+
+class PromptRejected(ValueError):
+    """A menu answer was refused before any key reached the terminal."""
+    def __init__(self, reason, status=409, code='prompt_changed'):
+        super().__init__(reason)
+        self.status, self.code = status, code
+
+
+def _screen_lines(screen):
+    """Screen rows without box borders; a border-only rule becomes None (a hard boundary)."""
+    lines = []
+    for raw in str(screen or '').replace('\r', '').split('\n'):
+        raw = raw.rstrip()
+        core = raw.strip()
+        if core and all('─' <= char <= '▟' or char.isspace() for char in core):
+            # "╭────╮" or "────" separates regions; "│      │" is an empty row inside a box.
+            lines.append('' if all(char in BOX_VERTICAL or char.isspace() for char in core) else None)
+            continue
+        lead = BOX_LEAD.match(raw)
+        if lead:
+            # Same width in spaces, so indentation inside the box keeps its columns.
+            raw = ' ' * len(lead.group(0)) + raw[lead.end():]
+        lines.append(BOX_TAIL.sub('', raw).rstrip())
+    return lines
+
+
+def _indent(line):
+    return len(line) - len(line.lstrip())
+
+
+def parse_menu(screen):
+    """The numbered selection menu at the bottom of a TUI screen, or None.
+
+    Only a block that ends the screen counts, so numbered lists in an answer above
+    the input line are not menus. The fingerprint leaves out the cursor position.
+    """
+    lines = _screen_lines(screen)
+    last = next((index for index in range(len(lines) - 1, -1, -1) if lines[index]), None)
+    if last is None:
+        return None
+    end = None
+    for index in range(last, max(last - MENU_TAIL, 0) - 1, -1):
+        line = lines[index]
+        if not line:
+            continue
+        if MENU_OPTION.match(line):
+            end = index
+            break
+        if INPUT_PROMPT.match(line):
+            return None
+    if end is None:
+        return None
+    found, expected, index = [], None, end
+    while index >= 0:
+        line = lines[index]
+        if line is None or (found and found[-1][0] - index > MENU_GAP):
+            return None
+        match = MENU_OPTION.match(line) if line else None
+        if match:
+            number = int(match.group(3))
+            if expected is not None and number != expected:
+                return None
+            found.append((index, match))
+            if number == 1:
+                break
+            expected = number - 1
+        index -= 1
+    if len(found) < 2 or int(found[-1][1].group(3)) != 1:
+        return None
+    found.reverse()
+    options, cursors = [], []
+    for position, (index, match) in enumerate(found):
+        column = match.start(3)
+        stop = found[position + 1][0] if position + 1 < len(found) else last + 1
+        details = []
+        for line in lines[index + 1:stop]:
+            if not line or not line.strip():
+                if position + 1 == len(found):
+                    break  # the last option's description is contiguous; hints follow a gap
+                continue
+            if _indent(line) <= column or INPUT_PROMPT.match(line):
+                if position + 1 < len(found):
+                    return None  # an unindented row between options: not one menu
+                break  # guidance under the last option ("Enter to select")
+            details.append(line.strip())
+        number = int(match.group(3))
+        if match.group(2):
+            cursors.append(number)
+        options.append({'number': number, 'label': match.group(4).rstrip(), 'detail': '\n'.join(details)})
+    groups, current_group, index = [], [], found[0][0] - 1
+    while index >= 0 and len(groups) < 2:
+        line = lines[index]
+        if line is None:
+            break
+        if line.strip():
+            current_group.append(line)
+        elif current_group:
+            groups.append(current_group)
+            current_group = []
+        index -= 1
+    if current_group and len(groups) < 2:
+        groups.append(current_group)
+    kept = []  # bottom-up, nearest the options first
+    for number, group in enumerate(groups):
+        for line in group:
+            if len(kept) < QUESTION_LINES:
+                kept.append((number, line))
+    kept.reverse()
+    margin = min((_indent(line) for _, line in kept), default=0)
+    rows, previous = [], None
+    for number, line in kept:
+        if previous is not None and number != previous:
+            rows.append('')
+        rows.append(line[margin:])
+        previous = number
+    question = '\n'.join(rows)
+    fingerprint = hashlib.sha256(json.dumps(
+        [question, [[o['number'], o['label'], o['detail']] for o in options]],
+        ensure_ascii=False).encode()).hexdigest()
+    return {'question': question, 'options': options,
+            'current': cursors[0] if len(cursors) == 1 else None,
+            'multi': any(o['label'].startswith(MULTI_MARKS) for o in options),
+            'fingerprint': fingerprint}
 
 
 class Chat:
@@ -40,7 +183,9 @@ class Chat:
         self.cache_epoch = 0
         self.read_sequence = 0
         self.upload_gate = threading.BoundedSemaphore(2)
+        # Serialises everything the board types into agent terminals (pastes, menu keys).
         self.claude_lock = threading.Lock()
+        self.prompt_results = {}
 
     @staticmethod
     def identity(source):
@@ -135,8 +280,12 @@ class Chat:
                 message['attachments'] = [{**item, 'name': scrub_text(item['name'])}
                                           if isinstance(item, dict) and isinstance(item.get('name'), str) else item
                                           for item in message['attachments']]
+        try:
+            terminal, terminal_failed = self._board_terminal(source), False
+        except (RuntimeError, OSError, ValueError):
+            terminal, terminal_failed = None, True
         if claude:
-            supported, reason = self._claude_capability(source, phase)
+            supported, reason = self._claude_capability(source, terminal, terminal_failed)
         else:
             supported, reason = bool(caps.get('canSend')), caps.get('reason') or result.get('reason')
         response = {'route': identity, 'phase': phase,
@@ -146,7 +295,12 @@ class Chat:
                     'messages': messages,
                     'receipts': receipts, 'maxAttachmentBytes': MAX_FILE,
                     'requiresNativeTerminal': phase == 'needs_input' if claude else
-                    result.get('requiresNativeTerminal', phase == 'needs_input')}
+                    result.get('requiresNativeTerminal', phase == 'needs_input'),
+                    # A menu on the board terminal's screen; the web may answer it.
+                    'prompt': self._screen_prompt(terminal, source) if terminal else None,
+                    # A background Claude session can be attached to read its menu.
+                    'promptOpenable': bool(claude and source.get('kind') == 'background'
+                                           and terminal is None and not terminal_failed)}
         with self.lock:
             cached = self.cache.get(key)
             # Receipt reads are request-specific. A send or a newer read must
@@ -158,32 +312,182 @@ class Chat:
                 self.cache[key] = (time.monotonic(), response, sequence, source.get('cwd'))
         return response
 
-    # ---------- Claude: input through a board-owned terminal ----------
-    @staticmethod
-    def _same_claude(native, source):
-        if not isinstance(native, dict) or native.get('agent') != 'claude' or native.get('host') != source.get('host'):
-            return False
-        ids = {source.get('id'), source.get('sessionId')} - {None}
-        return native.get('id') in ids or native.get('sessionId') in ids
+    def _forget_state(self, source):
+        # Terminal input changes what the next read must show; drop the cached view.
+        with self.lock:
+            self.cache_epoch += 1
+            self.cache.pop(json.dumps(self.identity(source), sort_keys=True), None)
 
-    def _claude_terminal(self, source):
+    # ---------- the board terminal attached to a session ----------
+    @staticmethod
+    def _same_native(native, source):
+        if (not isinstance(native, dict) or native.get('host') != source.get('host')
+                or native.get('agent') != source.get('agent')):
+            return False
+        if source.get('agent') == 'claude':
+            ids = {source.get('id'), source.get('sessionId')} - {None}
+            return native.get('id') in ids or native.get('sessionId') in ids
+        if source.get('agent') == 'codex':
+            return (source.get('id') is not None and native.get('id') == source.get('id')
+                    and (native.get('home') or '') == (source.get('home') or ''))
+        return False
+
+    def _board_terminal(self, source):
         for terminal in self.workflow.terminals.list():
             native = terminal.get('nativeSource') or terminal.get('metadata', {}).get('nativeSource')
-            if terminal.get('alive') and not terminal.get('closed') and self._same_claude(native, source):
+            if terminal.get('alive') and not terminal.get('closed') and self._same_native(native, source):
                 return terminal
         return None
 
-    def _claude_capability(self, source, phase):
+    def _claude_capability(self, source, terminal, failed):
         # A session waiting for the user can still take a reply; a menu on its
         # screen is checked at send time, right before anything is pasted.
-        try:
-            if self._claude_terminal(source):
-                return True, None
-        except (RuntimeError, OSError):
-            return False, '보드 터미널 상태를 확인하지 못했습니다. 잠시 뒤 다시 시도해 주세요.'
-        if source.get('kind') == 'background':
+        if failed:
+            return False, TERMINAL_STATE
+        if terminal or source.get('kind') == 'background':
             return True, None
         return False, CLAUDE_EXTERNAL
+
+    # ---------- approval / question menus answered from the web ----------
+    @staticmethod
+    def _present(menu, terminal, source):
+        from launch import scrub_text
+        # Display text is redacted like messages; the fingerprint stays the raw screen's.
+        return {**menu, 'question': scrub_text(menu['question']),
+                'options': [{**option, 'label': scrub_text(option['label']),
+                             'detail': scrub_text(option['detail'])} for option in menu['options']],
+                'terminalId': terminal['id'], 'agent': source.get('agent')}
+
+    def _screen_prompt(self, terminal, source):
+        try:
+            menu = parse_menu(self.workflow.terminals.capture(terminal['id']))
+        except (RuntimeError, ValueError, KeyError, OSError):
+            return None
+        return None if menu is None else self._present(menu, terminal, source)
+
+    def _prompt_terminal(self, source):
+        try:
+            return self._board_terminal(source)
+        except (RuntimeError, OSError, ValueError):
+            raise PromptRejected(TERMINAL_STATE, code='terminal_unavailable') from None
+
+    def prompt(self, data):
+        action = data.get('action')
+        if action not in ('open', 'answer'):
+            raise ValueError('질문 요청 종류가 올바르지 않습니다.')
+        request_id = data.get('requestId')
+        if (action == 'answer' or request_id is not None) and (
+                not isinstance(request_id, str) or not REQUEST.fullmatch(request_id)):
+            raise ValueError('질문 응답 요청 식별자가 필요합니다.')
+        source, _ = self.source(data.get('source'))
+        if action == 'open':
+            return self._open_prompt(data.get('source'), source, request_id)
+        fingerprint, number = data.get('fingerprint'), data.get('number')
+        if not isinstance(fingerprint, str) or not re.fullmatch('[0-9a-f]{64}', fingerprint):
+            raise ValueError('질문 식별값이 올바르지 않습니다.')
+        if isinstance(number, bool) or not isinstance(number, int):
+            raise ValueError('선택지 번호가 올바르지 않습니다.')
+        return self._answer_prompt(source, request_id, fingerprint, number)
+
+    def _open_prompt(self, ref, source, request_id):
+        """Show a menu: attach a background Claude session first when it has no terminal."""
+        if not self.claude_lock.acquire(timeout=30):
+            raise PromptRejected(PROMPT_BUSY, code='busy')
+        try:
+            terminal = self._prompt_terminal(source)
+            if terminal is None:
+                if source.get('agent') != 'claude' or source.get('kind') != 'background':
+                    raise PromptRejected(PROMPT_NO_TERMINAL, code='terminal_required')
+                try:
+                    terminal = self._open_claude_terminal(ref, source, request_id or 'prompt-' + secrets.token_hex(12))
+                except SendRejected as exc:
+                    raise PromptRejected(str(exc), exc.status, 'terminal_unavailable') from None
+                except (ValueError, RuntimeError, OSError) as exc:
+                    raise PromptRejected(str(exc) if isinstance(exc, (ValueError, RuntimeError)) else
+                                         'Claude 터미널을 열지 못했습니다.', 409, 'terminal_unavailable') from None
+        finally:
+            self.claude_lock.release()
+        self._forget_state(source)
+        return {'prompt': self._screen_prompt(terminal, source)}
+
+    @staticmethod
+    def _answer_refusal(menu, fingerprint, number):
+        if menu is None or menu['fingerprint'] != fingerprint:
+            return PROMPT_CHANGED
+        if menu['multi']:
+            return '여러 개를 고르는 메뉴는 웹에서 답할 수 없습니다. 터미널에서 직접 선택해 주세요.'
+        if menu['current'] is None:
+            return '메뉴의 현재 선택 위치를 확인하지 못했습니다. 터미널에서 직접 선택해 주세요.'
+        if (all(option['number'] != number for option in menu['options'])
+                or abs(number - menu['current']) >= PROMPT_KEY_LIMIT):
+            return '메뉴에 없는 선택지입니다. 질문을 다시 확인해 주세요.'
+        return None
+
+    def _answer_prompt(self, source, request_id, fingerprint, number):
+        """Move the menu cursor and press Enter, at most once per request id."""
+        key = json.dumps([self.identity(source), request_id], sort_keys=True)
+
+        def saved():
+            with self.lock:
+                entry = self.prompt_results.get(key)
+            if entry and entry[0] != [fingerprint, number]:
+                raise ValueError('이미 사용한 질문 응답 요청입니다.')
+            return entry[1] if entry else None
+
+        previous = saved()
+        if previous:
+            return previous
+        if not self.claude_lock.acquire(timeout=30):
+            raise PromptRejected(PROMPT_BUSY, code='busy')
+        try:
+            previous = saved()
+            if previous:
+                return previous
+            terminal = self._prompt_terminal(source)
+            if terminal is None:
+                raise PromptRejected(PROMPT_NO_TERMINAL, code='terminal_required')
+            try:
+                menu = parse_menu(self.workflow.terminals.capture(terminal['id']))
+            except (RuntimeError, ValueError, KeyError, OSError):
+                raise PromptRejected('터미널 화면을 확인하지 못해 선택을 보내지 않았습니다. 다시 시도해 주세요.',
+                                     code='terminal_unavailable') from None
+            reason = self._answer_refusal(menu, fingerprint, number)
+            if reason:
+                raise PromptRejected(reason)
+            current = menu['current']
+            keys = ['Down'] * (number - current) if number > current else ['Up'] * (current - number)
+            from terminal import InputNotSent
+            try:
+                self.workflow.terminals.send_keys(terminal['id'], keys + ['Enter'])
+                sent = True
+            except (InputNotSent, ValueError, KeyError) as exc:
+                # Refused before tmux delivered a key: the same request may be retried.
+                raise PromptRejected(str(exc) if isinstance(exc, InputNotSent) else
+                                     '터미널에 선택을 보내지 못했습니다. 다시 시도해 주세요.',
+                                     code='terminal_unavailable') from None
+            except (RuntimeError, OSError):
+                sent = False  # the keys may or may not have arrived; never press them again
+            after = None
+            if sent:
+                time.sleep(PROMPT_SETTLE)
+                try:
+                    after = parse_menu(self.workflow.terminals.capture(terminal['id']))
+                except (RuntimeError, ValueError, KeyError, OSError):
+                    sent = False
+            answered = sent and (after is None or after['fingerprint'] != fingerprint)
+            result = {'requestId': request_id, 'number': number,
+                      'status': 'answered' if answered else 'unconfirmed',
+                      'reason': None if answered else
+                      '선택이 반영됐는지 화면에서 확인하지 못했습니다. 같은 선택을 다시 보내지 않으니 터미널을 확인해 주세요.',
+                      'prompt': self._present(after, terminal, source) if after else None}
+            with self.lock:
+                if len(self.prompt_results) >= PROMPT_RESULTS:
+                    self.prompt_results.pop(next(iter(self.prompt_results)))
+                self.prompt_results[key] = ([fingerprint, number], result)
+            return result
+        finally:
+            self.claude_lock.release()
+            self._forget_state(source)
 
     def _open_claude_terminal(self, ref, source, request_id):
         """Attach the exact background session in a board terminal, never a new session."""
@@ -266,7 +570,7 @@ class Chat:
             if current.get('phase') == 'done' and source.get('kind') != 'background':
                 raise SendRejected(CLAUDE_EXTERNAL, 409)
             try:
-                terminal = self._claude_terminal(source)
+                terminal = self._board_terminal(source)
             except (RuntimeError, OSError):
                 raise SendRejected('보드 터미널 상태를 확인하지 못해 보내지 않았습니다. 잠시 뒤 다시 시도해 주세요.', 409) from None
             if terminal is None:
@@ -283,7 +587,8 @@ class Chat:
                 screen = self.workflow.terminals.capture(terminal['id'])
             except (RuntimeError, ValueError, KeyError, OSError):
                 raise SendRejected('Claude 터미널 화면을 확인하지 못해 보내지 않았습니다. 다시 시도해 주세요.', 409) from None
-            if CLAUDE_MENU.search(screen):
+            # Enter would confirm the highlighted choice of an open menu.
+            if parse_menu(screen):
                 raise SendRejected(CLAUDE_BLOCKED, 409)
             lines = [text.strip()] if text.strip() else []
             for aid in ids:
@@ -404,7 +709,5 @@ class Chat:
         if manifest and not result.get('attachments'):
             result = {**result, 'attachments': manifest}
         receipt = self.receipt(result, request_id)
-        with self.lock:
-            self.cache_epoch += 1
-            self.cache.pop(json.dumps(self.identity(source), sort_keys=True), None)
+        self._forget_state(source)
         return {'status': receipt['status'], 'receipt': receipt}

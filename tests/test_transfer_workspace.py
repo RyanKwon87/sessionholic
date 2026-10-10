@@ -415,6 +415,9 @@ class WorkspaceTest(unittest.TestCase):
         self.assertEqual(imported['attachmentsPathMap'][0]['from'], source['path'])
         self.assertEqual(imported['attachmentsPathMap'][0]['to'], received['path'])
         self.assertEqual(Path(received['path']).stat().st_mode & 0o777, 0o400)
+        # The fresh receiving repository also keeps uploads out of `git add -A`.
+        self.assertIn('.sessionholic-attachments/', (Path(imported['root']) / '.git/info/exclude').read_text().splitlines())
+        self.assertNotIn('.sessionholic-attachments', self.git('status', '--porcelain', '--untracked-files=all', root=Path(imported['root'])))
         returned_export = workspace.export_workspace(imported['cwd'], self.base / 'attachments-returned-export')
         returned = workspace.import_workspace(returned_export['archivePath'], self.base / 'attachments-returned',
                                                'attachment-return-0001', returned_export['sha256'])

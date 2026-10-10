@@ -813,7 +813,7 @@ def import_workspace(archive_path, destination_root, transfer_id, expected_sha25
                 digest = _sha_file(path)
             if digest != entry["sha256"]:
                 _fail("복원된 작업 파일 SHA-256 검증에 실패했습니다.")
-        from attachments import DIRECTORY, AttachmentError, workspace_files, resolve
+        from attachments import DIRECTORY, AttachmentError, workspace_files, resolve, exclude_from_git
         imported_attachments = []
         for parent in manifest.get("attachmentRoots", []):
             attachment_cwd = root / parent
@@ -836,6 +836,9 @@ def import_workspace(archive_path, destination_root, transfer_id, expected_sha25
                     imported_attachments.append({"id": record["id"], "relativePath": (Path(parent) / record["relativePath"]).as_posix(), "sha256": record["sha256"]})
             except (AttachmentError, OSError):
                 _fail("복원된 첨부 파일 검증에 실패했습니다.")
+            if git:
+                # The new repository has no excludes yet; keep uploads out of `git add -A`.
+                exclude_from_git(attachment_cwd)
         cwd = root / manifest["cwdRelative"]
         if not cwd.resolve().is_relative_to(root):
             _fail("복원된 작업 폴더가 올바르지 않습니다.")

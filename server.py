@@ -36,6 +36,8 @@ DEFAULT_HOSTS = Path.home() / ".config/sessionholic/hosts.json"
 STATE_DIR = Path.home() / ".local/state/sessionholic"
 TOKEN_FILE = Path.home() / ".config/sessionholic/token"
 COOKIE = "sessionholic_token"
+ONCE_TTL = 120
+INTERNAL_ERROR = "서버 내부 오류가 발생했습니다. 다시 시도해 주세요."
 NAME = re.compile(r"^[A-Za-z0-9_.-]{1,40}$")
 PYTHON_PATH = re.compile(r"^/[A-Za-z0-9_./-]{1,120}$")
 SESSION_ID = re.compile(r"^[0-9A-Za-z-]{8,64}$")
@@ -681,8 +683,31 @@ def host_allowed(value):
 
 class Handler(BaseHTTPRequestHandler):
     server_version = "Sessionholic/1"
+    responded = False
 
     # ---------- plumbing ----------
+    def send_response(self, code, message=None):
+        self.responded = True
+        super().send_response(code, message)
+
+    def guarded(self, route):
+        """An unexpected error becomes one generic JSON 500 without details.
+
+        It never claims a dispatch state: a chat send may already have started.
+        """
+        self.responded = False
+        try:
+            route()
+        except Exception as exc:
+            log_failure(f"{self.command} {urlparse(self.path).path} 처리", exc)
+            if self.responded:
+                self.close_connection = True
+                return
+            try:
+                self.send_json(500, {"error": INTERNAL_ERROR})
+            except OSError:
+                self.close_connection = True
+
     def log_message(self, fmt, *args):
         # Log the path only; query strings may carry a one-time login code.
         sys.stderr.write("%s %s %s\n" % (self.log_date_time_string(), self.command, urlparse(self.path).path))
@@ -779,6 +804,12 @@ class Handler(BaseHTTPRequestHandler):
         self.do_GET()
 
     def do_GET(self):
+        self.guarded(self.route_get)
+
+    def do_POST(self):
+        self.guarded(self.route_post)
+
+    def route_get(self):
         if not host_allowed(self.headers.get("Host")):
             return self.send_body(421, b"misdirected", "text/plain; charset=utf-8")
         url = urlparse(self.path)
@@ -825,7 +856,7 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_json(404, {"error": "없는 경로입니다."})
         return self.static(url.path)
 
-    def do_POST(self):
+    def route_post(self):
         from chat import SendRejected
         path = urlparse(self.path).path
         not_started = {"dispatchState": "not_started"} if path == "/api/chat/send" else {}
@@ -838,7 +869,7 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/chat/upload":
             if not self.authorized():
                 return self.send_json(401, {"error": "로그인이 필요합니다."})
-            if not hmac.compare_digest(self.headers.get("X-CSRF-Token", ""), self.server.csrf):
+            if not hmac.compare_digest(self.headers.get("X-CSRF-Token", "").encode(), self.server.csrf.encode()):
                 return self.send_json(403, {"error": "화면을 새로 열고 다시 시도해 주세요."})
             try:
                 from chat import MAX_FILE
@@ -879,7 +910,7 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_json(200, {"ok": True, "csrfToken": self.server.csrf}, {"Set-Cookie": self.session_cookie()})
         if not self.authorized():
             return self.send_json(401, {"error": "로그인이 필요합니다.", **not_started})
-        if not hmac.compare_digest(self.headers.get("X-CSRF-Token", ""), self.server.csrf):
+        if not hmac.compare_digest(self.headers.get("X-CSRF-Token", "").encode(), self.server.csrf.encode()):
             return self.send_json(403, {"error": "보안 연결을 갱신한 뒤 다시 시도해 주세요.",
                                         "code": "csrf_expired", **not_started})
         try:
@@ -890,7 +921,10 @@ class Handler(BaseHTTPRequestHandler):
                         self.server.sessions.pop(jar[self.server.cookie_name].value, None)
                 return self.send_json(200, {"ok": True}, {"Set-Cookie": self.session_cookie(clear=True)})
             if path == "/api/refresh":
-                self.server.board.request_refresh(data.get("host"), force=True)
+                host = data.get("host")
+                if host is not None and not isinstance(host, str):
+                    raise ValueError("기기 이름 형식이 올바르지 않습니다.")
+                self.server.board.request_refresh(host, force=True)
                 return self.send_json(200, self.server.board.snapshot())
             if path == "/api/chat/state":
                 return self.send_json(200, self.server.chat.state(data))
@@ -939,7 +973,8 @@ class Handler(BaseHTTPRequestHandler):
         """One-time code from `--open`; the long-lived token itself never appears in a URL."""
         with self.server.once_lock:
             expected, expires = self.server.once
-            valid = bool(code) and bool(expected) and time.time() < expires and hmac.compare_digest(code, expected)
+            valid = (bool(code) and bool(expected) and time.time() < expires
+                     and hmac.compare_digest(code.encode(), expected.encode()))
             if valid:
                 self.server.once = ("", 0)
         if not valid:
@@ -1000,6 +1035,14 @@ def make_server(bind, port, board, token, terminals=None, workflow=None, state_d
     return server
 
 
+def issue_login_link(httpd, ttl=ONCE_TTL):
+    """Arm one single-use, short-lived login code; the long-lived token never enters a URL."""
+    code = secrets.token_urlsafe(24)
+    with httpd.once_lock:
+        httpd.once = (code, time.time() + ttl)
+    return f"http://127.0.0.1:{httpd.server_address[1]}/login?once={code}"
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description="세션홀릭 - 에이전트 세션 매니저")
     parser.add_argument("--port", type=int, default=8790)
@@ -1011,7 +1054,8 @@ def main(argv=None):
     parser.add_argument("--state-dir", type=Path, default=STATE_DIR)
     parser.add_argument("--tailscale-user-file", type=Path,
                         help="비공개 파일에 적힌 Tailscale 사용자에게 HTTPS Serve 자동 인증 허용")
-    parser.add_argument("--open", action="store_true", help="개인 브라우저에서 주소를 직접 여세요")
+    parser.add_argument("--open", action="store_true",
+                        help=f"{ONCE_TTL // 60}분 동안 한 번만 쓸 수 있는 로그인 링크를 표준 출력에 표시")
     args = parser.parse_args(argv)
     if args.bind != "127.0.0.1":
         parser.error("127.0.0.1만 허용합니다. 원격 접속은 Tailscale Serve를 사용하세요.")
@@ -1033,7 +1077,9 @@ def main(argv=None):
                         max_terminals=args.max_terminals, tailscale_user=tailscale_user)
     print(f"세션홀릭: http://127.0.0.1:{args.port}/ · 화면을 열 때만 수집합니다.", file=sys.stderr)
     if args.open:
-        print("개인 Chrome 프로필에서 위 주소를 여세요.", file=sys.stderr)
+        print(issue_login_link(httpd), flush=True)
+        print(f"표준 출력의 일회용 로그인 링크를 {ONCE_TTL // 60}분 안에 개인 브라우저에서 여세요. 한 번만 사용할 수 있습니다.",
+              file=sys.stderr)
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:

@@ -10,6 +10,7 @@ import threading
 import time
 import unittest
 from unittest.mock import patch
+from urllib.parse import urlparse
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import server  # noqa: E402
@@ -106,6 +107,68 @@ class ServerTest(unittest.TestCase):
         self.assertIn("HttpOnly", res.getheader("Set-Cookie"))
         res, _ = self.request("GET", "/login?once=code123")
         self.assertEqual(res.status, 403)
+
+    def csrf_session(self):
+        res, data = self.request("POST", "/login", json.dumps({"token": TOKEN}), {"Content-Type": "application/json"})
+        return res.getheader("Set-Cookie").split(";", 1)[0], json.loads(data)["csrfToken"]
+
+    def post_json(self, path, body, cookie, csrf):
+        return self.request("POST", path, json.dumps(body), {"Content-Type": "application/json",
+                                                            "Cookie": cookie, "X-CSRF-Token": csrf})
+
+    def test_unexpected_errors_return_generic_json_500(self):
+        secret = "fixture-private-" + "detail"
+        cookie, csrf = self.csrf_session()
+        with patch("sys.stderr", new_callable=io.StringIO) as log:
+            with patch.object(self.board, "snapshot", side_effect=TypeError(secret)):
+                res, data = self.request("GET", "/api/snapshot", headers={"Cookie": cookie})
+            self.assertEqual(res.status, 500)
+            self.assertEqual(json.loads(data), {"error": "서버 내부 오류가 발생했습니다. 다시 시도해 주세요."})
+            # A send that failed unexpectedly may already have started: no dispatchState.
+            with patch.object(self.httpd.chat, "send", side_effect=TypeError(secret)):
+                res, data = self.post_json("/api/chat/send", {"source": {}}, cookie, csrf)
+            self.assertEqual(res.status, 500)
+            self.assertEqual(json.loads(data), {"error": server.INTERNAL_ERROR})
+        self.assertIn("TypeError", log.getvalue())
+        self.assertNotIn(secret, log.getvalue())
+        self.assertNotIn(secret.encode(), data)
+        res, _ = self.request("GET", "/api/snapshot", headers={"Cookie": cookie})
+        self.assertEqual(res.status, 200)
+
+    def test_refresh_host_must_be_a_string(self):
+        cookie, csrf = self.csrf_session()
+        for host in (["remote"], 5, {"name": "remote"}):
+            res, data = self.post_json("/api/refresh", {"host": host}, cookie, csrf)
+            self.assertEqual(res.status, 400, host)
+            self.assertIn("error", json.loads(data))
+
+    def test_non_ascii_secrets_are_rejected_not_errors(self):
+        cookie, _ = self.csrf_session()
+        res, _ = self.request("POST", "/api/refresh", json.dumps({}), {
+            "Content-Type": "application/json", "Cookie": cookie, "X-CSRF-Token": "é"})
+        self.assertEqual(res.status, 403)
+        self.httpd.once = ("code123", time.time() + 60)
+        res, _ = self.request("GET", "/login?once=%C3%A9")
+        self.assertEqual(res.status, 403)
+        self.httpd.once = ("", 0)
+
+    def test_issued_login_link_is_single_use_and_short_lived(self):
+        link = urlparse(server.issue_login_link(self.httpd))
+        self.assertEqual((link.scheme, link.hostname, link.port, link.path), ("http", "127.0.0.1", self.port, "/login"))
+        code, expires = self.httpd.once
+        self.assertEqual(link.query, "once=" + code)
+        self.assertGreaterEqual(len(code), 32)
+        self.assertTrue(time.time() < expires <= time.time() + server.ONCE_TTL <= time.time() + 300)
+        res, _ = self.request("GET", "/login?" + link.query)
+        self.assertEqual(res.status, 303)
+        self.assertIn("HttpOnly", res.getheader("Set-Cookie"))
+        res, _ = self.request("GET", "/login?" + link.query)
+        self.assertEqual(res.status, 403)
+        expired = urlparse(server.issue_login_link(self.httpd))
+        self.httpd.once = (self.httpd.once[0], time.time() - 1)
+        res, _ = self.request("GET", "/login?" + expired.query)
+        self.assertEqual(res.status, 403)
+        self.assertNotEqual(expired.query, link.query)
 
     def test_static_files_and_traversal(self):
         res, data = self.request("GET", "/")
@@ -223,6 +286,32 @@ class HelperTest(unittest.TestCase):
         self.assertFalse(entry["ok"])
         self.assertEqual(entry["error"], "SSH 연결 실패")
         self.assertEqual(entry["data"]["claude"][0]["title"], "정산")
+
+    def test_open_flag_prints_one_time_login_link(self):
+        class FakeServer:
+            server_address = ("127.0.0.1", 8799)
+            def __init__(self):
+                self.once, self.once_lock = ("", 0), threading.Lock()
+            def serve_forever(self):
+                raise KeyboardInterrupt
+            def server_close(self):
+                pass
+        for flags in ([], ["--open"]):
+            fake = FakeServer()
+            with tempfile.TemporaryDirectory() as directory, patch("server.settings.load"), \
+                 patch("server.settings.safe_path", side_effect=lambda path, **kw: Path(path)), \
+                 patch("server.load_hosts", return_value=HOSTS), patch("server.load_token", return_value=TOKEN), \
+                 patch("server.make_server", return_value=fake), \
+                 patch("sys.stdout", new_callable=io.StringIO) as out, patch("sys.stderr", new_callable=io.StringIO):
+                self.assertEqual(server.main(["--state-dir", directory] + flags), 0)
+            if not flags:
+                self.assertEqual((out.getvalue(), fake.once), ("", ("", 0)))
+                continue
+            code, expires = fake.once
+            self.assertTrue(code)
+            self.assertEqual(out.getvalue(), f"http://127.0.0.1:8799/login?once={code}\n")
+            self.assertTrue(time.time() < expires <= time.time() + server.ONCE_TTL)
+            self.assertNotIn(TOKEN, out.getvalue())
 
     def test_refresh_rejects_non_string_host(self):
         board = server.Board(HOSTS, 60, runner=fake_runner([]))

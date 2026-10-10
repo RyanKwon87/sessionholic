@@ -3100,7 +3100,8 @@ function bindPullToRefresh(root) {
     distance = 0;
     if (event.touches.length !== 1 || state.terminalVisible || state.pullRefreshing) return;
     if (event.target?.closest?.("textarea, input, select, dialog[open]")) return;
-    const scroller = scrollParent(event.target);
+    // In a conversation the message list decides, wherever the finger starts.
+    const scroller = event.target?.closest?.("#detail") ? $("messages") : scrollParent(event.target);
     if (scroller && scroller.scrollTop > 0) return;
     start = event.touches[0].clientY;
   }, { passive: true });

@@ -2,6 +2,7 @@ import http.client
 import io
 import json
 import os
+import shutil
 from pathlib import Path
 import sys
 import tempfile
@@ -154,6 +155,50 @@ class HelperTest(unittest.TestCase):
         self.assertTrue(command[-1].endswith("/usr/bin/python3 -I - read codex id-1 .codex-router/0123456789abcdef"))
         local = server.collector_command({"local": True}, ["snapshot"])
         self.assertEqual(local[1:3], ["-I", str(server.COLLECTOR)])
+
+    def test_ssh_control_path_fits_socket_limit(self):
+        self.assertIsNone(server.ssh_control_path(None))
+        self.assertEqual(server.ssh_control_options(None), [])
+        # "/" + 37 + "/ssh/cm-" is 46 bytes; with %C (40) and the bind suffix (17) it is 103.
+        fits = "/" + "s" * 37
+        self.assertEqual(server.ssh_control_path(fits), fits + "/ssh/cm-%C")
+        self.assertIsNone(server.ssh_control_path(fits + "s"))
+        for unsafe in ("/tmp/with space", "/tmp/100%", "/tmp/quote'", "/tmp/hash#x"):
+            self.assertIsNone(server.ssh_control_path(unsafe), unsafe)
+
+    def test_ssh_control_options_need_private_prepared_folder(self):
+        directory = tempfile.mkdtemp(prefix="sh", dir="/tmp")
+        self.addCleanup(shutil.rmtree, directory)
+        command = server.collector_command(HOSTS[0], ["snapshot"], directory)
+        self.assertNotIn("ControlMaster=auto", command)
+        board = server.Board(HOSTS, 60, state_dir=directory)
+        socket_dir = Path(directory) / "ssh"
+        self.assertEqual(socket_dir.stat().st_mode & 0o777, 0o700)
+        options = server.ssh_control_options(directory)
+        self.assertEqual(options, ["-o", "ControlMaster=auto", "-o", "ControlPersist=60",
+                                   "-o", "ControlPath=" + str(socket_dir) + "/cm-%C"])
+        command = server.collector_command(HOSTS[0], ["snapshot"], directory)
+        self.assertEqual(command[:6], ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=6", "-o"])
+        self.assertEqual(command[7:13], options)
+        self.assertEqual(command[-3:-1], ["--", "remote"])
+        self.assertNotIn("ControlMaster=auto", server.collector_command({"local": True}, ["snapshot"]))
+        with patch("server.run_collector", return_value={"claude": [], "codex": []}) as run:
+            self.assertTrue(board.poll(HOSTS[0]))
+        run.assert_called_once_with(HOSTS[0], ["snapshot"], 45, Path(directory))
+        socket_dir.chmod(0o755)
+        self.assertEqual(server.ssh_control_options(directory), [])
+        socket_dir.rmdir()
+        socket_dir.symlink_to(directory)
+        self.assertEqual(server.ssh_control_options(directory), [])
+
+    def test_ssh_control_options_are_omitted_for_long_state_paths(self):
+        directory = tempfile.mkdtemp(prefix="sh", dir="/tmp")
+        self.addCleanup(shutil.rmtree, directory)
+        state = Path(directory) / ("long-state-" + "x" * 60)
+        server.Board(HOSTS, 60, state_dir=state)
+        self.assertTrue((state / "ssh").is_dir())
+        self.assertEqual(server.ssh_control_options(state), [])
+        self.assertNotIn("ControlMaster=auto", server.collector_command(HOSTS[0], ["snapshot"], state))
 
     def test_load_hosts_validates(self):
         with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:

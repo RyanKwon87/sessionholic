@@ -42,6 +42,8 @@ SESSION_ID = re.compile(r"^[0-9A-Za-z-]{8,64}$")
 HOME_KEY = re.compile(r"^\.codex(-[A-Za-z0-9_-]{1,40})?$|^\.codex-router/[0-9a-f]{16}$")
 STATIC = re.compile(r"^(?:vendor/)?[a-z0-9_-]{1,40}\.(html|js|css|svg|png|webmanifest)$")
 REMOTE_PATH = "/opt/homebrew/bin:$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin"
+SOCKET_PATH_LIMIT = 104
+CONTROL_PREFIX = re.compile(r"^/[A-Za-z0-9_./+@-]+$")
 TYPES = {".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8",
          ".css": "text/css; charset=utf-8", ".svg": "image/svg+xml", ".png": "image/png",
          ".webmanifest": "application/manifest+json"}
@@ -89,17 +91,62 @@ def load_hosts(path):
     return hosts
 
 
-def collector_command(host, args):
+def ssh_control_path(state_dir):
+    """Pure path rule for shared SSH connections: `<state_dir>/ssh/cm-%C`, or None.
+
+    ssh expands %C to a 40 character hash and first binds a master socket at
+    `<path>.<16 random characters>`, so that longest form must fit the macOS
+    104 byte socket path (including NUL). Paths ssh would re-tokenize are refused.
+    """
+    if not state_dir:
+        return None
+    prefix = str(Path(state_dir).expanduser().absolute() / "ssh") + "/cm-"
+    if not CONTROL_PREFIX.fullmatch(prefix) or len(os.fsencode(prefix)) + 40 + 17 >= SOCKET_PATH_LIMIT:
+        return None
+    return prefix + "%C"
+
+
+def prepare_ssh_control_dir(state_dir):
+    """Create the private socket folder; a failure only disables connection sharing."""
+    directory = Path(state_dir).expanduser().absolute() / "ssh"
+    try:
+        directory.mkdir(mode=0o700, exist_ok=True)
+        info = os.lstat(directory)
+        if stat.S_ISDIR(info.st_mode) and info.st_uid == os.getuid():
+            os.chmod(directory, 0o700)
+    except OSError:
+        pass
+
+
+def ssh_control_options(state_dir):
+    """`ssh -o` options reusing one connection per host for 60 idle seconds, or [].
+
+    Without a state folder, a prepared 0700 socket folder owned by this user, or a
+    path within the socket limit, ssh runs exactly as before without sharing.
+    """
+    path = ssh_control_path(state_dir)
+    if path is None:
+        return []
+    try:
+        info = os.lstat(Path(path).parent)
+    except OSError:
+        return []
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
+        return []
+    return ["-o", "ControlMaster=auto", "-o", "ControlPersist=60", "-o", "ControlPath=" + path]
+
+
+def collector_command(host, args, state_dir=None):
     """Local hosts run the file; SSH hosts read it from stdin so nothing is left on the remote."""
     if host["local"]:
         return [sys.executable, "-I", str(COLLECTOR)] + list(args)
     remote = (f"PATH={REMOTE_PATH} {shlex.quote(host['python'])} -I - "
               + " ".join(shlex.quote(a) for a in args))
-    return ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=6", "-o", "ServerAliveInterval=5",
-            "--", host["ssh"], remote]
+    return (["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=6", "-o", "ServerAliveInterval=5"]
+            + ssh_control_options(state_dir) + ["--", host["ssh"], remote])
 
 
-def run_collector(host, args, timeout):
+def run_collector(host, args, timeout, state_dir=None):
     stdin = None
     if not host["local"]:
         # Remote stdin remains a single self-contained program, with settings
@@ -109,7 +156,8 @@ def run_collector(host, args, timeout):
         stdin = (b"from __future__ import annotations\n" + prefix.encode()
                  + COLLECTOR.read_bytes().replace(b"from __future__ import annotations\n", b"", 1))
     try:
-        done = subprocess.run(collector_command(host, args), input=stdin, capture_output=True, timeout=timeout)
+        done = subprocess.run(collector_command(host, args, state_dir), input=stdin, capture_output=True,
+                              timeout=timeout)
     except subprocess.TimeoutExpired:
         raise RuntimeError("응답 시간 초과") from None
     except OSError:
@@ -162,9 +210,10 @@ class Board:
                      "durationMs": None, "paused": False, "refreshing": False} for h in hosts}
         self.reads, self.attempted, self.backoff = {}, {}, {}
         self.state_dir = Path(state_dir) if state_dir else None
-        self.runner = runner or run_collector
+        self.runner = runner or (lambda host, args, timeout: run_collector(host, args, timeout, self.state_dir))
         if self.state_dir:
             self.state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+            prepare_ssh_control_dir(self.state_dir)
             try:
                 cached = json.loads((self.state_dir / "snapshot.json").read_text())
                 for row in cached.get("hosts", []):

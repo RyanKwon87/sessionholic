@@ -9,6 +9,8 @@ const MessageFormat = (() => {
   const MAX_DEPTH = 8;
   const MAX_NODES = 4096;
   const MAX_WORK = 262144;
+  // Code blocks longer than this fold to their first lines behind "모두 보기".
+  const FOLD_LINES = 25;
 
   function sourceOf(value) { return value == null ? "" : String(value); }
   function spend(budget, kind, amount = 1) {
@@ -252,29 +254,55 @@ const MessageFormat = (() => {
       container.append(node);
     }
   }
+  // A small icon in the code block's corner; whole messages and quotes are
+  // copied from the message menu instead.
   function copyButton(parent, text, kind, options) {
     if (typeof options?.onCopy !== "function") return;
-    const button = element("button", "message-block-copy", kind === "quote" ? "인용문 복사" : "코드 복사");
-    button.setAttribute("type", "button"); button.setAttribute("aria-label", kind === "quote" ? "인용문 본문 복사" : "코드 블록 복사");
+    const button = element("button", "message-block-copy");
+    button.setAttribute("type", "button"); button.setAttribute("aria-label", "코드 블록 복사");
+    button.setAttribute("title", "코드 복사");
     button.addEventListener("click", () => {
       // The caller owns clipboard permissions and success/failure feedback.
       try { Promise.resolve(options.onCopy(text, kind)).catch(() => {}); } catch { /* caller handles feedback */ }
     });
     parent.append(button);
   }
+  function lineCount(text) {
+    const lines = text.split(/\r\n|\r|\n/);
+    if (lines.length && lines[lines.length - 1] === "") lines.pop();
+    return lines.length;
+  }
+  // Folded: the first lines show under a fade; the toggle keeps the count.
+  function foldToggle(block, lines) {
+    const toggle = element("button", "message-code-toggle", `모두 보기 · ${lines}줄`);
+    toggle.setAttribute("type", "button"); toggle.setAttribute("aria-expanded", "false");
+    toggle.addEventListener("click", () => {
+      const folded = / is-folded(?: |$)/.test(" " + block.className);
+      block.className = folded ? block.className.replace(/\s*\bis-folded\b/, "") : `${block.className} is-folded`;
+      toggle.textContent = folded ? "접기" : `모두 보기 · ${lines}줄`;
+      toggle.setAttribute("aria-expanded", String(folded));
+    });
+    block.append(toggle);
+  }
   function appendBlocks(container, nodes, options) {
     for (const value of nodes) {
       if (value.kind === "blank") continue;
       if (value.kind === "fallback") { container.append(element("div", "message-format-fallback", value.text)); continue; }
       if (value.kind === "fence") {
-        const block = element("div", "message-code-block"); const pre = element("pre", "message-code");
+        const lines = lineCount(value.text);
+        const foldAfter = Number.isInteger(options?.foldAfter) ? options.foldAfter : FOLD_LINES;
+        const foldable = lines > foldAfter;
+        const block = element("div", `message-code-block${foldable ? " is-foldable is-folded" : ""}`);
+        const pre = element("pre", "message-code");
         const code = element("code", "", value.text); if (value.language) code.setAttribute("data-language", value.language);
-        pre.append(code); block.append(pre); copyButton(block, value.text, "code", options); container.append(block); continue;
+        pre.append(code); block.append(pre); copyButton(block, value.text, "code", options);
+        if (foldable) foldToggle(block, lines);
+        container.append(block); continue;
       }
       if (value.kind === "quote") {
         const block = element("div", "message-quote-block"); const quoted = element("blockquote", "message-quote");
         appendBlocks(quoted, value.children, options); block.append(quoted);
-        copyButton(block, blockPlain(value.children), "quote", options); container.append(block); continue;
+        container.append(block); continue;
       }
       if (value.kind === "list") {
         const list = element(value.ordered ? "ol" : "ul");
@@ -291,11 +319,22 @@ const MessageFormat = (() => {
       container.append(node);
     }
   }
+  // The exact text of every fenced block, quoted ones included.
+  function fences(nodes, out = []) {
+    for (const node of nodes) {
+      if (node.kind === "fence") out.push(node.text);
+      else if (node.kind === "quote") fences(node.children, out);
+      else if (node.kind === "list") for (const item of node.items) fences(item.nested, out);
+    }
+    return out;
+  }
   return Object.freeze({
+    FOLD_LINES,
     render(container, text, options = {}) {
       container.replaceChildren(); container.classList.add("message-markdown");
       appendBlocks(container, parse(text), options);
     },
     plainText(text) { return blockPlain(parse(text)); },
+    codeBlocks(text) { return fences(parse(text)); },
   });
 })();

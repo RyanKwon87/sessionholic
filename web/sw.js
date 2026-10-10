@@ -1,10 +1,19 @@
 "use strict";
 
 // Sessionholic caches only public static assets. All session and terminal data remains online-only.
-const CACHE = "sessionholic-shell-v10";
-const SHELL = [
-  "/",
+// - "/" (the page): network first; the cached copy is used only while offline.
+// - Allowed assets with "?v=<sha8>": cache first. The key is the full URL, and
+//   storing a new version drops the older versions of the same path. Only a
+//   response marked immutable is stored: the server marks it so only when the
+//   requested version is the file it sent (a stale or rolled-back version gets
+//   the current file with no-cache, which must not be kept under that URL).
+// - The same assets without a version: network first (pages served before
+//   versioned URLs, or by a server that does not fill them in).
+// - Anything else (API, login, terminal, other queries) is never touched.
+const CACHE = "sessionholic-shell-v13";
+const ASSETS = new Set([
   "/app.js",
+  "/theme-init.js",
   "/message-format.js",
   "/style.css",
   "/icon.svg",
@@ -15,10 +24,65 @@ const SHELL = [
   "/vendor/xterm.js",
   "/vendor/xterm.css",
   "/vendor/addon-fit.js",
-];
-const ALLOWED = new Set(SHELL);
+]);
+const VERSIONED = /^\?v=[0-9a-f]{8}$/;
+// Precached from the page's asset list at install; the terminal library is
+// only cached once a terminal is actually opened.
+const PRECACHE_SKIP = new Set(["/vendor/xterm.js", "/vendor/xterm.css", "/vendor/addon-fit.js"]);
+
+function cacheable(response) {
+  return !!response && response.ok && response.type !== "opaqueredirect" && !response.redirected;
+}
+function immutable(response) {
+  const control = String(response?.headers?.get?.("Cache-Control") || "");
+  return control.split(",").some((part) => part.trim().toLowerCase() === "immutable");
+}
+async function storeVersion(cache, request, url, response) {
+  if (!cacheable(response) || !immutable(response)) return;
+  await cache.put(request, response);
+  await pruneVersions(cache, url);
+}
+function offlineResponse() {
+  return new Response("연결을 확인한 뒤 다시 열어 주세요.", {
+    status: 503,
+    headers: { "Content-Type": "text/plain; charset=utf-8" },
+  });
+}
+async function pruneVersions(cache, url) {
+  for (const request of await cache.keys()) {
+    const cached = new URL(request.url);
+    if (cached.pathname === url.pathname && cached.search !== url.search) await cache.delete(request);
+  }
+}
+async function precache() {
+  const cache = await caches.open(CACHE);
+  const response = await fetch("/", { cache: "no-store", credentials: "same-origin" });
+  if (!cacheable(response)) return;
+  const page = await response.clone().text();
+  await cache.put("/", response);
+  const meta = /<meta\b[^>]*\bname="sessionholic-assets"[^>]*\bcontent="([^"]*)"/.exec(page);
+  let versions = {};
+  try {
+    versions = JSON.parse((meta?.[1] || "{}").replace(/&quot;/g, '"').replace(/&amp;/g, "&")) || {};
+  } catch {
+    versions = {};
+  }
+  const urls = Object.entries(versions)
+    .filter(([path, version]) => ASSETS.has(path) && !PRECACHE_SKIP.has(path) && /^[0-9a-f]{8}$/.test(String(version)))
+    .map(([path, version]) => `${path}?v=${version}`);
+  await Promise.all(urls.map(async (url) => {
+    try {
+      const asset = await fetch(url, { credentials: "same-origin" });
+      await storeVersion(cache, url, new URL(url, self.location.origin), asset);
+    } catch {
+      /* cached on first use instead */
+    }
+  }));
+}
+
 self.addEventListener("install", (event) => {
-  event.waitUntil(caches.open(CACHE).then((cache) => cache.addAll(SHELL)));
+  // Installing never fails on a flaky network; assets are cached on use too.
+  event.waitUntil(precache().catch(() => {}));
   self.skipWaiting();
 });
 self.addEventListener("activate", (event) => {
@@ -36,36 +100,39 @@ self.addEventListener("activate", (event) => {
   );
 });
 self.addEventListener("fetch", (event) => {
-  const url = new URL(event.request.url);
-  if (
-    event.request.method !== "GET" ||
-    url.origin !== self.location.origin ||
-    url.search ||
-    !ALLOWED.has(url.pathname)
-  )
+  const request = event.request;
+  if (request.method !== "GET") return;
+  const url = new URL(request.url);
+  if (url.origin !== self.location.origin) return;
+  if (url.pathname === "/") {
+    if (!url.search) event.respondWith(networkFirst(event, request));
     return;
-  event.respondWith(
-    fetch(event.request)
-      .then((response) => {
-        if (
-          response.ok &&
-          response.type !== "opaqueredirect" &&
-          !response.redirected
-        ) {
-          const clone = response.clone();
-          event.waitUntil(
-            caches.open(CACHE).then((cache) => cache.put(event.request, clone)),
-          );
-        }
-        return response;
-      })
-      .catch(
-        async () =>
-          (await (await caches.open(CACHE)).match(event.request)) ||
-          new Response("연결을 확인한 뒤 다시 열어 주세요.", {
-            status: 503,
-            headers: { "Content-Type": "text/plain; charset=utf-8" },
-          }),
-      ),
-  );
+  }
+  if (!ASSETS.has(url.pathname)) return;
+  if (!url.search) event.respondWith(networkFirst(event, request));
+  else if (VERSIONED.test(url.search)) event.respondWith(cacheFirst(event, request, url));
 });
+function networkFirst(event, request) {
+  return fetch(request)
+    .then((response) => {
+      if (cacheable(response)) {
+        const copy = response.clone();
+        event.waitUntil(caches.open(CACHE).then((cache) => cache.put(request, copy)));
+      }
+      return response;
+    })
+    .catch(async () => (await (await caches.open(CACHE)).match(request)) || offlineResponse());
+}
+async function cacheFirst(event, request, url) {
+  const cache = await caches.open(CACHE);
+  const cached = await cache.match(request);
+  if (cached) return cached;
+  let response;
+  try {
+    response = await fetch(request);
+  } catch {
+    return offlineResponse();
+  }
+  if (cacheable(response) && immutable(response)) event.waitUntil(storeVersion(cache, request, url, response.clone()));
+  return response;
+}

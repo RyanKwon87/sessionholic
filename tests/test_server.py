@@ -185,6 +185,487 @@ class ServerTest(unittest.TestCase):
         res, _ = self.request("GET", "/", headers={"Host": "remote.tailc1299f.ts.net"})
         self.assertEqual(res.status, 200)
 
+    def test_csp_allows_blob_images_only_in_img_src(self):
+        res, _ = self.request("GET", "/")
+        policy = dict(part.strip().split(" ", 1) for part in res.getheader("Content-Security-Policy").split(";"))
+        self.assertEqual(policy["img-src"], "'self' data: blob:")
+        self.assertEqual(policy["default-src"], "'self'")
+        self.assertNotIn("blob:", policy["script-src"])
+
+    def test_json_is_gzip_compressed_when_accepted_and_large(self):
+        import gzip
+        large = {"hosts": [{"name": "remote", "rows": ["정산 작업 %d" % index for index in range(200)]}]}
+        with patch.object(self.board, "snapshot", return_value=large):
+            res, data = self.request("GET", "/api/snapshot", headers={
+                "Authorization": "Bearer " + TOKEN, "Accept-Encoding": "br, gzip;q=0.8"})
+            self.assertEqual((res.status, res.getheader("Content-Encoding")), (200, "gzip"))
+            self.assertEqual(res.getheader("Vary"), "Accept-Encoding")
+            self.assertEqual(res.getheader("Cache-Control"), "no-store")
+            self.assertEqual(int(res.getheader("Content-Length")), len(data))
+            self.assertEqual(json.loads(gzip.decompress(data)), large)
+            for header in ({}, {"Accept-Encoding": "gzip;q=0"}, {"Accept-Encoding": "identity"}):
+                res, data = self.request("GET", "/api/snapshot", headers={"Authorization": "Bearer " + TOKEN, **header})
+                self.assertIsNone(res.getheader("Content-Encoding"), header)
+                self.assertEqual(json.loads(data), large)
+        # Small replies stay plain even for gzip clients.
+        res, data = self.request("GET", "/api/snapshot", headers={
+            "Authorization": "Bearer " + TOKEN, "Accept-Encoding": "gzip"})
+        self.assertIsNone(res.getheader("Content-Encoding"))
+        self.assertEqual(res.getheader("Vary"), "Accept-Encoding")
+        self.assertIn("version", json.loads(data))
+
+
+WEB_INDEX = ('<!doctype html><html><head><meta charset="utf-8">\n'
+             '<meta\n  name="sessionholic-assets"\n  content="{}"\n/>\n'
+             '<link rel="manifest" href="/manifest.webmanifest" />\n'
+             '<link rel="stylesheet" href="/vendor/x.css" />\n'
+             '<script src="/app.js" defer></script>\n<script src="/missing.js" defer></script>\n'
+             '<a href="/sw.js">worker</a> <a href="/app.js?keep=1">query</a> <a href="/">home</a>\n'
+             '</head><body>' + '<p>세션홀릭 고정 문단</p>\n' * 60 + '</body></html>\n')
+
+
+class StaticAssetTest(unittest.TestCase):
+    """Versioned, compressed and revalidated public assets from a fixture web folder."""
+    @classmethod
+    def setUpClass(cls):
+        cls.temp = tempfile.TemporaryDirectory()
+        cls.web = Path(cls.temp.name) / "web"
+        (cls.web / "vendor").mkdir(parents=True)
+        (cls.web / "index.html").write_text(WEB_INDEX)
+        (cls.web / "app.js").write_text("console.log('세션홀릭');\n" * 200)
+        (cls.web / "sw.js").write_text("self.addEventListener('fetch', () => {});\n" * 40)
+        (cls.web / "icon.svg").write_text('<svg xmlns="http://www.w3.org/2000/svg"/>')
+        (cls.web / "icon.png").write_bytes(b"\x89PNG\r\n\x1a\n" + os.urandom(4096))
+        (cls.web / "manifest.webmanifest").write_text('{"name":"세션홀릭"}')
+        (cls.web / "vendor/x.css").write_text("body{margin:0}\n")
+        (cls.web / "notes.txt").write_text("not served")
+        board = server.Board(HOSTS, 60, runner=fake_runner([]))
+        cls.httpd = server.make_server("127.0.0.1", 0, board, TOKEN, state_dir=cls.temp.name)
+        cls.httpd.assets = server.StaticAssets(cls.web)
+        cls.port = cls.httpd.server_address[1]
+        threading.Thread(target=cls.httpd.serve_forever, daemon=True).start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.httpd.shutdown()
+        cls.httpd.server_close()
+        cls.temp.cleanup()
+
+    def get(self, path, method="GET", **headers):
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
+        conn.request(method, path, headers=headers)
+        res = conn.getresponse()
+        data = res.read()
+        conn.close()
+        return res, data
+
+    @staticmethod
+    def sha(data):
+        import hashlib
+        return hashlib.sha256(data).hexdigest()
+
+    def test_gzip_etag_and_vary(self):
+        import gzip
+        raw = (self.web / "app.js").read_bytes()
+        res, data = self.get("/app.js", **{"Accept-Encoding": "gzip, deflate"})
+        self.assertEqual((res.status, res.getheader("Content-Encoding")), (200, "gzip"))
+        self.assertEqual(gzip.decompress(data), raw)
+        self.assertEqual(res.getheader("ETag"), '"%s-gz"' % self.sha(raw)[:16])
+        self.assertEqual(res.getheader("Vary"), "Accept-Encoding")
+        self.assertEqual(res.getheader("Content-Type"), "text/javascript; charset=utf-8")
+        self.assertEqual(int(res.getheader("Content-Length")), len(data))
+        res, data = self.get("/app.js")
+        self.assertEqual((res.getheader("Content-Encoding"), data), (None, raw))
+        self.assertEqual(res.getheader("ETag"), '"%s"' % self.sha(raw)[:16])
+        self.assertEqual(res.getheader("Vary"), "Accept-Encoding")
+        # Small files and images are never compressed, but still vary by encoding.
+        for path in ("/icon.svg", "/icon.png", "/vendor/x.css"):
+            res, data = self.get(path, **{"Accept-Encoding": "gzip"})
+            self.assertIsNone(res.getheader("Content-Encoding"), path)
+            self.assertEqual(data, (self.web / path[1:]).read_bytes())
+            self.assertEqual(res.getheader("Vary"), "Accept-Encoding")
+        res, _ = self.get("/app.js", method="HEAD", **{"Accept-Encoding": "gzip"})
+        self.assertEqual((res.status, res.getheader("Content-Encoding")), (200, "gzip"))
+
+    def test_if_none_match_returns_304_with_cache_headers(self):
+        raw = (self.web / "app.js").read_bytes()
+        tag = self.sha(raw)[:16]
+        res, data = self.get("/app.js?v=" + tag[:8], **{"Accept-Encoding": "gzip", "If-None-Match": '"%s-gz"' % tag})
+        self.assertEqual((res.status, data), (304, b""))
+        self.assertEqual(res.getheader("ETag"), '"%s-gz"' % tag)
+        self.assertEqual(res.getheader("Cache-Control"), server.IMMUTABLE)
+        self.assertEqual(res.getheader("Vary"), "Accept-Encoding")
+        res, data = self.get("/app.js", **{"If-None-Match": 'W/"other", "%s"' % tag})
+        self.assertEqual((res.status, data, res.getheader("Cache-Control")), (304, b"", "no-cache"))
+        # The plain tag does not validate the compressed body, nor the reverse.
+        res, data = self.get("/app.js", **{"Accept-Encoding": "gzip", "If-None-Match": '"%s"' % tag})
+        self.assertEqual(res.status, 200)
+        res, _ = self.get("/app.js", **{"If-None-Match": '"%s-gz"' % tag})
+        self.assertEqual(res.status, 200)
+
+    def test_only_the_current_hash_is_immutable(self):
+        raw = (self.web / "app.js").read_bytes()
+        res, _ = self.get("/app.js?v=" + self.sha(raw)[:8])
+        self.assertEqual(res.getheader("Cache-Control"), "public, max-age=31536000, immutable")
+        for path in ("/app.js", "/app.js?v=00000000", "/app.js?v="):
+            res, _ = self.get(path)
+            self.assertEqual(res.getheader("Cache-Control"), "no-cache", path)
+        sw = (self.web / "sw.js").read_bytes()
+        res, _ = self.get("/sw.js?v=" + self.sha(sw)[:8])
+        self.assertEqual(res.getheader("Cache-Control"), "no-cache")
+        self.assertEqual(res.getheader("Service-Worker-Allowed"), "/")
+        page = self.get("/")[1]
+        res, _ = self.get("/index.html?v=" + self.sha(page)[:8])
+        self.assertEqual(res.getheader("Cache-Control"), "no-cache")
+        for path in ("/notes.txt", "/missing.js", "/vendor/../app.js", "/%2e%2e/server.py"):
+            self.assertEqual(self.get(path)[0].status, 404, path)
+
+    def test_index_is_rendered_with_asset_versions(self):
+        import html
+        import re
+        res, data = self.get("/")
+        page = data.decode()
+        self.assertEqual(res.getheader("Cache-Control"), "no-cache")
+        expected = {"/" + name: self.sha((self.web / name).read_bytes())[:8]
+                    for name in ("app.js", "icon.png", "icon.svg", "index.html", "manifest.webmanifest",
+                                 "sw.js", "vendor/x.css")}
+        content = re.search(r'name="sessionholic-assets"\s+content="([^"]*)"', page).group(1)
+        self.assertEqual(json.loads(html.unescape(content)), expected)
+        self.assertIn('<script src="/app.js?v=%s" defer>' % expected["/app.js"], page)
+        self.assertIn('href="/vendor/x.css?v=%s"' % expected["/vendor/x.css"], page)
+        self.assertIn('href="/manifest.webmanifest?v=%s"' % expected["/manifest.webmanifest"], page)
+        for kept in ('src="/missing.js"', 'href="/sw.js"', 'href="/app.js?keep=1"', 'href="/"'):
+            self.assertIn(kept, page)
+        # The page's validator covers the rendered bytes, which change with any asset.
+        self.assertEqual(res.getheader("ETag"), '"%s"' % self.sha(data)[:16])
+        self.assertEqual(self.get("/index.html")[1], data)
+        res, packed = self.get("/", **{"Accept-Encoding": "gzip"})
+        self.assertEqual(res.getheader("Content-Encoding"), "gzip")
+        self.assertEqual(self.get("/", **{"If-None-Match": '"%s"' % self.sha(data)[:16]})[0].status, 304)
+
+    def test_changed_asset_updates_cache_and_page_validator(self):
+        import hashlib
+        path = self.web / "vendor/x.css"
+        original = path.read_bytes()
+        self.addCleanup(path.write_bytes, original)
+        first = self.get("/")[1]
+        entry = self.httpd.assets.files["vendor/x.css"][1]
+        self.get("/vendor/x.css")
+        self.assertIs(self.httpd.assets.files["vendor/x.css"][1], entry, "unchanged files are served from memory")
+        path.write_bytes(b"body{margin:1px}\n")
+        stamp = path.stat().st_mtime_ns + 1_000_000_000
+        os.utime(path, ns=(stamp, stamp))
+        res, data = self.get("/vendor/x.css")
+        self.assertEqual(data, b"body{margin:1px}\n")
+        second = self.get("/", **{"If-None-Match": '"%s"' % hashlib.sha256(first).hexdigest()[:16]})
+        self.assertEqual(second[0].status, 200)
+        self.assertIn('href="/vendor/x.css?v=%s"' % hashlib.sha256(data).hexdigest()[:8], second[1].decode())
+
+    def test_index_without_asset_meta_still_gets_versioned_references(self):
+        index = self.web / "index.html"
+        self.addCleanup(index.write_text, WEB_INDEX)
+        index.write_text('<!doctype html><script src="/app.js"></script>')
+        page = self.get("/")[1].decode()
+        self.assertRegex(page, r'^<!doctype html><script src="/app\.js\?v=[0-9a-f]{8}"></script>$')
+
+
+class PublishedWebTreeTest(unittest.TestCase):
+    """The shipped web/ folder, not a fixture: every page reference is servable."""
+
+    def test_page_references_are_static_assets_and_theme_init_runs_first(self):
+        import hashlib
+        import re
+        root = Path(__file__).resolve().parents[1] / "web"
+        page = (root / "index.html").read_text(encoding="utf-8")
+        refs = re.findall(r'(?:src|href)="/([^"?#]+)"', page)
+        self.assertIn("theme-init.js", refs)
+        for name in refs:
+            self.assertTrue(server.STATIC.fullmatch(name), name)
+            self.assertTrue((root / name).is_file(), name)
+        rendered = server.StaticAssets(root).index()["body"].decode("utf-8")
+        sha = hashlib.sha256((root / "theme-init.js").read_bytes()).hexdigest()[:8]
+        # Loaded without defer, before the stylesheet, so the stored theme applies before paint.
+        self.assertIn('<script src="/theme-init.js?v=%s"></script>' % sha, rendered)
+        self.assertLess(rendered.index("/theme-init.js?v="), rendered.index("/style.css?v="))
+
+
+class BoardVersionTest(unittest.TestCase):
+    def test_version_rises_only_when_published_state_changes(self):
+        board = server.Board(HOSTS, 60, runner=fake_runner([]))
+        board.clock = lambda: 1_000_000.0
+        seen = []
+        board.add_listener(seen.append)
+        self.assertEqual(board.snapshot()["version"], 0)
+        self.assertTrue(board.poll(HOSTS[0]))
+        # refreshing on, then the collected result.
+        self.assertEqual(board.snapshot()["version"], 2)
+        self.assertEqual(seen, [1, 2])
+        board.snapshot()
+        self.assertFalse(board.request_refresh())
+        self.assertEqual((board.version, seen), (2, [1, 2]))
+        board.runner = lambda host, args, timeout: (_ for _ in ()).throw(RuntimeError("SSH 연결 실패"))
+        self.assertFalse(board.poll(HOSTS[0]))
+        self.assertEqual(board.version, 4)
+        self.assertEqual(seen, [1, 2, 3, 4])
+        board.remove_listener(seen.append)
+
+    def test_failing_listener_does_not_break_collection(self):
+        board = server.Board(HOSTS, 60, runner=fake_runner([]))
+        def broken(version):
+            raise ValueError("fixture")
+        board.add_listener(broken)
+        with patch("sys.stderr", new_callable=io.StringIO) as log:
+            self.assertTrue(board.poll(HOSTS[0]))
+        self.assertTrue(board.state["remote"]["ok"])
+        self.assertIn("ValueError", log.getvalue())
+
+
+class EventStreamTest(unittest.TestCase):
+    """/api/events over real loopback sockets."""
+    SOURCE = "host=remote&agent=claude&id=a1b2c3d4"
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.data = {"claude": [{"id": "a1b2c3d4", "title": "정산", "phase": "idle"}], "codex": []}
+        self.board = server.Board(HOSTS, 60, runner=lambda host, args, timeout: json.loads(json.dumps(self.data)))
+        self.board.poll(HOSTS[0])
+        self.httpd = server.make_server("127.0.0.1", 0, self.board, TOKEN, state_dir=self.temp.name)
+        hub = self.httpd.events
+        hub.heartbeat, hub.peer_check, hub.grace = 0.2, 0.05, 0.2
+        hub.fast, hub.idle, hub.error = 0.05, (0.05,), 0.05
+        self.chat_state = {"phase": "working", "messages": [{"role": "user", "text": "hi"}]}
+        self.reads, self.watching = [], []
+        def state(data, watching=False):
+            self.reads.append(data["source"])
+            self.watching.append(watching)
+            return json.loads(json.dumps(self.chat_state))
+        patcher = patch.object(self.httpd.chat, "state", side_effect=state)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.port = self.httpd.server_address[1]
+        threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
+        self.sockets = []
+        self.closed = False
+        self.addCleanup(self.stop)
+
+    def stop(self):
+        for sock in self.sockets:
+            sock.close()
+        if not self.closed:
+            self.httpd.shutdown()
+            self.httpd.server_close()
+
+    def open(self, query="", method="GET", auth=True, extra=""):
+        import socket
+        sock = socket.create_connection(("127.0.0.1", self.port), timeout=5)
+        self.sockets.append(sock)
+        headers = "Host: 127.0.0.1\r\nAccept-Encoding: gzip\r\n" + extra
+        if auth:
+            headers += "Authorization: Bearer %s\r\n" % TOKEN
+        sock.sendall(("%s /api/events%s HTTP/1.1\r\n%s\r\n" % (method, "?" + query if query else "", headers)).encode())
+        return sock
+
+    @staticmethod
+    def read_until(sock, marker, received=b"", timeout=5):
+        deadline = time.monotonic() + timeout
+        while marker not in received:
+            if time.monotonic() > deadline:
+                raise AssertionError("missing %r in %r" % (marker, received[-300:]))
+            chunk = sock.recv(65536)
+            if not chunk:
+                raise AssertionError("stream closed before %r: %r" % (marker, received[-300:]))
+            received += chunk
+        return received
+
+    @staticmethod
+    def head(received):
+        head = received.split(b"\r\n\r\n", 1)[0].decode()
+        lines = head.split("\r\n")
+        return lines[0], {line.split(":", 1)[0].lower(): line.split(":", 1)[1].strip() for line in lines[1:]}
+
+    def refusal(self, sock):
+        """Status code, Retry-After and JSON error code of a plain (non-stream) answer."""
+        received = self.read_until(sock, b"\r\n\r\n")
+        status, headers = self.head(received)
+        body = received.split(b"\r\n\r\n", 1)[1]
+        while len(body) < int(headers["content-length"]):
+            chunk = sock.recv(65536)
+            if not chunk:
+                break
+            body += chunk
+        self.assertEqual(headers["content-type"], "application/json; charset=utf-8")
+        self.assertNotIn("content-encoding", headers)
+        return int(status.split()[1]), headers.get("retry-after"), json.loads(body).get("code")
+
+    def test_stream_headers_hello_heartbeat_and_snapshot_event(self):
+        sock = self.open()
+        received = self.read_until(sock, b": ping\n\n")
+        status, headers = self.head(received)
+        self.assertIn(" 200 ", status)
+        self.assertEqual(headers["content-type"], "text/event-stream; charset=utf-8")
+        self.assertEqual(headers["cache-control"], "no-store")
+        self.assertEqual(headers["x-accel-buffering"], "no")
+        self.assertNotIn("content-length", headers)
+        self.assertNotIn("content-encoding", headers)
+        body = received.split(b"\r\n\r\n", 1)[1]
+        version = self.board.version
+        self.assertTrue(body.startswith(b'retry: 3000\n\nevent: hello\ndata: {"snapshotVersion":%d}\n\n' % version))
+        self.data = {"claude": [{"id": "a1b2c3d4", "title": "정산 완료", "phase": "done"}], "codex": []}
+        self.board.poll(HOSTS[0])
+        received = self.read_until(sock, b'event: snapshot\ndata: {"version":%d}\n\n' % self.board.version, received)
+        res = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        res.request("GET", "/api/snapshot", headers={"Authorization": "Bearer " + TOKEN})
+        self.assertEqual(json.loads(res.getresponse().read())["version"], self.board.version)
+        res.close()
+
+    def test_chat_subscription_announces_digest_changes(self):
+        sock = self.open(self.SOURCE)
+        received = self.read_until(sock, b"event: chat\n")
+        # The watcher reads the server's identity of the listed row, as a watcher read.
+        self.assertEqual(self.reads[0], {"host": "remote", "agent": "claude", "home": None, "id": "a1b2c3d4"})
+        self.assertTrue(all(self.watching))
+        first = received.split(b"event: chat\ndata: ", 1)[1].split(b"\n", 1)[0]
+        self.chat_state = {"phase": "idle", "messages": [{"role": "assistant", "text": "끝"}]}
+        received = self.read_until(sock, b"event: chat\n", received.split(b"event: chat\n", 1)[1])
+        second = received.split(b"event: chat\ndata: ", 1)[1].split(b"\n", 1)[0]
+        self.assertNotEqual(json.loads(first)["digest"], json.loads(second)["digest"])
+        self.assertEqual(len(self.httpd.events.watchers), 1)
+
+    def test_login_source_validation_and_head(self):
+        sock = self.open(auth=False)
+        self.assertIn(b" 401 ", self.read_until(sock, b"\r\n\r\n"))
+        for query in ("host=remote&agent=sh&id=a1b2c3d4", "host=other&agent=claude&id=a1b2c3d4",
+                      "host=remote&agent=claude&id=ffffffff"):
+            sock = self.open(query)
+            received = self.read_until(sock, b"\r\n\r\n")
+            self.assertIn(b" 400 ", received, query)
+        sock = self.open(method="HEAD")
+        received = self.read_until(sock, b"\r\n\r\n")
+        self.assertIn(b"text/event-stream", received)
+        wait_for(lambda: not self.httpd.events.streams)
+        self.assertEqual(self.reads, [])
+
+    def test_spellings_of_one_conversation_share_one_watcher(self):
+        identity = {"host": "remote", "agent": "claude", "home": None, "id": "a1b2c3d4"}
+        socks = [self.open(self.SOURCE + extra) for extra in ("", "&home=.claude", "&home=other")]
+        for sock in socks:
+            self.read_until(sock, b"event: hello")
+        from events import watch_key
+        self.assertEqual(list(self.httpd.events.watchers), [watch_key(identity)])
+        wait_for(lambda: self.reads)
+        self.assertTrue(all(read == identity for read in self.reads))
+        # A send naming the row with a stray home speeds up that same watcher.
+        with patch.object(self.httpd.events, "boost", wraps=self.httpd.events.boost) as boost, \
+             patch.object(self.httpd.chat, "send", return_value={"status": "accepted"}):
+            conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+            conn.request("POST", "/api/chat/send", json.dumps({"source": {**identity, "home": ".claude"},
+                         "requestId": "request-0001", "text": "hi"}),
+                         {"Content-Type": "application/json", "Authorization": "Bearer " + TOKEN,
+                          "X-CSRF-Token": self.httpd.csrf})
+            self.assertEqual(conn.getresponse().status, 200)
+            conn.close()
+            boost.assert_called_once_with(identity)
+
+    def test_watcher_cap_counts_grace_watchers(self):
+        self.data = {"claude": [{"id": "a1b2c3d4", "title": "정산", "phase": "idle"},
+                                {"id": "e5f6a7b8", "title": "정리", "phase": "idle"}], "codex": []}
+        self.board.poll(HOSTS[0])
+        hub = self.httpd.events
+        hub.max_watchers, hub.grace = 1, 30.0
+        first = self.open(self.SOURCE)
+        self.read_until(first, b"event: hello")
+        other = "host=remote&agent=claude&id=e5f6a7b8"
+        # Only a full hub is "busy": the deploy check accepts nothing else as saturation.
+        self.assertEqual(self.refusal(self.open(other)), (503, "10", "events_busy"))
+        self.assertEqual(len(hub.watchers), 1)
+        # Left but still in its grace period: the next conversation takes its place.
+        first.close()
+        wait_for(lambda: not hub.streams)
+        self.assertEqual(len(hub.watchers), 1)
+        self.read_until(self.open(other), b"event: hello")
+        from events import watch_key
+        self.assertEqual(list(hub.watchers), [watch_key({"host": "remote", "agent": "claude", "id": "e5f6a7b8"})])
+        # A source the board cannot resolve right now is refused without a watcher.
+        with patch.object(self.httpd.chat, "resolve", side_effect=RuntimeError("fixture")):
+            self.assertEqual(self.refusal(self.open(self.SOURCE)), (503, "10", "events_unavailable"))
+        self.assertEqual(len(hub.watchers), 1)
+
+    def test_connection_limit_and_departed_clients(self):
+        self.httpd.events.max_streams = 2
+        first, second = self.open(), self.open()
+        for sock in (first, second):
+            self.read_until(sock, b"event: hello")
+        third = self.open()
+        self.assertEqual(self.refusal(third), (503, "10", "events_busy"))
+        # A client that leaves frees its slot without waiting for a heartbeat write.
+        first.close()
+        wait_for(lambda: len(self.httpd.events.streams) == 1)
+        self.read_until(self.open(), b"event: hello")
+
+    def test_failures_and_shutdown_are_not_reported_as_busy(self):
+        hub = self.httpd.events
+        # A watcher thread that cannot start is a failure, not a full hub.
+        with patch.object(hub, "open", side_effect=RuntimeError("can't start new thread")):
+            self.assertEqual(self.refusal(self.open(self.SOURCE)), (503, "10", "events_unavailable"))
+        self.read_until(self.open(), b"event: hello")
+        # A hub closing with the server is unavailable too.
+        hub.close()
+        self.assertEqual(self.refusal(self.open()), (503, "10", "events_unavailable"))
+
+    def test_successful_send_and_menu_answer_speed_up_the_watcher(self):
+        from chat import SendRejected
+        source = {"host": "remote", "agent": "claude", "id": "a1b2c3d4"}
+        def post(path, body):
+            conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+            conn.request("POST", path, json.dumps(body), {"Content-Type": "application/json",
+                         "Authorization": "Bearer " + TOKEN, "X-CSRF-Token": self.httpd.csrf})
+            res = conn.getresponse()
+            res.read()
+            conn.close()
+            return res.status
+        identity = {**source, "home": None}
+        with patch.object(self.httpd.events, "boost") as boost, \
+             patch.object(self.httpd.chat, "send", return_value={"requestId": "r", "status": "accepted"}), \
+             patch.object(self.httpd.chat, "prompt", return_value={"ok": True}):
+            self.assertEqual(post("/api/chat/send", {"source": source, "requestId": "r", "text": "hi"}), 200)
+            # The watcher is found by the server's identity of the row, not the posted spelling.
+            boost.assert_called_once_with(identity)
+            self.assertEqual(post("/api/chat/prompt", {"source": source, "action": "open"}), 200)
+            self.assertEqual(boost.call_count, 1, "opening a menu is not an answer")
+            self.assertEqual(post("/api/chat/prompt", {"source": source, "action": "answer"}), 200)
+            self.assertEqual(boost.call_count, 2)
+            # A row no longer listed has no watcher to speed up; the send still succeeded.
+            self.assertEqual(post("/api/chat/send", {"source": {**source, "id": "ffffffff"},
+                                                     "requestId": "r", "text": "hi"}), 200)
+            self.assertEqual(boost.call_count, 2)
+        with patch.object(self.httpd.events, "boost") as boost, \
+             patch.object(self.httpd.chat, "send", side_effect=SendRejected("fixture")):
+            self.assertEqual(post("/api/chat/send", {"source": source, "requestId": "r", "text": "hi"}), 400)
+            boost.assert_not_called()
+        # A failing hint never turns a delivered message into an error.
+        with patch.object(self.httpd.events, "boost", side_effect=TypeError("fixture")), \
+             patch.object(self.httpd.chat, "send", return_value={"status": "accepted"}), \
+             patch("sys.stderr", new_callable=io.StringIO):
+            self.assertEqual(post("/api/chat/send", {"source": source, "requestId": "r", "text": "hi"}), 200)
+
+    def test_server_close_ends_open_streams(self):
+        sock = self.open(self.SOURCE)
+        self.read_until(sock, b"event: hello")
+        started = time.monotonic()
+        self.httpd.shutdown()
+        self.httpd.server_close()
+        self.closed = True
+        self.assertLess(time.monotonic() - started, 3)
+        sock.settimeout(3)
+        tail = b""
+        while True:
+            chunk = sock.recv(65536)
+            if not chunk:
+                break
+            tail += chunk
+        wait_for(lambda: not self.httpd.events.watchers)
+
 
 class HelperTest(unittest.TestCase):
     def test_tailscale_user_file_is_private_and_single_login(self):

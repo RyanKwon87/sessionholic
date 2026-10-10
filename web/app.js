@@ -34,6 +34,8 @@ const prefs = {
     }
   },
 };
+const THEMES = ["auto", "light", "dark"];
+const TEXT_SIZES = ["small", "default", "large"];
 const state = {
   snapshot: null,
   capabilities: null,
@@ -42,6 +44,9 @@ const state = {
   csrf: "",
   selected: null,
   filters: { host: "", agent: "", project: "", account: "" },
+  // The status chips above the list ("needs_input" or "working"); tapping the
+  // active chip again clears it.
+  phaseFilter: "",
   accountFilterRoutes: null,
   search: "",
   showOld: false,
@@ -99,13 +104,315 @@ const state = {
   chatPollTimer: null,
   chatPollRun: 0,
   chatPollCount: 0,
+  // Board look (UI preference only) and phone navigation state.
+  theme: normalizeTheme(prefs.get("theme", "auto")),
+  // Board text size (UI preference only); the terminal has its own size.
+  textSize: normalizeTextSize(prefs.get("textSize", "default")),
+  detailShown: false,
+  terminalOpenRun: 0,
+  assetVersions: null,
+  // Live updates (/api/events) and the snapshot version they announce.
+  events: null,
+  eventsRetryAt: 0,
+  snapshotVersion: null,
+  eventsSnapshotVersion: null,
+  snapshotPending: false,
 };
+
+// --- UI foundation: theme, haptics, screen transitions, bottom sheet -------
+// Theme: "auto" follows the device; "light"/"dark" force the board. Only this
+// choice is stored, as a UI preference (THEMES is declared above `state`). The
+// terminal is always dark, so the browser bar turns dark while it is open.
+const THEME_COLORS = { light: "#f2f2f7", dark: "#000000", terminal: "#1c1c1e" };
+function normalizeTheme(value) {
+  return THEMES.includes(value) ? value : "auto";
+}
+function applyTheme(theme = state.theme) {
+  state.theme = normalizeTheme(theme);
+  const root = document.documentElement;
+  if (state.theme === "auto") root?.removeAttribute?.("data-theme");
+  else root?.setAttribute?.("data-theme", state.theme);
+  for (const value of THEMES) {
+    const input = $(`theme-${value}`);
+    if (input) input.checked = value === state.theme;
+  }
+  updateThemeColor();
+}
+function setTheme(theme) {
+  const next = normalizeTheme(theme);
+  if (next === state.theme) return;
+  applyTheme(next);
+  prefs.set("theme", next);
+  haptic("select");
+}
+// Board text size: "small"/"large" scale the root font size (style.css section
+// 12); "default" removes the attribute. theme-init.js applies the stored
+// choice before the first paint.
+function normalizeTextSize(value) {
+  return TEXT_SIZES.includes(value) ? value : "default";
+}
+function applyTextSize(size = state.textSize) {
+  state.textSize = normalizeTextSize(size);
+  const root = document.documentElement;
+  if (state.textSize === "default") root?.removeAttribute?.("data-text-size");
+  else root?.setAttribute?.("data-text-size", state.textSize);
+  for (const value of TEXT_SIZES) {
+    const input = $(`text-size-${value}`);
+    if (input) input.checked = value === state.textSize;
+  }
+}
+function setTextSize(size) {
+  const next = normalizeTextSize(size);
+  if (next === state.textSize) return;
+  applyTextSize(next);
+  prefs.set("textSize", next);
+  haptic("select");
+  // The composer and terminal measure text; let them follow the new size.
+  updateViewport();
+}
+function updateThemeColor() {
+  // Both media-specific metas take the forced color; "auto" restores them.
+  const forced = state.terminalVisible ? THEME_COLORS.terminal
+    : state.theme === "auto" ? null : THEME_COLORS[state.theme];
+  for (const meta of document.querySelectorAll?.('meta[name="theme-color"]') || []) {
+    if (meta.dataset && meta.dataset.original == null) meta.dataset.original = meta.getAttribute?.("content") || "";
+    const value = forced || meta.dataset?.original;
+    if (value && meta.getAttribute?.("content") !== value) meta.setAttribute?.("content", value);
+  }
+}
+
+// Haptic ticks where the platform has them (Android); silent elsewhere.
+const HAPTICS = { select: 8, success: [12, 60, 18], error: [30, 50, 30, 50, 30] };
+function haptic(kind = "select") {
+  const pattern = HAPTICS[kind];
+  if (pattern == null) return false;
+  try {
+    return globalThis.navigator?.vibrate?.(pattern) === true;
+  } catch {
+    return false;
+  }
+}
+
+function prefersReducedMotion() {
+  return !!window.matchMedia?.("(prefers-reduced-motion: reduce)")?.matches;
+}
+function phoneLayout() {
+  return !!window.matchMedia?.("(max-width: 700px)")?.matches;
+}
+// Runs `update` inside a view transition sliding in `direction` ("push",
+// "pop", "present" or "dismiss"; style.css section 11). Without support,
+// with reduced motion or in a hidden tab it runs at once. Returns the
+// transition, or null when `update` already ran.
+let navToken = 0;
+function navTransition(direction, update) {
+  const root = document.documentElement;
+  if (typeof document.startViewTransition !== "function" || prefersReducedMotion() || document.hidden || !root?.dataset) {
+    update();
+    return null;
+  }
+  const token = ++navToken;
+  root.dataset.nav = direction;
+  const clear = () => { if (token === navToken) delete root.dataset.nav; };
+  let transition;
+  try {
+    transition = document.startViewTransition(update);
+  } catch {
+    clear();
+    update();
+    return null;
+  }
+  transition?.finished?.then?.(clear, clear);
+  return transition || null;
+}
+// Phone screens: the list or one conversation. State changes at once (chat
+// reads depend on it); only the visible switch may wait for the transition.
+function setDetailShown(shown, { direction = null, focus = false } = {}) {
+  const changed = state.detailShown !== shown;
+  state.detailShown = shown;
+  const apply = () => {
+    if (shown) document.body.classList.add("show-detail");
+    else document.body.classList.remove("show-detail");
+    if (focus) {
+      if (shown) focusDetailBack();
+      else restoreSelectedCardFocus();
+    }
+  };
+  const transition = direction && changed && phoneLayout() ? navTransition(direction, apply) : (apply(), null);
+  syncEvents();
+  return transition;
+}
+
+// Bottom sheet for phone dialogs; wider screens keep the centered dialog.
+// Reuse: const sheet = BottomSheet.attach(dialog, { detents: ["medium", "large"], onDismiss });
+// sheet.open({ detent: "large" }); sheet.setDetent("medium"); sheet.close().
+// The <dialog> takes class "plan-dialog sheet" (a .sheet-handle is added when
+// missing); its handle, .dialog-top and title are the drag zone. A drag down,
+// a tap outside and the caller's own "cancel" handler should all dismiss via
+// onDismiss, which may refuse (e.g. while busy): the sheet then springs back.
+function sheetRelease({ offset = 0, velocity = 0, height = 0, detent = "medium", detents = ["medium", "large"] } = {}) {
+  // offset: px dragged (down is positive); velocity: px/ms at release.
+  const size = Math.max(1, height);
+  if (offset > 0) {
+    const dismiss = offset > size * 0.25 || velocity > 0.5;
+    const far = offset > size * 0.5 || velocity > 1.4;
+    if (dismiss && !far && detent === "large" && detents.includes("medium")) return "medium";
+    return dismiss ? "close" : detent;
+  }
+  if (offset < 0 && detent !== "large" && detents.includes("large") && (offset < -48 || velocity < -0.5)) return "large";
+  return detent;
+}
+class BottomSheet {
+  static attach(dialog, options = {}) {
+    if (!dialog) return null;
+    if (!dialog.bottomSheet) dialog.bottomSheet = new BottomSheet(dialog, options);
+    return dialog.bottomSheet;
+  }
+  constructor(dialog, { detents = ["medium", "large"], detent = detents[0], onDismiss = null } = {}) {
+    this.dialog = dialog;
+    this.detents = detents;
+    this.initial = detent;
+    this.onDismiss = onDismiss;
+    this.drag = null;
+    if (!dialog.querySelector?.(".sheet-handle") && typeof dialog.prepend === "function") {
+      const handle = el("div", "sheet-handle");
+      handle.setAttribute("aria-hidden", "true");
+      dialog.prepend(handle);
+    }
+    dialog.classList?.add("sheet");
+    this.setDetent(detent);
+    dialog.addEventListener("pointerdown", (event) => this.start(event));
+    dialog.addEventListener("pointermove", (event) => this.move(event));
+    dialog.addEventListener("pointerup", (event) => this.end(event));
+    dialog.addEventListener("pointercancel", (event) => this.end(event, true));
+    // A gesture whose pointerup never arrives must not block the next drag.
+    dialog.addEventListener("lostpointercapture", (event) => this.end(event, true));
+    dialog.addEventListener("click", (event) => this.outsideClick(event));
+    // Closed by code mid-drag: forget the gesture.
+    dialog.addEventListener("close", () => {
+      this.drag = null;
+      dialog.classList?.remove("is-dragging");
+    });
+  }
+  open({ detent = this.initial } = {}) {
+    this.setDetent(detent);
+    this.offset(0);
+    // A menu opened by a long press must not close on that finger's release:
+    // only a press that starts on the open sheet's backdrop dismisses it.
+    this.pressedSinceOpen = false;
+    if (!this.dialog.open) this.dialog.showModal();
+  }
+  close() {
+    if (this.dialog.open) this.dialog.close();
+  }
+  dismiss() {
+    if (!this.dialog.open) return;
+    if (typeof this.onDismiss === "function") this.onDismiss();
+    else this.close();
+  }
+  setDetent(detent) {
+    if (!this.detents.includes(detent)) return;
+    this.detent = detent;
+    if (this.dialog.dataset) this.dialog.dataset.detent = detent;
+  }
+  offset(px) {
+    this.dialog.style?.setProperty?.("--sheet-drag", `${Math.round(px)}px`);
+  }
+  start(event) {
+    if (this.dialog.open) this.pressedSinceOpen = true;
+    if (this.drag) this.end({ pointerId: this.drag.id }, true);
+    if (!this.dialog.open || !phoneLayout() || (event.button || 0) > 0) return;
+    const zone = event.target?.closest?.(".sheet-handle, .dialog-top, h2");
+    if (!zone || zone.parentElement !== this.dialog || event.target.closest("button, a, input, select, textarea")) return;
+    const now = Date.now();
+    const rect = this.dialog.getBoundingClientRect?.();
+    this.drag = { id: event.pointerId, y: event.clientY, offset: 0, height: rect?.height || this.dialog.offsetHeight || 0,
+      samples: [[now, event.clientY]] };
+    this.dialog.setPointerCapture?.(event.pointerId);
+    this.dialog.classList?.add("is-dragging");
+  }
+  move(event) {
+    const drag = this.drag;
+    if (!drag || event.pointerId !== drag.id) return;
+    drag.offset = event.clientY - drag.y;
+    drag.samples.push([Date.now(), event.clientY]);
+    if (drag.samples.length > 6) drag.samples.shift();
+    // Down follows the finger; up resists like a rubber band.
+    this.offset(drag.offset >= 0 ? drag.offset : -Math.min(40, Math.sqrt(-drag.offset) * 4));
+    if (event.cancelable) event.preventDefault();
+  }
+  end(event, cancelled = false) {
+    const drag = this.drag;
+    if (!drag || event?.pointerId !== drag.id) return;
+    this.drag = null;
+    this.dialog.classList?.remove("is-dragging");
+    const now = Date.now();
+    const recent = drag.samples.filter(([time]) => now - time < 120);
+    const velocity = recent.length >= 2
+      ? (recent[recent.length - 1][1] - recent[0][1]) / Math.max(1, recent[recent.length - 1][0] - recent[0][0]) : 0;
+    const outcome = cancelled ? this.detent
+      : sheetRelease({ offset: drag.offset, velocity, height: drag.height, detent: this.detent, detents: this.detents });
+    if (outcome === "close") this.dismiss();
+    else if (outcome !== this.detent) {
+      this.setDetent(outcome);
+      haptic("select");
+    }
+    // Closed: the exit transition ignores the offset. Still open: spring back.
+    this.offset(0);
+  }
+  outsideClick(event) {
+    if (event.target !== this.dialog || !this.dialog.open || !this.pressedSinceOpen) return;
+    const rect = this.dialog.getBoundingClientRect?.();
+    if (!rect || (event.clientX >= rect.left && event.clientX <= rect.right &&
+        event.clientY >= rect.top && event.clientY <= rect.bottom)) return;
+    this.dismiss();
+  }
+}
+const SHEETS = {
+  "plan-dialog": { onDismiss: () => closePlan() },
+  "close-terminal-dialog": { onDismiss: () => cancelTerminalClose() },
+  "settings-dialog": { onDismiss: () => closeSettings() },
+  "usage-dialog": { onDismiss: () => closeSheet("usage-dialog", "usage") },
+  "filter-dialog": { onDismiss: () => closeSheet("filter-dialog", "filter-open") },
+  "terminals-dialog": { onDismiss: () => closeSheet("terminals-dialog", "running-terminals") },
+  "action-sheet": { detents: ["medium"], onDismiss: () => closeActionSheet() },
+};
+function sheet(id) {
+  return BottomSheet.attach($(id), SHEETS[id]);
+}
+// Closes a simple sheet and returns focus to the control that opened it.
+function closeSheet(id, returnFocus = null) {
+  const dialog = $(id);
+  if (!dialog?.open) return;
+  dialog.close();
+  if (returnFocus) $(returnFocus)?.focus?.({ preventScroll: true });
+}
+function openSettings() {
+  applyTheme();
+  applyTextSize();
+  sheet("settings-dialog").open();
+}
+function closeSettings() {
+  if (!$("settings-dialog").open) return;
+  $("settings-dialog").close();
+  $("settings")?.focus?.({ preventScroll: true });
+}
+
+applyTheme();
+applyTextSize();
 
 function el(tag, className, text) {
   const node = document.createElement(tag);
   if (className) node.className = className;
   if (text != null) node.textContent = text;
   return node;
+}
+// Adds or removes one class through className, so the change is the same for
+// real elements and for the test DOM (whose classList is a stub).
+function setClass(node, name, on) {
+  if (!node) return;
+  const names = String(node.className || "").split(/\s+/).filter(Boolean);
+  if (names.includes(name) === !!on) return;
+  node.className = (on ? [...names, name] : names.filter((item) => item !== name)).join(" ");
 }
 function button(text, className, action) {
   const node = el("button", className, text);
@@ -250,7 +557,8 @@ function groupOf(s) {
       ? "working"
       : "rest";
 }
-function matches(s, now) {
+function matches(s, now, { phase = true } = {}) {
+  if (phase && state.phaseFilter && groupOf(s) !== state.phaseFilter) return false;
   for (const key of Object.keys(state.filters)) {
     if (key === "account" && state.filters.account && state.accountFilterRoutes) {
       if (!state.accountFilterRoutes.has(accountRouteKey(s))) return false;
@@ -285,9 +593,13 @@ function render() {
   if (!state.snapshot) return;
   const now = state.snapshot.serverTime || Date.now() / 1000;
   const sessions = allSessions();
-  const shown = sessions.filter((s) => matches(s, now));
+  // The status chips count what the other filters leave, so the inactive
+  // chip keeps its number while the other one filters the list.
+  const base = sessions.filter((s) => matches(s, now, { phase: false }));
+  const shown = state.phaseFilter ? base.filter((s) => groupOf(s) === state.phaseFilter) : base;
   renderHosts(now);
-  renderCounts(shown);
+  renderFreshness(now);
+  renderCounts(base);
   renderAttention(sessions);
   renderFilters(sessions);
   renderGroups(shown, now);
@@ -337,6 +649,18 @@ function renderHosts(now) {
     box.append(chip);
   }
 }
+// While hosts are still collecting, say how old the list on screen is; the
+// note disappears once the collection finishes.
+function renderFreshness(now) {
+  const box = $("list-freshness");
+  if (!box) return;
+  const times = (state.snapshot?.hosts || []).filter((host) => host.refreshing)
+    .map((host) => host.fetchedAt).filter((value) => Number.isFinite(value) && value > 0);
+  const oldest = times.length ? Math.min(...times) : null;
+  const text = oldest && now - oldest >= 60 ? `${ago(oldest, now)} 기준 · 갱신 중` : "";
+  if (box.textContent !== text) box.textContent = text;
+  box.hidden = !text;
+}
 // Agent usage (remaining limits) when the board host provides it; a board
 // without the endpoint simply never shows the strip.
 function usageTone(remaining) {
@@ -353,7 +677,12 @@ function renderUsage(data) {
   const box = $("usage");
   if (!box) return;
   const providers = data?.available && Array.isArray(data.providers) ? data.providers.filter((item) => item && typeof item === "object") : [];
-  if (!providers.length) { box.hidden = true; box.dataset.revision = ""; return; }
+  if (!providers.length) {
+    box.hidden = true;
+    box.dataset.revision = "";
+    if ($("usage-dialog")?.open) closeSheet("usage-dialog");
+    return;
+  }
   box.hidden = false;
   const revision = JSON.stringify([providers, data.refreshing, data.fetchedAt, data.error]);
   if (box.dataset.revision === revision) return;
@@ -367,8 +696,8 @@ function renderUsage(data) {
   });
   if (data.refreshing) pills.push(el("span", "usage-state", "조회 중"));
   summary.replaceChildren(...pills);
-  summary.setAttribute("aria-label", `남은 사용량 ${providers.map((provider) =>
-    `${provider.label || provider.short} ${Number.isFinite(provider.remaining) ? provider.remaining + "%" : "확인 불가"}`).join(", ")}`);
+  box.setAttribute("aria-label", `남은 사용량 ${providers.map((provider) =>
+    `${provider.label || provider.short} ${Number.isFinite(provider.remaining) ? provider.remaining + "%" : "확인 불가"}`).join(", ")}. 계정별로 보기`);
   const body = $("usage-body");
   const sections = providers.map((provider) => {
     const section = el("section", "usage-provider");
@@ -406,6 +735,12 @@ function renderUsage(data) {
   foot.append(refresh);
   body.replaceChildren(...sections, foot);
 }
+function openUsage() {
+  if ($("usage")?.hidden) return;
+  sheet("usage-dialog").open();
+  // A sheet opened long after the last read asks for fresh numbers.
+  if (Date.now() - (state.usageAt || 0) > 55000) loadUsage();
+}
 async function loadUsage(force = false) {
   if (state.usageUnsupported || !state.authenticated || networkOffline() || document.hidden) return;
   if (state.usageBusy) return;
@@ -438,33 +773,54 @@ function renderAttention(sessions) {
     /* badges are optional */
   }
 }
-function renderCounts(shown) {
+// Status chips: "답 필요 N" and "작업 중 N" filter the list to that state;
+// tapping the active chip again shows everything. The buttons are kept and
+// only relabelled, so keyboard focus stays on a chip while counts change.
+const PHASE_LABELS = { needs_input: "답 필요", working: "작업 중" };
+function togglePhaseFilter(key) {
+  state.phaseFilter = state.phaseFilter === key ? "" : key;
+  haptic("select");
+  render();
+}
+function renderCounts(sessions) {
   const box = $("counts");
-  const revision = GROUPS.slice(0, 2).map((group) => shown.filter((s) => groupOf(s) === group.key).length).join(",");
-  // A live region rewritten with the same text is re-announced by screen readers.
+  const counts = GROUPS.slice(0, 2).map((group) => sessions.filter((s) => groupOf(s) === group.key).length);
+  const revision = `${counts.join(",")}|${state.phaseFilter}`;
   if (box.dataset.revision === revision) return;
   box.dataset.revision = revision;
-  box.replaceChildren();
-  for (const group of GROUPS.slice(0, 2)) {
-    const n = shown.filter((s) => groupOf(s) === group.key).length;
-    const pill = el("span", `count ${group.tone}${n ? "" : " zero"}`);
-    pill.append(
-      el("span", "dot"),
-      el(
-        "span",
-        null,
-        `${group.key === "needs_input" ? "답 필요" : "작업 중"} ${n}`,
-      ),
-    );
-    box.append(pill);
-  }
+  box.chips ||= new Map();
+  const chips = GROUPS.slice(0, 2).map((group, index) => {
+    let chip = box.chips.get(group.key);
+    if (!chip) {
+      chip = button("", "count", () => togglePhaseFilter(group.key));
+      chip.dataset.phase = group.key;
+      chip.chipLabel = el("span", "count-label");
+      chip.append(el("span", "dot"), chip.chipLabel);
+      box.chips.set(group.key, chip);
+    }
+    const n = counts[index];
+    const active = state.phaseFilter === group.key;
+    chip.className = `count ${group.tone}${n ? "" : " zero"}${active ? " is-active" : ""}`;
+    chip.chipLabel.textContent = `${PHASE_LABELS[group.key]} ${n}`;
+    chip.setAttribute("aria-pressed", String(active));
+    chip.setAttribute("aria-label", `${PHASE_LABELS[group.key]} ${n}개${active ? ", 이것만 보는 중" : ""}`);
+    return chip;
+  });
+  placeChildren(box, chips);
 }
+// The filter sheet's selects; the button that opens it shows how many apply.
+const FILTER_FIELDS = ["filter-host", "filter-agent", "filter-project", "filter-account"];
 function renderFilters(sessions) {
-  const active = Object.values(state.filters).filter(Boolean).length;
-  $("filter-count").textContent = active ? `${active}개 적용` : "";
+  const active = Object.values(state.filters).filter(Boolean).length + (state.showOld ? 1 : 0);
+  $("filter-count").textContent = active ? String(active) : "";
+  const open = $("filter-open");
+  if (open) {
+    setClass(open, "is-active", active > 0);
+    open.setAttribute?.("aria-label", active ? `필터 ${active}개 적용됨` : "필터");
+  }
   const box = $("filter-fields");
-  const focused = document.activeElement?.id;
-  if (focused?.startsWith("filter-")) return;
+  // A select being used keeps its element (and the open picker).
+  if (FILTER_FIELDS.includes(document.activeElement?.id)) return;
   box.replaceChildren();
   for (const [key, label, pick] of [
     ["host", "기기", (s) => [s.host, s.hostLabel]],
@@ -492,8 +848,14 @@ function renderFilters(sessions) {
     field.append(select);
     box.append(field);
   }
-  const n = Object.values(state.filters).filter(Boolean).length;
-  $("filter-count").textContent = n ? `${n}개 적용` : "";
+}
+function resetFilters() {
+  for (const key of Object.keys(state.filters)) state.filters[key] = "";
+  state.accountFilterRoutes = null;
+  state.showOld = false;
+  if ($("show-old")) $("show-old").checked = false;
+  renderFilters(allSessions());
+  render();
 }
 function cardLine(value) {
   return String(value || "").replace(/\s+/g, " ").trim();
@@ -544,11 +906,11 @@ function renderGroups(shown, now) {
   const cards = new Map();
   // Reuse only what is mounted now; lock clears this DOM and its references.
   for (const section of box.children) {
-    if (section.dataset.groupKey) sections.set(section.dataset.groupKey, section);
-    for (const node of section.children)
-      if (node.dataset.sessionKey) cards.set(node.dataset.sessionKey, node);
+    if (section.dataset?.groupKey) sections.set(section.dataset.groupKey, section);
+    for (const node of section.children || [])
+      if (node.dataset?.sessionKey) cards.set(node.dataset.sessionKey, node);
   }
-  const focused = active?.dataset?.sessionKey && cards.get(active.dataset.sessionKey) === active ? active : null;
+  const focused = active?.dataset?.sessionKey && cards.get(active.dataset.sessionKey)?.card === active ? active : null;
   const folders = cardFolderHints(shown);
   const desired = [];
   const visible = new Set();
@@ -572,70 +934,130 @@ function renderGroups(shown, now) {
     for (const session of items) {
       const source = chatKey(sourceOf(session));
       const previous = cards.get(session.key);
-      const node = previous?.dataset.sourceKey === source ? previous : card(session);
-      updateCard(node, session, now, folders.get(session.key));
-      children.push(node); visible.add(node);
+      const row = previous?.dataset.sourceKey === source ? previous : card(session);
+      updateCard(row.card, session, now, folders.get(session.key));
+      children.push(row); visible.add(row.card);
     }
     placeChildren(section, children);
     desired.push(section);
   }
+  let loading = false;
   if (!shown.length) {
-    const filtered = state.search || Object.values(state.filters).some(Boolean);
+    const searching = !!state.search;
+    const filtering = Object.values(state.filters).some(Boolean);
     const unconfigured = !state.snapshot?.hosts?.length;
     const offline = state.snapshot?.hosts?.length && state.snapshot.hosts.every((host) => !host.ok && !host.refreshing);
-    const empty = el("div", "empty-list");
-    empty.append(el("p", null, filtered ? "조건에 맞는 작업이 없습니다." : unconfigured
-      ? "연결할 기기가 아직 설정되지 않았습니다. 설치 안내에 따라 기기를 설정한 뒤 새로고침해 주세요." : offline
-      ? "기기에 연결되지 않아 작업을 확인하지 못했습니다. 기기 연결과 에이전트 설치 상태를 확인한 뒤 다시 확인해 주세요."
-      : state.snapshot?.hosts?.some((host) => host.refreshing)
-        ? "기기에서 작업을 확인하고 있습니다…"
-        : "표시할 최근 작업이 없습니다. 설정한 기기에서 Claude Code나 Codex로 대화를 시작한 뒤 새로고침해 주세요. 이전 대화는 필터에서 확인할 수 있습니다."));
-    if (filtered) empty.append(button("검색·필터 초기화", "secondary", () => {
+    const clearAll = () => {
       state.search = "";
+      state.phaseFilter = "";
       for (const key of Object.keys(state.filters)) state.filters[key] = "";
       state.accountFilterRoutes = null;
       $("search").value = "";
       render();
-    }));
-    else if (offline) empty.append(button("다시 확인", "secondary", manualRefresh));
+    };
+    let empty;
+    if (state.phaseFilter && !searching && !filtering) {
+      empty = emptyState("filter", state.phaseFilter === "needs_input" ? "답이 필요한 작업이 없습니다." : "진행 중인 작업이 없습니다.",
+        "다른 작업은 필터를 해제하면 보입니다.", button("필터 해제", "secondary", () => togglePhaseFilter(state.phaseFilter)));
+    } else if (searching || filtering || state.phaseFilter) {
+      empty = emptyState("search", "조건에 맞는 작업이 없습니다.",
+        searching ? `‘${state.search}’로 찾은 작업이 없습니다. 검색어나 필터를 바꿔 보세요.` : "필터를 바꾸거나 초기화해 보세요.",
+        button("검색·필터 초기화", "secondary", clearAll));
+    } else if (unconfigured) {
+      empty = emptyState("setup", "연결할 기기가 아직 설정되지 않았습니다.",
+        "설치 안내에 따라 기기를 설정한 뒤 새로고침해 주세요.");
+    } else if (offline) {
+      empty = emptyState("offline", "기기에 연결되지 않아 작업을 확인하지 못했습니다.",
+        "기기 연결과 에이전트 설치 상태를 확인한 뒤 다시 확인해 주세요.", button("다시 확인", "secondary", manualRefresh));
+    } else if (state.snapshot?.hosts?.some((host) => host.refreshing)) {
+      loading = true;
+      empty = skeletonList("기기에서 작업을 확인하고 있습니다…");
+    } else {
+      empty = emptyState("none", "표시할 최근 작업이 없습니다.",
+        "설정한 기기에서 Claude Code나 Codex로 대화를 시작한 뒤 새로고침해 주세요. 3일 지난 대화는 필터에서 볼 수 있습니다.");
+    }
     desired.push(empty);
   }
+  box.setAttribute?.("aria-busy", String(loading));
   placeChildren(box, desired);
   if (focused && visible.has(focused) && document.activeElement !== focused) focused.focus({ preventScroll: true });
   if (typeof scroll === "number") pane.scrollTop = scroll;
 }
+// Empty and loading states of the list: an icon, a short title, what to do,
+// and at most one action.
+function emptyState(kind, title, body = "", action = null) {
+  const box = el("div", `empty-list empty-${kind}`);
+  const icon = el("span", "empty-icon");
+  icon.setAttribute("aria-hidden", "true");
+  box.append(icon, el("p", "empty-title", title));
+  if (body) box.append(el("p", "empty-body", body));
+  if (action) box.append(action);
+  return box;
+}
+function skeletonList(label = "작업을 확인하고 있습니다…") {
+  const wrap = el("div", "skeleton-wrap");
+  const list = el("div", "skeleton-list");
+  list.setAttribute("aria-hidden", "true");
+  for (let index = 0; index < 4; index++) {
+    const item = el("div", "skeleton-card");
+    item.append(el("span"), el("span"), el("span"));
+    list.append(item);
+  }
+  const note = el("p", "sr-only", label);
+  note.setAttribute("role", "status");
+  wrap.append(list, note);
+  return wrap;
+}
+function cardTitle(s) {
+  const rawTitle = cardLine(s.title);
+  return !rawTitle || ["(제목 없음)", "(이름 없음)"].includes(rawTitle) ? "제목 없는 작업" : rawTitle;
+}
+// A card is three short lines (title, a one-line preview, status · agent ·
+// project · time) with a disclosure chevron; device and account stay in its
+// accessible name and in the conversation header. The row holds the card and
+// the action a left swipe reveals.
 function card(s) {
+  const row = el("div", "card-row");
+  row.dataset.sessionKey = s.key;
+  row.dataset.sourceKey = chatKey(sourceOf(s));
+  // Touch shortcut only; the same actions open from a long press, a right
+  // click or the conversation itself, so it stays out of the focus order.
+  const action = button("", "card-swipe-action", () => runSwipeAction(row));
+  action.tabIndex = -1;
+  action.setAttribute("aria-hidden", "true");
   const node = button("", "card", () => {
-    const mounted = [...$("groups").children].some((section) => [...section.children].includes(node));
-    const current = allSessions().find((session) => session.key === node.dataset.sessionKey);
-    if (state.authenticated && mounted && current && chatKey(sourceOf(current)) === node.dataset.sourceKey) select(current.key);
+    if (state.swipeOpen === row) { closeSwipe(row); return; }
+    const mounted = [...$("groups").children].some((section) => [...(section.children || [])].includes(row));
+    const current = allSessions().find((session) => session.key === row.dataset.sessionKey);
+    if (state.authenticated && mounted && current && chatKey(sourceOf(current)) === row.dataset.sourceKey) select(current.key);
   });
   node.dataset.sessionKey = s.key;
-  node.dataset.sourceKey = chatKey(sourceOf(s));
-  const project = el("span", "card-project");
+  node.dataset.sourceKey = row.dataset.sourceKey;
   const title = el("span", "card-title");
   const snippet = el("span", "card-snippet");
-  const folder = el("span", "card-folder");
   const meta = el("span", "card-meta");
   const badge = el("span", "badge");
   const agent = el("span", "card-agent");
-  const host = el("span", "card-host");
+  const project = el("span", "card-project");
+  const stale = el("span", "stale-tag", "이전 정보");
   const time = el("span", "card-time");
-  meta.append(badge, agent, host, time);
-  const accountLine = el("span", "card-account-line");
-  const account = el("span", "card-account");
-  const stale = el("span", "stale-tag", "마지막 확인 기준");
-  accountLine.append(account, stale);
-  node.append(project, title, snippet, folder, meta, accountLine);
-  node.cardParts = { project, title, snippet, folder, badge, agent, host, time, accountLine, account, stale };
-  return node;
+  meta.append(badge, agent, project, stale, time);
+  const chevron = el("span", "card-chevron");
+  chevron.setAttribute("aria-hidden", "true");
+  node.append(title, snippet, meta, chevron);
+  node.cardParts = { title, snippet, badge, agent, project, stale, time };
+  node.cardRow = row;
+  row.append(action, node);
+  row.card = node;
+  row.swipeAction = action;
+  return row;
 }
 function updateCard(node, s, now, folderHint = "") {
   const p = node.cardParts;
   const write = (target, value) => { if (target.textContent !== value) target.textContent = value; };
   const project = cardProject(s);
   const rawTitle = cardLine(s.title);
-  const title = !rawTitle || ["(제목 없음)", "(이름 없음)"].includes(rawTitle) ? "제목 없는 작업" : rawTitle;
+  const title = cardTitle(s);
   const snippet = cardLine(s.snippet);
   const preview = snippet && snippet !== rawTitle && snippet !== title ? snippet : "";
   const agent = AGENTS[s.agent] || s.agent || "에이전트";
@@ -650,17 +1072,346 @@ function updateCard(node, s, now, folderHint = "") {
     label, agent, "기기: " + host, account ? "계정 설정: " + account : "", time,
     s.stale ? "마지막 확인 기준" : ""].filter(Boolean).join(". "));
   node.title = `${project}\n${title}`;
-  write(p.project, project); p.project.title = project;
+  const place = folderHint ? `${project} · ${folderHint}` : project;
   write(p.title, title); p.title.title = title;
-  write(p.snippet, preview ? `대화 미리보기 · ${preview}` : ""); p.snippet.hidden = !preview; p.snippet.title = preview;
-  write(p.folder, folderHint ? `작업 폴더 · ${folderHint}` : ""); p.folder.hidden = !folderHint; p.folder.title = folderHint;
+  write(p.snippet, preview); p.snippet.hidden = !preview; p.snippet.title = preview;
   write(p.badge, label); p.badge.className = `badge ${tone}`;
   write(p.agent, agent); p.agent.className = `card-agent ${s.agent}`;
-  write(p.host, host); p.host.title = host;
+  write(p.project, place); p.project.title = place;
   write(p.time, time);
-  write(p.account, account ? `계정 설정 · ${account}` : ""); p.account.title = account; p.account.hidden = !account;
   p.stale.hidden = !s.stale;
-  p.accountLine.hidden = !account && !s.stale;
+  p.stale.title = s.stale ? "기기에 연결되지 않아 마지막으로 확인한 정보입니다." : "";
+}
+
+// --- Gestures: long press menus and card swipes --------------------------------
+// A long press (or a right click) opens the same action sheet as the visible
+// controls; a left swipe on a card reveals its terminal action. The decisions
+// are pure functions so their timing and angles are testable.
+const LONG_PRESS_MS = 450;
+const PRESS_SLOP = 10; // px a finger may drift before a press becomes a drag
+const SWIPE_RATIO = 1.7; // |dx|/|dy| above this (within ~30° of horizontal) swipes
+const SWIPE_REVEAL = 96; // px of the revealed action button
+// What a drag is once it passes the slop: "swipe" (sideways: leftward, or
+// either way on an open row), "scroll" (anything steeper, or rightward on a
+// closed row), or null while still undecided.
+function swipeIntent(dx, dy, open = false) {
+  const ax = Math.abs(dx);
+  const ay = Math.abs(dy);
+  if (Math.max(ax, ay) < PRESS_SLOP) return null;
+  if (ax < ay * SWIPE_RATIO) return "scroll";
+  return dx < 0 || open ? "swipe" : "scroll";
+}
+// Where a released swipe settles. offset: px from rest (left is negative);
+// velocity: px/ms (left is negative). "action" runs it (a pull past 60% of
+// the card), "open" keeps the button revealed, "close" springs back.
+function swipeRelease({ offset = 0, velocity = 0, width = 0, reveal = SWIPE_REVEAL } = {}) {
+  const size = Math.max(1, width);
+  if (offset <= -size * 0.6) return "action";
+  if (velocity > 0.4) return "close";
+  if (offset <= -reveal * 0.5 || (velocity < -0.4 && offset < -PRESS_SLOP)) return "open";
+  return "close";
+}
+// One press at a time: fires onPress after LONG_PRESS_MS unless the pointer
+// moved past PRESS_SLOP, lifted or was cancelled (scrolling) first. Mouse
+// buttons use the context menu instead.
+function createLongPress(onPress) {
+  let press = null;
+  const tracker = {
+    start(event, target) {
+      tracker.cancel();
+      if (!target || event?.pointerType === "mouse" || event?.isPrimary === false) return;
+      press = { id: event.pointerId, x: event.clientX, y: event.clientY, target, fired: false };
+      const current = press;
+      press.timer = setTimeout(() => {
+        if (press !== current || current.fired) return;
+        current.fired = true;
+        onPress(current.target, current);
+      }, LONG_PRESS_MS);
+    },
+    move(event) {
+      if (!press || press.fired || event?.pointerId !== press.id) return;
+      if (Math.hypot((event.clientX || 0) - press.x, (event.clientY || 0) - press.y) > PRESS_SLOP) tracker.cancel();
+    },
+    // True when this press already opened its menu: its click is ignored.
+    end(event) {
+      if (!press || (event && event.pointerId !== press.id)) return false;
+      const fired = press.fired;
+      clearTimeout(press.timer);
+      press = null;
+      return fired;
+    },
+    // Android sends contextmenu for a long press; it opens the menu at once.
+    fire() {
+      if (!press || press.fired) return false;
+      clearTimeout(press.timer);
+      press.fired = true;
+      onPress(press.target, press);
+      return true;
+    },
+    cancel() {
+      if (press) clearTimeout(press.timer);
+      press = null;
+    },
+    get active() {
+      return press;
+    },
+  };
+  return tracker;
+}
+// Long press, right click and the context-menu key open `open(row, point)`;
+// the click a long press leaves behind is swallowed.
+function bindPressMenu(root, rowOf, open, { onDown = null, onMove = null, onUp = null } = {}) {
+  const press = createLongPress((row) => {
+    root.pressedAt = Date.now();
+    haptic("select");
+    open(row, null);
+  });
+  root.addEventListener("pointerdown", (event) => {
+    onDown?.(event);
+    if (event.target?.closest?.("button:not(.card), input, textarea, select, summary")) return;
+    press.start(event, rowOf(event.target));
+  });
+  root.addEventListener("pointermove", (event) => {
+    press.move(event);
+    if (onMove?.(event)) press.cancel();
+  });
+  root.addEventListener("pointerup", (event) => {
+    if (press.end(event)) root.pressedAt = Date.now();
+    onUp?.(event, false);
+  });
+  root.addEventListener("pointercancel", (event) => {
+    press.cancel();
+    onUp?.(event, true);
+  });
+  root.addEventListener("contextmenu", (event) => {
+    const row = rowOf(event.target);
+    if (!row) return;
+    if (press.active) {
+      event.preventDefault();
+      if (press.fire()) root.pressedAt = Date.now();
+      return;
+    }
+    if (Date.now() - (root.pressedAt || 0) < 1000) {
+      event.preventDefault();
+      return;
+    }
+    // A text selection keeps the browser's own menu (its copy works on it).
+    const selection = window.getSelection?.();
+    if (selection && !selection.isCollapsed && row.contains?.(selection.anchorNode)) return;
+    event.preventDefault();
+    open(row, { x: event.clientX, y: event.clientY });
+  });
+  root.addEventListener("click", (event) => {
+    // The button a swipe just revealed takes its first tap.
+    if (event.target?.closest?.(".card-swipe-action")) return;
+    if (Date.now() - (root.pressedAt || 0) > 700) return;
+    root.pressedAt = 0;
+    event.preventDefault();
+    event.stopPropagation();
+  }, true);
+  return press;
+}
+
+// Cards: swipe left for the terminal action, long press for all actions.
+function sessionForRow(row) {
+  return row ? allSessions().find((session) => session.key === row.dataset?.sessionKey) || null : null;
+}
+// The alive board terminal that belongs to a session: its attached runtime
+// (nativeSource) first, then the session it was launched from (sourceKey).
+function terminalForSession(s) {
+  if (!s) return null;
+  const key = chatKey(sourceOf(s));
+  const alive = state.terminals.filter((terminal) => terminal && terminal.alive !== false && !terminal.closed);
+  const launchedFrom = (info) => {
+    try {
+      const source = JSON.parse(info.sourceKey || "null");
+      return source && typeof source === "object" ? chatKey(source) : "";
+    } catch {
+      return "";
+    }
+  };
+  return alive.find((terminal) => {
+    const native = terminalInfo(terminal).nativeSource;
+    return native?.host && chatKey(native) === key;
+  }) || alive.find((terminal) => launchedFrom(terminalInfo(terminal)) === key) || null;
+}
+function openSessionTerminal(s) {
+  if (!s || state.launchBusy || !state.authenticated) return;
+  const terminal = terminalForSession(s);
+  if (terminal) {
+    openTerminal(terminal);
+    return;
+  }
+  // Opening a new terminal is reviewed from the conversation (plan sheet).
+  if (state.selected !== s.key) select(s.key);
+  const current = selectedSession();
+  if (current?.key === s.key) openChatTerminal(current);
+}
+function swipeActionFor(s) {
+  const terminal = terminalForSession(s);
+  if (!terminal) return { kind: "open", label: "터미널 열기", s };
+  const copy = terminalCloseCopy(terminal);
+  return { kind: "close", label: copy.action, danger: copy.danger, terminal, s };
+}
+function setSwipeOffset(row, px) {
+  row?.style?.setProperty?.("--swipe-x", `${Math.round(px)}px`);
+  if (row) row.swipeOffset = px;
+}
+function prepareSwipe(row) {
+  const action = swipeActionFor(sessionForRow(row));
+  row.pendingSwipe = action;
+  row.swipeAction.textContent = action.label;
+  row.swipeAction.className = `card-swipe-action ${action.kind === "close" ? `is-close${action.danger ? " is-danger" : ""}` : "is-open"}`;
+  setClass(row, "is-swiping", true);
+}
+function closeSwipe(row = state.swipeOpen) {
+  if (!row) return;
+  setSwipeOffset(row, 0);
+  setClass(row, "is-swiping", false);
+  setClass(row, "is-open", false);
+  if (state.swipeOpen === row) state.swipeOpen = null;
+}
+function settleSwipe(row, outcome) {
+  setClass(row, "is-swiping", false);
+  if (outcome === "open") {
+    if (state.swipeOpen && state.swipeOpen !== row) closeSwipe();
+    setSwipeOffset(row, -SWIPE_REVEAL);
+    setClass(row, "is-open", true);
+    state.swipeOpen = row;
+    haptic("select");
+    return;
+  }
+  closeSwipe(row);
+  if (outcome === "action") runSwipeAction(row);
+}
+function runSwipeAction(row) {
+  const action = row.pendingSwipe || swipeActionFor(sessionForRow(row));
+  row.pendingSwipe = null;
+  closeSwipe(row);
+  if (!action?.s || !state.authenticated) return;
+  haptic("select");
+  if (action.kind === "close") closeTerminal(action.terminal.id);
+  else openSessionTerminal(action.s);
+}
+function cardActions(s) {
+  const terminal = terminalForSession(s);
+  const actions = [
+    { label: "대화 열기", run: () => select(s.key) },
+    { label: terminal ? "터미널로 돌아가기" : "터미널 열기", run: () => openSessionTerminal(s), disabled: state.launchBusy },
+  ];
+  if (terminal) {
+    const copy = terminalCloseCopy(terminal);
+    actions.push({ label: copy.action, danger: copy.danger, run: () => closeTerminal(terminal.id) });
+  }
+  return actions;
+}
+function openCardMenu(row, at = null) {
+  const s = sessionForRow(row);
+  if (!s || !state.authenticated) return;
+  closeSwipe();
+  openActionSheet({ eyebrow: cardProject(s), title: cardTitle(s), actions: cardActions(s), at, trigger: row.card });
+}
+function bindCardGestures(root) {
+  let drag = null;
+  const rowOf = (target) => {
+    const row = target?.closest?.(".card-row");
+    return row?.card ? row : null;
+  };
+  bindPressMenu(root, rowOf, openCardMenu, {
+    onDown(event) {
+      const row = rowOf(event.target);
+      if (state.swipeOpen && state.swipeOpen !== row) closeSwipe();
+      drag = null;
+      if (!row || event.pointerType === "mouse" || event.target?.closest?.(".card-swipe-action")) return;
+      drag = { row, id: event.pointerId, x: event.clientX, y: event.clientY, intent: null, offset: 0,
+        base: state.swipeOpen === row ? -SWIPE_REVEAL : 0, samples: [[Date.now(), event.clientX]] };
+    },
+    // Returns true once the drag is a swipe, which ends the long press.
+    onMove(event) {
+      if (!drag || event.pointerId !== drag.id) return false;
+      const dx = event.clientX - drag.x;
+      const dy = event.clientY - drag.y;
+      if (!drag.intent) {
+        drag.intent = swipeIntent(dx, dy, drag.base !== 0);
+        if (drag.intent === "scroll") {
+          drag = null;
+          return false;
+        }
+        if (drag.intent !== "swipe") return false;
+        prepareSwipe(drag.row);
+        root.swiping = true;
+      }
+      // Never right of rest; past the card's width the pull resists.
+      const raw = Math.min(0, drag.base + dx);
+      const width = drag.row.offsetWidth || 360;
+      drag.offset = raw < -width * 0.75 ? -width * 0.75 - Math.sqrt(-raw - width * 0.75) * 4 : raw;
+      drag.samples.push([Date.now(), event.clientX]);
+      if (drag.samples.length > 6) drag.samples.shift();
+      setSwipeOffset(drag.row, drag.offset);
+      if (event.cancelable) event.preventDefault();
+      return true;
+    },
+    onUp(event, cancelled) {
+      const current = drag;
+      if (!current || event.pointerId !== current.id) return;
+      drag = null;
+      root.swiping = false;
+      if (current.intent !== "swipe") return;
+      root.pressedAt = Date.now(); // the click after a swipe never opens the card
+      root.swiping = false;
+      const now = Date.now();
+      const recent = current.samples.filter(([time]) => now - time < 120);
+      const velocity = recent.length >= 2
+        ? (recent[recent.length - 1][1] - recent[0][1]) / Math.max(1, recent[recent.length - 1][0] - recent[0][0]) : 0;
+      settleSwipe(current.row, cancelled ? "close"
+        : swipeRelease({ offset: current.offset, velocity, width: current.row.offsetWidth || 360 }));
+    },
+  });
+  // Once a drag is a swipe, the list does not also scroll under the finger.
+  root.addEventListener("touchmove", (event) => {
+    if (root.swiping && event.cancelable) event.preventDefault();
+  }, { passive: false });
+}
+
+// --- Action sheet (menus) -------------------------------------------------------
+// One sheet serves every menu: a bottom sheet on phones, a small popover at
+// the pointer for a right click on wider screens.
+function openActionSheet({ eyebrow = "", title = "", preview = "", actions = [], at = null, trigger = null } = {}) {
+  const dialog = $("action-sheet");
+  if (!dialog || !actions.length) return;
+  if (dialog.open) dialog.close();
+  $("action-eyebrow").textContent = eyebrow;
+  $("action-title").textContent = title;
+  const previewNode = $("action-preview");
+  previewNode.textContent = preview;
+  previewNode.hidden = !preview;
+  const items = actions.map((action) => {
+    const item = button(action.label, `action-item${action.danger ? " danger" : ""}`, () => {
+      if (item.disabled) return;
+      closeActionSheet({ restoreFocus: false });
+      action.run();
+    });
+    item.disabled = !!action.disabled;
+    return item;
+  });
+  $("action-list").replaceChildren(...items);
+  state.actionTrigger = trigger;
+  const popover = !!at && !phoneLayout();
+  setClass(dialog, "is-popover", popover);
+  if (dialog.style) {
+    const width = window.innerWidth || 0;
+    const height = window.innerHeight || 0;
+    dialog.style.left = popover ? `${Math.round(Math.max(8, Math.min(at.x, width - 268)))}px` : "";
+    dialog.style.top = popover ? `${Math.round(Math.max(8, Math.min(at.y, height - 96 - 46 * items.length)))}px` : "";
+  }
+  sheet("action-sheet").open();
+}
+function closeActionSheet({ restoreFocus = true } = {}) {
+  const dialog = $("action-sheet");
+  if (dialog?.open) dialog.close();
+  const trigger = state.actionTrigger;
+  state.actionTrigger = null;
+  if (restoreFocus && trigger && trigger.isConnected !== false) trigger.focus?.({ preventScroll: true });
 }
 
 function focusDetailBack() {
@@ -672,24 +1423,25 @@ function restoreSelectedCardFocus() {
 }
 function select(key) {
   if (state.launchBusy) return;
-  const mobile = window.matchMedia("(max-width: 700px)").matches;
-  if (
-    window.matchMedia("(max-width: 700px)").matches &&
-    !document.body.classList.contains("show-detail")
-  )
-    navigateView("detail");
+  const mobile = phoneLayout();
+  const entering = mobile && !state.detailShown;
+  if (entering) navigateView("detail");
   if (state.selected === key) {
-    document.body.classList.add("show-detail");
-    if (mobile) focusDetailBack();
+    setDetailShown(true, { direction: entering ? "push" : null, focus: mobile });
     return;
   }
+  haptic("select");
   state.selected = key;
   stopChatPolling();
   state.detailFor = null;
   state.route = null;
-  document.body.classList.add("show-detail");
+  // The conversation read that render() starts checks this, so it is set
+  // first; setDetailShown then switches the screen (and syncs live updates).
+  const wasShown = state.detailShown;
+  state.detailShown = true;
   render();
-  if (mobile) focusDetailBack();
+  state.detailShown = wasShown;
+  setDetailShown(true, { direction: entering ? "push" : null, focus: mobile });
 }
 function refreshDetail(s) {
   const revision = JSON.stringify([s.stale, s.phase, s.title, s.project, s.account, s.hostLabel, s.fetchedAt,
@@ -824,11 +1576,13 @@ function drawDetail(s) {
   jump.hidden = true;
   jump.setAttribute("aria-label", "대화 맨 아래로");
   list.addEventListener("scroll", () => readingScroll(list), { passive: true });
+  bindMessageGestures(list);
   // The folded one-line header unfolds when tapped (the back button keeps its job).
   head.addEventListener("click", (event) => {
     if (pane.classList?.contains?.("is-reading") && !event.target?.closest?.(".back")) setReading(false);
   });
   pane.classList?.remove("is-reading");
+  pane.classList?.remove("is-typing");
   const prompt = el("section", "chat-prompt");
   prompt.id = "chat-prompt";
   prompt.hidden = true;
@@ -839,6 +1593,7 @@ function drawDetail(s) {
 // here with the same keys a person would press. Nothing is sent until the
 // second, explicit tap, and the server rechecks the exact menu first.
 const AGENT_NAMES = { claude: "Claude", codex: "Codex" };
+const PROMPT_INLINE_OPTIONS = 4;
 function renderPrompt(s, data) {
   const card = $("chat-prompt");
   if (!card || !currentChat(chatEntry(s))) return;
@@ -877,11 +1632,17 @@ function renderPrompt(s, data) {
   const selectable = !prompt.multi && Number.isInteger(prompt.current);
   const options = el("div", "chat-prompt-options");
   options.setAttribute("role", "radiogroup");
-  for (const option of prompt.options) {
+  // A long menu keeps the card short: the first few choices (and the chosen
+  // one) inline, every choice in a sheet.
+  const many = selectable && prompt.options.length > PROMPT_INLINE_OPTIONS + 1;
+  const inline = many ? prompt.options.filter((option, index) => index < PROMPT_INLINE_OPTIONS ||
+    option.number === entry.promptChoice?.number) : prompt.options;
+  for (const option of inline) {
     const chosen = entry.promptChoice?.number === option.number;
     const item = button("", `chat-prompt-option${chosen ? " is-chosen" : ""}${option.number === prompt.current ? " is-current" : ""}`, () => {
       if (!selectable || entry.promptBusy) return;
       entry.promptChoice = { fingerprint: prompt.fingerprint, number: option.number };
+      haptic("select");
       renderPrompt(s, entry.data);
     });
     item.setAttribute("role", "radio");
@@ -892,6 +1653,23 @@ function renderPrompt(s, data) {
     options.append(item);
   }
   nodes.push(options);
+  if (many) {
+    const all = button(`선택지 ${prompt.options.length}개 모두 보기`, "chat-prompt-more", () => {
+      if (entry.promptBusy) return;
+      openActionSheet({ eyebrow: "선택지", title: prompt.question ? prompt.question.split("\n")[0] : "선택지를 고르세요",
+        trigger: all, actions: prompt.options.map((option) => ({
+          label: `${option.number}. ${option.label}${entry.promptChoice?.number === option.number ? " · 선택됨" : ""}`,
+          run: () => {
+            entry.promptChoice = { fingerprint: prompt.fingerprint, number: option.number };
+            haptic("select");
+            renderPrompt(s, entry.data);
+          },
+        })) });
+    });
+    all.setAttribute("aria-haspopup", "dialog");
+    all.disabled = !!entry.promptBusy;
+    nodes.push(all);
+  }
   if (!selectable) {
     nodes.push(el("p", "chat-prompt-note", prompt.multi ? "여러 개를 고르는 메뉴는 터미널에서 선택해 주세요."
       : "현재 선택 위치를 확인하지 못했습니다. 터미널에서 선택해 주세요."));
@@ -920,10 +1698,10 @@ async function promptAction(s, body) {
     entry.promptChoice = null;
     if (body.action === "answer")
       entry.promptNote = result.status === "answered" ? "" : "선택이 반영됐는지 확인하지 못했습니다. 터미널에서 확인해 주세요.";
-    if (body.action === "answer" && result.status === "answered") toast("선택을 보냈습니다.");
+    if (body.action === "answer" && result.status === "answered") { toast("선택을 보냈습니다."); haptic("success"); }
     entry.data = { ...entry.data, prompt: result.prompt || null, promptOpenable: false };
   } catch (err) {
-    if (!err.unauthorized && currentChat(entry)) entry.promptNote = err.message;
+    if (!err.unauthorized && currentChat(entry)) { entry.promptNote = err.message; haptic("error"); }
   } finally {
     entry.promptBusy = false;
     if (currentChat(entry)) {
@@ -953,10 +1731,24 @@ function setReading(reading, { stickBottom = false } = {}) {
   }
   renderJump();
 }
+// Typing on a phone folds the same chrome as reading mode (header to one
+// line, conversation bar, continue row and tool row), so the keyboard leaves
+// the transcript most of the screen. Leaving the input restores it.
+function setTyping(typing) {
+  const pane = $("detail");
+  if (!pane?.classList || !!pane.classList.contains?.("is-typing") === typing) return;
+  const list = $("messages");
+  const atBottom = !!list && list.scrollHeight - list.scrollTop - list.clientHeight < 50;
+  if (typing) pane.classList.add("is-typing");
+  else pane.classList.remove("is-typing");
+  if (list && atBottom) list.scrollTop = list.scrollHeight;
+  renderJump();
+}
 function readingScroll(list) {
   const top = list.scrollTop;
   const previous = list.lastScrollTop ?? top;
   list.lastScrollTop = top;
+  // While typing, the chrome is already folded (setTyping) and stays put.
   const typing = document.activeElement?.id === "chat-input";
   if (list.scrollHeight - top - list.clientHeight < 24) {
     list.upTravel = 0;
@@ -1035,21 +1827,28 @@ function attachmentMetadata(files) {
       source: file.source === "native" ? "native" : "sessionholic" };
   });
 }
-function attachmentGroup(files, caption = `첨부 ${files.length}개`) {
+// Names a transcript gives files it cannot name; such a chip shows its kind once.
+const GENERIC_ATTACHMENT_NAMES = new Set(["이미지 첨부", "이미지", "사진", "첨부파일", "파일", "image", "file", "attachment"]);
+function attachmentGroup(files, caption = `첨부 ${files.length}개`, { showCaption = true } = {}) {
   const group = el("div", "msg-attachments");
   group.setAttribute("role", "group");
   group.setAttribute("aria-label", caption);
-  group.append(el("span", "attachment-caption", caption));
+  if (showCaption) group.append(el("span", "attachment-caption", caption));
   const chips = el("div", "attachment-chips");
   chips.setAttribute("role", "list");
   for (const file of files) {
-    const kind = file.kind === "image" ? "이미지" : "파일";
+    const image = file.kind === "image";
+    const kind = image ? "이미지" : "파일";
+    const generic = GENERIC_ATTACHMENT_NAMES.has(String(file.name || "").trim().toLowerCase());
+    const name = generic ? kind : file.name;
     const size = file.size == null ? "" : formatBytes(file.size);
-    const chip = el("span", "msg-attachment");
+    const chip = el("span", `msg-attachment ${image ? "is-image" : "is-file"}`);
     chip.setAttribute("role", "listitem");
-    chip.setAttribute("aria-label", `${kind}: ${file.name}${size ? `, ${size}` : ""}`);
-    chip.title = file.name;
-    chip.append(el("span", "attachment-kind", kind), el("span", "attachment-name", file.name));
+    chip.setAttribute("aria-label", `${kind}${generic ? "" : `: ${file.name}`}${size ? `, ${size}` : ""}`);
+    chip.title = generic ? kind : file.name;
+    const icon = el("span", "attachment-icon");
+    icon.setAttribute("aria-hidden", "true");
+    chip.append(icon, el("span", "attachment-name", name));
     if (size) chip.append(el("span", "attachment-size", size));
     chips.append(chip);
   }
@@ -1087,7 +1886,7 @@ function chatEntry(s) {
   const key = chatKey(source);
   if (!state.chats.has(key)) state.chats.set(key, {
     source: Object.freeze({ ...source }), text: "", attachments: [], data: null, conversation: null,
-    pending: null, receipt: null, sending: false, uploads: 0,
+    pending: null, receipt: null, sending: false, uploads: 0, outbox: [], outboxClaims: [], uploadQueue: [], thumbs: new Map(),
     composing: false, editorEpoch: 0, stateEpoch: 0, recheckQueued: false, expanded: false, inputCollapsed: false, checking: false, error: "", notice: "", revision: 0,
   });
   return state.chats.get(key);
@@ -1100,8 +1899,7 @@ function networkOffline() {
   return state.offline || globalThis.navigator?.onLine === false;
 }
 function chatVisible() {
-  return !document.hidden && !state.terminalVisible &&
-    (!window.matchMedia?.("(max-width: 700px)").matches || document.body.classList.contains("show-detail"));
+  return !document.hidden && !state.terminalVisible && (!phoneLayout() || state.detailShown);
 }
 function chatSupported(entry) {
   return entry.data?.capability?.supported === true &&
@@ -1151,7 +1949,11 @@ function buildChatComposer(s) {
     entry.revision++;
     updateChatComposer(entry);
   });
-  input.addEventListener("focus", () => setReading(false));
+  input.addEventListener("focus", () => {
+    setReading(false);
+    setTyping(touchDevice());
+  });
+  input.addEventListener("blur", () => setTyping(false));
   input.addEventListener("compositionstart", () => {
     if (!editorCurrent()) return;
     entry.composing = true;
@@ -1213,6 +2015,15 @@ function buildChatComposer(s) {
   });
   native.id = "chat-native-open";
   native.hidden = true;
+  // The same "연결 닫기" a card offers on a swipe or long press.
+  const closeTerm = button("연결 닫기", "secondary", () => {
+    if (!editorCurrent()) return;
+    tools.open = false;
+    const terminal = terminalForSession(s);
+    if (terminal) closeTerminal(terminal.id);
+  });
+  closeTerm.id = "chat-terminal-close";
+  closeTerm.hidden = true;
   const send = button("보내기", "primary", () => {
     if (!editorCurrent()) return;
     if (entry.composing) {
@@ -1223,6 +2034,11 @@ function buildChatComposer(s) {
     sendChat(entry);
   });
   send.id = "chat-send";
+  // Sending keeps the keyboard and the folded typing layout; a blur first
+  // would move the button away under the finger before the click lands.
+  send.addEventListener("pointerdown", (event) => {
+    if (document.activeElement === input) event.preventDefault();
+  });
   const hint = el("p", "chat-hint", "Ctrl/⌘ + Enter로 전송 · 초안과 첨부 선택은 이 탭에서만 보관됩니다.");
   hint.id = "chat-hint";
   hint.hidden = !entry.expanded;
@@ -1245,8 +2061,8 @@ function buildChatComposer(s) {
   expand.addEventListener("pointerdown", (event) => event.preventDefault());
   tools.append(el("summary", null, "도구"));
   const toolsActions = el("div", "chat-tools-actions");
-  toolsActions.append(clipboard, check, native);
-  for (const action of [clipboard, check, native])
+  toolsActions.append(clipboard, check, native, closeTerm);
+  for (const action of [clipboard, check, native, closeTerm])
     action.addEventListener("pointerdown", (event) => event.preventDefault());
   tools.append(toolsActions);
   actions.append(attach, expand, terminal, tools);
@@ -1268,7 +2084,7 @@ function resizeChatInput(entry) {
   const border = (parseFloat(style?.borderTopWidth) || 1) + (parseFloat(style?.borderBottomWidth) || 1);
   const base = Math.max(44, line + padding + border);
   const viewport = window.visualViewport?.height || window.innerHeight || 800;
-  const cap = entry.inputCollapsed ? base : Math.max(base,
+  const cap = entry.inputCollapsed || sentDraftHidden(entry) ? base : Math.max(base,
     Math.min(line * (entry.expanded ? 11 : 6) + padding + border, viewport * 0.34, viewport - 200));
   const minimum = Math.min(cap, entry.expanded ? 3 * line + padding + border : base);
   const list = $("messages");
@@ -1290,11 +2106,19 @@ function resizeChatInput(entry) {
   toggle.setAttribute("aria-expanded", String(height > base + 1 || entry.expanded));
   if (atBottom) list.scrollTop = list.scrollHeight;
 }
+// While a send is in flight or unconfirmed, its text already shows as the
+// bubble; the editor keeps it (a rejected send leaves it there) but hides it.
+function sentDraftHidden(entry) {
+  return !entry.composing && draftIsPending(entry);
+}
 function closeChatToolsOutside(event) {
   for (const id of ["chat-tools", "terminal-settings"]) {
     const tools = $(id);
     if (tools?.open && !tools.contains(event.target)) tools.open = false;
   }
+  // An open card swipe closes on any touch outside its row.
+  const open = state.swipeOpen;
+  if (open && !open.contains?.(event.target)) closeSwipe(open);
 }
 function closeChatToolsEscape(event) {
   if (event.key !== "Escape" || event.isComposing || event.keyCode === 229) return;
@@ -1328,6 +2152,7 @@ function updateChatComposer(entry) {
   $("chat-composer").classList.toggle?.("is-busy", entry.data?.phase === "working" || entry.sending || !!entry.uploads);
   $("chat-composer").classList.toggle?.("is-error", !!entry.error || entry.receipt?.status === "failed");
   $("chat-composer").classList.toggle?.("is-unknown", !!entry.pending && !entry.sending);
+  setClass($("chat-composer"), "is-sent-draft", sentDraftHidden(entry));
   const offline = networkOffline();
   const blocked = offline || !supported || entry.sending || !!entry.pending || !!entry.uploads;
   $("chat-input").disabled = !supported || entry.sending || !!entry.pending;
@@ -1340,6 +2165,9 @@ function updateChatComposer(entry) {
   $("chat-terminal").disabled = state.launchBusy;
   const native = terminalInfo(state.terminal).nativeSource;
   $("chat-native-open").hidden = !native || chatKey(native) === chatKey(entry.source) || !state.terminalAlive;
+  const openTerminalRow = terminalForSession(selectedSession());
+  $("chat-terminal-close").hidden = !openTerminalRow;
+  if (openTerminalRow) $("chat-terminal-close").textContent = terminalCloseCopy(openTerminalRow).action;
   const phase = entry.data?.phase;
   const phaseCopy = phase === "working" ? "작업 중 · 지금 보내도 CLI가 이어서 반영합니다." : phase === "needs_input" ? (entry.data?.prompt ? "답변·승인 필요 · 위 카드에서 답해 주세요." : "답변·승인 필요 · 터미널에서 처리해 주세요.") : entry.expanded ? "위의 실제 세션에 메시지를 전달합니다." : "";
   const budgetNote = state.chatPollCount >= CHAT_POLL_MAX ? " 자동 상태 확인을 잠시 멈췄습니다. 상태 다시 확인을 눌러 주세요." : "";
@@ -1349,39 +2177,140 @@ function updateChatComposer(entry) {
   $("chat-status").textContent = (offline ? "오프라인입니다. 초안은 유지됩니다. 연결 후 상태를 확인하고 보내 주세요." : entry.error || entry.notice || (entry.uploads ? `첨부 ${entry.uploads}개를 올리고 있습니다…` : !entry.data ? "메시지 전송 환경을 확인하고 있습니다…" : !supported ? unsupportedCopy : chatReceiptCopy(entry.receipt) || phaseCopy)) + budgetNote;
   const deliveryVisible = updateChatDeliveryEvidence(entry);
   const chips = $("chat-attachments");
-  chips.hidden = !!entry.pending && deliveryVisible;
+  // While a bubble resends its own message, another draft's files stay as they are.
+  const draftSent = draftIsPending(entry);
+  chips.hidden = draftSent && deliveryVisible;
   const attachmentsLabel = $("chat-attachments-label");
   attachmentsLabel.hidden = chips.hidden || !entry.attachments.length;
-  const selectedCaption = entry.pending
+  const selectedCaption = draftSent
     ? `전송 요청 첨부 ${entry.attachments.length}개 · 결과 미확인`
     : `전송 전 첨부 ${entry.attachments.length}개 · 업로드 완료`;
   attachmentsLabel.textContent = selectedCaption;
   chips.setAttribute("aria-label", selectedCaption);
-  chips.replaceChildren();
-  for (const file of entry.attachments) {
-    const chip = el("div", "chat-attachment");
-    chip.append(el("span", null, `${file.name || "첨부파일"} · ${formatBytes(file.size)}`));
-    const remove = button("×", "chat-attachment-remove", () => {
-      if (entry.sending || entry.pending) return;
-      entry.attachments = entry.attachments.filter((item) => item.id !== file.id);
-      entry.revision++;
-      updateChatComposer(entry);
-    });
-    remove.setAttribute("aria-label", `${file.name || "첨부파일"} 제거`);
-    remove.disabled = entry.sending || !!entry.pending;
-    chip.append(remove);
-    if (file.path) {
-      const copy = button("경로", "chat-attachment-copy", async () => {
+  renderAttachmentTiles(entry, chips);
+  resizeChatInput(entry);
+}
+// Attachment tiles: a row that scrolls sideways. Images show a local preview
+// (an object URL of the picked file, memory only, revoked once the tile is
+// gone); uploads show a progress ring.
+function attachmentThumb(entry, key, file) {
+  entry.thumbs ||= new Map();
+  if (!String(file?.type || "").startsWith("image/") || entry.thumbs.has(key)) return;
+  try {
+    const url = URL.createObjectURL?.(file);
+    if (url) entry.thumbs.set(key, url);
+  } catch {
+    /* no preview for this file */
+  }
+}
+function revokeThumb(entry, key) {
+  const url = entry.thumbs?.get(key);
+  if (!url) return;
+  entry.thumbs.delete(key);
+  try {
+    URL.revokeObjectURL?.(url);
+  } catch {
+    /* already released */
+  }
+}
+function pruneThumbs(entry) {
+  if (!entry.thumbs?.size) return;
+  const live = new Set([...entry.attachments.map((item) => item.id), ...(entry.uploadQueue || []).map((item) => item.key)]);
+  for (const key of [...entry.thumbs.keys()]) if (!live.has(key)) revokeThumb(entry, key);
+}
+function attachmentTile(entry, file, { key, uploading = null } = {}) {
+  const image = String(file.type || "").startsWith("image/") || /\.(png|jpe?g|gif|webp|heic|bmp)$/i.test(file.name || "");
+  const tile = el("div", `chat-attachment${image ? " is-image" : " is-file"}${uploading ? " is-uploading" : ""}`);
+  tile.dataset.key = key;
+  const thumb = entry.thumbs.get(key);
+  const preview = el("span", "chat-attachment-preview");
+  preview.setAttribute("aria-hidden", "true");
+  if (thumb) {
+    const img = el("img");
+    img.src = thumb;
+    img.alt = "";
+    img.decoding = "async";
+    preview.append(img);
+  } else preview.append(el("span", "chat-attachment-ext", (String(file.name || "").split(".").pop() || "").slice(0, 4).toUpperCase()));
+  tile.append(preview);
+  tile.append(el("span", "chat-attachment-name", `${file.name || "첨부파일"} · ${formatBytes(file.size)}`));
+  if (uploading) {
+    const ring = el("span", "upload-ring");
+    ring.setAttribute("role", "progressbar");
+    ring.setAttribute("aria-label", `${file.name || "첨부파일"} 올리는 중`);
+    tile.uploadRing = ring;
+    tile.append(ring);
+    setUploadProgress(tile, uploading);
+    return tile;
+  }
+  const remove = button("×", "chat-attachment-remove", () => {
+    if (entry.sending || entry.pending) return;
+    entry.attachments = entry.attachments.filter((item) => item.id !== file.id);
+    revokeThumb(entry, file.id);
+    entry.revision++;
+    updateChatComposer(entry);
+  });
+  remove.setAttribute("aria-label", `${file.name || "첨부파일"} 제거`);
+  remove.disabled = entry.sending || !!entry.pending;
+  tile.append(remove);
+  if (file.path) {
+    const copy = button("경로", "chat-attachment-copy", async () => {
       try { await navigator.clipboard.writeText(file.path); toast("실제 세션의 첨부 경로를 복사했습니다. 같은 작업의 터미널에 붙여넣을 수 있습니다."); }
       catch { toast("클립보드에 접근할 수 없습니다."); }
-      });
-      copy.setAttribute("aria-label", `${file.name || "첨부파일"} 실제 경로 복사`);
-      copy.title = "실제 첨부 경로 복사";
-      chip.append(copy);
-    }
-    chips.append(chip);
+    });
+    copy.setAttribute("aria-label", `${file.name || "첨부파일"} 실제 경로 복사`);
+    copy.title = "실제 첨부 경로 복사";
+    tile.append(copy);
   }
-  resizeChatInput(entry);
+  return tile;
+}
+function setUploadProgress(tile, item) {
+  const ring = tile?.uploadRing;
+  if (!ring) return;
+  const percent = item.state === "uploading" && Number.isFinite(item.progress) ? Math.round(item.progress * 100) : null;
+  ring.style?.setProperty?.("--progress", `${percent ?? 0}%`);
+  setClass(ring, "is-waiting", percent === null);
+  if (percent === null) ring.removeAttribute?.("aria-valuenow");
+  else ring.setAttribute("aria-valuenow", String(percent));
+}
+function renderAttachmentTiles(entry, box = $("chat-attachments")) {
+  entry.thumbs ||= new Map();
+  entry.uploadQueue ||= [];
+  pruneThumbs(entry);
+  const tiles = [
+    ...entry.attachments.map((file) => attachmentTile(entry, file, { key: file.id })),
+    ...entry.uploadQueue.map((item) => attachmentTile(entry, item.file, { key: item.key, uploading: item })),
+  ];
+  for (const item of entry.uploadQueue) item.tile = tiles.find((tile) => tile.dataset.key === item.key) || null;
+  box.replaceChildren(...tiles);
+}
+// Uploads report progress through XMLHttpRequest where it exists; fetch is
+// the fallback (same request, no progress).
+function sendUpload(file, headers, onProgress) {
+  if (typeof XMLHttpRequest !== "function") {
+    return fetch("/api/chat/upload", { method: "POST", credentials: "same-origin", cache: "no-store", body: file, headers })
+      .then(async (response) => ({ status: response.status, ok: response.ok, data: await response.json().catch(() => ({})) }));
+  }
+  return new Promise((resolve, reject) => {
+    const request = new XMLHttpRequest();
+    request.open("POST", "/api/chat/upload");
+    for (const [name, value] of Object.entries(headers)) request.setRequestHeader(name, value);
+    request.upload?.addEventListener?.("progress", (event) => {
+      if (event.lengthComputable && event.total > 0) onProgress(event.loaded / event.total);
+    });
+    request.addEventListener("load", () => {
+      let data = {};
+      try {
+        data = JSON.parse(request.responseText || "{}") || {};
+      } catch {
+        data = {};
+      }
+      resolve({ status: request.status, ok: request.status >= 200 && request.status < 300, data });
+    });
+    request.addEventListener("error", () => reject(new Error("첨부파일을 올리지 못했습니다. 연결을 확인해 주세요.")));
+    request.addEventListener("abort", () => reject(new Error("첨부파일 올리기를 멈췄습니다.")));
+    request.send(file);
+  });
 }
 function stopChatPolling() {
   clearTimeout(state.chatPollTimer);
@@ -1391,6 +2320,8 @@ function stopChatPolling() {
 }
 const CHAT_POLL_MAX = 240;
 function chatPollDelay(count) {
+  // Live updates announce changes; polling is then only a safety net.
+  if (eventsHealthy()) return EVENTS_SAFETY_MS.chat;
   // Fast while a reply is likely, then slower; long turns keep being followed.
   return count < 10 ? 3000 : count < 30 ? 5000 : count < 90 ? 10000 : 20000;
 }
@@ -1411,8 +2342,12 @@ function applyChatReceipt(entry, receipt) {
   const fallback = entry.pending?.attachmentDetails ||
     (entry.receipt?.requestId === receipt.requestId ? entry.receipt.attachments : []);
   entry.receipt = { ...receipt, attachments: attachmentMetadata(Array.isArray(receipt.attachments) ? receipt.attachments : fallback) };
+  markOutbox(entry, receipt.requestId, entry.receipt);
   if (!entry.pending || !["accepted", "queued", "completed", "interrupted", "failed"].includes(receipt.status)) return;
-  if ((receipt.status !== "failed" || receipt.confirmed === true) && entry.revision === entry.pending.revision) {
+  // Only the draft that was sent is cleared; a resend from a bubble leaves
+  // any other draft in the editor.
+  if ((receipt.status !== "failed" || receipt.confirmed === true) && entry.revision === entry.pending.revision &&
+      draftIsPending(entry)) {
     entry.text = "";
     entry.attachments = [];
     if (currentChat(entry)) {
@@ -1497,11 +2432,21 @@ async function loadChatState(s, manual = false, { join = false } = {}) {
   }
   return outcome;
 }
-async function sendChat(entry) {
+// Whether the editor still holds exactly the message in flight.
+function draftIsPending(entry) {
+  const pending = entry.pending;
+  return !!pending && entry.text === pending.text && entry.attachments.length === pending.attachments.length &&
+    entry.attachments.every((item, index) => item.id === pending.attachments[index]);
+}
+// Sends the editor's draft, or `message` ({ text, attachments }) when a
+// bubble resends what it showed; the editor is then left as it is.
+async function sendChat(entry, message = null) {
   if (networkOffline()) { updateChatComposer(entry); return; }
+  const text = message ? String(message.text || "") : entry.text;
+  const attachments = (message ? message.attachments || [] : entry.attachments).slice();
   if (!currentChat(entry) || !chatSupported(entry) || entry.composing || entry.sending || entry.pending || entry.uploads ||
-      (!entry.text.trim() && !entry.attachments.length)) return;
-  if (new TextEncoder().encode(entry.text).length > 32768 || entry.attachments.length > 8) {
+      (!text.trim() && !attachments.length)) return;
+  if (new TextEncoder().encode(text).length > 32768 || attachments.length > 8) {
     entry.error = "메시지는 32KiB, 첨부는 8개까지 보낼 수 있습니다. 초안은 유지됩니다.";
     updateChatComposer(entry);
     return;
@@ -1509,14 +2454,21 @@ async function sendChat(entry) {
   // Keep the exact source and idempotency key even if selection changes during transport.
   const authEpoch = state.authEpoch;
   const pending = { requestId: requestId(), revision: entry.revision, source: entry.source,
-    text: entry.text, attachments: entry.attachments.map((item) => item.id),
-    attachmentDetails: attachmentMetadata(entry.attachments) };
+    text, attachments: attachments.map((item) => item.id),
+    attachmentDetails: attachmentMetadata(attachments) };
   entry.pending = pending;
   entry.stateEpoch++;
   entry.sending = true;
   entry.error = "";
   entry.notice = "";
+  // The bubble shows at once, translucent, and becomes the real message
+  // when the transcript has it. A failed earlier attempt is superseded.
+  entry.outbox = (entry.outbox || []).filter((item) => item.state !== "failed");
+  entry.outbox.push({ requestId: pending.requestId, text: pending.text, attachments: pending.attachmentDetails,
+    attachmentObjects: attachments, state: "sending", status: "", reason: "", at: Date.now(),
+    ...outboxOrigin(entry.conversation?.messages) });
   updateChatComposer(entry);
+  refreshConversationView(entry, true);
   try {
     const result = await api("/api/chat/send", { method: "POST", body: {
       source: pending.source, requestId: pending.requestId, text: pending.text, attachments: pending.attachments,
@@ -1525,8 +2477,10 @@ async function sendChat(entry) {
     if (result.receipt?.requestId && result.receipt.requestId !== pending.requestId)
       throw new Error("요청 확인 번호가 일치하지 않습니다.");
     applyChatReceipt(entry, { ...result.receipt, requestId: pending.requestId, status: result.status || "unknown" });
+    if (["accepted", "queued", "completed"].includes(result.status)) haptic("success");
   } catch (err) {
     if (authEpoch === state.authEpoch && !err.unauthorized && !err.staleAuth) {
+      haptic("error");
       if (err.dispatchState === "not_started") {
         applyChatReceipt(entry, { requestId: pending.requestId, status: "failed", confirmed: false,
           dispatchState: "not_started", reason: err.message });
@@ -1555,10 +2509,235 @@ async function sendChat(entry) {
   } finally {
     entry.stateEpoch++;
     entry.sending = false;
+    if (entry.receipt?.requestId === pending.requestId) markOutbox(entry, pending.requestId, entry.receipt);
+    else if (entry.pending?.requestId === pending.requestId) markOutbox(entry, pending.requestId, { status: "unknown" });
     updateChatComposer(entry);
+    refreshConversationView(entry);
     const s = selectedSession();
     if (currentChat(entry) && s) { state.chatPollCount = 0; loadChatState(s, true); }
   }
+}
+// --- Sent-from-here bubbles (outbox) ------------------------------------------
+// Memory only, per conversation. "sending" until the server answers; then
+// "sent" (accepted or queued), "uncertain" (no answer: the send stays locked
+// as before) or "failed" (never started: the draft is still in the editor).
+const OUTBOX_LABELS = { sending: "전송 중…", uncertain: "전송 확인 중", sent: "전송됨",
+  queued: "대기 중 · 지금 작업이 끝나면 전달됩니다", failed: "보내지 못함" };
+const OUTBOX_SETTLED_MS = 3 * 60 * 1000;
+const OUTBOX_MAX_MS = 15 * 60 * 1000;
+// A transcript may record a message a little before the browser's clock says
+// it was sent (clocks of the phone and the agent host differ slightly).
+const OUTBOX_CLOCK_SLACK_MS = 30 * 1000;
+// Settled messages remembered per conversation (the server shows 80 at most).
+const OUTBOX_CLAIM_LIMIT = 80;
+const OUTBOX_ATTACHMENT_LINE = /^첨부 파일: /;
+const OUTBOX_ATTACHMENT_ONLY = new Set(["[이미지 첨부]", "[파일 첨부]"]);
+function outboxText(text) {
+  return String(text || "").replace(/\s+/g, " ").trim();
+}
+// A transcript user message as a bubble compares it: the body without the
+// "첨부 파일: …" lines the server appends for attachments, and the possible
+// attachment counts (native attachments and those lines, which a transcript
+// may record once or twice for the same file).
+function outboxShape(message) {
+  const lines = String(message?.text || "").split("\n");
+  let marked = 0;
+  while (lines.length && OUTBOX_ATTACHMENT_LINE.test(lines[lines.length - 1].trim())) { lines.pop(); marked++; }
+  const native = attachmentMetadata(message?.attachments).length;
+  const truncated = message?.truncated === true;
+  let body = outboxText(lines.join("\n"));
+  if (truncated) body = body.replace(/\s*…$/, "");
+  if ((native || marked) && OUTBOX_ATTACHMENT_ONLY.has(body)) body = "";
+  return { body, counts: new Set([native + marked, Math.max(native, marked)]), truncated };
+}
+// A transcript row's stable identifier: Codex rows from /api/chat/state name
+// their item; /api/read and Claude rows carry none.
+function outboxRowId(message) {
+  return typeof message?.itemId === "string" && message.itemId ? message.itemId : null;
+}
+// A message as every read path shows it (role, text and time), whatever
+// attachment details or identifiers that path adds.
+function outboxPrint(message) {
+  return JSON.stringify([message?.role || "", message?.text || "", message?.ts ?? null]);
+}
+// What a bubble keeps of the conversation it was sent into, so a message that
+// was already there never counts as the one it sent: the user rows' item ids
+// when that read named them, and the message count with the last message.
+function outboxOrigin(messages) {
+  const list = Array.isArray(messages) ? messages : [];
+  const named = list.some((message) => outboxRowId(message));
+  return { base: list.length, anchor: list.length ? outboxPrint(list[list.length - 1]) : null,
+    known: named ? list.filter((message) => message?.role === "user").map(outboxRowId).filter(Boolean) : null };
+}
+// Where the messages sent after this bubble start: just after the last message
+// it saw (found again even when the server's window moved), else its count.
+function outboxCut(item, messages) {
+  const base = Math.max(0, Number(item.base) || 0);
+  if (!base || !item.anchor) return base;
+  if (base <= messages.length && outboxPrint(messages[base - 1]) === item.anchor) return base;
+  for (let index = messages.length - 1; index >= 0; index--)
+    if (outboxPrint(messages[index]) === item.anchor) return index + 1;
+  return base;
+}
+// Whether a transcript user message (row: { message, index, shape, id, taken })
+// is the one this bubble sent (view: { codex, cut, known } of this read). A
+// message already there at the send never is. Codex names it by request id,
+// and nothing else settles a Codex bubble; otherwise it is a message after
+// those the bubble saw, with the same body and attachment count, and not
+// recorded before the send (the clock slack only narrows it further).
+function outboxMatches(item, row, view = {}) {
+  const known = view.known || null;
+  if (row.id && known?.has(row.id)) return false;
+  const clientId = row.message?.clientId;
+  if (typeof clientId === "string" && clientId) return clientId === item.requestId;
+  if (view.codex || row.taken) return false;
+  if (!(row.id && known) && row.index < (view.cut ?? (Number(item.base) || 0))) return false;
+  const ts = Number(row.message?.ts);
+  if (Number.isFinite(ts) && ts > 0 && ts * 1000 < item.at - OUTBOX_CLOCK_SLACK_MS) return false;
+  const body = outboxText(item.text);
+  // A cut long message keeps only its beginning (and loses the attachment lines).
+  if (row.shape.truncated) return !!row.shape.body && body.startsWith(row.shape.body);
+  return row.shape.body === body && row.shape.counts.has(item.attachments?.length || 0);
+}
+// The same on /api/chat/state and /api/read: attachment details differ between
+// them (state names the board's files), the time and text do not.
+function outboxClaimKey(row) {
+  return JSON.stringify([row.message?.ts ?? null, row.message?.text || ""]);
+}
+function outboxState(receipt) {
+  if (!receipt) return "uncertain";
+  if (receipt.dispatchState === "not_started") return "failed";
+  if (receipt.status === "failed") return receipt.confirmed === true ? "sent" : "failed";
+  if (["accepted", "queued", "completed", "interrupted"].includes(receipt.status)) return "sent";
+  return "uncertain";
+}
+function markOutbox(entry, requestId, receipt) {
+  const item = entry.outbox?.find((value) => value.requestId === requestId);
+  if (!item) return;
+  item.state = outboxState(receipt);
+  item.status = receipt?.status || "unknown";
+  item.reason = item.state === "failed" ? String(receipt?.reason || "") : "";
+  if (item.state === "failed" || ["completed", "interrupted"].includes(receipt?.status)) item.settledAt ||= Date.now();
+}
+// Drops bubbles whose message reached the transcript, settled ones the
+// transcript never showed, and anything older than OUTBOX_MAX_MS. Each
+// transcript message settles at most one bubble, in the order they were
+// sent, and stays claimed on later renders (from either read path) so it
+// never settles another.
+function settleOutbox(entry, messages) {
+  if (!entry) return;
+  const now = Date.now();
+  entry.outboxClaims = (entry.outboxClaims || []).filter((claim) => now - claim.at < OUTBOX_MAX_MS);
+  if (!entry.outbox?.length) return;
+  const list = Array.isArray(messages) ? messages : [];
+  const rows = [];
+  list.forEach((message, index) => {
+    if (message?.role === "user") rows.push({ message, index, shape: outboxShape(message), id: outboxRowId(message), taken: false });
+  });
+  for (const claim of entry.outboxClaims) {
+    const row = rows.find((value) => !value.taken && (claim.id && value.id ? claim.id === value.id
+      : outboxClaimKey(value) === claim.key && (value.message.ts != null || value.index >= claim.base)));
+    if (row) row.taken = true;
+  }
+  const codex = entry.source?.agent === "codex";
+  const settled = new Set();
+  for (const item of entry.outbox) {
+    if (item.state === "failed") continue;
+    const view = { codex, cut: outboxCut(item, list), known: Array.isArray(item.known) ? new Set(item.known) : null };
+    const row = rows.find((value) => outboxMatches(item, value, view));
+    if (!row) continue;
+    row.taken = true;
+    settled.add(item);
+    entry.outboxClaims.push({ id: row.id, key: outboxClaimKey(row), base: view.cut, at: now });
+  }
+  if (entry.outboxClaims.length > OUTBOX_CLAIM_LIMIT)
+    entry.outboxClaims.splice(0, entry.outboxClaims.length - OUTBOX_CLAIM_LIMIT);
+  entry.outbox = entry.outbox.filter((item) => {
+    if (settled.has(item)) return false;
+    if (item.state !== "failed" && item.settledAt && now - item.settledAt > OUTBOX_SETTLED_MS) return false;
+    return now - item.at < OUTBOX_MAX_MS;
+  });
+}
+// Resends exactly what the failed bubble showed. Another draft in the editor
+// stays there, unsent; an empty editor gets the message back so a second
+// refusal still leaves it to edit.
+function retryOutbox(entry, item) {
+  if (!currentChat(entry) || entry.sending || entry.pending || entry.uploads || entry.composing) return;
+  const message = { text: String(item.text || ""), attachments: (item.attachmentObjects || []).slice() };
+  if (!message.text.trim() && !message.attachments.length) {
+    entry.outbox = (entry.outbox || []).filter((value) => value !== item);
+    refreshConversationView(entry);
+    return;
+  }
+  if (!entry.text.trim() && !entry.attachments.length) {
+    entry.text = message.text;
+    entry.attachments = message.attachments.slice();
+    entry.revision++;
+    const input = $("chat-input");
+    if (input && $("chat-composer")?.dataset.source === chatKey(entry.source)) input.value = entry.text;
+  }
+  // sendChat replaces the failed bubble once the resend starts.
+  sendChat(entry, message);
+}
+function outboxRows(list, entry) {
+  list.outboxNodes ||= new Map();
+  const rows = [];
+  const keep = new Set();
+  for (const item of entry.outbox || []) {
+    keep.add(item.requestId);
+    let row = list.outboxNodes.get(item.requestId);
+    if (!row) {
+      row = el("article", "msg user is-outbox");
+      const bubble = el("div", "bubble");
+      if (item.text) bubble.append(el("span", "msg-body", item.text));
+      if (item.attachments?.length)
+        bubble.append(attachmentGroup(item.attachments, `첨부 ${item.attachments.length}개`, { showCaption: false }));
+      const status = el("p", "msg-delivery");
+      status.setAttribute("role", "status");
+      row.append(bubble, status);
+      row.deliveryStatus = status;
+      list.outboxNodes.set(item.requestId, row);
+    }
+    const name = item.state === "sent" && item.status === "queued" ? "queued" : item.state;
+    const className = `msg user is-outbox is-${item.state}`;
+    if (row.className !== className) row.className = className;
+    const revision = `${name}|${item.reason}`;
+    if (row.deliveryRevision !== revision) {
+      row.deliveryRevision = revision;
+      // The reason stays in the composer's status line above the kept draft.
+      row.deliveryStatus.title = item.state === "failed" ? item.reason : "";
+      if (item.state === "failed") {
+        const retry = button("다시 보내기", "msg-retry", () => retryOutbox(entry, item));
+        retry.setAttribute("aria-label", "보내지 못한 메시지 다시 보내기");
+        row.deliveryStatus.replaceChildren(el("span", "msg-delivery-text", OUTBOX_LABELS.failed), retry);
+      } else row.deliveryStatus.replaceChildren(el("span", "msg-delivery-text", OUTBOX_LABELS[name] || OUTBOX_LABELS.uncertain));
+    }
+    rows.push(row);
+  }
+  for (const key of [...list.outboxNodes.keys()]) if (!keep.has(key)) list.outboxNodes.delete(key);
+  return rows;
+}
+// "··· 작업 중" at the end of a conversation whose agent is working.
+function workingRow(list) {
+  if (list.workingRow) return list.workingRow;
+  const row = el("article", "msg assistant msg-working");
+  row.setAttribute("role", "status");
+  const bubble = el("div", "bubble working-bubble");
+  const dots = el("span", "working-dots");
+  dots.setAttribute("aria-hidden", "true");
+  dots.append(el("i"), el("i"), el("i"));
+  bubble.append(dots, el("span", "working-label", "작업 중"));
+  row.append(bubble);
+  list.workingRow = row;
+  return row;
+}
+// Re-renders the open conversation from what is already on screen (new
+// bubble states, the working indicator), optionally scrolling to the end.
+function refreshConversationView(entry, toEnd = false) {
+  const list = $("messages");
+  const s = selectedSession();
+  if (!s || !list || !currentChat(entry) || list.conversationSource !== chatKey(entry.source)) return;
+  renderMessages(s, null, list.conversationErrorText || "", toEnd);
 }
 async function uploadChatFiles(entry, files) {
   if (networkOffline()) { updateChatComposer(entry); return; }
@@ -1572,39 +2751,61 @@ async function uploadChatFiles(entry, files) {
   entry.uploads = files.length;
   entry.error = "";
   entry.notice = "";
+  const queue = files.map((file, index) => ({ key: `upload-${Date.now()}-${index}`, file, state: "waiting", progress: null }));
+  for (const item of queue) attachmentThumb(entry, item.key, item.file);
+  entry.uploadQueue = queue;
+  const unqueue = (item) => {
+    entry.uploadQueue = entry.uploadQueue.filter((value) => value !== item);
+  };
   updateChatComposer(entry);
-  for (const file of files) {
-    if (authEpoch !== state.authEpoch) { entry.uploads = 0; return; }
-    if (networkOffline()) {
-      entry.notice = `아직 올리지 못한 파일 ${entry.uploads}개가 있습니다. 다시 첨부해 주세요.`;
-      entry.uploads = 0; updateChatComposer(entry); break;
-    }
-    try {
-      const limit = entry.data.maxAttachmentBytes || 20 * 1024 * 1024;
-      if (file.size > limit) throw new Error(`${file.name || "파일"}: 최대 ${formatBytes(limit)}까지 첨부할 수 있습니다.`);
-      const response = await fetch("/api/chat/upload", {
-        method: "POST", credentials: "same-origin", cache: "no-store", body: file,
-        headers: { "Content-Type": "application/octet-stream", "X-CSRF-Token": state.csrf,
-          "X-Chat-Source": encodeURIComponent(JSON.stringify(entry.source)),
-          "X-File-Name": encodeURIComponent(file.name || `clipboard-${Date.now()}.${file.type?.split("/")[1]?.replace("jpeg", "jpg") || "bin"}`) },
-      });
-      assertAuthEpoch(authEpoch);
-      if (response.status === 401) { showLogin(); return; }
-      const data = await response.json().catch(() => ({}));
-      assertAuthEpoch(authEpoch);
-      if (!response.ok || !data.attachment?.id) throw new Error(data.error || "첨부파일을 올리지 못했습니다.");
-      if (!state.authenticated || state.chats.get(chatKey(entry.source)) !== entry) return;
-      entry.attachments.push(data.attachment);
-      entry.revision++;
-    } catch (err) {
-      if (authEpoch !== state.authEpoch || err.staleAuth) { entry.uploads = 0; return; }
-      entry.error = err.message;
+  try {
+    for (const item of queue) {
+      const file = item.file;
+      if (authEpoch !== state.authEpoch) { entry.uploads = 0; return; }
       if (networkOffline()) {
         entry.notice = `아직 올리지 못한 파일 ${entry.uploads}개가 있습니다. 다시 첨부해 주세요.`;
-        entry.error = `${err.message} ${entry.notice}`;
-        break;
+        entry.uploads = 0; updateChatComposer(entry); break;
       }
-    } finally { entry.uploads = Math.max(0, entry.uploads - 1); updateChatComposer(entry); }
+      try {
+        const limit = entry.data.maxAttachmentBytes || 20 * 1024 * 1024;
+        if (file.size > limit) throw new Error(`${file.name || "파일"}: 최대 ${formatBytes(limit)}까지 첨부할 수 있습니다.`);
+        item.state = "uploading";
+        item.progress = 0;
+        setUploadProgress(item.tile, item);
+        const response = await sendUpload(file, { "Content-Type": "application/octet-stream", "X-CSRF-Token": state.csrf,
+          "X-Chat-Source": encodeURIComponent(JSON.stringify(entry.source)),
+          "X-File-Name": encodeURIComponent(file.name || `clipboard-${Date.now()}.${file.type?.split("/")[1]?.replace("jpeg", "jpg") || "bin"}`) },
+        (ratio) => {
+          item.progress = ratio;
+          setUploadProgress(item.tile, item);
+        });
+        assertAuthEpoch(authEpoch);
+        if (response.status === 401) { showLogin(); return; }
+        const data = response.data || {};
+        if (!response.ok || !data.attachment?.id) throw new Error(data.error || "첨부파일을 올리지 못했습니다.");
+        if (!state.authenticated || state.chats.get(chatKey(entry.source)) !== entry) return;
+        // The local preview now belongs to the uploaded attachment.
+        const thumb = entry.thumbs.get(item.key);
+        if (thumb) {
+          entry.thumbs.delete(item.key);
+          entry.thumbs.set(data.attachment.id, thumb);
+        }
+        unqueue(item);
+        entry.attachments.push(data.attachment);
+        entry.revision++;
+      } catch (err) {
+        if (authEpoch !== state.authEpoch || err.staleAuth) { entry.uploads = 0; return; }
+        unqueue(item);
+        entry.error = err.message;
+        if (networkOffline()) {
+          entry.notice = `아직 올리지 못한 파일 ${entry.uploads}개가 있습니다. 다시 첨부해 주세요.`;
+          entry.error = `${err.message} ${entry.notice}`;
+          break;
+        }
+      } finally { entry.uploads = Math.max(0, entry.uploads - 1); updateChatComposer(entry); }
+    }
+  } finally {
+    entry.uploadQueue = entry.uploadQueue.filter((item) => !queue.includes(item));
   }
   entry.uploads = 0;
   updateChatComposer(entry);
@@ -1766,6 +2967,7 @@ function renderMessages(s, messages, error = "", fresh = false) {
   const list = $("messages");
   if (!list) return;
   const source = chatKey(sourceOf(s));
+  const entry = state.chats.get(source) || null;
   const previous = list.conversationSource === source ? list.conversationRows || [] : [];
   // A failed refresh never removes a conversation that was already readable.
   if (messages == null || (error && !messages.length && previous.length))
@@ -1801,22 +3003,18 @@ function renderMessages(s, messages, error = "", fresh = false) {
         label.append(el("strong", null, role === "user" ? "나" : AGENTS[s.agent] || "에이전트"));
         if (message.ts) label.append(el("span", null, clock(message.ts)));
         row.append(label);
+        row.msgLabel = label;
       }
       const bubble = el("div", "bubble");
       if (role === "assistant" && typeof MessageFormat !== "undefined") {
         MessageFormat.render(bubble, message.text || "", {
-          onCopy: async (text, kind) => {
-            try {
-              await navigator.clipboard.writeText(text);
-              toast(kind === "code" ? "코드를 복사했습니다." : "인용문을 복사했습니다.");
-            } catch { toast("클립보드에 접근할 수 없습니다. 본문을 길게 눌러 선택해 주세요."); }
-          },
+          onCopy: (text) => copyText(text, "코드를 복사했습니다."),
         });
       } else {
         const text = message.text || "";
         if (role === "user" && attachments.length) {
           if (text) bubble.append(el("span", "msg-body", text));
-          bubble.append(attachmentGroup(attachments));
+          bubble.append(attachmentGroup(attachments, `첨부 ${attachments.length}개`, { showCaption: false }));
         } else bubble.textContent = text;
       }
       row.append(bubble);
@@ -1828,24 +3026,30 @@ function renderMessages(s, messages, error = "", fresh = false) {
       const total = Number.isInteger(message.fullLength) ? ` · 전체 ${message.fullLength.toLocaleString()}자` : "";
       row.append(el("p", "msg-truncated", `긴 메시지라 앞부분만 표시합니다${total}. 전체 내용은 터미널에서 확인해 주세요.`));
     }
-    const copy = button(truncated ? "표시된 부분 복사" : "복사", "msg-copy", async () => {
-      const text = role === "assistant" && typeof MessageFormat !== "undefined"
-        ? MessageFormat.plainText(message.text || "") : message.text || "";
-      try {
-        await navigator.clipboard.writeText(text);
-        toast(truncated ? "표시된 부분만 복사했습니다. 전체 내용은 터미널에서 확인해 주세요." : "메시지 본문을 복사했습니다.");
-      } catch { toast("클립보드에 접근할 수 없습니다. 본문을 길게 눌러 선택해 주세요."); }
-    });
-    copy.setAttribute("aria-label", truncated ? "표시된 메시지 일부 복사" : "메시지 본문 복사");
-    if (role === "user" && attachments.length && !message.text) {
-      copy.disabled = true;
-      copy.hidden = true;
-      copy.setAttribute("aria-label", "복사할 텍스트 본문이 없습니다");
+    // Copy, code copy, selection and the terminal live in a menu: long press
+    // on touch, right click or this button (shown on hover) with a mouse.
+    const item = { key, message, row, role, truncated };
+    row.messageItem = item;
+    if (role !== "system") {
+      const more = button("", "msg-more", () => openMessageMenu(row));
+      more.setAttribute("aria-label", "메시지 메뉴");
+      more.setAttribute("aria-haspopup", "dialog");
+      more.title = "메시지 메뉴";
+      row.moreButton = more;
+      row.append(more);
     }
-    row.append(copy);
-    return { key, message, row };
+    return item;
   });
+  groupMessageRows(rows);
   const desired = rows.map((item) => item.row);
+  // This board's own sends that the transcript does not show yet, then the
+  // working indicator, always after the transcript.
+  let tail = [];
+  if (entry) {
+    settleOutbox(entry, messages);
+    tail = outboxRows(list, entry);
+    if (entry.data?.phase === "working" && chatKey(entry.data.route || {}) === source) tail.push(workingRow(list));
+  }
   if (error) {
     if (!list.conversationError || list.conversationErrorText !== error || list.conversationSource !== source) {
       const warning = el("div", "conversation-read-error");
@@ -1861,11 +3065,12 @@ function renderMessages(s, messages, error = "", fresh = false) {
   } else {
     list.conversationError = null;
     list.conversationErrorText = "";
-    if (!rows.length) {
+    if (!rows.length && !tail.length) {
       list.conversationEmpty ||= el("p", "group-empty", "저장된 대화를 아직 찾지 못했습니다.");
       desired.push(list.conversationEmpty);
     }
   }
+  desired.push(...tail);
   // Keep unchanged text nodes mounted: mobile selections and expanded tool
   // records survive reads, including new messages appended during a turn.
   for (const child of [...list.children]) {
@@ -1887,6 +3092,94 @@ function renderMessages(s, messages, error = "", fresh = false) {
   renderJump();
 }
 
+// Consecutive messages of one speaker form a group: only the first keeps the
+// name and time, and the gap between them narrows (style.css: .is-cont).
+// Rows are reused across reads, so this runs on every render.
+const GROUP_GAP_SECONDS = 300;
+function sameSpeaker(a, b) {
+  if (!a || !b || a.role !== b.role || !["user", "assistant"].includes(a.role)) return false;
+  const first = a.message?.ts;
+  const next = b.message?.ts;
+  return !(Number.isFinite(first) && Number.isFinite(next) && next - first > GROUP_GAP_SECONDS);
+}
+function groupMessageRows(rows) {
+  rows.forEach((item, index) => {
+    const continued = sameSpeaker(rows[index - 1], item);
+    setClass(item.row, "is-cont", continued);
+    setClass(item.row, "has-next", sameSpeaker(item, rows[index + 1]));
+    if (item.row.msgLabel) item.row.msgLabel.hidden = continued;
+  });
+}
+async function copyText(text, done) {
+  try {
+    await navigator.clipboard.writeText(text);
+    toast(done);
+  } catch {
+    toast("클립보드에 접근할 수 없습니다. 메뉴의 ‘텍스트 선택’으로 골라 복사해 주세요.");
+  }
+}
+function messagePlainText(item) {
+  const text = item?.message?.text || "";
+  return item?.role === "assistant" && typeof MessageFormat !== "undefined" ? MessageFormat.plainText(text) : text;
+}
+function messageActions(s, item) {
+  const actions = [];
+  const text = messagePlainText(item);
+  if (text.trim()) {
+    actions.push({ label: item.truncated ? "표시된 부분 복사" : "복사", run: () => copyText(text, item.truncated
+      ? "표시된 부분만 복사했습니다. 전체 내용은 터미널에서 확인해 주세요." : "메시지 본문을 복사했습니다.") });
+  }
+  const code = item.role === "assistant" && typeof MessageFormat?.codeBlocks === "function"
+    ? MessageFormat.codeBlocks(item.message.text || "") : [];
+  if (code.length) {
+    actions.push({ label: code.length > 1 ? `코드 ${code.length}개 모두 복사` : "코드 복사",
+      run: () => copyText(code.join("\n"), "코드를 복사했습니다.") });
+  }
+  if (text.trim()) actions.push({ label: "텍스트 선택", run: () => selectMessageText(item.row) });
+  if (chatEntry(s).data && !state.launchBusy && (!s.nativeSource || terminalForSession(s)))
+    actions.push({ label: "터미널에서 보기", run: () => openChatTerminal(s) });
+  return actions;
+}
+function openMessageMenu(row, at = null) {
+  const item = row?.messageItem;
+  const s = selectedSession();
+  if (!item || !s || chatKey(sourceOf(s)) !== $("messages")?.conversationSource) return;
+  const speaker = item.role === "user" ? "내 메시지" : item.role === "tool" ? "도구 실행 기록"
+    : `${AGENTS[s.agent] || "에이전트"}의 답변`;
+  const preview = messagePlainText(item).replace(/\s+/g, " ").trim().slice(0, 140);
+  openActionSheet({ eyebrow: item.message.ts ? clock(item.message.ts) : "", title: speaker, preview,
+    actions: messageActions(s, item), at, trigger: row.moreButton || null });
+}
+// "텍스트 선택": the bubble becomes selectable (touch turns selection off so a
+// long press opens the menu) and its text is selected for the handles.
+function selectMessageText(row) {
+  const bubble = row?.querySelector?.(".bubble");
+  if (!bubble) return;
+  setClass(row, "is-selecting", true);
+  try {
+    const range = document.createRange();
+    range.selectNodeContents(bubble);
+    const selection = window.getSelection();
+    selection.removeAllRanges();
+    selection.addRange(range);
+  } catch {
+    /* the bubble stays selectable by hand */
+  }
+}
+function bindMessageGestures(list) {
+  const rowOf = (target) => {
+    const row = target?.closest?.(".msg");
+    return row?.messageItem ? row : null;
+  };
+  bindPressMenu(list, rowOf, openMessageMenu, {
+    onDown(event) {
+      // A selection made from the menu ends when another message is touched.
+      const row = rowOf(event.target);
+      for (const item of list.conversationRows || [])
+        if (item.row !== row && String(item.row.className || "").includes("is-selecting")) setClass(item.row, "is-selecting", false);
+    },
+  });
+}
 function updateReadNotice(data) {
   const pane = $("detail");
   let note = pane.querySelector(".stale-notice");
@@ -1913,7 +3206,7 @@ function backToList() {
     window.history.state.view === "detail"
   )
     window.history.back();
-  else { document.body.classList.remove("show-detail"); restoreSelectedCardFocus(); }
+  else setDetailShown(false, { direction: "pop", focus: true });
 }
 function backFromTerminal() {
   if (
@@ -2211,7 +3504,7 @@ async function preparePlan() {
   $("plan-launch").textContent = "터미널 열기 ↗";
   $("plan-close").disabled = false;
   $("plan-cancel").disabled = false;
-  $("plan-dialog").showModal();
+  sheet("plan-dialog").open();
   try {
     const plan = await api("/api/plan", {
       method: "POST",
@@ -2572,7 +3865,37 @@ function bindDraftInput(node) {
   node.addEventListener("compositionstart", startDraftComposition);
   node.addEventListener("compositionend", endDraftComposition);
 }
+// Korean needs monospace fallbacks that keep two-cell glyphs aligned. Only
+// fonts already on the device are named; no web font is bundled.
+const TERMINAL_FONT = 'ui-monospace, SFMono-Regular, Menlo, Consolas, D2Coding, "D2Coding ligature", ' +
+  '"Nanum Gothic Coding", NanumGothicCoding, "Noto Sans Mono CJK KR", "Source Han Mono K", "Sarasa Mono K", monospace';
+const FONT_MIN = 10;
+const FONT_MAX = 24;
+function clampFontSize(size) {
+  return Math.max(FONT_MIN, Math.min(FONT_MAX, Math.round(Number(size) || 14)));
+}
+// A−/A+ and the pinch share one range and one stored preference.
+function setTerminalFontSize(size, { persist = true } = {}) {
+  const next = clampFontSize(size);
+  const changed = next !== state.fontSize;
+  state.fontSize = next;
+  if (persist) prefs.set("fontSize", next);
+  if (changed && state.term) {
+    state.term.options.fontSize = next;
+    fitTerminal();
+  }
+  return changed;
+}
+function pinchFontSize(startSize, startDistance, distance) {
+  if (!(startDistance > 0) || !(distance > 0)) return clampFontSize(startSize);
+  return clampFontSize(startSize * (distance / startDistance));
+}
+function touchDistance(touches) {
+  const [a, b] = [touches[0], touches[1]];
+  return a && b ? Math.hypot(a.clientX - b.clientX, a.clientY - b.clientY) : 0;
+}
 function fitTerminal() {
+  measureTerminalTools();
   if (!state.term || !state.terminalVisible || !state.fit) return;
   try {
     state.fit.fit();
@@ -2599,9 +3922,85 @@ function fitTerminal() {
     }
   }, 180);
 }
+function showTerminalScreen(visible) {
+  $("app").hidden = visible;
+  $("terminal-screen").hidden = !visible;
+}
+// Keeps the toast above the key bar (style.css, section 8).
+function measureTerminalTools() {
+  const tools = $("terminal-tools");
+  if (tools?.offsetHeight) document.documentElement.style?.setProperty?.("--terminal-tools-h", `${tools.offsetHeight}px`);
+}
+// The terminal library (xterm + fit addon, ~490KB) loads on the first
+// terminal open, once; a failed load can be retried by opening again.
+function assetVersions() {
+  if (state.assetVersions) return state.assetVersions;
+  let versions = {};
+  try {
+    const meta = document.querySelector?.('meta[name="sessionholic-assets"]');
+    const parsed = JSON.parse(meta?.getAttribute?.("content") || "{}");
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) versions = parsed;
+  } catch {
+    versions = {};
+  }
+  state.assetVersions = versions;
+  return versions;
+}
+function assetUrl(path) {
+  const version = assetVersions()[path];
+  return typeof version === "string" && /^[0-9a-f]{8}$/.test(version) ? `${path}?v=${version}` : path;
+}
+let xtermLoading = null;
+// The stylesheet and both scripts are all required. Each one that loaded is
+// remembered, so opening again retries only the ones that failed.
+const xtermLoaded = new Set();
+function xtermReady() {
+  return !!(window.Terminal && window.FitAddon) && xtermLoaded.has("/vendor/xterm.css");
+}
+function loadXterm() {
+  if (xtermReady()) return Promise.resolve();
+  if (xtermLoading) return xtermLoading;
+  const head = document.head;
+  if (typeof head?.appendChild !== "function")
+    return Promise.reject(new Error("터미널 화면 파일을 불러올 수 없습니다."));
+  const add = (path, tag, attributes, loaded = () => true) => new Promise((resolve, reject) => {
+    const node = document.createElement(tag);
+    Object.assign(node, attributes);
+    node.onload = () => {
+      if (loaded()) xtermLoaded.add(path);
+      resolve();
+    };
+    node.onerror = () => {
+      node.remove?.();
+      reject(new Error("터미널 화면 파일을 받지 못했습니다."));
+    };
+    head.appendChild(node);
+  });
+  const assets = [
+    ["/vendor/xterm.css", "link", { rel: "stylesheet", href: assetUrl("/vendor/xterm.css") }],
+    // Inserted scripts with async=false still run in insertion order.
+    ["/vendor/xterm.js", "script", { src: assetUrl("/vendor/xterm.js"), async: false }, () => !!window.Terminal],
+    ["/vendor/addon-fit.js", "script", { src: assetUrl("/vendor/addon-fit.js"), async: false }, () => !!window.FitAddon],
+  ];
+  xtermLoading = Promise.all(assets.filter(([path]) => !xtermLoaded.has(path)).map((asset) => add(...asset))).then(() => {
+    if (!window.Terminal || !window.FitAddon) {
+      xtermLoaded.delete("/vendor/xterm.js");
+      xtermLoaded.delete("/vendor/addon-fit.js");
+      throw new Error("터미널 화면 파일이 올바르지 않습니다.");
+    }
+    if (!xtermReady()) throw new Error("터미널 화면 파일을 받지 못했습니다.");
+  }).catch((err) => {
+    xtermLoading = null;
+    throw err;
+  });
+  return xtermLoading;
+}
 async function openTerminal(terminal, { recordHistory = true } = {}) {
   stopChatPolling();
   if (recordHistory) navigateView("terminal");
+  const presenting = !state.terminalVisible;
+  const openRun = ++state.terminalOpenRun;
+  const current = () => openRun === state.terminalOpenRun && state.terminal?.id === terminal.id && state.terminalVisible;
   const changing = state.terminal?.id !== terminal.id;
   saveDraft();
   if (state.composing) {
@@ -2623,8 +4022,10 @@ async function openTerminal(terminal, { recordHistory = true } = {}) {
   state.terminal = terminal;
   state.terminalAlive = terminal.alive !== false && !terminal.closed;
   state.terminalVisible = true;
-  $("app").hidden = true;
-  $("terminal-screen").hidden = false;
+  renderConnectivity();
+  const shown = presenting ? navTransition("present", () => showTerminalScreen(true)) : (showTerminalScreen(true), null);
+  updateThemeColor();
+  closeEvents();
   $("terminal-title").textContent = terminal.title || "진행 중인 작업";
   $("terminal-route").textContent = targetLabel(terminalInfo(terminal));
   const nativeHost = terminalInfo(terminal).nativeSource?.host || terminalInfo(terminal).host;
@@ -2645,12 +4046,27 @@ async function openTerminal(terminal, { recordHistory = true } = {}) {
     terminalStatus(copy.ended);
     return;
   }
-  if (!window.Terminal || !window.FitAddon) {
-    terminalStatus("터미널 화면을 불러오지 못했습니다.");
-    terminalError(
-      "터미널 파일이 준비되지 않았습니다. 보드로 돌아가 새로고침해 주세요.",
-    );
-    return;
+  if (!xtermReady()) {
+    const viewport = $("terminal-viewport");
+    viewport.classList?.add("is-loading");
+    terminalStatus("터미널 화면을 불러오고 있습니다…");
+    try {
+      await loadXterm();
+    } catch {
+      if (current()) {
+        terminalStatus("터미널 화면을 불러오지 못했습니다.");
+        terminalError("터미널 화면 파일을 받지 못했습니다. 연결을 확인한 뒤 보드로 돌아가 다시 열어 주세요.");
+      }
+      return;
+    } finally {
+      viewport.classList?.remove("is-loading");
+    }
+    if (!current()) return;
+  }
+  // xterm measures its cells on open, so the screen must be visible first.
+  if (shown?.updateCallbackDone) {
+    await shown.updateCallbackDone.catch(() => {});
+    if (!current()) return;
   }
   if (changing || !state.term) {
     state.term?.dispose();
@@ -2659,7 +4075,7 @@ async function openTerminal(terminal, { recordHistory = true } = {}) {
     state.lastSize = "";
     $("terminal-viewport").replaceChildren();
     state.term = new Terminal({
-      fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
+      fontFamily: TERMINAL_FONT,
       fontSize: state.fontSize,
       lineHeight: 1.2,
       cursorBlink: true,
@@ -2838,15 +4254,19 @@ function sendInput(text) {
   state.inputQueue = send.catch(() => {});
   return send;
 }
-function returnToBoard({ selectLaunchedSource = true } = {}) {
+function returnToBoard({ selectLaunchedSource = true, animate = true } = {}) {
   saveDraft();
   stopTerminalReader();
   state.inputEpoch++;
+  state.terminalOpenRun++;
   state.terminalVisible = false;
-  $("terminal-screen").hidden = true;
-  $("app").hidden = false;
+  renderConnectivity();
+  if (animate) navTransition("dismiss", () => showTerminalScreen(false));
+  else showTerminalScreen(false);
+  updateThemeColor();
   renderTerminalReturn();
   schedule();
+  syncEvents();
   const info = terminalInfo(state.terminal);
   if (selectLaunchedSource && state.authenticated && info.nativeSource &&
       ["handoff", "transfer"].includes(info.launchMode || info.mode)) {
@@ -2863,8 +4283,9 @@ function renderTerminalReturn() {
   const info = terminalInfo(state.terminal);
   const host = capsHost(info.host)?.label || info.host;
   $("terminal-return-label").textContent = exists
-    ? [host, state.terminal.title || "열어 둔 터미널"].filter(Boolean).join(" · ")
+    ? [state.terminal.title || "열어 둔 터미널", host].filter(Boolean).join(" · ")
     : "";
+  $("return-terminal").setAttribute?.("aria-label", exists ? `열린 터미널로 돌아가기: ${$("terminal-return-label").textContent}` : "열린 터미널로 돌아가기");
 }
 function touchDevice() {
   return !!window.matchMedia?.("(pointer: coarse)").matches;
@@ -2891,6 +4312,7 @@ function renderTerminalScroll() {
   if (!live) return;
   live.hidden = !scrolled;
   if (scrolled) {
+    measureTerminalTools();
     live.textContent = `실시간으로 ↓ · ${state.terminalScrollLines}줄 위`;
     const tools = $("terminal-tools") || document.querySelector?.(".terminal-tools");
     if (live.style && tools?.offsetHeight) live.style.bottom = `${tools.offsetHeight + 12}px`;
@@ -2975,13 +4397,38 @@ function startTerminalMomentum(velocity) {
 function bindTerminalTouchScroll(node) {
   let lastY = null;
   let samples = [];
+  // Two fingers change the text size instead of scrolling; saved on release.
+  let pinch = null;
+  const endPinch = () => {
+    if (pinch?.changed) {
+      prefs.set("fontSize", state.fontSize);
+      toast(`터미널 글자 크기 ${state.fontSize}`);
+    }
+    pinch = null;
+  };
   // Capture phase: xterm's own layers must not swallow the gesture first.
   node.addEventListener("touchstart", (event) => {
     stopTerminalMomentum();
+    if (event.touches.length === 2) {
+      pinch = { size: state.fontSize, distance: touchDistance(event.touches), changed: false };
+      lastY = null;
+      samples = [];
+      return;
+    }
+    // A new single touch starts a new gesture (also after a cancelled pinch).
+    if (event.touches.length === 1) endPinch();
+    if (pinch) return;
     lastY = event.touches.length === 1 ? event.touches[0].clientY : null;
     samples = lastY === null ? [] : [[Date.now(), lastY]];
   }, { passive: true, capture: true });
   node.addEventListener("touchmove", (event) => {
+    if (pinch) {
+      if (event.touches.length === 2 &&
+          setTerminalFontSize(pinchFontSize(pinch.size, pinch.distance, touchDistance(event.touches)), { persist: false }))
+        pinch.changed = true;
+      if (event.cancelable) event.preventDefault();
+      return;
+    }
     if (lastY === null || event.touches.length !== 1) return;
     const y = event.touches[0].clientY;
     // Dragging down reveals older lines, as in any scrolling list.
@@ -2991,7 +4438,14 @@ function bindTerminalTouchScroll(node) {
     if (samples.length > 6) samples.shift();
     if (event.cancelable) event.preventDefault();
   }, { passive: false, capture: true });
-  node.addEventListener("touchend", () => {
+  node.addEventListener("touchend", (event) => {
+    if (pinch) {
+      // The finger left behind does not start a scroll.
+      if ((event?.touches?.length || 0) < 2) endPinch();
+      lastY = null;
+      samples = [];
+      return;
+    }
     const recent = samples.filter(([time]) => Date.now() - time < 100);
     if (recent.length >= 2) {
       const [t0, y0] = recent[0];
@@ -3079,13 +4533,16 @@ async function pasteDraft(submit = false) {
       resizeDraft();
     }
     $("draft-note").textContent = submit ? "" : "입력했습니다. 확인한 뒤 Enter를 눌러 실행하세요.";
+    if (submit) haptic("success");
     state.terminalScrollLines = 0;
     renderTerminalScroll();
     state.term.scrollToBottom();
   } catch {
-    if (state.terminal?.id === pending.id)
+    if (state.terminal?.id === pending.id) {
       $("draft-note").textContent =
         "전달 여부를 확인하지 못해 초안을 남겼습니다. 터미널을 확인한 뒤 다시 시도하세요.";
+      haptic("error");
+    }
   } finally {
     clearTimeout(pending.compositionTimer);
     if (state.draftPaste === pending) {
@@ -3142,13 +4599,21 @@ function renderTerminals() {
   const restoreFocus = focused?.terminalId ? { id: focused.terminalId, action: focused.action } : null;
   list.replaceChildren();
   const alive = state.terminals.filter((t) => t.alive !== false && !t.closed);
-  $("running-terminals").hidden = !alive.length && !state.terminalsError;
+  // A chip in the list's top row; the rows themselves live in a sheet.
+  const chip = $("running-terminals");
+  chip.hidden = !alive.length && !state.terminalsError;
+  setClass(chip, "has-error", !!state.terminalsError);
+  chip.setAttribute?.("aria-label", `열린 터미널 ${alive.length}개${state.terminalsError ? ", 목록 확인 필요" : ""}`);
+  if (chip.hidden && $("terminals-dialog")?.open) closeSheet("terminals-dialog");
   $("running-error").textContent = state.terminalsError;
   $("running-error").hidden = !state.terminalsError;
   $("running-refresh").hidden = !state.terminalsError;
   $("running-count").textContent = alive.length;
   for (const terminal of alive) {
-    const node = button("", "running-terminal", () => openTerminal(terminal));
+    const node = button("", "running-terminal", () => {
+      closeSheet("terminals-dialog");
+      openTerminal(terminal);
+    });
     node.dataset.terminalId = terminal.id;
     node.dataset.action = "open";
     const labels = el("span", "running-terminal-copy");
@@ -3174,6 +4639,9 @@ function renderTerminals() {
     if (restoreFocus?.id === terminal.id)
       (restoreFocus.action === "close" ? close : node).focus();
   }
+  // Cards and the open conversation offer "연결 닫기" for these terminals.
+  const selected = selectedSession();
+  if (selected) updateChatComposer(chatEntry(selected));
 }
 
 function closeTerminal(id) {
@@ -3199,7 +4667,7 @@ function closeTerminal(id) {
   $("close-terminal-confirm").textContent = copy.action;
   $("close-terminal-confirm").className = `primary${copy.danger ? " danger" : ""}`;
   $("close-terminal-confirm").disabled = false;
-  $("close-terminal-dialog").showModal();
+  sheet("close-terminal-dialog").open();
   $("close-terminal-cancel").focus();
 }
 function cancelTerminalClose() {
@@ -3224,14 +4692,16 @@ function finishTerminalClose(closing) {
     state.term = null;
     state.fit = null;
     $("terminal-viewport").replaceChildren();
-    $("terminal-screen").hidden = true;
-    $("app").hidden = false;
+    showTerminalScreen(false);
+    updateThemeColor();
     renderTerminalReturn();
     if (wasVisible) {
       navigateView("list", true);
-      backToList();
+      stopChatPolling();
+      setDetailShown(false, { focus: true });
     }
     schedule();
+    syncEvents();
   }
   state.closingTerminal = null;
   $("close-terminal-dialog").close();
@@ -3272,8 +4742,117 @@ async function confirmTerminalClose() {
   }
 }
 
+// Live updates: one EventSource for the board, subscribed to the open
+// conversation (its source in the query) and to snapshot changes. While it
+// is connected the polling below only runs as a slow safety net; a server
+// without /api/events, or 3 errors within 30s, falls back to normal polling
+// for a while. Events only say what changed; data is still read online.
+const EVENTS_SAFETY_MS = { snapshot: 60000, chat: 30000 };
+const EVENTS_RETRY_MS = 5 * 60 * 1000;
+function eventsHealthy() {
+  return !!state.events?.healthy;
+}
+function closeEvents() {
+  const events = state.events;
+  if (!events) return;
+  state.events = null;
+  try {
+    events.source.close();
+  } catch {
+    /* already closed */
+  }
+  // Polling returns to its normal pace until a new stream is healthy.
+  if (events.healthy) rescheduleAfterEvents();
+}
+function rescheduleAfterEvents() {
+  if (state.pollTimer) schedule();
+  const s = selectedSession();
+  if (s && state.chatPollTimer) scheduleChatPoll(s, chatEntry(s));
+}
+function fallbackEvents() {
+  state.eventsRetryAt = Date.now() + EVENTS_RETRY_MS;
+  closeEvents();
+}
+function syncEvents() {
+  const Source = globalThis.EventSource;
+  if (typeof Source !== "function" || !state.authenticated || document.hidden || networkOffline() ||
+      state.terminalVisible || Date.now() < state.eventsRetryAt) {
+    closeEvents();
+    return;
+  }
+  const s = selectedSession();
+  const chat = s && chatVisible() ? sourceOf(s) : null;
+  const key = chat ? chatKey(chat) : "";
+  if (state.events?.key === key) return;
+  closeEvents();
+  const params = new URLSearchParams();
+  for (const name of ["host", "agent", "home", "id"]) if (chat?.[name]) params.set(name, chat[name]);
+  const query = params.toString();
+  let source;
+  try {
+    source = new Source(`/api/events${query ? `?${query}` : ""}`);
+  } catch {
+    fallbackEvents();
+    return;
+  }
+  const events = { source, key, healthy: false, everOpen: false, errors: [], digest: null, authEpoch: state.authEpoch };
+  state.events = events;
+  const current = () => state.events === events && events.authEpoch === state.authEpoch;
+  const parse = (event) => {
+    try {
+      return JSON.parse(event?.data || "{}") || {};
+    } catch {
+      return {};
+    }
+  };
+  const healthy = () => {
+    if (events.healthy) return;
+    events.healthy = events.everOpen = true;
+    rescheduleAfterEvents();
+  };
+  source.addEventListener("open", () => { if (current()) healthy(); });
+  source.addEventListener("hello", (event) => {
+    if (!current()) return;
+    healthy();
+    snapshotAnnounced(parse(event).snapshotVersion);
+  });
+  source.addEventListener("snapshot", (event) => {
+    if (current()) snapshotAnnounced(parse(event).version);
+  });
+  source.addEventListener("chat", (event) => {
+    if (!current()) return;
+    const digest = parse(event).digest;
+    if (typeof digest === "string" && digest && digest === events.digest) return;
+    events.digest = typeof digest === "string" ? digest : null;
+    const selected = selectedSession();
+    if (!selected || !events.key || chatKey(sourceOf(selected)) !== events.key || !chatVisible()) return;
+    const entry = chatEntry(selected);
+    if (entry.checking) entry.recheckQueued = true;
+    else loadChatState(selected, false);
+  });
+  source.addEventListener("error", () => {
+    if (!current()) return;
+    const now = Date.now();
+    events.errors = events.errors.filter((time) => now - time < 30000).concat(now);
+    const wasHealthy = events.healthy;
+    events.healthy = false;
+    // CLOSED: the browser will not retry (404, 503, a closed server).
+    if (source.readyState === 2 || events.errors.length >= 3) fallbackEvents();
+    // CONNECTING: the browser reconnects by itself. Either way, the polling
+    // timers set for a healthy stream go back to their normal pace now.
+    if (wasHealthy) rescheduleAfterEvents();
+  });
+}
+function snapshotAnnounced(version) {
+  if (!Number.isInteger(version)) return;
+  state.eventsSnapshotVersion = Math.max(version, state.eventsSnapshotVersion ?? version);
+  if (Number.isInteger(state.snapshotVersion) && version <= state.snapshotVersion) return;
+  if (state.pollBusy) state.snapshotPending = true;
+  else poll(false);
+}
 function schedule() {
   clearTimeout(state.pollTimer);
+  state.pollTimer = null;
   if (!state.authenticated || networkOffline() || state.terminalVisible || document.hidden) return;
   // Reading a collection already in flight does not start another host request.
   const collecting =
@@ -3281,10 +4860,9 @@ function schedule() {
     Date.now() < state.refreshDeadline;
   // After a failed read, retry sooner with backoff instead of waiting a full minute.
   const retry = state.pollFailures ? Math.min(POLL_MS, 5000 * 2 ** (state.pollFailures - 1)) : POLL_MS;
-  state.pollTimer = setTimeout(
-    () => poll(!collecting),
-    collecting ? 2000 : retry,
-  );
+  // Live snapshot events replace the 2s collection loop while connected.
+  const delay = eventsHealthy() && !state.pollFailures ? EVENTS_SAFETY_MS.snapshot : collecting ? 2000 : retry;
+  state.pollTimer = setTimeout(() => poll(!collecting), delay);
 }
 async function loadCapabilities(authEpoch = state.authEpoch, { refreshView = true } = {}) {
   const accountFilter = state.filters.account;
@@ -3295,6 +4873,7 @@ async function loadCapabilities(authEpoch = state.authEpoch, { refreshView = tru
   state.capabilities = capabilities;
   state.csrf = state.capabilities.csrfToken || "";
   $("logout").hidden = state.capabilities.authMode === "tailscale";
+  if ($("settings-lock")) $("settings-lock").hidden = $("logout").hidden;
   if (accountFilter && state.filters.account === accountFilter && previousRoutes?.size) {
     const labels = new Set(allSessions().filter((s) => previousRoutes.has(accountRouteKey(s))).map((s) => s.account));
     if (labels.size === 1) state.filters.account = [...labels][0];
@@ -3315,6 +4894,7 @@ async function poll(refresh = false) {
     const snapshot = await api(`/api/snapshot${refresh ? "?refresh=1" : ""}`, { authEpoch });
     assertAuthEpoch(authEpoch);
     state.snapshot = snapshot;
+    if (Number.isInteger(snapshot?.version)) state.snapshotVersion = snapshot.version;
     state.authenticated = true;
     $("login").hidden = true;
     $("app").hidden = false;
@@ -3329,15 +4909,16 @@ async function poll(refresh = false) {
       state.capabilitiesRevision = revision;
     }
     state.pollFailures = 0;
+    renderConnectivity();
     if (Date.now() - (state.usageAt || 0) > 55000) loadUsage();
     schedule();
+    syncEvents();
   } catch (err) {
     if (!err.unauthorized && !err.staleAuth) {
-      notice(
-        "보드 연결을 확인하지 못했습니다. 마지막으로 읽은 내용을 표시하고 잠시 뒤 다시 확인합니다.",
-      );
-      // A transient failure (server restart, network blip) must not stop the list for good.
+      // A transient failure (server restart, network blip) must not stop the
+      // list for good; from the second failure in a row the top shows it.
       state.pollFailures = (state.pollFailures || 0) + 1;
+      renderConnectivity();
       if (authEpoch === state.authEpoch) {
         state.pollBusy = false;
         schedule();
@@ -3349,7 +4930,15 @@ async function poll(refresh = false) {
       }
     }
   } finally {
-    if (authEpoch === state.authEpoch) state.pollBusy = false;
+    if (authEpoch === state.authEpoch) {
+      state.pollBusy = false;
+      // A version announced during this read: read once more if still behind.
+      if (state.snapshotPending) {
+        state.snapshotPending = false;
+        if (Number.isInteger(state.eventsSnapshotVersion) &&
+            !(state.eventsSnapshotVersion <= state.snapshotVersion)) setTimeout(() => poll(false), 0);
+      }
+    }
   }
 }
 async function manualRefresh() {
@@ -3373,25 +4962,26 @@ async function manualRefresh() {
     if (authEpoch === state.authEpoch) $("refresh").disabled = false;
   }
 }
-// On phones the app bar slides away while the list is scrolled down and
-// returns as soon as the list moves back up.
-function setTopHidden(hidden) {
-  const bar = document.querySelector?.(".top");
+// Phones (iOS large title): "작업" scrolls with the list. Once it has passed
+// under the bar, the bar turns translucent (blurred) and shows the small
+// centered title; scrolling back to the top restores the large title.
+const LARGE_TITLE_COLLAPSE = 36;
+function setListCollapsed(collapsed) {
   const body = document.body;
-  if (!bar?.style || !body?.classList || body.classList.contains?.("top-hidden") === hidden) return;
-  bar.style.marginTop = hidden ? `-${bar.offsetHeight || 0}px` : "";
-  body.classList.toggle?.("top-hidden", hidden);
+  if (state.listCollapsed === collapsed && body?.classList?.contains?.("list-collapsed") === collapsed) return;
+  state.listCollapsed = collapsed;
+  if (!body?.classList) return;
+  if (collapsed) body.classList.add("list-collapsed");
+  else body.classList.remove("list-collapsed");
 }
 function listScroll(pane) {
-  if (!window.matchMedia?.("(max-width: 700px)").matches) { setTopHidden(false); return; }
-  const top = pane.scrollTop;
-  const previous = pane.lastScrollTop ?? top;
-  pane.lastScrollTop = top;
-  if (top < 12) { pane.travel = 0; setTopHidden(false); return; }
-  const delta = top - previous;
-  pane.travel = Math.sign(delta) === Math.sign(pane.travel || 0) ? (pane.travel || 0) + delta : delta;
-  if (pane.travel > 48) setTopHidden(true);
-  else if (pane.travel < -48) setTopHidden(false);
+  setListCollapsed(phoneLayout() && (pane?.scrollTop || 0) > LARGE_TITLE_COLLAPSE);
+  if (state.swipeOpen) closeSwipe();
+}
+function scrollListToTop() {
+  const pane = $("task-list-pane");
+  if (typeof pane?.scrollTo === "function") pane.scrollTo({ top: 0, behavior: prefersReducedMotion() ? "auto" : "smooth" });
+  else if (pane) pane.scrollTop = 0;
 }
 // Pull to refresh: the installed app has no browser gesture (overscroll is off),
 // so a downward pull from the top of the list or conversation reloads both.
@@ -3443,7 +5033,7 @@ async function pullRefresh() {
   }
 }
 function bindPullToRefresh(root) {
-  let start = null, distance = 0;
+  let start = null, startX = 0, distance = 0;
   root.addEventListener("touchstart", (event) => {
     start = null;
     distance = 0;
@@ -3453,16 +5043,28 @@ function bindPullToRefresh(root) {
     const scroller = event.target?.closest?.("#detail") ? $("messages") : scrollParent(event.target);
     if (scroller && scroller.scrollTop > 0) return;
     start = event.touches[0].clientY;
+    startX = event.touches[0].clientX;
   }, { passive: true });
   root.addEventListener("touchmove", (event) => {
     if (start === null || event.touches.length !== 1) return;
     const pulled = event.touches[0].clientY - start;
+    // The pull starts only on a clearly downward drag: a sideways one (a
+    // card swipe) is never a pull, and a small wobble waits for direction.
+    if (distance === 0) {
+      const sideways = Math.abs((event.touches[0].clientX || 0) - startX);
+      if (sideways > PRESS_SLOP && sideways >= Math.abs(pulled)) {
+        start = null;
+        showPull(0);
+        return;
+      }
+      if (pulled > 0 && pulled < PRESS_SLOP && sideways > pulled) return;
+    }
     if (pulled <= 0) { distance = 0; showPull(0); return; }
     const wasReady = distance >= PULL_TRIGGER;
     distance = pullDistance(pulled);
     const ready = distance >= PULL_TRIGGER;
     // A light tick when release would refresh (devices without vibration ignore it).
-    if (ready && !wasReady) globalThis.navigator?.vibrate?.(8);
+    if (ready && !wasReady) haptic("select");
     showPull(distance, ready ? "놓으면 새로고침" : "당겨서 새로고침", ready);
     if (event.cancelable) event.preventDefault();
   }, { passive: false });
@@ -3486,7 +5088,12 @@ function showLogin() {
   clearTimeout(state.pollTimer);
   stopTerminalReader();
   stopChatPolling();
+  // Object URLs of picked images are released with their drafts.
+  for (const entry of state.chats.values()) for (const key of [...(entry.thumbs?.keys() || [])]) revokeThumb(entry, key);
   state.chats.clear();
+  state.phaseFilter = "";
+  state.swipeOpen = null;
+  state.pollFailures = 0;
   state.nativeSessions.clear();
   state.accountFilterRoutes = null;
   state.inputEpoch++;
@@ -3496,9 +5103,12 @@ function showLogin() {
   state.capabilitiesRevision = null;
   state.refreshDeadline = 0;
   state.snapshot = null;
+  state.snapshotVersion = null;
+  state.eventsSnapshotVersion = null;
+  state.snapshotPending = false;
   state.selected = null;
   navigateView("list", true);
-  document.body.classList.remove("show-detail");
+  setDetailShown(false);
   state.detailFor = null;
   state.detailRun++;
   state.planRun++;
@@ -3522,6 +5132,10 @@ function showLogin() {
   $("app").hidden = true;
   $("login").hidden = false;
   if ($("plan-dialog").open) $("plan-dialog").close();
+  if ($("settings-dialog").open) $("settings-dialog").close();
+  for (const id of ["usage-dialog", "filter-dialog", "terminals-dialog", "action-sheet"]) if ($(id)?.open) $(id).close();
+  renderConnectivity();
+  updateThemeColor();
   $("login-token").focus();
 }
 async function lock() {
@@ -3550,6 +5164,20 @@ function updateViewport() {
   if (selected) resizeChatInput(chatEntry(selected));
   fitTerminal();
 }
+// "오프라인 · 다시 연결 중" at the top while the browser is offline or the
+// board failed to answer twice in a row; it goes away by itself once a read
+// succeeds. The terminal shows its own connection state instead.
+function renderConnectivity() {
+  const box = $("offline-banner");
+  if (!box) return;
+  const offline = networkOffline();
+  const failing = !offline && (state.pollFailures || 0) >= 2;
+  const text = !state.authenticated && !state.snapshot ? ""
+    : offline ? "오프라인 · 다시 연결 중" : failing ? "연결 끊김 · 다시 연결 중" : "";
+  if ($("offline-text").textContent !== text) $("offline-text").textContent = text;
+  box.dataset.kind = offline ? "offline" : failing ? "retrying" : "";
+  box.hidden = !text || state.terminalVisible;
+}
 function showOfflineStart() {
   if (state.snapshot || state.terminalVisible) return;
   $("login").hidden = false;
@@ -3559,6 +5187,7 @@ function showOfflineStart() {
 }
 function recoverConnection() {
   state.offline = false;
+  renderConnectivity();
   if (networkOffline()) return;
   if (!state.loginBusy) $("login-submit").disabled = false;
   if (document.hidden || state.loginBusy) return;
@@ -3569,7 +5198,6 @@ function recoverConnection() {
     startTerminalReader();
     return;
   }
-  notice("연결이 돌아왔습니다. 작업 상태를 확인하고 있습니다…");
   const initialAuthentication = !state.authenticated;
   const authEpoch = state.authEpoch;
   poll(false).then(() => {
@@ -3601,17 +5229,61 @@ window.addEventListener("DOMContentLoaded", () => {
         openTerminal(state.terminal, { recordHistory: false });
       return;
     }
-    if (state.terminalVisible) returnToBoard();
-    document.body.classList.toggle(
-      "show-detail",
-      view === "detail" && !!state.selected,
-    );
-    if (view === "detail") focusDetailBack();
-    else restoreSelectedCardFocus();
+    // A browser that already animated its own back swipe gets no second slide.
+    const animate = !event.hasUAVisualTransition;
+    const fromTerminal = state.terminalVisible;
+    if (fromTerminal) returnToBoard({ animate });
+    const detail = view === "detail" && !!state.selected;
     stopChatPolling();
+    setDetailShown(detail, { direction: animate && !fromTerminal ? (detail ? "push" : "pop") : null, focus: true });
     const selected = selectedSession();
     if (selected && chatVisible()) loadChatState(selected, true);
   });
+  $("settings").addEventListener("click", openSettings);
+  $("settings-close").addEventListener("click", closeSettings);
+  $("settings-done").addEventListener("click", closeSettings);
+  $("settings-dialog").addEventListener("cancel", (event) => {
+    event.preventDefault();
+    closeSettings();
+  });
+  for (const value of THEMES)
+    $(`theme-${value}`).addEventListener("change", (event) => {
+      if (event?.target?.checked !== false) setTheme(value);
+    });
+  for (const value of TEXT_SIZES)
+    $(`text-size-${value}`).addEventListener("change", (event) => {
+      if (event?.target?.checked !== false) setTextSize(value);
+    });
+  $("settings-lock").addEventListener("click", () => {
+    closeSettings();
+    lock();
+  });
+  applyTheme();
+  applyTextSize();
+  // List chips and their sheets.
+  $("usage").addEventListener("click", openUsage);
+  $("usage-close").addEventListener("click", () => closeSheet("usage-dialog", "usage"));
+  $("filter-open").addEventListener("click", () => sheet("filter-dialog").open());
+  $("filter-close").addEventListener("click", () => closeSheet("filter-dialog", "filter-open"));
+  $("filter-done").addEventListener("click", () => closeSheet("filter-dialog", "filter-open"));
+  $("filter-reset").addEventListener("click", resetFilters);
+  $("running-terminals").addEventListener("click", () => sheet("terminals-dialog").open());
+  $("terminals-close").addEventListener("click", () => closeSheet("terminals-dialog", "running-terminals"));
+  $("action-close").addEventListener("click", () => closeActionSheet());
+  for (const [id, close] of [["usage-dialog", () => closeSheet("usage-dialog", "usage")],
+    ["filter-dialog", () => closeSheet("filter-dialog", "filter-open")],
+    ["terminals-dialog", () => closeSheet("terminals-dialog", "running-terminals")],
+    ["action-sheet", () => closeActionSheet()]])
+    $(id).addEventListener("cancel", (event) => {
+      event.preventDefault();
+      close();
+    });
+  $("nav-title").addEventListener("click", scrollListToTop);
+  $("connection-notice").addEventListener("click", () => {
+    // Floating on phones; a tap acknowledges it.
+    if (phoneLayout()) notice();
+  });
+  bindCardGestures($("groups"));
   try {
     for (const key of ["sessionholic:selected", "sessionholic:filters", "sessionholic:showOld"])
       localStorage.removeItem(key);
@@ -3743,18 +5415,13 @@ window.addEventListener("DOMContentLoaded", () => {
     ["terminal-font-down", -1],
     ["terminal-font-up", 1],
   ])
-    $(id).addEventListener("click", () => {
-      state.fontSize = Math.max(10, Math.min(24, state.fontSize + delta));
-      prefs.set("fontSize", state.fontSize);
-      if (state.term) {
-        state.term.options.fontSize = state.fontSize;
-        fitTerminal();
-      }
-    });
+    $(id).addEventListener("click", () => setTerminalFontSize(state.fontSize + delta));
   document.addEventListener("visibilitychange", () => {
     clearTimeout(state.pollTimer);
     stopChatPolling();
     if (document.hidden) {
+      // Live updates stop with the page; a visible page reconnects after its read.
+      closeEvents();
       if (state.terminalVisible) {
         saveDraft();
         stopTerminalReader();
@@ -3771,6 +5438,7 @@ window.addEventListener("DOMContentLoaded", () => {
   });
   window.addEventListener("offline", () => {
     state.offline = true;
+    closeEvents();
     showOfflineStart();
     stopChatPolling();
     const selected = selectedSession();
@@ -3784,10 +5452,8 @@ window.addEventListener("DOMContentLoaded", () => {
       );
     } else {
       clearTimeout(state.pollTimer);
-      notice(
-        "오프라인입니다. 작업 상태를 확인하려면 연결 후 새로고침해 주세요.",
-      );
     }
+    renderConnectivity();
   });
   window.addEventListener("online", recoverConnection);
   $("terminal-direct-input").checked = directTerminalInput();
@@ -3804,6 +5470,8 @@ window.addEventListener("DOMContentLoaded", () => {
   });
   window.addEventListener("resize", updateViewport);
   window.addEventListener("beforeunload", warnDraftUnload);
+  // Dialog sheets: drag handle, detents and outside taps (BottomSheet).
+  for (const id of Object.keys(SHEETS)) sheet(id);
   window.visualViewport?.addEventListener("resize", updateViewport);
   updateViewport();
   if ("serviceWorker" in navigator)

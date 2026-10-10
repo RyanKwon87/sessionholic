@@ -29,11 +29,16 @@ PRE_BIND_STAGES = frozenset(('validate', 'import', 'build'))
 UNKNOWN_PREPARE = ('대상 준비 결과를 확인하지 못했습니다. 이미 작업이 시작되었을 수 있으므로 '
                    '대상 기기의 작업 목록과 이전 기록을 확인해 주세요.')
 # Only this versioned helper is installed. Credentials, dotfile profiles and hooks are not copied.
-# The helper is replaced atomically when missing or corrupt; other versions unused for a day are removed.
+# A call normally carries only the helper's SHA-256. When `worker-<sha>.pyz` is missing or
+# corrupt the bootstrap answers {"needRuntime": true} without running anything, and the
+# coordinator sends the full helper, which is verified and replaced atomically.
+# Other versions unused for a day are removed.
 BOOTSTRAP = r'''
 import base64,hashlib,io,json,os,pathlib,re,runpy,stat,sys,time
-p=json.load(sys.stdin); data=base64.b64decode(p['runtime'],validate=True); sha=p['sha256']
-assert re.fullmatch('[0-9a-f]{64}',sha) and len(data)<2*1024*1024 and hashlib.sha256(data).hexdigest()==sha
+p=json.load(sys.stdin); sha=p['sha256']; limit=2*1024*1024
+assert re.fullmatch('[0-9a-f]{64}',sha)
+data=base64.b64decode(p['runtime'],validate=True) if 'runtime' in p else None
+assert data is None or (len(data)<limit and hashlib.sha256(data).hexdigest()==sha)
 root=pathlib.Path.home()/'.local/state/sessionholic-transfer-runtime'
 for d in (root,)+tuple(root.parents):
  if d.exists(): assert not d.is_symlink() and d.is_dir()
@@ -45,8 +50,10 @@ def valid():
  except OSError: return False
  with os.fdopen(fd,'rb') as f:
   s=os.fstat(f.fileno())
-  return stat.S_ISREG(s.st_mode) and s.st_uid==os.getuid() and hashlib.sha256(f.read(len(data)+1)).hexdigest()==sha
+  return stat.S_ISREG(s.st_mode) and s.st_uid==os.getuid() and hashlib.sha256(f.read(limit+1)).hexdigest()==sha
 if not valid():
+ if data is None:
+  sys.stdout.write(json.dumps({'ok':False,'needRuntime':True,'sha256':sha}));sys.stdout.flush();sys.exit(0)
  tmp=root/('.worker-'+sha+'.'+os.urandom(6).hex()+'.tmp')
  fd=os.open(str(tmp),os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600)
  try:
@@ -90,6 +97,8 @@ class Transfers:
         self.base_dir = Path(state_dir)
         self.state_dir = self.base_dir / 'transfers'
         self.runtime_paths = {}
+        # host name -> whether this process's helper SHA is known to be installed there
+        self.runtime_installed = {}
         self.profile_cache = {}
         self.profile_failures = {}
         self.lock = threading.RLock()
@@ -126,8 +135,12 @@ class Transfers:
         return [shutil.which('ssh') or '/usr/bin/ssh'] + (['-tt'] if tty else []) + ['-o', 'BatchMode=yes', '-o', 'ConnectTimeout=6',
                 '-o', 'ServerAliveInterval=10', '-o', 'ServerAliveCountMax=2'] + self.control_options() + ['--', host['ssh'], command]
 
-    def rpc(self, host, op, args=None, timeout=30):
-        payload = {**self.runtime(), 'request': {'op': op, 'args': args or {}}}
+    def _exchange(self, host, request, timeout, full):
+        """One bootstrap run; `full` adds the helper archive, otherwise only its SHA-256 goes."""
+        runtime = self.runtime()
+        payload = {'sha256': runtime['sha256'], 'request': request}
+        if full:
+            payload['runtime'] = runtime['runtime']
         import collector
         try:
             result = subprocess.run(self.command(host, ['-I', '-c', BOOTSTRAP]),
@@ -144,6 +157,28 @@ class Transfers:
         try: data = json.loads(result.stdout)
         except (ValueError, UnicodeError): raise RuntimeError('기기 응답을 읽지 못했습니다.') from None
         if not isinstance(data, dict): raise RuntimeError('기기 응답을 읽지 못했습니다.')
+        return data
+
+    def _needs_runtime(self, data):
+        return data.get('needRuntime') is True and data.get('sha256') == self.runtime()['sha256']
+
+    def rpc(self, host, op, args=None, timeout=30):
+        request = {'op': op, 'args': args or {}}
+        name = host['name']
+        with self.lock:
+            # True: this helper version is confirmed on the host. False: the host
+            # reported it missing and no full copy has been confirmed since.
+            # Unknown hosts are asked with the SHA first, which a restart usually finds installed.
+            missing = self.runtime_installed.get(name) is False
+        data = self._exchange(host, request, timeout, full=missing)
+        if not missing and self._needs_runtime(data):
+            with self.lock:
+                self.runtime_installed[name] = False
+            data = self._exchange(host, request, timeout, full=True)
+        if self._needs_runtime(data):
+            raise RuntimeError('기기에 이전 도우미를 설치하지 못했습니다. 기기 상태를 확인해 주세요.')
+        with self.lock:
+            self.runtime_installed[name] = True
         if not data.get('ok'):
             stage = data.get('stage')
             raise WorkerError(scrub_text(data.get('error') or '기기의 이전 준비에 실패했습니다.')[:1000],

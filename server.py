@@ -8,7 +8,9 @@ from __future__ import annotations
 
 import argparse
 import copy
+import gzip
 import hashlib
+import html
 import shutil
 import hmac
 import ipaddress
@@ -19,6 +21,7 @@ import os
 from pathlib import Path
 import re
 import secrets
+import select
 import shlex
 import stat
 import subprocess
@@ -50,8 +53,18 @@ SSH_FALLBACK_ROOT = Path("/tmp")
 TYPES = {".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8",
          ".css": "text/css; charset=utf-8", ".svg": "image/svg+xml", ".png": "image/png",
          ".webmanifest": "application/manifest+json"}
+# Static and JSON responses are gzip-compressed for clients that accept it, from this size.
+GZIP_MIN = 1024
+COMPRESSIBLE = frozenset((".html", ".js", ".css", ".svg", ".webmanifest", ".json"))
+IMMUTABLE = "public, max-age=31536000, immutable"
+# Always revalidated: the page names every other asset's version, and the worker URL is fixed.
+REVALIDATED = ("index.html", "sw.js")
+ASSET_META = re.compile(r'(<meta\b[^>]*?\bname="sessionholic-assets"[^>]*?\bcontent=")([^"]*)(")')
+ASSET_REF = re.compile(r'\b(src|href)="(/[^"?#]*)"')
+# A stalled event-stream reader is dropped after this many seconds of a blocked write.
+STREAM_WRITE_TIMEOUT = 30
 SECURITY_HEADERS = {
-    "Content-Security-Policy": "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self'; "
+    "Content-Security-Policy": "default-src 'self'; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; script-src 'self'; "
                                "connect-src 'self'; manifest-src 'self'; worker-src 'self'; "
                                "frame-ancestors 'none'; base-uri 'none'; form-action 'self'",
     "X-Content-Type-Options": "nosniff",
@@ -210,6 +223,118 @@ def log_failure(context, exc):
     sys.stderr.write(f"세션홀릭: {context} 중 예상하지 못한 오류 ({type(exc).__name__})\n{frames}")
 
 
+def accepts_gzip(header):
+    """True when Accept-Encoding lists gzip with a non-zero quality."""
+    for item in (header or "").split(","):
+        name, _, params = item.partition(";")
+        if name.strip().lower() != "gzip":
+            continue
+        quality = 1.0
+        for param in params.split(";"):
+            key, _, value = param.partition("=")
+            if key.strip().lower() == "q":
+                try:
+                    quality = float(value.strip())
+                except ValueError:
+                    quality = 0.0
+        return quality > 0
+    return False
+
+
+def etag_matches(header, etag):
+    for item in (header or "").split(","):
+        item = item.strip()
+        if item.startswith("W/"):
+            item = item[2:]
+        if item in ("*", etag):
+            return True
+    return False
+
+
+class StaticAssets:
+    """Public web files with their hashes and gzip bodies, cached by (name, mtime_ns, size).
+
+    Only public assets are cached. index.html is rendered with the current asset
+    versions, so its hash is taken over the rendered page.
+    """
+    def __init__(self, root=WEB):
+        self.root = Path(root)
+        self.lock = threading.Lock()
+        self.files, self.page = {}, None
+
+    @staticmethod
+    def build(name, body):
+        digest = hashlib.sha256(body).hexdigest()
+        packed = None
+        if Path(name).suffix in COMPRESSIBLE and len(body) >= GZIP_MIN:
+            packed = gzip.compress(body, compresslevel=9, mtime=0)
+            if len(packed) >= len(body):
+                packed = None
+        return {"body": body, "gzip": packed, "sha8": digest[:8], "etag": digest[:16]}
+
+    def file(self, name):
+        if not STATIC.fullmatch(name):
+            return None
+        path = self.root / name
+        try:
+            info = path.stat()
+        except OSError:
+            return None
+        if not stat.S_ISREG(info.st_mode):
+            return None
+        key = (info.st_mtime_ns, info.st_size)
+        with self.lock:
+            cached = self.files.get(name)
+        if cached and cached[0] == key:
+            return cached[1]
+        try:
+            body = path.read_bytes()
+        except OSError:
+            return None
+        entry = self.build(name, body)
+        with self.lock:
+            self.files[name] = (key, entry)
+        return entry
+
+    def manifest(self):
+        """{"/app.js": "<sha8>", ...} for every servable file under web/."""
+        names = []
+        for folder, prefix in ((self.root, ""), (self.root / "vendor", "vendor/")):
+            try:
+                names.extend(prefix + item for item in sorted(os.listdir(folder)) if STATIC.fullmatch(prefix + item))
+            except OSError:
+                continue
+        result = {}
+        for name in names:
+            entry = self.file(name)
+            if entry is not None:
+                result["/" + name] = entry["sha8"]
+        return result
+
+    def index(self):
+        template = self.file("index.html")
+        if template is None:
+            return None
+        manifest = self.manifest()
+        key = (template["etag"], tuple(sorted(manifest.items())))
+        with self.lock:
+            if self.page is not None and self.page[0] == key:
+                return self.page[1]
+        text = template["body"].decode("utf-8")
+        filled = html.escape(json.dumps(manifest, sort_keys=True, separators=(",", ":")), quote=True)
+        text = ASSET_META.sub(lambda match: match.group(1) + filled + match.group(3), text, count=1)
+
+        def versioned(match):
+            path = match.group(2)
+            if path in manifest and path[1:] not in REVALIDATED:
+                return '%s="%s?v=%s"' % (match.group(1), path, manifest[path])
+            return match.group(0)
+        entry = self.build("index.html", ASSET_REF.sub(versioned, text).encode("utf-8"))
+        with self.lock:
+            self.page = (key, entry)
+        return entry
+
+
 class Board:
     """Visible-client driven collection.
 
@@ -223,7 +348,8 @@ class Board:
         self.hosts, self.interval = hosts, max(interval, 60)
         self.clock = time.time
         self.lock = threading.RLock()
-        # Lock order: a host lock, then save_lock, then self.lock; never the reverse.
+        # Lock order: a host lock, then save_lock, then self.lock, then a change
+        # listener's own lock; never the reverse.
         self.host_locks = {h["name"]: threading.Lock() for h in hosts}
         self.save_lock = threading.Lock()
         self.state = {h["name"]: {"name": h["name"], "label": h["label"], "ok": False,
@@ -249,6 +375,36 @@ class Board:
                     self.reads[tuple(entry["key"])] = (entry["at"], entry["data"])
             except (OSError, ValueError, KeyError, TypeError):
                 pass
+        # `version` rises within this process only when the published host state changes.
+        self.version, self.listeners = 0, []
+        self.signature = self.state_signature()
+
+    def state_signature(self):
+        with self.lock:
+            return hashlib.sha256(json.dumps(self.state, sort_keys=True, ensure_ascii=False,
+                                             default=str).encode()).digest()
+
+    def add_listener(self, callback):
+        with self.lock:
+            self.listeners.append(callback)
+
+    def remove_listener(self, callback):
+        with self.lock:
+            self.listeners.remove(callback)
+
+    def changed(self):
+        """Bump `version` and tell listeners when the host state differs; callers hold self.lock."""
+        with self.lock:
+            signature = self.state_signature()
+            if signature == self.signature:
+                return
+            self.signature = signature
+            self.version += 1
+            for callback in list(self.listeners):
+                try:
+                    callback(self.version)
+                except Exception as exc:
+                    log_failure("변경 알림", exc)
 
     def start(self):
         # Kept for old callers; no background polling without a visible client.
@@ -264,6 +420,7 @@ class Board:
                 with self.lock:
                     self.state[name]["refreshing"] = True
                     self.attempted[name] = started
+                    self.changed()
                 data = scrub_payload(self.runner(host, ["snapshot"], 45))
                 update = {"ok": True, "paused": False, "error": None, "data": data,
                           "fetchedAt": int(self.clock())}
@@ -283,6 +440,7 @@ class Board:
                         failures = self.backoff.get(name, (0, 0))[0] + 1
                         delay = self.RETRY_BACKOFF[min(failures, len(self.RETRY_BACKOFF)) - 1]
                         self.backoff[name] = (failures, finished + delay)
+                    self.changed()
             self.persist("snapshot.json", self.snapshot)
             return update["ok"]
 
@@ -317,6 +475,7 @@ class Board:
                     continue
                 row["refreshing"] = True
                 queued.append(host)
+            self.changed()
         for host in queued:
             try:
                 threading.Thread(target=self.poll, args=(host,), daemon=True,
@@ -324,11 +483,12 @@ class Board:
             except RuntimeError:
                 with self.lock:
                     self.state[host["name"]].update(refreshing=False, error="수집을 시작하지 못했습니다.")
+                    self.changed()
         return bool(queued)
 
     def snapshot(self):
         with self.lock:
-            return {"serverTime": int(time.time()), "interval": self.interval,
+            return {"serverTime": int(time.time()), "interval": self.interval, "version": self.version,
                     "hosts": copy.deepcopy(list(self.state.values()))}
 
     def source(self, ref):
@@ -731,9 +891,18 @@ class Handler(BaseHTTPRequestHandler):
         # Log the path only; query strings may carry a one-time login code.
         sys.stderr.write("%s %s %s\n" % (self.log_date_time_string(), self.command, urlparse(self.path).path))
 
-    def send_body(self, code, body, content_type, extra=None):
+    def accepts_gzip(self):
+        return accepts_gzip(self.headers.get("Accept-Encoding") if self.headers else None)
+
+    def send_body(self, code, body, content_type, extra=None, compress=False):
+        headers = {**SECURITY_HEADERS, **(extra or {})}
+        if compress:
+            headers["Vary"] = "Accept-Encoding"
+            if len(body) >= GZIP_MIN and self.accepts_gzip():
+                body = gzip.compress(body, compresslevel=6, mtime=0)
+                headers["Content-Encoding"] = "gzip"
         self.send_response(code)
-        for key, value in {**SECURITY_HEADERS, **(extra or {})}.items():
+        for key, value in headers.items():
             self.send_header(key, value)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
@@ -743,7 +912,14 @@ class Handler(BaseHTTPRequestHandler):
 
     def send_json(self, code, data, extra=None):
         body = json.dumps(data, ensure_ascii=False).encode()
-        self.send_body(code, body, "application/json; charset=utf-8", {"Cache-Control": "no-store", **(extra or {})})
+        self.send_body(code, body, "application/json; charset=utf-8", {"Cache-Control": "no-store", **(extra or {})},
+                       compress=True)
+
+    def send_not_modified(self, extra):
+        self.send_response(304)
+        for key, value in {**SECURITY_HEADERS, **extra}.items():
+            self.send_header(key, value)
+        self.end_headers()
 
     def tailscale_authorized(self):
         """Trust identity headers only from the opted-in loopback HTTPS Serve route.
@@ -838,6 +1014,8 @@ class Handler(BaseHTTPRequestHandler):
             if not self.authorized():
                 return self.send_json(401, {"error": "로그인이 필요합니다."})
             query = {k: v[0] for k, v in parse_qs(url.query).items()}
+            if url.path == "/api/events":
+                return self.stream_events(query)
             try:
                 if url.path == "/api/snapshot":
                     if query.get("refresh") == "1":
@@ -873,7 +1051,77 @@ class Handler(BaseHTTPRequestHandler):
             except (OSError, ImportError):
                 return self.send_json(503, {"error": "실행 연결을 준비하지 못했어요. 설정을 확인해 주세요."})
             return self.send_json(404, {"error": "없는 경로입니다."})
-        return self.static(url.path)
+        return self.static(url.path, url.query)
+
+    def stream_events(self, query):
+        """Server-sent events; the same cookie login as other reads, no CSRF for a GET."""
+        from events import chat_ref
+        ref = chat_ref(query)
+        if ref is not None:
+            # Same sources as /api/chat/state. An offline host may still be followed:
+            # its watcher backs off until the host is reachable again. The watcher follows
+            # the server's identity of the listed source, never the query's spelling.
+            try:
+                ref = self.server.chat.identity(self.server.chat.resolve(ref))
+            except ValueError as exc:
+                return self.send_json(400, {"error": str(exc)})
+            except (RuntimeError, OSError):
+                return self.events_unavailable()
+        hub = self.server.events
+        try:
+            stream = hub.open(ref)
+        except RuntimeError:
+            # The conversation watcher could not be started.
+            return self.events_unavailable()
+        if stream is None:
+            if hub.closed:
+                return self.events_unavailable()
+            # Only this answer means "every stream or watcher place is taken".
+            return self.send_json(503, {"error": "실시간 연결이 너무 많습니다. 잠시 뒤 다시 연결합니다.",
+                                        "code": "events_busy"}, {"Retry-After": "10"})
+        try:
+            self.send_response(200)
+            for key, value in SECURITY_HEADERS.items():
+                self.send_header(key, value)
+            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Accel-Buffering", "no")
+            self.end_headers()
+            self.close_connection = True
+            if self.command == "HEAD":
+                return
+            self.connection.settimeout(STREAM_WRITE_TIMEOUT)
+            hub.pump(stream, self.stream_write, self.peer_closed)
+        finally:
+            hub.close_stream(stream)
+
+    def events_unavailable(self):
+        return self.send_json(503, {"error": "실시간 연결을 준비하지 못했습니다. 잠시 뒤 다시 연결합니다.",
+                                    "code": "events_unavailable"}, {"Retry-After": "10"})
+
+    def follow_closely(self, data):
+        """After a successful send or menu answer, its conversation watcher reads quickly again."""
+        try:
+            # The watcher follows the server's identity of the source, as in stream_events.
+            self.server.events.boost(self.server.chat.identity(self.server.chat.resolve(data.get("source"))))
+        except (ValueError, RuntimeError, OSError):
+            # No longer listed: there is no watcher to speed up.
+            pass
+        except Exception as exc:
+            # The board input already succeeded; a watcher hint never changes that reply.
+            log_failure("대화 감시 간격 조정", exc)
+
+    def stream_write(self, data):
+        self.wfile.write(data)
+        self.wfile.flush()
+
+    def peer_closed(self):
+        """An event-stream client sends nothing after its request, so readable means gone."""
+        try:
+            readable, _, _ = select.select([self.connection], [], [], 0)
+        except (OSError, ValueError):
+            return True
+        return bool(readable)
 
     def route_post(self):
         from chat import PromptRejected, SendRejected
@@ -948,9 +1196,14 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/chat/state":
                 return self.send_json(200, self.server.chat.state(data))
             if path == "/api/chat/send":
-                return self.send_json(200, self.server.chat.send(data))
+                result = self.server.chat.send(data)
+                self.follow_closely(data)
+                return self.send_json(200, result)
             if path == "/api/chat/prompt":
-                return self.send_json(200, self.server.chat.prompt(data))
+                result = self.server.chat.prompt(data)
+                if data.get("action") == "answer":
+                    self.follow_closely(data)
+                return self.send_json(200, result)
             if path == "/api/plan":
                 return self.send_json(200, self.server.workflow.plan(data))
             if path == "/api/launch":
@@ -1016,19 +1269,32 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", "0")
         self.end_headers()
 
-    def static(self, path):
+    def static(self, path, query=""):
         name = "index.html" if path in ("/", "") else path.lstrip("/")
-        target = WEB / name
-        if not STATIC.match(name) or not target.is_file():
+        assets = self.server.assets
+        entry = assets.index() if name == "index.html" else assets.file(name)
+        if entry is None:
             return self.send_body(404, b"not found", "text/plain; charset=utf-8")
-        extra = {"Cache-Control": "no-cache"}
+        # Only a URL naming the current content hash may be kept without revalidation.
+        immutable = name not in REVALIDATED and parse_qs(query).get("v", [""])[0] == entry["sha8"]
+        packed = entry["gzip"] if self.accepts_gzip() else None
+        etag = '"%s%s"' % (entry["etag"], "-gz" if packed else "")
+        extra = {"Cache-Control": IMMUTABLE if immutable else "no-cache", "ETag": etag, "Vary": "Accept-Encoding"}
         if name == "sw.js":
             extra["Service-Worker-Allowed"] = "/"
-        self.send_body(200, target.read_bytes(), TYPES[target.suffix], extra)
+        if etag_matches(self.headers.get("If-None-Match"), etag):
+            return self.send_not_modified(extra)
+        if packed:
+            extra["Content-Encoding"] = "gzip"
+        self.send_body(200, packed or entry["body"], TYPES[Path(name).suffix], extra)
 
 
 class BoardHTTPServer(ThreadingHTTPServer):
     def server_close(self):
+        # Open event streams and conversation watchers end instead of outliving the server.
+        events = getattr(self, "events", None)
+        if events is not None:
+            events.close()
         manager = getattr(self, "terminals", None)
         if manager is not None and hasattr(manager, "close"):
             manager.close()
@@ -1051,6 +1317,7 @@ def make_server(bind, port, board, token, terminals=None, workflow=None, state_d
     server.sessions, server.auth_lock = {}, threading.Lock()
     server.csrf = secrets.token_urlsafe(32)
     server.upload_gate = threading.BoundedSemaphore(2)
+    server.assets = StaticAssets(WEB)
     try:
         server.terminals = terminals if terminals is not None else TerminalManager(state_dir=Path(state_dir) / "terminals", max_terminals=max_terminals)
         from terminal_input import TerminalInputs
@@ -1061,6 +1328,8 @@ def make_server(bind, port, board, token, terminals=None, workflow=None, state_d
     server.workflow = workflow if workflow is not None else Workflow(board, server.terminals, state_dir)
     from chat import Chat
     server.chat = Chat(board, server.workflow, state_dir)
+    from events import EventHub
+    server.events = EventHub(board, server.chat)
     return server
 
 

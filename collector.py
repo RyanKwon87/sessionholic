@@ -8,6 +8,7 @@ Standard library only and Python 3.9 compatible because POSIX host's /usr/bin/py
 from __future__ import annotations
 
 import base64
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 import glob
 import hashlib
@@ -42,6 +43,8 @@ TEXT_LIMIT = 4000
 MESSAGE_LIMIT = 80
 SNIPPET_TAILS = (32 * 1024, 128 * 1024)
 CODEX_THREAD_LIMIT = 25
+# Codex homes listed at once; each uses its own daemon connection.
+CODEX_PARALLEL = 4
 REMINDER = re.compile(r"<system-reminder>.*?</system-reminder>", re.S)
 COMMAND_NAME = re.compile(r"<command-name>([^<]{1,60})</command-name>")
 
@@ -458,23 +461,43 @@ def codex_homes():
     return homes
 
 
+def codex_home_threads(path):
+    """One home's thread list over its own daemon connection: (listed, loaded, failure)."""
+    try:
+        with AppServer(path / SOCKET_REL) as server:
+            listed = server.call("thread/list", {"limit": CODEX_THREAD_LIMIT, "archived": False,
+                                                 "sortKey": "updated_at", "sortDirection": "desc"})
+            loaded = server.call("thread/loaded/list", {})
+            loaded = set(loaded.get("data") or []) if isinstance(loaded, dict) else set()
+    except (OSError, RpcError):
+        return None, None, "connect"
+    except Exception:
+        return None, None, "read"
+    return listed, loaded, None
+
+
 def codex_threads(errors, projects):
     out = []
-    for key, path in codex_homes():
+    homes = codex_homes()
+    labels = []
+    for key, path in homes:
         try:
-            project_id, account = home_label(key, path)
+            labels.append(home_label(key, path))
         except Exception:
-            project_id, account = None, key
-        try:
-            with AppServer(path / SOCKET_REL) as server:
-                listed = server.call("thread/list", {"limit": CODEX_THREAD_LIMIT, "archived": False,
-                                                     "sortKey": "updated_at", "sortDirection": "desc"})
-                loaded = server.call("thread/loaded/list", {})
-                loaded = set(loaded.get("data") or []) if isinstance(loaded, dict) else set()
-        except (OSError, RpcError):
+            labels.append((None, key))
+    # Each home has its own daemon socket, so the lists are read concurrently;
+    # rows and errors are still assembled in the original home order.
+    paths = [path for _, path in homes]
+    if len(paths) > 1:
+        with ThreadPoolExecutor(max_workers=min(CODEX_PARALLEL, len(paths))) as pool:
+            replies = list(pool.map(codex_home_threads, paths))
+    else:
+        replies = [codex_home_threads(path) for path in paths]
+    for (key, _), (project_id, account), (listed, loaded, failure) in zip(homes, labels, replies):
+        if failure == "connect":
             errors.append(f"Codex daemon({account})에 연결하지 못했습니다.")
             continue
-        except Exception:
+        if failure:
             errors.append(f"Codex daemon({account}) 응답을 읽지 못했습니다.")
             continue
         threads = listed.get("data") if isinstance(listed, dict) else None

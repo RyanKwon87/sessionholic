@@ -349,6 +349,49 @@ class SnapshotIsolationTest(unittest.TestCase):
         self.assertEqual([(row["id"], row["loaded"]) for row in rows], [("t1", True)])
         self.assertEqual(errors, ["Codex(기본) 작업 2건을 읽지 못했습니다."])
 
+    def test_codex_homes_are_listed_concurrently_in_home_order(self):
+        import threading
+        import time
+        keys = [".codex", ".codex-a", ".codex-b", ".codex-c", ".codex-d"]
+        homes = [(key, self.home / key) for key in keys]
+        # The four first homes meet at once, which a serial loop could never do.
+        barrier = threading.Barrier(4, timeout=5)
+        lock, active, peak, sockets = threading.Lock(), [0], [0], []
+
+        class Server:
+            def __init__(self, path):
+                self.home = Path(path).parent.parent.name
+                with lock:
+                    sockets.append(self.home)
+                    active[0] += 1
+                    peak[0] = max(peak[0], active[0])
+            def __enter__(self):
+                return self
+            def __exit__(self, *exc):
+                with lock:
+                    active[0] -= 1
+                return False
+            def call(self, method, params):
+                if method == "thread/loaded/list":
+                    return {"data": []}
+                if self.home in keys[:4]:
+                    barrier.wait()
+                # Earlier homes answer later, so completion order differs from home order.
+                time.sleep(0.05 * (len(keys) - keys.index(self.home)))
+                if self.home == ".codex-b":
+                    raise collector.RpcError("fixture")
+                return {"data": [{"id": "t" + self.home, "status": {"type": "idle"}}]}
+
+        errors = []
+        with patch.object(collector, "codex_homes", return_value=homes), \
+             patch.object(collector, "AppServer", Server):
+            rows = collector.codex_threads(errors, [])
+        self.assertEqual([row["home"] for row in rows], [".codex", ".codex-a", ".codex-c", ".codex-d"])
+        self.assertEqual(errors, ["Codex daemon(.codex-b)에 연결하지 못했습니다."])
+        # One independent connection per home, never more than four at a time.
+        self.assertEqual(sorted(sockets), sorted(keys))
+        self.assertEqual(peak[0], 4)
+
 
 if __name__ == "__main__":
     unittest.main()

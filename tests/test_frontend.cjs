@@ -120,7 +120,7 @@ function client(
   vm.runInContext(messageSource, context);
   vm.runInContext(source, context);
   const api = vm.runInContext(
-    "({state,api,sourceOf,accountOf,sendInput,pasteDraft,prepareDraftPaste,startDraftComposition,endDraftComposition,inputDraft,stopTerminalReader,startTerminalReader,closePlan,navigateView,backToList,backFromTerminal,closeTerminal,cancelTerminalClose,confirmTerminalClose,populateAccount,populateRoute,updateContinue,renderPlan,launchPlan,openTerminal,saveDraft,draftKey,refreshTerminals,renderTerminals,renderTerminalReturn,renderFilters,terminalCloseCopy,warnDraftUnload,preparePlan,renderGroups,renderMessages,loadDetail,chatKey,chatEntry,currentChat,chatSupported,chatAttachmentsSupported,buildChatComposer,sendChat,loadChatState,applyChatReceipt,uploadChatFiles,pasteChat,scheduleChatPoll,stopChatPolling,openNativeChat,allSessions,buildContinuePanel,chatReceiptCopy,returnToBoard,readChatClipboard,accountDisplay,sessionAccountLabel,closeChatToolsOutside,closeChatToolsEscape,drawDetail,refreshDetail,loadCapabilities,matches,recoverConnection,networkOffline,poll,select,focusDetailBack,restoreSelectedCardFocus,showLogin,lock,beginAuthEpoch,resizeChatInput,updateViewport,draftKeydown,configureTerminalKeyboard,queueTerminalScroll,flushTerminalScroll,terminalScrollEnd,renderAttention,chatPollDelay,pullRefresh,readingScroll,renderJump,pullDistance,listScroll,setReading,renderPrompt,promptAction,renderUsage,loadUsage})",
+    "({state,api,sourceOf,accountOf,sendInput,pasteDraft,prepareDraftPaste,startDraftComposition,endDraftComposition,inputDraft,stopTerminalReader,startTerminalReader,closePlan,navigateView,backToList,backFromTerminal,closeTerminal,cancelTerminalClose,confirmTerminalClose,populateAccount,populateRoute,updateContinue,renderPlan,launchPlan,openTerminal,saveDraft,draftKey,refreshTerminals,renderTerminals,renderTerminalReturn,renderFilters,terminalCloseCopy,warnDraftUnload,preparePlan,renderGroups,renderMessages,loadDetail,chatKey,chatEntry,currentChat,chatSupported,chatAttachmentsSupported,buildChatComposer,sendChat,loadChatState,applyChatReceipt,uploadChatFiles,pasteChat,scheduleChatPoll,stopChatPolling,openNativeChat,allSessions,buildContinuePanel,chatReceiptCopy,returnToBoard,readChatClipboard,accountDisplay,sessionAccountLabel,closeChatToolsOutside,closeChatToolsEscape,drawDetail,refreshDetail,loadCapabilities,matches,recoverConnection,networkOffline,poll,select,focusDetailBack,restoreSelectedCardFocus,showLogin,lock,beginAuthEpoch,resizeChatInput,updateViewport,draftKeydown,configureTerminalKeyboard,queueTerminalScroll,flushTerminalScroll,terminalScrollEnd,renderAttention,chatPollDelay,pullRefresh,readingScroll,renderJump,pullDistance,listScroll,setReading,renderPrompt,promptAction,renderUsage,loadUsage,applyTheme,setTheme,updateThemeColor,haptic,navTransition,setDetailShown,chatVisible,sheetRelease,BottomSheet,sheet,openSettings,closeSettings,setTyping,pinchFontSize,setTerminalFontSize,loadXterm,assetUrl,syncEvents,closeEvents,eventsHealthy,renderFreshness,schedule,touchDevice,togglePhaseFilter,renderCounts,createLongPress,swipeIntent,swipeRelease,groupMessageRows,setTextSize,applyTextSize,renderConnectivity,terminalForSession,swipeActionFor,openMessageMenu,openCardMenu,messageActions,outboxShape,outboxMatches,outboxOrigin,settleOutbox,retryOutbox,renderAttachmentTiles,attachmentThumb,sendUpload,openActionSheet,closeActionSheet,setListCollapsed,closeSwipe,settleSwipe,prepareSwipe,runSwipeAction,LONG_PRESS_MS,PRESS_SLOP,SWIPE_REVEAL})",
     context,
   );
   api.state.csrf = "csrf-test";
@@ -1066,7 +1066,8 @@ test("empty lists distinguish filtered results, offline hosts, and pending colle
   c.state.filters.host = "homeserver";
   c.renderGroups([], Date.now());
   assert.match(textOf(c.get("groups")), /조건에 맞는 작업/);
-  c.get("groups").children[0].children[1].events.click();
+  assert.match(textOf(c.get("groups")), /‘없는 작업’로 찾은 작업이 없습니다/);
+  byClass(c.get("groups"), "secondary")[0].events.click();
   assert.equal(c.state.search, "");
   assert.equal(c.state.filters.host, "");
   assert.equal(c.get("search").value, "");
@@ -1256,7 +1257,7 @@ test('accepted native receipts are read back until completion and interrupted pe
   assert.equal(requests[0].requestId, 'accepted-request-id');
   assert.equal(entry.receipt.status, 'completed');
   entry.text = '중단된 요청';
-  entry.pending = { requestId: 'interrupted-request-id', revision: entry.revision };
+  entry.pending = { requestId: 'interrupted-request-id', revision: entry.revision, text: entry.text, attachments: [] };
   c.applyChatReceipt(entry, { requestId: 'interrupted-request-id', status: 'interrupted' });
   assert.equal(entry.pending, null);
   assert.equal(entry.text, '');
@@ -1324,7 +1325,7 @@ test('a confirmed native turn failure clears its submitted draft while an unacce
   const { entry } = selectChat(c);
   entry.text = '이미 접수된 요청';
   entry.attachments = [{ id: 'attached-file' }];
-  entry.pending = { requestId: 'confirmed-failed-id', revision: entry.revision };
+  entry.pending = { requestId: 'confirmed-failed-id', revision: entry.revision, text: entry.text, attachments: ['attached-file'] };
   c.applyChatReceipt(entry, { requestId: 'confirmed-failed-id', status: 'failed', confirmed: true });
   assert.equal(entry.text, '');
   assert.equal(entry.attachments.length, 0);
@@ -1332,7 +1333,7 @@ test('a confirmed native turn failure clears its submitted draft while an unacce
   assert.match(c.chatReceiptCopy(entry.receipt), /처리 중 오류/);
   assert.doesNotMatch(c.chatReceiptCopy(entry.receipt), /접수하지 못/);
   entry.text = '미접수 요청';
-  entry.pending = { requestId: 'unaccepted-failed-id', revision: entry.revision };
+  entry.pending = { requestId: 'unaccepted-failed-id', revision: entry.revision, text: entry.text, attachments: [] };
   c.applyChatReceipt(entry, { requestId: 'unaccepted-failed-id', status: 'failed', confirmed: false });
   assert.equal(entry.text, '미접수 요청');
   assert.equal(entry.pending, null);
@@ -1760,8 +1761,10 @@ test('capability refresh immediately updates account labels while preserving exa
   assert.deepEqual(Array.from(c.allSessions(), (row) => row.account), [personal.label, standard.label, personal.label]);
   assert.equal(c.state.filters.account, 'sample');
   assert.equal(c.state.accountFilterRoutes.size, 2);
-  assert.match(textOf(c.get('groups')), /실험 환경 · sample/);
-  assert.match(textOf(c.get('groups')), /공용 환경 · sample/);
+  // Cards show three short lines; the account stays in each card's accessible name.
+  const cardNames = () => byClass(c.get('groups'), 'card').map((card) => card.attributes['aria-label']).join(' ');
+  assert.match(cardNames(), /실험 환경 · sample/);
+  assert.match(cardNames(), /공용 환경 · sample/);
   assert.doesNotMatch(textOf(c.get('groups')), /원래 필터와 무관한 작업/);
   assert.equal(c.get('session-count').textContent, '2개');
   profiles = [personal, { ...standard, label: personal.label }, other];
@@ -1814,9 +1817,10 @@ test('unchanged and appended conversations retain selected nodes and expanded to
   assert.equal(tool.children[0].open, true); assert.equal(list.scrollTop, 395);
   let copied;
   c.context.navigator = { clipboard: { writeText: async (text) => { copied = text; } } };
-  await answer.children.at(-1).events.click();
+  assert.equal(answer.moreButton.attributes['aria-label'], '메시지 메뉴');
+  assert.equal(byClass(answer, 'msg-copy').length, 0, 'no per-message copy button');
+  await menuAction(c, answer, '복사');
   assert.equal(copied, '답변 본문');
-  assert.equal(answer.children.at(-1).attributes['aria-label'], '메시지 본문 복사');
 });
 
 test('assistant replies render Markdown and copy readable body or exact code while user input stays literal', async () => {
@@ -1832,15 +1836,33 @@ test('assistant replies render Markdown and copy readable body or exact code whi
   assert.equal(flatten(user).some((n) => n.tagName === 'BLOCKQUOTE'), false);
   let copied;
   c.context.navigator = { clipboard: { writeText: async (text) => { copied = text; } } };
-  await answer.children.at(-1).events.click();
+  await menuAction(c, answer, '복사');
   assert.equal(copied, '요청\n\n첫 줄\n\n둘째 줄\n\nif a > b:\n    print("확인")\n');
-  rendered.find((n) => n.attributes['aria-label'] === '인용문 본문 복사').events.click();
-  assert.equal(copied, '첫 줄\n\n둘째 줄\n');
+  // Quotes copy with the message; only code keeps its own small icon.
+  assert.equal(rendered.some((n) => n.attributes['aria-label'] === '인용문 본문 복사'), false);
   rendered.find((n) => n.attributes['aria-label'] === '코드 블록 복사').events.click();
+  await settle();
   assert.equal(copied, 'if a > b:\n    print("확인")\n');
-  await user.children.at(-1).events.click();
+  copied = '';
+  await menuAction(c, answer, '코드 복사');
+  assert.equal(copied, 'if a > b:\n    print("확인")\n');
+  await menuAction(c, user, '복사');
   assert.equal(copied, raw);
+  assert.equal(menuLabels(c, user).includes('코드 복사'), false, 'user text is never parsed for code');
 });
+
+// Opens a message's menu with its button and runs one action by label.
+function menuLabels(c, row) {
+  row.moreButton.events.click();
+  return c.get('action-list').children.map((item) => item.textContent);
+}
+async function menuAction(c, row, label) {
+  row.moreButton.events.click();
+  const item = c.get('action-list').children.find((child) => child.textContent === label);
+  assert.ok(item, `menu item ${label}`);
+  item.events.click();
+  await settle();
+}
 
 test('a delayed previous-session state success or failure cannot cancel the current polling timer', async () => {
   for (const failed of [false, true]) {
@@ -2081,7 +2103,8 @@ test('first-run, empty-session and unavailable-host views give the installer a c
   assert.match(textOf(c.get('groups')), /Claude Code나 Codex로 대화를 시작.*새로고침/);
   c.state.snapshot.hosts[0].ok = false; c.renderGroups([], Date.now() / 1000);
   assert.match(textOf(c.get('groups')), /기기 연결과 에이전트 설치 상태.*다시 확인/);
-  assert.equal(c.get('groups').children[0].children[1].textContent, '다시 확인');
+  assert.equal(byClass(c.get('groups'), 'secondary')[0].textContent, '다시 확인');
+  assert.equal(byClass(c.get('groups'), 'empty-title').length, 1, 'one short title per empty state');
 });
 
 test('service worker evicts only its own old shells and offline reads use the current Sessionholic cache', async () => {
@@ -2093,7 +2116,7 @@ test('service worker evicts only its own old shells and offline reads use the cu
     self, URL, Set, Response,
     fetch: async () => { throw new Error('offline'); },
     caches: {
-      keys: async () => ['another-app-shell', 'sessionholic-shell-v0', 'sessionholic-shell-v1', 'sessionholic-shell-v2', 'sessionholic-shell-v4', 'sessionholic-shell-v5', 'sessionholic-shell-v6', 'sessionholic-shell-v7', 'sessionholic-shell-v8', 'sessionholic-shell-v9', 'sessionholic-shell-v10'],
+      keys: async () => ['another-app-shell', 'sessionholic-shell-v0', 'sessionholic-shell-v1', 'sessionholic-shell-v2', 'sessionholic-shell-v4', 'sessionholic-shell-v5', 'sessionholic-shell-v6', 'sessionholic-shell-v7', 'sessionholic-shell-v8', 'sessionholic-shell-v9', 'sessionholic-shell-v10', 'sessionholic-shell-v11', 'sessionholic-shell-v12'],
       delete: async (key) => { deleted.push(key); },
       open: async (key) => { opened.push(key); return { match: async () => currentShell }; },
       match: async () => { throw new Error('Global cross-application cache lookup is forbidden'); },
@@ -2101,11 +2124,11 @@ test('service worker evicts only its own old shells and offline reads use the cu
   });
   let activated;
   listeners.activate({ waitUntil: (promise) => { activated = promise; } }); await activated;
-  assert.deepEqual(deleted, ['sessionholic-shell-v0', 'sessionholic-shell-v1', 'sessionholic-shell-v2', 'sessionholic-shell-v4', 'sessionholic-shell-v5', 'sessionholic-shell-v6', 'sessionholic-shell-v7', 'sessionholic-shell-v8', 'sessionholic-shell-v9']);
+  assert.deepEqual(deleted, ['sessionholic-shell-v0', 'sessionholic-shell-v1', 'sessionholic-shell-v2', 'sessionholic-shell-v4', 'sessionholic-shell-v5', 'sessionholic-shell-v6', 'sessionholic-shell-v7', 'sessionholic-shell-v8', 'sessionholic-shell-v9', 'sessionholic-shell-v10', 'sessionholic-shell-v11', 'sessionholic-shell-v12']);
   listeners.fetch({ request: { method: 'GET', url: 'https://app.example/' },
     respondWith: (promise) => { response = promise; }, waitUntil() {} });
   assert.equal(await response, currentShell);
-  assert.deepEqual(opened, ['sessionholic-shell-v10']);
+  assert.deepEqual(opened, ['sessionholic-shell-v13']);
 });
 
 test('an offline first launch restores authentication and already-open terminal rows without reopening their sessions', async () => {
@@ -2281,7 +2304,7 @@ test('only explicit not_started send errors unlock the draft and attachments, pr
     assert.match(c.get('chat-status').textContent, /첨부를 다시 확인.*전송되지 않았습니다.*초안과 첨부는 유지/);
     assert.equal(requests.filter((r) => r.url === '/api/chat/send').length, 1);
     assert.equal(requests.filter((r) => r.url === '/api/chat/state').some((r) => r.body.requestId), false);
-    c.get('chat-attachments').children[0].children[1].events.click();
+    byClass(c.get('chat-attachments'), 'chat-attachment-remove')[0].events.click();
     assert.equal(entry.attachments.length, 0); assert.equal(entry.text, '거절된 초안');
   }
 });
@@ -2523,7 +2546,7 @@ test('programmatic clipboard insertion grows the editor and accepted delivery sh
   Object.defineProperty(input, 'scrollHeight', { get: () => 20 + 22 * input.value.split('\n').length });
   await c.readChatClipboard(entry, input, c.get('chat-files'), entry.editorEpoch);
   assert.equal(input.style.height, '88px');
-  entry.pending = { requestId: 'grow-draft-request', revision: entry.revision };
+  entry.pending = { requestId: 'grow-draft-request', revision: entry.revision, text: entry.text, attachments: [] };
   c.applyChatReceipt(entry, { requestId: 'grow-draft-request', status: 'accepted' });
   assert.equal(input.value, '');
   assert.equal(input.style.height, '44px');
@@ -2566,14 +2589,19 @@ test('user history displays durable attachment names, image kinds and attachment
   const rows = c.get('messages').children;
   const group = byClass(rows[0], 'msg-attachments')[0];
   assert.equal(group.attributes['aria-label'], '첨부 2개');
-  assert.equal(byClass(group, 'msg-attachment').length, 2);
-  assert.match(textOf(group), /이미지.*화면.png.*파일.*<img onerror=alert\(1\)>.txt/);
+  const chips = byClass(group, 'msg-attachment');
+  assert.equal(chips.length, 2);
+  assert.deepEqual(chips.map((chip) => chip.attributes['aria-label']), ['이미지: 화면.png, 2KB', '파일: <img onerror=alert(1)>.txt, 12B']);
+  assert.match(textOf(group), /화면.png.*<img onerror=alert\(1\)>.txt/);
   assert.equal(byClass(group, 'attachment-name')[1].textContent, '<img onerror=alert(1)>.txt');
-  await byClass(rows[0], 'msg-copy')[0].events.click();
+  await menuAction(c, rows[0], '복사');
   assert.equal(copied, messages[0].text);
-  assert.match(textOf(rows[1]), /첨부 1개.*이미지.*이미지 첨부/);
+  // A transcript that cannot name the file shows its kind once, not "이미지 이미지 첨부".
+  assert.equal(byClass(rows[1], 'attachment-name')[0].textContent, '이미지');
+  assert.doesNotMatch(textOf(rows[1]), /이미지\s+이미지/);
+  assert.equal(byClass(rows[1], 'msg-attachment')[0].attributes['aria-label'], '이미지');
   assert.equal(byClass(rows[1], 'attachment-size').length, 0);
-  assert.equal(byClass(rows[1], 'msg-copy')[0].hidden, true);
+  assert.equal(menuLabels(c, rows[1]).includes('복사'), false, 'nothing to copy from an attachment-only message');
   assert.equal(byClass(rows[2], 'msg-attachments').length, 0);
 });
 
@@ -2970,16 +2998,20 @@ test('recent cards give project and full task separate priority while retaining 
   c.renderGroups([s], 1100);
   const card = byClass(c.get('groups'), 'card')[0];
   assert.equal(card.tagName, 'BUTTON'); assert.equal(card.type, 'button');
-  assert.equal(card.children[0].className, 'card-project'); assert.equal(card.children[1].className, 'card-title');
-  assert.equal(byClass(card, 'card-project')[0].textContent, project.trim());
-  assert.equal(byClass(card, 'card-project')[0].title, project.trim());
+  // Three short lines: title, preview, then status · agent · project · time.
+  assert.deepEqual(card.children.map((child) => child.className), ['card-title', 'card-snippet', 'card-meta', 'card-chevron']);
   assert.equal(byClass(card, 'card-title')[0].textContent, title.trim());
   assert.equal(byClass(card, 'card-snippet')[0].hidden, true);
+  const meta = byClass(card, 'card-meta')[0];
+  assert.deepEqual(meta.children.map((child) => child.className.split(' ')[0]), ['badge', 'card-agent', 'card-project', 'stale-tag', 'card-time']);
+  assert.match(byClass(card, 'card-project')[0].textContent, new RegExp('^' + project.trim()));
+  assert.equal(byClass(card, 'stale-tag')[0].hidden, false);
   assert.match(card.attributes['aria-label'], /프로젝트:.*작업:.*작업 중.*Codex.*기기: Workstation.*계정 설정: Sample profile.*마지막 확인 기준/s);
   assert.equal(card.attributes['aria-pressed'], 'true');
   assert.equal(byClass(card, 'agent').length, 0);
   assert.equal(byClass(card, 'card-agent')[0].textContent, 'Codex');
-  assert.equal(byClass(card, 'card-account')[0].textContent, '계정 설정 · Sample profile');
+  // Device and account move to the accessible name and the conversation header.
+  assert.doesNotMatch(textOf(card), /Workstation|Sample profile/);
   assert.equal(calls, 0); assert.equal(c.state.chats.size, 0);
   assert.equal(s.title, title); assert.equal(s.cwd, '/Users/example/work/service');
 });
@@ -2995,14 +3027,15 @@ test('recent cards expose only disambiguating folder suffixes, handle home and m
   ];
   c.renderGroups(rows, 1100);
   const cards = byClass(c.get('groups'), 'card');
-  assert.equal(byClass(cards[0], 'card-folder')[0].textContent, '작업 폴더 · team-a / repo / src');
-  assert.equal(byClass(cards[1], 'card-folder')[0].textContent, '작업 폴더 · team-b / repo / src');
+  // The folder suffix follows the project in the meta line only when it disambiguates.
+  assert.equal(byClass(cards[0], 'card-project')[0].textContent, 'Shared project · team-a / repo / src');
+  assert.equal(byClass(cards[1], 'card-project')[0].textContent, 'Shared project · team-b / repo / src');
+  assert.match(cards[0].attributes['aria-label'], /작업 폴더: team-a \/ repo \/ src/);
   for (const card of cards) {
     assert.doesNotMatch(textOf(card) + card.attributes['aria-label'], /source|other|\/Users|\/home/);
   }
-  assert.equal(byClass(cards[2], 'card-folder')[0].hidden, true);
+  assert.equal(byClass(cards[2], 'card-project')[0].textContent, 'Sessionholic');
   assert.equal(byClass(cards[3], 'card-project')[0].textContent, '홈 폴더');
-  assert.equal(byClass(cards[3], 'card-folder')[0].hidden, true);
   assert.equal(byClass(cards[4], 'card-project')[0].textContent, '프로젝트 확인 필요');
   assert.equal(byClass(cards[4], 'card-title')[0].textContent, '제목 없는 작업');
   c.state.search = 'work/team-b/repo/src';
@@ -3027,7 +3060,7 @@ test('recent card updates retain mounted buttons, selection, keyboard focus and 
   c.context.document.createElement = (tag) => {
     const made = create(tag); const insert = made.insertBefore;
     made.insertBefore = function (child, before) {
-      if (child === selected) { c.context.document.activeElement = c.context.document.body; pane.scrollTop = 0; }
+      if (child === selected.cardRow) { c.context.document.activeElement = c.context.document.body; pane.scrollTop = 0; }
       return insert.call(this, child, before);
     };
     return made;
@@ -3069,7 +3102,8 @@ test('changing list filters removes hidden cards without changing the selected s
   const second = recentSession('preview-b', { project: 'Second project' });
   c.state.selected = first.key; c.renderGroups([first, second], 1100);
   const original = byClass(c.get('groups'), 'card')[0];
-  assert.equal(byClass(original, 'card-snippet')[0].textContent, '대화 미리보기 · 이전에 확인한 대화의 본문');
+  assert.equal(byClass(original, 'card-snippet')[0].textContent, '이전에 확인한 대화의 본문');
+  assert.match(original.attributes['aria-label'], /대화 미리보기: 이전에 확인한 대화의 본문/);
   c.state.filters.project = 'Second project'; c.renderGroups([second], 1100);
   assert.equal(byClass(c.get('groups'), 'card').length, 1);
   assert.equal(c.state.selected, first.key);
@@ -3190,8 +3224,10 @@ test('a message cut at the server limit says so and copies as a visible part onl
     { role: 'assistant', text: '짧은 답변', ts: 2 }]);
   const text = textOf(c.get('messages'));
   assert.match(text, /긴 메시지라 앞부분만 표시합니다 · 전체 12,000자/);
-  assert.match(text, /표시된 부분 복사/);
   assert.equal((text.match(/앞부분만 표시/g) || []).length, 1);
+  const [cut, whole] = c.get('messages').children;
+  assert.equal(menuLabels(c, cut)[0], '표시된 부분 복사');
+  assert.equal(menuLabels(c, whole)[0], '복사');
 });
 
 test('pull to refresh reloads the board once and never overlaps a running refresh', async () => {
@@ -3259,24 +3295,28 @@ test('messages arriving while reading back are counted on the jump button and cl
   assert.equal(jump.textContent, '↓');
 });
 
-test('pull distance is elastic and the list app bar slides away only on phones', () => {
+test('pull distance is elastic and the large title collapses into the bar on phones only', () => {
   const c = client(undefined, noChatTimers);
   assert.equal(c.pullDistance(0), 0);
   assert.ok(c.pullDistance(80) < 80 && c.pullDistance(300) < 110 && c.pullDistance(300) > c.pullDistance(150));
-  const bar = { style: {}, offsetHeight: 52 };
-  c.context.document.querySelector = (selector) => (selector === '.top' ? bar : null);
   c.context.document.body.classList = classes();
   c.context.window.matchMedia = (query) => ({ matches: query === '(max-width: 700px)' });
   const pane = { scrollTop: 0 };
-  for (const top of [20, 40, 80]) { pane.scrollTop = top; c.listScroll(pane); }
-  assert.equal(c.context.document.body.classList.contains('top-hidden'), true);
-  assert.equal(bar.style.marginTop, '-52px');
-  for (const top of [60, 20]) { pane.scrollTop = top; c.listScroll(pane); }
-  assert.equal(c.context.document.body.classList.contains('top-hidden'), false);
-  assert.equal(bar.style.marginTop, '');
+  const collapsed = () => c.context.document.body.classList.contains('list-collapsed');
+  for (const top of [10, 30]) { pane.scrollTop = top; c.listScroll(pane); }
+  assert.equal(collapsed(), false, 'the large title is still visible');
+  pane.scrollTop = 80; c.listScroll(pane);
+  assert.equal(collapsed(), true, 'past the title the bar shows the small title');
+  pane.scrollTop = 500; c.listScroll(pane);
+  assert.equal(collapsed(), true, 'the bar never slides away while reading down');
+  pane.scrollTop = 0; c.listScroll(pane);
+  assert.equal(collapsed(), false);
   c.context.window.matchMedia = () => ({ matches: false });
-  pane.scrollTop = 400; c.listScroll(pane); pane.scrollTop = 800; c.listScroll(pane);
-  assert.equal(c.context.document.body.classList.contains('top-hidden'), false, 'desktop keeps its bar');
+  pane.scrollTop = 800; c.listScroll(pane);
+  assert.equal(collapsed(), false, 'wide screens keep their plain bar');
+  const html = indexPage();
+  assert.match(html, /id="nav-title"[^>]*aria-label="작업 목록 맨 위로"/);
+  assert.match(styleSheet(), /body\.list-collapsed \.top \{[^}]*backdrop-filter: saturate\(180%\) blur\(20px\)/);
 });
 
 test('an app that owns its screen scrolls in both directions, while tmux history stops at the live screen', async () => {
@@ -3391,4 +3431,1464 @@ test('the usage strip shows remaining limits per provider and hides on boards wi
   await missing.loadUsage();
   assert.equal(missing.state.usageUnsupported, true);
   assert.equal(missing.get('usage').hidden, true);
+});
+
+// --- UI foundation: theme, motion, sheets, typing, terminal, assets, live updates ---
+const settle = async (rounds = 3) => { for (let i = 0; i < rounds; i++) await new Promise((resolve) => setImmediate(resolve)); };
+const styleSheet = () => fs.readFileSync(path.join(__dirname, '../web/style.css'), 'utf8');
+const indexPage = () => fs.readFileSync(path.join(__dirname, '../web/index.html'), 'utf8');
+function cssBlock(css, selector) {
+  const start = css.indexOf(`${selector} {`);
+  assert.notEqual(start, -1, selector);
+  const end = css.indexOf('}', start);
+  const tokens = {};
+  for (const line of css.slice(css.indexOf('{', start) + 1, end).split(';')) {
+    const match = /^\s*(--[\w-]+|color-scheme)\s*:\s*([\s\S]+?)\s*$/.exec(line);
+    if (match) tokens[match[1]] = match[2].replace(/\s+/g, ' ');
+  }
+  return tokens;
+}
+
+test('every board color is a token, and dark values exist for the device setting and for a forced dark board', () => {
+  const css = styleSheet().replace(/\/\*[\s\S]*?\*\//g, '');
+  const tokenBlock = /^(:root(\[data-theme="(light|dark)"\]|:not\(\[data-theme="light"\]\))?)$/;
+  const literals = [];
+  const stack = [];
+  let buffer = '';
+  for (const char of css) {
+    if (char === '{') { stack.push(buffer.trim()); buffer = ''; continue; }
+    if (char === '}') {
+      const selector = stack.pop();
+      if (selector && !tokenBlock.test(selector))
+        for (const declaration of buffer.split(';')) {
+          const value = declaration.split(':').slice(1).join(':');
+          if (/#[0-9a-fA-F]{3,8}\b|rgba?\(|hsla?\(|\bwhite\b|\bblack\b/.test(value)) literals.push(`${selector} -> ${declaration.trim()}`);
+        }
+      buffer = '';
+      continue;
+    }
+    buffer += char;
+  }
+  assert.deepEqual(literals, [], 'colors outside the token blocks');
+  assert.match(css, /@media \(prefers-color-scheme: dark\) \{\s*:root:not\(\[data-theme="light"\]\) \{/);
+  const light = cssBlock(css, ':root');
+  const system = cssBlock(css, ':root:not([data-theme="light"])');
+  const forced = cssBlock(css, ':root[data-theme="dark"]');
+  assert.deepEqual(system, forced, 'both dark blocks carry the same values');
+  assert.equal(forced['color-scheme'], 'dark');
+  for (const name of ['--bg', '--surface', '--label', '--label-3', '--accent', '--accent-fill', '--bubble', '--codex', '--toast-bg', '--backdrop', '--chevron-select'])
+    assert.ok(forced[name] && forced[name] !== light[name], `${name} has its own dark value`);
+  for (const name of Object.keys(forced)) if (name !== 'color-scheme') assert.ok(name in light, `${name} has a light value`);
+  assert.equal(light['color-scheme'], 'light dark');
+  assert.match(css, /:root\[data-theme="light"\] \{\s*color-scheme: light;/);
+  const html = indexPage();
+  assert.match(html, /name="color-scheme" content="light dark"/);
+  assert.match(html, /name="theme-color" content="#f2f2f7" media="\(prefers-color-scheme: light\)"/);
+  assert.match(html, /name="theme-color" content="#000000" media="\(prefers-color-scheme: dark\)"/);
+});
+
+test('the theme follows the device by default, forced themes set data-theme, only the choice is stored, and the terminal darkens the browser bar', () => {
+  const c = client(undefined, noChatTimers);
+  const root = c.context.document.documentElement;
+  root.attributes = {};
+  root.setAttribute = (name, value) => { root.attributes[name] = String(value); };
+  root.removeAttribute = (name) => { delete root.attributes[name]; };
+  const meta = (content) => ({ attributes: { content }, dataset: {}, getAttribute(name) { return this.attributes[name]; },
+    setAttribute(name, value) { this.attributes[name] = value; } });
+  const metas = [meta('#f2f2f7'), meta('#000000')];
+  c.context.document.querySelectorAll = (selector) => (selector === 'meta[name="theme-color"]' ? metas : []);
+  const writes = [];
+  c.context.localStorage = { getItem: () => null, setItem: (key, value) => writes.push([key, value]) };
+  c.applyTheme('auto');
+  assert.equal(root.attributes['data-theme'], undefined);
+  assert.deepEqual(metas.map((item) => item.attributes.content), ['#f2f2f7', '#000000']);
+  c.setTheme('dark');
+  assert.equal(root.attributes['data-theme'], 'dark');
+  assert.deepEqual(metas.map((item) => item.attributes.content), ['#000000', '#000000']);
+  assert.equal(c.get('theme-dark').checked, true); assert.equal(c.get('theme-auto').checked, false);
+  c.setTheme('dark');
+  c.setTheme('sepia');
+  assert.equal(c.state.theme, 'auto'); assert.equal(root.attributes['data-theme'], undefined);
+  assert.deepEqual(metas.map((item) => item.attributes.content), ['#f2f2f7', '#000000'], 'auto restores the media colors');
+  assert.deepEqual(writes, [['sessionholic:ui:theme', '"dark"'], ['sessionholic:ui:theme', '"auto"']]);
+  c.setTheme('light');
+  c.state.terminalVisible = true; c.updateThemeColor();
+  assert.deepEqual(metas.map((item) => item.attributes.content), ['#1c1c1e', '#1c1c1e']);
+  c.state.terminalVisible = false; c.updateThemeColor();
+  assert.deepEqual(metas.map((item) => item.attributes.content), ['#f2f2f7', '#f2f2f7']);
+});
+
+test('the settings sheet opens from the top bar with the current theme and returns focus when closed', () => {
+  const c = client(undefined, noChatTimers);
+  c.context.navigator = { onLine: false };
+  c.windowEvents.DOMContentLoaded();
+  c.state.theme = 'dark';
+  c.get('settings').events.click();
+  assert.equal(c.get('settings-dialog').open, true);
+  assert.equal(c.get('theme-dark').checked, true);
+  c.get('theme-light').events.change({ target: { checked: true } });
+  assert.equal(c.state.theme, 'light');
+  c.get('settings-done').events.click();
+  assert.equal(c.get('settings-dialog').open, false);
+  assert.equal(c.get('settings').focusCount, 1);
+  let prevented = 0;
+  c.get('settings').events.click();
+  c.get('settings-dialog').events.cancel({ preventDefault() { prevented++; } });
+  assert.equal(prevented, 1); assert.equal(c.get('settings-dialog').open, false);
+});
+
+test('haptics use vibration only where available and map selection, success and errors', async () => {
+  const c = client(undefined, noChatTimers);
+  assert.equal(c.haptic('select'), false, 'no navigator: silent');
+  const calls = [];
+  c.context.navigator = { vibrate: (pattern) => { calls.push(pattern); return true; } };
+  c.haptic('select'); c.haptic('success'); c.haptic('error'); c.haptic('unknown');
+  assert.equal(JSON.stringify(calls), JSON.stringify([8, [12, 60, 18], [30, 50, 30, 50, 30]]));
+  c.context.navigator = { vibrate: () => { throw new Error('blocked'); } };
+  assert.equal(c.haptic('select'), false);
+  let fail = false;
+  const d = client(async (url, options) => {
+    if (url === '/api/chat/send' && fail) throw new Error('lost');
+    return { ok: true, status: 200, json: async () => (url === '/api/chat/send' ? { status: 'accepted', receipt: {} }
+      : { route: JSON.parse(options.body).source, capability: { supported: true }, phase: 'idle' }) };
+  }, noChatTimers);
+  const { entry } = selectChat(d);
+  const pulses = [];
+  d.context.navigator = { vibrate: (pattern) => { pulses.push(pattern); return true; } };
+  entry.text = '보낼 메시지';
+  await d.sendChat(entry);
+  assert.equal(JSON.stringify(pulses), '[[12,60,18]]', 'an accepted send ticks success');
+  fail = true; entry.pending = null; entry.text = '다시 보낼 메시지';
+  await d.sendChat(entry);
+  assert.equal(JSON.stringify(pulses.at(-1)), '[30,50,30,50,30]', 'an uncertain send buzzes an error');
+});
+
+test('screen changes run at once without view transitions or with reduced motion, and slide in the given direction otherwise', async () => {
+  const c = client(undefined, noChatTimers);
+  const root = c.context.document.documentElement;
+  root.dataset = {};
+  let ran = 0;
+  assert.equal(c.navTransition('push', () => ran++), null);
+  assert.equal(ran, 1, 'no support: the update runs immediately');
+  const seen = [];
+  let finish;
+  c.context.document.startViewTransition = (update) => {
+    seen.push(root.dataset.nav);
+    Promise.resolve().then(update);
+    return { finished: new Promise((resolve) => { finish = resolve; }), updateCallbackDone: Promise.resolve() };
+  };
+  assert.ok(c.navTransition('pop', () => ran++));
+  assert.deepEqual(seen, ['pop']); assert.equal(root.dataset.nav, 'pop');
+  await settle();
+  assert.equal(ran, 2);
+  finish(); await settle();
+  assert.equal(root.dataset.nav, undefined, 'the direction is cleared when the slide ends');
+  c.context.window.matchMedia = (query) => ({ matches: query === '(prefers-reduced-motion: reduce)' });
+  c.navTransition('push', () => ran++);
+  assert.equal(ran, 3); assert.deepEqual(seen, ['pop'], 'reduced motion never starts a transition');
+  c.context.window.matchMedia = () => ({ matches: false });
+  c.context.document.startViewTransition = () => { throw new Error('busy'); };
+  c.navTransition('push', () => ran++);
+  assert.equal(ran, 4); assert.equal(root.dataset.nav, undefined, 'a refused transition still updates');
+});
+
+test('Android back keeps one history step per phone screen while list and conversation slide', async () => {
+  const c = client(undefined, noChatTimers);
+  c.context.navigator = { onLine: false };
+  c.windowEvents.DOMContentLoaded();
+  const { s } = selectChat(c);
+  const root = c.context.document.documentElement;
+  root.dataset = {};
+  const body = classes();
+  c.context.document.body.classList = body;
+  c.context.window.matchMedia = (query) => ({ matches: query === '(max-width: 700px)' });
+  const slides = [];
+  c.context.document.startViewTransition = (update) => { slides.push(root.dataset.nav); update(); return { finished: Promise.resolve() }; };
+  c.select(s.key);
+  assert.equal(c.context.window.history.state.view, 'detail');
+  assert.deepEqual(slides, ['push']); assert.equal(body.contains('show-detail'), true); assert.equal(c.chatVisible(), true);
+  c.backToList();
+  assert.equal(c.context.window.history.backCount, 1, 'back uses the browser history');
+  c.context.window.history.state = { sessionholic: true, view: 'list' };
+  c.windowEvents.popstate({ state: { sessionholic: true, view: 'list' } });
+  assert.deepEqual(slides, ['push', 'pop']);
+  assert.equal(body.contains('show-detail'), false); assert.equal(c.chatVisible(), false);
+  c.windowEvents.popstate({ state: { sessionholic: true, view: 'detail' }, hasUAVisualTransition: true });
+  assert.deepEqual(slides, ['push', 'pop'], 'a browser-animated swipe gets no second slide');
+  assert.equal(body.contains('show-detail'), true);
+  await settle();
+});
+
+test('bottom sheets follow the finger, dismiss on a long or fast pull, step between heights and spring back when dismissal is refused', () => {
+  const c = client(undefined, noChatTimers);
+  const release = (fields) => c.sheetRelease({ height: 600, detent: 'medium', ...fields });
+  assert.equal(release({ offset: 30, velocity: 0.1 }), 'medium');
+  assert.equal(release({ offset: 200, velocity: 0.1 }), 'close');
+  assert.equal(release({ offset: 60, velocity: 0.9 }), 'close');
+  assert.equal(release({ offset: 260, velocity: 0.2, height: 800, detent: 'large' }), 'medium');
+  assert.equal(release({ offset: 500, velocity: 0.2, height: 800, detent: 'large' }), 'close');
+  assert.equal(release({ offset: -60, velocity: -0.1 }), 'large');
+  assert.equal(release({ offset: -20, velocity: -0.1 }), 'medium');
+  assert.equal(release({ offset: -60, detents: ['medium'] }), 'medium');
+  let now = 1000;
+  c.context.Date = { now: () => now };
+  c.context.window.matchMedia = (query) => ({ matches: query === '(max-width: 700px)' });
+  const dialog = node();
+  dialog.open = false;
+  dialog.classList = classes();
+  dialog.style = { props: {}, setProperty(name, value) { this.props[name] = value; } };
+  dialog.getBoundingClientRect = () => ({ top: 300, bottom: 900, left: 0, right: 412, height: 600 });
+  const handle = node();
+  handle.parentElement = dialog;
+  handle.closest = (selector) => (selector.includes('button') ? null : handle);
+  let dismissed = 0, allow = true;
+  const sheet = c.BottomSheet.attach(dialog, { onDismiss: () => { dismissed++; if (allow) dialog.close(); } });
+  assert.equal(c.BottomSheet.attach(dialog), sheet, 'one controller per dialog');
+  sheet.open();
+  assert.equal(dialog.open, true); assert.equal(dialog.dataset.detent, 'medium');
+  const pointer = (type, y, extra = {}) => dialog.events[type]({ pointerId: 1, clientY: y, clientX: 200, button: 0, target: handle,
+    cancelable: true, preventDefault() {}, ...extra });
+  pointer('pointerdown', 320); now = 1100; pointer('pointermove', 360);
+  assert.equal(dialog.style.props['--sheet-drag'], '40px'); assert.equal(dialog.classList.contains('is-dragging'), true);
+  now = 1300; pointer('pointerup', 360);
+  assert.equal(dismissed, 0, 'a short slow pull stays'); assert.equal(dialog.style.props['--sheet-drag'], '0px');
+  assert.equal(dialog.classList.contains('is-dragging'), false);
+  pointer('pointerdown', 320); now = 1400; pointer('pointermove', 600); now = 1700; pointer('pointerup', 600);
+  assert.equal(dismissed, 1); assert.equal(dialog.open, false);
+  sheet.open(); allow = false;
+  pointer('pointerdown', 320); now = 1800; pointer('pointermove', 620); now = 2100; pointer('pointerup', 620);
+  assert.equal(dismissed, 2); assert.equal(dialog.open, true, 'a refused dismissal keeps the sheet');
+  assert.equal(dialog.style.props['--sheet-drag'], '0px', 'and springs back');
+  pointer('pointerdown', 320); now = 2200; pointer('pointermove', 250);
+  assert.equal(dialog.style.props['--sheet-drag'], '-33px', 'pulling up resists');
+  now = 2400; pointer('pointerup', 250);
+  assert.equal(dialog.dataset.detent, 'large');
+  const button = node(); button.closest = () => button;
+  pointer('pointerdown', 320, { target: button }); now = 2500; pointer('pointermove', 700);
+  assert.equal(dialog.style.props['--sheet-drag'], '0px', 'header buttons keep their taps');
+  c.context.window.matchMedia = () => ({ matches: false });
+  pointer('pointerdown', 320); pointer('pointermove', 700);
+  assert.equal(dialog.style.props['--sheet-drag'], '0px', 'wide screens keep the centered dialog');
+  dialog.events.click({ target: dialog, clientX: 200, clientY: 100 });
+  assert.equal(dismissed, 3, 'a tap outside dismisses');
+  dialog.events.click({ target: dialog, clientX: 200, clientY: 500 });
+  assert.equal(dismissed, 3, 'a tap inside does not');
+});
+
+test('typing on a phone folds the conversation chrome, sending keeps the keyboard, and blur restores the layout', () => {
+  const c = client(undefined, noChatTimers);
+  const { s } = selectChat(c);
+  c.drawDetail(s);
+  const pane = c.get('detail');
+  pane.classList = classes();
+  const list = c.get('messages');
+  Object.assign(list, { scrollHeight: 2000, clientHeight: 300, scrollTop: 1700 });
+  const input = c.get('chat-input');
+  c.context.window.matchMedia = (query) => ({ matches: query === '(pointer: coarse)' });
+  input.events.focus();
+  assert.equal(pane.classList.contains('is-typing'), true);
+  assert.equal(list.scrollTop, 2000, 'the newest message stays in view');
+  input.events.blur();
+  assert.equal(pane.classList.contains('is-typing'), false);
+  c.context.window.matchMedia = () => ({ matches: false });
+  input.events.focus();
+  assert.equal(pane.classList.contains('is-typing'), false, 'a mouse and keyboard keep the full layout');
+  const send = c.get('chat-send');
+  let prevented = 0;
+  c.context.document.activeElement = input;
+  send.events.pointerdown({ preventDefault() { prevented++; } });
+  c.context.document.activeElement = null;
+  send.events.pointerdown({ preventDefault() { prevented++; } });
+  assert.equal(prevented, 1, 'focus is kept only while typing');
+  const css = styleSheet();
+  for (const part of ['.conversation-bar', '.continue-disclosure', '.chat-toolbar', '.detail-meta'])
+    assert.match(css, new RegExp(`\\.detail-pane\\.is-typing ${part.replace('.', '\\.')}`));
+});
+
+test('terminal text size pinches within the A−/A+ range, stores once on release, and keys are taller', () => {
+  const c = client(undefined, noChatTimers);
+  assert.equal(c.pinchFontSize(14, 100, 200), 24);
+  assert.equal(c.pinchFontSize(14, 100, 50), 10);
+  assert.equal(c.pinchFontSize(14, 100, 120), 17);
+  assert.equal(c.pinchFontSize(14, 0, 100), 14);
+  const writes = [];
+  c.context.navigator = { onLine: false };
+  c.context.localStorage = { getItem: () => null, removeItem() {}, setItem: (key, value) => writes.push([key, value]) };
+  c.windowEvents.DOMContentLoaded();
+  const term = { options: { fontSize: 14 } };
+  c.state.term = term; c.state.fontSize = 14;
+  c.state.connected = true; c.state.terminal = { id: 'term-1' };
+  const viewport = c.get('terminal-viewport');
+  const fingers = (distance) => [{ clientX: 0, clientY: 100 }, { clientX: distance, clientY: 100 }];
+  viewport.events.touchstart({ touches: fingers(100) });
+  viewport.events.touchmove({ touches: fingers(130), cancelable: true, preventDefault() {} });
+  assert.equal(c.state.fontSize, 18); assert.equal(term.options.fontSize, 18);
+  viewport.events.touchmove({ touches: fingers(400), cancelable: true, preventDefault() {} });
+  assert.equal(c.state.fontSize, 24);
+  assert.deepEqual(writes, [], 'nothing is stored mid-gesture');
+  viewport.events.touchend({ touches: [{ clientX: 0, clientY: 100 }] });
+  assert.deepEqual(writes, [['sessionholic:ui:fontSize', '24']]);
+  assert.match(c.get('toast').textContent, /글자 크기 24/);
+  viewport.events.touchmove({ touches: [{ clientX: 0, clientY: 300 }], cancelable: true, preventDefault() {} });
+  assert.equal(c.state.terminalScrollPending, 0, 'the finger left behind does not scroll');
+  c.get('terminal-font-up').events.click();
+  assert.equal(c.state.fontSize, 24);
+  c.get('terminal-font-down').events.click();
+  assert.equal(c.state.fontSize, 23); assert.equal(term.options.fontSize, 23);
+  const css = styleSheet();
+  assert.match(css, /\.terminal-keys \{[^}]*grid-template-rows: repeat\(2, 42px\)/);
+  assert.match(css, /\.terminal-screen:not\(\[hidden\]\) ~ \.toast \{\s*bottom: calc\(var\(--terminal-tools-h/);
+  assert.match(source, /D2Coding/); assert.match(source, /"Noto Sans Mono CJK KR"/);
+});
+
+test('the terminal library loads once on first open with versioned URLs, and a failed load is reported and can be retried', async () => {
+  const html = indexPage();
+  assert.doesNotMatch(html, /<(script|link)\b[^>]*(xterm|addon-fit)/, 'no terminal files on the board page');
+  assert.match(html, /<meta name="sessionholic-assets" content="\{\}"/);
+  const c = client(undefined, noChatTimers);
+  const appended = [];
+  c.context.document.head = { appendChild(item) { appended.push(item); } };
+  c.context.document.querySelector = (selector) => (selector === 'meta[name="sessionholic-assets"]'
+    ? { getAttribute: () => JSON.stringify({ '/vendor/xterm.js': 'abcdef12', '/vendor/addon-fit.js': '1234abcd', '/vendor/xterm.css': 'bad' }) } : null);
+  const first = c.loadXterm();
+  assert.equal(c.loadXterm(), first, 'one promise while loading');
+  assert.deepEqual(appended.map((item) => item.href || item.src), ['/vendor/xterm.css', '/vendor/xterm.js?v=abcdef12', '/vendor/addon-fit.js?v=1234abcd']);
+  assert.equal(appended[1].async, false); assert.equal(appended[2].async, false);
+  c.context.window.Terminal = function Terminal() {};
+  c.context.window.FitAddon = { FitAddon: function FitAddon() {} };
+  for (const item of appended) item.onload();
+  await first;
+  await c.loadXterm();
+  assert.equal(appended.length, 3, 'loaded once');
+  const d = client(undefined, noChatTimers);
+  const added = [];
+  d.context.document.head = { appendChild(item) { added.push(item); } };
+  const failed = d.loadXterm();
+  added[1].onerror();
+  await assert.rejects(failed);
+  d.loadXterm();
+  assert.equal(added.length, 6, 'opening again retries');
+  const e = client(undefined, noChatTimers);
+  e.context.document.head = { appendChild(item) { queueMicrotask(() => item.onerror()); } };
+  const viewport = e.get('terminal-viewport');
+  const loading = [];
+  viewport.classList = { add: (name) => loading.push(`+${name}`), remove: (name) => loading.push(`-${name}`) };
+  await e.openTerminal({ id: 'term-1', mode: 'attach' });
+  assert.deepEqual(loading, ['+is-loading', '-is-loading']);
+  assert.match(e.get('terminal-status').textContent, /불러오지 못했습니다/);
+  assert.match(e.get('terminal-error').textContent, /다시 열어/);
+});
+
+test('service worker serves versioned assets cache-first by full URL, drops older versions, keeps the page network-first and never caches APIs', async () => {
+  const listeners = {};
+  const store = new Map();
+  const cache = {
+    match: async (request) => store.get(typeof request === 'string' ? request : request.url),
+    put: async (request, response) => { store.set(typeof request === 'string' ? request : request.url, response); },
+    keys: async () => [...store.keys()].map((url) => ({ url })),
+    delete: async (request) => store.delete(request.url),
+  };
+  const fetched = [];
+  let online = true;
+  // Like the server: immutable only when the requested version is the current file.
+  const current = { '/app.js': 'aaaaaaaa' };
+  vm.runInNewContext(fs.readFileSync(path.join(__dirname, '../web/sw.js'), 'utf8'), {
+    self: { location: { origin: 'https://app.example' }, addEventListener: (type, handler) => { listeners[type] = handler; } },
+    URL, Set, Response,
+    fetch: async (request) => {
+      const url = typeof request === 'string' ? request : request.url;
+      fetched.push(url);
+      if (!online) throw new Error('offline');
+      const parsed = new URL(url, 'https://app.example');
+      const fresh = parsed.searchParams.get('v') === current[parsed.pathname];
+      return new Response(`body ${url}`, { headers: { 'Cache-Control': fresh ? 'public, max-age=31536000, immutable' : 'no-cache' } });
+    },
+    caches: { open: async () => cache, keys: async () => [] },
+  });
+  const run = async (route) => {
+    let response;
+    const waits = [];
+    listeners.fetch({ request: { method: 'GET', url: `https://app.example${route}` }, respondWith: (promise) => { response = promise; },
+      waitUntil: (promise) => waits.push(promise) });
+    if (!response) return null;
+    const result = await response;
+    await Promise.all(waits);
+    return result;
+  };
+  assert.match(await (await run('/app.js?v=aaaaaaaa')).text(), /aaaaaaaa/);
+  await run('/app.js?v=aaaaaaaa');
+  assert.equal(fetched.length, 1, 'a cached version is served without the network');
+  current['/app.js'] = 'bbbbbbbb';
+  await run('/app.js?v=bbbbbbbb');
+  assert.equal(fetched.length, 2);
+  assert.deepEqual([...store.keys()], ['https://app.example/app.js?v=bbbbbbbb'], 'older versions of the path are dropped');
+  online = false;
+  assert.match(await (await run('/app.js?v=bbbbbbbb')).text(), /bbbbbbbb/, 'versioned assets work offline');
+  online = true;
+  for (const route of ['/api/snapshot', '/api/events?host=a', '/api/chat/state', '/app.js?v=private', '/app.js?v=aaaaaaaa&x=1', '/?token=x', '/login'])
+    assert.equal(await run(route), null, route);
+  await run('/');
+  assert.ok(store.has('https://app.example/'));
+  online = false;
+  assert.match(await (await run('/')).text(), /body https:\/\/app\.example\//, 'the page falls back to its cached copy offline');
+  assert.equal((await run('/style.css')).status, 503, 'an uncached unversioned asset reports offline');
+  assert.ok(![...store.keys()].some((url) => url.includes('/api/')));
+});
+
+function serviceWorkerHarness(page = '') {
+  const listeners = {};
+  const store = new Map();
+  const key = (request) => new URL(typeof request === 'string' ? request : request.url, 'https://app.example').href;
+  // A Cache without add(): storing goes through fetch, a header check, then put.
+  const cache = {
+    match: async (request) => store.get(key(request)),
+    put: async (request, response) => { store.set(key(request), response); },
+    keys: async () => [...store.keys()].map((url) => ({ url })),
+    delete: async (request) => store.delete(key(request)),
+  };
+  const fetched = [];
+  const current = {};
+  vm.runInNewContext(fs.readFileSync(path.join(__dirname, '../web/sw.js'), 'utf8'), {
+    self: { location: { origin: 'https://app.example' }, addEventListener: (type, handler) => { listeners[type] = handler; },
+      skipWaiting() {} },
+    URL, Set, Response,
+    fetch: async (request) => {
+      const url = typeof request === 'string' ? request : request.url;
+      fetched.push(url);
+      const parsed = new URL(url, 'https://app.example');
+      if (parsed.pathname === '/') return new Response(page, { headers: { 'Cache-Control': 'no-cache' } });
+      const version = parsed.searchParams.get('v');
+      const fresh = version === current[parsed.pathname];
+      return new Response(`${parsed.pathname}@${current[parsed.pathname]}`,
+        { headers: { 'Cache-Control': fresh ? 'public, max-age=31536000, immutable' : 'no-cache' } });
+    },
+    caches: { open: async () => cache, keys: async () => [] },
+  });
+  const run = async (route) => {
+    let response;
+    const waits = [];
+    listeners.fetch({ request: { method: 'GET', url: `https://app.example${route}` }, respondWith: (promise) => { response = promise; },
+      waitUntil: (promise) => waits.push(promise) });
+    if (!response) return null;
+    const result = await response;
+    await Promise.all(waits);
+    return result;
+  };
+  return { listeners, store, fetched, current, run };
+}
+
+test('service worker keeps only responses the server marked immutable, so a mismatched version is never pinned to that URL', async () => {
+  const sw = serviceWorkerHarness();
+  sw.current['/app.js'] = 'aaaaaaaa';
+  await sw.run('/app.js?v=aaaaaaaa');
+  assert.deepEqual([...sw.store.keys()], ['https://app.example/app.js?v=aaaaaaaa']);
+  // A page that asks for v=bbbbbbbb before the server has it (or after a
+  // rollback) gets the current file with no-cache: shown, but not stored.
+  assert.equal(await (await sw.run('/app.js?v=bbbbbbbb')).text(), '/app.js@aaaaaaaa');
+  assert.deepEqual([...sw.store.keys()], ['https://app.example/app.js?v=aaaaaaaa'], 'not kept, and the valid version stays');
+  const before = sw.fetched.length;
+  await sw.run('/app.js?v=bbbbbbbb');
+  assert.equal(sw.fetched.length, before + 1, 'asked again rather than served from the cache');
+  // Once the server has that version it is immutable and cached for good.
+  sw.current['/app.js'] = 'bbbbbbbb';
+  assert.equal(await (await sw.run('/app.js?v=bbbbbbbb')).text(), '/app.js@bbbbbbbb');
+  assert.deepEqual([...sw.store.keys()], ['https://app.example/app.js?v=bbbbbbbb']);
+  const cached = sw.fetched.length;
+  assert.equal(await (await sw.run('/app.js?v=bbbbbbbb')).text(), '/app.js@bbbbbbbb');
+  assert.equal(sw.fetched.length, cached, 'served from the cache');
+  assert.match(fs.readFileSync(path.join(__dirname, '../web/sw.js'), 'utf8'), /const CACHE = "sessionholic-shell-v13";/,
+    'a new cache name drops entries stored by the older rule');
+});
+
+test('service worker precache stores only immutable versioned assets and skips the terminal library', async () => {
+  const versions = { '/app.js': 'aaaaaaaa', '/style.css': 'cccccccc', '/theme-init.js': 'eeeeeeee', '/vendor/xterm.js': 'dddddddd',
+    '/api/snapshot': 'ffffffff' };
+  const page = `<meta name="sessionholic-assets" content="${JSON.stringify(versions).replace(/"/g, '&quot;')}">`;
+  const sw = serviceWorkerHarness(page);
+  // The server already serves a different app.js than the page names.
+  Object.assign(sw.current, { '/app.js': '99999999', '/style.css': 'cccccccc', '/theme-init.js': 'eeeeeeee', '/vendor/xterm.js': 'dddddddd' });
+  let installed;
+  sw.listeners.install({ waitUntil: (promise) => { installed = promise; } });
+  await installed;
+  assert.deepEqual([...sw.store.keys()].sort(), ['https://app.example/', 'https://app.example/style.css?v=cccccccc',
+    'https://app.example/theme-init.js?v=eeeeeeee']);
+  assert.ok(sw.fetched.includes('/app.js?v=aaaaaaaa'), 'fetched, then refused by its header');
+  assert.ok(!sw.fetched.some((url) => url.includes('xterm') || url.includes('/api/')));
+});
+
+test('a list still being collected says how old it is, outside the cards, and the note clears when collection ends', () => {
+  const c = client(undefined, noChatTimers);
+  const now = 1800000000;
+  c.state.snapshot = { serverTime: now, hosts: [{ name: 'a', refreshing: true, fetchedAt: now - 300 },
+    { name: 'b', refreshing: false, fetchedAt: now - 3000 }] };
+  c.renderFreshness(now);
+  assert.equal(c.get('list-freshness').textContent, '5분 전 기준 · 갱신 중');
+  assert.equal(c.get('list-freshness').hidden, false);
+  c.state.snapshot.hosts[0].fetchedAt = now - 20;
+  c.renderFreshness(now);
+  assert.equal(c.get('list-freshness').hidden, true, 'a fresh list needs no note');
+  c.state.snapshot.hosts[0] = { name: 'a', refreshing: false, fetchedAt: now - 300 };
+  c.renderFreshness(now);
+  assert.equal(c.get('list-freshness').hidden, true); assert.equal(c.get('list-freshness').textContent, '');
+  assert.match(indexPage(), /id="list-freshness"[\s\S]*id="groups"/);
+});
+
+function fakeEventSource() {
+  const sources = [];
+  class FakeEventSource {
+    constructor(url) { this.url = url; this.readyState = 0; this.listeners = {}; this.closed = false; sources.push(this); }
+    addEventListener(type, callback) { this.listeners[type] = callback; }
+    emit(type, data) { this.listeners[type]?.({ data: data === undefined ? undefined : JSON.stringify(data) }); }
+    close() { this.closed = true; this.readyState = 2; }
+  }
+  return { FakeEventSource, sources };
+}
+
+test('live updates follow the open conversation, reread only on newer events, slow polling to a safety net and fall back after errors', async () => {
+  const requests = [];
+  const timers = [];
+  let c;
+  c = client(async (url, options) => {
+    requests.push(url);
+    return { ok: true, status: 200, json: async () => (url.startsWith('/api/snapshot') ? { hosts: c.state.snapshot.hosts, version: 7 }
+      : { route: JSON.parse(options.body).source, capability: { supported: true }, phase: 'working', messages: [] }) };
+  }, { setTimeout: (callback, ms) => { timers.push(ms); return timers.length; }, clearTimeout() {} });
+  const { FakeEventSource, sources } = fakeEventSource();
+  c.context.EventSource = FakeEventSource;
+  const { s } = selectChat(c);
+  c.state.detailShown = true;
+  c.state.capabilities = {};
+  c.state.capabilitiesRevision = JSON.stringify(c.state.snapshot.hosts.map((host) => [host.name, host.ok, host.fetchedAt]));
+  c.state.usageAt = Date.now();
+  c.state.detailFor = s.key; c.state.detailUpdatedAt = s.updatedAt;
+  c.state.detailRevision = JSON.stringify([false, undefined, undefined, undefined, '현재 계정 설정', 'Workstation', undefined, null, null]);
+  c.syncEvents();
+  assert.equal(sources.length, 1);
+  assert.equal(sources[0].url, '/api/events?host=workstation&agent=codex&home=.codex-example&id=native-session');
+  c.syncEvents();
+  assert.equal(sources.length, 1, 'the same conversation keeps its stream');
+  assert.equal(c.chatPollDelay(0), 3000);
+  c.state.snapshot.hosts[0].refreshing = true;
+  c.state.refreshDeadline = Date.now() + 60000;
+  sources[0].emit('hello', { snapshotVersion: 3 });
+  await settle();
+  assert.equal(c.eventsHealthy(), true);
+  assert.equal(requests.filter((url) => url === '/api/snapshot').length, 1, 'the first announced version is read once');
+  assert.equal(c.state.snapshotVersion, 7);
+  assert.equal(c.chatPollDelay(0), 30000, 'conversation polling becomes a 30s safety net');
+  timers.length = 0; c.schedule();
+  assert.deepEqual(timers, [60000], 'snapshot polling becomes a 60s safety net even while collecting');
+  requests.length = 0;
+  sources[0].emit('snapshot', { version: 7 });
+  await settle();
+  assert.deepEqual(requests, [], 'a version already shown reads nothing');
+  sources[0].emit('snapshot', { version: 8 });
+  await settle();
+  assert.deepEqual(requests, ['/api/snapshot']);
+  requests.length = 0;
+  sources[0].emit('chat', { digest: 'd1' });
+  await settle();
+  assert.deepEqual(requests, ['/api/chat/state']);
+  sources[0].emit('chat', { digest: 'd1' });
+  await settle();
+  assert.deepEqual(requests, ['/api/chat/state'], 'an unchanged digest reads nothing');
+  c.state.detailShown = false;
+  c.context.window.matchMedia = (query) => ({ matches: query === '(max-width: 700px)' });
+  c.syncEvents();
+  assert.equal(sources[0].closed, true);
+  assert.equal(sources[1].url, '/api/events', 'the list alone subscribes to snapshots only');
+  c.context.window.matchMedia = () => ({ matches: false });
+  c.context.document.hidden = true; c.syncEvents();
+  assert.equal(sources[1].closed, true); assert.equal(c.state.events, null, 'a hidden page closes the stream');
+  c.context.document.hidden = false; c.syncEvents();
+  assert.equal(sources.length, 3);
+  sources[2].emit('open');
+  assert.equal(c.eventsHealthy(), true);
+  for (let index = 0; index < 3; index++) sources[2].emit('error');
+  assert.equal(sources[2].closed, true, 'three errors within 30 seconds fall back');
+  assert.equal(c.eventsHealthy(), false);
+  assert.equal(c.chatPollDelay(0), 3000, 'polling returns to its normal backoff');
+  timers.length = 0; c.schedule();
+  assert.deepEqual(timers, [2000], 'and to the 2s collection loop');
+  c.syncEvents();
+  assert.equal(sources.length, 3, 'no reconnect right after a fallback');
+  c.state.eventsRetryAt = 0;
+  c.syncEvents();
+  sources[3].emit('open');
+  timers.length = 0; c.schedule();
+  assert.deepEqual(timers, [60000]);
+  timers.length = 0;
+  sources[3].readyState = 2;
+  sources[3].emit('error');
+  assert.equal(c.state.events, null, 'a healthy stream closed for good falls back');
+  assert.deepEqual(timers, [2000, 3000], 'and both safety timers (60s list, 30s conversation) return to the normal pace at once');
+  const d = client(undefined, noChatTimers);
+  const second = fakeEventSource();
+  d.context.EventSource = second.FakeEventSource;
+  selectChat(d);
+  d.syncEvents();
+  second.sources[0].readyState = 2;
+  second.sources[0].emit('error');
+  assert.equal(d.state.events, null, 'a server without /api/events (closed before opening) falls back at once');
+  const e = client(undefined, noChatTimers);
+  selectChat(e);
+  e.syncEvents();
+  assert.equal(e.state.events, null, 'no EventSource: the existing polling stays');
+});
+
+// --- UI round 2: list header, sending, gestures, attachments, states, text size ---
+
+test('status chips filter the list to answers or running work, keep both counts, and clear on a second tap', () => {
+  const c = client(undefined, noChatTimers);
+  const rows = [recentSession('wait-a', { phase: 'needs_input', updatedAt: 1090 }), recentSession('wait-b', { phase: 'needs_input', updatedAt: 1080 }),
+    recentSession('run', { phase: 'working', updatedAt: 1070 }), recentSession('idle', { updatedAt: 1060 })];
+  setRecentSnapshot(c, rows);
+  vm.runInContext('render()', c.context);
+  const chips = c.get('counts').children;
+  assert.deepEqual(chips.map((chip) => chip.tagName), ['BUTTON', 'BUTTON']);
+  assert.deepEqual(chips.map((chip) => chip.chipLabel.textContent), ['답 필요 2', '작업 중 1']);
+  assert.deepEqual(chips.map((chip) => chip.attributes['aria-pressed']), ['false', 'false']);
+  assert.equal(byClass(c.get('groups'), 'card').length, 4);
+  chips[0].events.click();
+  assert.equal(c.state.phaseFilter, 'needs_input');
+  assert.deepEqual(byClass(c.get('groups'), 'card').map((card) => card.dataset.sessionKey), [rows[0].key, rows[1].key]);
+  const after = c.get('counts').children;
+  assert.equal(after[0], chips[0], 'the chip keeps its element (and keyboard focus)');
+  assert.equal(after[0].attributes['aria-pressed'], 'true');
+  assert.match(after[0].className, /is-active/);
+  assert.equal(after[1].chipLabel.textContent, '작업 중 1', 'the other chip keeps its count');
+  assert.equal(c.get('session-count').textContent, '2개');
+  assert.equal(c.context.document.title, '(2) 답 필요 · 세션홀릭', 'the tab title still counts every waiting session');
+  after[1].events.click();
+  assert.equal(c.state.phaseFilter, 'working');
+  assert.deepEqual(byClass(c.get('groups'), 'card').map((card) => card.dataset.sessionKey), [rows[2].key]);
+  after[1].events.click();
+  assert.equal(c.state.phaseFilter, '');
+  assert.equal(byClass(c.get('groups'), 'card').length, 4);
+  assert.equal(c.matches(rows[3], 1100), true);
+  // A filter that leaves nothing explains itself and clears with one tap.
+  c.state.snapshot.hosts[0].data.codex = rows.filter((s) => s.phase !== 'working');
+  after[1].events.click();
+  assert.match(textOf(c.get('groups')), /진행 중인 작업이 없습니다/);
+  byClass(c.get('groups'), 'secondary')[0].events.click();
+  assert.equal(c.state.phaseFilter, '');
+  assert.equal(byClass(c.get('groups'), 'card').length, 3);
+});
+
+test('the usage line is one chip that opens a sheet of per-account bars, and open terminals live in their own sheet', () => {
+  const c = client(undefined, noChatTimers);
+  c.context.navigator = { onLine: false };
+  c.windowEvents.DOMContentLoaded();
+  c.renderUsage({ available: true, providers: [{ short: 'CX', label: 'Codex', remaining: 45, status: 'ready', rows: [
+    { name: '개인', windows: [{ label: '주간', remaining: 45 }] }] }] });
+  assert.equal(c.get('usage').hidden, false);
+  assert.match(c.get('usage').attributes['aria-label'], /남은 사용량 Codex 45%.*계정별로 보기/);
+  c.get('usage').events.click();
+  assert.equal(c.get('usage-dialog').open, true);
+  assert.match(textOf(c.get('usage-body')), /개인.*주간.*45%/);
+  c.get('usage-close').events.click();
+  assert.equal(c.get('usage-dialog').open, false);
+  assert.equal(c.get('usage').focusCount, 1, 'focus returns to the chip');
+  c.state.terminals = [{ id: 'one', alive: true, title: '열어 둔 작업', host: 'workstation', agent: 'codex', mode: 'attach' }];
+  c.renderTerminals();
+  assert.equal(c.get('running-terminals').hidden, false);
+  assert.equal(c.get('running-count').textContent, 1);
+  c.get('running-terminals').events.click();
+  assert.equal(c.get('terminals-dialog').open, true);
+  assert.match(textOf(c.get('running-list')), /열어 둔 작업/);
+  c.state.terminals = [];
+  c.renderTerminals();
+  assert.equal(c.get('running-terminals').hidden, true);
+  assert.equal(c.get('terminals-dialog').open, false, 'an emptied list closes its sheet');
+  // The filter sheet holds the selects and the old-conversations switch; its button counts what applies.
+  c.state.filters.agent = 'codex'; c.state.showOld = true;
+  c.renderFilters([]);
+  assert.equal(c.get('filter-count').textContent, '2');
+  assert.equal(c.get('filter-open').attributes['aria-label'], '필터 2개 적용됨');
+  c.get('filter-reset').events.click();
+  assert.equal(c.state.filters.agent, ''); assert.equal(c.state.showOld, false);
+  assert.equal(c.get('filter-count').textContent, '');
+  const html = indexPage();
+  for (const id of ['usage-dialog', 'filter-dialog', 'terminals-dialog', 'action-sheet'])
+    assert.match(html, new RegExp(`<dialog id="${id}" class="plan-dialog sheet`));
+  assert.match(html, /id="terminal-return"[\s\S]*<\/aside>/, 'the terminal bar floats inside the list');
+});
+
+test('sending shows the bubble at once, keeps but hides the draft, and gives way to the transcript row', async () => {
+  let release; let delivered = false; const sends = [];
+  const now = Math.floor(Date.now() / 1000);
+  const c = client(async (url, options) => {
+    const body = JSON.parse(options.body);
+    if (url === '/api/chat/send') {
+      sends.push(body);
+      return await new Promise((resolve) => { release = () => resolve({ ok: true, status: 200, json: async () => ({ status: 'accepted', receipt: {} }) }); });
+    }
+    // A Codex state read names each item and the request a board message came from.
+    return { ok: true, status: 200, json: async () => ({ route: body.source, capability: { supported: true }, phase: 'working',
+      receipts: body.requestId ? [{ requestId: body.requestId, status: 'accepted' }] : [],
+      messages: [{ role: 'assistant', text: '이전 답변', ts: now - 60, itemId: 'item-answer-0', clientId: null },
+        ...(delivered ? [{ role: 'user', text: '테스트를 다시 돌려 주세요', ts: now, itemId: 'item-user-1', clientId: sends[0].requestId }] : [])] }) };
+  }, noChatTimers);
+  const { s, entry } = selectChat(c);
+  wireTree(c, c.buildChatComposer(s)); await settle();
+  await c.loadChatState(s, true);
+  const list = c.get('messages');
+  const input = c.get('chat-input'); input.value = entry.text = '테스트를 다시 돌려 주세요';
+  const pending = c.sendChat(entry);
+  // Before any answer: a translucent "전송 중" bubble after the transcript, before the working row.
+  const outbox = () => list.children.filter((row) => /is-outbox/.test(row.className));
+  assert.equal(outbox().length, 1);
+  assert.match(outbox()[0].className, /is-outbox is-sending/);
+  assert.match(textOf(outbox()[0]), /테스트를 다시 돌려 주세요.*전송 중/);
+  assert.match(list.children.at(-1).className, /msg-working/);
+  assert.match(c.get('chat-composer').className, /is-sent-draft/, 'the kept draft is drawn empty');
+  assert.equal(entry.text, '테스트를 다시 돌려 주세요', 'and is not cleared before the server accepts it');
+  await settle();
+  assert.equal(sends.length, 1);
+  delivered = true;
+  release(); await pending; await settle();
+  assert.equal(entry.text, ''); assert.equal(input.value, '');
+  assert.equal(entry.outbox.length, 0, 'the transcript has the message now');
+  assert.equal(outbox().length, 0);
+  assert.equal(list.children.filter((row) => row.messageItem?.message.text === '테스트를 다시 돌려 주세요').length, 1);
+  assert.doesNotMatch(c.get('chat-composer').className, /is-sent-draft/);
+  // Accepted but not yet in the transcript (a queued turn): the bubble stays, labelled.
+  const d = client(async (url, options) => {
+    const body = JSON.parse(options.body);
+    if (url === '/api/chat/send') return { ok: true, status: 200, json: async () => ({ status: 'queued', receipt: {} }) };
+    return { ok: true, status: 200, json: async () => ({ route: body.source, capability: { supported: true }, phase: 'working', receipts: [], messages: [] }) };
+  }, noChatTimers);
+  const queued = selectChat(d);
+  wireTree(d, d.buildChatComposer(queued.s)); await settle();
+  d.renderMessages(queued.s, []);
+  queued.entry.text = '끝나면 이어서 해 주세요';
+  await d.sendChat(queued.entry); await settle();
+  const bubble = d.get('messages').children.find((row) => /is-outbox/.test(row.className));
+  assert.match(bubble.className, /is-sent/);
+  assert.match(textOf(bubble), /대기 중/);
+});
+
+test('a refused send becomes "보내지 못함 · 다시 보내기", shows the kept draft again and resends only when asked', async () => {
+  const sends = [];
+  const c = client(async (url, options) => {
+    const body = JSON.parse(options.body);
+    if (url === '/api/chat/send') {
+      sends.push(body.requestId);
+      if (sends.length === 1) return { ok: false, status: 409, json: async () => ({
+        error: '현재 실행 중인 작업은 새 입력을 받을 수 없습니다.', dispatchState: 'not_started' }) };
+      return { ok: true, status: 200, json: async () => ({ status: 'queued', receipt: {} }) };
+    }
+    return { ok: true, status: 200, json: async () => ({ route: body.source, capability: { supported: true }, phase: 'working',
+      receipts: [], messages: [{ role: 'assistant', text: '진행 중' }] }) };
+  }, noChatTimers);
+  const { s, entry } = selectChat(c);
+  wireTree(c, c.buildChatComposer(s)); await settle();
+  c.renderMessages(s, [{ role: 'assistant', text: '진행 중' }]);
+  const input = c.get('chat-input'); input.value = entry.text = '끝나면 요약해 주세요';
+  await c.sendChat(entry); await settle();
+  const failed = c.get('messages').children.find((row) => /is-outbox/.test(row.className));
+  assert.match(failed.className, /is-failed/);
+  assert.match(textOf(failed), /끝나면 요약해 주세요.*보내지 못함/);
+  assert.equal(failed.deliveryStatus.title, '현재 실행 중인 작업은 새 입력을 받을 수 없습니다.');
+  const retry = byClass(failed, 'msg-retry')[0];
+  assert.equal(retry.textContent, '다시 보내기');
+  assert.equal(entry.text, '끝나면 요약해 주세요'); assert.equal(input.value, '끝나면 요약해 주세요');
+  assert.doesNotMatch(c.get('chat-composer').className, /is-sent-draft/, 'the kept draft shows again');
+  assert.match(c.get('chat-status').textContent, /새 입력을 받을 수 없습니다.*전송되지 않았습니다/);
+  assert.equal(sends.length, 1, 'nothing is resent by itself');
+  retry.events.click(); await settle();
+  assert.equal(sends.length, 2);
+  assert.notEqual(sends[1], sends[0], 'an explicit resend is a new request');
+  assert.deepEqual(Array.from(entry.outbox, (item) => [item.state, item.status]), [['sent', 'queued']]);
+  assert.equal(entry.text, '');
+  // A runtime refusal reported in a 200 receipt (NOT_STEERABLE) is a failed bubble too.
+  const d = client(async (url, options) => {
+    const body = JSON.parse(options.body);
+    if (url === '/api/chat/send') return { ok: true, status: 200, json: async () => ({ status: 'failed',
+      receipt: { confirmed: false, reason: '현재 실행 중인 작업(/review·/compact 등)은 새 입력을 받을 수 없습니다. 끝난 뒤 다시 보내 주세요.' } }) };
+    return { ok: true, status: 200, json: async () => ({ route: body.source, capability: { supported: true }, phase: 'working', receipts: [], messages: [] }) };
+  }, noChatTimers);
+  const second = selectChat(d);
+  wireTree(d, d.buildChatComposer(second.s)); await settle();
+  d.renderMessages(second.s, []);
+  second.entry.text = '리뷰가 끝나면 알려 주세요';
+  await d.sendChat(second.entry); await settle();
+  assert.match(d.get('messages').children.find((row) => /is-outbox/.test(row.className)).className, /is-failed/);
+  assert.equal(second.entry.text, '리뷰가 끝나면 알려 주세요');
+  assert.equal(second.entry.pending, null);
+});
+
+test('resending a refused bubble sends that message and its files only, and leaves a different draft in the editor', async () => {
+  const sends = [];
+  const c = client(async (url, options) => {
+    const body = JSON.parse(options.body);
+    if (url === '/api/chat/send') {
+      sends.push(body);
+      if (sends.length === 1) return { ok: false, status: 409, json: async () => ({
+        error: '현재 실행 중인 작업은 새 입력을 받을 수 없습니다.', dispatchState: 'not_started' }) };
+      return { ok: true, status: 200, json: async () => ({ status: 'accepted', receipt: {} }) };
+    }
+    return { ok: true, status: 200, json: async () => ({ route: body.source, capability: { supported: true }, phase: 'working',
+      receipts: [], messages: [{ role: 'assistant', text: '진행 중' }] }) };
+  }, noChatTimers);
+  const { s, entry } = selectChat(c);
+  wireTree(c, c.buildChatComposer(s)); await settle();
+  c.renderMessages(s, [{ role: 'assistant', text: '진행 중' }]);
+  const input = c.get('chat-input');
+  input.value = entry.text = '메시지 A';
+  entry.attachments = [{ id: 'file-a', name: 'a.png', type: 'image/png', size: 10 }];
+  await c.sendChat(entry); await settle();
+  const failed = c.get('messages').children.find((row) => /is-outbox/.test(row.className));
+  assert.match(failed.className, /is-failed/);
+  // The user drops A's file, writes B, then taps A's "다시 보내기".
+  entry.attachments = []; entry.revision++;
+  input.value = '초안 B'; input.events.input();
+  byClass(failed, 'msg-retry')[0].events.click(); await settle();
+  assert.equal(sends.length, 2);
+  assert.equal(sends[1].text, '메시지 A', 'the bubble\'s own text');
+  assert.deepEqual(sends[1].attachments, ['file-a'], 'and its own files');
+  assert.notEqual(sends[1].requestId, sends[0].requestId, 'a refused request gets a new id');
+  assert.deepEqual(Array.from(entry.outbox, (item) => [item.text, item.state]), [['메시지 A', 'sent']]);
+  assert.equal(entry.text, '초안 B', 'the other draft is kept'); assert.equal(input.value, '초안 B');
+  assert.equal(entry.attachments.length, 0);
+  assert.equal(entry.pending, null);
+  assert.ok(!sends.some((body) => body.text === '초안 B'), 'and is never sent by itself');
+  // With the editor emptied instead, the message comes back to it and leaves once accepted.
+  const emptied = [];
+  const d = client(async (url, options) => {
+    const body = JSON.parse(options.body);
+    if (url === '/api/chat/send') {
+      emptied.push(body);
+      if (emptied.length === 1) return { ok: false, status: 409, json: async () => ({ error: '거절', dispatchState: 'not_started' }) };
+      return { ok: true, status: 200, json: async () => ({ status: 'accepted', receipt: {} }) };
+    }
+    return { ok: true, status: 200, json: async () => ({ route: body.source, capability: { supported: true }, phase: 'idle', receipts: [], messages: [] }) };
+  }, noChatTimers);
+  const second = selectChat(d);
+  wireTree(d, d.buildChatComposer(second.s)); await settle();
+  d.renderMessages(second.s, []);
+  const editor = d.get('chat-input');
+  editor.value = second.entry.text = '메시지 C';
+  await d.sendChat(second.entry); await settle();
+  editor.value = ''; editor.events.input();
+  byClass(d.get('messages').children.find((row) => /is-failed/.test(row.className)), 'msg-retry')[0].events.click();
+  assert.equal(second.entry.text, '메시지 C', 'back in the editor while it is sent');
+  await settle();
+  assert.equal(emptied[1].text, '메시지 C');
+  assert.equal(second.entry.text, ''); assert.equal(editor.value, '');
+});
+
+test('one transcript message settles one bubble, matched by its whole text and attachment count, never by an earlier message', () => {
+  const c = client(undefined, noChatTimers);
+  // Claude rows carry no identifiers, so a Claude bubble is matched by its text.
+  const { s, entry } = selectChat(c, { agent: 'claude', home: '.claude', id: 'claude-session' });
+  wireTree(c, c.buildChatComposer(s));
+  const now = Date.now(); const ts = Math.floor(now / 1000);
+  const bubble = (requestId, text, extra = {}) => ({ requestId, text, attachments: [], state: 'sent', status: 'accepted', reason: '',
+    at: now, base: 0, ...extra });
+  const pending = () => entry.outbox.map((item) => item.requestId);
+  // The same text sent twice, both accepted; the transcript shows one so far.
+  entry.outbox = [bubble('req-first-0001', '다시 확인해 주세요', { at: now - 2000 }),
+    bubble('req-second-0002', '다시 확인해 주세요', { at: now - 1000 })];
+  const earlier = { role: 'user', text: '다시 확인해 주세요', ts: ts - 600 };
+  const first = { role: 'user', text: '다시 확인해 주세요\n', ts };
+  c.renderMessages(s, [earlier, first]);
+  assert.deepEqual(pending(), ['req-second-0002']);
+  assert.equal(c.get('messages').children.filter((row) => /is-outbox/.test(row.className)).length, 1, 'one bubble left on screen');
+  c.renderMessages(s, [earlier, first]);
+  assert.deepEqual(pending(), ['req-second-0002'], 'a message that settled a bubble never settles another on a later render');
+  c.renderMessages(s, [earlier, first, { role: 'user', text: '  다시   확인해 주세요 ', ts: ts + 1 }]);
+  assert.deepEqual(pending(), []);
+  // Neither a longer message containing the text, another attachment count,
+  // nor the same message from before the send settles a bubble.
+  entry.outbox = [bubble('req-third-0003', '확인', { attachments: [{ id: 'f', name: 'a.png', type: 'image/png', kind: 'image' }] })];
+  const others = [{ role: 'user', text: '확인', ts: ts - 120, attachments: [{ kind: 'image' }] },
+    { role: 'user', text: '다시 확인할까요', ts: ts + 2, attachments: [{ kind: 'image' }] },
+    { role: 'user', text: '확인', ts: ts + 2 }];
+  c.settleOutbox(entry, others);
+  assert.deepEqual(pending(), ['req-third-0003']);
+  // A Claude message carries its file as a "첨부 파일:" line the server appended.
+  c.settleOutbox(entry, [...others, { role: 'user', text: '확인\n첨부 파일: /work/a.png', ts: ts + 3 }]);
+  assert.deepEqual(pending(), []);
+  // A Codex message with only an image reads "[이미지 첨부]".
+  entry.outbox = [bubble('req-image-0004', '', { attachments: [{ id: 'g', name: 'b.png', type: 'image/png', kind: 'image' }] })];
+  c.settleOutbox(entry, [{ role: 'user', text: '[이미지 첨부]', ts: ts + 4, attachments: [{ kind: 'image' }] }]);
+  assert.deepEqual(pending(), []);
+  // Without times, only messages after those on screen at the send count.
+  entry.outbox = [bubble('req-untimed-0005', '계속', { base: 2 })];
+  const untimed = [{ role: 'user', text: '계속' }, { role: 'assistant', text: '네' }];
+  c.settleOutbox(entry, untimed);
+  assert.deepEqual(pending(), ['req-untimed-0005']);
+  c.settleOutbox(entry, [...untimed, { role: 'user', text: '계속' }]);
+  assert.deepEqual(pending(), []);
+  // A Codex row names its request: another request's row never settles it, its
+  // own does even when it joined a turn that started before the send.
+  const d = client(undefined, noChatTimers);
+  const codex = selectChat(d).entry;
+  codex.outbox = [bubble('req-codex-0006', '계속 진행')];
+  d.settleOutbox(codex, [{ role: 'user', text: '계속 진행', ts: ts + 5, itemId: 'item-9', clientId: 'req-other-0099' }]);
+  assert.deepEqual(codex.outbox.map((item) => item.requestId), ['req-codex-0006']);
+  d.settleOutbox(codex, [{ role: 'user', text: '계속 진행', ts: ts - 300, itemId: 'item-6', clientId: 'req-codex-0006' }]);
+  assert.deepEqual(codex.outbox.map((item) => item.requestId), []);
+  // A cut long message is compared by its beginning.
+  const long = '가'.repeat(5000);
+  entry.outbox = [bubble('req-long-0007', long)];
+  c.settleOutbox(entry, [{ role: 'user', text: long.slice(0, 4000) + ' …', truncated: true, fullLength: 5000, ts: ts + 6 }]);
+  assert.deepEqual(pending(), []);
+});
+
+test('the same text sent 10 seconds earlier never settles the new bubble, also after switching away and back', async () => {
+  const now = Math.floor(Date.now() / 1000);
+  const sends = []; let delivered = false;
+  const earlier = [{ role: 'user', text: '계속 진행해 주세요', ts: now - 10 }, { role: 'assistant', text: '진행했습니다', ts: now - 5 }];
+  const c = client(async (url, options) => {
+    const body = JSON.parse(options.body);
+    if (url === '/api/chat/send') { sends.push(body); return { ok: true, status: 200, json: async () => ({ status: 'accepted', receipt: {} }) }; }
+    return { ok: true, status: 200, json: async () => ({ route: body.source, capability: { supported: true }, phase: 'working', receipts: [],
+      messages: [...earlier, ...(delivered ? [{ role: 'user', text: '계속 진행해 주세요', ts: now }] : [])] }) };
+  }, noChatTimers);
+  const claude = { agent: 'claude', home: '.claude', id: 'claude-session' };
+  const { s, entry } = selectChat(c, claude);
+  wireTree(c, c.buildChatComposer(s)); await settle();
+  await c.loadChatState(s, true);
+  entry.text = '계속 진행해 주세요';
+  await c.sendChat(entry); await settle();
+  assert.equal(sends.length, 1);
+  const bubbles = () => c.get('messages').children.filter((row) => /is-outbox/.test(row.className)).length;
+  assert.equal(entry.outbox.length, 1, 'the message already there is not the one just sent');
+  assert.equal(bubbles(), 1);
+  await c.loadChatState(s, true); await settle();
+  assert.equal(entry.outbox.length, 1, 'nor on the next read');
+  // Another conversation and back: the bubble still knows what it was sent after.
+  const other = selectChat(c, { ...claude, id: 'claude-other' });
+  c.renderMessages(other.s, []);
+  assert.equal(bubbles(), 0);
+  assert.equal(selectChat(c, claude).entry, entry);
+  await c.loadChatState(s, true); await settle();
+  assert.equal(entry.outbox.length, 1);
+  assert.equal(bubbles(), 1);
+  delivered = true;
+  await c.loadChatState(s, true); await settle();
+  assert.equal(entry.outbox.length, 0, 'its own message settles it');
+  assert.equal(bubbles(), 0);
+  assert.equal(c.get('messages').children.filter((row) => row.messageItem?.message.text === '계속 진행해 주세요').length, 2);
+});
+
+test('a Codex bubble settles only by its request id, and /api/read rows without ids never settle a second bubble of the same text', async () => {
+  const now = Math.floor(Date.now() / 1000);
+  const sends = []; const reads = [];
+  let stateFails = false;
+  const answer = { role: 'assistant', text: '확인했습니다', ts: now - 30 };
+  let stateRows = [{ ...answer, itemId: 'item-answer', clientId: null }];
+  let readRows = [answer];
+  const c = client(async (url, options) => {
+    if (url.startsWith('/api/read')) { reads.push(url); return { ok: true, status: 200, json: async () => ({ messages: readRows }) }; }
+    const body = JSON.parse(options.body);
+    if (url === '/api/chat/send') { sends.push(body); return { ok: true, status: 200, json: async () => ({ status: 'accepted', receipt: {} }) }; }
+    if (stateFails) return { ok: false, status: 502, json: async () => ({ error: '상태를 확인하지 못했습니다.' }) };
+    return { ok: true, status: 200, json: async () => ({ route: body.source, capability: { supported: true }, phase: 'working',
+      receipts: [], messages: stateRows }) };
+  }, noChatTimers);
+  const { s, entry } = selectChat(c);
+  c.state.detailShown = true;
+  wireTree(c, c.buildChatComposer(s)); await settle();
+  await c.loadChatState(s, true);
+  for (let i = 0; i < 2; i++) {
+    entry.text = '다시 확인해 주세요';
+    await c.sendChat(entry); await settle();
+  }
+  const [first, second] = sends.map((body) => body.requestId);
+  assert.equal(sends.length, 2); assert.notEqual(first, second);
+  const pending = () => Array.from(entry.outbox, (item) => item.requestId);
+  const bubbles = () => c.get('messages').children.filter((row) => /is-outbox/.test(row.className)).length;
+  assert.deepEqual(pending(), [first, second]);
+  // The state read shows the first send, named by its request id.
+  const own = (requestId, itemId) => ({ role: 'user', text: '다시 확인해 주세요', ts: now, itemId, clientId: requestId });
+  stateRows = [...stateRows, own(first, 'item-1')];
+  await c.loadChatState(s, true); await settle();
+  assert.deepEqual(pending(), [second]);
+  // The state read fails; /api/read shows the same message without any id.
+  stateFails = true;
+  readRows = [answer, { role: 'user', text: '다시 확인해 주세요', ts: now }];
+  await c.loadDetail(s); await settle();
+  assert.equal(reads.length, 1, 'the conversation came from /api/read');
+  assert.deepEqual(pending(), [second], 'a message settled by its id is not taken again by its text');
+  assert.equal(bubbles(), 1);
+  // Even the second message, as /api/read shows it, cannot say which request it was.
+  readRows = [...readRows, { role: 'user', text: '다시 확인해 주세요', ts: now }];
+  await c.loadDetail(s); await settle();
+  assert.equal(reads.length, 2);
+  assert.deepEqual(pending(), [second]);
+  // Back on the state read, its own row settles it.
+  stateFails = false;
+  stateRows = [...stateRows, own(second, 'item-2')];
+  await c.loadChatState(s, true); await settle();
+  assert.deepEqual(pending(), []);
+  assert.equal(bubbles(), 0);
+});
+
+test('one new message settles one bubble with or without row ids, after the last message the bubble saw', () => {
+  const now = Date.now(); const ts = Math.floor(now / 1000);
+  const c = client(undefined, noChatTimers);
+  const bubble = (requestId, text, seen, extra = {}) => ({ requestId, text, attachments: [], state: 'sent', status: 'accepted', reason: '',
+    at: now, ...c.outboxOrigin(seen), ...extra });
+  // Rows named by item id (a Codex state read).
+  const codex = selectChat(c).entry;
+  const named = [{ role: 'user', text: '계속', ts: ts - 10, itemId: 'item-old', clientId: null },
+    { role: 'assistant', text: '네', ts: ts - 5, itemId: 'item-answer', clientId: null }];
+  codex.outbox = [bubble('req-codex-a001', '계속', named), bubble('req-codex-b002', '계속', named)];
+  assert.deepEqual(codex.outbox[0].known, ['item-old']);
+  const codexPending = () => codex.outbox.map((item) => item.requestId);
+  // Neither the message already there nor one typed in the terminal (no request id) settles a Codex bubble.
+  const typed = { role: 'user', text: '계속', ts, itemId: 'item-typed', clientId: null };
+  c.settleOutbox(codex, [...named, typed]);
+  assert.deepEqual(codexPending(), ['req-codex-a001', 'req-codex-b002']);
+  const a = { role: 'user', text: '계속', ts, itemId: 'item-a', clientId: 'req-codex-a001' };
+  c.settleOutbox(codex, [...named, typed, a]);
+  assert.deepEqual(codexPending(), ['req-codex-b002'], 'one new row, one bubble');
+  c.settleOutbox(codex, [...named, typed, a]);
+  assert.deepEqual(codexPending(), ['req-codex-b002'], 'and not another on the next read');
+  // A row named at the send never counts as new, whatever it claims.
+  c.settleOutbox(codex, [{ ...named[0], clientId: 'req-codex-b002' }, named[1]]);
+  assert.deepEqual(codexPending(), ['req-codex-b002']);
+  // Rows without ids (a Claude read): only what follows the last message the bubble saw.
+  const claude = selectChat(c, { agent: 'claude', home: '.claude', id: 'claude-session' }).entry;
+  const shown = [{ role: 'user', text: '계속', ts: ts - 10 }, { role: 'assistant', text: '네', ts: ts - 5 }];
+  claude.outbox = [bubble('req-claude-a001', '계속', shown), bubble('req-claude-b002', '계속', shown)];
+  assert.equal(claude.outbox[0].known, null);
+  const claudePending = () => claude.outbox.map((item) => item.requestId);
+  c.settleOutbox(claude, shown);
+  assert.deepEqual(claudePending(), ['req-claude-a001', 'req-claude-b002']);
+  const next = { role: 'user', text: '계속', ts };
+  c.settleOutbox(claude, [...shown, next]);
+  assert.deepEqual(claudePending(), ['req-claude-b002'], 'one new row, one bubble');
+  c.settleOutbox(claude, [...shown, next]);
+  assert.deepEqual(claudePending(), ['req-claude-b002']);
+  // The server's window moved on (the oldest message dropped): the bubbles' last message is found again.
+  c.settleOutbox(claude, [shown[1], next]);
+  assert.deepEqual(claudePending(), ['req-claude-b002']);
+  c.settleOutbox(claude, [shown[1], next, { role: 'user', text: '계속', ts: ts + 1 }]);
+  assert.deepEqual(claudePending(), []);
+  // A Claude message names its file in a "첨부 파일:" line; the same one from before the send does not count.
+  const withFile = [{ role: 'user', text: '확인\n첨부 파일: /work/a.png', ts: ts - 10 }];
+  claude.outbox = [bubble('req-claude-c003', '확인', withFile, { attachments: [{ id: 'f', name: 'a.png', type: 'image/png', kind: 'image' }] })];
+  c.settleOutbox(claude, withFile);
+  assert.deepEqual(claudePending(), ['req-claude-c003']);
+  c.settleOutbox(claude, [...withFile, { role: 'user', text: '확인\n첨부 파일: /work/a.png', ts: ts + 2 }]);
+  assert.deepEqual(claudePending(), []);
+  // What settled stays remembered per conversation only up to a limit.
+  claude.outboxClaims = Array.from({ length: 200 }, (_, index) => ({ id: null, key: `old-${index}`, base: 0, at: now }));
+  claude.outbox = [bubble('req-claude-d004', '끝', [])];
+  c.settleOutbox(claude, [{ role: 'user', text: '끝', ts: ts + 3 }]);
+  assert.deepEqual(claudePending(), []);
+  assert.equal(claude.outboxClaims.length, 80);
+  assert.equal(claude.outboxClaims.at(-1).key, JSON.stringify([ts + 3, '끝']));
+});
+
+test('a failed xterm stylesheet fails the terminal load, and opening again retries only that file', async () => {
+  const c = client(undefined, noChatTimers);
+  const appended = []; const removed = [];
+  c.context.document.head = { appendChild(item) { item.remove = () => removed.push(item); appended.push(item); } };
+  c.context.document.querySelector = (selector) => (selector === 'meta[name="sessionholic-assets"]'
+    ? { getAttribute: () => JSON.stringify({ '/vendor/xterm.js': 'abcdef12', '/vendor/addon-fit.js': '1234abcd', '/vendor/xterm.css': '0badc0de' }) } : null);
+  const first = c.loadXterm();
+  c.context.window.Terminal = function Terminal() {};
+  c.context.window.FitAddon = { FitAddon: function FitAddon() {} };
+  appended[1].onload(); appended[2].onload();
+  appended[0].onerror();
+  await assert.rejects(first, /받지 못했습니다/);
+  assert.deepEqual(removed, [appended[0]], 'the failed stylesheet is not left in the page');
+  const second = c.loadXterm();
+  assert.deepEqual(appended.slice(3).map((item) => item.href || item.src), ['/vendor/xterm.css?v=0badc0de'], 'only the stylesheet again');
+  appended[3].onload();
+  await second;
+  await c.loadXterm();
+  assert.equal(appended.length, 4, 'nothing more once all three loaded');
+  // Scripts that ran without defining the terminal are asked again too.
+  const e = client(undefined, noChatTimers);
+  const tried = [];
+  e.context.document.head = { appendChild(item) { tried.push(item); } };
+  const broken = e.loadXterm();
+  for (const item of tried) item.onload();
+  await assert.rejects(broken, /올바르지 않습니다/);
+  e.loadXterm();
+  assert.deepEqual(tried.slice(3).map((item) => item.src), ['/vendor/xterm.js', '/vendor/addon-fit.js']);
+  // Opening a terminal whose scripts are present but whose stylesheet fails
+  // reports it instead of drawing an unstyled terminal.
+  const d = client(undefined, noChatTimers);
+  d.context.window.Terminal = function Terminal() {};
+  d.context.window.FitAddon = { FitAddon: function FitAddon() {} };
+  d.context.document.head = { appendChild(item) { queueMicrotask(() => (item.tagName === 'LINK' ? item.onerror() : item.onload())); } };
+  await d.openTerminal({ id: 'term-1', mode: 'attach' });
+  assert.match(d.get('terminal-status').textContent, /불러오지 못했습니다/);
+  assert.match(d.get('terminal-error').textContent, /다시 열어/);
+});
+
+test('a long press opens its menu after 450ms, while a drag, an early release or a mouse never does', () => {
+  const timers = [];
+  const c = client(undefined, { setTimeout: (callback, delay) => { timers.push({ callback, delay }); return timers.length; },
+    clearTimeout(id) { if (timers[id - 1]) timers[id - 1].cleared = true; } });
+  assert.equal(c.LONG_PRESS_MS, 450); assert.equal(c.PRESS_SLOP, 10);
+  const fired = [];
+  const press = c.createLongPress((target) => fired.push(target));
+  const down = (extra = {}) => ({ pointerId: 1, pointerType: 'touch', clientX: 100, clientY: 200, ...extra });
+  press.start(down(), 'row-a');
+  assert.equal(timers.at(-1).delay, 450);
+  press.move({ pointerId: 1, clientX: 106, clientY: 205 });
+  timers.at(-1).callback();
+  assert.deepEqual(fired, ['row-a'], 'a small wobble still counts as a press');
+  assert.equal(press.end({ pointerId: 1 }), true, 'the click after a fired press is swallowed');
+  press.start(down(), 'row-b');
+  press.move({ pointerId: 1, clientX: 100, clientY: 212 });
+  assert.equal(timers.at(-1).cleared, true, 'moving past the slop (a scroll) cancels');
+  timers.at(-1).callback();
+  press.start(down(), 'row-c');
+  assert.equal(press.end({ pointerId: 1 }), false, 'a release before 450ms is an ordinary tap');
+  timers.at(-1).callback();
+  assert.deepEqual(fired, ['row-a']);
+  press.start(down({ pointerType: 'mouse' }), 'row-d');
+  assert.equal(press.active, null, 'a mouse uses the right-click menu instead');
+  press.start(down(), 'row-e');
+  assert.equal(press.fire(), true, "Android's contextmenu opens it at once");
+  assert.equal(press.fire(), false);
+  assert.deepEqual(fired, ['row-a', 'row-e']);
+  // Wired to a conversation: the long press opens the message menu and its click is ignored.
+  const { s } = selectChat(c);
+  c.renderMessages(s, [{ role: 'assistant', text: '길게 눌러 볼 답변' }]);
+  const list = c.get('messages');
+  const row = list.children[0];
+  vm.runInContext('bindMessageGestures', c.context)(list);
+  const target = { closest: (selector) => (selector === '.msg' ? row : null) };
+  list.events.pointerdown({ ...down(), target });
+  timers.at(-1).callback();
+  assert.equal(c.get('action-sheet').open, true);
+  assert.deepEqual(c.get('action-list').children.map((item) => item.textContent), ['복사', '텍스트 선택', '터미널에서 보기']);
+  list.events.pointerup({ pointerId: 1 });
+  let stopped = 0;
+  list.events.click({ preventDefault() { stopped++; }, stopPropagation() { stopped++; } });
+  assert.equal(stopped, 2);
+  let prevented = 0;
+  list.events.contextmenu({ target, clientX: 10, clientY: 10, preventDefault() { prevented++; } });
+  assert.equal(prevented, 1, 'the native long-press menu stays closed');
+  // A right click (no press in progress) opens the same menu at the pointer.
+  c.closeActionSheet();
+  c.context.Date = { now: () => 1e13 };
+  list.events.contextmenu({ target, clientX: 10, clientY: 10, preventDefault() { prevented++; } });
+  assert.equal(prevented, 2); assert.equal(c.get('action-sheet').open, true);
+});
+
+test('a card swipe needs a sideways drag within about 30 degrees and settles open, back or into its action', () => {
+  const c = client(undefined, noChatTimers);
+  assert.equal(c.swipeIntent(-6, 2), null, 'inside the slop nothing is decided');
+  assert.equal(c.swipeIntent(-30, 5), 'swipe');
+  assert.equal(c.swipeIntent(-17, 10), 'swipe', 'up to about 30 degrees');
+  assert.equal(c.swipeIntent(-16, 10), 'scroll', 'steeper drags scroll the list');
+  assert.equal(c.swipeIntent(2, 40), 'scroll');
+  assert.equal(c.swipeIntent(30, 2), 'scroll', 'a rightward drag on a closed card is left to the browser');
+  assert.equal(c.swipeIntent(30, 2, true), 'swipe', 'but closes an open card');
+  const release = (fields) => c.swipeRelease({ width: 380, ...fields });
+  assert.equal(release({ offset: -20, velocity: 0 }), 'close');
+  assert.equal(release({ offset: -60, velocity: 0 }), 'open');
+  assert.equal(release({ offset: -30, velocity: -0.8 }), 'open', 'a quick flick opens');
+  assert.equal(release({ offset: -230, velocity: 0 }), 'action', 'past 60% of the card runs the action');
+  assert.equal(release({ offset: -80, velocity: 0.6 }), 'close', 'flicking back closes');
+});
+
+test('a swipe offers 터미널 열기, or 연결 닫기 when the session has a board terminal, and the same actions open from a long press', () => {
+  const c = client(undefined, noChatTimers);
+  const s = recentSession('swipe-me');
+  setRecentSnapshot(c, [s]); c.renderGroups([s], 1100);
+  const row = byClass(c.get('groups'), 'card-row')[0];
+  assert.equal(row.card, byClass(c.get('groups'), 'card')[0]);
+  assert.equal(row.swipeAction.attributes['aria-hidden'], 'true', 'the swipe button stays out of the focus order');
+  assert.equal(c.swipeActionFor(s).label, '터미널 열기');
+  c.state.terminals = [{ id: 'attached', alive: true, mode: 'attach',
+    metadata: { nativeSource: { host: s.host, agent: s.agent, home: s.home, id: s.id }, mode: 'attach' } }];
+  assert.equal(c.terminalForSession(s).id, 'attached');
+  assert.equal(c.swipeActionFor(s).label, '연결 닫기');
+  c.state.terminals = [{ id: 'gone', alive: false, sourceKey: JSON.stringify({ agent: s.agent, home: s.home, host: s.host, id: s.id }) },
+    { id: 'launched', alive: true, mode: 'handoff', sourceKey: JSON.stringify({ agent: s.agent, home: s.home, host: s.host, id: s.id }) }];
+  assert.equal(c.terminalForSession(s).id, 'launched', 'a terminal launched from the session counts; a closed one does not');
+  assert.equal(c.swipeActionFor(s).label, '실행 종료');
+  // Touch drag on the list: the card follows the finger and stays open past half the button.
+  const groups = c.get('groups');
+  vm.runInContext('bindCardGestures', c.context)(groups);
+  const target = { closest: (selector) => (selector === '.card-row' ? row : null) };
+  let prevented = 0;
+  groups.events.pointerdown({ target, pointerId: 3, pointerType: 'touch', clientX: 300, clientY: 100 });
+  groups.events.pointermove({ target, pointerId: 3, clientX: 280, clientY: 103, cancelable: true, preventDefault() {} });
+  groups.events.touchmove({ cancelable: true, preventDefault() { prevented++; } });
+  groups.events.pointermove({ target, pointerId: 3, clientX: 200, clientY: 106, cancelable: true, preventDefault() {} });
+  assert.equal(row.swipeOffset, -100);
+  assert.equal(prevented, 1, 'a swiping finger does not also scroll the list');
+  assert.equal(row.swipeAction.textContent, '실행 종료');
+  groups.events.pointerup({ pointerId: 3 });
+  assert.equal(c.state.swipeOpen, row); assert.equal(row.swipeOffset, -c.SWIPE_REVEAL);
+  assert.match(row.className, /is-open/);
+  // The revealed button takes its first tap right after the swipe.
+  let swallowed = 0;
+  groups.events.click({ target: { closest: (selector) => (selector === '.card-swipe-action' ? row.swipeAction : null) },
+    preventDefault() { swallowed++; }, stopPropagation() { swallowed++; } });
+  assert.equal(swallowed, 0);
+  row.swipeAction.events.click();
+  assert.equal(c.get('close-terminal-dialog').open, true, 'its action runs (closing asks first)');
+  assert.equal(c.state.swipeOpen, null);
+  c.cancelTerminalClose();
+  c.prepareSwipe(row); c.settleSwipe(row, 'open');
+  // Tapping the open card closes it instead of opening the conversation.
+  c.context.Date = { now: () => 1e13 };
+  row.card.events.click();
+  assert.equal(c.state.swipeOpen, null); assert.equal(c.state.selected, null);
+  // The action asks for confirmation (the existing close sheet); nothing closes directly.
+  c.prepareSwipe(row); c.settleSwipe(row, 'action');
+  assert.equal(c.get('close-terminal-dialog').open, true);
+  assert.equal(c.get('close-terminal-confirm').textContent, '실행 종료');
+  c.cancelTerminalClose();
+  c.openCardMenu(row);
+  assert.deepEqual(c.get('action-list').children.map((item) => item.textContent), ['대화 열기', '터미널로 돌아가기', '실행 종료']);
+  // A vertical drag is a scroll: no swipe, no menu.
+  groups.events.pointerdown({ target, pointerId: 4, pointerType: 'touch', clientX: 300, clientY: 100 });
+  groups.events.pointermove({ target, pointerId: 4, clientX: 296, clientY: 130, cancelable: true, preventDefault() {} });
+  groups.events.pointerup({ pointerId: 4 });
+  assert.equal(c.state.swipeOpen, null);
+});
+
+test('consecutive messages from one speaker group under one name and time, with tighter spacing, and regroup on new rows', () => {
+  const c = client(undefined, noChatTimers); const { s } = selectChat(c);
+  const messages = [{ role: 'assistant', text: '첫 답변', ts: 1000 }, { role: 'assistant', text: '이어지는 답변', ts: 1060 },
+    { role: 'user', text: '질문', ts: 1100 }, { role: 'user', text: '추가 질문', ts: 1110 },
+    { role: 'tool', text: '도구 기록' }, { role: 'assistant', text: '도구 뒤 답변', ts: 1200 },
+    { role: 'assistant', text: '한참 뒤 답변', ts: 1900 }];
+  c.renderMessages(s, messages);
+  const flags = () => c.get('messages').children.map((row) =>
+    [/is-cont/.test(row.className), /has-next/.test(row.className), row.msgLabel ? row.msgLabel.hidden : null]);
+  assert.deepEqual(flags(), [[false, true, false], [true, false, true], [false, true, false], [true, false, true],
+    [false, false, null], [false, false, false], [false, false, false]]);
+  const last = c.get('messages').children[6];
+  c.renderMessages(s, [...messages, { role: 'assistant', text: '바로 이어진 답변', ts: 1930 }]);
+  assert.equal(c.get('messages').children[6], last, 'the row is reused');
+  assert.deepEqual(flags().slice(6), [[false, true, false], [true, false, true]]);
+  assert.match(styleSheet(), /\.msg\.is-cont \{\s*margin-top: -10px;/);
+});
+
+test('a working agent shows "··· 작업 중" after the newest message, still under reduced motion, and it leaves when the turn ends', () => {
+  const c = client(undefined, noChatTimers); const { s, entry } = selectChat(c);
+  entry.data.phase = 'working';
+  c.renderMessages(s, [{ role: 'user', text: '시작해 주세요' }]);
+  const list = c.get('messages');
+  assert.match(list.children.at(-1).className, /msg-working/);
+  assert.match(textOf(list.children.at(-1)), /작업 중/);
+  assert.equal(list.children.at(-1).attributes.role, 'status');
+  c.renderMessages(s, [{ role: 'user', text: '시작해 주세요' }, { role: 'assistant', text: '보는 중' }]);
+  assert.match(list.children.at(-1).className, /msg-working/, 'it stays last as messages arrive');
+  entry.data.phase = 'idle';
+  c.renderMessages(s, [{ role: 'user', text: '시작해 주세요' }, { role: 'assistant', text: '끝났습니다' }]);
+  assert.equal(list.children.some((row) => /msg-working/.test(row.className)), false);
+  assert.match(styleSheet(), /@media \(prefers-reduced-motion: reduce\) \{[^@]*\.working-dots i \{\s*animation: none;/);
+});
+
+test('picked images preview from memory with an upload ring, move to the uploaded file, and are released when removed', async () => {
+  const created = []; const revoked = [];
+  const c = client(undefined, noChatTimers);
+  c.context.URL = class extends URL {};
+  c.context.URL.createObjectURL = (file) => { created.push(file.name); return `blob:preview-${created.length}`; };
+  c.context.URL.revokeObjectURL = (url) => revoked.push(url);
+  const sent = [];
+  c.context.XMLHttpRequest = class {
+    constructor() { this.headers = {}; this.listeners = {}; this.upload = { addEventListener: (type, callback) => { this.onProgress = callback; } }; sent.push(this); }
+    open(method, url) { this.method = method; this.url = url; }
+    setRequestHeader(name, value) { this.headers[name] = value; }
+    addEventListener(type, callback) { this.listeners[type] = callback; }
+    send(body) { this.body = body; }
+  };
+  const { s, entry } = selectChat(c);
+  wireTree(c, c.buildChatComposer(s)); await settle();
+  const photo = { name: '화면.png', size: 2048, type: 'image/png' };
+  const pending = c.uploadChatFiles(entry, [photo]);
+  await settle();
+  const request = sent[0];
+  assert.equal(request.method, 'POST'); assert.equal(request.url, '/api/chat/upload'); assert.equal(request.body, photo);
+  assert.equal(request.headers['X-CSRF-Token'], 'csrf-test');
+  assert.equal(JSON.parse(decodeURIComponent(request.headers['X-Chat-Source'])).home, '.codex-example');
+  assert.equal(decodeURIComponent(request.headers['X-File-Name']), '화면.png');
+  const tile = byClass(c.get('chat-attachments'), 'chat-attachment')[0];
+  assert.match(tile.className, /is-image is-uploading/);
+  assert.equal(byClass(tile, 'chat-attachment-preview')[0].children[0].src, 'blob:preview-1');
+  const ring = byClass(tile, 'upload-ring')[0];
+  assert.equal(ring.attributes.role, 'progressbar');
+  request.onProgress({ lengthComputable: true, loaded: 512, total: 2048 });
+  assert.equal(ring.attributes['aria-valuenow'], '25');
+  request.status = 200;
+  request.responseText = JSON.stringify({ attachment: { id: 'up-1', name: '화면.png', size: 2048, type: 'image/png' } });
+  request.listeners.load();
+  await pending; await settle();
+  assert.deepEqual(Array.from(entry.attachments, (item) => item.id), ['up-1']);
+  const done = byClass(c.get('chat-attachments'), 'chat-attachment')[0];
+  assert.doesNotMatch(done.className, /is-uploading/);
+  assert.equal(byClass(done, 'chat-attachment-preview')[0].children[0].src, 'blob:preview-1', 'the preview follows the upload');
+  assert.deepEqual(revoked, []);
+  byClass(done, 'chat-attachment-remove')[0].events.click();
+  assert.deepEqual(revoked, ['blob:preview-1'], 'released with its tile');
+  // A failed upload releases its preview too, and locking releases whatever is left.
+  const again = c.uploadChatFiles(entry, [{ name: '두번째.png', size: 10, type: 'image/png' }]);
+  await settle();
+  sent[1].listeners.error();
+  await again; await settle();
+  assert.deepEqual(revoked, ['blob:preview-1', 'blob:preview-2']);
+  assert.match(entry.error, /첨부파일을 올리지 못했습니다/);
+  c.attachmentThumb(entry, 'left-over', { name: 'x.png', type: 'image/png' });
+  c.showLogin();
+  assert.deepEqual(revoked, ['blob:preview-1', 'blob:preview-2', 'blob:preview-3']);
+});
+
+test('the board text size is its own stored choice scaling the rem type scale, apart from the terminal size', () => {
+  const c = client(undefined, noChatTimers);
+  const root = c.context.document.documentElement;
+  root.attributes = {};
+  root.setAttribute = (name, value) => { root.attributes[name] = String(value); };
+  root.removeAttribute = (name) => { delete root.attributes[name]; };
+  const writes = [];
+  c.context.localStorage = { getItem: () => null, setItem: (key, value) => writes.push([key, value]) };
+  c.setTextSize('large');
+  assert.equal(root.attributes['data-text-size'], 'large');
+  assert.equal(c.get('text-size-large').checked, true); assert.equal(c.get('text-size-default').checked, false);
+  c.setTextSize('large');
+  c.setTextSize('huge');
+  assert.equal(c.state.textSize, 'default'); assert.equal(root.attributes['data-text-size'], undefined);
+  assert.deepEqual(writes, [['sessionholic:ui:textSize', '"large"'], ['sessionholic:ui:textSize', '"default"']]);
+  assert.equal(c.state.fontSize, 14, 'the terminal text size is untouched');
+  c.context.navigator = { onLine: false };
+  c.windowEvents.DOMContentLoaded();
+  c.get('text-size-small').events.change({ target: { checked: true } });
+  assert.equal(root.attributes['data-text-size'], 'small');
+  const css = styleSheet();
+  assert.match(css, /:root\[data-text-size="large"\] \{\s*font-size: 112\.5%;/);
+  assert.match(css, /:root\[data-text-size="small"\] \{\s*font-size: 93\.75%;/);
+  const tokens = cssBlock(css.replace(/\/\*[\s\S]*?\*\//g, ''), ':root');
+  for (const name of ['--fs-head', '--fs-body', '--fs-sub', '--fs-cap']) assert.match(tokens[name], /^[\d.]+rem$/, name);
+  for (const name of ['--fs-large', '--fs-title']) assert.match(tokens[name], /^clamp\([\d.]+rem, .*\)$/, name);
+  assert.doesNotMatch(css, /content:\s*['"][⌄⌃]['"]/, 'chevrons are drawn, not glyphs');
+  assert.match(indexPage(), /id="refresh"[\s\S]{0,200}<svg/, 'the refresh icon is drawn too');
+  assert.match(css, /input\.switch \{[^}]*appearance: none;/);
+  for (const id of ['show-old', 'terminal-direct-input', 'terminal-accessibility'])
+    assert.match(indexPage(), new RegExp(`id="${id}" class="switch" type="checkbox" role="switch"`), id);
+});
+
+test('theme-init applies a forced theme and text size before paint, keeps meta originals for auto, and survives blocked storage', () => {
+  const source = fs.readFileSync(path.join(__dirname, '../web/theme-init.js'), 'utf8');
+  const run = (stored, { throws = false } = {}) => {
+    const attributes = {};
+    const meta = (content) => ({ attributes: { content }, getAttribute(name) { return this.attributes[name] ?? null; },
+      setAttribute(name, value) { this.attributes[name] = String(value); } });
+    const metas = [meta('#f2f2f7'), meta('#000000')];
+    const document = { documentElement: { setAttribute(name, value) { attributes[name] = String(value); } },
+      querySelectorAll: (selector) => (selector === 'meta[name="theme-color"]' ? metas : []) };
+    const localStorage = { getItem(key) { if (throws) throw new Error('blocked'); return stored[key] ?? null; } };
+    vm.runInNewContext(source, { window: { localStorage }, document, JSON });
+    return { attributes, metas };
+  };
+  const dark = run({ 'sessionholic:ui:theme': '"dark"', 'sessionholic:ui:textSize': '"large"' });
+  assert.deepEqual(dark.attributes, { 'data-theme': 'dark', 'data-text-size': 'large' });
+  assert.deepEqual(dark.metas.map((item) => [item.attributes.content, item.attributes['data-original']]),
+    [['#000000', '#f2f2f7'], ['#000000', '#000000']]);
+  assert.deepEqual(run({ 'sessionholic:ui:theme': '"light"' }).metas.map((item) => item.attributes.content), ['#f2f2f7', '#f2f2f7']);
+  const auto = run({ 'sessionholic:ui:theme': '"auto"', 'sessionholic:ui:textSize': '"default"' });
+  assert.deepEqual(auto.attributes, {});
+  assert.equal(auto.metas[0].attributes['data-original'], undefined);
+  assert.deepEqual(run({ 'sessionholic:ui:theme': '{not json' }).attributes, {});
+  assert.deepEqual(run({}, { throws: true }).attributes, {}, 'blocked storage keeps the device defaults');
+  const html = indexPage();
+  const init = html.indexOf('<script src="/theme-init.js"></script>');
+  assert.ok(init > 0, 'loaded without defer');
+  assert.ok(init < html.indexOf('<link rel="stylesheet" href="/style.css"'), 'before the stylesheet');
+  assert.ok(html.lastIndexOf('name="theme-color"', init) > 0, 'after the theme-color metas it updates');
+  assert.match(fs.readFileSync(path.join(__dirname, '../web/sw.js'), 'utf8'), /"\/theme-init\.js",/);
+  assert.ok(JSON.parse(fs.readFileSync(path.join(__dirname, '../scripts/public-files.json'), 'utf8')).includes('web/theme-init.js'));
+  // app.js keeps the original colors theme-init recorded, so "auto" restores them.
+  const c = client(undefined, noChatTimers);
+  const metas = dark.metas.map((item) => ({ ...item, dataset: { original: item.attributes['data-original'] },
+    getAttribute(name) { return this.attributes[name]; }, setAttribute(name, value) { this.attributes[name] = value; } }));
+  c.context.document.querySelectorAll = (selector) => (selector === 'meta[name="theme-color"]' ? metas : []);
+  c.applyTheme('auto');
+  assert.deepEqual(metas.map((item) => item.attributes.content), ['#f2f2f7', '#000000']);
+});
+
+test('the top shows "오프라인 · 다시 연결 중" while offline or after two failed reads in a row, and clears after a good read', async () => {
+  let fail = false;
+  const c = client(async (url) => {
+    if (fail) throw new Error('down');
+    return { ok: true, status: 200, json: async () => (url.startsWith('/api/snapshot') ? { hosts: [], serverTime: 1 } : { hosts: [], terminals: [] }) };
+  }, noChatTimers);
+  c.context.navigator = { onLine: true };
+  c.windowEvents.DOMContentLoaded(); await settle(10);
+  assert.equal(c.state.authenticated, true);
+  assert.equal(c.get('offline-banner').hidden, true);
+  c.windowEvents.offline();
+  assert.equal(c.get('offline-banner').hidden, false);
+  assert.equal(c.get('offline-text').textContent, '오프라인 · 다시 연결 중');
+  assert.equal(c.get('offline-banner').dataset.kind, 'offline');
+  assert.equal(c.get('connection-notice').hidden, true, 'one indicator for one state');
+  c.context.navigator.onLine = true; c.windowEvents.online(); await settle(10);
+  assert.equal(c.get('offline-banner').hidden, true);
+  fail = true;
+  await c.poll(false);
+  assert.equal(c.get('offline-banner').hidden, true, 'a single failed read retries quietly');
+  await c.poll(false);
+  assert.equal(c.get('offline-banner').hidden, false);
+  assert.equal(c.get('offline-text').textContent, '연결 끊김 · 다시 연결 중');
+  c.state.terminalVisible = true; c.renderConnectivity();
+  assert.equal(c.get('offline-banner').hidden, true, 'the terminal shows its own connection state');
+  c.state.terminalVisible = false;
+  fail = false; await c.poll(false);
+  assert.equal(c.get('offline-banner').hidden, true);
+  assert.match(indexPage(), /<div id="offline-banner" class="offline-banner" role="status" hidden>/);
+});
+
+test('the first paint shows skeleton cards, a collection in progress keeps them, and the list replaces them', () => {
+  const html = indexPage();
+  assert.match(html, /<div id="groups" class="groups" aria-busy="true">\s*<div class="skeleton-list" aria-hidden="true">/);
+  assert.match(html, /<p class="sr-only" role="status">작업을 확인하고 있습니다…<\/p>/);
+  const c = client(undefined, noChatTimers);
+  c.state.snapshot = { hosts: [{ name: 'workstation', ok: true, refreshing: true }] };
+  c.renderGroups([], 1100);
+  assert.equal(byClass(c.get('groups'), 'skeleton-card').length, 4);
+  assert.equal(c.get('groups').attributes['aria-busy'], 'true');
+  const s = recentSession('ready'); setRecentSnapshot(c, [s]);
+  c.renderGroups([s], 1100);
+  assert.equal(byClass(c.get('groups'), 'skeleton-card').length, 0);
+  assert.equal(c.get('groups').attributes['aria-busy'], 'false');
+  assert.match(styleSheet(), /@media \(prefers-reduced-motion: reduce\) \{[^@]*\.skeleton-card span \{\s*animation: none;/);
+});
+
+test('a long question menu keeps its first choices inline and lists every choice in a sheet that only selects', async () => {
+  const requests = [];
+  const c = client(async (url, opts) => { requests.push(url); return { ok: true, status: 200, json: async () => ({ messages: [] }) }; }, noChatTimers);
+  const { s, entry } = selectChat(c);
+  c.drawDetail(s);
+  const prompt = { agent: 'codex', fingerprint: 'e'.repeat(64), current: 1, multi: false, question: '어느 브랜치에 반영할까요?\n자세한 설명',
+    options: Array.from({ length: 7 }, (_, index) => ({ number: index + 1, label: `브랜치 ${index + 1}`, detail: '' })) };
+  entry.data = { ...entry.data, prompt, phase: 'needs_input' };
+  c.renderPrompt(s, entry.data);
+  const card = c.get('chat-prompt');
+  assert.equal(findClass(card, 'chat-prompt-option').length, 4);
+  const more = findClass(card, 'chat-prompt-more')[0];
+  assert.equal(more.textContent, '선택지 7개 모두 보기');
+  more.events.click();
+  assert.equal(c.get('action-sheet').open, true);
+  assert.equal(c.get('action-title').textContent, '어느 브랜치에 반영할까요?');
+  const items = c.get('action-list').children;
+  assert.equal(items.length, 7);
+  items[5].events.click();
+  assert.equal(c.get('action-sheet').open, false);
+  assert.equal(entry.promptChoice.number, 6);
+  assert.equal(requests.length, 0, 'choosing in the sheet sends nothing');
+  const inline = findClass(c.get('chat-prompt'), 'chat-prompt-option');
+  assert.deepEqual(inline.map((item) => item.attributes['aria-checked']), ['false', 'false', 'false', 'false', 'true'],
+    'the chosen choice joins the inline list');
+  assert.match(findClass(c.get('chat-prompt'), 'primary')[0].textContent, /6번 보내기/);
+  // Short menus are unchanged: every choice inline, no sheet.
+  entry.data = { ...entry.data, prompt: { ...prompt, fingerprint: 'd'.repeat(64), options: prompt.options.slice(0, 5) } };
+  c.renderPrompt(s, entry.data);
+  assert.equal(findClass(c.get('chat-prompt'), 'chat-prompt-option').length, 5);
+  assert.equal(findClass(c.get('chat-prompt'), 'chat-prompt-more').length, 0);
 });

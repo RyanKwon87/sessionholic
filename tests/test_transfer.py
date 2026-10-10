@@ -614,6 +614,101 @@ class RuntimeInstallTest(unittest.TestCase):
         self.status()
         self.assertFalse(stale.exists());self.assertFalse(leftover.exists())
         self.assertTrue(fresh.exists());self.assertTrue(unrelated.exists());self.assertTrue(current.exists())
+    def recorded(self):
+        """Run real bootstrap processes while recording whether each one carried the helper."""
+        sent,real=[],subprocess.run
+        def run(*args,**kwargs):
+            sent.append('runtime' in json.loads(kwargs['input']))
+            return real(*args,**kwargs)
+        return sent,patch('transfer.subprocess.run',side_effect=run)
+    def test_installed_helper_is_reached_with_its_sha_only(self):
+        sent,recording=self.recorded()
+        with recording:
+            # A fresh host is asked with the SHA first, answers need-runtime, then gets the archive.
+            self.assertEqual(self.status(),{'prepared':False,'started':False})
+            self.assertEqual(sent,[False,True])
+            self.assertIs(self.flow.runtime_installed['self'],True)
+            del sent[:]
+            self.assertEqual(self.status(),{'prepared':False,'started':False})
+            self.assertEqual(sent,[False])
+            # Another coordinator process (a restart) finds the installed helper by SHA alone.
+            restarted=Transfers([self.host],self.home/'board-state')
+            self.assertEqual(restarted.rpc(self.host,'status',{'transferId':'f'*32}),{'prepared':False,'started':False})
+            self.assertEqual(sent,[False,False])
+            # A helper removed on the host is reinstalled after one explicit need-runtime reply.
+            current=self.root/('worker-'+self.flow.runtime()['sha256']+'.pyz')
+            current.unlink();del sent[:]
+            self.status()
+            self.assertEqual(sent,[False,True])
+            self.assertEqual(hashlib.sha256(current.read_bytes()).hexdigest(),self.flow.runtime()['sha256'])
+    def test_sha_only_bootstrap_never_runs_or_installs_a_missing_helper(self):
+        runtime=self.flow.runtime()
+        payload={'sha256':runtime['sha256'],'request':{'op':'status','args':{'transferId':'f'*32}}}
+        done=subprocess.run([sys.executable,'-I','-c',transfer.BOOTSTRAP],input=json.dumps(payload).encode(),
+                            capture_output=True,timeout=30)
+        self.assertEqual(done.returncode,0)
+        self.assertEqual(json.loads(done.stdout),{'ok':False,'needRuntime':True,'sha256':runtime['sha256']})
+        self.assertEqual(list(self.root.iterdir()),[])
+        # A runtime that does not match its SHA is still refused before anything is written.
+        payload.update(runtime=base64.b64encode(b'not the helper').decode())
+        done=subprocess.run([sys.executable,'-I','-c',transfer.BOOTSTRAP],input=json.dumps(payload).encode(),
+                            capture_output=True,timeout=30)
+        self.assertNotEqual(done.returncode,0)
+        self.assertEqual(list(self.root.iterdir()),[])
+
+
+class RuntimeMemoryTest(unittest.TestCase):
+    """Per-host memory of the installed helper decides whether the archive is sent."""
+    def setUp(self):
+        self.temp=tempfile.TemporaryDirectory();self.addCleanup(self.temp.cleanup)
+        self.flow=Transfers(HOSTS,self.temp.name)
+        self.sha=self.flow.runtime()['sha256']
+        self.sent,self.replies=[],[]
+        def run(command,input=None,**kwargs):
+            payload=json.loads(input)
+            self.assertEqual(payload['sha256'],self.sha)
+            self.sent.append(('runtime' in payload,command[command.index('--')+1] if '--' in command else 'local'))
+            reply=self.replies.pop(0)
+            if isinstance(reply,Exception):raise reply
+            return subprocess.CompletedProcess(command,0,json.dumps(reply).encode(),b'')
+        patcher=patch('transfer.subprocess.run',side_effect=run);patcher.start();self.addCleanup(patcher.stop)
+    def ok(self,result=None):
+        return {'ok':True,'result':result or {},'runtime':'/fixture/worker-'+self.sha+'.pyz'}
+    def need(self):
+        return {'ok':False,'needRuntime':True,'sha256':self.sha}
+    def test_need_runtime_resends_the_archive_once_and_remembers_the_host(self):
+        remote=HOSTS[1]
+        self.replies=[self.need(),self.ok({'step':1}),self.ok({'step':2})]
+        self.assertEqual(self.flow.rpc(remote,'status',{}),{'step':1})
+        self.assertEqual(self.flow.rpc(remote,'status',{}),{'step':2})
+        self.assertEqual(self.sent,[(False,'local'),(True,'local'),(False,'local')])
+        self.assertEqual(self.flow.runtime_installed,{'local':True})
+        # Memory is per host: another host starts with its own SHA-first probe.
+        self.replies=[self.ok()]
+        self.flow.rpc(HOSTS[0],'status',{})
+        self.assertEqual(self.sent[-1],(False,'local'))
+        self.assertEqual(self.flow.runtime_installed,{'local':True,'remote':True})
+    def test_need_runtime_forgets_the_install_until_a_full_copy_is_confirmed(self):
+        remote=HOSTS[1]
+        self.replies=[self.ok(),self.need(),RuntimeError('fixture transport')]
+        self.flow.rpc(remote,'status',{})
+        with self.assertRaisesRegex(RuntimeError,'fixture transport'):
+            self.flow.rpc(remote,'status',{})
+        self.assertIs(self.flow.runtime_installed['local'],False)
+        # Known to be missing: the next call sends the archive at once, without another probe.
+        self.replies=[self.ok({'again':True})]
+        self.assertEqual(self.flow.rpc(remote,'status',{}),{'again':True})
+        self.assertEqual(self.sent,[(False,'local'),(False,'local'),(True,'local'),(True,'local')])
+        self.assertIs(self.flow.runtime_installed['local'],True)
+    def test_need_runtime_for_another_sha_or_after_a_full_copy_is_an_error(self):
+        remote=HOSTS[1]
+        self.replies=[{'ok':False,'needRuntime':True,'sha256':'0'*64}]
+        with self.assertRaises(WorkerError):
+            self.flow.rpc(remote,'status',{})
+        self.replies=[self.need(),self.need()]
+        with self.assertRaisesRegex(RuntimeError,'도우미를 설치하지 못했습니다'):
+            self.flow.rpc(remote,'status',{})
+        self.assertEqual(self.sent[-2:],[(False,'local'),(True,'local')])
 
 
 class SshReuseTest(unittest.TestCase):

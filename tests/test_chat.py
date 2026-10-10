@@ -290,7 +290,7 @@ class ChatTest(unittest.TestCase):
         self.assertEqual(set(receipt),{'requestId','status','confirmed','readbackConfirmed','currentSnapshotConfirmed',
                                        'acknowledged','turnId','reason','attachments'})
         self.assertEqual(self.chat.receipt({'delivery':'rejected'},'request-0001')['status'],'failed')
-    def test_batch_receipts_use_one_read_and_never_enter_plain_state_cache(self):
+    def test_batch_receipts_use_one_read_and_plain_cache_hits_show_no_receipts(self):
         def rpc(host,op,args,timeout):
             self.calls.append((host['name'],op,args))
             return {'messages':[], 'receipts':[{'requestId':identifier,'delivery':'accepted','confirmed':True,
@@ -302,11 +302,12 @@ class ChatTest(unittest.TestCase):
         self.assertTrue(all(not r['currentSnapshotConfirmed'] for r in result['receipts']))
         self.assertEqual(len(self.calls),1)
         self.assertEqual(self.calls[0][2]['action'],'read')
+        # The same read answers a plain view from the cache, without anyone's receipts.
         self.assertEqual(self.chat.state({'source':REF})['receipts'],[])
-        self.assertEqual(len(self.calls),2)
+        self.assertEqual(len(self.calls),1)
         for ids in (['invalid'], ['request-'+str(i) for i in range(21)], None):
             with self.assertRaises(ValueError):self.chat.state({'source':REF,'requestIds':ids})
-        self.assertEqual(len(self.calls),2)
+        self.assertEqual(len(self.calls),1)
     def test_state_accepts_native_ids_without_broadening_web_send_ids(self):
         ids=['native.request:000','n'*128]
         response=self.chat.state({'source':REF,'requestId':ids[0],'requestIds':ids})
@@ -350,24 +351,123 @@ class ChatTest(unittest.TestCase):
         self.assertEqual(len(self.calls),1)
         self.board.state['local']['ok']=False
         with self.assertRaises(RuntimeError): self.chat.state({'source':REF})
-    def test_receipt_lookup_does_not_pollute_plain_state_cache(self):
+    def test_receipt_lookup_answers_plain_reads_from_cache_without_receipts(self):
         receipt=self.chat.state({'source':REF,'requestId':'request-0001'})
         self.assertEqual(receipt['receipts'][0]['requestId'],'request-0001')
         plain=self.chat.state({'source':REF})
         self.assertEqual(plain['receipts'],[])
-        self.assertEqual(len(self.calls),2)
-        self.assertEqual([args['action'] for _,_,args in self.calls],['read','read'])
+        self.assertEqual(plain['messages'],receipt['messages'])
+        # The cached view itself keeps its receipt for the next request that asks for it.
+        self.assertEqual(self.chat.state({'source':REF,'requestId':'request-0001'})['receipts'],receipt['receipts'])
+        self.assertEqual(len(self.calls),1)
         self.assertEqual(self.calls[0][2]['requestId'],'request-0001')
+        self.chat.cache.clear()
+        self.chat.state({'source':REF})
+        self.assertEqual([args['action'] for _,_,args in self.calls],['read','read'])
         self.assertNotIn('requestId',self.calls[1][2])
     def test_combined_missing_or_other_request_receipt_remains_unknown(self):
         for result in ({'messages':[]}, {'messages':[],'receipts':[{'requestId':'different-request','delivery':'completed','confirmed':True}]}):
             with self.subTest(result=result):
                 calls=[]
+                self.chat.cache.clear()
                 self.flow.transfers.rpc=lambda *a,**k: calls.append((a,k)) or result
                 response=self.chat.state({'source':REF,'requestId':'request-0001'})
                 self.assertEqual(response['receipts'][0]['status'],'unknown')
                 self.assertFalse(response['receipts'][0]['confirmed'])
                 self.assertEqual(len(calls),1)
+    def receipt_rpc(self):
+        """Codex reads that answer every asked id, numbering the reads."""
+        def rpc(host,op,args,timeout):
+            self.calls.append((host['name'],op,args))
+            if args.get('action')!='read':
+                return {'delivery':'accepted','confirmed':True,'acknowledged':True,'turnId':'t1'}
+            ids=([args['requestId']] if args.get('requestId') else [])+args.get('requestIds',[])
+            return {'cwd':str(self.project),'phase':'idle','capabilities':{'canSend':True},
+                    'messages':[{'role':'assistant','text':'read %d'%len(self.calls)}],
+                    'receipts':[{'requestId':i,'delivery':'accepted','confirmed':True} for i in dict.fromkeys(ids)]}
+        self.flow.transfers.rpc=rpc
+
+    def test_watcher_read_carries_the_receipts_clients_wait_for(self):
+        self.receipt_rpc()
+        key=chat.Chat.state_key(self.source)
+        import events
+        self.assertEqual(events.watch_key(chat.Chat.identity(self.source)),key)
+        self.chat.state({'source':REF,'requestId':'request-000a','requestIds':['request-000a']})
+        self.chat.state({'source':REF,'requestIds':['request-000b']})
+        self.assertEqual(self.chat._waiting_ids(key,time.monotonic()),['request-000a','request-000b'])
+        self.chat.cache.clear()
+        watched=self.chat.state({'source':REF},watching=True)
+        # One remote read asks for every waiting id; no single requestId is sent for the watcher.
+        self.assertEqual(self.calls[-1][2]['requestIds'],['request-000a','request-000b'])
+        self.assertNotIn('requestId',self.calls[-1][2])
+        self.assertEqual([r['requestId'] for r in watched['receipts']],['request-000a','request-000b'])
+        reads=len(self.calls)
+        # A subset is answered from the cache: only the asked receipts, in the asked order.
+        both=self.chat.state({'source':REF,'requestId':'request-000b','requestIds':['request-000b','request-000a']})
+        self.assertEqual([r['requestId'] for r in both['receipts']],['request-000b','request-000a'])
+        self.assertTrue(all(r['status']=='accepted' for r in both['receipts']))
+        one=self.chat.state({'source':REF,'requestIds':['request-000a']})
+        self.assertEqual([r['requestId'] for r in one['receipts']],['request-000a'])
+        self.assertEqual(self.chat.state({'source':REF})['receipts'],[])
+        self.assertEqual(one['messages'],watched['messages'])
+        self.assertEqual([r['requestId'] for r in watched['receipts']],['request-000a','request-000b'])
+        self.assertEqual(len(self.calls),reads)
+        # The watcher's own reads never keep an id waiting.
+        expiry=dict(self.chat.waiting[key])
+        self.chat.state({'source':REF},watching=True)
+        self.assertEqual(self.chat.waiting[key],expiry)
+        self.assertEqual(len(self.calls),reads)
+        # An id outside the cached set is a new remote read, which replaces the cache. It also
+        # carries the ids still waited on (asked ids first), so the watcher and other clients share it.
+        fresh=self.chat.state({'source':REF,'requestIds':['request-000c']})
+        self.assertEqual(len(self.calls),reads+1)
+        self.assertEqual(self.calls[-1][2]['requestIds'],['request-000c','request-000b','request-000a'])
+        self.assertEqual([r['requestId'] for r in fresh['receipts']],['request-000c'])
+        again=self.chat.state({'source':REF,'requestIds':['request-000a']})
+        self.assertEqual([r['requestId'] for r in again['receipts']],['request-000a'])
+        self.assertEqual(len(self.calls),reads+1)
+        # A stale cache is never used, even for a covered subset.
+        cached=self.chat.cache[key]
+        self.chat.cache[key]=(cached[0]-chat.STATE_CACHE_SECONDS,)+cached[1:]
+        self.chat.state({'source':REF,'requestIds':['request-000a']})
+        self.assertEqual(len(self.calls),reads+2)
+
+    def test_waiting_ids_expire_are_bounded_and_only_valid(self):
+        key=chat.Chat.state_key(self.source)
+        with patch.object(chat,'WAITING_SECONDS',-1):
+            self.chat.state({'source':REF,'requestIds':['request-old1']})
+        self.assertEqual(self.chat._waiting_ids(key,time.monotonic()),[])
+        self.assertNotIn(key,self.chat.waiting)
+        for invalid in (['../outside'],['request-'+str(i) for i in range(21)]):
+            with self.assertRaises(ValueError):self.chat.state({'source':REF,'requestIds':invalid})
+        self.assertNotIn(key,self.chat.waiting)
+        ids=['request-%04d'%i for i in range(25)]
+        self.chat.state({'source':REF,'requestIds':ids[:20]})
+        self.chat.state({'source':REF,'requestIds':ids[20:]})
+        # At most the 20 most recently asked ids are kept for one conversation.
+        self.assertEqual(self.chat._waiting_ids(key,time.monotonic()),ids[5:])
+        self.chat.state({'source':REF,'requestIds':[ids[5]]})
+        self.assertEqual(self.chat._waiting_ids(key,time.monotonic())[-1],ids[5])
+        self.chat.cache.clear()
+        self.chat.state({'source':REF},watching=True)
+        self.assertEqual(len(self.calls[-1][2]['requestIds']),20)
+
+    def test_watcher_read_right_after_a_send_answers_the_receipt_read(self):
+        self.receipt_rpc()
+        self.chat.state({'source':REF})
+        self.chat.send({'source':REF,'requestId':'request-0001','text':'hello'})
+        sends=len(self.calls)
+        # The send dropped the cached view; the watcher's next read carries the new receipt.
+        self.chat.state({'source':REF},watching=True)
+        self.assertEqual(self.calls[-1][2]['requestIds'],['request-0001'])
+        receipt=self.chat.state({'source':REF,'requestId':'request-0001','requestIds':['request-0001']})
+        self.assertEqual(receipt['receipts'][0]['requestId'],'request-0001')
+        self.assertEqual(receipt['receipts'][0]['status'],'accepted')
+        self.assertEqual(len(self.calls),sends+1)
+        # Send ids the state route would refuse are never waited on.
+        self.chat.send({'source':REF,'requestId':'_request-0002','text':'hello'})
+        self.assertNotIn('_request-0002',self.chat.waiting[chat.Chat.state_key(self.source)])
+
     def test_cwd_change_bypasses_cached_state(self):
         self.chat.state({'source':REF})
         changed=self.root/'changed';changed.mkdir()
@@ -417,7 +517,8 @@ class ChatTest(unittest.TestCase):
         worker.start()
         try:
             self.assertTrue(started.wait(3))
-            self.assertEqual(self.chat.state({'source':REF})['messages'][0]['text'],'newer')
+            # Asks for a receipt the first read does not carry, so it reads on its own.
+            self.assertEqual(self.chat.state({'source':REF,'requestId':'request-0009'})['messages'][0]['text'],'newer')
         finally:
             release.set();worker.join(3)
         self.assertFalse(worker.is_alive())
@@ -497,6 +598,145 @@ class ChatTest(unittest.TestCase):
         with self.assertRaises(chat.PromptRejected) as caught:
             self.chat.prompt({'source': REF, 'action': 'open'})
         self.assertEqual(caught.exception.code, 'terminal_required')
+
+
+def wait_for(predicate, timeout=3):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return
+        time.sleep(0.005)
+    raise AssertionError('condition was not reached')
+
+
+class StateShareTest(unittest.TestCase):
+    """One remote conversation read at a time: a reader asking for a subset of the receipts
+    of a read in progress, started after the latest send, waits for it instead of reading."""
+    setUp = ChatTest.setUp
+    tearDown = ChatTest.tearDown
+    receipt_rpc = ChatTest.receipt_rpc
+    RID = 'request-0001'
+
+    def gated_reads(self, failure=None):
+        """Codex reads that wait at a gate; the first one may fail with `failure`."""
+        gate, self.started = threading.Event(), []
+        self.addCleanup(gate.set)
+        self.receipt_rpc()
+        answer = self.flow.transfers.rpc
+        def rpc(host, op, args, timeout):
+            if args.get('action') == 'read':
+                self.started.append(args)
+                if not gate.wait(5):
+                    raise RuntimeError('fixture gate was not opened')
+                if failure is not None and len(self.started) == 1:
+                    raise failure
+            return answer(host, op, args, timeout)
+        self.flow.transfers.rpc = rpc
+        self.key = chat.Chat.state_key(self.source)
+        return gate
+
+    def run_reads(self, *reads):
+        """Start each read in its own thread once the previous one has started or joined a read."""
+        results, threads = {}, []
+        def read(name, data, watching):
+            try:
+                results[name] = self.chat.state(data, watching=watching)
+            except Exception as exc:
+                results[name] = exc
+        for name, data, watching, ready in reads:
+            thread = threading.Thread(target=read, args=(name, data, watching), daemon=True)
+            thread.start()
+            threads.append(thread)
+            wait_for(ready)
+        return results, threads
+
+    def joined(self, count):
+        return lambda: self.key in self.chat.reads and self.chat.reads[self.key].joined == count
+
+    def finish(self, gate, threads):
+        gate.set()
+        for thread in threads:
+            thread.join(3)
+        self.assertFalse(any(thread.is_alive() for thread in threads))
+        self.assertEqual(self.chat.reads, {})
+
+    def share_after_send(self, leader):
+        gate = self.gated_reads()
+        self.chat.send({'source': REF, 'requestId': self.RID, 'text': 'hello'})
+        browser = ('browser', {'source': REF, 'requestId': self.RID, 'requestIds': [self.RID]}, False)
+        watcher = ('watcher', {'source': REF}, True)
+        first, second = (watcher, browser) if leader == 'watcher' else (browser, watcher)
+        results, threads = self.run_reads(first + (lambda: len(self.started) == 1,),
+                                          second + (self.joined(1),))
+        self.finish(gate, threads)
+        # One remote read for the receipt both asked for right after the send.
+        self.assertEqual(len(self.started), 1)
+        self.assertIn(self.RID, [self.started[0].get('requestId')] + self.started[0].get('requestIds', []))
+        self.assertEqual([r['requestId'] for r in results['browser']['receipts']], [self.RID])
+        self.assertEqual(results['browser']['receipts'][0]['status'], 'accepted')
+        self.assertEqual([r['requestId'] for r in results['watcher']['receipts']], [self.RID])
+        self.assertEqual(results['watcher']['messages'], results['browser']['messages'])
+        # The shared read is the cached view for the next reader.
+        self.assertEqual(self.chat.state({'source': REF, 'requestId': self.RID})['receipts'][0]['status'], 'accepted')
+        self.assertEqual(len(self.started), 1)
+
+    def test_watcher_read_right_after_a_send_is_shared_by_the_browser_read(self):
+        self.share_after_send('watcher')
+
+    def test_browser_read_right_after_a_send_is_shared_by_the_watcher_read(self):
+        self.share_after_send('browser')
+
+    def test_a_read_started_before_a_send_is_not_shared(self):
+        gate = self.gated_reads()
+        results, threads = self.run_reads(('before', {'source': REF}, False, lambda: len(self.started) == 1))
+        self.chat.send({'source': REF, 'requestId': self.RID, 'text': 'hello'})
+        more, others = self.run_reads(('after', {'source': REF, 'requestId': self.RID}, False,
+                                       lambda: len(self.started) == 2))
+        self.finish(gate, threads + others)
+        self.assertNotIn('requestIds', self.started[0])
+        self.assertEqual(self.started[1]['requestId'], self.RID)
+        self.assertEqual([r['requestId'] for r in more['after']['receipts']], [self.RID])
+        self.assertEqual(results['before']['receipts'], [])
+        # Only the read started after the send is cached.
+        self.assertIn(self.RID, self.chat.cache[self.key][4])
+
+    def test_a_read_missing_an_asked_id_starts_one_carrying_every_waiting_id(self):
+        gate = self.gated_reads()
+        results, threads = self.run_reads(
+            ('a', {'source': REF, 'requestIds': ['request-000a']}, False, lambda: len(self.started) == 1),
+            ('b', {'source': REF, 'requestIds': ['request-000b']}, False, lambda: len(self.started) == 2),
+            # Waits on both ids: the newer read carries them and is shared.
+            ('watcher', {'source': REF}, True, self.joined(1)))
+        self.finish(gate, threads)
+        self.assertEqual(len(self.started), 2)
+        self.assertEqual(self.started[1]['requestIds'], ['request-000b', 'request-000a'])
+        self.assertEqual([r['requestId'] for r in results['b']['receipts']], ['request-000b'])
+        self.assertEqual([r['requestId'] for r in results['watcher']['receipts']], ['request-000a', 'request-000b'])
+        self.assertTrue(all(r['status'] == 'accepted' for r in results['watcher']['receipts']))
+
+    def test_a_failed_read_fails_the_readers_waiting_for_it_with_the_same_error(self):
+        failure = RuntimeError('기기 연결을 다시 확인한 뒤 메시지를 보내 주세요.')
+        gate = self.gated_reads(failure)
+        results, threads = self.run_reads(('leader', {'source': REF}, False, lambda: len(self.started) == 1),
+                                          ('follower', {'source': REF}, True, self.joined(1)))
+        self.finish(gate, threads)
+        self.assertIs(results['leader'], failure)
+        self.assertIs(results['follower'], failure)
+        self.assertEqual(len(self.started), 1)
+        # Nothing was cached or left registered: the next read asks the host again.
+        self.assertEqual(self.chat.state({'source': REF})['phase'], 'idle')
+        self.assertEqual(len(self.started), 2)
+
+    def test_a_waiting_reader_gives_up_after_its_own_timeout(self):
+        gate = self.gated_reads()
+        results, threads = self.run_reads(('leader', {'source': REF}, False, lambda: len(self.started) == 1))
+        with patch.object(chat, 'STATE_SHARE_SECONDS', 0.05):
+            with self.assertRaises(RuntimeError) as caught:
+                self.chat.state({'source': REF}, watching=True)
+        self.assertEqual(str(caught.exception), chat.STATE_UNAVAILABLE)
+        self.finish(gate, threads)
+        self.assertEqual(len(self.started), 1)
+        self.assertEqual(results['leader']['phase'], 'idle')
 
 
 class ChatHttpTest(ChatTest):
@@ -838,6 +1078,24 @@ class ChatClaudeTest(unittest.TestCase):
         self.assertEqual(len(self.terms.pastes), 1)
         self.assertEqual(len(self.records()), 1)
         self.assertEqual(self.state(requestId='request-0001')['receipts'][0]['status'], 'unknown')
+
+    def test_watcher_read_serves_the_local_ledger_receipt_from_cache(self):
+        self.terminal()
+        self.chat.cache.clear()
+        self.send()
+        self.messages = [{'role': 'user', 'text': '안녕하세요', 'ts': int(time.time())}]
+        watched = self.chat.state({'source': CLAUDE_REF}, watching=True)
+        self.assertEqual([r['requestId'] for r in watched['receipts']], ['request-0001'])
+        reads = self.calls.count(('chat', 'read'))
+        receipt = self.chat.state({'source': CLAUDE_REF, 'requestId': 'request-0001'})['receipts'][0]
+        self.assertEqual(self.calls.count(('chat', 'read')), reads)
+        # The Claude receipt is still the board's own ledger judgment against the read messages.
+        self.assertEqual(receipt['status'], 'accepted')
+        self.assertTrue(receipt['readbackConfirmed'])
+        self.assertEqual(receipt, watched['receipts'][0])
+        missing = self.chat.state({'source': CLAUDE_REF, 'requestId': 'request-9999'})['receipts'][0]
+        self.assertEqual(self.calls.count(('chat', 'read')), reads + 1)
+        self.assertEqual(missing['status'], 'unknown')
 
     def test_receipt_readback_matches_collapsed_opening_text_of_new_user_message(self):
         self.terminal()

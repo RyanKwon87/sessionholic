@@ -51,18 +51,16 @@ test('nested emphasis and inline code retain every code character, including com
   assert.equal(format.plainText('file_name_inside and a > b and **`**literal**`**'), 'file_name_inside and a > b and **literal**');
 });
 
-test('blockquote prefixes are structural rather than visible and optional copies exclude button labels', () => {
+test('blockquote prefixes are structural rather than visible and quotes carry no copy buttons of their own', () => {
   const format = formatter(); const root = element(); const copied = [];
   const text = '> **첫 문장**\n> 다음 문장: a > b\n> > 중첩 인용\n';
   format.render(root, text, { onCopy: (content, kind) => copied.push([content, kind]) });
   assert.equal(byTag(root, 'blockquote').length, 2);
   assert.equal(format.plainText(text), '첫 문장\n다음 문장: a > b\n중첩 인용\n');
   assert.doesNotMatch(visibleText(root), /> 첫|> 다음|> 중첩/);
-  const buttons = byTag(root, 'button'); assert.equal(buttons.length, 2);
-  assert.equal(buttons[1].attributes['aria-label'], '인용문 본문 복사');
-  assert.equal(copied.length, 0); buttons[1].events.click();
-  assert.deepEqual(copied, [['첫 문장\n다음 문장: a > b\n중첩 인용\n', 'quote']]);
-  assert.equal(copied[0][0].includes('인용문 복사'), false);
+  // The message menu copies the whole message; only code keeps a small icon.
+  assert.equal(byTag(root, 'button').length, 0);
+  assert.equal(copied.length, 0);
 });
 
 test('fenced code and quoted code copies preserve tabs, spaces, CRLF, symbols and blank lines exactly', () => {
@@ -139,4 +137,39 @@ test('copy buttons are optional, fixed aria labels are used and rejected callbac
   format.render(root, '```\ncode\n```', { onCopy: () => Promise.reject(new Error('caller reports this')) });
   assert.equal(byTag(root, 'button')[0].attributes['aria-label'], '코드 블록 복사');
   byTag(root, 'button')[0].events.click(); await new Promise((resolve) => setImmediate(resolve));
+});
+
+test('a code block longer than 25 lines folds behind "모두 보기" with its line count, and the toggle unfolds and folds it', () => {
+  const format = formatter(); const root = element();
+  assert.equal(format.FOLD_LINES, 25);
+  const lines = (count) => Array.from({ length: count }, (_, index) => `line ${index + 1}`).join('\n') + '\n';
+  format.render(root, '```\n' + lines(25) + '```', { onCopy() {} });
+  assert.equal(nodes(root).some((node) => /is-folded/.test(node.className)), false, 'exactly 25 lines stay open');
+  assert.equal(byTag(root, 'button').length, 1, 'only the copy icon');
+  format.render(root, '```js\n' + lines(26) + '```', { onCopy() {} });
+  const block = nodes(root).find((node) => /message-code-block/.test(node.className));
+  assert.match(block.className, /is-foldable is-folded/);
+  const toggle = nodes(root).find((node) => node.className === 'message-code-toggle');
+  assert.equal(toggle.textContent, '모두 보기 · 26줄');
+  assert.equal(toggle.attributes['aria-expanded'], 'false');
+  toggle.events.click();
+  assert.doesNotMatch(block.className, /is-folded/);
+  assert.equal(toggle.textContent, '접기'); assert.equal(toggle.attributes['aria-expanded'], 'true');
+  toggle.events.click();
+  assert.match(block.className, /is-folded/);
+  assert.equal(toggle.textContent, '모두 보기 · 26줄');
+  // Folding never changes what is copied, and the threshold is adjustable by the caller.
+  assert.equal(byTag(root, 'code')[0].textContent, lines(26));
+  format.render(root, '```\n' + lines(4) + '```', { foldAfter: 3 });
+  assert.match(nodes(root).find((node) => /message-code-block/.test(node.className)).className, /is-folded/);
+  // CRLF and a missing final newline count the same lines.
+  format.render(root, '```\r\n' + lines(26).replace(/\n/g, '\r\n').replace(/\r\n$/, '') + '\r\n```');
+  assert.equal(nodes(root).find((node) => node.className === 'message-code-toggle').textContent, '모두 보기 · 26줄');
+});
+
+test('code blocks are listed exactly, including quoted and list-nested fences, for the message menu', () => {
+  const format = formatter();
+  assert.deepEqual(Array.from(format.codeBlocks('설명\n\n```py\nprint(1)\n```\n\n> ```\n> a > b\n> ```\n')), ['print(1)\n', 'a > b\n']);
+  assert.deepEqual(Array.from(format.codeBlocks('코드 없음')), []);
+  assert.deepEqual(Array.from(format.codeBlocks('`인라인`만 있음')), [], 'inline code is not a block');
 });

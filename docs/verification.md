@@ -39,6 +39,14 @@ Python 검증에는 macOS의 Python 3.9.6을 사용했습니다. 원격 실행 �
 - 호스트 수집의 예외 뒤 복구, 병렬 수집, 실패 호스트 자동 재시도 간격, SSH 연결 재사용 소켓 경로(긴 상태 경로의 짧은 대체 경로 포함)를 가짜 runner로 검사했습니다. 실제 원격 기기에는 접속하지 않았습니다.
 - Flip5 실기의 키보드·음성 입력과 실제 Codex·Claude 세션 전송은 아직 검수하지 않았습니다.
 
+## 2026-10-10 속도 개선 검증 (서버)
+
+- 정적 자산의 gzip·`Vary`·ETag·304, 현재 해시의 `?v=`에서만 immutable, `index.html`·`sw.js`의 `no-cache`, 자산 해시 meta 채움과 `src`·`href` 버전 치환, 파일 변경 시 캐시·페이지 ETag 갱신을 임시 web 폴더와 실제 HTTP 서버로 검사했습니다. JSON 응답의 gzip 조건(1,024바이트 이상, `q=0` 제외)도 검사했습니다.
+- `/api/events`의 응답 헤더, `retry`·hello·heartbeat·snapshot·chat 이벤트, 같은 대화의 감시자 공유와 10초 유예 뒤 정지, 연결 상한 503, 끊긴 클라이언트의 슬롯 회수, 서버 종료 시 스트림·감시자 정리를 실제 loopback 소켓과 가짜 대화 상태로 검사했습니다.
+- helper 전송은 처음 SHA-256만 보내고, 실제 로컬 하위 프로세스에서 없는 helper·손상된 helper·재시작 뒤 재사용을 확인했습니다. "런타임 필요" 뒤 전체 재전송과 호스트별 기억도 가짜 실행으로 검사했습니다.
+- Codex home 병렬 조회의 순서 유지와 home별 독립 연결, LaunchAgent의 `ProcessType=Interactive`를 검사했습니다.
+- 합성 보드(Python 3.9.6)를 loopback에 띄워 `curl`로 압축·304·immutable 헤더와 SSE 이벤트를 확인했습니다. 실제 원격 기기와 운영 보드에는 접속하지 않았습니다.
+
 ## 추가 리뷰에서 확인한 복구 경계
 
 - 잠금 전에 시작한 snapshot·capability·터미널 목록과 늦은 401이 새 로그인 상태를 덮지 않는지 검사했습니다.

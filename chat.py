@@ -41,6 +41,26 @@ PROMPT_NO_TERMINAL = ('이 세션에는 보드가 연결한 터미널이 없어 
                       '실행 중인 터미널에서 직접 선택해 주세요.')
 PROMPT_BUSY = '다른 입력을 전달하고 있습니다. 잠시 뒤 다시 시도해 주세요.'
 TERMINAL_STATE = '보드 터미널 상태를 확인하지 못했습니다. 잠시 뒤 다시 시도해 주세요.'
+# Conversation state reads are shared for this many seconds.
+STATE_CACHE_SECONDS = 2
+# Message ids a client recently asked receipts for, per conversation: a conversation
+# watcher reads them along, so the client's next read is answered from the cache.
+WAITING_SECONDS = 60
+WAITING_IDS = 20
+WAITING_CONVERSATIONS = 64
+# A reader sharing another reader's remote read waits this long (the RPC itself has 20 s).
+STATE_SHARE_SECONDS = 30
+STATE_UNAVAILABLE = '대화 상태를 확인하지 못했습니다. 잠시 뒤 다시 시도해 주세요.'
+
+
+class StateRead:
+    """One conversation read in progress. Readers asking for a subset of its receipt ids
+    share it instead of starting their own remote read."""
+    def __init__(self, ids, epoch, cwd):
+        self.ids, self.epoch, self.cwd = frozenset(ids), epoch, cwd
+        self.done = threading.Event()
+        self.response = self.error = None
+        self.joined = 0
 
 
 class SendRejected(ValueError):
@@ -186,27 +206,40 @@ class Chat:
         # Serialises everything the board types into agent terminals (pastes, menu keys).
         self.claude_lock = threading.Lock()
         self.prompt_results = {}
+        # state key -> {request id: monotonic expiry}, oldest first.
+        self.waiting = {}
+        # state key -> the newest remote read in progress (StateRead).
+        self.reads = {}
 
     @staticmethod
     def identity(source):
         return {k: source.get(k) for k in ('host', 'agent', 'home', 'id')}
 
-    def source(self, ref):
+    @classmethod
+    def state_key(cls, source):
+        # The conversation cache key; event watchers use the same key (events.watch_key).
+        return json.dumps(cls.identity(source), sort_keys=True)
+
+    def resolve(self, ref):
+        """The listed source a client reference names, whether or not its host is reachable."""
         if not isinstance(ref, dict):
             raise ValueError('작업을 선택해 주세요.')
         # Ordinary messages stay on the selected source even after a transfer.
         # A fresh destination is accepted only from server-written nativeSource metadata.
         try:
             source = self.board.source(ref)
+            # Found among the board's rows of exactly this agent.
+            source.setdefault('agent', ref.get('agent'))
+            return source
         except ValueError:
-            source = None
             for terminal in self.workflow.terminals.list():
                 native = terminal.get('nativeSource') or terminal.get('metadata', {}).get('nativeSource')
                 if isinstance(native, dict) and self.identity(native) == self.identity(ref or {}):
-                    source = {**native, 'title': terminal.get('title', '이어가는 작업')}
-                    break
-            if source is None:
-                raise
+                    return {**native, 'title': terminal.get('title', '이어가는 작업')}
+            raise
+
+    def source(self, ref):
+        source = self.resolve(ref)
         host = next(h for h in self.board.hosts if h['name'] == source['host'])
         if not self.board.state[host['name']]['ok']:
             raise RuntimeError('기기 연결을 다시 확인한 뒤 메시지를 보내 주세요.')
@@ -234,10 +267,13 @@ class Chat:
                 'reason': result.get('reason'),
                 'attachments': Chat.attachment_history(result.get('attachments', []))}
 
-    def state(self, data):
+    def state(self, data, watching=False):
+        """The conversation view. A watcher read (watching=True) also carries the receipts
+        clients recently asked for, so their next read is answered from the cache; a read
+        still in progress is shared by readers asking for a subset of its receipts."""
         source, host = self.source(data.get('source'))
         identity = self.identity(source)
-        key = json.dumps(identity, sort_keys=True)
+        key = self.state_key(source)
         request_id = data.get('requestId')
         if request_id is not None and (not isinstance(request_id, str) or not STATE_REQUEST.fullmatch(request_id)):
             raise ValueError('메시지 요청 식별자가 올바르지 않습니다.')
@@ -249,15 +285,68 @@ class Chat:
         if len(request_ids) > 20:
             raise ValueError('한 번에 확인할 메시지는 20개까지 선택할 수 있습니다.')
         with self.lock:
+            now = time.monotonic()
+            if watching:
+                # The watcher's own reads never extend how long an id is waited for.
+                request_ids = carried = self._waiting_ids(key, now)
+            else:
+                self._remember(key, request_ids, now)
+                # A new read also carries every id still waited on here, so the watcher's
+                # read and other clients' reads can share it.
+                carried = list(dict.fromkeys(request_ids + self._waiting_ids(key, now)))
             cached = self.cache.get(key)
-            if (not request_ids and cached and cached[3] == source.get('cwd')
-                    and time.monotonic() - cached[0] < 2):
-                return cached[1]
-            self.read_sequence += 1
-            sequence, epoch = self.read_sequence, self.cache_epoch
-        kwargs = {'requestId': request_id} if request_id else {}
-        if additional:
-            kwargs['requestIds'] = additional
+            if (cached and cached[3] == source.get('cwd') and now - cached[0] < STATE_CACHE_SECONDS
+                    and cached[4].issuperset(request_ids)):
+                return self._cached_view(cached[1], request_ids)
+            shared = self.reads.get(key)
+            # Shared only when it started after the latest send or terminal input (the same
+            # epoch) and carries every id asked for here.
+            if (shared is not None and shared.epoch == self.cache_epoch and shared.cwd == source.get('cwd')
+                    and shared.ids.issuperset(request_ids)):
+                shared.joined += 1
+            else:
+                shared = None
+                self.read_sequence += 1
+                sequence, epoch = self.read_sequence, self.cache_epoch
+                read = self.reads[key] = StateRead(carried, epoch, source.get('cwd'))
+        if shared is not None:
+            return self._shared_view(shared, request_ids)
+        if watching:
+            kwargs = {'requestIds': carried} if carried else {}
+        else:
+            kwargs = {'requestId': request_id} if request_id else {}
+            extra = [identifier for identifier in carried if identifier not in request_ids]
+            if additional or extra:
+                kwargs['requestIds'] = additional + extra
+        try:
+            response = self._read_state(source, host, identity, key, carried, kwargs, sequence, epoch)
+        except Exception as exc:
+            read.error = exc
+            raise
+        else:
+            read.response = response
+        finally:
+            with self.lock:
+                if self.reads.get(key) is read:
+                    del self.reads[key]
+            read.done.set()
+        return self._cached_view(response, request_ids)
+
+    @staticmethod
+    def _shared_view(shared, request_ids):
+        """The asked receipts from another reader's read; its failure is this reader's too."""
+        if not shared.done.wait(STATE_SHARE_SECONDS):
+            raise RuntimeError(STATE_UNAVAILABLE)
+        if shared.error is not None:
+            raise shared.error
+        if shared.response is None:
+            raise RuntimeError(STATE_UNAVAILABLE)
+        # A send after this reader joined keeps the result out of the cache, not from this reader.
+        return Chat._cached_view(shared.response, request_ids)
+
+    def _read_state(self, source, host, identity, key, request_ids, kwargs, sequence, epoch):
+        """One remote read with the receipts of `request_ids`, cached unless a send or a newer
+        read came in meanwhile."""
         result = self.rpc(host, 'read', source, **kwargs)
         caps = result.get('capabilities', {})
         phase = result.get('phase', 'unavailable')
@@ -303,20 +392,53 @@ class Chat:
                                            and terminal is None and not terminal_failed)}
         with self.lock:
             cached = self.cache.get(key)
-            # Receipt reads are request-specific. A send or a newer read must
-            # also prevent an earlier in-flight snapshot from repopulating cache.
-            if (not request_ids and epoch == self.cache_epoch
-                    and (cached is None or sequence > cached[2])):
+            # The ids whose receipts this read carries are kept with it: a later read may
+            # use it only for a subset of them. A send or a newer read must also prevent
+            # an earlier in-flight snapshot from repopulating cache.
+            if epoch == self.cache_epoch and (cached is None or sequence > cached[2]):
                 if key not in self.cache and len(self.cache) >= 64:
                     self.cache.pop(next(iter(self.cache)))
-                self.cache[key] = (time.monotonic(), response, sequence, source.get('cwd'))
+                self.cache[key] = (time.monotonic(), response, sequence, source.get('cwd'),
+                                   frozenset(request_ids))
         return response
+
+    @staticmethod
+    def _cached_view(response, request_ids):
+        """A cached view with only the requested receipts, in the requested order."""
+        receipts = {receipt['requestId']: receipt for receipt in response['receipts']}
+        return {**response, 'receipts': [receipts[request_id] for request_id in request_ids]}
+
+    def _remember(self, key, request_ids, now):
+        """Note ids a client is waiting on (already validated); caller holds self.lock."""
+        if not request_ids:
+            return
+        waiting = self.waiting.pop(key, {})
+        for request_id in request_ids:
+            waiting.pop(request_id, None)
+            waiting[request_id] = now + WAITING_SECONDS
+        while len(waiting) > WAITING_IDS:
+            waiting.pop(next(iter(waiting)))
+        # Most recently asked conversation last; the least recent one is dropped first.
+        self.waiting[key] = waiting
+        while len(self.waiting) > WAITING_CONVERSATIONS:
+            self.waiting.pop(next(iter(self.waiting)))
+
+    def _waiting_ids(self, key, now):
+        """Ids still waited on in this conversation, oldest first; caller holds self.lock."""
+        waiting = self.waiting.get(key)
+        if not waiting:
+            return []
+        for request_id in [request_id for request_id, expiry in waiting.items() if expiry <= now]:
+            del waiting[request_id]
+        if not waiting:
+            del self.waiting[key]
+        return list(waiting)
 
     def _forget_state(self, source):
         # Terminal input changes what the next read must show; drop the cached view.
         with self.lock:
             self.cache_epoch += 1
-            self.cache.pop(json.dumps(self.identity(source), sort_keys=True), None)
+            self.cache.pop(self.state_key(source), None)
 
     # ---------- the board terminal attached to a session ----------
     @staticmethod
@@ -709,5 +831,10 @@ class Chat:
         if manifest and not result.get('attachments'):
             result = {**result, 'attachments': manifest}
         receipt = self.receipt(result, request_id)
+        if STATE_REQUEST.fullmatch(request_id):
+            # The client asks for this receipt next; the watcher's read right after the
+            # send carries it, so that question is answered from the cache.
+            with self.lock:
+                self._remember(self.state_key(source), [request_id], time.monotonic())
         self._forget_state(source)
         return {'status': receipt['status'], 'receipt': receipt}

@@ -1577,6 +1577,15 @@ class ManagedLaunchTest(unittest.TestCase):
             again=managed_launch.bind(spec,{'agent':'codex','home':'.codex'},'remote',receipt_path=receipt)
             self.assertEqual(client.calls,['thread/start','turn/start'])
             self.assertEqual(out['nativeSource'],again['nativeSource'])
+    def test_codex_bind_without_app_server_starts_nothing_when_it_cannot_start_one(self):
+        # A board-local handoff also goes through bind: no daemon and no way to start one
+        # refuses before any thread or first prompt exists.
+        spec={'mode':'handoff','argv':['codex','prompt'],'cwd':'/tmp/fixture','env':{}}
+        with tempfile.TemporaryDirectory() as folder, patch('managed_launch.app_server_running',return_value=False),patch('native_chat._client') as client, patch('subprocess.run') as run:
+            with self.assertRaisesRegex(ValueError,'앱 서버를 시작하지 못했습니다'):
+                managed_launch.bind(spec,{'agent':'codex','home':'.codex'},'remote',receipt_path=Path(folder)/'receipt.json')
+            client.assert_not_called(); run.assert_not_called()
+            self.assertFalse((Path(folder)/'receipt.json').exists())
     def test_claude_fixed_uuid_and_attach_unchanged(self):
         spec={'mode':'handoff','argv':['claude','prompt'],'cwd':'/tmp','env':{}}
         out=managed_launch.bind(spec,{'agent':'claude','home':'.claude'},'remote')

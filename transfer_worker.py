@@ -150,7 +150,7 @@ def prepare(args, profiles, import_workspace):
     # validate/import/build failures start nothing; bind may create a native
     # session, so its failures and later ones stay unknown to the coordinator.
     from launch import build_transferred_launch
-    from managed_launch import bind
+    from managed_launch import bind, ensure_app_server
     with stage('validate'):
         folder = job(args['transferId'])
         if (folder / 'launch.json').exists():
@@ -169,6 +169,7 @@ def prepare(args, profiles, import_workspace):
                         'attachmentsPathMap': imported.get('attachmentsPathMap', [])}
             spec = build_transferred_launch(args['source'], {**profile, 'host': args['target']['host']},
                                             args['messages'], folder, imported['cwd'], metadata)
+            ensure_app_server(spec, profile)
     except Exception:
         discard_import(destination, args['transferId'])
         raise
@@ -239,14 +240,6 @@ def handoff_profile(selector, target):
     if settings.crosses_boundary(profile['agent'], environment, profile.get('environment', 'default'),
                                  settings.load()):
         raise ValueError('원본과 대상의 실행 환경 경계가 다릅니다.')
-    if profile['agent'] == 'codex':
-        # The first input goes through this home's app-server; without it nothing can start.
-        from transfer_native import _socket_path
-        try:
-            _socket_path({'home': profile['home']}, None)
-        except ValueError:
-            raise ValueError('이 기기에서 대상 Codex 계정의 app-server 연결을 찾지 못했습니다. '
-                             'Codex 앱 서버가 실행 중인지 확인해 주세요.') from None
     return profile, environment
 
 
@@ -260,7 +253,7 @@ def handoff_summary(spec, **extra):
 
 def stage_handoff(args):
     from launch import build_launch
-    from managed_launch import bind
+    from managed_launch import bind, ensure_app_server
     with stage('validate'):
         if not isinstance(args, dict):
             raise ValueError('인계 요청 형식이 올바르지 않습니다.')
@@ -281,6 +274,9 @@ def stage_handoff(args):
             spec = build_launch(selector, {**profile, 'host': selector['host']}, args.get('messages'), folder)
             if spec.get('mode') != 'handoff':
                 raise ValueError('이 기기 안의 도구·계정 전환만 준비할 수 있습니다.')
+            # The first input goes through the target home's app-server; start it before
+            # anything is bound, so a refusal here still means nothing started.
+            ensure_app_server(spec, profile)
         with stage('bind'):
             # Route-keyed like the board's own receipt: a later launch of the same route
             # reopens an unattached thread instead of sending the first prompt again.
@@ -298,15 +294,17 @@ def check_handoff(args):
     """`handoff --check -`: validate and build like `stage_handoff`, but bind nothing, start
     nothing and keep no file. Prints what a prepared launch would run."""
     from launch import build_launch
+    from managed_launch import app_server_running
     selector, target = handoff_request(args, check=True)
     profile, environment = handoff_profile(selector, target)
     messages = args.get('messages') or CHECK_MESSAGES
     with tempfile.TemporaryDirectory(prefix='handoff-check-') as scratch:
         spec = build_launch(selector, {**profile, 'host': selector['host']}, messages, Path(scratch) / 'state')
     codex = profile['agent'] == 'codex'
+    extra = {'appServer': 'running' if app_server_running(profile) else 'start'} if codex else {}
     return handoff_summary({**spec, 'connectionMode': 'attach' if codex else None}, prepared=False,
                            agent=profile['agent'], profile=profile['id'], sourceEnvironment=environment,
-                           firstInput='app-server' if codex else 'argument')
+                           firstInput='app-server' if codex else 'argument', **extra)
 
 
 def _prepared_launch(folder):

@@ -559,10 +559,22 @@ class WorkerPrepareStageTest(unittest.TestCase):
         self.assertIn('native CLI',reply['error'])
         self.assertFalse((self.workspaces/self.identifier).exists())
         self.assertTrue(self.workspaces.is_dir())
+    def test_app_server_start_failure_is_a_build_failure_and_discards_the_import(self):
+        spec={'mode':'transfer','argv':['/fixture/codex','prompt'],'cwd':'/fixture','env':{}}
+        with patch('transfer_workspace.import_workspace',side_effect=self.imported),\
+             patch('launch.build_transferred_launch',return_value=spec),\
+             patch('managed_launch.app_server_running',return_value=False),\
+             patch('managed_launch.bind') as bind:
+            reply=self.main()
+        self.assertEqual((reply['ok'],reply['stage']),(False,'build'))
+        self.assertIn('앱 서버를 시작하지 못했습니다',reply['error'])
+        bind.assert_not_called()
+        self.assertFalse((self.workspaces/self.identifier).exists())
     def test_bind_failure_is_tagged_and_keeps_the_import(self):
         spec={'mode':'transfer','argv':['/fixture/codex','prompt'],'cwd':'/fixture','env':{}}
         with patch('transfer_workspace.import_workspace',side_effect=self.imported),\
              patch('launch.build_transferred_launch',return_value=spec),\
+             patch('managed_launch.ensure_app_server',return_value=False),\
              patch('managed_launch.bind',side_effect=RuntimeError('fixture native thread result unknown')):
             reply=self.main()
         self.assertEqual((reply['ok'],reply['stage']),(False,'bind'))
@@ -1007,15 +1019,57 @@ class StageHandoffTest(RemoteHandoffHome):
         self.assertIn('로그인 파일', str(error))
         self.assertEqual(self.native_calls, [])
 
-    def test_codex_target_without_app_server_is_refused_before_bind(self):
+    def fixture_daemon(self):
+        """A fixture `codex` whose only command is `app-server daemon start`: it records the
+        variables it ran with and leaves a socket file where the real daemon publishes one."""
+        codex = self.home / '.local/bin/codex'
+        codex.write_text('#!%s -I\n' % sys.executable + (
+            'import json, os, socket, sys\n'
+            'if sys.argv[1:] != ["app-server", "daemon", "start"]: sys.exit(1)\n'
+            'home = os.environ["CODEX_HOME"]\n'
+            'with open(os.path.join(os.environ["HOME"], "daemon-starts.jsonl"), "a") as out:\n'
+            '    out.write(json.dumps({"home": home, "nosystem": os.environ.get("GIT_CONFIG_NOSYSTEM"),\n'
+            '                          "cwd": os.getcwd()}) + "\\n")\n'
+            'folder = os.path.join(home, "app-server-control")\n'
+            'os.makedirs(folder, mode=0o700, exist_ok=True)\n'
+            'socket.socket(socket.AF_UNIX).bind(os.path.join(folder, "app-server-control.sock"))\n'
+            'print(json.dumps({"status": "started"}))\n'))
+        codex.chmod(0o700)
+        return self.home / 'daemon-starts.jsonl'
+
+    def test_codex_target_without_app_server_starts_it_in_the_target_environment(self):
+        starts = self.fixture_daemon()
+        self.socket.stop()
+        try:
+            request = {'source': {**CLAUDE_SOURCE, 'cwd': str(self.private)},
+                       'target': {'agent': 'codex', 'account': 'codex:.codex-private'}}
+            summary = transfer_worker.check_handoff(request)
+            # The check only reports it; nothing runs.
+            self.assertEqual(summary['appServer'], 'start')
+            self.assertFalse(starts.exists())
+            result = self.stage(cwd=self.private, account='codex:.codex-private')
+            self.stage(cwd=self.private, account='codex:.codex-private', request='request-0002')
+        finally:
+            self.socket.start()
+        self.assertEqual(result['nativeSource']['home'], '.codex-private')
+        # Started once, with the target home and its environment's variables, from that home.
+        home = str(self.home / '.codex-private')
+        self.assertEqual([json.loads(line) for line in starts.read_text().splitlines()],
+                         [{'home': home, 'nosystem': '1', 'cwd': home}])
+        # The same route reopens its unattached thread: the first prompt was sent once.
+        self.assertEqual(self.native_calls.count('turn/start'), 1)
+
+    def test_codex_target_whose_app_server_cannot_start_is_refused_before_bind(self):
         self.socket.stop()
         try:
             error = self.refused()
         finally:
             self.socket.start()
-        self.assertEqual(error.transfer_stage, 'validate')
-        self.assertIn('app-server', str(error))
+        self.assertEqual(error.transfer_stage, 'build')
+        self.assertIn('앱 서버를 시작하지 못했습니다', str(error))
         self.assertEqual(self.native_calls, [])
+        folder = self.handoffs / transfer_worker.handoff_token('request-0001')
+        self.assertFalse((folder / 'launch.json').exists())
 
     def test_same_account_and_other_hosts_are_not_staged(self):
         error = self.refused(source=CODEX_SOURCE, account='codex:.codex')
@@ -1142,7 +1196,7 @@ class HandoffStepTest(RemoteHandoffHome):
         self.assertEqual((summary['prepared'], summary['binary'], summary['cwd']), (False, 'codex', str(self.private)))
         self.assertEqual(summary['sourceEnvironment'], 'private')
         self.assertIn('GIT_CONFIG_NOSYSTEM', summary['envKeys'])
-        self.assertEqual(summary['firstInput'], 'app-server')
+        self.assertEqual((summary['firstInput'], summary['appServer']), ('app-server', 'running'))
         self.assertEqual(self.native_calls, calls)
         self.assertEqual(sorted(str(p) for p in self.handoffs.rglob('*')), before)
         # The host's own boundary verdict is reported as a refusal.

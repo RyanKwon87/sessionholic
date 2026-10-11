@@ -142,6 +142,24 @@ def _environment(home, agent, key, environment):
     return env
 
 
+def start_app_server(key, home=None):
+    """Start one Codex home's app-server (`codex app-server daemon start`) with that account's
+    launch variables, as a handoff to it would. Nothing is sent to a model. Later Codex
+    sessions of that account join this daemon, so its variables are theirs too."""
+    home = _home(home)
+    if not isinstance(key, str) or not HOME_KEY.fullmatch(key):
+        raise ValueError("Codex 계정 경로가 올바르지 않습니다.")
+    profile = next((p for p in discover_profiles(home) if p["id"] == "codex:" + key), None)
+    if profile is None or not profile["available"]:
+        raise ValueError((profile or {}).get("reason") or "이 기기의 Codex 계정을 사용할 수 없습니다.")
+    binary = _binary("codex", home)
+    if not binary:
+        raise ValueError("이 호스트에 native CLI가 없습니다.")
+    from managed_launch import ensure_app_server
+    env = _environment(home, "codex", key, profile.get("environment", "default"))
+    return {"started": ensure_app_server({"argv": [binary], "env": env}, profile, home)}
+
+
 def new_session(home=None):
     """This host's launcher (`launcher` in the host settings) as a terminal launch.
 

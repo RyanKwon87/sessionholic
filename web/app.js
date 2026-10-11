@@ -609,7 +609,7 @@ function beginAuthEpoch() {
 // deduplicates by requestId, are sent once more with a fresh token. A chat send
 // never is: it waits for a new press (sendChat).
 const CSRF_RETRY = new Set(["/api/chat/state", "/api/chat/prompt", "/api/plan", "/api/launch",
-  "/api/new-session", "/api/refresh", "/api/usage/refresh"]);
+  "/api/new-session", "/api/app-server", "/api/refresh", "/api/usage/refresh"]);
 async function api(path, { method = "GET", body, signal, authEpoch = state.authEpoch, csrfRetry = true } = {}) {
   assertAuthEpoch(authEpoch);
   const headers = {};
@@ -1777,7 +1777,9 @@ async function loadDetail(s, fresh = false) {
     if (entry.conversation !== fallbackSnapshot && chatReadSupported(entry)) return;
     const messages = data.messages || [];
     rememberConversation(s, messages, data);
-    renderMessages(s, messages, data.error || "", fresh && !usableCache);
+    // The host said its daemon is off even if the list read just before did not.
+    const shown = data.code === "app_server_off" ? { ...s, appServer: "off" } : s;
+    renderMessages(shown, messages, data.error || "", fresh && !usableCache);
     updateReadNotice(data);
     conversationSyncNotice(s, data.error ? "failed" : data.stale ? "stale" : "");
   } catch (err) {
@@ -3900,15 +3902,25 @@ function renderMessages(s, messages, error = "", fresh = false) {
     if (working) tail.push(workingRow(list));
   }
   if (error) {
-    if (!list.conversationError || list.conversationErrorText !== error || list.conversationSource !== source) {
-      const warning = el("div", "conversation-read-error");
+    // A Codex account without its app-server daemon: listed from its state DB, readable
+    // once the daemon runs. "앱 서버 켜기" starts it on that host.
+    const serverOff = s.agent === "codex" && s.appServer === "off";
+    const errorKey = error + (serverOff ? "\0off" : "");
+    if (!list.conversationError || list.conversationErrorText !== errorKey || list.conversationSource !== source) {
+      const warning = el("div", `conversation-read-error${serverOff ? " app-server-off" : ""}`);
       warning.setAttribute("role", "status");
-      warning.append(el("p", "detail-error", error), button("대화 다시 불러오기", "secondary", () => {
-        const current = selectedSession();
-        if (current?.key === s.key) loadDetail(current, !list.conversationRows?.length);
-      }));
+      warning.append(el("p", "detail-error", error));
+      if (serverOff) {
+        warning.append(el("p", "detail-note", "켜면 이 계정의 Codex 앱 서버가 이 기기에서 계속 실행되고, 이 계정의 다음 Codex 세션도 같은 앱 서버를 씁니다."),
+          button("앱 서버 켜기", "primary app-server-start", (event) => startAppServer(s, event?.currentTarget)));
+      } else {
+        warning.append(button("대화 다시 불러오기", "secondary", () => {
+          const current = selectedSession();
+          if (current?.key === s.key) loadDetail(current, !list.conversationRows?.length);
+        }));
+      }
       list.conversationError = warning;
-      list.conversationErrorText = error;
+      list.conversationErrorText = errorKey;
     }
     desired.unshift(list.conversationError);
   } else {
@@ -5627,6 +5639,35 @@ function renderTerminals() {
   renderTerminalMarks();
   const selected = selectedSession();
   if (selected) updateChatComposer(chatEntry(selected));
+}
+
+// "앱 서버 켜기": start one Codex account's daemon on its host, then read the list and
+// this conversation again. Nothing is sent to the agent.
+async function startAppServer(s, trigger) {
+  if (state.appServerBusy) return;
+  state.appServerBusy = true;
+  const authEpoch = state.authEpoch;
+  if (trigger) {
+    trigger.disabled = true;
+    trigger.textContent = "앱 서버를 켜는 중…";
+  }
+  try {
+    await api("/api/app-server", { method: "POST", body: { host: s.host, home: s.home || ".codex" }, authEpoch });
+    assertAuthEpoch(authEpoch);
+    toast("앱 서버를 켰습니다. 대화를 다시 읽습니다.");
+    await poll(true);
+    const current = selectedSession();
+    if (current?.key === s.key) await loadDetail(current, true);
+  } catch (err) {
+    if (!err.unauthorized && !err.staleAuth && authEpoch === state.authEpoch)
+      toast(err.message || "앱 서버를 켜지 못했습니다.");
+  } finally {
+    state.appServerBusy = false;
+    if (trigger && trigger.isConnected !== false) {
+      trigger.disabled = false;
+      trigger.textContent = "앱 서버 켜기";
+    }
+  }
 }
 
 // "새 세션": a host's own launcher (settings `launcher`), opened in a board

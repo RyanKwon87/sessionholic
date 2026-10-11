@@ -1206,6 +1206,35 @@ class Workflow:
         except (RuntimeError, OSError, ValueError):
             return {"available": False, "label": None, "reason": "이 기기의 새 세션 설정을 확인하지 못했습니다."}
 
+    def start_app_server(self, payload):
+        """Start one Codex account's app-server on its host, then read that host again.
+
+        Its sessions were listed from the state DB; reading and sending need the daemon.
+        The host starts it with that account's own launch variables (`codex app-server
+        daemon start`, nothing when it already runs) and never sends anything to a model."""
+        if not isinstance(payload, dict):
+            raise ValueError("앱 서버 요청 형식이 올바르지 않습니다.")
+        host = next((h for h in self.board.hosts if h["name"] == payload.get("host")), None)
+        key = payload.get("home")
+        if host is None or not isinstance(key, str) or not HOME_KEY.fullmatch(key):
+            raise ValueError("기기와 Codex 계정을 확인해 주세요.")
+        if host["local"]:
+            from launch import start_app_server
+            result = start_app_server(key)
+        else:
+            if not self.board.state[host["name"]]["ok"]:
+                raise RuntimeError("기기에 연결할 수 없어 앱 서버를 켜지 않았어요.")
+            from transfer import WorkerError
+            try:
+                # A first start installs the daemon package on that host.
+                result = self.transfers.rpc(host, "start_app_server", {"home": key}, timeout=150)
+            except WorkerError as exc:
+                raise ValueError(str(exc)) from None
+            if not isinstance(result, dict) or type(result.get("started")) is not bool:
+                raise RuntimeError("기기의 앱 서버 시작 결과를 확인하지 못했습니다.")
+        self.board.request_refresh(host["name"], force=True)
+        return {"ok": True, "started": result["started"]}
+
     def new_session(self, payload):
         """Open a host's own launcher in a new board terminal. The launcher, not the board,
         chooses the project, agent and account, so nothing else is decided here."""
@@ -1938,6 +1967,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_json(200, self.server.workflow.launch(data.get("planId"), data.get("requestId")))
             if path == "/api/new-session":
                 return self.send_json(200, self.server.workflow.new_session(data))
+            if path == "/api/app-server":
+                return self.send_json(200, self.server.workflow.start_app_server(data))
             match = re.fullmatch(r"/api/terminal/([a-f0-9]{32})/(input|resize|scroll|scroll-end|detach|close)", path)
             if match:
                 tid, action = match.groups()

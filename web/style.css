@@ -3931,6 +3931,34 @@ select:disabled {
   white-space: normal;
   line-height: 1.25;
 }
+/* A Codex account whose app-server is off: the reason, what starting it means
+   and "앱 서버 켜기", stacked. */
+.conversation-read-error.app-server-off {
+  flex-wrap: wrap;
+  gap: 6px 10px;
+  padding: 10px 12px;
+  background:
+    linear-gradient(var(--orange-tint), var(--orange-tint)),
+    var(--surface);
+}
+.conversation-read-error.app-server-off .detail-error {
+  flex-basis: 100%;
+  max-height: none;
+  font-weight: 600;
+}
+.conversation-read-error .detail-note {
+  flex-basis: 100%;
+  margin: 0;
+  color: var(--label-2);
+  font-size: var(--fs-cap);
+  line-height: 1.4;
+}
+.conversation-read-error > .app-server-start {
+  min-height: var(--tap);
+  padding: 0 14px;
+  border-radius: var(--radius-s);
+  font-size: var(--fs-sub);
+}
 /* If the notice is placed in #detail (like .stale-notice) instead of
    .messages, align it with the transcript column. */
 .detail-pane > .conversation-read-error {

@@ -618,6 +618,28 @@ class AppServer:
 
 
 def codex_homes():
+    """Homes with a daemon socket, read over that daemon."""
+    return codex_home_sets()[0]
+
+
+def codex_offline_homes():
+    return codex_home_sets()[1]
+
+
+def codex_home_sets():
+    """(live, offline): homes with a daemon socket, and homes without one whose state DB
+    still lists their threads read only. Kept router homes (`.codex-router/`) are archives:
+    without a daemon they stay out, as before."""
+    live, offline = [], []
+    for key, path, socket_there in _codex_home_candidates():
+        if socket_there:
+            live.append((key, path))
+        elif not key.startswith(".codex-router/") and state_db(path) is not None:
+            offline.append((key, path))
+    return live, offline
+
+
+def _codex_home_candidates():
     # Symlinked homes (for example `.codex-alias` -> `.codex-work`) are skipped, so one
     # daemon is never listed twice under two names, unless `codexHomes.allowSymlinks`.
     # `codexHomes.excludeSuspended` skips `.codex-<a>` and `.codex-personal-<a>` of the
@@ -634,16 +656,69 @@ def codex_homes():
         for account in router.suspended():
             skipped.update((".codex-" + account, ".codex-personal-" + account))
     homes = []
-    candidates = [HOME / ".codex"] + sorted(HOME.glob(".codex-*")) + sorted(ROUTER.glob("*"))
+    router = HOME / ".codex-router"
+    candidates = [HOME / ".codex"] + sorted(HOME.glob(".codex-*")) + sorted(router.glob("*"))
     for path in candidates:
-        if path == ROUTER or not path.is_dir():
+        if path == router or not path.is_dir():
             continue
         if not options.get("allowSymlinks") and path.resolve() != path.absolute():
             continue
         key = str(path.relative_to(HOME))
-        if key not in skipped and HOME_KEY.match(key) and (path / SOCKET_REL).exists():
-            homes.append((key, path))
+        if key not in skipped and HOME_KEY.match(key):
+            homes.append((key, path, (path / SOCKET_REL).exists()))
     return homes
+
+
+STATE_DB = re.compile(r"state_(\d{1,4})\.sqlite\Z")
+# Interactive threads only, as a daemon's own list shows by default (no `exec` runs or subagents).
+OFFLINE_SOURCES = ("cli", "vscode")
+
+
+def state_db(path):
+    """This home's newest Codex state DB (`state_<n>.sqlite`), or None."""
+    best = None
+    try:
+        names = os.listdir(path)
+    except OSError:
+        return None
+    for name in names:
+        match = STATE_DB.match(name)
+        if match and (best is None or int(match.group(1)) > best[0]):
+            candidate = Path(path) / name
+            if candidate.is_file() and not candidate.is_symlink():
+                best = (int(match.group(1)), candidate)
+    return best[1] if best else None
+
+
+def codex_db_threads(path):
+    """(listed, loaded, failure) like `codex_home_threads`, read from the home's state DB
+    without a daemon: its newest interactive threads, none loaded. Nothing starts or writes."""
+    import sqlite3
+    database = state_db(path)
+    if database is None:
+        return None, None, "read"
+    try:
+        connection = sqlite3.connect(database.resolve().as_uri() + "?mode=ro", uri=True, timeout=2)
+        try:
+            columns = {row[1] for row in connection.execute("PRAGMA table_info(threads)")}
+            if not {"id", "cwd", "title", "created_at", "updated_at", "archived", "source"} <= columns:
+                return None, None, "read"
+            optional = [name for name in ("name", "preview", "first_user_message") if name in columns]
+            rows = connection.execute(
+                "SELECT id, cwd, title, created_at, updated_at, source%s FROM threads WHERE archived = 0"
+                " AND source IN (?, ?) ORDER BY updated_at DESC LIMIT ?" % "".join(", " + n for n in optional),
+                (*OFFLINE_SOURCES, CODEX_THREAD_LIMIT)).fetchall()
+        finally:
+            connection.close()
+    except sqlite3.Error:
+        return None, None, "read"
+    data = []
+    for row in rows:
+        extra = dict(zip(optional, row[6:]))
+        data.append({"id": row[0], "cwd": row[1], "name": extra.get("name") or None,
+                     "preview": extra.get("preview") or extra.get("first_user_message") or row[2],
+                     "createdAt": row[3], "updatedAt": row[4], "source": row[5], "status": {"type": "notLoaded"}})
+    return {"data": data}, set(), None
 
 
 THREAD_LIST = {"limit": CODEX_THREAD_LIMIT, "archived": False, "sortKey": "updated_at", "sortDirection": "desc"}
@@ -700,9 +775,12 @@ def codex_labels(homes):
     return labels
 
 
-def codex_home_rows(key, project_id, account, reply, projects):
-    """(rows, errors) of one home's (listed, loaded, failure) reply."""
+def codex_home_rows(key, project_id, account, reply, projects, offline=False):
+    """(rows, errors) of one home's (listed, loaded, failure) reply; `offline` rows come from
+    its state DB without a daemon and say so (`appServer: "off"`)."""
     listed, loaded, failure = reply
+    if failure and offline:
+        return [], [f"Codex({account}) 기록을 읽지 못했습니다."]
     if failure == "connect":
         return [], [f"Codex daemon({account})에 연결하지 못했습니다."]
     if failure:
@@ -712,7 +790,10 @@ def codex_home_rows(key, project_id, account, reply, projects):
     for thread in threads if isinstance(threads, list) else []:
         # Each thread row is isolated so one unexpected shape keeps the rest visible.
         try:
-            rows.append(codex_row(thread, key, project_id, account, loaded, projects))
+            row = codex_row(thread, key, project_id, account, loaded, projects)
+            if offline:
+                row["appServer"] = "off"
+            rows.append(row)
         except Exception:
             skipped += 1
     return rows, ([f"Codex({account}) 작업 {skipped}건을 읽지 못했습니다."] if skipped else [])
@@ -720,7 +801,7 @@ def codex_home_rows(key, project_id, account, reply, projects):
 
 def codex_threads(errors, projects, full=False):
     out = []
-    homes = codex_homes()
+    homes, offline = codex_homes(), codex_offline_homes()
     labels = codex_labels(homes)
     # Each home has its own daemon socket, so the lists are read concurrently;
     # rows and errors are still assembled in the original home order.
@@ -732,6 +813,10 @@ def codex_threads(errors, projects, full=False):
         replies = [codex_home_threads(path, full) for path in paths]
     for (key, _), (project_id, account), reply in zip(homes, labels, replies):
         rows, failures = codex_home_rows(key, project_id, account, reply, projects)
+        out.extend(rows)
+        errors.extend(failures)
+    for (key, path), (project_id, account) in zip(offline, codex_labels(offline)):
+        rows, failures = codex_home_rows(key, project_id, account, codex_db_threads(path), projects, offline=True)
         out.extend(rows)
         errors.extend(failures)
     return out
@@ -753,6 +838,8 @@ def codex_row(thread, key, project_id, account, loaded, projects):
         "loaded": thread.get("id") in loaded,
         "startedAt": to_epoch(thread.get("createdAt")), "updatedAt": to_epoch(thread.get("updatedAt")),
         "snippet": preview if name else "", "resume": "codex resume " + str(thread.get("id") or ""),
+        # "cli", "vscode", "exec", ...: a subagent's structured source is left out.
+        "source": thread.get("source") if isinstance(thread.get("source"), str) else None,
     }
 
 
@@ -884,6 +971,10 @@ def read(agent, session_id, home_key=None):
     if agent == "codex":
         if not HOME_KEY.match(home_key or ""):
             raise ValueError("Codex home 형식이 올바르지 않습니다.")
+        if not (HOME / home_key / SOCKET_REL).exists():
+            # Listed from its state DB; the conversation itself needs the account's daemon.
+            return {"messages": [], "code": "app_server_off",
+                    "error": "이 계정의 Codex 앱 서버가 꺼져 있어 대화를 읽지 못했습니다."}
         try:
             with AppServer(HOME / home_key / SOCKET_REL, timeout=30) as server:
                 result = server.call("thread/read", {"threadId": session_id, "includeTurns": True})
@@ -1180,11 +1271,12 @@ class Watch:
     def sync_homes(self):
         self.load_projects()
         try:
-            homes = codex_homes()
+            homes, offline = codex_homes(), codex_offline_homes()
         except OSError:
             return
         labels = codex_labels(homes)
         keys = [key for key, _ in homes]
+        offline_keys = [key for key, _ in offline]
         started, stopped = [], []
         with self.lock:
             for (key, path), label in zip(homes, labels):
@@ -1195,12 +1287,21 @@ class Watch:
                     started.append(self.homes[key])
             for key in [key for key in self.homes if key not in keys]:
                 stopped.append(self.homes.pop(key))
-                self.parts.pop(("codex", key), None)
-            self.order = keys
+                if key not in offline_keys:
+                    self.parts.pop(("codex", key), None)
+            listed = set(keys) | set(offline_keys)
+            for part in [part for part in self.parts if isinstance(part, tuple) and part[1] not in listed]:
+                self.parts.pop(part)
+            self.order = keys + offline_keys
         for home in stopped:
             home.stopping.set()
         for home in started:
             home.thread.start()
+        # A home without a daemon is listed from its state DB on each sync; a daemon that
+        # appears later takes the home over on the next sync.
+        for (key, path), (project_id, account) in zip(offline, codex_labels(offline)):
+            rows, errors = codex_home_rows(key, project_id, account, codex_db_threads(path), self.projects, offline=True)
+            self.publish(("codex", key), rows, errors)
 
     def watch_local(self):
         """Claude Code from stat fingerprints plus `claude agents`, and tmux every few seconds."""

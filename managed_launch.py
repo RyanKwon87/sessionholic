@@ -64,6 +64,12 @@ def ensure_app_server(spec, profile, home=None):
     if (not argv or not os.path.isabs(argv[0]) or not os.access(argv[0], os.X_OK)
             or not env.get('CODEX_HOME') or Path(env['CODEX_HOME']).resolve() != expected):
         raise ValueError(APP_SERVER_FAILED)
+    # Later sessions of this account (from the user's own launcher too) join this daemon and
+    # run their tools in its variables: a plain launch environment also keeps the user's SSH
+    # agent, as their terminal does; one with isolation variables (personal Git·SSH) never.
+    import settings
+    if 'SSH_AUTH_SOCK' in os.environ and settings.ENV_KEYS.isdisjoint(env):
+        env = {**env, 'SSH_AUTH_SOCK': os.environ['SSH_AUTH_SOCK']}
     try:
         result = subprocess.run([argv[0], 'app-server', 'daemon', 'start'], env=env, cwd=str(expected),
                                 stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,

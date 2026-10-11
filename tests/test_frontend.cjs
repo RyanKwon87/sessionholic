@@ -126,7 +126,7 @@ function client(
   vm.runInContext(messageSource, context);
   vm.runInContext(source, context);
   const api = vm.runInContext(
-    "({state,api,sourceOf,accountOf,sendInput,pasteDraft,prepareDraftPaste,startDraftComposition,endDraftComposition,inputDraft,stopTerminalReader,startTerminalReader,closePlan,navigateView,backToList,backFromTerminal,closeTerminal,cancelTerminalClose,confirmTerminalClose,populateAccount,populateRoute,updateContinue,renderPlan,launchPlan,openTerminal,saveDraft,draftKey,refreshTerminals,renderTerminals,renderTerminalReturn,renderFilters,terminalCloseCopy,warnDraftUnload,preparePlan,renderGroups,renderMessages,loadDetail,chatKey,chatEntry,currentChat,chatSupported,chatAttachmentsSupported,buildChatComposer,sendChat,loadChatState,applyChatReceipt,uploadChatFiles,pasteChat,scheduleChatPoll,stopChatPolling,openNativeChat,allSessions,buildContinuePanel,chatReceiptCopy,returnToBoard,readChatClipboard,accountDisplay,sessionAccountLabel,closeChatToolsOutside,closeChatToolsEscape,drawDetail,refreshDetail,loadCapabilities,matches,recoverConnection,networkOffline,poll,select,focusDetailBack,restoreSelectedCardFocus,showLogin,lock,beginAuthEpoch,resizeChatInput,updateViewport,draftKeydown,configureTerminalKeyboard,queueTerminalScroll,flushTerminalScroll,terminalScrollEnd,renderAttention,chatPollDelay,pullRefresh,readingScroll,renderJump,pullDistance,listScroll,setReading,renderPrompt,promptAction,renderUsage,loadUsage,applyTheme,setTheme,updateThemeColor,haptic,navTransition,setDetailShown,chatVisible,sheetRelease,BottomSheet,sheet,openSettings,closeSettings,setTyping,pinchFontSize,setTerminalFontSize,loadXterm,assetUrl,syncEvents,closeEvents,eventsHealthy,renderFreshness,schedule,touchDevice,togglePhaseFilter,renderCounts,createLongPress,swipeIntent,swipeRelease,groupMessageRows,setTextSize,applyTextSize,renderConnectivity,terminalForSession,swipeActionFor,openMessageMenu,openCardMenu,messageActions,outboxShape,outboxMatches,outboxOrigin,settleOutbox,retryOutbox,renderAttachmentTiles,attachmentThumb,sendUpload,openActionSheet,closeActionSheet,setListCollapsed,closeSwipe,settleSwipe,prepareSwipe,runSwipeAction,GESTURE,setChromeVisible,toggleChrome,revealChrome,isChromeTap,snapshotAnnounced,updateChatComposer,capabilitiesRevision,toolKindOf,userMessageParts,formatElapsed,tickWorking,renderTerminalMarks,renderDetailTerminal,terminalsAnnounced,goToSessionTerminal,rememberTerminal,terminalMenu,updateTerminalMenu,chooseTerminalMenu,clearTerminalMenu,renderNewSession,openNewSession,startNewSession})",
+    "({state,api,sourceOf,accountOf,sendInput,pasteDraft,prepareDraftPaste,startDraftComposition,endDraftComposition,inputDraft,stopTerminalReader,startTerminalReader,closePlan,navigateView,backToList,backFromTerminal,closeTerminal,cancelTerminalClose,confirmTerminalClose,populateAccount,populateRoute,updateContinue,renderPlan,launchPlan,openTerminal,saveDraft,draftKey,refreshTerminals,renderTerminals,renderTerminalReturn,renderFilters,terminalCloseCopy,warnDraftUnload,preparePlan,renderGroups,renderMessages,loadDetail,chatKey,chatEntry,currentChat,chatSupported,chatAttachmentsSupported,buildChatComposer,sendChat,loadChatState,applyChatReceipt,uploadChatFiles,pasteChat,scheduleChatPoll,stopChatPolling,openNativeChat,allSessions,buildContinuePanel,chatReceiptCopy,returnToBoard,readChatClipboard,accountDisplay,sessionAccountLabel,closeChatToolsOutside,closeChatToolsEscape,drawDetail,refreshDetail,loadCapabilities,matches,recoverConnection,networkOffline,poll,select,focusDetailBack,restoreSelectedCardFocus,showLogin,lock,beginAuthEpoch,resizeChatInput,updateViewport,draftKeydown,configureTerminalKeyboard,queueTerminalScroll,flushTerminalScroll,terminalScrollEnd,renderAttention,chatPollDelay,pullRefresh,readingScroll,renderJump,pullDistance,listScroll,setReading,renderPrompt,promptAction,renderUsage,loadUsage,applyTheme,setTheme,updateThemeColor,haptic,navTransition,setDetailShown,chatVisible,sheetRelease,BottomSheet,sheet,openSettings,closeSettings,setTyping,pinchFontSize,setTerminalFontSize,loadXterm,assetUrl,syncEvents,closeEvents,eventsHealthy,renderFreshness,schedule,touchDevice,togglePhaseFilter,renderCounts,createLongPress,swipeIntent,swipeRelease,groupMessageRows,setTextSize,applyTextSize,renderConnectivity,terminalForSession,swipeActionFor,openMessageMenu,openCardMenu,messageActions,outboxShape,outboxMatches,outboxOrigin,settleOutbox,retryOutbox,renderAttachmentTiles,attachmentThumb,sendUpload,openActionSheet,closeActionSheet,setListCollapsed,closeSwipe,settleSwipe,prepareSwipe,runSwipeAction,GESTURE,setChromeVisible,toggleChrome,revealChrome,isChromeTap,snapshotAnnounced,updateChatComposer,capabilitiesRevision,toolKindOf,userMessageParts,formatElapsed,tickWorking,renderTerminalMarks,renderDetailTerminal,terminalsAnnounced,goToSessionTerminal,rememberTerminal,terminalMenu,updateTerminalMenu,chooseTerminalMenu,clearTerminalMenu,renderNewSession,openNewSession,startNewSession,startAppServer})",
     context,
   );
   api.state.csrf = "csrf-test";
@@ -6897,4 +6897,39 @@ test('opening a new session posts once per host and request, then opens its term
   assert.ok(c.state.terminals.some((item) => item.id === terminal.id));
   assert.equal(c.terminalCloseCopy(terminal).action, '실행 종료');
   assert.equal(c.terminalCloseCopy(terminal).danger, true);
+});
+
+// A Codex account without its app-server: listed from its state DB; "앱 서버 켜기" starts it.
+test('a conversation of an account whose app-server is off offers to start it, then reads again', async () => {
+  const calls = [];
+  const c = client(async (url, options) => {
+    calls.push({ url, body: options?.body ? JSON.parse(options.body) : null });
+    if (url === '/api/app-server') return { ok: true, status: 200, json: async () => ({ ok: true, started: true }) };
+    return { ok: true, status: 200, json: async () => ({ ok: true }) };
+  }, noChatTimers);
+  const s = recentSession('off-thread', { home: '.codex', appServer: 'off', phase: 'closed' });
+  setRecentSnapshot(c, [s]);
+  c.state.selected = s.key;
+  c.renderGroups([s], 1100);
+  c.drawDetail(s);
+  const reloaded = [];
+  c.context.poll = async (refresh) => { reloaded.push(['poll', refresh]); };
+  c.context.loadDetail = async (current, fresh) => { reloaded.push(['detail', current.key, fresh]); };
+  c.renderMessages(s, [], '이 계정의 Codex 앱 서버가 꺼져 있어 대화를 읽지 못했습니다.');
+  const box = byClass(c.get('messages'), 'conversation-read-error')[0];
+  assert.match(box.className, /app-server-off/);
+  const start = byClass(box, 'app-server-start')[0];
+  assert.equal(start.textContent, '앱 서버 켜기');
+  assert.equal(byClass(box, 'secondary').length, 0, 'no plain retry: reading cannot work before the start');
+  await start.events.click({ currentTarget: start });
+  const posts = calls.filter((call) => call.url === '/api/app-server');
+  assert.deepEqual(posts.map((call) => call.body), [{ host: 'workstation', home: '.codex' }]);
+  assert.deepEqual(reloaded, [['poll', true], ['detail', s.key, true]]);
+  assert.equal(start.disabled, false);
+  // An ordinary read failure keeps its retry button.
+  const other = recentSession('other-thread');
+  c.renderMessages(other, [], '대화를 읽지 못했습니다.');
+  const plain = byClass(c.get('messages'), 'conversation-read-error')[0];
+  assert.equal(byClass(plain, 'app-server-start').length, 0);
+  assert.equal(byClass(plain, 'secondary')[0].textContent, '대화 다시 불러오기');
 });

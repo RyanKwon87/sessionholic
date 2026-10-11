@@ -47,6 +47,7 @@
   "tests/test_message_format.cjs",
   "tests/test_native_chat.py",
   "tests/test_new_session.py",
+  "tests/test_offline_codex.py",
   "tests/test_public_tree.py",
   "tests/test_server.py",
   "tests/test_settings.py",

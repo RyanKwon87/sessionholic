@@ -405,6 +405,9 @@ def _rpc(request):
         return prepare(args, profiles, import_workspace)
     if op == 'stage_handoff':
         return stage_handoff(args)
+    if op == 'start_app_server':
+        from launch import start_app_server
+        return start_app_server(args.get('home'))
     if op == 'cleanup':
         folder = job(args['transferId'])
         return cleanup_archives(folder)

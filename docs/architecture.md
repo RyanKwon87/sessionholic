@@ -8,6 +8,7 @@ flowchart LR
     S --> C[수집기 · 세션/대화 읽기]
     S --> W[워크플로 · 연결/인계/이전 계획]
     S --> H[채팅 조정기 · 첨부 검증]
+    S --> G[목표 저장 · 세션 연결 참조]
     S --> T[PTY · tmux 터미널]
     C --> N[호스트 native CLI 및 세션 파일]
     H --> N
@@ -26,13 +27,43 @@ flowchart LR
    - `/api/events`(`events.py`)는 Server-Sent Events로 스냅샷 `version` 변경과 구독한 대화의 상태 digest 변경을 알립니다. 스냅샷 `version`은 호스트 상태가 실제로 바뀔 때만 오릅니다. 같은 대화는 구독자 수와 관계없이 감시자 하나가 기존 대화 상태 조회 경로(2초 캐시 포함)로 읽습니다. 작업 중이거나 내용이 바뀌었거나 보드에서 메시지 전송·질문 응답이 성공하면 2초 간격이고, 변화 없는 조회가 이어지면 5·10·20·30초로 늘린 뒤 30초를 유지합니다. 오류 뒤에는 10초 이상, 현재 유휴 간격보다 짧지 않게 기다립니다. 감시자는 마지막 구독이 끊긴 뒤 10초에 멈춥니다. 연결은 8개까지 받고 15초마다 heartbeat를 보내며, 스트림은 수집 잠금을 잡지 않고 서버 종료를 막지 않습니다.
    - 보드 터미널 목록이 바뀌면 `event: terminals`(data `{"version": <int>}`)를 보냅니다. hello에는 현재 `terminalsVersion`을, `/api/terminals` 응답에는 목록을 읽기 직전의 `version`을 싣습니다. 생성·닫기·attach·detach는 `TerminalManager`가 직접 알리고, tmux 세션이 스스로 끝난 경우는 스트림이 하나라도 열려 있을 때만 감시자 하나가 5초마다 `terminals.list()`의 살아 있는 터미널 집합을 비교해 찾습니다(오류 뒤 10초, 마지막 스트림이 끊기고 10초 뒤 멈춤). 아무도 보지 않는 동안에는 읽지 않고, 다시 연결되면 첫 조회에서 그사이 끝난 터미널을 알립니다. 화면은 이 이벤트를 300ms 묶어 `/api/terminals`를 다시 읽고, 같은 기기의 열기·닫기는 응답 직후 목록 카드와 대화 머리말에 반영합니다. 실시간 연결이 없으면 일반 새로고침이 1분 넘은 터미널 목록을 다시 읽습니다.
 3. `collector.py`는 호스트에서 Claude Code·Codex의 세션 상태와 최근 대화를 읽습니다. Codex home이 여러 개면 home마다 별도 daemon 연결로 최대 4개를 동시에 읽고, 결과는 home 순서대로 합칩니다. 메시지는 4,000자에서 자르고, 잘린 행에만 `truncated`와 원래 글자 수 `fullLength`를 붙입니다. 원격 조회는 기존 SSH 별칭을 통해 수집기 코드를 표준 입력으로 전달합니다. 이는 사용자의 SSH 연결과 원격 native CLI 설치·로그인을 전제로 합니다.
-   - Codex 목록(`thread/list`)은 `useStateDbOnly`로 상태 DB에서만 읽습니다. 이 인자에 오류 응답을 주는 Codex는 그 home만 인자 없이 한 번 더 읽습니다. 다른 Codex home을 가리키는 심볼릭 링크 home은 같은 daemon을 두 번 읽지 않도록 건너뜁니다.
-   - daemon 소켓이 없는 home(보관용 `.codex-router/` 제외)은 가장 높은 번호의 `state_<n>.sqlite`를 읽기 전용(`mode=ro`, daemon이 WAL 색인 없이 남긴 DB는 `immutable=1`)으로 열어, 보관하지 않은 대화형(`cli`·`vscode`) 스레드를 최신순으로 목록에 넣고 `appServer: "off"`로 표시합니다. 그 대화 읽기는 `app_server_off` 코드로 거절하고, 화면의 "앱 서버 켜기"(`POST /api/app-server`)가 그 기기에서 해당 계정의 실행 환경으로 `codex app-server daemon start`를 실행합니다. 이후 그 계정의 Codex 세션은 이 daemon을 함께 씁니다. 실행 환경에 격리 변수가 없을 때만 사용자의 `SSH_AUTH_SOCK`를 넘깁니다.
+   - Codex 목록(`thread/list`)은 `useStateDbOnly`로 상태 DB에서 읽으며 `sourceKinds`에 `cli`, `vscode`, `exec`, `appServer`, `subAgent`, `unknown`을 지정합니다. 이 인자에 오류 응답을 주는 Codex는 상태 DB 전용 옵션 없이 다시 읽고, source 필터도 거부하면 이를 빼고 마지막으로 조회합니다. 이 경우 대화형 기록만 표시될 수 있다는 경고를 함께 반환합니다. 다른 Codex home을 가리키는 심볼릭 링크 home은 같은 daemon을 두 번 읽지 않도록 건너뜁니다.
+   - daemon 소켓이 없는 home(보관용 `.codex-router/` 제외)은 가장 높은 번호의 `state_<n>.sqlite`를 읽기 전용(`mode=ro`, daemon이 WAL 색인 없이 남긴 DB는 `immutable=1`)으로 엽니다. 보관하지 않은 스레드를 source 종류와 무관하게 최신 25개까지 읽고 `appServer: "off"`로 표시합니다. 구조화 source의 JSON과 존재하는 이름·부모·명시 시작 메타데이터 열도 보존합니다. 그 대화 읽기는 `app_server_off` 코드로 거절하고, 화면의 "앱 서버 켜기"(`POST /api/app-server`)가 그 기기에서 해당 계정의 실행 환경으로 `codex app-server daemon start`를 실행합니다. 이후 그 계정의 Codex 세션은 이 daemon을 함께 씁니다. 실행 환경에 격리 변수가 없을 때만 사용자의 `SSH_AUTH_SOCK`를 넘깁니다.
    - `watch` 모드는 Codex home마다 daemon 연결 하나를 유지합니다. 모든 연결에 방송되는 스레드 목록 알림(`thread/started`·`thread/status/changed`·`thread/name/updated`·`thread/archived`·`thread/unarchived`·`thread/closed`·`thread/deleted`)을 받으면 0.25초 묶어 상태 DB 목록을 다시 읽습니다. 스레드를 구독(`thread/resume` 등)하지 않으므로 Codex 실행 수명은 바뀌지 않습니다. 알림이 없어도 Codex는 5초마다 상태 DB로, 120초마다 파일 재검토 목록으로 읽고, daemon이 재시작되면 home의 소켓 링크로 다시 연결합니다. Claude Code는 세션 등록 파일·백그라운드 작업 상태·대화 기록 파일의 크기와 수정 시각만 1초마다 확인해, 등록 정보가 바뀌면 `claude agents`를 다시 부르고(최소 2초 간격, 변화가 없어도 60초마다) 기록만 늘면 미리보기만 다시 읽습니다. tmux는 10초마다 읽습니다. 내용이 바뀔 때만 전체 스냅샷을 JSON 한 줄로 내고, 상태·제목·행 변경은 1초, 시각·미리보기만 바뀐 경우는 5초 간격으로 묶습니다. 10초마다 heartbeat를 내고, 표준 입력이 닫히거나 30초 동안 아무 줄도 받지 못하면 스스로 끝납니다. 같은 보드의 상주 수집기는 `/tmp/sessionholic-watch-<uid>/<보드 ID>.lock` 잠금으로 호스트마다 하나만 돌고, 잠금을 35초 안에 얻지 못하면 `busy`를 내고 끝납니다.
 4. `Workflow`는 선택된 세션·계정·호스트를 다시 확인하고 연결 계획을 만듭니다. 같은 native 세션 연결, 최근 맥락을 전달하는 새 native 실행, 새 작업 폴더를 준비하는 호스트 간 이전은 서로 다른 경로입니다.
 5. `Chat`은 메시지·첨부 요청을 원본 세션이 있는 호스트로 전달하고 결과를 확인합니다. `native_chat.py`는 호스트별 native capability를 검사하고, `attachments.py`는 실제 세션의 작업 경로 안에서 파일을 안전하게 저장·검증합니다.
 6. `terminal.py`는 서버가 검증한 native CLI 명령을 전용 tmux 세션과 PTY에서 실행합니다. 브라우저의 xterm은 해당 PTY에 연결된 터미널 화면입니다. 브라우저 연결을 닫는 것과 CLI 실행을 종료하는 동작은 별도입니다.
 7. `terminal_input.py`는 PTY 입력 전에 요청 해시와 미확인 상태를 SQLite에 저장합니다. 쓰기를 마친 경우만 접수 상태로 바꾸며, 미확인 요청은 재시작 뒤에도 재전송하지 않습니다. 터미널 원문은 이 기록에 넣지 않습니다.
+
+## 목표와 세션 메타데이터
+
+`goals.py`는 `GET /api/goals`, `GET /api/goals/<id>`, `POST /api/goals`, `POST /api/goals/<id>`로 읽고 쓰는 목표 저장소입니다. 목록·대화와 같은 인증을 사용하고 쓰기는 Origin·CSRF 검사를 통과해야 합니다. 목표 상태는 `todo / in_progress / waiting / review / done`이며 세션 `phase`, 연결 상태, 전송 receipt와 독립적입니다. turn 종료·receipt 완료·기기 오프라인은 목표 상태를 변경하지 않습니다.
+
+각 목표는 제목, 완료 조건, 현재 상황, 다음 행동, 프로젝트, 대기 이유, 완료 근거, 고정·보관 여부와 연결 세션을 가집니다. 완료 저장에는 완료 조건과 근거가, 대기 저장에는 이유가 필요합니다. 입력한 근거의 진위를 모델이나 외부 서비스로 자동 판정하지 않습니다. 한 목표는 세션 참조를 최대 64개 보관하며, 같은 세션도 여러 목표에 연결할 수 있습니다. 참조는 기기·도구·계정 홈·세션 ID와 선택적인 대화 지점 메모(`point`)로 구성되고 대화 내용을 복제하지 않습니다.
+
+저장은 보드의 `<state-dir>/goals.json`(0600)에 원자적으로 반영합니다. 작업마다 `revision`을 보내 수정하고, 기존 버전과 다르면 409 충돌을 반환해 다른 화면의 변경을 덮어쓰지 않습니다. 파일 잠금으로 프로세스 간 쓰기도 직렬화합니다. 변경 주체(`user / agent / inferred`), 이유, 시각, 바뀐 필드와 전후 상태는 작업별 최근 100건을 남깁니다. 주체 표시는 입력된 보고 메타데이터이며 인증된 사람·에이전트 신원 증명이 아닙니다. 저장 한도는 목표 2,000개와 파일 8 MiB이며, 파일 손상·권한 오류가 있으면 원본을 빈 파일로 바꾸지 않고 목표 API만 실패합니다.
+
+확인된 인계·기기 이전 결과에 원본과 새 native 세션 식별자가 모두 있으면 원본의 목표에 대상 세션 참조를 추가합니다. 목표 상태는 유지합니다. 시각·제목·프로젝트가 비슷하다는 이유로 목표를 자동 연결하지 않습니다. 목표 연결 저장이 실패해도 이미 시작된 native 실행을 실패로 바꾸거나 다시 실행하지 않고 별도 안내를 반환합니다.
+
+세션 시작 주체의 공통 필드는 다음과 같습니다.
+
+| 필드 | 의미 |
+| --- | --- |
+| `initiator` | `human`(직접 시작), `agent`(에이전트 시작), `unknown`(출처 미확인) |
+| `initiatorName`, `initiatorEvidence` | 명시된 시작 주체 이름과 `explicit / subagent / board / unknown` 근거 구분 |
+| `parentSessionId` | 명시적으로 확인된 부모 세션 ID |
+| `agentName`, `agentRole` | 현재 세션의 워커 이름·역할. 시작한 부모 이름과 별도 |
+| `source`, `originator` | native 시작 경로와 원본 originator 메타데이터 |
+
+Codex RPC의 `source.subAgent`와 DB의 `source.subagent` 구조를 보존하고, 알려진 하위 에이전트 source는 에이전트 시작으로 분류합니다. `cli / exec`, Claude `interactive / background`, agent 이름이나 부모 ID만으로 사람·에이전트 시작을 추정하지 않습니다. Claude 목록의 명시 initiator·부모 필드도 전달합니다. 같은 기기·도구·계정의 부모 참조가 목표 상세에 함께 있을 때 하위 세션을 접어 보여 줍니다. 공통 스키마가 새로운 수집 adapter를 만드는 것은 아니며 현재 Codex·Claude Code만 지원합니다.
+
+## 작업 화면과 대화 보기
+
+`web/goals.js`는 작업 칸반·목표 상세·세션 연결을, `web/app.js`는 세션 목록·대화·터미널을 담당합니다. 작업 검색은 목표명·세션명·프로젝트를 함께 찾고 소속 작업과 기기를 표시합니다. 폰은 상태별 세로 목록이 기본이고 칸반으로 전환할 수 있습니다. 넓은 화면은 보드와 상세·대화를 함께 보여 주고 분할 폭을 조절합니다. 고정한 작업은 먼저 표시하며 카드 이동·보관 등의 목표 수정은 직전 변경 실행 취소를 제공합니다. 메시지 전송과 외부 실행에는 적용하지 않습니다.
+
+집중 모드는 모든 화면에서 명시 버튼으로 전환합니다. 패드·폰은 짧고 움직이지 않은 일반 본문 탭도 허용하며, 텍스트 선택·링크·코드·첨부·길게 누르기·드래그는 제외합니다. 직접 스크롤하면 부가 도구를 접고, 바닥 도달·맨 아래 버튼·새 답변·질문·전송 오류가 숨김 선택을 해제하지 않습니다. 질문·전송 상태와 최소 입력은 대화 곁에 남고 PC 본문 클릭은 선택 동작을 유지합니다. 접고 펼칠 때 읽던 줄의 화면 위치 또는 바닥 고정을 유지합니다.
+
+같은 탭 안에서 작업 필터·보드 위치와 대화별 보기 상태·읽던 위치·초안·첨부 선택을 복원합니다. 대화 상태의 식별에는 기기·도구·계정 홈·세션·작업 경로를 사용합니다. 초안과 보기 상태를 브라우저 장기 저장소에 새로 저장하지 않으며, 탭 닫기·새로고침·잠금·인증 만료 시 메모리에서 지웁니다. 이미 업로드된 파일은 별도 저장물입니다. 시스템 동작 줄이기, 키보드 검색·이동과 시트 종료 후 초점 복귀를 지원합니다.
 
 ## 세션 전환 모델
 
@@ -57,22 +88,24 @@ flowchart LR
 `"version": 2` 파일은 위 필드에 더해 다음 선택 필드를 받습니다. 빠진 필드는 버전 1 동작 그대로이고, 형식이 틀리면 버전 1처럼 기동·수집·실행을 멈춥니다(fail closed).
 
 - `environments.<g>`: `boundaryGroup`(경계 비교에 쓸 다른 그룹, 한 단계), `scope`·`description`(실행 설정 화면의 묶음 이름과 설명). 환경 변수 허용 키에 `CMUX_CODEX_HOOKS_DISABLED`가 추가됩니다(버전 1에서도 허용).
-- `profileRules`: `[{agent, homePrefix, environment, label, suffixLabel}]`. 목록에 없는 홈을 접두사로 분류합니다. 접두사는 이름 경계(`-`·`/`)에서만 맞고, 처음 맞는 규칙을 씁니다. `suffixLabel`이면 접두사 뒤 이름이 표시 이름이 됩니다.
-- `profiles[]`: `placeholder`(폴더가 없어도 사용 불가로 표시), `project`(이 홈의 세션을 프로젝트에 연결), `title`(전체 표시 이름).
+- `profileRules`: `[{agent, homePrefix, environment, label, suffixLabel, launchEnabled}]`. 목록에 없는 홈을 접두사로 분류합니다. 접두사는 이름 경계(`-`·`/`)에서만 맞고, 처음 맞는 규칙을 씁니다. `suffixLabel`이면 접두사 뒤 이름이 표시 이름이 됩니다.
+- `profiles[]`: `placeholder`(폴더가 없어도 사용 불가로 표시), `project`(이 홈의 세션을 프로젝트에 연결), `title`(전체 표시 이름), `launchEnabled`(기본 `true`). `false`이면 기록 수집은 유지하고 보드의 새 CLI 실행·앱 서버 시작을 거부합니다. 명시 프로필 값이 규칙보다 우선하며 클라이언트가 보내는 `available` 값으로 우회할 수 없습니다. 별도로 설정한 `hide`·`excludeSuspended`는 계속 수집 범위에 적용됩니다.
 - `projects[].match: "component"`: `root`를 폴더 이름 하나로 보고, 해석한 작업 경로의 어느 구성요소든 같으면 그 환경을 씁니다. 긴 root 매칭이 먼저이고, 이름표에는 쓰지 않습니다.
 - `boundary`: `{agents, claude, priority}`. `agents`에 있는 대상 에이전트만 경계를 검사합니다(기본 둘 다). 빠진 에이전트는 원본 환경 변수로 실행합니다(`claude: "inherit-source"`). `priority` 그룹은 신호(원본 홈의 profile·규칙, 경로 구성요소·root project)가 하나라도 있으면 다른 판정과 이전받은 작업공간의 기록보다 먼저 적용되고, 이때 기록은 읽지 않습니다. 없으면 이전받은 작업공간은 기록만 따릅니다.
 - `legacy.sourcePersonal`: `{"true": g, "false": g}`. `sourceEnvironment`가 없는 옛 이전 기록의 boolean을 읽기만 합니다. 둘 다 없거나 boolean이 아니면 거절합니다.
 - `codexHomes`: `allowSymlinks`(링크 홈 수집), `excludeSuspended`(계정 정책의 중단 계정 `.codex-<a>`·`.codex-personal-<a>` 수집 제외), `requireMarker`(로그인·설정·소켓 파일이 있는 폴더만 실행 프로필로 표시), `hide`(쓰지 않는 홈 이름 목록. 수집과 실행 대상에서 모두 뺍니다).
-- `agentRouter`: `{projectsFile, workspacesRoot, accountPolicy}`. 수집기의 프로젝트 이름표, 작업공간 루트, `.codex-router/<hash>` 홈의 (프로젝트, 계정) 이름표에만 씁니다. 계정 정책은 키 이름만 읽습니다.
+- `agentRouter`: `{projectsFile, workspacesRoot, accountPolicy}`. 수집기의 프로젝트 이름표, 작업공간 루트, `.codex-router/<hash>` 홈의 (프로젝트, 계정) 이름표와 중단 계정 실행 정책에 씁니다. 계정 정책의 계정 이름·`suspended_accounts`만 사용하며 이메일 등 계정 값을 응답에 복사하지 않습니다. 중단 계정은 프로필을 남기되 실행 불가로 표시합니다. `excludeSuspended`를 켜지 않았다면 이 정책만으로 이전 기록을 숨기지 않습니다.
 - `tmux`: `{titleOption, taskOption}`. 기존 tmux 세션의 사용자 옵션을 제목·작업으로 표시합니다.
 - `transfer.agentConfig`: `"exclude-private"`(기본, `.claude`·`.codex*`의 개인 상태만 제외) 또는 `"exclude-all"`(이 이름의 폴더·파일 전체 제외).
 - `attachments.gitExclude`: 기본 `true`. `false`면 업로드 때 저장소의 `.git/info/exclude`를 쓰지 않습니다.
 - `usage`: 보드 호스트의 사용량 도우미(`usage.py`). `provider: "helper"`, `resources`·`python`·`path`, Codex(`codex`, `codexHelper`, `codexAccounts: [{key, label}]`)·Claude(`claude`, `claudeHelper`) 중 하나 이상, `intervalSeconds`(기본 300)·`manualIntervalSeconds`(기본 20). 없으면 `/api/usage`는 404이고 화면은 사용량을 숨깁니다.
 
-- `launcher`: `{command, label, cwd}`. 목록의 "새 세션"이 이 기기의 터미널에서 여는 실행 명령입니다. `command[0]`은 절대 경로나 `~/` 경로이고, `label`(기본 "새 세션")은 화면 이름, `cwd`(기본 홈 폴더)는 시작 폴더입니다. 보드는 명령을 열기만 하고, 프로젝트·에이전트·계정 선택과 그 검사는 실행 명령이 맡습니다. 원격 기기는 그 기기의 설정으로 실행하며, 환경 변수는 일반 터미널 변수(`PATH`·`LANG`·`TERM` 등과 사용자의 `SSH_AUTH_SOCK`)만 넘깁니다. 실행 명령이 `  1. 이름` 줄과 `선택:` 같은 입력 줄로 번호 메뉴를 보이면, 화면은 그 메뉴를 버튼으로 보여 주고 누르면 번호와 Enter를 입력합니다. 없으면 "새 세션"은 숨겨집니다. 새 세션 터미널은 열린 뒤 30분 안에 그 기기에 처음 나타난 대화형 세션(Codex `exec`·Claude 백그라운드 제외, 다른 터미널과 연결되지 않은 것)과 서버에서 한 번 연결되어 기록되고, 그 세션 카드에 "터미널 열림"이 표시됩니다. 같은 기기의 다른 터미널에서 거의 같은 때 시작한 세션이 있으면 잘못 연결될 수 있습니다.
+- `launcher`: `{command, label, cwd}`. 목록의 "새 세션"이 이 기기의 터미널에서 여는 실행 명령입니다. `command[0]`은 절대 경로나 `~/` 경로이고, `label`(기본 "새 세션")은 화면 이름, `cwd`(기본 홈 폴더)는 시작 폴더입니다. 보드는 명령을 열기만 하고, 프로젝트·에이전트·계정 선택과 그 검사는 실행 명령이 맡습니다. 원격 기기는 그 기기의 설정으로 실행하며, 환경 변수는 일반 터미널 변수(`PATH`·`LANG`·`TERM` 등과 사용자의 `SSH_AUTH_SOCK`)만 넘깁니다. 실행 명령이 `  1. 이름` 줄과 `선택:` 같은 입력 줄로 번호 메뉴를 보이면, 화면은 그 메뉴를 버튼으로 보여 주고 누르면 번호와 Enter를 입력합니다. 없으면 "새 세션"은 숨겨집니다. 이 임의 실행 명령 내부의 계정 정책은 명령 자체가 책임지며 보드의 `launchEnabled` 설정을 자동 주입하지 않습니다.
+
+새 세션 터미널과 이후 나타난 native 대화를 시각으로 짝짓는 기존 경로는 `linkConfidence: "estimated"`입니다. 보드에서 실행 버튼을 누른 사실만으로 그 native 대화를 직접 시작으로 확정하거나 목표를 자동 연결하지 않습니다. 외부 라우터가 launch ID와 native session ID를 정확하게 기록하더라도 보드 터미널 요청과 그 launch ID를 연결하는 계약은 별도로 필요하며 현재 지원하지 않습니다.
 
 기기 목록·SSH 별칭과 HTTP 서버 실행 옵션은 설치 안내의 예시 설정을 따릅니다. 외부 주소, 호스트, 계정, 토큰을 코드나 문서 예시에 고정하지 않습니다.
 
 ## 상태 보관
 
-세션 캐시, 읽은 대화, terminal 등록, 요청 중복 방지 기록, 이전 진행 기록은 사용자의 지정 상태 디렉터리에 보관됩니다. 첨부 파일은 실행 호스트의 실제 작업 디렉터리 아래 `.sessionholic-attachments/`에 저장되며, 이전 파일 선택에 포함될 수 있습니다. 데이터는 계정 간이나 기기 간에 자동 동기화되지 않습니다.
+목표와 변경 이력, 세션 캐시, 읽은 대화, terminal 등록, 요청 중복 방지 기록, 이전 진행 기록은 사용자의 지정 상태 디렉터리에 보관됩니다. 목표는 보관해도 파일에서 삭제되지 않습니다. 첨부 파일은 실행 호스트의 실제 작업 디렉터리 아래 `.sessionholic-attachments/`에 저장되며, 이전 파일 선택에 포함될 수 있습니다. 데이터는 계정 간이나 기기 간에 자동 동기화되지 않습니다.

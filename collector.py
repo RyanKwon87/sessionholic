@@ -472,6 +472,77 @@ def claude_snippet(path, size):
     return ""
 
 
+def _metadata_text(value, limit=256):
+    if (isinstance(value, str) and value.strip() and len(value) <= limit
+            and not any(ord(char) < 32 for char in value)):
+        return value.strip()
+    return None
+
+
+def session_source(value):
+    """Keep a bounded native source, including a DB's stringified structured enum.
+
+    The app-server spells `subAgent`; persisted Codex records spell `subagent`.
+    Unrecognized sources remain visible and do not imply who started a session.
+    """
+    if isinstance(value, str):
+        if len(value) > 4096:
+            return None
+        if value.lstrip().startswith(("{", '"')):
+            try:
+                parsed = json.loads(value)
+                if isinstance(parsed, (str, dict)):
+                    value = parsed
+            except (ValueError, RecursionError):
+                pass
+        if isinstance(value, str):
+            return _metadata_text(value, 4096)
+    if isinstance(value, dict):
+        try:
+            encoded = json.dumps(value, allow_nan=False)
+            if len(encoded) <= 4096:
+                return json.loads(encoded)
+        except (ValueError, TypeError, RecursionError):
+            pass
+    return None
+
+
+def session_origin(row):
+    """Explicit initiator evidence, independent of client mode or current executor.
+
+    CLI/interactive and exec/background are transport modes, never human/agent evidence.
+    A parent reference alone can be a fork, so only a structured subagent source or an
+    explicit initiator establishes agent initiation. Native nicknames name the child.
+    """
+    source = session_source(row.get("source"))
+    subagent = next((source[key] for key in ("subAgent", "subagent") if key in source), None) \
+        if isinstance(source, dict) else None
+    spawn = subagent.get("thread_spawn", {}) if isinstance(subagent, dict) else {}
+    spawn = spawn if isinstance(spawn, dict) else {}
+    explicit = row.get("initiator")
+    detail = explicit if isinstance(explicit, dict) else {}
+    kind = detail.get("type", detail.get("kind")) if detail else explicit
+    kind = {"user": "human", "human": "human", "agent": "agent"}.get(kind) if isinstance(kind, str) else None
+    # Known native subagent variants. An unknown object is preserved but not classified.
+    is_subagent = (isinstance(subagent, str) and subagent in ("review", "compact", "memory_consolidation")) or \
+        (isinstance(subagent, dict) and
+         (isinstance(subagent.get("thread_spawn"), dict) or isinstance(subagent.get("other"), str)))
+    evidence = "explicit" if kind else "subagent" if is_subagent else "unknown"
+    parent = next((text for key in ("parentSessionId", "parent_session_id", "parentThreadId", "parent_thread_id")
+                   for text in [_metadata_text(row.get(key))] if text), None)
+    parent = parent or _metadata_text(spawn.get("parent_thread_id"))
+    name = (_metadata_text(row.get("initiatorName")) or _metadata_text(row.get("initiator_name")) or
+            _metadata_text(detail.get("name")))
+    agent_name = (_metadata_text(row.get("agentName")) or _metadata_text(row.get("agentNickname")) or
+                  _metadata_text(row.get("agent_nickname")) or _metadata_text(spawn.get("agent_nickname")))
+    role = (_metadata_text(row.get("agentRole")) or _metadata_text(row.get("agent_role")) or
+            _metadata_text(spawn.get("agent_role")) or _metadata_text(spawn.get("agent_type")))
+    return {"initiator": kind or ("agent" if is_subagent else "unknown"),
+            "initiatorName": name, "initiatorEvidence": evidence, "parentSessionId": parent,
+            "agentName": agent_name, "agentRole": role, "source": source,
+            "originator": _metadata_text(row.get("originator"))}
+
+
 def claude_row(row, transcripts, projects):
     if not isinstance(row, dict):
         raise TypeError("Claude 세션 행 형식이 올바르지 않습니다.")
@@ -494,6 +565,7 @@ def claude_row(row, transcripts, projects):
         "waitingFor": row.get("waitingFor"), "phase": claude_phase(row.get("state"), row.get("status")),
         "startedAt": to_epoch(row.get("startedAt")), "updatedAt": updated,
         "snippet": snippet, "resume": "claude attach " + str(row.get("id") or ""),
+        **session_origin(row),
     }
     pid = row.get("pid")
     if not out["id"] and isinstance(pid, int) and not isinstance(pid, bool):
@@ -670,8 +742,8 @@ def _codex_home_candidates():
 
 
 STATE_DB = re.compile(r"state_(\d{1,4})\.sqlite\Z")
-# Interactive threads only, as a daemon's own list shows by default (no `exec` runs or subagents).
-OFFLINE_SOURCES = ("cli", "vscode")
+# Native source filters are transport kinds, not the initiator classification.
+CODEX_SOURCES = ("cli", "vscode", "exec", "appServer", "subAgent", "unknown")
 
 
 def state_db(path):
@@ -713,7 +785,8 @@ def _open_read_only(sqlite3, database, immutable=False):
 
 def codex_db_threads(path):
     """(listed, loaded, failure) like `codex_home_threads`, read from the home's state DB
-    without a daemon: its newest interactive threads, none loaded. Nothing starts or writes."""
+    without a daemon: newest unarchived threads of every source, none loaded.
+    Unknown source kinds stay visible. Nothing starts or writes."""
     import sqlite3
     database = state_db(path)
     if database is None:
@@ -733,11 +806,13 @@ def codex_db_threads(path):
             columns = {row[1] for row in connection.execute("PRAGMA table_info(threads)")}
             if not {"id", "cwd", "title", "created_at", "updated_at", "archived", "source"} <= columns:
                 return None, None, "read"
-            optional = [name for name in ("name", "preview", "first_user_message") if name in columns]
+            optional = [name for name in ("name", "preview", "first_user_message", "originator",
+                                          "agent_nickname", "agent_role", "parent_thread_id",
+                                          "initiator", "initiator_name", "parent_session_id") if name in columns]
             rows = connection.execute(
                 "SELECT id, cwd, title, created_at, updated_at, source%s FROM threads WHERE archived = 0"
-                " AND source IN (?, ?) ORDER BY updated_at DESC LIMIT ?" % "".join(", " + n for n in optional),
-                (*OFFLINE_SOURCES, CODEX_THREAD_LIMIT)).fetchall()
+                " ORDER BY updated_at DESC LIMIT ?" % "".join(", " + n for n in optional),
+                (CODEX_THREAD_LIMIT,)).fetchall()
         finally:
             connection.close()
     except sqlite3.Error:
@@ -745,13 +820,17 @@ def codex_db_threads(path):
     data = []
     for row in rows:
         extra = dict(zip(optional, row[6:]))
-        data.append({"id": row[0], "cwd": row[1], "name": extra.get("name") or None,
+        data.append({**{key: extra[key] for key in optional
+                         if key not in ("name", "preview", "first_user_message")},
+                     "id": row[0], "cwd": row[1], "name": extra.get("name") or None,
                      "preview": extra.get("preview") or extra.get("first_user_message") or row[2],
-                     "createdAt": row[3], "updatedAt": row[4], "source": row[5], "status": {"type": "notLoaded"}})
+                     "createdAt": row[3], "updatedAt": row[4], "source": session_source(row[5]),
+                     "status": {"type": "notLoaded"}})
     return {"data": data}, set(), None
 
 
-THREAD_LIST = {"limit": CODEX_THREAD_LIMIT, "archived": False, "sortKey": "updated_at", "sortDirection": "desc"}
+THREAD_LIST = {"limit": CODEX_THREAD_LIMIT, "archived": False, "sortKey": "updated_at", "sortDirection": "desc",
+               "sourceKinds": list(CODEX_SOURCES)}
 
 
 def list_threads(server, quick=True):
@@ -766,7 +845,15 @@ def list_threads(server, quick=True):
             return server.call("thread/list", dict(THREAD_LIST, useStateDbOnly=True)), True
         except RpcReplyError:
             pass
-    return server.call("thread/list", dict(THREAD_LIST)), False
+    try:
+        return server.call("thread/list", dict(THREAD_LIST)), False
+    except RpcReplyError:
+        # Older daemons may reject the source filter. Keep their interactive listing and
+        # report its narrower coverage rather than claiming every source is supported.
+        listed = server.call("thread/list", {key: value for key, value in THREAD_LIST.items() if key != "sourceKinds"})
+        if isinstance(listed, dict):
+            listed = dict(listed, _sourceCoverage="interactive")
+        return listed, False
 
 
 def loaded_threads(server):
@@ -826,7 +913,10 @@ def codex_home_rows(key, project_id, account, reply, projects, offline=False):
             rows.append(row)
         except Exception:
             skipped += 1
-    return rows, ([f"Codex({account}) 작업 {skipped}건을 읽지 못했습니다."] if skipped else [])
+    errors = [f"Codex({account}) 작업 {skipped}건을 읽지 못했습니다."] if skipped else []
+    if isinstance(listed, dict) and listed.get("_sourceCoverage") == "interactive":
+        errors.append(f"Codex({account}) 버전이 시작 경로 필터를 지원하지 않아 대화형 기록만 표시합니다.")
+    return rows, errors
 
 
 def codex_threads(errors, projects, full=False):
@@ -868,8 +958,7 @@ def codex_row(thread, key, project_id, account, loaded, projects):
         "loaded": thread.get("id") in loaded,
         "startedAt": to_epoch(thread.get("createdAt")), "updatedAt": to_epoch(thread.get("updatedAt")),
         "snippet": preview if name else "", "resume": "codex resume " + str(thread.get("id") or ""),
-        # "cli", "vscode", "exec", ...: a subagent's structured source is left out.
-        "source": thread.get("source") if isinstance(thread.get("source"), str) else None,
+        **session_origin(thread),
     }
 
 

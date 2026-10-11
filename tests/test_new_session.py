@@ -250,11 +250,12 @@ class LinkTerminals(FakeTerminals):
     def list(self):
         return [dict(row) for row in self.rows]
 
-    def link_native(self, terminal_id, native):
+    def link_native(self, terminal_id, native, confidence="exact"):
         row = next(row for row in self.rows if row['id'] == terminal_id)
         if row.get('nativeSource'):
             return False
         row['nativeSource'] = native
+        row['linkConfidence'] = confidence
         self.linked.append((terminal_id, native))
         return True
 
@@ -289,6 +290,7 @@ class LinkNewSessionTest(unittest.TestCase):
         self.rows['local']['codex'] = [codex_row('5', 1001)]
         self.assertEqual(self.link(), [{'host': 'remote', 'agent': 'codex', 'id': codex_row('4', 0)['id'],
                                         'home': '.codex', 'cwd': '/work/project'}])
+        self.assertEqual(self.terminal['linkConfidence'], 'estimated')
         # Recorded once: a later, earlier-looking session never moves it.
         self.rows['remote']['codex'].append(codex_row('6', 1010))
         self.assertEqual(len(self.link()), 1)

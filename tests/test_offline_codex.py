@@ -62,13 +62,15 @@ class OfflineHomeTest(unittest.TestCase):
         listed, loaded, failure = collector.codex_db_threads(self.home / '.codex')
         self.assertEqual(sorted(p.name for p in (self.home / '.codex').iterdir()), names)
         self.assertEqual((loaded, failure), (set(), None))
-        # Interactive, not archived, newest first; no exec run.
-        self.assertEqual([t['id'][-1] for t in listed['data']], ['2', '1'])
+        # Every source, not archived, newest first. Exec still does not imply agent initiation.
+        self.assertEqual([t['id'][-1] for t in listed['data']], ['3', '2', '1'])
         rows, errors = collector.codex_home_rows('.codex', None, '기본', (listed, loaded, failure), [], offline=True)
         self.assertEqual(errors, [])
         self.assertEqual([(r['title'], r['phase'], r['appServer'], r['source'], r['loaded']) for r in rows],
-                         [('이름 붙인 작업', 'closed', 'off', 'vscode', False), ('안녕', 'closed', 'off', 'cli', False)])
-        self.assertEqual((rows[0]['startedAt'], rows[0]['updatedAt']), (110, 500))
+                         [('자동화', 'closed', 'off', 'exec', False),
+                          ('이름 붙인 작업', 'closed', 'off', 'vscode', False), ('안녕', 'closed', 'off', 'cli', False)])
+        self.assertTrue(all(row['initiator'] == 'unknown' for row in rows))
+        self.assertEqual((rows[1]['startedAt'], rows[1]['updatedAt']), (110, 500))
         self.assertEqual((self.home / '.codex/state_5.sqlite').read_bytes(), before)
 
     def test_snapshot_adds_offline_rows_and_reports_an_unreadable_db(self):
@@ -87,7 +89,7 @@ class OfflineHomeTest(unittest.TestCase):
         with patch.object(collector, 'AppServer', Live):
             rows = collector.codex_threads(errors, [])
         self.assertEqual([(r['home'], r.get('appServer')) for r in rows],
-                         [('.codex-live', None), ('.codex', 'off'), ('.codex', 'off')])
+                         [('.codex-live', None), ('.codex', 'off'), ('.codex', 'off'), ('.codex', 'off')])
         self.assertEqual(errors, [])
         (self.home / '.codex/state_5.sqlite').write_bytes(b'not a database')
         errors = []
@@ -109,6 +111,45 @@ class OfflineHomeTest(unittest.TestCase):
         self.assertIsNone(failure)
         self.assertEqual([t['preview'] for t in listed['data']], ['남은 작업'])
         self.assertEqual(sorted(p.name for p in folder.iterdir()), before)
+
+    def test_offline_structured_sources_and_native_executor_columns_survive(self):
+        source = {'subagent': {'thread_spawn': {'parent_thread_id': 'parent-thread', 'depth': 1,
+                                               'agent_nickname': 'Old name', 'agent_role': 'worker'}}}
+        folder = self.home / '.codex-agent'
+        state_db(folder, [('agent-thread', 1, 3, json.dumps(source), '/work/a', '검토', 0, '', '', None),
+                         ('future-thread', 1, 2, 'future-kind', '/work/b', '새 형식', 0, '', '', None)])
+        connection = sqlite3.connect(str(folder / 'state_5.sqlite'))
+        try:
+            connection.execute('ALTER TABLE threads ADD COLUMN agent_nickname TEXT')
+            connection.execute('ALTER TABLE threads ADD COLUMN agent_role TEXT')
+            connection.execute('ALTER TABLE threads ADD COLUMN originator TEXT')
+            connection.execute("UPDATE threads SET agent_nickname = 'Reviewer', agent_role = 'explorer', originator = 'native_client' WHERE id = 'agent-thread'")
+            connection.commit()
+        finally:
+            connection.close()
+        before = (folder / 'state_5.sqlite').read_bytes()
+        reply = collector.codex_db_threads(folder)
+        rows, errors = collector.codex_home_rows('.codex-agent', None, 'Fixture', reply, [], offline=True)
+        self.assertEqual(errors, [])
+        self.assertEqual(rows[0]['source'], source)
+        self.assertEqual((rows[0]['initiator'], rows[0]['parentSessionId'], rows[0]['agentName'], rows[0]['agentRole']),
+                         ('agent', 'parent-thread', 'Reviewer', 'explorer'))
+        self.assertIsNone(rows[0]['initiatorName'])
+        self.assertEqual((rows[1]['source'], rows[1]['initiator']), ('future-kind', 'unknown'))
+        self.assertEqual((folder / 'state_5.sqlite').read_bytes(), before)
+
+    def test_launch_disabled_profile_keeps_collected_history(self):
+        config = self.home / '.config/sessionholic/config.json'
+        config.parent.mkdir(parents=True, mode=0o700)
+        config.write_text(json.dumps({'version': 2, 'profiles': [
+            {'agent': 'codex', 'home': '.codex', 'launchEnabled': False}]}))
+        config.chmod(0o600)
+        (self.home / '.codex/auth.json').write_text('fixture-never-read')
+        self.assertEqual([key for key, _ in collector.codex_offline_homes()], ['.codex'])
+        with patch.object(launch, '_binary', return_value='/fixture/codex'):
+            profile = next(row for row in launch.discover_profiles(self.home) if row['home'] == '.codex')
+        self.assertFalse(profile['available'])
+        self.assertFalse(profile['launchEnabled'])
 
     def test_reading_a_thread_of_a_home_without_a_daemon_says_why(self):
         result = collector.read('codex', '019a0000-0000-7000-8000-000000000001', '.codex')

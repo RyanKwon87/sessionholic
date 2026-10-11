@@ -124,6 +124,26 @@ class SettingsTest(unittest.TestCase):
                 settings.load(self.home)
             self.assertNotIn('SENTINEL', str(error.exception))
 
+    def test_launch_enabled_rule_and_exact_profile_override_preserve_environment(self):
+        config = self.config(version=2, environments={'personal': {}}, profileRules=[
+            {'agent': 'codex', 'homePrefix': '.codex-personal', 'environment': 'personal', 'launchEnabled': False}],
+            profiles=[{'agent': 'codex', 'home': '.codex-personal-active', 'launchEnabled': True}])
+        self.assertEqual(settings.resolve_profile('codex', '.codex-personal-old', config=config),
+                         {'environment': 'personal', 'launchEnabled': False})
+        self.assertEqual(settings.resolve_profile('codex', '.codex-personal-active', config=config),
+                         {'environment': 'personal', 'launchEnabled': True})
+        self.assertEqual(settings.resolve_profile('codex', '.codex-personalish', config=config),
+                         {'environment': 'default', 'launchEnabled': True})
+
+    def test_launch_enabled_requires_boolean_in_version_two(self):
+        for value in ('false', 0, None, []):
+            for fields in ({'profiles': [{'agent': 'codex', 'home': '.codex', 'launchEnabled': value}]},
+                           {'profileRules': [{'agent': 'codex', 'homePrefix': '.codex', 'launchEnabled': value}]}):
+                with self.subTest(value=value, fields=fields), self.assertRaises(ValueError):
+                    self.config(version=2, **fields)
+        with self.assertRaises(ValueError):
+            self.config(profiles=[{'agent': 'codex', 'home': '.codex', 'launchEnabled': False}])
+
     def test_config_ancestor_link_and_oversized_file_are_rejected(self):
         self.path.write_text(' ' * 65537)
         with self.assertRaises(ValueError): settings.load(self.home)

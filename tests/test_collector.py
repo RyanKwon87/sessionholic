@@ -117,6 +117,82 @@ class LabelTest(unittest.TestCase):
             self.assertFalse(collector.HOME_KEY.match(bad), bad)
 
 
+class SessionOriginTest(unittest.TestCase):
+    def codex(self, **fields):
+        return collector.codex_row({'id': 'child-session', **fields}, '.codex', None, 'Fixture', set(), [])
+
+    def test_client_and_execution_modes_never_determine_initiator(self):
+        for source in ('cli', 'vscode', 'exec', 'appServer', 'mcp', 'background', 'future-client', None):
+            with self.subTest(source=source):
+                row = self.codex(source=source, originator='codex_cli_rs', agentNickname='Current worker')
+                self.assertEqual((row['initiator'], row['initiatorEvidence']), ('unknown', 'unknown'))
+                self.assertIsNone(row['initiatorName'])
+                self.assertEqual(row['agentName'], 'Current worker')
+        for kind in ('interactive', 'background'):
+            row = collector.claude_row({'id': 'abcd', 'kind': kind}, {}, [])
+            self.assertEqual(row['initiator'], 'unknown')
+
+    def test_explicit_initiator_and_parent_preserve_executor_separately(self):
+        row = self.codex(source='exec', initiator={'type': 'human', 'name': 'Owner'},
+                         parentSessionId='parent-session', agentNickname='Executor')
+        self.assertEqual((row['initiator'], row['initiatorName'], row['initiatorEvidence']),
+                         ('human', 'Owner', 'explicit'))
+        self.assertEqual((row['parentSessionId'], row['agentName']), ('parent-session', 'Executor'))
+        row = collector.claude_row({'id': 'abcd', 'kind': 'interactive', 'initiator': 'agent',
+                                    'initiatorName': 'Scheduler', 'parentSessionId': 'parent-session',
+                                    'agentName': 'Reviewer'}, {}, [])
+        self.assertEqual((row['initiator'], row['initiatorName'], row['parentSessionId'], row['agentName']),
+                         ('agent', 'Scheduler', 'parent-session', 'Reviewer'))
+
+    def test_structured_codex_subagent_rpc_and_persisted_forms(self):
+        # Native schemas: app-server v2 SessionSource uses subAgent; persisted protocol
+        # uses subagent. SubAgentSource.thread_spawn fields keep their snake_case.
+        for key in ('subAgent', 'subagent'):
+            source = {key: {'thread_spawn': {'parent_thread_id': 'parent-session', 'depth': 1,
+                                             'agent_nickname': 'Reviewer', 'agent_role': 'explorer'}}}
+            for value in (source, json.dumps(source)):
+                with self.subTest(source=value):
+                    row = self.codex(source=value)
+                    self.assertEqual(row['source'], source)
+                    self.assertEqual((row['initiator'], row['initiatorEvidence'], row['parentSessionId']),
+                                     ('agent', 'subagent', 'parent-session'))
+                    self.assertEqual((row['agentName'], row['agentRole']), ('Reviewer', 'explorer'))
+                    self.assertIsNone(row['initiatorName'], 'A child nickname is not the initiating parent name')
+
+    def test_parent_alone_and_unrecognized_source_keep_unknown(self):
+        for source in ({'futureSource': {'mode': 'agent'}}, {'subAgent': None},
+                       {'subAgent': {'thread_spawn': 'bad'}}, 'subagent', '{invalid', None):
+            row = self.codex(source=source, parentThreadId='parent-session')
+            self.assertEqual(row['initiator'], 'unknown')
+            self.assertEqual(row['parentSessionId'], 'parent-session')
+            self.assertEqual(row['source'], source)
+
+    def test_explicit_initiator_precedes_native_source_and_malformed_metadata_is_bounded(self):
+        row = self.codex(source={'subAgent': 'review'}, initiator='human', initiatorName='Owner')
+        self.assertEqual((row['initiator'], row['initiatorEvidence']), ('human', 'explicit'))
+        row = self.codex(source={'unbounded': 'x' * 4097}, initiator=['agent'],
+                         initiatorName='x\nsecret', parentSessionId={'id': 'parent'}, agentNickname='x' * 257)
+        self.assertEqual(row['initiator'], 'unknown')
+        self.assertTrue(all(row[field] is None for field in ('source', 'initiatorName', 'parentSessionId', 'agentName')))
+
+    def test_native_listing_requests_agent_sources_and_reports_legacy_filter_fallback(self):
+        calls = []
+        class Legacy:
+            def call(self, method, params):
+                calls.append(params)
+                if 'sourceKinds' in params:
+                    raise collector.RpcReplyError('unsupported source filter', -32602)
+                return {'data': [{'id': 'legacy', 'source': 'cli'}]}
+        listed, quick = collector.list_threads(Legacy())
+        self.assertFalse(quick)
+        self.assertIn('subAgent', calls[0]['sourceKinds'])
+        self.assertIn('exec', calls[0]['sourceKinds'])
+        self.assertEqual(len(calls), 3)
+        rows, errors = collector.codex_home_rows('.codex', None, 'Fixture', (listed, set(), None), [])
+        self.assertEqual(rows[0]['initiator'], 'unknown')
+        self.assertIn('대화형 기록만', errors[0])
+
+
 class PhaseTest(unittest.TestCase):
     def test_claude(self):
         self.assertEqual(collector.claude_phase("blocked", "idle"), "needs_input")

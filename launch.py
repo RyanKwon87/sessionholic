@@ -17,6 +17,7 @@ import uuid
 
 import instance
 import settings
+import agent_router
 
 
 HOME_KEY = re.compile(r"(?:\.codex(?:-[A-Za-z0-9_-]{1,40})?|\.codex-router/[0-9a-f]{16})\Z")
@@ -82,14 +83,18 @@ def profile_metadata(agent, key, home=None):
             "scope": environment.get("scope", group), "environment": group, "scopeLabel": scope_label,
             "scopeDescription": environment.get("description", "이 호스트에 명시된 실행 환경을 사용합니다."),
             "accountKey": key, "accountLabel": label, "identityVerified": False,
+            "launchEnabled": configured["launchEnabled"],
             "identityReason": "설정 디렉터리의 표시 이름입니다. 실제 로그인 신원과 유효성은 확인하지 않았습니다."}
 
 
 def _profile(agent, key, home, binary):
     path = home / key
+    metadata = profile_metadata(agent, key, home)
     available = True
     reason = "저장된 로그인 파일만 확인했습니다. 로그인 유효성은 실행 시 확인합니다."
-    if not binary:
+    if not metadata["launchEnabled"]:
+        available, reason = False, "이 계정은 기록 조회만 허용되며 새 실행은 중지되어 있습니다."
+    elif not binary:
         available, reason = False, "이 호스트에 native CLI가 없습니다."
     elif not path.is_dir():
         available, reason = False, "이 호스트에 계정 디렉터리가 없습니다."
@@ -100,7 +105,7 @@ def _profile(agent, key, home, binary):
     elif agent == "claude":
         reason = "기기 기본 Claude 설정입니다. 로그인 유효성은 실행 시 확인합니다."
     identifier = "claude:default" if agent == "claude" else "codex:" + key
-    return {**profile_metadata(agent, key, home), "id": identifier, "agent": agent, "home": key,
+    return {**metadata, "id": identifier, "agent": agent, "home": key,
             "available": available, "reason": reason}
 
 
@@ -109,6 +114,7 @@ def discover_profiles(home=None):
 
     `profiles[].placeholder` rows are listed even when missing (available=False), and
     `codexHomes.requireMarker` keeps only folders holding auth.json, config.toml or a socket.
+    A disabled or suspended profile stays visible but cannot execute through the board.
     """
     home = _home(home)
     config = settings.load(home)  # Invalid explicit settings fail closed.
@@ -124,6 +130,21 @@ def discover_profiles(home=None):
     profiles = [_profile("codex", key, home, _binary("codex", home)) for key in sorted(set(keys))]
     if (home / ".claude").is_dir() or ("claude", ".claude") in placeholders:
         profiles.append(_profile("claude", ".claude", home, _binary("claude", home)))
+    router = agent_router.from_settings(config)
+    suspended = set(router.suspended()) if router is not None else set()
+    if suspended:
+        labels = router.labels()
+        for profile in profiles:
+            if profile["agent"] != "codex":
+                continue
+            key = profile["home"]
+            account = (router.home_label(key, home / key, labels)[1]
+                       if key.startswith(".codex-router/") else
+                       key[len(".codex-personal-"):] if key.startswith(".codex-personal-") else
+                       key[len(".codex-"):] if key.startswith(".codex-") else None)
+            if account in suspended:
+                profile.update(available=False, launchEnabled=False,
+                               reason="이 계정은 실행 정책에서 중지되어 있습니다. 이전 기록은 계속 볼 수 있습니다.")
     return profiles
 
 

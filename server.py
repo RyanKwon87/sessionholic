@@ -33,6 +33,7 @@ import uuid
 from urllib.parse import parse_qs, urlparse, unquote
 import instance
 import settings
+from goals import GoalError, Goals
 
 HERE = Path(__file__).resolve().parent
 WEB = HERE / "web"
@@ -1151,6 +1152,7 @@ class Workflow:
     """Only server-discovered identities become native terminal launch commands."""
     def __init__(self, board, terminals, state_dir=STATE_DIR):
         self.board, self.terminals, self.state_dir = board, terminals, Path(state_dir)
+        self.goals = Goals(state_dir)
         self.plans, self.requests = {}, {}
         self.lock = threading.RLock()
         from transfer import Transfers
@@ -1320,7 +1322,7 @@ class Workflow:
                 continue
             native = min(candidates, key=lambda item: item[0])[1]
             try:
-                if record(terminal["id"], native):
+                if record(terminal["id"], native, confidence="estimated"):
                     taken.add(json.dumps(self.identity(native), sort_keys=True))
             except (KeyError, ValueError, RuntimeError, OSError):
                 continue
@@ -1451,6 +1453,25 @@ class Workflow:
             self.plans[plan["id"]] = (plan, source, profile)
         return plan
 
+    def _link_handoff_goals(self, result):
+        """Native launch results identify both ends; time-based new-session links do not."""
+        terminal = result.get("terminal") or {}
+        mode = terminal.get("launchMode") or terminal.get("mode")
+        if (mode not in ("handoff", "transfer") or not terminal.get("sourceKey")
+                or not terminal.get("nativeSource") or terminal.get("linkConfidence") == "estimated"):
+            return result
+        try:
+            source = json.loads(terminal["sourceKey"])
+            count = self.goals.link_sessions(source, terminal["nativeSource"], actor_label=BRAND["shortName"])
+            if count:
+                result["goalLinksUpdated"] = count
+            result.pop("goalLinkWarning", None)
+        except (GoalError, ValueError, TypeError):
+            # The native launch may already be running: never report that it failed or
+            # encourage another launch just because optional goal metadata could not save.
+            result["goalLinkWarning"] = "세션은 준비됐지만 작업 연결을 저장하지 못했습니다. 작업 상세에서 세션을 연결해 주세요."
+        return result
+
     def launch(self, plan_id, request_id):
         if not isinstance(request_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{8,100}", request_id):
             raise ValueError("실행 요청 식별자가 필요합니다.")
@@ -1461,7 +1482,7 @@ class Workflow:
                     raise ValueError("이미 사용한 요청입니다.")
                 if isinstance(result, LaunchFailure):
                     raise result
-                return result
+                return self._link_handoff_goals(result)
             saved = self.plans.get(plan_id)
             if not saved or saved[0]["expiresAt"] <= time.time():
                 raise ValueError("선택이 만료됐어요. 실행 설정을 다시 확인해 주세요.")
@@ -1474,7 +1495,7 @@ class Workflow:
             if live:
                 result = {"terminal": live, "mode": plan["mode"], "reused": True}
                 self.requests[request_id] = (plan_id, result)
-                return result
+                return self._link_handoff_goals(result)
             if plan["mode"] == "reconnect":
                 raise RuntimeError("열어 둔 터미널이 종료됐어요. 실행 설정을 다시 확인해 주세요.")
             # A new explicit launch after a completed CLI is separate from reconnect.
@@ -1553,7 +1574,7 @@ class Workflow:
                 self.requests[request_id] = (plan_id, result)
                 if len(self.requests) > 256:
                     self.requests.pop(next(iter(self.requests)))
-                return result
+                return self._link_handoff_goals(result)
 
     def remote_handoff(self, host, source, target, profile, request_id, route_key, messages):
         """Another agent or account on the same remote host, prepared and run by that host.
@@ -1829,6 +1850,11 @@ class Handler(BaseHTTPRequestHandler):
             if url.path == "/api/events":
                 return self.stream_events(query)
             try:
+                if url.path == "/api/goals":
+                    return self.send_json(200, self.server.goals.snapshot())
+                goal_match = re.fullmatch(r"/api/goals/([a-f0-9]{32})", url.path)
+                if goal_match:
+                    return self.send_json(200, self.server.goals.get(goal_match[1]))
                 if url.path == "/api/snapshot":
                     if query.get("refresh") == "1":
                         self.server.board.request_refresh()
@@ -1862,6 +1888,8 @@ class Handler(BaseHTTPRequestHandler):
                         raise ValueError("출력 위치가 올바르지 않습니다.")
                     result = self.server.terminals.read(match[1], after, wait, epoch=query.get("epoch"))
                     return self.send_json(200, result)
+            except GoalError as exc:
+                return self.send_json(exc.status, exc.payload)
             except (ValueError, KeyError) as exc:
                 return self.send_json(400, {"error": str(exc) if isinstance(exc, ValueError) else "터미널을 찾지 못했어요."})
             except RuntimeError as exc:
@@ -2011,6 +2039,11 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_json(403, {"error": "보안 연결을 갱신한 뒤 다시 시도해 주세요.",
                                         "code": "csrf_expired", **not_started})
         try:
+            if path == "/api/goals":
+                return self.send_json(201, self.server.goals.save(data))
+            goal_match = re.fullmatch(r"/api/goals/([a-f0-9]{32})", path)
+            if goal_match:
+                return self.send_json(200, self.server.goals.save(data, goal_match[1]))
             if path == "/logout":
                 jar = cookies.SimpleCookie(self.headers.get("Cookie") or "")
                 if self.server.cookie_name in jar:
@@ -2072,6 +2105,8 @@ class Handler(BaseHTTPRequestHandler):
                 else:
                     self.server.terminals.detach(tid)
                 return self.send_json(200, {"ok": True})
+        except GoalError as exc:
+            return self.send_json(exc.status, exc.payload)
         except SendRejected as exc:
             # A refusal with a code (e.g. "terminal_required") lets the composer act on it at once.
             payload = {"error": str(exc), "dispatchState": "not_started"}
@@ -2157,6 +2192,7 @@ def make_server(bind, port, board, token, terminals=None, workflow=None, state_d
     server.daemon_threads = True
     server.board, server.token, server.tailscale_user = board, token, tailscale_user
     server.usage = usage
+    server.goals = Goals(state_dir)
     server.cookie_name = COOKIE + "_" + str(server.server_address[1])
     server.once, server.once_lock = ("", 0), threading.Lock()
     server.sessions, server.auth_lock = {}, threading.Lock()
@@ -2174,6 +2210,7 @@ def make_server(bind, port, board, token, terminals=None, workflow=None, state_d
         server.server_close()
         raise
     server.workflow = workflow if workflow is not None else Workflow(board, server.terminals, state_dir)
+    server.workflow.goals = server.goals
     from chat import Chat
     server.chat = Chat(board, server.workflow, state_dir)
     from events import EventHub

@@ -126,7 +126,7 @@ function client(
   vm.runInContext(messageSource, context);
   vm.runInContext(source, context);
   const api = vm.runInContext(
-    "({state,api,sourceOf,accountOf,sendInput,pasteDraft,prepareDraftPaste,startDraftComposition,endDraftComposition,inputDraft,stopTerminalReader,startTerminalReader,closePlan,navigateView,backToList,backFromTerminal,closeTerminal,cancelTerminalClose,confirmTerminalClose,populateAccount,populateRoute,updateContinue,renderPlan,launchPlan,openTerminal,saveDraft,draftKey,refreshTerminals,renderTerminals,renderTerminalReturn,renderFilters,terminalCloseCopy,warnDraftUnload,preparePlan,renderGroups,renderMessages,loadDetail,chatKey,chatEntry,currentChat,chatSupported,chatAttachmentsSupported,buildChatComposer,sendChat,loadChatState,applyChatReceipt,uploadChatFiles,pasteChat,scheduleChatPoll,stopChatPolling,openNativeChat,allSessions,buildContinuePanel,chatReceiptCopy,returnToBoard,readChatClipboard,accountDisplay,sessionAccountLabel,closeChatToolsOutside,closeChatToolsEscape,drawDetail,refreshDetail,loadCapabilities,matches,recoverConnection,networkOffline,poll,select,focusDetailBack,restoreSelectedCardFocus,showLogin,lock,beginAuthEpoch,resizeChatInput,updateViewport,draftKeydown,configureTerminalKeyboard,queueTerminalScroll,flushTerminalScroll,terminalScrollEnd,renderAttention,chatPollDelay,pullRefresh,readingScroll,renderJump,pullDistance,listScroll,setReading,renderPrompt,promptAction,renderUsage,loadUsage,applyTheme,setTheme,updateThemeColor,haptic,navTransition,setDetailShown,chatVisible,sheetRelease,BottomSheet,sheet,openSettings,closeSettings,setTyping,pinchFontSize,setTerminalFontSize,loadXterm,assetUrl,syncEvents,closeEvents,eventsHealthy,renderFreshness,schedule,touchDevice,togglePhaseFilter,renderCounts,createLongPress,swipeIntent,swipeRelease,groupMessageRows,setTextSize,applyTextSize,renderConnectivity,terminalForSession,swipeActionFor,openMessageMenu,openCardMenu,messageActions,outboxShape,outboxMatches,outboxOrigin,settleOutbox,retryOutbox,renderAttachmentTiles,attachmentThumb,sendUpload,openActionSheet,closeActionSheet,setListCollapsed,closeSwipe,settleSwipe,prepareSwipe,runSwipeAction,GESTURE,setChromeVisible,toggleChrome,revealChrome,isChromeTap,snapshotAnnounced,updateChatComposer,capabilitiesRevision,toolKindOf,userMessageParts,formatElapsed,tickWorking,renderTerminalMarks,renderDetailTerminal,terminalsAnnounced,goToSessionTerminal,rememberTerminal,terminalMenu,updateTerminalMenu,chooseTerminalMenu,clearTerminalMenu,renderNewSession,openNewSession,startNewSession,startAppServer})",
+    "({state,api,sourceOf,accountOf,sendInput,pasteDraft,prepareDraftPaste,startDraftComposition,endDraftComposition,inputDraft,stopTerminalReader,startTerminalReader,closePlan,navigateView,backToList,backFromTerminal,closeTerminal,cancelTerminalClose,confirmTerminalClose,populateAccount,populateRoute,updateContinue,renderPlan,launchPlan,openTerminal,saveDraft,draftKey,refreshTerminals,renderTerminals,renderTerminalReturn,renderFilters,terminalCloseCopy,warnDraftUnload,preparePlan,renderGroups,renderMessages,loadDetail,chatKey,chatEntry,currentChat,chatSupported,chatAttachmentsSupported,buildChatComposer,sendChat,loadChatState,applyChatReceipt,uploadChatFiles,pasteChat,scheduleChatPoll,stopChatPolling,openNativeChat,allSessions,buildContinuePanel,chatReceiptCopy,returnToBoard,readChatClipboard,accountDisplay,sessionAccountLabel,closeChatToolsOutside,closeChatToolsEscape,drawDetail,refreshDetail,loadCapabilities,matches,recoverConnection,networkOffline,poll,select,focusDetailBack,restoreSelectedCardFocus,showLogin,lock,beginAuthEpoch,resizeChatInput,updateViewport,draftKeydown,configureTerminalKeyboard,queueTerminalScroll,flushTerminalScroll,terminalScrollEnd,renderAttention,chatPollDelay,pullRefresh,readingScroll,renderJump,pullDistance,listScroll,setReading,renderPrompt,promptAction,renderUsage,loadUsage,applyTheme,setTheme,updateThemeColor,haptic,navTransition,setDetailShown,chatVisible,sheetRelease,BottomSheet,sheet,openSettings,closeSettings,setTyping,pinchFontSize,setTerminalFontSize,loadXterm,assetUrl,syncEvents,closeEvents,eventsHealthy,renderFreshness,schedule,touchDevice,togglePhaseFilter,renderCounts,createLongPress,swipeIntent,swipeRelease,groupMessageRows,setTextSize,applyTextSize,renderConnectivity,terminalForSession,swipeActionFor,openMessageMenu,openCardMenu,messageActions,outboxShape,outboxMatches,outboxOrigin,settleOutbox,retryOutbox,renderAttachmentTiles,attachmentThumb,sendUpload,openActionSheet,closeActionSheet,setListCollapsed,closeSwipe,settleSwipe,prepareSwipe,runSwipeAction,GESTURE,setChromeVisible,toggleChrome,revealChrome,isChromeTap,snapshotAnnounced,updateChatComposer,capabilitiesRevision,toolKindOf,userMessageParts,formatElapsed,tickWorking,renderTerminalMarks,renderDetailTerminal,terminalsAnnounced,goToSessionTerminal,rememberTerminal,terminalMenu,updateTerminalMenu,chooseTerminalMenu,clearTerminalMenu,renderNewSession,openNewSession,startNewSession,startAppServer,rememberConversationView,restoreConversationView,conversationIdentity,initiatorOf,initiatorLabel,documentKeydown})",
     context,
   );
   api.state.csrf = "csrf-test";
@@ -1072,7 +1072,7 @@ test("empty lists distinguish filtered results, offline hosts, and pending colle
   c.state.filters.host = "homeserver";
   c.renderGroups([], Date.now());
   assert.match(textOf(c.get("groups")), /조건에 맞는 작업/);
-  assert.match(textOf(c.get("groups")), /‘없는 작업’로 찾은 작업이 없습니다/);
+  assert.match(textOf(c.get("groups")), /‘없는 작업’ 검색.*필터.*3일 지난 대화/s);
   byClass(c.get("groups"), "secondary")[0].events.click();
   assert.equal(c.state.search, "");
   assert.equal(c.state.filters.host, "");
@@ -1389,6 +1389,9 @@ test('switching away and back resets chat IME ownership and ignores the detached
   newInput.events.keydown({ key: 'Enter', ctrlKey: true, isComposing: false, preventDefault() {} });
   assert.equal(requests.filter((r) => r.url === '/api/chat/send').length, 0);
   newInput.events.compositionend();
+  newInput.events.keydown({ key: 'Enter', metaKey: true, isComposing: false, preventDefault() {} });
+  assert.equal(requests.filter((r) => r.url === '/api/chat/send').length, 0, 'the IME commit Enter never sends');
+  entry.compositionEndedAt -= 100;
   newInput.events.keydown({ key: 'Enter', metaKey: true, isComposing: false, preventDefault() {} });
   await new Promise((resolve) => setImmediate(resolve));
   const sends = requests.filter((r) => r.url === '/api/chat/send');
@@ -1739,7 +1742,7 @@ test('same-session metadata changes preserve the active chat DOM, Korean composi
   assert.equal(entry.composing, true);
   assert.equal(entry.text, '한글 입력 중인 초안');
   assert.equal(c.get('detail').querySelector('.detail-title').textContent, '갱신된 제목');
-  assert.equal(c.get('detail').querySelector('.eyebrow').textContent, '새 프로젝트');
+  assert.equal(c.get('detail').querySelector('.detail-project').textContent, '새 프로젝트');
   assert.match(textOf(c.get('detail').querySelector('.detail-meta')), /작업 중.*실험 환경/);
   assert.match(c.get('detail').querySelector('.stale-notice').textContent, /Workstation/);
   assert.equal(messages.scrollTop, 35);
@@ -1933,7 +1936,7 @@ test('online recovery reads one selected state and snapshot without resending un
   }, noChatTimers);
   const { s, entry } = selectChat(c); snapshot = c.state.snapshot;
   c.state.detailFor = s.key; c.state.detailUpdatedAt = s.updatedAt;
-  c.state.detailRevision = JSON.stringify([false, undefined, undefined, undefined, '현재 계정 설정', 'Workstation', undefined, null, null]);
+  c.state.detailRevision = JSON.stringify([false, undefined, undefined, undefined, '현재 계정 설정', 'Workstation', undefined, null, null, undefined, undefined, undefined, undefined]);
   c.state.capabilities = {}; c.state.capabilitiesRevision = c.capabilitiesRevision(c.state.snapshot);
   entry.pending = { requestId: 'unknown-request', revision: entry.revision }; entry.text = '전송 결과 모르는 초안';
   c.state.offline = true; c.context.navigator = { onLine: true };
@@ -2116,7 +2119,7 @@ test('offline visibility and return-online events restart only bounded reads and
   await new Promise((resolve) => setImmediate(resolve));
   const { s, entry } = selectChat(c);
   c.state.detailFor = s.key; c.state.detailUpdatedAt = s.updatedAt;
-  c.state.detailRevision = JSON.stringify([false, undefined, undefined, undefined, '현재 계정 설정', 'Workstation', undefined, null, null]);
+  c.state.detailRevision = JSON.stringify([false, undefined, undefined, undefined, '현재 계정 설정', 'Workstation', undefined, null, null, undefined, undefined, undefined, undefined]);
   c.state.capabilities = {}; c.state.capabilitiesRevision = c.capabilitiesRevision(c.state.snapshot);
   entry.text = '미전송 초안';
   c.windowEvents.offline(); assert.equal(c.state.offline, true);
@@ -2775,7 +2778,7 @@ test('queued attachment delivery keeps server metadata evidence after clearing t
   assert.equal(evidence.children[0], retained);
   receipt = { ...receipt, status: 'completed' };
   await c.loadChatState(selected.s, true);
-  assert.match(textOf(evidence), /요청 완료.*authoritative.png/);
+  assert.match(textOf(evidence), /응답 종료.*authoritative.png/);
   assert.doesNotMatch(textOf(evidence), /모델.*읽|동기화 완료/);
 });
 
@@ -3089,7 +3092,7 @@ test('recent cards give project and full task separate priority while retaining 
   const card = byClass(c.get('groups'), 'card')[0];
   assert.equal(card.tagName, 'BUTTON'); assert.equal(card.type, 'button');
   // Three short lines: title, preview, then status · agent · project · time.
-  assert.deepEqual(card.children.map((child) => child.className), ['card-title', 'card-snippet', 'card-meta', 'card-chevron']);
+  assert.deepEqual(card.children.map((child) => child.className), ['card-title', 'card-snippet', 'card-initiator', 'card-goals', 'card-meta', 'card-chevron']);
   assert.equal(byClass(card, 'card-title')[0].textContent, title.trim());
   assert.equal(byClass(card, 'card-snippet')[0].hidden, true);
   const meta = byClass(card, 'card-meta')[0];
@@ -3102,7 +3105,8 @@ test('recent cards give project and full task separate priority while retaining 
   assert.equal(byClass(card, 'agent').length, 0);
   assert.equal(byClass(card, 'card-agent')[0].textContent, 'Codex');
   // Device and account move to the accessible name and the conversation header.
-  assert.doesNotMatch(textOf(card), /Workstation|Sample profile/);
+  assert.match(textOf(card), /Workstation.*출처 미확인/);
+  assert.doesNotMatch(textOf(card), /Sample profile/);
   assert.equal(calls, 0); assert.equal(c.state.chats.size, 0);
   assert.equal(s.title, title); assert.equal(s.cwd, '/Users/example/work/service');
 });
@@ -3350,7 +3354,7 @@ function classes() {
     toggle: (name, force) => { const on = force ?? !set.has(name); on ? set.add(name) : set.delete(name); return on; } };
 }
 
-test('reading mode folds only after a deliberate upward read and unfolds at the newest message', () => {
+test('reading mode folds after deliberate scrolling and stays folded at the newest message', () => {
   const c = client(undefined, noChatTimers);
   const pane = c.get('detail'); pane.classList = classes();
   const list = c.get('messages'); Object.assign(list, { scrollHeight: 3000, clientHeight: 600, scrollTop: 2400 });
@@ -3366,7 +3370,9 @@ test('reading mode folds only after a deliberate upward read and unfolds at the 
   list.scrollTop = 2300; c.readingScroll(list);
   assert.equal(pane.classList.contains('is-reading'), true, 'reading downward keeps the space');
   list.scrollTop = 2395; c.readingScroll(list);
-  assert.equal(pane.classList.contains('is-reading'), false, 'the newest message restores the chrome');
+  assert.equal(pane.classList.contains('is-reading'), true, 'the newest message preserves the focus choice');
+  c.toggleChrome();
+  assert.equal(pane.classList.contains('is-reading'), false, 'explicit restore shows the tools');
   assert.equal(c.get('jump-bottom').hidden, true);
 });
 
@@ -4172,7 +4178,7 @@ test('live updates follow the open conversation, reread only on newer events, sl
   c.state.capabilitiesRevision = c.capabilitiesRevision(c.state.snapshot);
   c.state.usageAt = Date.now();
   c.state.detailFor = s.key; c.state.detailUpdatedAt = s.updatedAt;
-  c.state.detailRevision = JSON.stringify([false, undefined, undefined, undefined, '현재 계정 설정', 'Workstation', undefined, null, null]);
+  c.state.detailRevision = JSON.stringify([false, undefined, undefined, undefined, '현재 계정 설정', 'Workstation', undefined, null, null, undefined, undefined, undefined, undefined]);
   c.syncEvents();
   assert.equal(sources.length, 1);
   assert.equal(sources[0].url, '/api/events?host=workstation&agent=codex&home=.codex-example&id=native-session');
@@ -4858,7 +4864,7 @@ test('the composer note: a question waiting beats the receipt note, and an ended
   const status = () => c.get('chat-status').textContent;
   entry.receipt = { requestId: 'req-done-0001', status: 'completed' };
   c.updateChatComposer(entry);
-  assert.match(status(), /요청한 작업이 완료됐습니다/);
+  assert.match(status(), /응답이 끝났습니다.*목표 완료/);
   // A new turn (typed in the terminal) runs now: the old "completed" is no news.
   entry.data = { ...entry.data, phase: 'working' };
   c.updateChatComposer(entry);
@@ -5350,7 +5356,7 @@ test('the top shows "오프라인 · 다시 연결 중" while offline or after t
 test('the first paint shows skeleton cards, a collection in progress keeps them, and the list replaces them', () => {
   const html = indexPage();
   assert.match(html, /<div id="groups" class="groups" aria-busy="true">\s*<div class="skeleton-list" aria-hidden="true">/);
-  assert.match(html, /<p class="sr-only" role="status">작업을 확인하고 있습니다…<\/p>/);
+  assert.match(html, /<p class="sr-only" role="status">세션을 확인하고 있습니다…<\/p>/);
   const c = client(undefined, noChatTimers);
   c.state.snapshot = { hosts: [{ name: 'workstation', ok: true, refreshing: true }] };
   c.renderGroups([], 1100);
@@ -5543,12 +5549,12 @@ test('the board\'s own scrolling, layout changes and typing never hide the bars 
   c.context.document.activeElement = input;
   input.events.focus();
   assert.equal(pane.classList.contains('is-typing'), true);
-  assert.equal(reading(), false, 'typing shows only the typing layout');
+  assert.equal(reading(), true, 'typing preserves the focus choice');
   assert.equal(c.state.chromeVisible, false, 'the reader\'s choice is kept for later');
   scrollTo(1500);
   c.revealChrome();
-  assert.equal(c.state.chromeVisible, true);
-  assert.equal(reading(), false, 'nothing unfolds under the keyboard');
+  assert.equal(c.state.chromeVisible, false);
+  assert.equal(reading(), true, 'attention never unfolds the tools under the keyboard');
   c.setChromeVisible(false);
   c.context.document.activeElement = null;
   input.events.blur();
@@ -5560,44 +5566,45 @@ test('the board\'s own scrolling, layout changes and typing never hide the bars 
   assert.equal(reading(), false, 'shown before typing: shown again after');
 });
 
-test('a new question, a send result and a connection problem show the bars; re-renders of the same question do not', async () => {
+test('questions and failures remain visible without overriding focus mode', async () => {
   const { c, s, entry, tap, reading } = phoneConversation({ fetchImpl: async (url) => {
     if (url === '/api/chat/send') return { ok: false, status: 409, json: async () => ({ error: '지금은 보낼 수 없습니다.', dispatchState: 'not_started' }) };
     if (url === '/api/chat/state') return { ok: false, status: 503, json: async () => ({ error: '연결 실패' }) };
     return { ok: true, status: 200, json: async () => ({}) };
   } });
-  tap();
+  c.setChromeVisible(false);
   assert.equal(reading(), true);
   const prompt = { agent: 'codex', fingerprint: 'a'.repeat(64), current: 1, multi: false, question: '진행할까요?',
     options: [{ number: 1, label: 'Yes', detail: '' }, { number: 2, label: 'No', detail: '' }] };
   entry.data = { ...entry.data, prompt, phase: 'needs_input' };
   c.renderPrompt(s, entry.data);
-  assert.equal(reading(), false, 'a question that appears is never missed');
-  tap();
+  assert.equal(reading(), true, 'a question preserves focus mode');
+  assert.equal(c.get('chat-prompt').hidden, false, 'the approval card stays visible');
+  c.setChromeVisible(false);
   c.renderPrompt(s, entry.data);
   c.renderPrompt(s, { ...entry.data, prompt: { ...prompt, current: 2 } });
   assert.equal(reading(), true, 'the same question re-rendered by polling leaves the bars hidden');
   c.renderPrompt(s, { ...entry.data, prompt: { ...prompt, fingerprint: 'b'.repeat(64) } });
-  assert.equal(reading(), false, 'a different question shows them');
-  tap();
+  assert.equal(reading(), true, 'a different question preserves the choice');
+  c.setChromeVisible(false);
   c.renderPrompt(s, { ...entry.data, prompt: null, promptOpenable: false });
   c.renderPrompt(s, { ...entry.data, prompt: { ...prompt, fingerprint: 'b'.repeat(64) } });
-  assert.equal(reading(), false, 'a question that comes back after the card was gone shows them');
+  assert.equal(reading(), true, 'a returning question keeps focus mode');
   // A send that was refused: the result is in the composer, so the bars come back.
   entry.data = { capability: { supported: true }, phase: 'idle', route: c.sourceOf(s) };
-  tap();
+  c.setChromeVisible(false);
   assert.equal(reading(), true);
   entry.text = '안녕하세요';
   await c.sendChat(entry);
-  assert.equal(reading(), false, 'a send result shows the bars');
+  assert.equal(reading(), true, 'a send result stays near the composer');
   assert.equal(entry.text, '안녕하세요', 'the refused draft is kept');
   await settle();
   // A failing conversation read (connection problem) shows them once.
-  tap();
+  c.setChromeVisible(false);
   entry.error = '';
   await c.loadChatState(s, false);
-  assert.equal(reading(), false);
-  tap();
+  assert.equal(reading(), true);
+  c.setChromeVisible(false);
   await c.loadChatState(s, false);
   assert.equal(reading(), true, 'the same ongoing problem does not keep unfolding them');
   // The board's offline notice.
@@ -5605,10 +5612,10 @@ test('a new question, a send result and a connection problem show the bars; re-r
   c.get('offline-text').textContent = '';
   c.renderConnectivity();
   assert.equal(c.get('offline-text').textContent, '오프라인 · 다시 연결 중');
-  assert.equal(reading(), false, 'going offline shows them');
+  assert.equal(reading(), true, 'going offline keeps the tools folded');
 });
 
-test('entering a conversation shows its bars, and the first hide on a phone explains the tap once', () => {
+test('a new conversation shows tools, and revisiting preserves focus mode and the one-time hint', () => {
   const writes = [];
   const { c, list, scrollTo, reading } = phoneConversation();
   c.context.localStorage = { getItem: () => null, setItem: (key, value) => writes.push([key, value]) };
@@ -5632,11 +5639,11 @@ test('entering a conversation shows its bars, and the first hide on a phone expl
   other.scrollTo(2350);
   assert.equal(other.reading(), true);
   assert.equal(other.c.get('tap-hint').hidden, true);
-  // Leaving and entering again starts with the bars.
+  // Leaving and entering the same conversation preserves the choice.
   c.setDetailShown(false);
   c.setDetailShown(true);
-  assert.equal(c.state.chromeVisible, true);
-  assert.equal(reading(), false);
+  assert.equal(c.state.chromeVisible, false);
+  assert.equal(reading(), true);
   // Reduced motion: the bars switch without transitions; the gate folds with them.
   const css = styleSheet();
   assert.match(css, /\.jump-bottom, \.tap-hint, \.detail-head, \.conversation-bar,\s*\.detail-pane\.is-reading \.detail-head \{ transition: none; animation: none; \}/);
@@ -6394,16 +6401,16 @@ test('sending locks the draft read-only instead of disabling the field, so the f
   assert.match(styleSheet(), /\.chat-input:disabled,\n\.chat-input\[readonly\] \{/);
 });
 
-test('a wide touch screen keeps its bars: scrolling, a tap or typing on a hardware keyboard fold nothing; an on-screen keyboard does', () => {
+test('a tablet supports focus scrolling and taps, preserving the choice across keyboards and rotation', () => {
   const { c, pane, tap, scrollTo, reading } = phoneConversation({ wide: true });
   const typing = () => pane.classList.contains('is-typing');
   scrollTo(2350); scrollTo(2300); scrollTo(2200);
-  assert.equal(reading(), false, 'scrolling up keeps them');
+  assert.equal(reading(), true, 'tablet scrolling folds the tools');
   scrollTo(2300); scrollTo(2400);
-  assert.equal(reading(), false, 'and down');
-  assert.equal(c.get('tap-hint').hidden, true, 'no tap hint');
+  assert.equal(reading(), true, 'the bottom keeps focus mode');
+  assert.equal(c.get('tap-hint').hidden, false, 'tablet receives the tap hint');
   tap();
-  assert.equal(reading(), false, 'a tap on the conversation does not toggle them');
+  assert.equal(reading(), false, 'a safe tablet tap restores the tools');
   assert.equal(c.state.chromeVisible, true);
   // A hardware keyboard: nothing takes the screen (a shortcut bar stays below 150px).
   const input = c.get('chat-input');
@@ -6443,9 +6450,8 @@ test('a wide touch screen keeps its bars: scrolling, a tap or typing on a hardwa
   assert.equal(phone.c.get('tap-hint').hidden, false);
   phone.c.context.window.matchMedia = (query) => ({ matches: query === '(pointer: coarse)' });
   phone.c.updateViewport();
-  assert.equal(phone.reading(), false);
-  assert.equal(phone.c.state.chromeVisible, true);
-  assert.equal(phone.c.get('tap-hint').hidden, true);
+  assert.equal(phone.reading(), true);
+  assert.equal(phone.c.state.chromeVisible, false);
   // A phone held sideways (short) keeps the phone rules.
   const sideways = phoneConversation({ wide: true });
   sideways.c.context.window.matchMedia = (query) => ({ matches: query === '(pointer: coarse)' || query === '(max-height: 520px)' });
@@ -7037,4 +7043,75 @@ test('a conversation of an account whose app-server is off offers to start it, t
   const plain = byClass(c.get('messages'), 'conversation-read-error')[0];
   assert.equal(byClass(plain, 'app-server-start').length, 0);
   assert.equal(byClass(plain, 'secondary')[0].textContent, '대화 다시 불러오기');
+});
+
+
+test('focus view restores the message anchor per conversation without storing conversation text', () => {
+  const c = client(undefined, noChatTimers);
+  const { s } = selectChat(c);
+  const list = c.get('messages');
+  Object.assign(list, { scrollHeight: 3000, clientHeight: 600, scrollTop: 400, lastScrollTop: 400, pinned: false });
+  c.renderMessages(s, [{ role: 'assistant', text: '검증용 대화', ts: 1 }]);
+  const item = list.conversationRows[0]; Object.assign(item.row, { offsetTop: 350, offsetHeight: 150 });
+  c.state.chromeVisible = false;
+  c.rememberConversationView();
+  const saved = c.state.conversationViews.get(c.conversationIdentity(s));
+  assert.equal(saved.top, 400); assert.equal(saved.chromeVisible, false); assert.equal(saved.pinned, false);
+  assert.equal(saved.anchor, item.key);
+  assert.equal(c.state.conversationViews.has(c.conversationIdentity({ ...s, home: '.codex-other' })), false);
+  Object.assign(item.row, { offsetTop: 550 });
+  list.pendingView = saved; list.scrollTop = 0;
+  c.restoreConversationView(list);
+  assert.equal(list.scrollTop, 600, 'the same message keeps its visual offset after layout changes');
+  assert.equal(list.pinned, false);
+  c.showLogin();
+  assert.equal(c.state.conversationViews.size, 0, 'locking clears private view metadata');
+});
+
+test('focus restoration waits for a hidden pane to acquire its real size', () => {
+  const c = client(undefined, noChatTimers); const { s } = selectChat(c);
+  const list = c.get('messages');
+  c.renderMessages(s, [{ role: 'assistant', text: '기존 답', ts: 1 }]);
+  list.pendingView = { top: 225, pinned: false, anchor: null, offset: 0, chromeVisible: false };
+  list.clientHeight = 0; c.restoreConversationView(list);
+  assert.ok(list.pendingView);
+  list.clientHeight = 600; c.restoreConversationView(list);
+  assert.equal(list.scrollTop, 225); assert.equal(list.pendingView, null);
+});
+
+test('reopening the same retained conversation restores its scroll after a hidden parent reset', () => {
+  const c = client(undefined, noChatTimers); const { s } = selectChat(c);
+  const list = c.get('messages');
+  c.renderMessages(s, [{ role: 'assistant', text: '다시 읽을 대화', ts: 1 }]);
+  Object.assign(list, { scrollHeight: 3000, clientHeight: 600, scrollTop: 720, lastScrollTop: 720, pinned: false });
+  c.state.chromeVisible = false;
+  c.rememberConversationView();
+  c.state.detailShown = false;
+  list.scrollTop = 0; // Browsers reset this when the retained node moves to a hidden pane.
+  c.select(s.key);
+  assert.equal(list.scrollTop, 720);
+  assert.equal(c.state.chromeVisible, false);
+  list.scrollTop = 840;
+  c.select(s.key);
+  assert.equal(list.scrollTop, 840, 'selecting an already visible conversation does not replay an older view');
+});
+
+test('session origin filters never equate execution surface with its initiator', () => {
+  const c = client(undefined, noChatTimers); c.state.showOld = true;
+  for (const row of [{ source: 'cli' }, { kind: 'background' }, { source: 'exec' }]) {
+    assert.equal(c.initiatorOf(row), 'unknown');
+    c.state.filters.initiator = 'human'; assert.equal(c.matches(row, 100), false);
+    c.state.filters.initiator = 'unknown'; assert.equal(c.matches(row, 100), true);
+  }
+  c.state.filters.initiator = 'agent';
+  assert.equal(c.matches({ initiator: 'agent', initiatorName: 'Planner' }, 100), true);
+  assert.equal(c.initiatorLabel({ initiator: 'agent', initiatorName: 'Planner' }), '에이전트 시작 · Planner');
+});
+
+test('Ctrl or Command K focuses the visible unified search without submitting a draft', () => {
+  const c = client(undefined, noChatTimers); let prevented = 0;
+  c.documentKeydown({ key: 'k', metaKey: true, preventDefault() { prevented++; } });
+  assert.equal(c.get('search').focusCount, 1); assert.equal(prevented, 1);
+  c.documentKeydown({ key: 'k', metaKey: true, isComposing: true, preventDefault() { prevented++; } });
+  assert.equal(prevented, 1);
 });

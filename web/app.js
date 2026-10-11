@@ -108,7 +108,7 @@ const state = {
   refreshDeadline: 0,
   csrf: "",
   selected: null,
-  filters: { host: "", agent: "", project: "", account: "" },
+  filters: { host: "", agent: "", project: "", account: "", initiator: "" },
   // The status chips above the list ("needs_input" or "working"); tapping the
   // active chip again clears it.
   phaseFilter: "",
@@ -165,6 +165,8 @@ const state = {
   terminalMomentum: null,
   toastTimer: null,
   chats: new Map(),
+  // Private view state lives in this authenticated tab, never browser storage.
+  conversationViews: new Map(),
   nativeSessions: new Map(),
   // Session key -> { phase, base }: the phase an open conversation's own read
   // found, shown while the list still has the phase `base` it had then.
@@ -347,10 +349,9 @@ function navTransition(direction, update) {
 // Phone screens: the list or one conversation. State changes at once (chat
 // reads depend on it); only the visible switch may wait for the transition.
 function setDetailShown(shown, { direction = null, focus = false } = {}) {
+  if (!shown) rememberConversationView();
   const changed = state.detailShown !== shown;
   state.detailShown = shown;
-  // Entering a conversation (again) always starts with its bars shown.
-  if (shown && changed) setChromeVisible(true);
   const apply = () => {
     if (shown) document.body.classList.add("show-detail");
     else document.body.classList.remove("show-detail");
@@ -742,6 +743,10 @@ function groupOf(s) {
 function matches(s, now, { phase = true } = {}) {
   if (phase && state.phaseFilter && groupOf(s) !== state.phaseFilter) return false;
   for (const key of Object.keys(state.filters)) {
+    if (key === "initiator") {
+      if (state.filters.initiator && initiatorOf(s) !== state.filters.initiator) return false;
+      continue;
+    }
     if (key === "account" && state.filters.account && state.accountFilterRoutes) {
       if (!state.accountFilterRoutes.has(accountRouteKey(s))) return false;
       continue;
@@ -756,6 +761,7 @@ function matches(s, now, { phase = true } = {}) {
     return false;
   if (!state.search) return true;
   const q = state.search.toLocaleLowerCase();
+  if (window.SessionholicGoals?.sessionMatches?.(s, q)) return true;
   return [
     s.title,
     s.project,
@@ -800,6 +806,7 @@ function render() {
     );
     $("detail").append(welcome);
   }
+  window.SessionholicGoals?.update?.(sessions);
   if (selected) refreshDetail(selected);
   else if (state.selected) {
     state.selected = null;
@@ -999,7 +1006,12 @@ function renderCounts(sessions) {
   placeChildren(box, chips);
 }
 // The filter sheet's selects; the button that opens it shows how many apply.
-const FILTER_FIELDS = ["filter-host", "filter-agent", "filter-project", "filter-account"];
+const INITIATOR_LABELS = { human: "직접 시작", agent: "에이전트 시작", unknown: "출처 미확인" };
+function initiatorOf(s) { return ["human", "agent"].includes(s?.initiator) ? s.initiator : "unknown"; }
+function initiatorLabel(s) {
+  return INITIATOR_LABELS[initiatorOf(s)] + (s?.initiatorName ? ` · ${s.initiatorName}` : "");
+}
+const FILTER_FIELDS = ["filter-host", "filter-agent", "filter-project", "filter-account", "filter-initiator"];
 function renderFilters(sessions) {
   const active = Object.values(state.filters).filter(Boolean).length + (state.showOld ? 1 : 0);
   $("filter-count").textContent = active ? String(active) : "";
@@ -1017,8 +1029,10 @@ function renderFilters(sessions) {
     ["agent", "에이전트", (s) => [s.agent, AGENTS[s.agent]]],
     ["project", "프로젝트", (s) => [s.project, s.project]],
     ["account", "계정 설정", (s) => [s.account, s.account]],
+    ["initiator", "시작 주체", (s) => [initiatorOf(s), INITIATOR_LABELS[initiatorOf(s)]]],
   ]) {
     const options = new Map(sessions.map(pick).filter(([v]) => v));
+    if (key === "initiator") for (const [value, text] of Object.entries(INITIATOR_LABELS)) options.set(value, text);
     const field = el("label", null, label);
     const select = el("select");
     select.id = `filter-${key}`;
@@ -1151,7 +1165,7 @@ function renderGroups(shown, now) {
         "다른 작업은 필터를 해제하면 보입니다.", button("필터 해제", "secondary", () => togglePhaseFilter(state.phaseFilter)));
     } else if (searching || filtering || state.phaseFilter) {
       empty = emptyState("search", "조건에 맞는 작업이 없습니다.",
-        searching ? `‘${state.search}’로 찾은 작업이 없습니다. 검색어나 필터를 바꿔 보세요.` : "필터를 바꾸거나 초기화해 보세요.",
+        `${searching ? `‘${state.search}’ 검색. ` : ""}${filtering ? "선택한 필터가 적용되어 있습니다. " : ""}${state.showOld ? "오래된 기록도 포함했습니다." : "3일 지난 대화는 제외되어 있습니다. 필터에서 오래된 기록을 포함할 수 있습니다."}`,
         button("검색·필터 초기화", "secondary", clearAll));
     } else if (unconfigured) {
       empty = emptyState("setup", "연결할 기기가 아직 설정되지 않았습니다.",
@@ -1231,13 +1245,15 @@ function card(s) {
   const project = el("span", "card-project");
   const stale = el("span", "stale-tag", "이전 정보");
   const time = el("span", "card-time");
+  const initiator = el("span", "card-initiator");
+  const goals = el("span", "card-goals");
   // A live board terminal of this session (renderTerminalMarks keeps it current).
   const terminal = terminalMark("card-terminal");
   meta.append(badge, terminal, agent, project, stale, time);
   const chevron = el("span", "card-chevron");
   chevron.setAttribute("aria-hidden", "true");
-  node.append(title, snippet, meta, chevron);
-  node.cardParts = { title, snippet, badge, terminal, agent, project, stale, time };
+  node.append(title, snippet, initiator, goals, meta, chevron);
+  node.cardParts = { title, snippet, badge, terminal, agent, project, stale, time, initiator, goals };
   node.cardRow = row;
   row.append(action, node);
   row.card = node;
@@ -1272,6 +1288,10 @@ function updateCard(node, s, now, folderHint = "") {
   write(p.agent, agent); p.agent.className = `card-agent ${s.agent}`;
   write(p.project, place); p.project.title = place;
   write(p.time, time);
+  write(p.initiator, `${host} · ${initiatorLabel(s)}`);
+  const linkedGoals = window.SessionholicGoals?.linkedTitles?.(s) || "";
+  write(p.goals, linkedGoals);
+  p.goals.hidden = !linkedGoals;
   p.stale.hidden = !s.stale;
   p.stale.title = s.stale ? "기기에 연결되지 않아 마지막으로 확인한 정보입니다." : "";
 }
@@ -1441,10 +1461,19 @@ function terminalMark(className) {
 function markCardTerminal(node, s) {
   const mark = node?.cardParts?.terminal;
   if (!mark) return;
-  const open = !!terminalForSession(s);
+  const terminal = terminalForSession(s);
+  const open = !!terminal;
+  const label = terminalEstimated(terminal) ? "터미널 연결 추정" : "터미널 열림";
+  const text = mark.querySelector?.(".terminal-mark-label");
+  if (text) text.textContent = label;
   if (mark.hidden !== !open) mark.hidden = !open;
   if (typeof node.cardLabel === "string")
-    node.setAttribute("aria-label", open ? `${node.cardLabel}. 터미널 열림` : node.cardLabel);
+    node.setAttribute("aria-label", open ? `${node.cardLabel}. ${label}` : node.cardLabel);
+}
+function terminalEstimated(terminal) {
+  if (!terminal) return false;
+  const info = terminalInfo(terminal);
+  return info.linkConfidence === "estimated" || (info.mode === "new-session" && info.nativeSource && info.linkConfidence !== "exact");
 }
 // The terminal list changed (a read, an open or a close here, or a live update):
 // mounted cards and the open conversation's header follow without a full render.
@@ -1462,6 +1491,9 @@ function renderDetailTerminal(s) {
   if (!box) return;
   const terminal = terminalForSession(s);
   box.hidden = !terminal;
+  const mark = box.querySelector?.(".terminal-mark-label");
+  if (mark) mark.textContent = terminalEstimated(terminal) ? "터미널 연결 추정" : "터미널 열림";
+  box.title = terminalEstimated(terminal) ? "시작 시각으로 추정한 연결입니다. 터미널의 대화가 맞는지 확인해 주세요." : "";
   $("detail-terminal-open")?.setAttribute("aria-label",
     terminal ? `열린 터미널로 가기: ${terminal.title || s.title || "열어 둔 터미널"}` : "열린 터미널로 가기");
 }
@@ -1672,12 +1704,57 @@ function restoreSelectedCardFocus() {
   const card = [...$("groups").querySelectorAll(".card")].find((node) => node.dataset.sessionKey === state.selected);
   (card || $("home")).focus({ preventScroll: true });
 }
+function rememberConversationView() {
+  const session = selectedSession();
+  const list = $("messages");
+  if (!session || !list || !list.conversationSource || !list.clientHeight || list.pendingView) return;
+  const pinned = pinnedToEnd(list);
+  let anchor = null;
+  let occurrence = 0;
+  let offset = 0;
+  for (const item of list.conversationRows || []) {
+    const box = rowBox(list, item.row);
+    if (box && box.top + box.height > list.scrollTop) {
+      anchor = item.key;
+      const rows = list.conversationRows || [];
+      occurrence = rows.slice(rows.indexOf(item) + 1).filter((row) => row.key === item.key).length;
+      offset = box.top - list.scrollTop;
+      break;
+    }
+  }
+  state.conversationViews.set(conversationIdentity(session), {
+    chromeVisible: state.chromeVisible, pinned, top: list.scrollTop, anchor, occurrence, offset,
+  });
+}
+function restoreConversationView(list) {
+  const view = list.pendingView;
+  if (!view || !list.conversationRows?.length || !list.clientHeight) return;
+  list.pendingView = null;
+  list.pinned = view.pinned;
+  const matches = list.conversationRows.filter((item) => item.key === view.anchor);
+  const item = matches[Math.max(0, matches.length - 1 - (view.occurrence || 0))];
+  const box = item && rowBox(list, item.row);
+  setMessagesScroll(list, view.pinned ? list.scrollHeight : box ? box.top - view.offset : view.top);
+}
 function select(key) {
   if (state.launchBusy) return;
+  if (state.selected !== key) rememberConversationView();
   const mobile = phoneLayout();
   const entering = mobile && !state.detailShown;
   if (entering) navigateView("detail");
   if (state.selected === key) {
+    // Moving this retained DOM through a hidden goal/session pane can reset its
+    // scrollTop. Reapply the saved view only when reopening, not on a live click.
+    if (!state.detailShown) {
+      const list = $("messages");
+      const session = selectedSession();
+      const savedView = session && state.conversationViews.get(conversationIdentity(session));
+      if (list && savedView) {
+        list.pendingView = savedView;
+        list.pinned = savedView.pinned;
+        setChromeVisible(savedView.chromeVisible);
+      }
+    }
     setDetailShown(true, { direction: entering ? "push" : null, focus: mobile });
     return;
   }
@@ -1696,7 +1773,7 @@ function select(key) {
 }
 function detailRevision(s) {
   return JSON.stringify([s.stale, s.phase, s.title, s.project, s.account, s.hostLabel, s.fetchedAt,
-    s.cwd || null, s.sessionId || null]);
+    s.cwd || null, s.sessionId || null, s.initiator, s.initiatorName, s.initiatorEvidence, s.parentSessionId]);
 }
 function refreshDetail(s) {
   const revision = detailRevision(s);
@@ -1718,15 +1795,15 @@ function detailMetaChildren(s) {
   const [label, tone] = BADGES[s.phase] || [s.phase || "상태 확인 필요", "gray"];
   return [el("span", `badge ${tone}`, label),
     el("span", null, [AGENTS[s.agent], s.account, s.hostLabel].filter(Boolean).join(" · ")),
-    el("span", null, clock(s.updatedAt))];
+    el("span", null, initiatorLabel(s)), el("span", null, clock(s.updatedAt))];
 }
 function patchDetailMetadata(s) {
   const pane = $("detail");
   if (pane.dataset.key !== s.key) return;
   const title = pane.querySelector(".detail-title");
-  const eyebrow = pane.querySelector(".detail-titles .eyebrow");
+  const eyebrow = pane.querySelector(".detail-project");
   if (title) title.textContent = s.title || "제목 없는 작업";
-  if (eyebrow) eyebrow.textContent = s.project || "RECENT CONVERSATION";
+  if (eyebrow) eyebrow.textContent = s.project || "";
   pane.querySelector(".detail-meta")?.replaceChildren(...detailMetaChildren(s));
   let note = pane.querySelector(".stale-notice");
   if (s.stale) {
@@ -1803,11 +1880,14 @@ function drawDetail(s) {
   pane.replaceChildren();
   pane.dataset.key = s.key;
   const head = el("div", "detail-head");
-  head.append(button("←", "back", backToList));
+  const back = button("←", "back", backToList);
+  back.setAttribute("aria-label", "대화에서 돌아가기");
+  head.append(back);
   const titles = el("div", "detail-titles");
   titles.append(
-    el("p", "eyebrow", s.project || "RECENT CONVERSATION"),
     el("h1", "detail-title", s.title || "제목 없는 작업"),
+    el("span", "detail-device", s.hostLabel || s.host || "기기 미확인"),
+    el("span", "detail-project", s.project || ""),
   );
   const meta = el("div", "detail-meta");
   meta.append(...detailMetaChildren(s));
@@ -1823,6 +1903,13 @@ function drawDetail(s) {
   terminal.append(mark, goTerminal);
   titles.append(meta, terminal);
   head.append(titles);
+  const focusToggle = button("집중 모드", "focus-toggle quiet", toggleChrome);
+  focusToggle.id = "focus-toggle";
+  // Keep the keyboard and compact header still until the click lands.
+  focusToggle.addEventListener("pointerdown", (event) => event.preventDefault());
+  focusToggle.setAttribute("aria-pressed", "false");
+  head.append(focusToggle);
+  window.SessionholicGoals?.attachSessionDetail?.(s, head);
   pane.append(head);
   renderDetailTerminal(s);
   if (s.stale)
@@ -1840,8 +1927,9 @@ function drawDetail(s) {
   );
   const list = el("div", "messages");
   list.id = "messages";
-  // A conversation opens at its newest message (see pinnedToEnd).
-  list.pinned = true;
+  const savedView = state.conversationViews.get(conversationIdentity(s));
+  list.pendingView = savedView || null;
+  list.pinned = savedView ? savedView.pinned : true;
   list.lastScrollTop = 0;
   observeMessages(list);
   list.setAttribute("aria-label", "최근 대화 읽기");
@@ -1856,12 +1944,7 @@ function drawDetail(s) {
   jump.setAttribute("aria-label", "대화 맨 아래로");
   list.addEventListener("scroll", () => readingScroll(list), { passive: true });
   bindMessageGestures(list);
-  // The folded one-line header unfolds when tapped (the back button keeps its job).
-  head.addEventListener("click", (event) => {
-    if (!state.chromeVisible && !event.target?.closest?.(".back, .detail-terminal-open"))
-      setChromeVisible(true, { stickBottom: messagesAtEnd(list) });
-  });
-  state.chromeVisible = true;
+  state.chromeVisible = savedView ? savedView.chromeVisible : true;
   pane.classList?.remove("is-reading");
   pane.classList?.remove("is-typing");
   // Shown once, the first time scrolling hides the bars on a phone.
@@ -1874,6 +1957,7 @@ function drawDetail(s) {
   prompt.hidden = true;
   prompt.setAttribute("aria-live", "polite");
   pane.append(bar, sync, list, jump, hint, prompt, buildChatComposer(s), buildContinuePanel(s));
+  setChromeVisible(state.chromeVisible);
 }
 // Questions and approvals drawn by the CLI in the board's terminal, answered
 // here with the same keys a person would press. Nothing is sent until the
@@ -2035,10 +2119,9 @@ async function promptAction(s, body) {
 // folded layout. Phones (coarse pointer): scrolling either way hides the bars,
 // reaching the end does not bring them back, and a tap on the conversation
 // shows or hides them; a new question, a send result or a connection problem
-// shows them. Mouse layouts keep the older rule: an upward read hides them and
-// the newest message restores them.
+// toggles them on touch devices. Mouse users restore with the focus button.
 const CHROME_TAP_IGNORE = "a, button, input, textarea, select, label, summary, [role=button], " +
-  ".msg-more, .message-block-copy, .message-code-toggle, .chat-prompt, .msg-attachment, .chat-attachment, img, video";
+  "pre, code, .tool-group, .msg-more, .message-block-copy, .message-code-toggle, .chat-prompt, .msg-attachment, .chat-attachment, img, video";
 const TAP_HINT_MS = 2500;
 function chatTyping() {
   return document.activeElement?.id === "chat-input";
@@ -2060,6 +2143,7 @@ function pinnedToEnd(list) {
 // The list's own size changed (shown, a card, the keyboard, the bars): a pinned
 // conversation is put back at its newest message.
 function keepAtEnd(list) {
+  if (list?.pendingView) { restoreConversationView(list); return; }
   if (!list || list.isConnected === false || !list.clientHeight || !pinnedToEnd(list)) return;
   setMessagesScroll(list, list.scrollHeight);
   list.unread = 0;
@@ -2073,22 +2157,26 @@ function observeMessages(list) {
   state.messagesObserver.disconnect();
   state.messagesObserver.observe(list);
 }
-// Applies the reader's choice; while a phone is typing it waits for the blur.
+// The explicit choice survives keyboard, network, receipt and viewport changes.
 function setChromeVisible(visible, { stickBottom = false } = {}) {
   state.chromeVisible = !!visible;
-  if (chatTyping() && touchDevice()) return;
   setReading(!visible, { stickBottom });
+  const toggle = $("focus-toggle");
+  if (toggle) {
+    toggle.textContent = visible ? "집중 모드" : "복원";
+    toggle.setAttribute("aria-pressed", String(!visible));
+    toggle.setAttribute("aria-label", visible ? "대화 집중 모드" : "대화 도구 복원");
+  }
+  rememberConversationView();
 }
 function toggleChrome() {
   const hint = $("tap-hint");
   if (hint && !hint.hidden) hint.hidden = true;
   setChromeVisible(!state.chromeVisible, { stickBottom: messagesAtEnd($("messages")) });
 }
-// Something the reader must not miss shows the bars on phones; mouse layouts
-// are left as they were.
+// Attention stays beside the input. It never overrides the reader's choice.
 function revealChrome() {
-  if (state.chromeVisible || !touchDevice()) return;
-  setChromeVisible(true, { stickBottom: messagesAtEnd($("messages")) });
+  $("chat-status")?.setAttribute?.("data-attention", "true");
 }
 // Whether a finger's down → up toggles the bars: short and still, not on a
 // control (which keeps its own tap), no text selected, no long-press menu.
@@ -2147,22 +2235,21 @@ function setTyping(typing) {
   if (!pane?.classList || !!pane.classList.contains?.("is-typing") === typing) return;
   const list = $("messages");
   const atBottom = messagesAtEnd(list);
+  const before = list?.getBoundingClientRect?.().top;
   if (typing) pane.classList.add("is-typing");
   else pane.classList.remove("is-typing");
   if (list && atBottom) setMessagesScroll(list, list.scrollHeight);
+  else if (list && typeof before === "number") setMessagesScroll(list, list.scrollTop + list.getBoundingClientRect().top - before);
   renderJump();
 }
 // The viewport changed (an on-screen keyboard opened or closed, a rotation, a
-// split view): typing folds the bars only while the screen is compact, and a
-// wide touch screen never keeps them hidden or shows the tap hint.
+// split view): only the temporary typing layout follows the available space.
+// The reader's focus choice is independent of the keyboard and viewport.
 function syncChromeMode() {
-  if (!touchDevice()) return;
   const compact = compactChrome();
-  if (chatTyping()) setTyping(compact);
-  if (compact) return;
+  setTyping(chatTyping() && compact);
   const hint = $("tap-hint");
-  if (hint && !hint.hidden) hint.hidden = true;
-  if (!state.chromeVisible) setChromeVisible(true, { stickBottom: messagesAtEnd($("messages")) });
+  if (!touchDevice() && hint && !hint.hidden) hint.hidden = true;
 }
 function readingScroll(list) {
   const top = list.scrollTop;
@@ -2175,24 +2262,14 @@ function readingScroll(list) {
   list.pinHeight = height;
   if (messagesAtEnd(list)) list.pinned = true;
   else if (top !== previous && !resized && Date.now() >= (list.autoScrollUntil || 0)) list.pinned = false;
-  // While typing, the chrome is already folded (setTyping) and stays put. A
-  // wide touch screen keeps its bars: its scroll is tracked but hides nothing.
   const typing = chatTyping();
-  if (touchDevice()) phoneReadingScroll(list, top - previous, typing || !compactChrome());
-  else if (list.scrollHeight - top - list.clientHeight < GESTURE.readingBottomPx) {
-    list.upTravel = 0;
-    list.unread = 0;
-    if (!typing) setChromeVisible(true, { stickBottom: true });
-  } else if (!typing) {
-    // A deliberate upward read folds the chrome; a small wobble does not.
-    list.upTravel = top < previous ? (list.upTravel || 0) + previous - top : 0;
-    if (list.upTravel > GESTURE.readingHideTravelPx) setChromeVisible(false);
-  }
+  phoneReadingScroll(list, top - previous, typing || resized);
+  rememberConversationView();
   renderJump();
 }
 // Phones: a deliberate scroll either way hides the bars; only a tap (or
-// something that needs attention) shows them again, even at the end. `keep`
-// (typing, or a wide touch screen) records the scroll without hiding.
+// the explicit restore button) shows them again, even at the end. `keep`
+// (typing or a resize) records the scroll without hiding.
 function phoneReadingScroll(list, delta, keep) {
   if (messagesAtEnd(list, GESTURE.readingBottomPx)) list.unread = 0;
   const height = list.clientHeight;
@@ -2212,7 +2289,7 @@ function phoneReadingScroll(list, delta, keep) {
   if (list.travel <= GESTURE.readingHideTravelPx || !state.chromeVisible) return;
   list.travel = 0;
   setChromeVisible(false);
-  showTapHint();
+  if (touchDevice()) showTapHint();
 }
 function scrollMessagesToEnd() {
   const list = $("messages");
@@ -2222,7 +2299,7 @@ function scrollMessagesToEnd() {
   if (typeof list.scrollTo === "function") {
     // The smooth scroll's own events do not hide the bars; a touch ends this.
     list.autoScrollUntil = Date.now() + 1000;
-    list.scrollTo({ top: list.scrollHeight, behavior: "smooth" });
+    list.scrollTo({ top: list.scrollHeight, behavior: prefersReducedMotion() ? "auto" : "smooth" });
   } else setMessagesScroll(list, list.scrollHeight);
   renderJump();
 }
@@ -2326,7 +2403,7 @@ function updateChatDeliveryEvidence(entry) {
   const visible = retained && files.length > 0;
   box.hidden = !visible;
   if (!visible) { box.replaceChildren(); box.deliveryRevision = null; return false; }
-  const labels = { accepted: "전송 접수", queued: "전송 접수", completed: "요청 완료",
+  const labels = { accepted: "전송 접수", queued: "전송 접수", completed: "응답 종료",
     interrupted: "접수 후 중단", unknown: "전송 결과 미확인", failed: "접수 후 오류" };
   const label = pending ? entry.sending ? "전송 중" : "전송 결과 미확인" : labels[receipt?.status];
   const record = receipt?.readbackConfirmed === true && !pending ? " · 세션 기록 확인" : "";
@@ -2431,8 +2508,6 @@ function buildChatComposer(s) {
   // A tablet folds them only once its on-screen keyboard takes the space
   // (syncChromeMode on the viewport's resize); a hardware keyboard never does.
   input.addEventListener("focus", () => {
-    if (!touchDevice()) state.chromeVisible = true;
-    setReading(false);
     setTyping(compactChrome());
   });
   input.addEventListener("blur", () => {
@@ -2447,6 +2522,7 @@ function buildChatComposer(s) {
   input.addEventListener("compositionend", () => {
     if (!editorCurrent()) return;
     entry.composing = false;
+    entry.compositionEndedAt = Date.now();
     entry.inputCollapsed = false;
     entry.text = input.value;
     entry.revision++;
@@ -2464,7 +2540,7 @@ function buildChatComposer(s) {
     }
     if (event.key !== "Enter" || !(event.ctrlKey || event.metaKey)) return;
     event.preventDefault();
-    if (event.isComposing || event.keyCode === 229 || entry.composing) return;
+    if (event.isComposing || event.keyCode === 229 || entry.composing || Date.now() - (entry.compositionEndedAt || 0) < 80) return;
     sendChat(entry);
   });
   input.addEventListener("paste", (event) => {
@@ -2672,6 +2748,13 @@ function promptKeydown(event) {
   return true;
 }
 function documentKeydown(event) {
+  if ((event.metaKey || event.ctrlKey) && String(event.key).toLowerCase() === "k" && !event.isComposing) {
+    event.preventDefault();
+    const search = window.SessionholicGoals?.searchElement?.() || $("search");
+    search?.focus();
+    search?.select?.();
+    return;
+  }
   noteHardwareKey(event);
   closeChatToolsEscape(event);
   promptKeydown(event);
@@ -2684,7 +2767,7 @@ function chatReceiptCopy(receipt) {
   const labels = {
     accepted: "메시지를 접수했습니다. 작업 완료는 대화에서 확인해 주세요.",
     queued: "메시지를 접수했습니다. 답변은 대화에서 확인해 주세요.",
-    completed: "요청한 작업이 완료됐습니다.",
+    completed: "응답이 끝났습니다. 목표 완료 여부는 결과와 완료 조건을 확인해 주세요.",
     interrupted: "접수했던 작업이 중단되었습니다. 대화를 확인한 뒤 새 메시지를 보내 주세요.",
     unknown: "전송 결과를 아직 확인하지 못했습니다. 중복 전송하지 않고 상태를 확인합니다.",
     failed: "메시지를 접수하지 못했습니다. 초안은 유지됩니다.",
@@ -2754,6 +2837,7 @@ function updateChatComposer(entry) {
     ? "첨부는 이 작업 폴더에 저장됐습니다. 첨부의 ‘경로’를 복사해 터미널에 붙여넣으세요."
     : entry.data?.capability?.reason || "직접 입력을 지원하지 않습니다. 터미널을 사용해 주세요.";
   $("chat-status").textContent = (offline ? "오프라인입니다. 초안은 유지됩니다. 연결 후 상태를 확인하고 보내 주세요." : entry.error || entry.notice || (entry.uploads ? `첨부 ${entry.uploads}개를 올리고 있습니다…` : !entry.data ? (claudeWithoutId(selectedSession()) ? CLAUDE_NO_SEND : "메시지 전송 환경을 확인하고 있습니다…") : !supported ? unsupportedCopy : receiptNotice(entry) || phaseCopy)) + budgetNote;
+  $("chat-status").setAttribute("data-attention", String(!!(offline || entry.error || entry.receipt?.status === "unknown")));
   const deliveryVisible = updateChatDeliveryEvidence(entry);
   const chips = $("chat-attachments");
   // While a bubble resends its own message, another draft's files stay as they are.
@@ -3847,7 +3931,8 @@ function renderMessages(s, messages, error = "", fresh = false) {
   // Pinned (or within 50px of the end): stays at the newest message, also when the
   // list was laid out at another size (hidden, a question card, the keyboard).
   const stick = !readingSelection &&
-    (fresh || pinnedToEnd(list) || list.scrollHeight - list.scrollTop - list.clientHeight < 50);
+    (list.pendingView ? list.pendingView.pinned :
+      fresh || pinnedToEnd(list) || list.scrollHeight - list.scrollTop - list.clientHeight < 50);
   if (stick) list.pinned = true;
   const scroll = list.scrollTop;
   const previousKeys = new Set(previous.map((item) => item.key));
@@ -4041,6 +4126,8 @@ function renderMessages(s, messages, error = "", fresh = false) {
     }
     if (added) list.unread = (list.unread || 0) + added;
   } else if (stick) list.unread = 0;
+  restoreConversationView(list);
+  if (list.pendingView && typeof requestAnimationFrame === "function") requestAnimationFrame(() => restoreConversationView(list));
   renderJump();
 }
 
@@ -4155,7 +4242,7 @@ function bindMessageGestures(list) {
       list.autoScrollUntil = 0;
       // A touch that stops a moving list only stops it.
       const settled = Date.now() - (list.lastScrollAt || 0) >= GESTURE.scrollSettleMs;
-      tap = compactChrome() && event.pointerType !== "mouse" && event.isPrimary !== false && settled
+      tap = touchDevice() && event.pointerType !== "mouse" && event.isPrimary !== false && settled
         ? { id: event.pointerId, x: event.clientX, y: event.clientY, at: Date.now(), target: event.target } : null;
     },
     onMove(event) {
@@ -4187,11 +4274,13 @@ function navigateView(view, replace = false) {
   const current = window.history.state;
   if (!replace && current?.[INSTANCE.historyKey] && current.view === view) return;
   window.history[replace ? "replaceState" : "pushState"](
-    { [INSTANCE.historyKey]: true, view },
+    { ...current, [INSTANCE.historyKey]: true, view },
     "",
   );
 }
 function backToList() {
+  rememberConversationView();
+  if (window.SessionholicGoals?.backFromSession?.()) return;
   stopChatPolling();
   if (
     window.history.state?.[INSTANCE.historyKey] &&
@@ -4687,6 +4776,8 @@ async function launchPlan() {
     rememberTerminal(result.terminal);
     await openTerminal(result.terminal);
     assertAuthEpoch(authEpoch);
+    if (result.goalLinkWarning) notice(result.goalLinkWarning);
+    window.SessionholicGoals?.refresh?.();
     if (plan.mode === "transfer" || result.mode === "transfer")
       toast(
         `실제 실행 위치가 ${plan.transfer?.targetHostLabel || hostLabel(plan.target?.host || "")}로 바뀌었습니다. 새 작업 폴더에서 이어가세요.`,
@@ -6184,6 +6275,7 @@ async function poll(refresh = false, { capabilities = true } = {}) {
     }
     state.pollFailures = 0;
     renderConnectivity();
+    if (refresh) window.SessionholicGoals?.refresh?.();
     if (Date.now() - (state.usageAt || 0) > 55000) loadUsage();
     // Safety net for missed (or unavailable) terminal announcements: a regular
     // read also reads a terminal list older than a minute. The first list is
@@ -6376,6 +6468,8 @@ function showLogin() {
   // Object URLs of picked images are released with their drafts.
   for (const entry of state.chats.values()) for (const key of [...(entry.thumbs?.keys() || [])]) revokeThumb(entry, key);
   state.chats.clear();
+  state.conversationViews.clear();
+  window.SessionholicGoals?.locked?.();
   state.phaseFilter = "";
   state.swipeOpen = null;
   state.pollFailures = 0;
@@ -6507,6 +6601,10 @@ function warnDraftUnload(event) {
 
 window.addEventListener("DOMContentLoaded", () => {
   navigateView("list", true);
+  window.SessionholicGoals?.init?.({ api, sessions: allSessions, openSession: select,
+    hideSession: () => setDetailShown(false), getSheet: sheet,
+    onChanged: render,
+    onSearch: (query) => { state.search = query.trim(); $("search").value = query; render(); } });
   document.addEventListener("pointerdown", closeChatToolsOutside);
   document.addEventListener("keydown", documentKeydown);
   window.addEventListener("popstate", (event) => {
@@ -6524,6 +6622,7 @@ window.addEventListener("DOMContentLoaded", () => {
     const animate = !event.hasUAVisualTransition;
     const fromTerminal = state.terminalVisible;
     if (fromTerminal) returnToBoard({ animate });
+    if (window.SessionholicGoals?.handleHistory?.(event)) return;
     const detail = view === "detail" && !!state.selected;
     stopChatPolling();
     setDetailShown(detail, { direction: animate && !fromTerminal ? (detail ? "push" : "pop") : null, focus: true });
@@ -6623,13 +6722,18 @@ window.addEventListener("DOMContentLoaded", () => {
   });
   $("search").addEventListener("input", (event) => {
     state.search = event.target.value.trim();
+    window.SessionholicGoals?.setQuery?.(state.search);
     render();
   });
   $("show-old").addEventListener("change", (event) => {
     state.showOld = event.target.checked;
     render();
   });
-  $("home").addEventListener("click", backToList);
+  $("home").addEventListener("click", () => {
+    rememberConversationView();
+    if (window.SessionholicGoals) window.SessionholicGoals.openTab("goals", { clearSelection: true });
+    else backToList();
+  });
   $("refresh").addEventListener("click", manualRefresh);
   $("running-refresh").addEventListener("click", () => refreshTerminals());
   $("logout").addEventListener("click", lock);

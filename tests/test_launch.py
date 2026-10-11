@@ -92,6 +92,40 @@ class LaunchTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "로그인 파일"):
             self.build(target)
 
+    def test_disabled_launch_profile_is_visible_and_cannot_be_reenabled_by_client(self):
+        path = self.home / '.config/sessionholic/config.json'
+        data = json.loads(path.read_text())
+        data['version'] = 2
+        data['profiles'].append({'agent': 'codex', 'home': '.codex-beta', 'launchEnabled': False})
+        path.write_text(json.dumps(data))
+        row = next(profile for profile in launch.discover_profiles(self.home) if profile['home'] == '.codex-beta')
+        self.assertFalse(row['launchEnabled'])
+        self.assertFalse(row['available'])
+        self.assertIn('기록 조회', row['reason'])
+        target = dict(row, available=True, launchEnabled=True, host='local')
+        with self.assertRaisesRegex(ValueError, '새 실행은 중지'):
+            self.build(target)
+        with self.assertRaisesRegex(ValueError, '새 실행은 중지'):
+            launch.start_app_server('.codex-beta', self.home)
+
+    def test_suspended_policy_blocks_launch_without_hiding_history_profiles(self):
+        path = self.home / '.config/sessionholic/config.json'
+        data = json.loads(path.read_text())
+        data['version'] = 2
+        data['agentRouter'] = {'accountPolicy': '~/policy.json'}
+        path.write_text(json.dumps(data))
+        (self.home / 'policy.json').write_text(json.dumps({
+            'accounts': {'beta': 'DO-NOT-EXPOSE'}, 'suspended_accounts': ['beta']}))
+        self.profile('codex', '.codex-personal-beta')
+        self.profile('codex', '.codex-personal-betax')
+        profiles = {row['home']: row for row in launch.discover_profiles(self.home)}
+        for key in ('.codex-beta', '.codex-personal-beta'):
+            self.assertFalse(profiles[key]['available'])
+            self.assertFalse(profiles[key]['launchEnabled'])
+            self.assertIn('실행 정책에서 중지', profiles[key]['reason'])
+        self.assertTrue(profiles['.codex-personal-betax']['available'])
+        self.assertNotIn('DO-NOT-EXPOSE', json.dumps(profiles))
+
     def test_profile_scope_describes_environment_not_login_identity(self):
         for key in (".codex-isolated", ".codex-isolated-beta", ".codex-default",
                     ".codex-isolatedish", ".codex-router/0123456789abcdef"):

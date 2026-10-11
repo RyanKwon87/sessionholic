@@ -43,7 +43,7 @@ SECTIONS = ("profileRules", "boundary", "legacy", "codexHomes", "agentRouter", "
 V1 = {"environment": {"label", "variables"}, "profile": {"agent", "home", "label", "environment"},
       "project": {"id", "label", "root", "environment"}}
 V2 = {"environment": V1["environment"] | {"boundaryGroup", "scope", "description"},
-      "profile": V1["profile"] | {"project", "placeholder", "title"},
+      "profile": V1["profile"] | {"project", "placeholder", "title", "launchEnabled"},
       "project": V1["project"] | {"match"}}
 
 
@@ -175,6 +175,7 @@ def load(home=None, path=None):
                 or row.get("environment", "default") not in groups
                 or not isinstance(row.get("project", "x"), str) or not GROUP.fullmatch(row.get("project", "x"))
                 or type(row.get("placeholder", False)) is not bool
+                or type(row.get("launchEnabled", True)) is not bool
                 or ("title" in row and not _text(row["title"]))):
             _error()
         identity = row["agent"], row["home"]
@@ -212,13 +213,14 @@ def _sections(data, config, groups, home):
     if not isinstance(rules, list) or len(rules) > 32:
         _error()
     for rule in rules:
-        _fields(rule, ("agent", "homePrefix", "environment", "label", "suffixLabel"))
+        _fields(rule, ("agent", "homePrefix", "environment", "label", "suffixLabel", "launchEnabled"))
         prefix = rule.get("homePrefix")
         if (rule.get("agent") not in AGENTS or not isinstance(prefix, str)
                 or not (HOME_PREFIX.fullmatch(prefix) if rule["agent"] == "codex" else prefix == ".claude")
                 or not isinstance(rule.get("environment", "default"), str)
                 or rule.get("environment", "default") not in groups
                 or ("label" in rule and not _text(rule["label"]))
+                or type(rule.get("launchEnabled", True)) is not bool
                 or type(rule.get("suffixLabel", False)) is not bool):
             _error()
     config["profileRules"] = rules
@@ -354,21 +356,23 @@ def profile(agent, key, home=None, config=None):
 def resolve_profile(agent, key, home=None, config=None):
     """Explicit row fields, else the first matching `profileRules` entry, else the default group.
 
-    The result has `environment` and, when known, `label`, `title` and `project`.
+    `launchEnabled` controls new executions, independently of collecting old sessions.
+    The result also has `environment` and, when known, `label`, `title` and `project`.
     """
     config = config if config is not None else load(home)
-    result = {"environment": "default"}
+    result = {"environment": "default", "launchEnabled": True}
     rule = next((r for r in config["profileRules"]
                  if r["agent"] == agent and isinstance(key, str) and _prefix_match(r["homePrefix"], key)), None)
     if rule is not None:
         result["environment"] = rule.get("environment", "default")
+        result["launchEnabled"] = rule.get("launchEnabled", True)
         suffix = key[len(rule["homePrefix"]):].lstrip("-/")
         if rule.get("suffixLabel") and suffix:
             result["label"] = suffix
         elif "label" in rule:
             result["label"] = rule["label"]
     row = profile(agent, key, home, config)
-    result.update({name: row[name] for name in ("environment", "label", "title", "project") if name in row})
+    result.update({name: row[name] for name in ("environment", "label", "title", "project", "launchEnabled") if name in row})
     return result
 
 

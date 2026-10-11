@@ -1488,8 +1488,7 @@ select:disabled {
 .detail-pane.is-reading .continue-panel,
 .detail-pane.is-reading .chat-toolbar,
 .detail-pane.is-reading .chat-heading,
-.detail-pane.is-reading .chat-hint,
-.detail-pane.is-reading .chat-status:not(:empty) {
+.detail-pane.is-reading .chat-hint {
   display: none;
 }
 .detail-pane.is-reading .detail-title {
@@ -5252,6 +5251,8 @@ select:disabled {
   grid-template-areas:
     "title chevron"
     "snippet chevron"
+    "initiator chevron"
+    "goals chevron"
     "meta chevron";
   align-items: center;
   column-gap: 10px;
@@ -6467,3 +6468,39 @@ input.switch:focus-visible {
     opacity: 0.8;
   }
 }
+
+/* Focus mode: explicit restoration and a stable reading anchor on every device. */
+.detail-device { display: none; color: var(--label-2); font-size: var(--fs-cap); }
+.focus-toggle { flex: none; min-height: 44px; min-width: 64px; font-size: var(--fs-sub); }
+.focus-toggle[aria-pressed="true"] { color: var(--accent-strong); background: var(--accent-tint); }
+.detail-pane.is-reading .detail-device,
+.detail-pane.is-typing .detail-device { display: block; }
+.detail-pane.is-reading .detail-head,
+.detail-pane.is-typing .detail-head,
+.detail-head, .conversation-bar { transition: none; }
+.detail-pane.is-reading .chat-status:not(:empty),
+.detail-pane.is-typing .chat-status:not(:empty) { display: block; }
+.detail-pane.is-reading .chat-status,
+.detail-pane.is-typing .chat-status { font-size: var(--fs-cap); line-height: 1.5; }
+.detail-pane.is-reading .chat-status[data-attention="true"] { color: var(--red); }
+.detail-pane.is-reading .chat-terminal-gate:not([hidden]) { display: flex; }
+.card-initiator { grid-area: initiator; color: var(--label-2); font-size: var(--fs-cap); }
+.card-goals { grid-area: goals; color: var(--accent); font-size: var(--fs-cap); overflow-wrap: anywhere; }
+@media (max-width: 600px) {
+  .focus-toggle { padding-inline: 10px; }
+}
+.detail-project { color: var(--label-2); font-size: var(--fs-sub); }
+.detail-pane.is-reading .detail-project,
+.detail-pane.is-typing .detail-project { display: none; }
+.detail-head .back {
+  display: inline-flex; align-items: center; justify-content: center;
+  flex: none; min-width: 44px; min-height: 44px; padding: 0; margin: 0;
+  border: 0; border-radius: var(--radius-s); background: transparent;
+  color: var(--accent); font-size: 0;
+}
+.detail-head .back::before {
+  content: ""; width: 11px; height: 11px; margin: 0;
+  border-left: 2px solid currentColor; border-bottom: 2px solid currentColor;
+  transform: rotate(45deg);
+}
+.detail-head .back::after { content: none; }

@@ -63,6 +63,7 @@ class AttachmentsTest(unittest.TestCase):
         self.assertEqual(list(outside.iterdir()), [])
         managed.unlink()
         managed.mkdir(mode=0o755)
+        managed.chmod(0o755)  # Exercise public permissions even under a private umask.
         with self.assertRaises(attachments.AttachmentError):
             attachments.store(self.cwd, 'note.txt', b'x')
 

@@ -13,6 +13,8 @@
 const CACHE = "sessionholic-shell-v13";
 const ASSETS = new Set([
   "/app.js",
+  "/goals.js",
+  "/goals.css",
   "/theme-init.js",
   "/message-format.js",
   "/style.css",

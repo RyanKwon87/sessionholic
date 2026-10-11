@@ -4124,6 +4124,47 @@ test('the usage line is one chip that opens a sheet of per-account bars, and ope
   assert.match(html, /id="terminal-return"[\s\S]*<\/aside>/, 'the terminal bar floats inside the list');
 });
 
+test('after an answer a still-working session shows no "작업 중" until a message is sent, which brings it back right after the bubble', async () => {
+  let release; let stage = 'answered'; const sends = [];
+  const now = Math.floor(Date.now() / 1000);
+  const c = client(async (url, options) => {
+    const body = JSON.parse(options.body);
+    if (url === '/api/chat/send') {
+      sends.push(body);
+      return await new Promise((resolve) => { release = () => resolve({ ok: true, status: 200, json: async () => ({ status: 'accepted', receipt: {} }) }); });
+    }
+    const messages = [{ role: 'user', text: '정리해 주세요', ts: now - 120, itemId: 'item-user-0', clientId: null },
+      { role: 'assistant', text: '정리했습니다', ts: now - 60, itemId: 'item-answer-0', clientId: null }];
+    if (stage !== 'answered') messages.push({ role: 'user', text: '이것도 해 주세요', ts: now, itemId: 'item-user-1', clientId: sends[0].requestId });
+    if (stage === 'done') messages.push({ role: 'assistant', text: '그것도 했습니다', ts: now + 5, itemId: 'item-answer-1', clientId: null });
+    return { ok: true, status: 200, json: async () => ({ route: body.source, capability: { supported: true }, phase: 'working',
+      workingSince: now - 30, receipts: body.requestId ? [{ requestId: body.requestId, status: 'accepted' }] : [], messages }) };
+  }, noChatTimers);
+  const { s, entry } = selectChat(c);
+  wireTree(c, c.buildChatComposer(s)); await settle();
+  await c.loadChatState(s, true);
+  const list = c.get('messages');
+  const working = () => list.children.filter((row) => /msg-working/.test(row.className));
+  assert.equal(entry.data.phase, 'working');
+  assert.equal(working().length, 0, 'the answer is the newest row');
+  c.get('chat-input').value = entry.text = '이것도 해 주세요';
+  const pending = c.sendChat(entry);
+  const bubble = list.children.find((row) => /is-outbox/.test(row.className));
+  assert.match(bubble.className, /is-sending/);
+  assert.equal(list.children.at(-2), bubble);
+  assert.match(list.children.at(-1).className, /msg-working/, 'right after the bubble sent from here');
+  assert.match(list.children.at(-1).workingTime.textContent, /^ · 3[0-2]초$/, 'Codex counts its exact turn start');
+  await settle();
+  stage = 'delivered';
+  release(); await pending; await settle();
+  assert.equal(list.children.some((row) => /is-outbox/.test(row.className)), false);
+  assert.equal(list.children.at(-2).messageItem.message.text, '이것도 해 주세요');
+  assert.match(list.children.at(-1).className, /msg-working/, 'the transcript\'s own user row still waits');
+  stage = 'done';
+  await c.loadChatState(s, true);
+  assert.equal(working().length, 0);
+});
+
 test('sending shows the bubble at once, keeps but hides the draft, and gives way to the transcript row', async () => {
   let release; let delivered = false; const sends = [];
   const now = Math.floor(Date.now() / 1000);
@@ -4689,12 +4730,77 @@ test('a working agent shows "··· 작업 중" after the newest message, still 
   assert.match(list.children.at(-1).className, /msg-working/);
   assert.match(textOf(list.children.at(-1)), /작업 중/);
   assert.equal(list.children.at(-1).attributes.role, 'status');
-  c.renderMessages(s, [{ role: 'user', text: '시작해 주세요' }, { role: 'assistant', text: '보는 중' }]);
-  assert.match(list.children.at(-1).className, /msg-working/, 'it stays last as messages arrive');
+  c.renderMessages(s, [{ role: 'user', text: '시작해 주세요' }, { role: 'tool', text: '$ npm test' }]);
+  assert.match(list.children.at(-1).className, /msg-working/, 'it stays last as tool records arrive');
   entry.data.phase = 'idle';
   c.renderMessages(s, [{ role: 'user', text: '시작해 주세요' }, { role: 'assistant', text: '끝났습니다' }]);
   assert.equal(list.children.some((row) => /msg-working/.test(row.className)), false);
   assert.match(styleSheet(), /@media \(prefers-reduced-motion: reduce\) \{[^@]*\.working-dots i \{\s*animation: none;/);
+});
+
+test('"작업 중" shows only while the conversation waits on the agent: after a user message or tool records, never after an answer or a system line', () => {
+  const armed = [];
+  const c = client(undefined, { setTimeout: (callback, ms) => { armed.push({ callback, ms }); return armed.length; },
+    clearTimeout: (id) => { if (armed[id - 1]) armed[id - 1].cleared = true; } });
+  const ticking = () => armed.filter((timer) => timer.callback === c.context.tickWorking && !timer.cleared);
+  const { s, entry } = selectChat(c);
+  entry.data.phase = 'working';
+  entry.data.workingSince = Math.floor(Date.now() / 1000) - 90;
+  const list = c.get('messages');
+  const working = () => list.children.filter((row) => /msg-working/.test(row.className));
+  const ask = { role: 'user', text: '테스트를 고쳐 주세요' };
+  const tool = (n) => ({ role: 'tool', text: `$ npm test -- --shard=${n}` });
+  const answer = { role: 'assistant', text: '고쳤습니다. 테스트가 모두 통과합니다.' };
+  c.renderMessages(s, [ask]);
+  assert.equal(working().length, 1); assert.equal(list.children.at(-1), working()[0], 'a user message waits for its first answer');
+  assert.equal(ticking().length, 1);
+  c.renderMessages(s, [ask, tool(1), tool(2)]);
+  const group = list.children.find((row) => /tool-group/.test(row.className));
+  assert.ok(group); assert.equal(list.children.at(-1), working()[0], 'tool records mean something runs now');
+  group.toolToggle.events.click();
+  // The agent's answer is on screen: background tools may still run, but the row leaves and its clock stops.
+  c.renderMessages(s, [ask, tool(1), tool(2), answer]);
+  assert.equal(working().length, 0);
+  assert.equal(ticking().length, 0, 'no clock for a row that is not shown');
+  assert.equal(list.children.at(-1).messageItem.message.text, answer.text);
+  c.renderMessages(s, [ask, tool(1), tool(2), answer, { role: 'system', text: '세션을 다시 시작했습니다.' }]);
+  assert.equal(working().length, 0, 'a system line ends nothing on screen either');
+  // More tool records after the answer: the same row returns and counts again.
+  const row = list.workingRow;
+  c.renderMessages(s, [ask, tool(1), tool(2), answer, tool(3)]);
+  assert.equal(list.children.at(-1), row); assert.equal(ticking().length, 1);
+  assert.match(row.workingTime.textContent, /^ · 1분 3[01]초$/);
+  assert.equal(group.open, true, 'an opened tool group stays open while the row comes and goes');
+  // Phase "working" alone, with nothing read yet (a Claude row without an id): the row stays.
+  c.renderMessages(s, []);
+  assert.equal(list.children.at(-1), row);
+  assert.doesNotMatch(textOf(list), /저장된 대화를 아직/);
+});
+
+test('Claude\'s approximate start shows "··· 작업 중" without a time or a ticking clock; the status line carries no time', () => {
+  const armed = [];
+  const c = client(undefined, { setTimeout: (callback, ms) => { armed.push({ callback, ms }); return armed.length; },
+    clearTimeout: (id) => { if (armed[id - 1]) armed[id - 1].cleared = true; } });
+  const ticking = () => armed.filter((timer) => timer.callback === c.context.tickWorking && !timer.cleared);
+  const { s, entry } = selectChat(c, { agent: 'claude', home: '.claude', id: 'claude-session' });
+  entry.data.phase = 'working';
+  // The server's newest-prompt time for Claude: a guess, never shown.
+  entry.data.workingSince = Math.floor(Date.now() / 1000) - 754;
+  entry.data.workingSinceApprox = true;
+  c.renderMessages(s, [{ role: 'user', text: '시작해 주세요' }]);
+  const list = c.get('messages'); const row = list.children.at(-1);
+  assert.match(row.className, /msg-working/);
+  assert.equal(textOf(row).trim(), '작업 중');
+  assert.equal(row.workingTime.textContent, '');
+  assert.ok(!row.title, 'no note about an approximate time either');
+  assert.equal(ticking().length, 0, 'nothing to count');
+  c.tickWorking();
+  assert.equal(ticking().length, 0);
+  // An answer on screen ends it here as well, though the session is still working.
+  c.renderMessages(s, [{ role: 'user', text: '시작해 주세요' }, { role: 'assistant', text: '끝났습니다' }]);
+  assert.equal(list.children.includes(row), false);
+  vm.runInContext('updateChatComposer([...state.chats.values()][0])', c.context);
+  assert.equal(c.get('chat-status').textContent, '작업 중 · 지금 보내도 CLI가 이어서 반영합니다.', 'the session state stays in the status line');
 });
 
 test('picked images preview from memory with an upload ring, move to the uploaded file, and are released when removed', async () => {
@@ -5445,9 +5551,12 @@ test('the working row counts "작업 중 · 12분 34초" from workingSince once 
   assert.equal(ticking().length, 1);
   assert.deepEqual([0, 59, 60, 754, 3599, 3600, 3900, 7200].map(c.formatElapsed),
     ['0초', '59초', '1분 0초', '12분 34초', '59분 59초', '1시간', '1시간 5분', '2시간']);
-  // Claude's time is approximate; no workingSince leaves the label alone.
+  // An approximate start (Claude) and no workingSince both leave the label alone.
   entry.data.workingSinceApprox = true; c.renderMessages(s, [{ role: 'user', text: '시작해 주세요' }]);
-  assert.equal(row.title, '마지막 요청부터 잰 시간입니다.');
+  assert.equal(row.workingTime.textContent, ''); assert.equal(ticking().length, 0);
+  assert.match(textOf(row), /작업 중/);
+  entry.data.workingSinceApprox = false; c.renderMessages(s, [{ role: 'user', text: '시작해 주세요' }]);
+  assert.match(row.workingTime.textContent, /^ · 12분 3[4-6]초$/); assert.equal(ticking().length, 1);
   entry.data.workingSince = null; c.renderMessages(s, [{ role: 'user', text: '시작해 주세요' }]);
   assert.equal(row.workingTime.textContent, ''); assert.equal(ticking().length, 0);
   entry.data.phase = 'idle'; entry.data.workingSince = Math.floor(now / 1000) - 10;

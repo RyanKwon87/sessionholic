@@ -2967,8 +2967,9 @@ function outboxRows(list, entry) {
   for (const key of [...list.outboxNodes.keys()]) if (!keep.has(key)) list.outboxNodes.delete(key);
   return rows;
 }
-// "··· 작업 중 · 12분 34초" at the end of a conversation whose agent is
-// working, counted from the server's workingSince (epoch seconds).
+// "··· 작업 중 · 12분 34초" at the end of a conversation that waits on its
+// working agent (renderMessages decides), counted from an exact workingSince
+// (epoch seconds); without one (Claude) it says "··· 작업 중" alone.
 function workingRow(list) {
   if (list.workingRow) return list.workingRow;
   const row = el("article", "msg assistant msg-working");
@@ -3013,8 +3014,6 @@ function tickWorking() {
   if (!row || ![...(list.children || [])].includes(row)) return;
   const text = workingElapsedText(list.workingSince);
   if (row.workingTime.textContent !== text) row.workingTime.textContent = text;
-  // Claude records no turn start: its time counts from the newest prompt.
-  row.title = text && list.workingApprox ? "마지막 요청부터 잰 시간입니다." : "";
   if (!text || !chatVisible()) return;
   state.workingTimer = setTimeout(tickWorking, 1000 - (Date.now() % 1000) + 20);
 }
@@ -3497,9 +3496,16 @@ function renderMessages(s, messages, error = "", fresh = false) {
     tail = outboxRows(list, entry);
     const live = entry.data && chatKey(entry.data.route || {}) === source ? entry.data : null;
     // A Claude row without an id is never read; its listed phase still says it works.
-    working = live ? live.phase === "working" : claudeWithoutId(s) && s.phase === "working";
-    list.workingSince = live?.workingSince ?? null;
-    list.workingApprox = live?.workingSinceApprox === true;
+    const phaseWorking = live ? live.phase === "working" : claudeWithoutId(s) && s.phase === "working";
+    // The phase stays "working" while a background agent still runs tools after
+    // its answer, so the row shows only while the conversation waits on the
+    // agent: it ends with a message of the user's (one sent from here included),
+    // with tool records, or nothing has been read yet.
+    const lastRole = tail.length ? "user" : rows.at(-1)?.role;
+    working = phaseWorking && (!lastRole || lastRole === "user" || lastRole === "tool");
+    // Only an exact start (Codex's running turn) is counted; Claude's newest
+    // prompt time is an approximation and shows no time.
+    list.workingSince = live && live.workingSinceApprox !== true ? live.workingSince ?? null : null;
     if (working) tail.push(workingRow(list));
   }
   if (error) {

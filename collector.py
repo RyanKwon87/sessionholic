@@ -627,7 +627,8 @@ def codex_homes():
     except ValueError:
         config = None
     options = config["codexHomes"] if config is not None else {}
-    skipped = set()
+    # `codexHomes.hide`: retired homes, left out of collection as of the launch targets.
+    skipped = set(options.get("hide", []))
     router = agent_router.from_settings(config) if config is not None else None
     if options.get("excludeSuspended") and router is not None:
         for account in router.suspended():

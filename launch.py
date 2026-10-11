@@ -119,6 +119,8 @@ def discover_profiles(home=None):
             and (not marker or any((p / name).exists() for name in ("auth.json", "config.toml", SOCKET_REL)))]
     placeholders = [(row["agent"], row["home"]) for row in config["profiles"] if row.get("placeholder")]
     keys += [key for agent, key in placeholders if agent == "codex"]
+    hidden = set(config["codexHomes"].get("hide", []))
+    keys = [key for key in keys if key not in hidden]
     profiles = [_profile("codex", key, home, _binary("codex", home)) for key in sorted(set(keys))]
     if (home / ".claude").is_dir() or ("claude", ".claude") in placeholders:
         profiles.append(_profile("claude", ".claude", home, _binary("claude", home)))

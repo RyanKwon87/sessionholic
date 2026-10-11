@@ -11,6 +11,7 @@ from unittest.mock import patch
 
 import agent_router
 import collector
+import launch
 import server
 import settings
 
@@ -98,6 +99,23 @@ class CollectorTest(Fixture):
         homes = collector.codex_homes()
         self.assertEqual([key for key, _ in homes], ['.codex', '.codex-one', '.codex-router/' + self.digest])
         self.assertEqual(collector.codex_labels(homes), [(None, '기본'), (None, 'one'), ('alpha', 'one')])
+
+    def test_hidden_homes_are_neither_collected_nor_launch_targets(self):
+        (self.home / '.codex-retired/app-server-control').mkdir(parents=True)
+        (self.home / '.codex-retired/app-server-control/app-server-control.sock').write_text('')
+        for key in ('.codex-retired', '.codex-one'):
+            (self.home / key / 'auth.json').write_text('fixture-only-never-read')
+        self.write({'version': 2, 'codexHomes': {'hide': ['.codex-retired', '.codex-two']}})
+        self.assertNotIn('.codex-retired', [key for key, _ in collector.codex_homes()])
+        self.assertNotIn('.codex-two', [key for key, _ in collector.codex_homes()])
+        with patch.object(launch, '_binary', return_value='/fixture/codex'):
+            homes = [p['home'] for p in launch.discover_profiles(self.home)]
+        self.assertIn('.codex-one', homes)
+        self.assertNotIn('.codex-retired', homes)
+        for bad in (['../x'], '.codex-x', [1]):
+            self.write({'version': 2, 'codexHomes': {'hide': bad}})
+            with self.assertRaises(ValueError):
+                settings.load(self.home)
 
     def test_profile_rows_label_first_and_settings_without_router_ignore_its_files(self):
         self.write({'version': 2, 'agentRouter': {'projectsFile': '~/.config/router/projects.tsv'},

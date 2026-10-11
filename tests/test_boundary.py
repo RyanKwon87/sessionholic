@@ -411,7 +411,8 @@ class SettingsValidationTest(BoundaryFixture):
                                      'claude': '/fixture/claude', 'claudeHelper': 'claude-usage.py'}})
         config = settings.load(self.home)
         self.assertEqual(config['agentRouter'], {'accountPolicy': str(self.home / 'policy.json')})
-        self.assertEqual(config['codexHomes'], {'allowSymlinks': True, 'excludeSuspended': True, 'requireMarker': False})
+        self.assertEqual(config['codexHomes'], {'allowSymlinks': True, 'excludeSuspended': True, 'requireMarker': False,
+                                                'hide': []})
         self.assertEqual(config['usage']['resources'], str(self.home / 'helpers'))
         self.assertEqual((config['usage']['intervalSeconds'], config['usage']['manualIntervalSeconds']), (300, 20))
         self.assertEqual(settings.variables('private', self.home)['CMUX_CODEX_HOOKS_DISABLED'], '1')

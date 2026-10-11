@@ -61,7 +61,7 @@ flowchart LR
 - `projects[].match: "component"`: `root`를 폴더 이름 하나로 보고, 해석한 작업 경로의 어느 구성요소든 같으면 그 환경을 씁니다. 긴 root 매칭이 먼저이고, 이름표에는 쓰지 않습니다.
 - `boundary`: `{agents, claude, priority}`. `agents`에 있는 대상 에이전트만 경계를 검사합니다(기본 둘 다). 빠진 에이전트는 원본 환경 변수로 실행합니다(`claude: "inherit-source"`). `priority` 그룹은 신호(원본 홈의 profile·규칙, 경로 구성요소·root project)가 하나라도 있으면 다른 판정과 이전받은 작업공간의 기록보다 먼저 적용되고, 이때 기록은 읽지 않습니다. 없으면 이전받은 작업공간은 기록만 따릅니다.
 - `legacy.sourcePersonal`: `{"true": g, "false": g}`. `sourceEnvironment`가 없는 옛 이전 기록의 boolean을 읽기만 합니다. 둘 다 없거나 boolean이 아니면 거절합니다.
-- `codexHomes`: `allowSymlinks`(링크 홈 수집), `excludeSuspended`(계정 정책의 중단 계정 `.codex-<a>`·`.codex-personal-<a>` 수집 제외), `requireMarker`(로그인·설정·소켓 파일이 있는 폴더만 실행 프로필로 표시).
+- `codexHomes`: `allowSymlinks`(링크 홈 수집), `excludeSuspended`(계정 정책의 중단 계정 `.codex-<a>`·`.codex-personal-<a>` 수집 제외), `requireMarker`(로그인·설정·소켓 파일이 있는 폴더만 실행 프로필로 표시), `hide`(쓰지 않는 홈 이름 목록. 수집과 실행 대상에서 모두 뺍니다).
 - `agentRouter`: `{projectsFile, workspacesRoot, accountPolicy}`. 수집기의 프로젝트 이름표, 작업공간 루트, `.codex-router/<hash>` 홈의 (프로젝트, 계정) 이름표에만 씁니다. 계정 정책은 키 이름만 읽습니다.
 - `tmux`: `{titleOption, taskOption}`. 기존 tmux 세션의 사용자 옵션을 제목·작업으로 표시합니다.
 - `transfer.agentConfig`: `"exclude-private"`(기본, `.claude`·`.codex*`의 개인 상태만 제외) 또는 `"exclude-all"`(이 이름의 폴더·파일 전체 제외).

@@ -95,7 +95,8 @@ def _seconds(value, low, high):
 def defaults():
     """Version 2 sections when they are omitted: the version 1 behaviour."""
     return {"profileRules": [], "boundary": {"agents": list(AGENTS), "claude": "inherit-source"},
-            "legacy": {}, "codexHomes": {"allowSymlinks": False, "excludeSuspended": False, "requireMarker": False},
+            "legacy": {}, "codexHomes": {"allowSymlinks": False, "excludeSuspended": False, "requireMarker": False,
+                                         "hide": []},
             "agentRouter": None, "tmux": {}, "transfer": {"agentConfig": "exclude-private"},
             "attachments": {"gitExclude": True}, "usage": None, "launcher": None}
 
@@ -245,11 +246,17 @@ def _sections(data, config, groups, home):
             _error()
         config["agentRouter"] = {key: _location(value, home) for key, value in router.items()}
     if "codexHomes" in data:
-        homes = _fields(data["codexHomes"], ("allowSymlinks", "excludeSuspended", "requireMarker"))
+        homes = _fields(data["codexHomes"], ("allowSymlinks", "excludeSuspended", "requireMarker", "hide"))
         config["codexHomes"] = {key: _flag(homes.get(key, False))
                                 for key in ("allowSymlinks", "excludeSuspended", "requireMarker")}
         if config["codexHomes"]["excludeSuspended"] and "accountPolicy" not in (config["agentRouter"] or {}):
             _error()
+        # Homes left out of both collection and the launch targets (a retired login folder).
+        hide = homes.get("hide", [])
+        if (not isinstance(hide, list) or len(hide) > 32
+                or any(not isinstance(key, str) or not HOME_KEY.fullmatch(key) for key in hide)):
+            _error()
+        config["codexHomes"]["hide"] = list(hide)
     if "tmux" in data:
         tmux = _fields(data["tmux"], ("titleOption", "taskOption"))
         if not tmux or any(not isinstance(v, str) or not TMUX_OPTION.fullmatch(v) for v in tmux.values()):

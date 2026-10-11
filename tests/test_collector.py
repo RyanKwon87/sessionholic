@@ -164,6 +164,43 @@ class MessageTest(unittest.TestCase):
         self.assertEqual([len(r.get("attachments", [])) for r in rows], [1, 0, 1])
         self.assertNotIn("PRIVATE", json.dumps(rows))
 
+    def test_claude_input_typed_while_working_is_a_user_row_shown_once(self):
+        # Claude Code records input sent while it works (a board paste included) as a
+        # queued_command attachment, not as a user line.
+        def queued(prompt, kind="human", mode="prompt", ts="2026-10-07T01:00:10Z"):
+            return {"type": "attachment", "timestamp": ts, "attachment": {
+                "type": "queued_command", "prompt": prompt, "origin": {"kind": kind}, "commandMode": mode}}
+        image = {"type": "image", "source": {"type": "base64", "data": "PRIVATE"}}
+        entries = [
+            {"type": "user", "timestamp": "2026-10-07T01:00:00Z", "message": {"content": "정리해 줘"}},
+            {"type": "assistant", "timestamp": "2026-10-07T01:00:05Z",
+             "message": {"content": [{"type": "text", "text": "정리하겠습니다."}]}},
+            queued("<system-reminder>숨김</system-reminder>이것도 확인해 줘"),
+            queued("<task-notification><task-id>x</task-id></task-notification>", "task-notification", "task-notification"),
+            queued([{"type": "text", "text": "[Image #1]그림 봐 줘"}, image], ts="2026-10-07T01:00:12Z"),
+            {"type": "attachment", "attachment": {"type": "hook_success", "content": "숨김"}},
+        ]
+        rows = collector.claude_messages(entries)
+        self.assertEqual([(r["role"], r["text"]) for r in rows],
+                         [("user", "정리해 줘"), ("assistant", "정리하겠습니다."),
+                          ("user", "이것도 확인해 줘"), ("user", "[Image #1]그림 봐 줘")])
+        self.assertEqual(rows[2]["ts"], 1791334810)
+        self.assertEqual(len(rows[3]["attachments"]), 1)
+        self.assertNotIn("PRIVATE", json.dumps(rows))
+        # An interrupt hands the queued input back; Claude Code records it again as a prompt.
+        again = entries[:3] + [
+            {"type": "user", "message": {"content": "[Request interrupted by user]"}},
+            {"type": "user", "timestamp": "2026-10-07T01:00:20Z", "message": {"content": "이것도  확인해 줘"}}]
+        rows = collector.claude_messages(again)
+        self.assertEqual([(r["role"], r["text"]) for r in rows],
+                         [("user", "정리해 줘"), ("assistant", "정리하겠습니다."), ("system", "사용자가 중단함"),
+                          ("user", "이것도  확인해 줘")])
+        self.assertEqual(rows[-1]["ts"], 1791334820)
+        # The same words asked again after an answer are a new message.
+        later = entries[:3] + [{"type": "assistant", "message": {"content": [{"type": "text", "text": "확인했습니다."}]}},
+                               {"type": "user", "message": {"content": "이것도 확인해 줘"}}]
+        self.assertEqual([r["text"] for r in collector.claude_messages(later)].count("이것도 확인해 줘"), 2)
+
     def test_claude_messages_hide_harness_wrappers(self):
         entries = [
             {"type": "user", "timestamp": "2026-10-07T01:00:00Z",

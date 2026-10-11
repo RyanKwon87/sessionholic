@@ -1143,6 +1143,52 @@ class ChatClaudeTest(unittest.TestCase):
         self.assertFalse(missing['confirmed'])
         self.assertEqual(len(self.terms.pastes), 1)
 
+    def test_receipt_readback_matches_the_words_claude_code_recorded_for_an_image(self):
+        # The board pastes "본문\n첨부 파일: <경로>"; Claude Code records the image path as
+        # "[Image #1]" (before, after or instead of the words) and drops the line.
+        self.terminal()
+        uploaded = self.chat.upload(CLAUDE_REF, 'shot.png', b'\x89PNG\r\n\x1a\nfixture')['attachment']
+        self.send(text='코덱스로 이어서 하려는데 여기서 막힘', attachments=[uploaded['id']])
+        self.send(rid='request-0002', text='', attachments=[uploaded['id']])
+        image = {'id': None, 'name': '이미지', 'type': 'image/*', 'size': None, 'kind': 'image', 'source': 'native'}
+        now = int(time.time())
+        cases = [('request-0001', '[Image #1]코덱스로 이어서 하려는데 여기서 막힘', [image], True),
+                 ('request-0001', '[Image #1] 코덱스로   이어서 하려는데\n여기서 막힘', [image], True),
+                 ('request-0001', '코덱스로 이어서 하려는데 여기서 막힘 [Image #1]', [image], True),
+                 ('request-0001', '코덱스로 이어서 하려는데 여기서 막힘\n첨부 파일: ' + uploaded['path'], [], True),
+                 ('request-0001', '[Image #1]코덱스로 이어서 하려는데 여기서 막힘 그리고 더', [image], False),
+                 ('request-0001', '[Image #1]다른 메시지', [image], False),
+                 ('request-0002', '[Image #1]', [image], True),
+                 ('request-0002', '[이미지 첨부]', [image], True),
+                 ('request-0002', '[Pasted text #1 +12 lines]', [], False)]
+        for index, (rid, text, files, confirmed) in enumerate(cases):
+            with self.subTest(case=index):
+                self.messages = [{'role': 'user', 'text': text, 'ts': now, 'attachments': files}]
+                receipt = self.state(requestId=rid)['receipts'][0]
+                self.assertEqual(receipt['status'], 'accepted')
+                self.assertIs(receipt['readbackConfirmed'], confirmed)
+        # Only hashes of the words are kept, never the words or the path.
+        saved = ''.join(path.read_text() for path in self.records())
+        self.assertNotIn('코덱스', saved)
+        self.assertNotIn(uploaded['path'], saved)
+
+    def test_unknown_paste_result_is_accepted_once_the_transcript_shows_the_message(self):
+        self.terminal()
+        self.terms.paste_error = RuntimeError('fixture enter failure')
+        self.assertEqual(self.send(text='확인해 주세요')['status'], 'unknown')
+        now = int(time.time())
+        self.messages = [{'role': 'user', 'text': '다른 메시지', 'ts': now}]
+        self.assertEqual(self.state(requestId='request-0001')['receipts'][0]['status'], 'unknown')
+        self.messages = [{'role': 'user', 'text': '확인해 주세요', 'ts': now - 60}]
+        self.assertEqual(self.state(requestId='request-0001')['receipts'][0]['status'], 'unknown',
+                         'a message from before the send is not this one')
+        self.messages = [{'role': 'user', 'text': '확인해 주세요', 'ts': now}]
+        receipt = self.state(requestId='request-0001')['receipts'][0]
+        self.assertEqual(receipt['status'], 'accepted')
+        self.assertTrue(receipt['confirmed'])
+        self.assertTrue(receipt['readbackConfirmed'])
+        self.assertEqual(len(self.terms.pastes), 1, 'and nothing was sent again')
+
     def test_attachment_paths_are_pasted_as_separate_lines(self):
         self.terminal()
         uploaded = self.chat.upload(CLAUDE_REF, 'memo.txt', b'fixture')['attachment']

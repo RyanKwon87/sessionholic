@@ -166,6 +166,9 @@ const state = {
   toastTimer: null,
   chats: new Map(),
   nativeSessions: new Map(),
+  // Session key -> { phase, base }: the phase an open conversation's own read
+  // found, shown while the list still has the phase `base` it had then.
+  livePhases: new Map(),
   chatPollTimer: null,
   chatPollRun: 0,
   chatPollCount: 0,
@@ -661,16 +664,22 @@ function allSessions() {
       ...(host.data?.claude || []),
       ...(host.data?.codex || []),
     ]) {
+      // A Claude row listed without an id is told apart by its process (or folder and start).
+      const key = [host.name, s.agent, s.home || "", s.id || (s.agent === "claude"
+        ? `~${s.pid ?? ""}:${s.sessionId || ""}:${s.cwd || ""}:${s.startedAt ?? ""}` : "")].join("|");
+      // The list's own phase stands again once it changed since the conversation was read.
+      const live = state.livePhases.get(key);
+      if (live && live.base !== s.phase) state.livePhases.delete(key);
       out.push({
         ...s,
+        phase: live && live.base === s.phase ? live.phase : s.phase,
+        listedPhase: s.phase,
         host: host.name,
         account: sessionAccountLabel({ ...s, host: host.name }),
         hostLabel: host.label,
         stale: !host.ok,
         fetchedAt: host.fetchedAt,
-        // A Claude row listed without an id is told apart by its process (or folder and start).
-        key: [host.name, s.agent, s.home || "", s.id || (s.agent === "claude"
-          ? `~${s.pid ?? ""}:${s.sessionId || ""}:${s.cwd || ""}:${s.startedAt ?? ""}` : "")].join("|"),
+        key,
       });
     }
   }
@@ -678,6 +687,25 @@ function allSessions() {
     if (!out.some((s) => s.key === session.key)) out.push({ ...session, account: sessionAccountLabel(session) });
   }
   return out;
+}
+// The open conversation's own read says what its session does now; the list
+// may say so only a minute later (a host without a resident collector). Its
+// card, header and counts follow the read until the list's phase changes.
+function noteLivePhase(s, data) {
+  const listed = allSessions().find((value) => value.key === s?.key);
+  if (!listed || listed.listedPhase === undefined && listed.nativeSource || !BADGES[data?.phase] ||
+      chatKey(data.route || {}) !== chatKey(sourceOf(listed))) return;
+  if (data.phase === listed.listedPhase) state.livePhases.delete(listed.key);
+  else state.livePhases.set(listed.key, { phase: data.phase, base: listed.listedPhase });
+  // Redrawn only where it shows (a detail not drawn yet takes it when drawn).
+  // This read is the news: the header shows it without reading the
+  // conversation again, and the list follows.
+  if (listed.phase !== data.phase && state.detailFor === listed.key) {
+    const shown = allSessions().find((value) => value.key === listed.key);
+    state.detailRevision = detailRevision(shown);
+    patchDetailMetadata(shown);
+    render();
+  }
 }
 function sourceOf(s) {
   const source = {
@@ -766,8 +794,10 @@ function render() {
   }
   if (selected) refreshDetail(selected);
   else if (state.selected) {
-      state.selected = null;
+    state.selected = null;
     state.detailFor = null;
+    // Nothing follows the conversation any more (polling, its live stream).
+    stopChatPolling();
     $("detail").replaceChildren(
       el(
         "div",
@@ -775,6 +805,12 @@ function render() {
         "이 작업을 목록에서 더 이상 찾을 수 없습니다. 새로고침 후 확인해 주세요.",
       ),
     );
+    // A phone showed nothing but that conversation, and its back button went
+    // with it: back to the list, saying why.
+    if (phoneLayout() && state.detailShown && !state.terminalVisible) {
+      toast("열어 둔 작업을 목록에서 더 이상 찾을 수 없어 목록으로 돌아왔습니다.");
+      backToList();
+    } else syncEvents();
   }
 }
 function renderHosts(now) {
@@ -1650,9 +1686,12 @@ function select(key) {
   state.detailShown = wasShown;
   setDetailShown(true, { direction: entering ? "push" : null, focus: mobile });
 }
-function refreshDetail(s) {
-  const revision = JSON.stringify([s.stale, s.phase, s.title, s.project, s.account, s.hostLabel, s.fetchedAt,
+function detailRevision(s) {
+  return JSON.stringify([s.stale, s.phase, s.title, s.project, s.account, s.hostLabel, s.fetchedAt,
     s.cwd || null, s.sessionId || null]);
+}
+function refreshDetail(s) {
+  const revision = detailRevision(s);
   if (
     state.detailFor === s.key &&
     state.detailUpdatedAt === s.updatedAt &&
@@ -1839,13 +1878,16 @@ function renderPrompt(s, data) {
     card.dataset.fingerprint = "";
     card.dataset.question = "";
     entry.promptChoice = null;
+    // A note belongs to the question it was written for.
+    entry.promptNote = "";
     return;
   }
-  const revision = prompt ? `${prompt.fingerprint}|${prompt.current}|${entry.promptChoice?.number || ""}|${entry.promptBusy ? 1 : 0}`
-    : `open|${entry.promptBusy ? 1 : 0}`;
+  const question = prompt ? prompt.fingerprint : "open";
+  if (card.dataset.question && card.dataset.question !== question) entry.promptNote = "";
+  const revision = prompt ? `${prompt.fingerprint}|${prompt.current}|${entry.promptChoice?.number || ""}|${entry.promptBusy ? 1 : 0}|${entry.promptNote || ""}`
+    : `open|${entry.promptBusy ? 1 : 0}|${entry.promptNote || ""}`;
   // A question that just appeared (or a different one) must not be missed:
   // the bars come back. Re-renders of the same question leave them alone.
-  const question = prompt ? prompt.fingerprint : "open";
   const appeared = card.hidden || card.dataset.question !== question;
   card.hidden = false;
   card.dataset.question = question;
@@ -1864,6 +1906,8 @@ function renderPrompt(s, data) {
     const open = button(entry.promptBusy ? "불러오는 중…" : "질문 불러오기", "primary", () => promptAction(s, { action: "open" }));
     open.disabled = !!entry.promptBusy || networkOffline();
     nodes.push(open);
+    // Why the last "질문 불러오기" did not work.
+    if (entry.promptNote) nodes.push(el("p", "chat-prompt-note", entry.promptNote));
     card.replaceChildren(...nodes);
     return;
   }
@@ -1944,6 +1988,9 @@ async function promptAction(s, body) {
   if (entry.promptBusy || !currentChat(entry)) return;
   entry.promptBusy = true;
   entry.promptNote = "";
+  // A state read begun before the answer still shows the question: it is not
+  // drawn again (the read that follows the answer is).
+  entry.stateEpoch++;
   renderPrompt(s, entry.data);
   try {
     const result = await api("/api/chat/prompt", { method: "POST", body: {
@@ -1960,6 +2007,7 @@ async function promptAction(s, body) {
     if (!err.unauthorized && currentChat(entry)) { entry.promptNote = err.message; haptic("error"); }
   } finally {
     entry.promptBusy = false;
+    entry.stateEpoch++;
     if (currentChat(entry)) {
       renderPrompt(s, entry.data);
       state.chatPollCount = 0;
@@ -2222,8 +2270,10 @@ function updateChatDeliveryEvidence(entry) {
   const matchingReceipt = !pending || receipt?.requestId === pending.requestId;
   const files = attachmentMetadata(matchingReceipt && Array.isArray(receipt?.attachments)
     ? receipt.attachments : pending?.attachmentDetails);
-  const retained = pending || ["accepted", "queued", "completed", "interrupted", "unknown"].includes(receipt?.status) ||
-    receipt?.status === "failed" && receipt.confirmed === true;
+  // Once the message is in the conversation, its own chips show the files.
+  const retained = pending || !receiptSettled(entry) &&
+    (["accepted", "queued", "completed", "interrupted", "unknown"].includes(receipt?.status) ||
+    receipt?.status === "failed" && receipt.confirmed === true);
   const visible = retained && files.length > 0;
   box.hidden = !visible;
   if (!visible) { box.replaceChildren(); box.deliveryRevision = null; return false; }
@@ -2321,6 +2371,9 @@ function buildChatComposer(s) {
     entry.inputCollapsed = false;
     entry.text = input.value;
     entry.notice = "";
+    // Editing the draft answers an input error about it.
+    if (entry.inputError && entry.error === entry.inputError) entry.error = "";
+    entry.inputError = "";
     entry.revision++;
     updateChatComposer(entry);
   });
@@ -2589,6 +2642,23 @@ function chatReceiptCopy(receipt) {
   };
   return labels[receipt?.status] || "";
 }
+// The last receipt's message reached the conversation (its bubble went): what
+// the composer said about it being taken is no longer news.
+function receiptSettled(entry) {
+  return !entry.pending && !!entry.receipt?.requestId && entry.settledRequestId === entry.receipt.requestId;
+}
+function receiptNotice(entry) {
+  const status = entry.receipt?.status;
+  const phase = entry.data?.phase;
+  // A refusal keeps saying the draft was not sent; anything else waits while
+  // the agent asks something (the phase says so).
+  if (phase === "needs_input" && entry.receipt?.dispatchState !== "not_started" && status !== "failed") return "";
+  if (receiptSettled(entry) && ["accepted", "queued"].includes(status)) return "";
+  // Its request ended and the agent now works on a newer one (typed in the
+  // terminal, say): the phase says what is going on.
+  if (["completed", "interrupted"].includes(status) && phase === "working") return "";
+  return chatReceiptCopy(entry.receipt);
+}
 function updateChatComposer(entry) {
   if (!currentChat(entry) || $("chat-composer")?.dataset.source !== chatKey(entry.source)) return;
   const supported = chatSupported(entry);
@@ -2634,7 +2704,7 @@ function updateChatComposer(entry) {
     ? "메시지는 전송되지 않았습니다. 초안과 첨부는 유지됩니다." : "") : !supported && entry.attachments.length
     ? "첨부는 이 작업 폴더에 저장됐습니다. 첨부의 ‘경로’를 복사해 터미널에 붙여넣으세요."
     : entry.data?.capability?.reason || "직접 입력을 지원하지 않습니다. 터미널을 사용해 주세요.";
-  $("chat-status").textContent = (offline ? "오프라인입니다. 초안은 유지됩니다. 연결 후 상태를 확인하고 보내 주세요." : entry.error || entry.notice || (entry.uploads ? `첨부 ${entry.uploads}개를 올리고 있습니다…` : !entry.data ? (claudeWithoutId(selectedSession()) ? CLAUDE_NO_SEND : "메시지 전송 환경을 확인하고 있습니다…") : !supported ? unsupportedCopy : chatReceiptCopy(entry.receipt) || phaseCopy)) + budgetNote;
+  $("chat-status").textContent = (offline ? "오프라인입니다. 초안은 유지됩니다. 연결 후 상태를 확인하고 보내 주세요." : entry.error || entry.notice || (entry.uploads ? `첨부 ${entry.uploads}개를 올리고 있습니다…` : !entry.data ? (claudeWithoutId(selectedSession()) ? CLAUDE_NO_SEND : "메시지 전송 환경을 확인하고 있습니다…") : !supported ? unsupportedCopy : receiptNotice(entry) || phaseCopy)) + budgetNote;
   const deliveryVisible = updateChatDeliveryEvidence(entry);
   const chips = $("chat-attachments");
   // While a bubble resends its own message, another draft's files stay as they are.
@@ -2788,8 +2858,12 @@ function chatPollDelay(count) {
 function scheduleChatPoll(s, entry) {
   if (!currentChat(entry)) return;
   clearTimeout(state.chatPollTimer);
+  // A bubble still waiting for its message keeps the conversation followed, so it
+  // goes when the message (or an answer after it) shows, or when it times out.
   if (networkOffline() || !currentChat(entry) || !chatVisible() || state.chatPollCount >= CHAT_POLL_MAX ||
-      (!entry.pending && !entry.error && !entry.data?.prompt && !["working", "needs_input"].includes(entry.data?.phase))) return;
+      (!entry.pending && !(entry.error && entry.error !== entry.inputError) && !entry.data?.prompt &&
+       !["working", "needs_input"].includes(entry.data?.phase) &&
+       !(entry.outbox || []).some(outboxAwaitsAgent))) return;
   const run = state.chatPollRun;
   state.chatPollTimer = setTimeout(() => {
     if (run !== state.chatPollRun || !currentChat(entry) || !chatVisible()) return;
@@ -2843,7 +2917,10 @@ async function loadChatState(s, manual = false, { join = false } = {}) {
   const epoch = entry.stateEpoch;
   const pollRun = state.chatPollRun;
   let readFailed = false;
-  if (manual) { state.chatPollCount = 0; entry.error = ""; }
+  // A read clears its own (and a send's) errors; an input error (a file too
+  // large, too many files, too long a message) stays until the user acts again.
+  const clearError = () => { if (entry.error !== entry.inputError) entry.error = ""; };
+  if (manual) { state.chatPollCount = 0; clearError(); }
   updateChatComposer(entry);
   try {
     const lastRequestId = entry.pending?.requestId ||
@@ -2857,7 +2934,7 @@ async function loadChatState(s, manual = false, { join = false } = {}) {
     if (epoch !== entry.stateEpoch || currentChat(entry) && conversationIdentity(selectedSession()) !== identity) return;
     entry.data = data;
     outcome = { status: "success", data };
-    entry.error = "";
+    clearError();
     for (const receipt of data.receipts || []) {
       if (receipt.requestId === entry.pending?.requestId ||
           (entry.receipt?.dispatchState !== "not_started" && receipt.requestId === entry.receipt?.requestId))
@@ -2871,6 +2948,7 @@ async function loadChatState(s, manual = false, { join = false } = {}) {
         conversationSyncNotice(s, data.stale ? "stale" : "");
       }
     }
+    noteLivePhase(s, data);
     scheduleChatPoll(s, entry);
   } catch (err) {
     readFailed = true;
@@ -2913,7 +2991,7 @@ async function sendChat(entry, message = null) {
   if (!currentChat(entry) || !chatSupported(entry) || entry.composing || entry.sending || entry.pending || entry.uploads ||
       (!text.trim() && !attachments.length)) return;
   if (new TextEncoder().encode(text).length > 32768 || attachments.length > 8) {
-    entry.error = "메시지는 32KiB, 첨부는 8개까지 보낼 수 있습니다. 초안은 유지됩니다.";
+    entry.error = entry.inputError = "메시지는 32KiB, 첨부는 8개까지 보낼 수 있습니다. 초안은 유지됩니다.";
     updateChatComposer(entry);
     return;
   }
@@ -3002,19 +3080,33 @@ const OUTBOX_MAX_MS = 15 * 60 * 1000;
 const OUTBOX_CLOCK_SLACK_MS = 30 * 1000;
 // Settled messages remembered per conversation (the server shows 80 at most).
 const OUTBOX_CLAIM_LIMIT = 80;
-const OUTBOX_ATTACHMENT_LINE = /^첨부 파일: /;
+const OUTBOX_ATTACHMENT_LINE = /^첨부 파일:/;
 const OUTBOX_ATTACHMENT_ONLY = new Set(["[이미지 첨부]", "[파일 첨부]"]);
+// Claude Code records a pasted image path as "[Image #1]" in the prompt (before,
+// after or instead of the words) and may show a long paste as
+// "[Pasted text #1 +12 lines]"; the board's own words never contain them.
+const CLAUDE_INPUT_TOKEN = /\[(?:Image|Pasted text|Pasted image) #\d+(?: \+\d+ lines?)?\]/g;
+const CLAUDE_IMAGE_TOKEN = /[ \t]*\[(?:Image|Pasted image) #\d+\][ \t]*/g;
+// A sent bubble waits this long for its own message before an answer recorded
+// after it settles it while the agent still works (a message sent mid-turn is
+// recorded when the agent takes it, after the rest of the answer in progress).
+const OUTBOX_REPLY_GRACE_MS = 60 * 1000;
 function outboxText(text) {
   return String(text || "").replace(/\s+/g, " ").trim();
 }
-// A transcript user message as a bubble compares it: the body without the
-// "첨부 파일: …" lines the server appends for attachments, and the possible
-// attachment counts (native attachments and those lines, which a transcript
-// may record once or twice for the same file).
+// A transcript user message as a bubble compares it: the body without Claude
+// Code's input tokens and the "첨부 파일: …" lines the server appends for
+// attachments, and the possible attachment counts (native attachments and
+// those lines, which a transcript may record once or twice for the same file).
 function outboxShape(message) {
-  const lines = String(message?.text || "").split("\n");
+  const lines = String(message?.text || "").replace(CLAUDE_INPUT_TOKEN, " ").split("\n");
   let marked = 0;
-  while (lines.length && OUTBOX_ATTACHMENT_LINE.test(lines[lines.length - 1].trim())) { lines.pop(); marked++; }
+  while (lines.length) {
+    const last = lines[lines.length - 1].trim();
+    if (last && !OUTBOX_ATTACHMENT_LINE.test(last)) break;
+    lines.pop();
+    if (last) marked++;
+  }
   const native = attachmentMetadata(message?.attachments).length;
   const truncated = message?.truncated === true;
   let body = outboxText(lines.join("\n"));
@@ -3052,11 +3144,12 @@ function outboxCut(item, messages) {
   return base;
 }
 // Whether a transcript user message (row: { message, index, shape, id, taken })
-// is the one this bubble sent (view: { codex, cut, known } of this read). A
-// message already there at the send never is. Codex names it by request id,
-// and nothing else settles a Codex bubble; otherwise it is a message after
-// those the bubble saw, with the same body and attachment count, and not
-// recorded before the send (the clock slack only narrows it further).
+// is the one this bubble sent (view: { codex, cut, known, loose } of this
+// read). A message already there at the send never is. Codex names it by
+// request id, and nothing else settles a Codex bubble; otherwise it is a
+// message after those the bubble saw, with the same body and attachment
+// count, and not recorded before the send (the clock slack only narrows it
+// further). A loose view (the Claude safety net) skips the body comparison.
 function outboxMatches(item, row, view = {}) {
   const known = view.known || null;
   if (row.id && known?.has(row.id)) return false;
@@ -3064,12 +3157,27 @@ function outboxMatches(item, row, view = {}) {
   if (typeof clientId === "string" && clientId) return clientId === item.requestId;
   if (view.codex || row.taken) return false;
   if (!(row.id && known) && row.index < (view.cut ?? (Number(item.base) || 0))) return false;
-  const ts = Number(row.message?.ts);
-  if (Number.isFinite(ts) && ts > 0 && ts * 1000 < item.at - OUTBOX_CLOCK_SLACK_MS) return false;
+  if (!outboxAfterSend(item, row.message)) return false;
+  if (view.loose) return true;
   const body = outboxText(item.text);
   // A cut long message keeps only its beginning (and loses the attachment lines).
   if (row.shape.truncated) return !!row.shape.body && body.startsWith(row.shape.body);
   return row.shape.body === body && row.shape.counts.has(item.attachments?.length || 0);
+}
+// Not recorded before the send (a message without a time may be after it).
+function outboxAfterSend(item, message) {
+  const ts = Number(message?.ts);
+  return !(Number.isFinite(ts) && ts > 0 && ts * 1000 < item.at - OUTBOX_CLOCK_SLACK_MS);
+}
+// A bubble the server took (accepted, or a later turn status): not one still
+// sending, unconfirmed, refused, or queued behind the running turn.
+function outboxDelivered(item) {
+  return item.state === "sent" && item.status !== "queued";
+}
+// A bubble whose message the agent has yet to show: it keeps "작업 중" after
+// it. A refused one, or one whose request already ended, does not.
+function outboxAwaitsAgent(item) {
+  return item.state !== "failed" && !item.settledAt;
 }
 // The same on /api/chat/state and /api/read: attachment details differ between
 // them (state names the board's files), the time and text do not.
@@ -3090,17 +3198,23 @@ function markOutbox(entry, requestId, receipt) {
   item.status = receipt?.status || "unknown";
   item.reason = item.state === "failed" ? String(receipt?.reason || "") : "";
   if (item.state === "failed" || ["completed", "interrupted"].includes(receipt?.status)) item.settledAt ||= Date.now();
+  // The server found the message in the conversation it read.
+  if (item.state !== "failed" && receipt?.readbackConfirmed === true) item.recorded = true;
 }
 // Drops bubbles whose message reached the transcript, settled ones the
 // transcript never showed, and anything older than OUTBOX_MAX_MS. Each
 // transcript message settles at most one bubble, in the order they were
 // sent, and stays claimed on later renders (from either read path) so it
-// never settles another.
-function settleOutbox(entry, messages) {
-  if (!entry) return;
+// never settles another. Every bubble is first matched by its own text; a
+// delivered Claude bubble left over then takes the next new user message
+// (Claude Code may record the words differently), or goes once the agent
+// answered after it (`working`: the conversation's agent still works).
+// Returns whether a bubble went.
+function settleOutbox(entry, messages, { working = false, claimed = null } = {}) {
+  if (!entry) return false;
   const now = Date.now();
   entry.outboxClaims = (entry.outboxClaims || []).filter((claim) => now - claim.at < OUTBOX_MAX_MS);
-  if (!entry.outbox?.length) return;
+  if (!entry.outbox?.length) return false;
   const list = Array.isArray(messages) ? messages : [];
   const rows = [];
   list.forEach((message, index) => {
@@ -3113,22 +3227,53 @@ function settleOutbox(entry, messages) {
   }
   const codex = entry.source?.agent === "codex";
   const settled = new Set();
+  const views = new Map();
+  const claim = (item, row, view) => {
+    row.taken = true;
+    settled.add(item);
+    claimed?.add(row.message);
+    entry.outboxClaims.push({ id: row.id, key: outboxClaimKey(row), base: view.cut, at: now });
+  };
   for (const item of entry.outbox) {
     if (item.state === "failed") continue;
     const view = { codex, cut: outboxCut(item, list), known: Array.isArray(item.known) ? new Set(item.known) : null };
+    views.set(item, view);
     const row = rows.find((value) => outboxMatches(item, value, view));
-    if (!row) continue;
-    row.taken = true;
-    settled.add(item);
-    entry.outboxClaims.push({ id: row.id, key: outboxClaimKey(row), base: view.cut, at: now });
+    if (row) claim(item, row, view);
+  }
+  for (const item of entry.outbox) {
+    if (settled.has(item) || item.state === "failed") continue;
+    const view = { ...views.get(item), loose: true };
+    if (!codex && outboxDelivered(item)) {
+      const row = rows.find((value) => outboxMatches(item, value, view));
+      if (row) { claim(item, row, view); continue; }
+    }
+    // The server read the conversation and found the message there.
+    if (item.recorded) { settled.add(item); continue; }
+    if (!codex && outboxDelivered(item)) {
+      // An answer recorded after the send itself (no clock slack: an answer the
+      // bubble's view of the conversation had not caught yet is no reply).
+      const answered = list.slice(view.cut).some((message) => {
+        const ts = Number(message?.ts);
+        return message?.role === "assistant" && !(Number.isFinite(ts) && ts > 0 && (ts + 1) * 1000 <= item.at);
+      });
+      if (answered && (!working || now - item.at > OUTBOX_REPLY_GRACE_MS)) settled.add(item);
+    }
   }
   if (entry.outboxClaims.length > OUTBOX_CLAIM_LIMIT)
     entry.outboxClaims.splice(0, entry.outboxClaims.length - OUTBOX_CLAIM_LIMIT);
+  const before = entry.outbox.length;
   entry.outbox = entry.outbox.filter((item) => {
-    if (settled.has(item)) return false;
-    if (item.state !== "failed" && item.settledAt && now - item.settledAt > OUTBOX_SETTLED_MS) return false;
-    return now - item.at < OUTBOX_MAX_MS;
+    const keep = !settled.has(item) &&
+      !(item.state !== "failed" && item.settledAt && now - item.settledAt > OUTBOX_SETTLED_MS) &&
+      now - item.at < OUTBOX_MAX_MS;
+    // The composer's "접수했습니다" note was about this message; the conversation
+    // now says the rest.
+    if (!keep && item.state !== "failed" && entry.receipt?.requestId === item.requestId)
+      entry.settledRequestId = item.requestId;
+    return keep;
   });
+  return entry.outbox.length !== before;
 }
 // Resends exactly what the failed bubble showed. Another draft in the editor
 // stays there, unsent; an empty editor gets the message back so a second
@@ -3260,7 +3405,7 @@ async function uploadChatFiles(entry, files) {
   if (networkOffline()) { updateChatComposer(entry); return; }
   if (!currentChat(entry) || !chatAttachmentsSupported(entry) || entry.sending || entry.pending || entry.uploads || !files.length) return;
   if (entry.attachments.length + files.length > 8) {
-    entry.error = "한 메시지에는 첨부 파일을 8개까지 추가할 수 있습니다.";
+    entry.error = entry.inputError = "한 메시지에는 첨부 파일을 8개까지 추가할 수 있습니다.";
     updateChatComposer(entry);
     return;
   }
@@ -3313,10 +3458,10 @@ async function uploadChatFiles(entry, files) {
       } catch (err) {
         if (authEpoch !== state.authEpoch || err.staleAuth) { entry.uploads = 0; return; }
         unqueue(item);
-        entry.error = err.message;
+        entry.error = entry.inputError = err.message;
         if (networkOffline()) {
           entry.notice = `아직 올리지 못한 파일 ${entry.uploads}개가 있습니다. 다시 첨부해 주세요.`;
-          entry.error = `${err.message} ${entry.notice}`;
+          entry.error = entry.inputError = `${err.message} ${entry.notice}`;
           break;
         }
       } finally { entry.uploads = Math.max(0, entry.uploads - 1); updateChatComposer(entry); }
@@ -3630,6 +3775,11 @@ function userMessageParts(message) {
     else chips.push(chip);
   }
   let body = names.length ? lines.join("\n").replace(/\s+$/, "") : text;
+  // Claude Code's "[Image #1]" stands for an image the chips already show.
+  if (chips.some((file) => file.kind === "image")) {
+    const words = body.replace(CLAUDE_IMAGE_TOKEN, " ");
+    if (words !== body) body = words.trim();
+  }
   if (chips.length && OUTBOX_ATTACHMENT_ONLY.has(body.trim())) body = "";
   return { body, attachments: chips };
 }
@@ -3651,15 +3801,29 @@ function renderMessages(s, messages, error = "", fresh = false) {
   const previousKeys = new Set(previous.map((item) => item.key));
   const oldWarningHeight = list.conversationError && [...list.children].includes(list.conversationError)
     ? list.conversationError.offsetHeight || 0 : 0;
+  const keys = messages.map((message) => JSON.stringify([message.role, message.text, message.ts || null,
+    attachmentMetadata(message.attachments), message.truncated === true]));
+  // The server's 80-row window drops whole rows at its start: the rows on
+  // screen are first lined up with the new ones where they overlap most, so
+  // two rows with the same key (the same first command of two Codex turns,
+  // which have no time) each keep their own row and tool group.
+  let overlap = 0;
+  let shift = 0;
+  for (let start = 0; start < previous.length && previous.length - start > overlap; start++) {
+    let length = 0;
+    while (start + length < previous.length && length < keys.length && previous[start + length].key === keys[length]) length++;
+    if (length > overlap) { overlap = length; shift = start; }
+  }
+  const lined = new Set(previous.slice(shift, shift + overlap));
   const available = new Map();
   for (const item of previous) {
+    if (lined.has(item)) continue;
     if (!available.has(item.key)) available.set(item.key, []);
     available.get(item.key).push(item);
   }
-  const rows = messages.map((message) => {
-    const attachments = attachmentMetadata(message.attachments);
-    const key = JSON.stringify([message.role, message.text, message.ts || null, attachments, message.truncated === true]);
-    const retained = available.get(key)?.shift();
+  const rows = messages.map((message, index) => {
+    const key = keys[index];
+    const retained = index < overlap ? previous[shift + index] : available.get(key)?.shift();
     if (retained) return retained;
     const role = ["user", "assistant", "tool", "system"].includes(message.role) ? message.role : "system";
     // A tool record is one line of its group (toolGroupNode), not a row of its own.
@@ -3713,17 +3877,21 @@ function renderMessages(s, messages, error = "", fresh = false) {
   // working indicator, always after the transcript.
   let tail = [];
   let working = false;
+  // Transcript messages that settled one of this board's bubbles in this render.
+  const claimed = new Set();
   if (entry) {
-    settleOutbox(entry, messages);
-    tail = outboxRows(list, entry);
     const live = entry.data && chatKey(entry.data.route || {}) === source ? entry.data : null;
     // A Claude row without an id is never read; its listed phase still says it works.
     const phaseWorking = live ? live.phase === "working" : claudeWithoutId(s) && s.phase === "working";
+    // The composer's receipt note follows a bubble that went (renderMessages
+    // also runs for /api/read, which no composer update follows).
+    if (settleOutbox(entry, messages, { working: phaseWorking, claimed })) updateChatComposer(entry);
+    tail = outboxRows(list, entry);
     // The phase stays "working" while a background agent still runs tools after
     // its answer, so the row shows only while the conversation waits on the
-    // agent: it ends with a message of the user's (one sent from here included),
-    // with tool records, or nothing has been read yet.
-    const lastRole = tail.length ? "user" : rows.at(-1)?.role;
+    // agent: it ends with a message of the user's (one sent from here and not
+    // refused or ended included), with tool records, or nothing has been read yet.
+    const lastRole = (entry.outbox || []).some(outboxAwaitsAgent) ? "user" : rows.at(-1)?.role;
     working = phaseWorking && (!lastRole || lastRole === "user" || lastRole === "tool");
     // Only an exact start (Codex's running turn) is counted; Claude's newest
     // prompt time is an approximation and shows no time.
@@ -3791,9 +3959,24 @@ function renderMessages(s, messages, error = "", fresh = false) {
   else setMessagesScroll(list, scroll + warningHeight - oldWarningHeight);
   if (working) tickWorking();
   else stopWorkingClock();
-  // While reading back, count what arrived below instead of jumping to it.
+  // While reading back, count what arrived below instead of jumping to it. A
+  // row that only got its time (Codex's final answer takes its turn's end) is
+  // not new, nor this board's own message that took the place of its bubble.
   if (!stick && previous.length) {
-    const added = rows.filter((item) => !previousKeys.has(item.key) && item.message.role !== "tool").length;
+    const before = new Set(previous);
+    const loose = (item) => JSON.stringify([item.message.role, item.message.text, attachmentMetadata(item.message.attachments)]);
+    const gone = new Map();
+    for (const item of previous) {
+      if (rows.includes(item)) continue;
+      gone.set(loose(item), (gone.get(loose(item)) || 0) + 1);
+    }
+    let added = 0;
+    for (const item of rows) {
+      if (before.has(item) || previousKeys.has(item.key)) continue;
+      const replaced = gone.get(loose(item)) || 0;
+      if (replaced) { gone.set(loose(item), replaced - 1); continue; }
+      if (item.message.role !== "tool" && !claimed.has(item.message)) added++;
+    }
     if (added) list.unread = (list.unread || 0) + added;
   } else if (stick) list.unread = 0;
   renderJump();
@@ -5362,7 +5545,7 @@ function terminalsAnnounced(version, { hello = false } = {}) {
   if (!Number.isInteger(version)) return;
   state.eventsTerminalsVersion = Math.max(version, state.eventsTerminalsVersion ?? version);
   if (Number.isInteger(state.terminalsVersion) && version <= state.terminalsVersion) return;
-  if (hello && !Number.isInteger(state.terminalsVersion) && !state.terminalsReadAt) return;
+  if (hello && !Number.isInteger(state.terminalsVersion) && !state.terminalsReadAt && !state.terminalsError) return;
   if (state.terminalsEventTimer) return;
   const authEpoch = state.authEpoch;
   state.terminalsEventTimer = setTimeout(() => {
@@ -5764,8 +5947,8 @@ async function poll(refresh = false, { capabilities = true } = {}) {
     if (Date.now() - (state.usageAt || 0) > 55000) loadUsage();
     // Safety net for missed (or unavailable) terminal announcements: a regular
     // read also reads a terminal list older than a minute. The first list is
-    // read by login and startup themselves.
-    if (capabilities && state.terminalsReadAt && Date.now() - state.terminalsReadAt >= POLL_MS)
+    // read by login and startup themselves; when that read failed, this tries again.
+    if (capabilities && (state.terminalsReadAt ? Date.now() - state.terminalsReadAt >= POLL_MS : !!state.terminalsError))
       refreshTerminals(authEpoch);
     schedule();
     syncEvents();
@@ -5957,6 +6140,7 @@ function showLogin() {
   state.swipeOpen = null;
   state.pollFailures = 0;
   state.nativeSessions.clear();
+  state.livePhases.clear();
   state.accountFilterRoutes = null;
   state.inputEpoch++;
   state.authenticated = false;

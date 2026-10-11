@@ -313,11 +313,39 @@ def native_attachments(blocks):
     return out[:32]
 
 
+def queued_prompt(entry):
+    """The content of input the user typed while Claude was working, or None.
+
+    Claude Code records such input (a message the board pasted mid-turn included) as a
+    queued_command attachment instead of a user line; a notification queued the same way
+    is not the user's words."""
+    attachment = entry.get("attachment")
+    if (not isinstance(attachment, dict) or attachment.get("type") != "queued_command"
+            or attachment.get("commandMode") not in (None, "prompt")):
+        return None
+    origin = attachment.get("origin")
+    if not isinstance(origin, dict) or origin.get("kind") != "human":
+        return None
+    prompt = attachment.get("prompt")
+    if isinstance(prompt, str):
+        return prompt
+    return prompt if isinstance(prompt, list) else None
+
+
 def claude_messages(entries):
     out = []
+    # Queued input since the last answer; an interrupt hands it back to the input line, and
+    # Claude Code then records it once more as a plain prompt, which is shown instead.
+    queued = []
+    dropped = set()
     for entry in entries:
         kind = entry.get("type")
-        if kind not in ("user", "assistant") or entry.get("isMeta") or entry.get("isSidechain"):
+        content = queued_prompt(entry) if kind == "attachment" else None
+        if content is not None:
+            kind = "user"
+        elif kind not in ("user", "assistant"):
+            continue
+        if entry.get("isMeta") or entry.get("isSidechain"):
             continue
         ts = to_epoch(entry.get("timestamp"))
         if entry.get("isCompactSummary"):
@@ -325,11 +353,13 @@ def claude_messages(entries):
             # recorded as a user line; the board shows one note instead of its text.
             out.append({"role": "system", "text": "이전 대화 요약으로 이어짐", "ts": ts})
             continue
-        message = entry.get("message")
-        content = message.get("content") if isinstance(message, dict) else None
+        if content is None:
+            message = entry.get("message")
+            content = message.get("content") if isinstance(message, dict) else None
         blocks = [{"type": "text", "text": content}] if isinstance(content, str) else content
         attached = native_attachments(blocks) if kind == "user" else []
         attachment_row = None
+        start = len(out)
         for block in blocks if isinstance(blocks, list) else []:
             if not isinstance(block, dict):
                 continue
@@ -349,6 +379,19 @@ def claude_messages(entries):
                 attachment_row = {"role": "user", "text": "[이미지 첨부]" if all(a["kind"] == "image" for a in attached) else "[파일 첨부]", "ts": ts}
                 out.append(attachment_row)
             attachment_row["attachments"] = attached
+        if kind == "assistant":
+            queued = []
+        elif attachment_row is not None:
+            words = " ".join(str(attachment_row["text"]).split())
+            if entry.get("type") == "attachment":
+                queued.append((words, out[start:]))
+            else:
+                again = next((item for item in queued if item[0] == words), None)
+                if again is not None:
+                    queued.remove(again)
+                    dropped.update(id(row) for row in again[1])
+    if dropped:
+        out = [row for row in out if id(row) not in dropped]
     return out[-MESSAGE_LIMIT:]
 
 

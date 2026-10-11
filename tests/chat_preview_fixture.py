@@ -131,6 +131,36 @@ class FakeNative:
                         self.messages[identifier].append({'role': 'tool', 'text': f'$ npm test -- --shard={count}',
                                                           'ts': None, 'toolKind': 'command'})
 
+    def claude_paste(self, identifier, text):
+        """--claude-paste-demo: what the board pasted, recorded the way Claude Code records
+        it: each image path becomes "[Image #N]" before the words (its "첨부 파일:" line goes)
+        and an image block; other files keep their line. Two answers follow while the
+        session stays "working", like a background agent that keeps running tools."""
+        lines = text.split('\n')
+        images, files = 0, []
+        while lines and lines[-1].startswith('첨부 파일: '):
+            path = lines.pop()[len('첨부 파일: '):]
+            if path.lower().endswith(('.png', '.jpg', '.jpeg', '.gif', '.webp')):
+                images += 1
+            else:
+                files.insert(0, '첨부 파일: ' + path)
+        words = '\n'.join(lines + files)
+        row = {'role': 'user', 'text': ''.join('[Image #%d]' % (index + 1) for index in range(images)) + words,
+               'ts': time.time()}
+        if images:
+            row['attachments'] = [{'id': None, 'name': '이미지', 'type': 'image/*', 'size': None,
+                                   'kind': 'image', 'source': 'native'}] * images
+        with self.lock:
+            self.messages[identifier].append(row)
+        for delay, answer in ((3, '보내 주신 내용을 확인했습니다.'), (6, '이어서 정리했습니다. 도구 실행은 계속됩니다.')):
+            timer = threading.Timer(delay, self.answer, args=(identifier, answer))
+            timer.daemon = True
+            timer.start()
+
+    def answer(self, identifier, text):
+        with self.lock:
+            self.messages[identifier].append({'role': 'assistant', 'text': text, 'ts': time.time()})
+
     def finish(self, identifier, request_id, text):
         with self.lock:
             self.messages[identifier].append({'role': 'assistant', 'text': '검증 응답: ' + text, 'ts': time.time()})
@@ -215,6 +245,9 @@ def main(argv=None):
                         help='보드 터미널을 방향키·Enter로 답하는 번호 메뉴로 실행하고 Claude 백그라운드 세션을 추가')
     parser.add_argument('--live-tools', type=float, metavar='SECONDS',
                         help='작업 중인 세션에 이 간격(초)마다 도구 실행 기록을 하나씩 추가')
+    parser.add_argument('--claude-paste-demo', action='store_true',
+                        help='작업 중인 Claude 백그라운드 세션을 추가하고, 보드 터미널에 보낸 메시지를 '
+                             'Claude Code처럼("[Image #1]본문") 대화 기록에 남긴 뒤 답변 두 개를 추가')
     args = parser.parse_args(argv)
     if not 0 <= args.port <= 65535:
         parser.error('포트는 0~65535 범위여야 합니다.')
@@ -241,6 +274,9 @@ def main(argv=None):
     if args.menu_demo:
         # No board terminal until "질문 불러오기" attaches it (promptOpenable).
         sessions.append(('claude', '.claude', 'Claude 백그라운드 · 질문 응답 검증', 'needs_input', 'background'))
+    if args.claude_paste_demo:
+        # Sending needs a board terminal the user opens from the composer ("터미널 열기").
+        sessions.append(('claude', '.claude', 'Claude 백그라운드 · 이미지 전송 기록 검증', 'working', 'background'))
     for index, (agent, home, title, phase, kind) in enumerate(sessions, 1):
         cwd = directory / ('workspace-' + str(index))
         cwd.mkdir(exist_ok=True, mode=0o700)
@@ -278,7 +314,18 @@ def main(argv=None):
         return result
     flow.profiles = profiles
     flow.transfers.rpc = fake.rpc
-    echo = "import sys\nprint('검증용 실제 PTY · 모델 호출 없음',flush=True)\nfor line in sys.stdin:\n print('받은 입력: '+line.rstrip(),flush=True)\n"
+    if args.claude_paste_demo:
+        paste = manager.paste
+
+        def recorded_paste(terminal_id, text, submit=True):
+            result = paste(terminal_id, text, submit)
+            terminal = next((item for item in manager.list() if item.get('id') == terminal_id), {})
+            native = terminal.get('nativeSource') or terminal.get('metadata', {}).get('nativeSource') or {}
+            if native.get('agent') == 'claude' and native.get('id') in fake.rows:
+                fake.claude_paste(native['id'], text)
+            return result
+        manager.paste = recorded_paste
+    echo ="import sys\nprint('검증용 실제 PTY · 모델 호출 없음',flush=True)\nfor line in sys.stdin:\n print('받은 입력: '+line.rstrip(),flush=True)\n"
     program = MENU_DEMO if args.menu_demo else echo
     launch.build_launch = lambda *a, **kw: {'argv': [sys.executable, '-u', '-c', program], 'cwd': str(directory), 'env': {'PATH': os.environ['PATH'], 'LANG': 'en_US.UTF-8'}}
     httpd = server.make_server('127.0.0.1', args.port, board, token, terminals=manager, workflow=flow,

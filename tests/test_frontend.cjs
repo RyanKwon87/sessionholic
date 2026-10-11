@@ -1706,11 +1706,12 @@ function wireTree(c, root, parent = null) {
 
 test('same-session metadata changes preserve the active chat DOM, Korean composition, draft and transcript position', async () => {
   let message = '기존 대화';
+  let phase = 'idle';
   const requests = [];
   const c = client(async (url, options) => {
     requests.push(url);
     return { ok: true, status: 200, json: async () => url === '/api/chat/state'
-      ? { capability: { supported: true }, phase: 'idle', route: JSON.parse(options.body).source }
+      ? { capability: { supported: true }, phase, route: JSON.parse(options.body).source }
       : { messages: [{ role: 'assistant', text: message }] } };
   }, noChatTimers);
   const { s, entry } = selectChat(c);
@@ -1725,8 +1726,8 @@ test('same-session metadata changes preserve the active chat DOM, Korean composi
   c.context.document.activeElement = input;
   const messages = c.get('messages');
   messages.scrollHeight = 500; messages.clientHeight = 120; messages.scrollTop = 35;
-  message = '갱신된 대화';
-  const updated = { ...s, title: '갱신된 제목', project: '새 프로젝트', phase: 'working',
+  message = '갱신된 대화'; phase = 'working';
+  const updated ={ ...s, title: '갱신된 제목', project: '새 프로젝트', phase: 'working',
     account: '실험 환경 · 새 표시', stale: true, hostLabel: 'Workstation', updatedAt: s.updatedAt + 1 };
   c.state.snapshot.hosts[0].data.codex[0] = updated;
   c.refreshDetail(updated);
@@ -1950,6 +1951,88 @@ test('online recovery reads one selected state and snapshot without resending un
   assert.ok(after.every((r) => /\/api\/terminal\/visible-terminal\/events\?/.test(r.url) && (r.options?.method || 'GET') === 'GET'));
   assert.equal(c.state.connected, false);
   assert.match(c.get('terminal-status').textContent, /다시 연결/);
+});
+
+test('the open conversation\'s own phase shows on its header, card and counts until the list\'s phase changes', async () => {
+  const requests = [];
+  const c = client(async (url, options) => {
+    requests.push(url);
+    return { ok: true, status: 200, json: async () => ({ route: JSON.parse(options.body).source, capability: { supported: true },
+      phase: 'idle', receipts: [], messages: [] }) };
+  }, noChatTimers);
+  const { s } = selectChat(c);
+  Object.assign(s, { phase: 'working', title: '목록이 늦은 작업', updatedAt: Date.now() / 1000 });
+  c.state.snapshot.hosts[0].data.codex[0] = s;
+  c.refreshDetail(c.allSessions()[0]);
+  wireTree(c, c.get('detail'));
+  assert.match(textOf(c.get('detail').querySelector('.detail-meta')), /작업 중/, 'the list says working');
+  await settle();
+  // The conversation's read (newer than the list) says the turn ended.
+  assert.equal(c.allSessions()[0].phase, 'idle');
+  assert.match(textOf(c.get('detail').querySelector('.detail-meta')), /열림/);
+  assert.equal(requests.filter((url) => url === '/api/chat/state').length, 1, 'shown without reading the conversation again');
+  // The list catches up, then moves on: its own phase stands again.
+  c.state.snapshot.hosts[0].data.codex[0] = { ...s, phase: 'idle' };
+  assert.equal(c.allSessions()[0].phase, 'idle');
+  assert.equal(c.state.livePhases.size, 0);
+  c.state.snapshot.hosts[0].data.codex[0] = { ...s, phase: 'needs_input' };
+  assert.equal(c.allSessions()[0].phase, 'needs_input');
+});
+
+test('a terminal list whose first read failed is read again by the next regular read', async () => {
+  const requests = []; let fail = true; let snapshot;
+  const c = client(async (url) => {
+    requests.push(url);
+    if (url === '/api/terminals') {
+      if (fail) return { ok: false, status: 502, json: async () => ({ error: '일시적인 오류' }) };
+      return { ok: true, status: 200, json: async () => ({ terminals: [], version: 3 }) };
+    }
+    return { ok: true, status: 200, json: async () => url === '/api/snapshot' ? snapshot : {} };
+  }, noChatTimers);
+  selectChat(c);
+  snapshot = c.state.snapshot;
+  c.state.capabilities = {}; c.state.capabilitiesRevision = c.capabilitiesRevision(snapshot);
+  await c.refreshTerminals();
+  assert.ok(c.state.terminalsError);
+  assert.equal(c.state.terminalsReadAt, 0);
+  fail = false;
+  await c.poll(); await settle();
+  assert.equal(requests.filter((url) => url === '/api/terminals').length, 2);
+  assert.equal(c.state.terminalsError, '');
+  assert.ok(c.state.terminalsReadAt > 0);
+  await c.poll(); await settle();
+  assert.equal(requests.filter((url) => url === '/api/terminals').length, 2, 'then once a minute as before');
+});
+
+test('a conversation that left the list stops being followed, and a phone goes back to the list instead of a screen without a way back', async () => {
+  const requests = [];
+  let snapshot;
+  const c = client(async (url, options) => {
+    requests.push(url);
+    return { ok: true, status: 200, json: async () => url === '/api/snapshot' ? snapshot : {} };
+  }, noChatTimers);
+  c.context.window.matchMedia = (query) => ({ matches: query === '(max-width: 700px)' });
+  const { s } = selectChat(c);
+  c.state.detailShown = true;
+  c.state.capabilities = {};
+  snapshot = { hosts: [{ name: 'workstation', label: 'Workstation', ok: true, data: { codex: [] } }] };
+  c.state.capabilitiesRevision = c.capabilitiesRevision(snapshot);
+  const run = c.state.chatPollRun;
+  await c.poll();
+  assert.equal(c.state.selected, null);
+  assert.ok(c.state.chatPollRun > run, 'its polling stopped');
+  assert.equal(c.state.detailShown, false, 'the phone shows the list again');
+  assert.match(c.get('toast').textContent, /더 이상 찾을 수 없어 목록으로/);
+  // A wide screen keeps the list beside it and says so in the detail pane.
+  const d = client(async (url) => ({ ok: true, status: 200, json: async () => url === '/api/snapshot' ? snapshot : {} }), noChatTimers);
+  selectChat(d);
+  d.state.detailShown = true;
+  d.state.capabilities = {};
+  d.state.capabilitiesRevision = d.capabilitiesRevision(snapshot);
+  await d.poll();
+  assert.equal(d.state.selected, null);
+  assert.match(textOf(d.get('detail')), /더 이상 찾을 수 없습니다/);
+  assert.ok(s);
 });
 
 test('a state read begun before sending cannot roll back new chat state and schedules one reconciliation read', async () => {
@@ -3303,6 +3386,50 @@ test('messages arriving while reading back are counted on the jump button and cl
   assert.equal(jump.textContent, '↓');
 });
 
+test('the new-message count skips a row that only got its time and this board\'s own message that replaced its bubble', () => {
+  const c = client(undefined, noChatTimers);
+  const { s, entry } = selectChat(c, { agent: 'claude', home: '.claude', id: 'claude-session' });
+  const list = c.get('messages');
+  const now = Date.now(); const ts = Math.floor(now / 1000);
+  const shown = [{ role: 'user', text: '요청', ts: ts - 60 }, { role: 'assistant', text: '중간 보고' }];
+  c.renderMessages(s, shown, '', true);
+  Object.assign(list, { scrollHeight: 3000, clientHeight: 600, scrollTop: 100 });
+  const untimed = { role: 'assistant', text: '최종 답' };
+  c.renderMessages(s, [...shown, untimed]);
+  assert.equal(list.unread, 1);
+  // The turn ended: the same answer now carries the turn's end time.
+  c.renderMessages(s, [...shown, { ...untimed, ts: ts - 1 }]);
+  assert.equal(list.unread, 1, 'the same answer, counted once');
+  // A message sent from here reaches the transcript while the reader is above.
+  const seen = [...shown, { ...untimed, ts: ts - 1 }];
+  entry.outbox = [{ requestId: 'req-own-0001', text: '내 질문', attachments: [], state: 'sent', status: 'accepted', reason: '',
+    at: now, ...c.outboxOrigin(seen) }];
+  c.renderMessages(s, [...seen, { role: 'user', text: '내 질문', ts: ts + 1 }]);
+  assert.equal(entry.outbox.length, 0);
+  assert.equal(list.unread, 1, 'its own message is no news');
+  c.renderMessages(s, [...seen, { role: 'user', text: '내 질문', ts: ts + 1 }, { role: 'assistant', text: '답', ts: ts + 5 }]);
+  assert.equal(list.unread, 2, 'the answer to it is');
+});
+
+test('two turns that start with the same command keep their own tool groups when the window drops the first', () => {
+  const c = client(undefined, noChatTimers); const { s } = selectChat(c);
+  const list = c.get('messages');
+  // Codex tool records carry no time: both turns' first records have the same key.
+  const turn = (n) => [{ role: 'user', text: `요청 ${n}`, ts: 1000 + n * 100 },
+    { role: 'tool', text: '$ npm test', toolKind: 'command' }, { role: 'tool', text: `파일 수정 · ${n}.py`, toolKind: 'edit' },
+    { role: 'assistant', text: `답 ${n}`, ts: 1050 + n * 100 }];
+  const groups = () => list.children.filter((row) => /tool-group/.test(row.className));
+  c.renderMessages(s, [...turn(1), ...turn(2), ...turn(3)]);
+  const [first, second, third] = groups();
+  first.toolToggle.events.click();
+  third.toolToggle.events.click();
+  assert.deepEqual(groups().map((group) => group.open), [true, false, true]);
+  c.renderMessages(s, [...turn(2), ...turn(3)]);
+  assert.deepEqual(groups(), [second, third], 'each turn keeps its own group');
+  assert.deepEqual(groups().map((group) => group.open), [false, true]);
+  assert.deepEqual(second.toolList.children.map((item) => textOf(item).trim()), ['$ npm test', '파일 수정 · 2.py']);
+});
+
 test('pull distance is elastic and the large title collapses into the bar on phones only', () => {
   const c = client(undefined, noChatTimers);
   assert.equal(c.pullDistance(0), 0);
@@ -3415,6 +3542,78 @@ test('menus the web cannot drive stay readable with disabled options, and a wait
   entry.data = { ...entry.data, promptOpenable: false, phase: 'working' };
   c.renderPrompt(s, entry.data);
   assert.equal(c.get('chat-prompt').hidden, true);
+});
+
+test('a failed "질문 불러오기" says why on its card, and the note never follows to the next question', async () => {
+  const c = client(async (url, opts) => {
+    if (url === '/api/chat/prompt') return { ok: false, status: 409, json: async () => ({ error: '질문 화면을 불러오지 못했습니다.' }) };
+    return { ok: true, status: 200, json: async () => ({ route: JSON.parse(opts.body).source, capability: { supported: true },
+      phase: 'needs_input', prompt: null, promptOpenable: true, messages: [] }) };
+  }, noChatTimers);
+  const { s, entry } = selectChat(c);
+  c.drawDetail(s);
+  entry.data = { ...entry.data, phase: 'needs_input', prompt: null, promptOpenable: true };
+  c.renderPrompt(s, entry.data);
+  await findClass(c.get('chat-prompt'), 'primary')[0].events.click();
+  await settle();
+  assert.match(textOf(c.get('chat-prompt')), /질문 화면을 불러오지 못했습니다/);
+  // The question shows up later (the terminal was opened by hand): a fresh card.
+  entry.data = { ...entry.data, prompt: { agent: 'codex', fingerprint: 'd'.repeat(64), current: 1, multi: false, question: '계속할까요?',
+    options: [{ number: 1, label: 'Yes', detail: '' }, { number: 2, label: 'No', detail: '' }] } };
+  c.renderPrompt(s, entry.data);
+  assert.match(textOf(c.get('chat-prompt')), /계속할까요/);
+  assert.doesNotMatch(textOf(c.get('chat-prompt')), /불러오지 못했습니다/);
+});
+
+test('a state read begun before an answer does not bring the answered question back', async () => {
+  const releases = [];
+  const prompt = { agent: 'codex', fingerprint: 'c'.repeat(64), current: 1, multi: false, question: '계속할까요?',
+    options: [{ number: 1, label: 'Yes', detail: '' }, { number: 2, label: 'No', detail: '' }] };
+  const c = client(async (url, opts) => {
+    if (url === '/api/chat/prompt') return { ok: true, status: 200, json: async () => ({ status: 'answered', prompt: null }) };
+    const route = JSON.parse(opts.body).source;
+    // The first read saw the question; any later one does not (both wait to be released).
+    const answer = releases.length ? { route, capability: { supported: true }, phase: 'working', prompt: null, messages: [] }
+      : { route, capability: { supported: true }, phase: 'needs_input', prompt, messages: [] };
+    return await new Promise((resolve) => releases.push(() => resolve({ ok: true, status: 200, json: async () => answer })));
+  }, noChatTimers);
+  const { s, entry } = selectChat(c);
+  c.drawDetail(s);
+  entry.data = { ...entry.data, phase: 'needs_input', prompt };
+  c.renderPrompt(s, entry.data);
+  const stale = c.loadChatState(s, false);
+  await settle();
+  findClass(c.get('chat-prompt'), 'chat-prompt-option')[0].events.click();
+  await findClass(c.get('chat-prompt'), 'primary')[0].events.click();
+  await settle();
+  assert.equal(c.get('chat-prompt').hidden, true, 'answered');
+  releases[0]();
+  await stale; await settle();
+  assert.equal(c.get('chat-prompt').hidden, true, 'the read from before the answer is not drawn');
+  assert.equal(releases.length, 2, 'a read after the answer follows');
+  releases[1](); await settle();
+  assert.equal(c.get('chat-prompt').hidden, true);
+});
+
+test('an input error (a file too large) stays until the user acts again; a state read does not wipe it', async () => {
+  const c = client(async (url, opts) => ({ ok: true, status: 200, json: async () => ({ route: JSON.parse(opts.body).source,
+    capability: { supported: true }, phase: 'working', receipts: [], messages: [] }) }), noChatTimers);
+  const { s, entry } = selectChat(c);
+  wireTree(c, c.buildChatComposer(s)); await settle();
+  entry.data = { ...entry.data, phase: 'working', maxAttachmentBytes: 10 };
+  await c.uploadChatFiles(entry, [{ name: 'big.png', size: 100, type: 'image/png' }]);
+  const status = () => c.get('chat-status').textContent;
+  assert.match(status(), /big\.png.*최대/);
+  await c.loadChatState(s, false);
+  assert.match(status(), /big\.png.*최대/, 'an automatic read keeps it');
+  await c.loadChatState(s, true);
+  assert.match(status(), /big\.png.*최대/, 'so does a detail refresh');
+  const input = c.get('chat-input'); input.value = '다른 파일로 보낼게요'; input.events.input();
+  assert.doesNotMatch(status(), /최대/, 'editing the draft answers it');
+  // A read's own error still goes with the next successful read.
+  entry.error = '상태를 확인하지 못했습니다. 상태 다시 확인을 눌러 주세요.';
+  await c.loadChatState(s, false);
+  assert.doesNotMatch(status(), /확인하지 못했습니다/);
 });
 
 test('the usage strip shows remaining limits per provider and hides on boards without the endpoint', async () => {
@@ -4353,8 +4552,11 @@ test('one transcript message settles one bubble, matched by its whole text and a
   c.renderMessages(s, [earlier, first, { role: 'user', text: '  다시   확인해 주세요 ', ts: ts + 1 }]);
   assert.deepEqual(pending(), []);
   // Neither a longer message containing the text, another attachment count,
-  // nor the same message from before the send settles a bubble.
-  entry.outbox = [bubble('req-third-0003', '확인', { attachments: [{ id: 'f', name: 'a.png', type: 'image/png', kind: 'image' }] })];
+  // nor the same message from before the send settles a bubble by its text.
+  // (An unconfirmed bubble: a delivered Claude bubble would take the next new
+  // message through the safety net, tested on its own below.)
+  entry.outbox = [bubble('req-third-0003', '확인', { state: 'uncertain', status: 'unknown',
+    attachments: [{ id: 'f', name: 'a.png', type: 'image/png', kind: 'image' }] })];
   const others = [{ role: 'user', text: '확인', ts: ts - 120, attachments: [{ kind: 'image' }] },
     { role: 'user', text: '다시 확인할까요', ts: ts + 2, attachments: [{ kind: 'image' }] },
     { role: 'user', text: '확인', ts: ts + 2 }];
@@ -4536,6 +4738,189 @@ test('one new message settles one bubble with or without row ids, after the last
   assert.deepEqual(claudePending(), []);
   assert.equal(claude.outboxClaims.length, 80);
   assert.equal(claude.outboxClaims.at(-1).key, JSON.stringify([ts + 3, '끝']));
+});
+
+test('a Claude image message recorded as "[Image #1]본문" settles its bubble, so neither "작업 중" nor the receipt note stays', async () => {
+  const now = Math.floor(Date.now() / 1000);
+  const sends = []; let stage = 'before';
+  const native = { id: null, name: '이미지', type: 'image/*', size: null, kind: 'image', source: 'native' };
+  const c = client(async (url, options) => {
+    const body = JSON.parse(options.body);
+    if (url === '/api/chat/send') {
+      sends.push(body);
+      return { ok: true, status: 200, json: async () => ({ status: 'accepted', receipt: { confirmed: true, acknowledged: true,
+        attachments: [{ id: 'file-a', name: 'shot.png', type: 'image/png', size: 10, kind: 'image', source: 'sessionholic' }] } }) };
+    }
+    const messages = [{ role: 'assistant', text: '이전 답변', ts: now - 60 }];
+    // Claude Code turned the pasted "첨부 파일: <경로>" line into an image and "[Image #1]".
+    if (stage !== 'before') messages.push({ role: 'user', text: '[Image #1]코덱스로 이어서 하려는데 여기서 막힘', ts: now + 1, attachments: [native] });
+    if (stage === 'answered') messages.push({ role: 'assistant', text: '확인했습니다', ts: now + 5 }, { role: 'assistant', text: '이어서 정리했습니다', ts: now + 9 });
+    return { ok: true, status: 200, json: async () => ({ route: body.source, capability: { supported: true }, phase: 'working',
+      receipts: body.requestId ? [{ requestId: body.requestId, status: 'accepted', confirmed: true, acknowledged: true }] : [], messages }) };
+  }, noChatTimers);
+  const { s, entry } = selectChat(c, { agent: 'claude', home: '.claude', id: 'claude-session' });
+  wireTree(c, c.buildChatComposer(s)); await settle();
+  await c.loadChatState(s, true);
+  const list = c.get('messages');
+  const bubbles = () => list.children.filter((row) => /is-outbox/.test(row.className));
+  const working = () => list.children.some((row) => /msg-working/.test(row.className));
+  entry.text = '코덱스로 이어서 하려는데 여기서 막힘';
+  entry.attachments = [{ id: 'file-a', name: 'shot.png', type: 'image/png', size: 10 }];
+  await c.sendChat(entry); await settle();
+  assert.equal(sends.length, 1);
+  assert.equal(bubbles().length, 1, 'not in the transcript yet');
+  assert.match(c.get('chat-status').textContent, /메시지를 접수했습니다/);
+  assert.equal(c.get('chat-delivery-evidence').hidden, false);
+  assert.equal(working(), true, 'the conversation waits on the agent');
+  stage = 'answered';
+  await c.loadChatState(s, true); await settle();
+  assert.equal(bubbles().length, 0, 'its own message, as Claude Code recorded it, settled the bubble');
+  assert.equal(entry.outbox.length, 0);
+  assert.equal(working(), false, 'the agent answered: the newest row is its answer');
+  assert.doesNotMatch(c.get('chat-status').textContent, /접수했습니다/, 'the receipt note went with the bubble');
+  assert.equal(c.get('chat-delivery-evidence').hidden, true, 'the message\'s own chips show its file now');
+  const own = list.children.find((row) => row.messageItem?.message.text.startsWith('[Image #1]'));
+  assert.ok(own, 'the transcript row is drawn once');
+  assert.doesNotMatch(textOf(own), /\[Image #1\]/, 'the image token is not drawn next to the image chip');
+  assert.match(textOf(own), /코덱스로 이어서 하려는데 여기서 막힘/);
+  assert.equal(c.messageActions(s, own.messageItem)[0].label, '복사');
+  // The token sits before, after or instead of the words; spaces around it vary.
+  for (const text of ['[Image #1] 확인', '확인 [Image #1]', '확인\n[Image #1]', '[Image #1]확인\n첨부 파일: [Image #2]']) {
+    const shape = c.outboxShape({ role: 'user', text, attachments: [native] });
+    assert.equal(shape.body, '확인', text);
+    assert.ok(shape.counts.has(1), text);
+  }
+  assert.equal(c.outboxShape({ role: 'user', text: '[Image #1]', attachments: [native] }).body, '');
+  assert.equal(c.outboxShape({ role: 'user', text: '[Pasted text #1 +12 lines]' }).body, '');
+});
+
+test('a delivered Claude bubble the transcript words differently takes the next new user message, or goes after an answer to it', () => {
+  const c = client(undefined, noChatTimers);
+  const now = Date.now(); const ts = Math.floor(now / 1000);
+  const { entry } = selectChat(c, { agent: 'claude', home: '.claude', id: 'claude-session' });
+  const seen = [{ role: 'user', text: '처음 요청', ts: ts - 100 }, { role: 'assistant', text: '네', ts: ts - 90 }];
+  const bubble = (requestId, text, extra = {}) => ({ requestId, text, attachments: [], state: 'sent', status: 'accepted', reason: '',
+    at: now, ...c.outboxOrigin(seen), ...extra });
+  const pending = () => entry.outbox.map((item) => item.requestId);
+  // Every bubble is matched by its own text first: a reworded message never takes a later bubble's row.
+  entry.outbox = [bubble('req-a-0001', '긴 붙여넣기'), bubble('req-b-0002', '짧은 확인')];
+  const shortRow = { role: 'user', text: '짧은 확인', ts: ts + 1 };
+  c.settleOutbox(entry, [...seen, shortRow]);
+  assert.deepEqual(pending(), ['req-a-0001'], 'B by its own text; nothing new is left for A');
+  c.settleOutbox(entry, [...seen, shortRow, { role: 'user', text: '[Pasted text #1 +12 lines]', ts: ts + 2 }]);
+  assert.deepEqual(pending(), [], 'A takes the next new message, one for one');
+  // Not a message from before the send, and never for a bubble the server has not taken.
+  entry.outbox = [bubble('req-c-0003', '확인', { state: 'uncertain', status: 'unknown' }), bubble('req-d-0004', '확인', { status: 'queued' }),
+    bubble('req-e-0005', '확인', { state: 'failed', status: 'failed' })];
+  c.settleOutbox(entry, [...seen, { role: 'user', text: '다른 말', ts: ts + 3 }]);
+  assert.deepEqual(pending(), ['req-c-0003', 'req-d-0004', 'req-e-0005']);
+  entry.outbox = [bubble('req-f-0006', '확인')];
+  c.settleOutbox(entry, [...seen, { role: 'user', text: '예전 말', ts: ts - 120 }]);
+  assert.deepEqual(pending(), ['req-f-0006']);
+  // A Codex bubble still settles only by its request id.
+  const codex = selectChat(c).entry;
+  codex.outbox = [bubble('req-codex-0007', '계속')];
+  c.settleOutbox(codex, [...seen, { role: 'user', text: '터미널에서 입력', ts: ts + 4, itemId: 'item-typed', clientId: null },
+    { role: 'assistant', text: '답', ts: ts + 5, itemId: 'item-answer', clientId: null }]);
+  assert.deepEqual(codex.outbox.map((item) => item.requestId), ['req-codex-0007']);
+  // No message of its own (yet), but the agent answered after it.
+  entry.outbox = [bubble('req-g-0008', '이미지 확인')];
+  const answered = [...seen, { role: 'assistant', text: '확인했습니다', ts: ts + 6 }];
+  c.settleOutbox(entry, answered, { working: true });
+  assert.deepEqual(pending(), ['req-g-0008'], 'while the agent works, its own message gets a minute to show');
+  entry.outbox[0].at = now - 61 * 1000;
+  c.settleOutbox(entry, answered, { working: true });
+  assert.deepEqual(pending(), []);
+  entry.outbox = [bubble('req-h-0009', '이미지 확인')];
+  c.settleOutbox(entry, [...seen, { role: 'assistant', text: '보내기 직전 답', ts: ts - 1 }]);
+  assert.deepEqual(pending(), ['req-h-0009'], 'an answer recorded before the send is no reply to it');
+  c.settleOutbox(entry, [...seen, { role: 'assistant', text: '답', ts: ts + 7 }]);
+  assert.deepEqual(pending(), [], 'an agent that answered after it and stopped');
+  // The server read the conversation and found the message: that settles it too,
+  // for Claude and for Codex, and the composer's receipt note goes with it.
+  for (const target of [entry, codex]) {
+    target.outbox = [bubble('req-i-0010', '어떤 말')];
+    target.pending = null;
+    c.applyChatReceipt(target, { requestId: 'req-i-0010', status: 'accepted', readbackConfirmed: false });
+    c.settleOutbox(target, seen, { working: true });
+    assert.equal(target.outbox.length, 1, 'taken, not yet found');
+    c.applyChatReceipt(target, { requestId: 'req-i-0010', status: 'accepted', readbackConfirmed: true });
+    c.settleOutbox(target, seen, { working: true });
+    assert.equal(target.outbox.length, 0);
+    assert.equal(target.settledRequestId, 'req-i-0010');
+  }
+});
+
+test('the composer note: a question waiting beats the receipt note, and an ended request yields to a newer running turn', () => {
+  const c = client(undefined, noChatTimers);
+  const { s, entry } = selectChat(c);
+  wireTree(c, c.buildChatComposer(s));
+  const status = () => c.get('chat-status').textContent;
+  entry.receipt = { requestId: 'req-done-0001', status: 'completed' };
+  c.updateChatComposer(entry);
+  assert.match(status(), /요청한 작업이 완료됐습니다/);
+  // A new turn (typed in the terminal) runs now: the old "completed" is no news.
+  entry.data = { ...entry.data, phase: 'working' };
+  c.updateChatComposer(entry);
+  assert.match(status(), /^작업 중/);
+  entry.receipt = { requestId: 'req-stop-0002', status: 'interrupted' };
+  c.updateChatComposer(entry);
+  assert.match(status(), /^작업 중/);
+  // The agent asks something: that comes before "접수했습니다".
+  entry.receipt = { requestId: 'req-wait-0003', status: 'accepted' };
+  entry.data = { ...entry.data, phase: 'needs_input' };
+  c.updateChatComposer(entry);
+  assert.match(status(), /답변·승인 필요/);
+  entry.data = { ...entry.data, phase: 'working' };
+  c.updateChatComposer(entry);
+  assert.match(status(), /메시지를 접수했습니다/, 'until its bubble settles');
+  entry.settledRequestId = 'req-wait-0003';
+  c.updateChatComposer(entry);
+  assert.match(status(), /^작업 중/);
+  // A refused send keeps saying its draft was not sent, question or not.
+  entry.receipt = { requestId: 'req-refused-0004', status: 'failed', confirmed: false, dispatchState: 'not_started',
+    reason: '메뉴가 떠 있어 보내지 않았습니다.' };
+  entry.data = { ...entry.data, phase: 'needs_input' };
+  c.updateChatComposer(entry);
+  assert.match(status(), /메뉴가 떠 있어 보내지 않았습니다.*초안과 첨부는 유지/);
+});
+
+test('"작업 중" waits only on bubbles still on their way, and a waiting bubble keeps the conversation followed', () => {
+  const timers = [];
+  const c = client(undefined, { setTimeout: (callback, delay) => { timers.push({ callback, delay }); return timers.length; }, clearTimeout() {} });
+  const { s, entry } = selectChat(c, { agent: 'claude', home: '.claude', id: 'claude-session' });
+  wireTree(c, c.buildChatComposer(s));
+  const now = Date.now(); const ts = Math.floor(now / 1000);
+  const shown = [{ role: 'user', text: '요청', ts: ts - 60 }, { role: 'assistant', text: '답변', ts: ts - 30 }];
+  const item = (extra) => ({ requestId: 'req-wait-0001', text: '보낸 말', attachments: [], reason: '', at: now, ...c.outboxOrigin(shown), ...extra });
+  const list = c.get('messages');
+  const working = () => list.children.some((row) => /msg-working/.test(row.className));
+  const bubbles = () => list.children.filter((row) => /is-outbox/.test(row.className)).length;
+  entry.data.phase = 'working';
+  entry.outbox = [item({ state: 'failed', status: 'failed', reason: '거절', settledAt: now })];
+  c.renderMessages(s, shown);
+  assert.equal(bubbles(), 1, 'a refused bubble stays to be resent');
+  assert.equal(working(), false, 'but nothing waits on it');
+  entry.outbox = [item({ state: 'uncertain', status: 'unknown' })];
+  c.renderMessages(s, shown);
+  assert.equal(working(), true, 'a message on its way');
+  // A Codex request that already ended (the transcript never showed it) waits on nothing.
+  const codex = selectChat(c);
+  wireTree(c, c.buildChatComposer(codex.s));
+  codex.entry.data.phase = 'working';
+  codex.entry.outbox = [item({ state: 'sent', status: 'completed', settledAt: now })];
+  c.renderMessages(codex.s, shown);
+  assert.equal(working(), false);
+  // An idle conversation is still read while a bubble waits for its message.
+  const claude = selectChat(c, { agent: 'claude', home: '.claude', id: 'claude-session' });
+  claude.entry.data.phase = 'idle';
+  claude.entry.outbox = [item({ state: 'sent', status: 'accepted' })];
+  const count = timers.length;
+  c.scheduleChatPoll(claude.s, claude.entry);
+  assert.equal(timers.length, count + 1);
+  claude.entry.outbox = [item({ state: 'failed', status: 'failed', settledAt: now })];
+  c.scheduleChatPoll(claude.s, claude.entry);
+  assert.equal(timers.length, count + 1, 'not for a refused one');
 });
 
 test('a failed xterm stylesheet fails the terminal load, and opening again retries only that file', async () => {

@@ -22,6 +22,21 @@ CLAUDE_OPEN_TERMINAL = '보내려면 먼저 터미널을 여세요.'
 CONTROL = re.compile(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]')
 CLAUDE_READY_SECONDS = 12
 CLAUDE_PROBE = 160
+# Claude Code records a pasted image path as "[Image #1]" in the prompt (before, after or
+# instead of the words) and may show a long paste as "[Pasted text #1 +12 lines]".
+CLAUDE_INPUT_TOKEN = re.compile(r'\[(?:Image|Pasted text|Pasted image) #\d+(?: \+\d+ lines?)?\]')
+ATTACHMENT_LINE = '첨부 파일:'
+ATTACHMENT_ONLY = ('[이미지 첨부]', '[파일 첨부]')
+
+
+def claude_words(text):
+    """A Claude prompt as the board compares it: collapsed, without Claude Code's input
+    tokens and without the trailing "첨부 파일: …" lines the board appends for files."""
+    lines = CLAUDE_INPUT_TOKEN.sub(' ', str(text or '')).split('\n')
+    while lines and (not lines[-1].strip() or lines[-1].strip().startswith(ATTACHMENT_LINE)):
+        lines.pop()
+    words = ' '.join(' '.join(lines).split())
+    return '' if words in ATTACHMENT_ONLY else words
 
 # ---------- approval / question menus drawn by the agent TUIs ----------
 # "❯ 1. Yes" (Claude Code), "› 1. Yes, proceed (y)" (Codex): optional cursor, number, label.
@@ -681,21 +696,43 @@ class Chat:
                 return None
         return record if isinstance(record, dict) else None
 
+    @staticmethod
+    def _recorded(record, message):
+        """Whether a transcript user message (recorded after the send) is the one this
+        record sent: its whole opening text as pasted, or its words as Claude Code recorded
+        them (an image path becomes "[Image #1]" and its "첨부 파일:" line goes)."""
+        text = message.get('text')
+        probe, length = record.get('probe'), record.get('probeLength')
+        if isinstance(probe, str) and isinstance(length, int):
+            collapsed = ' '.join(str(text or '').split())[:length]
+            if hashlib.sha256(collapsed.encode()).hexdigest() == probe:
+                return True
+        probe, length = record.get('wordsProbe'), record.get('wordsLength')
+        if not isinstance(probe, str) or not isinstance(length, int):
+            return False
+        words = claude_words(text)
+        # A short message is compared whole; a long one by its opening, as the transcript
+        # may cut it. An attachment-only message has no words but does have its files.
+        words = words if length < CLAUDE_PROBE else words[:length]
+        if not words and not (message.get('attachments') or ATTACHMENT_LINE in str(text or '')):
+            return False
+        return hashlib.sha256(words.encode()).hexdigest() == probe
+
     def _claude_receipt(self, source, request_id, messages):
         record = self._claude_read_record(source, request_id)
         if not record:
             return {'delivery': 'unknown', 'reason': '전송 결과를 확인하지 못했습니다. 상태를 다시 확인해 주세요.'}
         receipt = dict(record.get('receipt') or {})
-        probe, length = record.get('probe'), record.get('probeLength')
-        if receipt.get('acknowledged') and isinstance(probe, str) and isinstance(length, int):
-            for message in messages:
-                if (isinstance(message, dict) and message.get('role') == 'user'
-                        and (message.get('ts') or 0) >= record.get('sentAt', 0) - 5):
-                    collapsed = ' '.join(str(message.get('text') or '').split())[:length]
-                    if hashlib.sha256(collapsed.encode()).hexdigest() == probe:
-                        receipt.update(readbackConfirmed=True, currentSnapshotConfirmed=True,
-                                       reason=None)
-                        break
+        for message in messages:
+            if (isinstance(message, dict) and message.get('role') == 'user'
+                    and (message.get('ts') or 0) >= record.get('sentAt', 0) - 5
+                    and self._recorded(record, message)):
+                receipt.update(readbackConfirmed=True, currentSnapshotConfirmed=True, reason=None)
+                if not receipt.get('acknowledged') and receipt.get('delivery') == 'unknown':
+                    # The paste's own result was lost, but the transcript has the message:
+                    # it was delivered (the board still never sends it again).
+                    receipt.update(delivery='accepted', confirmed=True)
+                break
         return receipt
 
     def _send_claude(self, ref, source, host, request_id, text, ids, manifest):
@@ -749,8 +786,10 @@ class Chat:
             except FileExistsError:
                 saved = self._claude_read_record(source, request_id) or {}
                 return {**(saved.get('receipt') or unknown), 'attachments': manifest}
+            words = claude_words(body)[:CLAUDE_PROBE]
             record = {'requestId': request_id, 'sentAt': time.time(), 'probe': digest,
-                      'probeLength': len(probe), 'receipt': unknown}
+                      'probeLength': len(probe), 'wordsProbe': hashlib.sha256(words.encode()).hexdigest(),
+                      'wordsLength': len(words), 'receipt': unknown}
             with os.fdopen(fd, 'w', encoding='utf-8') as file:
                 json.dump(record, file)
             from terminal import InputNotSent

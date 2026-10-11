@@ -6899,6 +6899,99 @@ test('opening a new session posts once per host and request, then opens its term
   assert.equal(c.terminalCloseCopy(terminal).danger, true);
 });
 
+// The conversation keeps its newest message in view (pinnedToEnd, keepAtEnd).
+function scrollingList(c, { scrollHeight, clientHeight }) {
+  const list = c.get('messages');
+  let top = 0;
+  Object.defineProperty(list, 'scrollTop', { configurable: true, get: () => top,
+    // A browser ignores a scroll on a list without a box and clamps one past the end.
+    set: (value) => { if (list.clientHeight) top = Math.max(0, Math.min(value, list.scrollHeight - list.clientHeight)); } });
+  Object.assign(list, { scrollHeight, clientHeight });
+  return list;
+}
+function resizeObservers(c) {
+  const observers = [];
+  c.context.ResizeObserver = class {
+    constructor(callback) { this.callback = callback; this.targets = []; observers.push(this); }
+    observe(target) { this.targets.push(target); }
+    disconnect() { this.targets = []; }
+  };
+  return () => { for (const observer of observers) observer.callback(observer.targets.map((target) => ({ target }))); };
+}
+const LONG_CONVERSATION = Array.from({ length: 30 }, (_, i) => ({ role: i % 2 ? 'assistant' : 'user', text: `메시지 ${i}`, ts: i + 1 }));
+function openLong(c, id) {
+  const s = recentSession(id);
+  setRecentSnapshot(c, [s]);
+  c.state.selected = s.key;
+  c.drawDetail(s);
+  return s;
+}
+
+test('a conversation drawn while its pane is still hidden opens at its newest message once laid out', () => {
+  const c = client(undefined, noChatTimers);
+  const resize = resizeObservers(c);
+  const s = openLong(c, 'hidden-open');
+  const list = scrollingList(c, { scrollHeight: 3000, clientHeight: 0 });
+  // A phone draws the cached copy before it shows the conversation pane.
+  c.renderMessages(s, LONG_CONVERSATION, '', true);
+  assert.equal(list.scrollTop, 0, 'a hidden list cannot scroll');
+  list.clientHeight = 600;
+  resize();
+  assert.equal(list.scrollTop, 2400);
+  list.scrollHeight = 3200;
+  c.renderMessages(s, [...LONG_CONVERSATION, { role: 'assistant', text: '새 답', ts: 99 }]);
+  assert.equal(list.scrollTop, 2600, 'the read that follows stays at the end');
+  assert.equal(c.get('jump-bottom').hidden, true);
+  // Without a resize callback, showing the pane puts it at the end as well.
+  const other = client(undefined, noChatTimers);
+  const t = openLong(other, 'hidden-open-2');
+  const plain = scrollingList(other, { scrollHeight: 3000, clientHeight: 0 });
+  other.renderMessages(t, LONG_CONVERSATION, '', true);
+  plain.clientHeight = 600;
+  other.setDetailShown(true);
+  assert.equal(plain.scrollTop, 2400);
+});
+
+test('a question card, the keyboard or the bars shrinking the list keep a pinned conversation at its end', () => {
+  const c = client(undefined, noChatTimers);
+  const resize = resizeObservers(c);
+  const s = openLong(c, 'pinned-shrink');
+  const list = scrollingList(c, { scrollHeight: 3000, clientHeight: 600 });
+  c.renderMessages(s, LONG_CONVERSATION, '', true);
+  assert.equal(list.scrollTop, 2400);
+  list.clientHeight = 350;
+  resize();
+  assert.equal(list.scrollTop, 2650);
+  // A read that comes before the resize callback still sticks, though 300px from the end.
+  list.clientHeight = 300;
+  c.renderMessages(s, [...LONG_CONVERSATION, { role: 'assistant', text: '질문입니다', ts: 99 }]);
+  assert.equal(list.scrollTop, 2700);
+  assert.equal(list.unread, 0);
+});
+
+test('a reader who scrolled up keeps the place through resizes and new messages until 맨 아래', () => {
+  const c = client(undefined, noChatTimers);
+  const resize = resizeObservers(c);
+  const s = openLong(c, 'reading-back');
+  const list = scrollingList(c, { scrollHeight: 3000, clientHeight: 600 });
+  c.renderMessages(s, LONG_CONVERSATION, '', true);
+  list.scrollTop = 1200;
+  c.readingScroll(list);
+  assert.equal(list.pinned, false);
+  list.clientHeight = 500;
+  resize();
+  assert.equal(list.scrollTop, 1200);
+  c.renderMessages(s, [...LONG_CONVERSATION, { role: 'assistant', text: '새 답', ts: 99 }]);
+  assert.equal(list.scrollTop, 1200);
+  assert.equal(list.unread, 1);
+  c.get('jump-bottom').events.click();
+  assert.equal(list.scrollTop, 2500);
+  assert.equal(list.pinned, true);
+  list.clientHeight = 450;
+  resize();
+  assert.equal(list.scrollTop, 2550);
+});
+
 test('a new-session terminal belongs to the session the server linked it to, and only then', () => {
   const c = client(async () => ({ ok: true, status: 200, json: async () => ({ ok: true }) }), noChatTimers);
   const s = recentSession('launched-here', { home: '.codex', id: '019a0000-0000-7000-8000-000000000004' });

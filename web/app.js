@@ -354,6 +354,13 @@ function setDetailShown(shown, { direction = null, focus = false } = {}) {
   const apply = () => {
     if (shown) document.body.classList.add("show-detail");
     else document.body.classList.remove("show-detail");
+    // A phone lays the conversation out only now: a scroll set while it was
+    // hidden did nothing, so a pinned one is put at its end once it has a size.
+    if (shown) {
+      const list = $("messages");
+      keepAtEnd(list);
+      if (typeof requestAnimationFrame === "function") requestAnimationFrame(() => keepAtEnd(list));
+    }
     if (focus) {
       if (shown) focusDetailBack();
       else restoreSelectedCardFocus();
@@ -1833,6 +1840,10 @@ function drawDetail(s) {
   );
   const list = el("div", "messages");
   list.id = "messages";
+  // A conversation opens at its newest message (see pinnedToEnd).
+  list.pinned = true;
+  list.lastScrollTop = 0;
+  observeMessages(list);
   list.setAttribute("aria-label", "최근 대화 읽기");
   list.append(el("p", "group-empty", "대화를 불러오고 있습니다…"));
   const sync = el("p", "conversation-sync-notice");
@@ -2035,6 +2046,33 @@ function chatTyping() {
 function messagesAtEnd(list, slack = 50) {
   return !!list && list.scrollHeight - list.scrollTop - list.clientHeight < slack;
 }
+// Whether the conversation stays at its newest message. A newly opened one does
+// (drawDetail), "맨 아래" sets it again, and only the reader's own scroll away
+// from the end clears it — not a hidden list (a phone's detail before it shows),
+// a question card, the keyboard or a growing composer, which change the list's
+// size but not the reader's place. A scroll the board has not seen yet (no
+// scroll event since its own) decides afresh by the distance.
+function pinnedToEnd(list) {
+  if (!list) return false;
+  if (list.scrollTop !== list.lastScrollTop) list.pinned = messagesAtEnd(list);
+  return list.pinned === true;
+}
+// The list's own size changed (shown, a card, the keyboard, the bars): a pinned
+// conversation is put back at its newest message.
+function keepAtEnd(list) {
+  if (!list || list.isConnected === false || !list.clientHeight || !pinnedToEnd(list)) return;
+  setMessagesScroll(list, list.scrollHeight);
+  list.unread = 0;
+  renderJump();
+}
+function observeMessages(list) {
+  if (typeof ResizeObserver === "undefined") return;
+  state.messagesObserver ||= new ResizeObserver((entries) => {
+    for (const entry of entries) keepAtEnd(entry.target);
+  });
+  state.messagesObserver.disconnect();
+  state.messagesObserver.observe(list);
+}
 // Applies the reader's choice; while a phone is typing it waits for the blur.
 function setChromeVisible(visible, { stickBottom = false } = {}) {
   state.chromeVisible = !!visible;
@@ -2130,6 +2168,13 @@ function readingScroll(list) {
   const top = list.scrollTop;
   const previous = list.lastScrollTop ?? top;
   list.lastScrollTop = top;
+  // Pinned to the end unless the reader moved away: a resize or the board's
+  // smooth "맨 아래" also scrolls, without unpinning.
+  const height = list.clientHeight;
+  const resized = Number.isFinite(list.pinHeight) && list.pinHeight !== height;
+  list.pinHeight = height;
+  if (messagesAtEnd(list)) list.pinned = true;
+  else if (top !== previous && !resized && Date.now() >= (list.autoScrollUntil || 0)) list.pinned = false;
   // While typing, the chrome is already folded (setTyping) and stays put. A
   // wide touch screen keeps its bars: its scroll is tracked but hides nothing.
   const typing = chatTyping();
@@ -2173,6 +2218,7 @@ function scrollMessagesToEnd() {
   const list = $("messages");
   if (!list) return;
   list.unread = 0;
+  list.pinned = true;
   if (typeof list.scrollTo === "function") {
     // The smooth scroll's own events do not hide the bars; a touch ends this.
     list.autoScrollUntil = Date.now() + 1000;
@@ -3798,8 +3844,11 @@ function renderMessages(s, messages, error = "", fresh = false) {
   const selectedText = window.getSelection?.();
   const readingSelection = selectedText && !selectedText.isCollapsed &&
     (list.contains?.(selectedText.anchorNode) || list.contains?.(selectedText.focusNode));
+  // Pinned (or within 50px of the end): stays at the newest message, also when the
+  // list was laid out at another size (hidden, a question card, the keyboard).
   const stick = !readingSelection &&
-    (fresh || list.scrollHeight - list.scrollTop - list.clientHeight < 50);
+    (fresh || pinnedToEnd(list) || list.scrollHeight - list.scrollTop - list.clientHeight < 50);
+  if (stick) list.pinned = true;
   const scroll = list.scrollTop;
   const previousKeys = new Set(previous.map((item) => item.key));
   const oldWarningHeight = list.conversationError && [...list.children].includes(list.conversationError)

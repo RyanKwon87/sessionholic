@@ -106,6 +106,7 @@ class Transfers:
         # host name -> whether this process's helper SHA is known to be installed there
         self.runtime_installed = {}
         self.profile_cache = {}
+        self.launcher_cache = {}
         self.profile_failures = {}
         self.lock = threading.RLock()
         self._runtime = None
@@ -208,14 +209,29 @@ class Transfers:
             if not refresh and cached and time.monotonic() - cached[0] < 120:
                 return cached[1]
         try:
-            result = self.rpc(host, 'profiles', timeout=12)['profiles']
+            data = self.rpc(host, 'profiles', timeout=12)
+            if not isinstance(data, dict) or not isinstance(data.get('profiles'), list):
+                raise RuntimeError('기기의 계정 목록을 읽지 못했습니다.')
+            result = data['profiles']
         except (RuntimeError, OSError, ValueError) as exc:
             with self.lock: self.profile_failures[host['name']] = (time.monotonic(), str(exc))
             raise
         with self.lock:
             self.profile_cache[host['name']] = (time.monotonic(), result)
+            self.launcher_cache[host['name']] = data.get('launcher') if isinstance(data.get('launcher'), dict) else None
             self.profile_failures.pop(host['name'], None)
         return result
+
+    def launcher(self, host, refresh=False):
+        """The host's "새 세션" status, read with its profiles (the same helper request)."""
+        self.profiles(host, refresh=refresh)
+        with self.lock:
+            status = self.launcher_cache.get(host['name'])
+        if not status:
+            return {'available': False, 'label': None, 'reason': '이 기기의 새 세션 설정을 확인하지 못했습니다.'}
+        return {'available': status.get('available') is True,
+                'label': status['label'] if isinstance(status.get('label'), str) else None,
+                'reason': status['reason'] if isinstance(status.get('reason'), str) else None}
 
     def preview(self, source, target, source_host, target_host):
         status = self.rpc(source_host, 'state', {'source': source}, timeout=12)

@@ -1185,6 +1185,7 @@ class Workflow:
                             accounts.append({**presentation, "id": key, "agent": agent,
                                              "home": home, "available": True})
             hosts.append({"name": host["name"], "label": host["label"], "online": status["ok"],
+                "newSession": self.new_session_status(host, status["ok"]),
                 "agents": [{"id": agent, "label": "Claude Code" if agent == "claude" else "Codex",
                     "accounts": [{k: p.get(k) for k in ("id", "label", "available", "reason", "home",
                         "scope", "scopeLabel", "scopeDescription", "accountKey", "accountLabel",
@@ -1192,6 +1193,61 @@ class Workflow:
                     for agent in ("claude", "codex")]})
         return {"hosts": hosts, "terminal": {"available": bool(shutil.which("tmux", path=collector_path())),
                 "reason": "터미널 연결에는 tmux가 필요합니다."}}
+
+    def new_session_status(self, host, online=True):
+        """Whether this host's launcher can open "새 세션", read from that host's own settings."""
+        if host["local"]:
+            from launch import new_session_status
+            return new_session_status()
+        if not online:
+            return {"available": False, "label": None, "reason": "기기에 연결할 수 없습니다."}
+        try:
+            return self.transfers.launcher(host)
+        except (RuntimeError, OSError, ValueError):
+            return {"available": False, "label": None, "reason": "이 기기의 새 세션 설정을 확인하지 못했습니다."}
+
+    def new_session(self, payload):
+        """Open a host's own launcher in a new board terminal. The launcher, not the board,
+        chooses the project, agent and account, so nothing else is decided here."""
+        if not isinstance(payload, dict):
+            raise ValueError("새 세션 요청 형식이 올바르지 않습니다.")
+        host_name, request_id = payload.get("host"), payload.get("requestId")
+        if not isinstance(request_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{8,100}", request_id):
+            raise ValueError("실행 요청 식별자가 필요합니다.")
+        host = next((h for h in self.board.hosts if h["name"] == host_name), None)
+        if host is None:
+            raise ValueError("새 세션을 열 기기를 선택해 주세요.")
+        with self.lock:
+            if request_id in self.requests:
+                previous, result = self.requests[request_id]
+                if previous != ("new-session", host["name"]):
+                    raise ValueError("이미 사용한 요청입니다.")
+                return result
+            if not host["local"] and not self.board.state[host["name"]]["ok"]:
+                raise RuntimeError("기기에 연결할 수 없어 새 세션을 열지 않았어요.")
+            key = "new-session:" + request_id
+            with self.terminals.reserve(key):
+                if host["local"]:
+                    from launch import new_session
+                    spec = new_session()
+                    label = spec["label"]
+                else:
+                    # Asked fresh: the host's settings decide, and its helper path is then known.
+                    status = self.transfers.launcher(host, refresh=True)
+                    if not status["available"]:
+                        raise ValueError(status["reason"] or "이 기기에는 새 세션 실행 명령이 설정되지 않았습니다.")
+                    import collector
+                    label = status["label"] or "새 세션"
+                    spec = {"argv": self.transfers.command(host, ["-I", self.transfers.runtime_paths[host["name"]],
+                                                                 "new-session"], tty=True),
+                            "cwd": str(Path.home()), "env": collector.tool_env()}
+                terminal = self.terminals.create(key, spec["argv"], spec["cwd"], spec["env"],
+                                                 {"title": label, "host": host["name"], "mode": "new-session"})
+            result = {"terminal": terminal, "mode": "new-session"}
+            self.requests[request_id] = (("new-session", host["name"]), result)
+            if len(self.requests) > 256:
+                self.requests.pop(next(iter(self.requests)))
+            return result
 
     @staticmethod
     def identity(row):
@@ -1880,6 +1936,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_json(200, self.server.workflow.plan(data))
             if path == "/api/launch":
                 return self.send_json(200, self.server.workflow.launch(data.get("planId"), data.get("requestId")))
+            if path == "/api/new-session":
+                return self.send_json(200, self.server.workflow.new_session(data))
             match = re.fullmatch(r"/api/terminal/([a-f0-9]{32})/(input|resize|scroll|scroll-end|detach|close)", path)
             if match:
                 tid, action = match.groups()

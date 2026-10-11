@@ -129,6 +129,13 @@
           <div class="list-chips">
             <div id="counts" class="counts" role="group" aria-label="상태로 거르기"></div>
             <button
+              id="new-session"
+              class="list-chip new-session-chip"
+              type="button"
+              aria-haspopup="dialog"
+              hidden
+            ><span class="new-session-chip-icon" aria-hidden="true">+</span><span>새 세션</span></button>
+            <button
               id="running-terminals"
               class="list-chip terminals-chip"
               type="button"
@@ -289,6 +296,10 @@
       <div id="terminal-viewport" class="terminal-viewport" role="region" aria-label="터미널 출력과 입력"></div>
       <button id="terminal-live" class="terminal-live" type="button" hidden>실시간으로 ↓</button>
       <div id="terminal-tools" class="terminal-tools">
+        <div id="terminal-menu" class="terminal-menu" role="group" hidden>
+          <p id="terminal-menu-title" class="terminal-menu-title"></p>
+          <div id="terminal-menu-options" class="terminal-menu-options"></div>
+        </div>
         <div
           id="terminal-keys"
           class="terminal-keys"
@@ -487,6 +498,19 @@
           >다시 확인</button>
         </div>
         <div id="running-list" class="running-list"></div>
+      </div>
+    </dialog>
+    <dialog id="new-session-dialog" class="plan-dialog sheet" aria-labelledby="new-session-title">
+      <div class="sheet-handle" aria-hidden="true"></div>
+      <div class="dialog-top">
+        <p class="eyebrow">새 세션</p>
+        <button id="new-session-close" class="icon-button" type="button" aria-label="새 세션 닫기">×</button>
+      </div>
+      <h2 id="new-session-title">어느 기기에서 열까요?</h2>
+      <div class="dialog-body">
+        <p class="new-session-note">기기의 실행 명령을 터미널로 엽니다. 프로젝트·에이전트·계정은 터미널 메뉴에서 고릅니다.</p>
+        <div id="new-session-hosts" class="new-session-hosts"></div>
+        <p id="new-session-error" class="error" role="alert" hidden></p>
       </div>
     </dialog>
     <dialog id="action-sheet" class="plan-dialog sheet action-sheet" aria-labelledby="action-title">

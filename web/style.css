@@ -1143,6 +1143,93 @@ select:disabled {
 .running-terminal-close:focus-visible {
   outline-offset: -3px;
 }
+/* "새 세션": the chip's "+" tile and its sheet's host rows (same shape as the
+   running terminal rows). Disabled rows say why in their second line. */
+.new-session-chip-icon {
+  display: grid;
+  place-items: center;
+  width: 20px;
+  height: 20px;
+  border-radius: 6px;
+  background: var(--accent-tint);
+  color: var(--accent);
+  font: 700 15px/1 var(--mono);
+}
+.new-session-note {
+  margin: 0 0 12px;
+  color: var(--label-2);
+  font-size: var(--fs-sub);
+  line-height: 1.4;
+}
+.new-session-hosts {
+  border-radius: var(--radius);
+  background: var(--surface);
+  overflow: hidden;
+}
+.new-session-host {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  width: 100%;
+  min-height: 60px;
+  padding: 8px 12px 8px 16px;
+  border: 0;
+  background: transparent;
+  color: var(--label);
+  font-size: var(--fs-body);
+  text-align: left;
+}
+.new-session-host + .new-session-host {
+  border-top: 1px solid var(--sep);
+}
+.new-session-host::before {
+  content: "+";
+  content: "+" / "";
+  display: grid;
+  place-items: center;
+  flex: none;
+  width: 32px;
+  height: 32px;
+  border-radius: 9px;
+  background: var(--accent-tint);
+  color: var(--accent);
+  font: 600 18px/1 var(--mono);
+}
+.new-session-host-copy {
+  display: grid;
+  flex: 1;
+  gap: 2px;
+  min-width: 0;
+}
+.new-session-host-title {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 600;
+  line-height: 1.3;
+}
+.new-session-host-meta {
+  color: var(--label-2);
+  font-size: var(--fs-sub);
+  line-height: 1.3;
+  overflow-wrap: anywhere;
+}
+.new-session-host > span:last-child {
+  flex: none;
+  color: var(--label-3);
+}
+.new-session-host:active:not(:disabled) {
+  background: var(--fill-soft);
+}
+.new-session-host:disabled {
+  opacity: 0.55;
+}
+.new-session-host:focus-visible {
+  outline-offset: -3px;
+}
+#new-session-error {
+  margin: 12px 0 0;
+}
 .running-terminal-close {
   flex: none;
   min-width: 68px;
@@ -2358,6 +2445,44 @@ select:disabled {
   overflow: auto;
   border-top: 1px solid var(--t-sep);
   background: var(--t-bg);
+}
+/* A launcher's numbered menu in a "새 세션" terminal: a tap types the key and Enter. */
+.terminal-menu {
+  max-width: 560px;
+  margin: 0 0 8px;
+}
+.terminal-menu[hidden] {
+  display: none;
+}
+.terminal-menu-title {
+  margin: 0 2px 6px;
+  color: var(--t-label-2);
+  font-size: 13px;
+}
+.terminal-menu-options {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.terminal-menu-option {
+  min-height: 40px;
+  padding: 0 14px;
+  border: 0;
+  border-radius: 10px;
+  background: var(--t-key);
+  box-shadow: 0 1px 0 var(--t-key-shadow);
+  color: var(--t-label);
+  font-size: 14px;
+  text-align: left;
+  touch-action: manipulation;
+}
+.terminal-menu-option:active {
+  background: var(--t-key-press);
+}
+.terminal-menu-option.cancel {
+  background: transparent;
+  box-shadow: inset 0 0 0 1px var(--t-sep);
+  color: var(--t-label-2);
 }
 /* Two rows like a real keyboard: control keys, an inverted-T arrow cluster
    and a tall Enter, all within one thumb's reach. */

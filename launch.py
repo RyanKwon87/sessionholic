@@ -140,6 +140,42 @@ def _environment(home, agent, key, environment):
     return env
 
 
+def new_session(home=None):
+    """This host's launcher (`launcher` in the host settings) as a terminal launch.
+
+    The board only opens it in a terminal; the launcher chooses the project, agent and
+    account and owns their checks. Its variables are the usual terminal ones (plus the
+    user's SSH agent socket, as in their own terminal), never board or credential overrides.
+    """
+    home = _home(home)
+    launcher = settings.load(home).get("launcher")
+    if not launcher:
+        raise ValueError("이 기기에는 새 세션 실행 명령이 설정되지 않았습니다.")
+    program = launcher["command"][0]
+    if not os.path.isfile(program) or not os.access(program, os.X_OK):
+        raise ValueError("새 세션 실행 명령을 이 기기에서 찾지 못했습니다.")
+    cwd = Path(launcher.get("cwd") or home)
+    if not cwd.is_dir():
+        raise ValueError("새 세션을 시작할 폴더가 이 기기에 없습니다.")
+    keep = ("PATH", "TERM", "COLORTERM", "TMPDIR", "LANG", "LC_ALL", "LC_CTYPE",
+            "USER", "LOGNAME", "SHELL", "SSH_AUTH_SOCK")
+    env = {name: os.environ[name] for name in keep if name in os.environ}
+    env["HOME"] = str(home)
+    env.setdefault("PATH", "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin")
+    env.setdefault("TERM", "xterm-256color")
+    env.setdefault("LANG", "en_US.UTF-8")
+    return {"argv": list(launcher["command"]), "cwd": str(cwd), "env": env, "label": launcher["label"]}
+
+
+def new_session_status(home=None):
+    """Whether "새 세션" can open here, with the launcher's label or the reason it cannot."""
+    try:
+        spec = new_session(home)
+    except ValueError as exc:
+        return {"available": False, "label": None, "reason": str(exc)}
+    return {"available": True, "label": spec["label"], "reason": None}
+
+
 def source_environment(source, home=None):
     """Resolve explicit host-local boundary; imported work retains its origin group.
 

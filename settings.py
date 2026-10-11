@@ -39,7 +39,7 @@ ACCOUNT = re.compile(r"[A-Za-z0-9_-]{1,32}\Z")
 HELPER = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}\Z")
 # Optional sections; each may appear only in version 2.
 SECTIONS = ("profileRules", "boundary", "legacy", "codexHomes", "agentRouter", "tmux",
-            "transfer", "attachments", "usage")
+            "transfer", "attachments", "usage", "launcher")
 V1 = {"environment": {"label", "variables"}, "profile": {"agent", "home", "label", "environment"},
       "project": {"id", "label", "root", "environment"}}
 V2 = {"environment": V1["environment"] | {"boundaryGroup", "scope", "description"},
@@ -97,7 +97,7 @@ def defaults():
     return {"profileRules": [], "boundary": {"agents": list(AGENTS), "claude": "inherit-source"},
             "legacy": {}, "codexHomes": {"allowSymlinks": False, "excludeSuspended": False, "requireMarker": False},
             "agentRouter": None, "tmux": {}, "transfer": {"agentConfig": "exclude-private"},
-            "attachments": {"gitExclude": True}, "usage": None}
+            "attachments": {"gitExclude": True}, "usage": None, "launcher": None}
 
 
 def config_path(home=None):
@@ -265,6 +265,25 @@ def _sections(data, config, groups, home):
         config["attachments"] = {"gitExclude": _flag(attachments.get("gitExclude", True))}
     if "usage" in data:
         config["usage"] = _usage(data["usage"], home)
+    if "launcher" in data:
+        config["launcher"] = _launcher(data["launcher"], home)
+
+
+def _launcher(value, home):
+    """The command a board terminal runs for "새 세션": this host's own launcher, which then
+    chooses the project, agent and account itself. Its program is an absolute or `~/` path."""
+    launcher = _fields(value, ("command", "label", "cwd"))
+    command = launcher.get("command")
+    if (not isinstance(command, list) or not 0 < len(command) <= 16
+            or any(not _text(arg, 1024) for arg in command)):
+        _error()
+    label = launcher.get("label", "새 세션")
+    if not _text(label, 64):
+        _error()
+    result = {"command": [_location(command[0], home)] + list(command[1:]), "label": label}
+    if "cwd" in launcher:
+        result["cwd"] = _location(launcher["cwd"], home)
+    return result
 
 
 def _usage(value, home):

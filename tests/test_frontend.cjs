@@ -126,7 +126,7 @@ function client(
   vm.runInContext(messageSource, context);
   vm.runInContext(source, context);
   const api = vm.runInContext(
-    "({state,api,sourceOf,accountOf,sendInput,pasteDraft,prepareDraftPaste,startDraftComposition,endDraftComposition,inputDraft,stopTerminalReader,startTerminalReader,closePlan,navigateView,backToList,backFromTerminal,closeTerminal,cancelTerminalClose,confirmTerminalClose,populateAccount,populateRoute,updateContinue,renderPlan,launchPlan,openTerminal,saveDraft,draftKey,refreshTerminals,renderTerminals,renderTerminalReturn,renderFilters,terminalCloseCopy,warnDraftUnload,preparePlan,renderGroups,renderMessages,loadDetail,chatKey,chatEntry,currentChat,chatSupported,chatAttachmentsSupported,buildChatComposer,sendChat,loadChatState,applyChatReceipt,uploadChatFiles,pasteChat,scheduleChatPoll,stopChatPolling,openNativeChat,allSessions,buildContinuePanel,chatReceiptCopy,returnToBoard,readChatClipboard,accountDisplay,sessionAccountLabel,closeChatToolsOutside,closeChatToolsEscape,drawDetail,refreshDetail,loadCapabilities,matches,recoverConnection,networkOffline,poll,select,focusDetailBack,restoreSelectedCardFocus,showLogin,lock,beginAuthEpoch,resizeChatInput,updateViewport,draftKeydown,configureTerminalKeyboard,queueTerminalScroll,flushTerminalScroll,terminalScrollEnd,renderAttention,chatPollDelay,pullRefresh,readingScroll,renderJump,pullDistance,listScroll,setReading,renderPrompt,promptAction,renderUsage,loadUsage,applyTheme,setTheme,updateThemeColor,haptic,navTransition,setDetailShown,chatVisible,sheetRelease,BottomSheet,sheet,openSettings,closeSettings,setTyping,pinchFontSize,setTerminalFontSize,loadXterm,assetUrl,syncEvents,closeEvents,eventsHealthy,renderFreshness,schedule,touchDevice,togglePhaseFilter,renderCounts,createLongPress,swipeIntent,swipeRelease,groupMessageRows,setTextSize,applyTextSize,renderConnectivity,terminalForSession,swipeActionFor,openMessageMenu,openCardMenu,messageActions,outboxShape,outboxMatches,outboxOrigin,settleOutbox,retryOutbox,renderAttachmentTiles,attachmentThumb,sendUpload,openActionSheet,closeActionSheet,setListCollapsed,closeSwipe,settleSwipe,prepareSwipe,runSwipeAction,GESTURE,setChromeVisible,toggleChrome,revealChrome,isChromeTap,snapshotAnnounced,updateChatComposer,capabilitiesRevision,toolKindOf,userMessageParts,formatElapsed,tickWorking,renderTerminalMarks,renderDetailTerminal,terminalsAnnounced,goToSessionTerminal,rememberTerminal})",
+    "({state,api,sourceOf,accountOf,sendInput,pasteDraft,prepareDraftPaste,startDraftComposition,endDraftComposition,inputDraft,stopTerminalReader,startTerminalReader,closePlan,navigateView,backToList,backFromTerminal,closeTerminal,cancelTerminalClose,confirmTerminalClose,populateAccount,populateRoute,updateContinue,renderPlan,launchPlan,openTerminal,saveDraft,draftKey,refreshTerminals,renderTerminals,renderTerminalReturn,renderFilters,terminalCloseCopy,warnDraftUnload,preparePlan,renderGroups,renderMessages,loadDetail,chatKey,chatEntry,currentChat,chatSupported,chatAttachmentsSupported,buildChatComposer,sendChat,loadChatState,applyChatReceipt,uploadChatFiles,pasteChat,scheduleChatPoll,stopChatPolling,openNativeChat,allSessions,buildContinuePanel,chatReceiptCopy,returnToBoard,readChatClipboard,accountDisplay,sessionAccountLabel,closeChatToolsOutside,closeChatToolsEscape,drawDetail,refreshDetail,loadCapabilities,matches,recoverConnection,networkOffline,poll,select,focusDetailBack,restoreSelectedCardFocus,showLogin,lock,beginAuthEpoch,resizeChatInput,updateViewport,draftKeydown,configureTerminalKeyboard,queueTerminalScroll,flushTerminalScroll,terminalScrollEnd,renderAttention,chatPollDelay,pullRefresh,readingScroll,renderJump,pullDistance,listScroll,setReading,renderPrompt,promptAction,renderUsage,loadUsage,applyTheme,setTheme,updateThemeColor,haptic,navTransition,setDetailShown,chatVisible,sheetRelease,BottomSheet,sheet,openSettings,closeSettings,setTyping,pinchFontSize,setTerminalFontSize,loadXterm,assetUrl,syncEvents,closeEvents,eventsHealthy,renderFreshness,schedule,touchDevice,togglePhaseFilter,renderCounts,createLongPress,swipeIntent,swipeRelease,groupMessageRows,setTextSize,applyTextSize,renderConnectivity,terminalForSession,swipeActionFor,openMessageMenu,openCardMenu,messageActions,outboxShape,outboxMatches,outboxOrigin,settleOutbox,retryOutbox,renderAttachmentTiles,attachmentThumb,sendUpload,openActionSheet,closeActionSheet,setListCollapsed,closeSwipe,settleSwipe,prepareSwipe,runSwipeAction,GESTURE,setChromeVisible,toggleChrome,revealChrome,isChromeTap,snapshotAnnounced,updateChatComposer,capabilitiesRevision,toolKindOf,userMessageParts,formatElapsed,tickWorking,renderTerminalMarks,renderDetailTerminal,terminalsAnnounced,goToSessionTerminal,rememberTerminal,terminalMenu,updateTerminalMenu,chooseTerminalMenu,clearTerminalMenu,renderNewSession,openNewSession,startNewSession})",
     context,
   );
   api.state.csrf = "csrf-test";
@@ -6785,4 +6785,116 @@ test('a terminal opened or closed here shows on its card and header at once, bef
   assert.equal(byClass(cardOf(c, s), 'card-terminal')[0].hidden, true, 'the close answer alone hides it');
   assert.equal(c.get('detail-terminal').hidden, true);
   assert.equal(c.state.terminals.find((item) => item.id === opened.id).closed, true);
+});
+
+// "새 세션": a host's own launcher in a terminal; its numbered menu becomes buttons.
+const LAUNCHER_MENU = ['', '프로젝트 선택', '  1. Alpha project', '  2. Personal', '  q. 취소', '선택:'];
+
+test('a launcher menu is read from the rows above the prompt on the cursor line', () => {
+  const c = client();
+  const menu = c.terminalMenu(LAUNCHER_MENU);
+  assert.equal(menu.title, '프로젝트 선택');
+  assert.equal(menu.prompt, '선택');
+  assert.deepEqual(JSON.parse(JSON.stringify(menu.options)),
+    [{ key: '1', label: 'Alpha project' }, { key: '2', label: 'Personal' }, { key: 'q', label: '취소' }]);
+  // A refused answer and its hint between the rows and the prompt asked again.
+  const retried = c.terminalMenu([...LAUNCHER_MENU.slice(0, -1), '선택: x', '번호를 직접 선택하세요.', '선택:']);
+  assert.equal(retried.options.length, 3);
+  // Not a menu: an answer already typed, no numbered row, a drawn list, a distant prompt.
+  assert.equal(c.terminalMenu([...LAUNCHER_MENU.slice(0, -1), '선택: 1']), null);
+  assert.equal(c.terminalMenu(['계정', '  a. 하나', '  b. 둘', '선택:']), null);
+  assert.equal(c.terminalMenu(['│ 1. Yes      │', '│ 2. No       │', '╰─────────────╯', '› ']), null);
+  assert.equal(c.terminalMenu([...LAUNCHER_MENU.slice(0, -1), ...Array(7).fill('출력'), '선택:']), null);
+  assert.equal(c.terminalMenu(['  1. 하나', '  1. 둘', '선택:']), null);
+});
+
+function menuScreen(c, lines, mode = 'new-session') {
+  c.state.terminal = { id: 'c'.repeat(32), mode };
+  c.state.terminalAlive = true;
+  c.state.term = { buffer: { active: { baseY: 0, cursorY: lines.length - 1,
+    getLine: (y) => ({ translateToString: () => lines[y] }) } } };
+}
+
+test('only a new-session terminal turns a launcher menu into buttons that type the key and Enter', () => {
+  const c = client();
+  const sent = [];
+  c.context.sendInput = (text) => { sent.push(text); return Promise.resolve(); };
+  menuScreen(c, LAUNCHER_MENU, 'attach');
+  c.updateTerminalMenu();
+  assert.equal(c.get('terminal-menu').hidden, true, 'an attached agent CLI never gets menu buttons');
+  menuScreen(c, LAUNCHER_MENU);
+  c.updateTerminalMenu();
+  assert.equal(c.get('terminal-menu').hidden, false);
+  assert.equal(c.get('terminal-menu-title').textContent, '프로젝트 선택');
+  const options = c.get('terminal-menu-options').children;
+  assert.deepEqual(options.map((node) => node.textContent), ['1. Alpha project', '2. Personal', '취소']);
+  assert.match(options[2].className, /cancel/);
+  options[1].events.click();
+  assert.deepEqual(sent, ['2\r']);
+  assert.equal(c.get('terminal-menu').hidden, true, 'hidden until the launcher answers');
+  // The echoed answer is not a menu; the next menu appears with the next output.
+  menuScreen(c, [...LAUNCHER_MENU.slice(0, -1), '선택: 2']);
+  c.updateTerminalMenu();
+  assert.equal(c.get('terminal-menu').hidden, true);
+  menuScreen(c, [...LAUNCHER_MENU.slice(0, -1), '선택: 2', '', '에이전트 선택', '  1. Codex', '  2. Claude Code', '  q. 취소', '선택:']);
+  c.updateTerminalMenu();
+  assert.equal(c.get('terminal-menu-title').textContent, '에이전트 선택');
+  c.state.terminalAlive = false;
+  c.updateTerminalMenu();
+  assert.equal(c.get('terminal-menu').hidden, true, 'an ended terminal shows no menu');
+});
+
+const NEW_SESSION_HOSTS = [
+  { name: 'mini', label: 'Mini', online: true, newSession: { available: true, label: 'launcher' } },
+  { name: 'air', label: 'Air', online: true, newSession: { available: false, label: null, reason: '이 기기에는 새 세션 실행 명령이 설정되지 않았습니다.' } },
+  { name: 'old', label: 'Old', online: false, newSession: { available: true, label: 'launcher' } },
+];
+
+test('the new session chip shows only when a host can open one; the sheet says why others cannot', () => {
+  const c = client();
+  c.state.capabilities = { hosts: NEW_SESSION_HOSTS.slice(1, 2) };
+  c.renderNewSession();
+  assert.equal(c.get('new-session').hidden, true);
+  c.state.capabilities = { hosts: NEW_SESSION_HOSTS };
+  c.renderNewSession();
+  assert.equal(c.get('new-session').hidden, false);
+  c.openNewSession();
+  const rows = c.get('new-session-hosts').children;
+  assert.deepEqual(rows.map((row) => row.disabled), [false, true, true]);
+  assert.match(textOf(rows[0]), /launcher 실행/);
+  assert.match(textOf(rows[1]), /설정되지 않았습니다/);
+  assert.match(textOf(rows[2]), /연결할 수 없습니다/);
+  assert.equal(c.get('new-session-dialog').open, true);
+});
+
+test('opening a new session posts once per host and request, then opens its terminal', async () => {
+  const calls = [];
+  let fail = true;
+  const terminal = { id: 'd'.repeat(32), title: 'launcher', host: 'mini', mode: 'new-session', alive: true };
+  const c = client(async (url, options) => {
+    calls.push({ url, body: options?.body ? JSON.parse(options.body) : null });
+    if (url === '/api/new-session') {
+      if (fail) { fail = false; return { ok: false, status: 409, json: async () => ({ error: '기기 응답 시간이 초과됐습니다.' }) }; }
+      return { ok: true, status: 200, json: async () => ({ terminal, mode: 'new-session' }) };
+    }
+    return { ok: true, status: 200, json: async () => ({ terminals: [terminal] }) };
+  });
+  const opened = [];
+  c.context.openTerminal = async (value) => { opened.push(value.id); };
+  c.state.capabilities = { hosts: NEW_SESSION_HOSTS };
+  c.openNewSession();
+  await c.startNewSession('mini');
+  assert.equal(c.get('new-session-error').hidden, false);
+  assert.match(c.get('new-session-error').textContent, /시간이 초과/);
+  assert.equal(c.get('new-session-dialog').open, true, 'the sheet stays for a retry');
+  await c.startNewSession('mini');
+  const posts = calls.filter((call) => call.url === '/api/new-session');
+  assert.equal(posts.length, 2);
+  assert.equal(posts[0].body.host, 'mini');
+  assert.equal(posts[0].body.requestId, posts[1].body.requestId, 'a retry reuses the request id');
+  assert.deepEqual(opened, [terminal.id]);
+  assert.equal(c.get('new-session-dialog').open, false);
+  assert.ok(c.state.terminals.some((item) => item.id === terminal.id));
+  assert.equal(c.terminalCloseCopy(terminal).action, '실행 종료');
+  assert.equal(c.terminalCloseCopy(terminal).danger, true);
 });

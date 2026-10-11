@@ -381,7 +381,8 @@ def _rpc(request):
         from attachments import receive
         return receive(args)
     if op == 'profiles':
-        return {'profiles': profiles(), 'home': str(Path.home())}
+        from launch import new_session_status
+        return {'profiles': profiles(), 'home': str(Path.home()), 'launcher': new_session_status()}
     if op == 'state': return source_state(args['source'])
     if op == 'interrupt': return interrupt_source(args['source'])
     if op == 'inspect':
@@ -438,9 +439,24 @@ def attach(source):
     os.execve(spec['argv'][0], spec['argv'], spec['env'])
 
 
+def new_session_main():
+    """The terminal step of "새 세션": run this host's own launcher, with its own settings."""
+    from launch import new_session
+    try:
+        spec = new_session()
+        os.chdir(spec['cwd'])
+        os.execve(spec['argv'][0], spec['argv'], spec['env'])
+    except (ValueError, OSError) as exc:
+        message = str(exc) if isinstance(exc, ValueError) else '실행 명령을 시작하지 못했습니다.'
+        print('새 세션을 열지 못했습니다. ' + message, file=sys.stderr)
+        raise SystemExit(1)
+
+
 def _main():
     if len(sys.argv) >= 3 and sys.argv[1] == 'handoff':
         return handoff_main(sys.argv[2:])
+    if len(sys.argv) == 2 and sys.argv[1] == 'new-session':
+        return new_session_main()
     if len(sys.argv) == 3 and sys.argv[1] == 'attach':
         try:
             attach(json.loads(sys.argv[2]))

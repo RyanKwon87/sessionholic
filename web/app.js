@@ -503,6 +503,7 @@ const SHEETS = {
   "usage-dialog": { onDismiss: () => closeSheet("usage-dialog", "usage") },
   "filter-dialog": { onDismiss: () => closeSheet("filter-dialog", "filter-open") },
   "terminals-dialog": { onDismiss: () => closeSheet("terminals-dialog", "running-terminals") },
+  "new-session-dialog": { onDismiss: () => closeNewSession() },
   "action-sheet": { detents: ["medium"], onDismiss: () => closeActionSheet() },
 };
 function sheet(id) {
@@ -608,7 +609,7 @@ function beginAuthEpoch() {
 // deduplicates by requestId, are sent once more with a fresh token. A chat send
 // never is: it waits for a new press (sendChat).
 const CSRF_RETRY = new Set(["/api/chat/state", "/api/chat/prompt", "/api/plan", "/api/launch",
-  "/api/refresh", "/api/usage/refresh"]);
+  "/api/new-session", "/api/refresh", "/api/usage/refresh"]);
 async function api(path, { method = "GET", body, signal, authEpoch = state.authEpoch, csrfRetry = true } = {}) {
   assertAuthEpoch(authEpoch);
   const headers = {};
@@ -4690,6 +4691,13 @@ function terminalCloseCopy(terminal) {
     ended: "이 보드의 연결이 종료되었습니다. 기존 작업 상태는 실행 기기에서 확인하세요.",
     done: "연결을 닫았습니다. 기존 작업에 중단 명령을 보내지 않았습니다.",
   };
+  if (mode === "new-session") return {
+    action: "실행 종료", title: "이 터미널의 실행을 종료할까요?", danger: true,
+    description: "이 보드에서 연 새 세션을 종료합니다. 진행 중인 응답이 중단될 수 있고, 대화 기록은 남습니다.",
+    context: "보드에서 새로 연 세션입니다. 보드로 돌아가거나 브라우저를 닫아도 실행은 유지됩니다.",
+    ended: "새 세션의 실행이 종료되었습니다. 대화 기록은 보드의 작업 목록에서 확인하세요.",
+    done: "새 세션의 실행을 종료했습니다. 대화 기록은 보드의 작업 목록에서 확인하세요.",
+  };
   if (mode === "handoff" || mode === "transfer") return {
     action: "실행 종료", title: "이 터미널의 실행을 종료할까요?", danger: true,
     description: "이 보드에서 새로 시작한 작업을 종료합니다. 진행 중인 응답이 중단될 수 있고, 대화 기록은 남습니다. 이어서 하려면 실행 기기의 최근 작업을 선택하세요.",
@@ -4949,6 +4957,7 @@ async function openTerminal(terminal, { recordHistory = true } = {}) {
   state.inputEpoch++;
   state.inputQueue = Promise.resolve();
   state.inputFailed = false;
+  clearTerminalMenu();
   state.terminal = terminal;
   state.terminalAlive = terminal.alive !== false && !terminal.closed;
   state.terminalVisible = true;
@@ -5112,6 +5121,7 @@ async function startTerminalReader() {
       } else commitCursor();
       if (run !== state.terminalRun) return;
       state.terminalAlive = result.alive !== false;
+      updateTerminalMenu();
       if (!state.terminalAlive) {
         state.terminal.alive = false;
         $("terminal-close").disabled = true;
@@ -5619,6 +5629,145 @@ function renderTerminals() {
   if (selected) updateChatComposer(chatEntry(selected));
 }
 
+// "새 세션": a host's own launcher (settings `launcher`), opened in a board
+// terminal. The launcher, not the board, chooses the project, agent and account.
+function newSessionHosts() {
+  return (state.capabilities?.hosts || []).filter((host) => host.newSession);
+}
+function renderNewSession() {
+  const chip = $("new-session");
+  if (!chip) return;
+  chip.hidden = !newSessionHosts().some((host) => host.newSession.available);
+  if (chip.hidden && $("new-session-dialog")?.open) closeNewSession();
+}
+function newSessionHostMeta(host) {
+  const status = host.newSession;
+  if (host.online === false) return "기기에 연결할 수 없습니다.";
+  if (!status.available) return status.reason || "이 기기에서는 열 수 없습니다.";
+  return `${status.label || "새 세션"} 실행`;
+}
+function renderNewSessionHosts() {
+  const list = $("new-session-hosts");
+  list.replaceChildren();
+  for (const host of newSessionHosts()) {
+    const ready = host.newSession.available && host.online !== false;
+    const node = button("", "new-session-host", () => startNewSession(host.name));
+    node.dataset.host = host.name;
+    node.disabled = !ready || !!state.newSessionBusy;
+    const copy = el("span", "new-session-host-copy");
+    copy.append(
+      el("strong", "new-session-host-title", host.label || host.name),
+      el("span", "new-session-host-meta",
+        state.newSessionBusy === host.name ? "터미널을 여는 중…" : newSessionHostMeta(host)),
+    );
+    const arrow = el("span", null, "↗");
+    arrow.setAttribute("aria-hidden", "true");
+    node.append(copy, arrow);
+    list.append(node);
+  }
+}
+function openNewSession() {
+  // One request id per host while this sheet is open: a retry after a lost
+  // reply returns the same terminal instead of opening a second one.
+  state.newSessionRequests = new Map();
+  $("new-session-error").textContent = "";
+  $("new-session-error").hidden = true;
+  renderNewSessionHosts();
+  sheet("new-session-dialog").open();
+}
+function closeNewSession() {
+  closeSheet("new-session-dialog", "new-session");
+}
+async function startNewSession(hostName) {
+  if (state.newSessionBusy) return;
+  const authEpoch = state.authEpoch;
+  state.newSessionRequests ||= new Map();
+  if (!state.newSessionRequests.has(hostName)) state.newSessionRequests.set(hostName, requestId());
+  state.newSessionBusy = hostName;
+  $("new-session-error").hidden = true;
+  renderNewSessionHosts();
+  try {
+    const result = await api("/api/new-session", {
+      method: "POST",
+      body: { host: hostName, requestId: state.newSessionRequests.get(hostName) }, authEpoch,
+    });
+    assertAuthEpoch(authEpoch);
+    if (!result.terminal?.id) throw new Error("터미널 연결 정보를 받지 못했습니다.");
+    state.newSessionBusy = null;
+    closeSheet("new-session-dialog");
+    rememberTerminal(result.terminal);
+    await openTerminal(result.terminal);
+    refreshTerminals(authEpoch);
+  } catch (err) {
+    if (authEpoch === state.authEpoch && !err.unauthorized && !err.staleAuth) {
+      $("new-session-error").textContent = err.message || "새 세션을 열지 못했습니다.";
+      $("new-session-error").hidden = false;
+    }
+  } finally {
+    state.newSessionBusy = null;
+    if ($("new-session-dialog").open) renderNewSessionHosts();
+  }
+}
+
+// A numbered menu a launcher prints and waits on: rows such as "  1. label"
+// (and "  q. 취소"), then a short prompt such as "선택:" on the cursor's line.
+// A refused answer and its hint may sit between the rows and the new prompt.
+const MENU_ROW = /^\s{0,8}([0-9]{1,2}|[A-Za-z])\.\s+(\S.*)$/;
+function terminalMenu(lines, cursorLine = lines.length - 1) {
+  const prompt = /^(\S[^:：]{0,30})[:：]$/.exec(String(lines[cursorLine] || "").trim());
+  if (!prompt) return null;
+  let index = cursorLine - 1;
+  for (let skipped = 0; index >= 0 && skipped < 6 && !MENU_ROW.test(lines[index] || ""); skipped++) index--;
+  const options = [];
+  for (; index >= 0 && MENU_ROW.test(lines[index] || ""); index--) {
+    const [, key, label] = MENU_ROW.exec(lines[index]);
+    options.unshift({ key, label: label.trim() });
+  }
+  if (!options.some((option) => /^\d+$/.test(option.key)) ||
+      new Set(options.map((option) => option.key.toLowerCase())).size !== options.length)
+    return null;
+  const title = String(lines[index] || "").trim();
+  return { title: title.length <= 80 ? title : "", prompt: prompt[1], options };
+}
+// Only "새 세션" terminals: the agent CLIs that follow in the same terminal
+// draw their own lists, which are never turned into buttons.
+function updateTerminalMenu() {
+  const box = $("terminal-menu");
+  if (!box) return;
+  let menu = null;
+  const buffer = state.term?.buffer?.active;
+  if (buffer && terminalInfo(state.terminal).mode === "new-session" && state.terminalAlive !== false) {
+    const cursor = buffer.baseY + buffer.cursorY;
+    const lines = [];
+    for (let y = Math.max(0, cursor - 40); y <= cursor; y++)
+      lines.push(buffer.getLine(y)?.translateToString(true) || "");
+    menu = terminalMenu(lines);
+  }
+  const signature = menu ? JSON.stringify(menu) : "";
+  if (signature === state.terminalMenuSignature) return;
+  state.terminalMenuSignature = signature;
+  box.hidden = !menu;
+  $("terminal-menu-options").replaceChildren();
+  if (!menu) return;
+  $("terminal-menu-title").textContent = menu.title || menu.prompt;
+  box.setAttribute("aria-label", menu.title || "선택 메뉴");
+  for (const option of menu.options) {
+    const cancel = /^q$/i.test(option.key);
+    $("terminal-menu-options").append(button(cancel ? option.label : `${option.key}. ${option.label}`,
+      `terminal-menu-option${cancel ? " cancel" : ""}`, () => chooseTerminalMenu(option.key)));
+  }
+}
+function clearTerminalMenu() {
+  state.terminalMenuSignature = "";
+  if ($("terminal-menu")) $("terminal-menu").hidden = true;
+  $("terminal-menu-options")?.replaceChildren();
+}
+function chooseTerminalMenu(key) {
+  // Hidden at once; the launcher's echo and next menu (if any) follow as output.
+  clearTerminalMenu();
+  sendInput(`${key}\r`).catch(() => {});
+}
+
 function closeTerminal(id) {
   if (state.terminalCloseBusy) return;
   if ($("close-terminal-dialog").open) {
@@ -5879,6 +6028,7 @@ async function loadCapabilities(authEpoch = state.authEpoch, { refreshView = tru
   assertAuthEpoch(authEpoch);
   state.capabilities = capabilities;
   state.csrf = state.capabilities.csrfToken || "";
+  renderNewSession();
   $("logout").hidden = state.capabilities.authMode === "tailscale";
   if ($("settings-lock")) $("settings-lock").hidden = $("logout").hidden;
   if (accountFilter && state.filters.account === accountFilter && previousRoutes?.size) {
@@ -6320,10 +6470,13 @@ window.addEventListener("DOMContentLoaded", () => {
   $("filter-reset").addEventListener("click", resetFilters);
   $("running-terminals").addEventListener("click", () => sheet("terminals-dialog").open());
   $("terminals-close").addEventListener("click", () => closeSheet("terminals-dialog", "running-terminals"));
+  $("new-session").addEventListener("click", () => openNewSession());
+  $("new-session-close").addEventListener("click", () => closeNewSession());
   $("action-close").addEventListener("click", () => closeActionSheet());
   for (const [id, close] of [["usage-dialog", () => closeSheet("usage-dialog", "usage")],
     ["filter-dialog", () => closeSheet("filter-dialog", "filter-open")],
     ["terminals-dialog", () => closeSheet("terminals-dialog", "running-terminals")],
+    ["new-session-dialog", () => closeNewSession()],
     ["action-sheet", () => closeActionSheet()]])
     $(id).addEventListener("cancel", (event) => {
       event.preventDefault();

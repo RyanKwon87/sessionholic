@@ -68,6 +68,8 @@ flowchart LR
 - `attachments.gitExclude`: 기본 `true`. `false`면 업로드 때 저장소의 `.git/info/exclude`를 쓰지 않습니다.
 - `usage`: 보드 호스트의 사용량 도우미(`usage.py`). `provider: "helper"`, `resources`·`python`·`path`, Codex(`codex`, `codexHelper`, `codexAccounts: [{key, label}]`)·Claude(`claude`, `claudeHelper`) 중 하나 이상, `intervalSeconds`(기본 300)·`manualIntervalSeconds`(기본 20). 없으면 `/api/usage`는 404이고 화면은 사용량을 숨깁니다.
 
+- `launcher`: `{command, label, cwd}`. 목록의 "새 세션"이 이 기기의 터미널에서 여는 실행 명령입니다. `command[0]`은 절대 경로나 `~/` 경로이고, `label`(기본 "새 세션")은 화면 이름, `cwd`(기본 홈 폴더)는 시작 폴더입니다. 보드는 명령을 열기만 하고, 프로젝트·에이전트·계정 선택과 그 검사는 실행 명령이 맡습니다. 원격 기기는 그 기기의 설정으로 실행하며, 환경 변수는 일반 터미널 변수(`PATH`·`LANG`·`TERM` 등과 사용자의 `SSH_AUTH_SOCK`)만 넘깁니다. 실행 명령이 `  1. 이름` 줄과 `선택:` 같은 입력 줄로 번호 메뉴를 보이면, 화면은 그 메뉴를 버튼으로 보여 주고 누르면 번호와 Enter를 입력합니다. 없으면 "새 세션"은 숨겨집니다.
+
 기기 목록·SSH 별칭과 HTTP 서버 실행 옵션은 설치 안내의 예시 설정을 따릅니다. 외부 주소, 호스트, 계정, 토큰을 코드나 문서 예시에 고정하지 않습니다.
 
 ## 상태 보관

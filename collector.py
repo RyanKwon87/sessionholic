@@ -690,6 +690,17 @@ def state_db(path):
     return best[1] if best else None
 
 
+def _open_read_only(sqlite3, database, immutable=False):
+    connection = sqlite3.connect(database.resolve().as_uri() + "?mode=ro" + ("&immutable=1" if immutable else ""),
+                                 uri=True, timeout=2)
+    try:
+        connection.execute("PRAGMA schema_version").fetchone()
+    except sqlite3.Error:
+        connection.close()
+        raise
+    return connection
+
+
 def codex_db_threads(path):
     """(listed, loaded, failure) like `codex_home_threads`, read from the home's state DB
     without a daemon: its newest interactive threads, none loaded. Nothing starts or writes."""
@@ -698,7 +709,12 @@ def codex_db_threads(path):
     if database is None:
         return None, None, "read"
     try:
-        connection = sqlite3.connect(database.resolve().as_uri() + "?mode=ro", uri=True, timeout=2)
+        try:
+            connection = _open_read_only(sqlite3, database)
+        except sqlite3.OperationalError:
+            # A WAL database whose daemon left no -shm cannot be opened read only, and
+            # nothing may create one here. With no daemon writing, read it as immutable.
+            connection = _open_read_only(sqlite3, database, immutable=True)
         try:
             columns = {row[1] for row in connection.execute("PRAGMA table_info(threads)")}
             if not {"id", "cwd", "title", "created_at", "updated_at", "archived", "source"} <= columns:

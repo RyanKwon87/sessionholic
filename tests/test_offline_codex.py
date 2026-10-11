@@ -94,6 +94,20 @@ class OfflineHomeTest(unittest.TestCase):
         self.assertEqual([r['home'] for r in rows], ['.codex-live'])
         self.assertEqual(errors, ['Codex(기본) 기록을 읽지 못했습니다.'])
 
+    def test_a_wal_database_left_without_its_shm_is_read_as_immutable_and_never_written(self):
+        folder = self.home / '.codex-left'
+        state_db(folder, [('019a0000-0000-7000-8000-000000000007', 1, 2, 'cli', '/l', '남은 작업', 0, '', '', None)])
+        connection = sqlite3.connect(str(folder / 'state_5.sqlite'))
+        connection.execute('PRAGMA journal_mode=WAL')
+        connection.close()
+        for extra in ('state_5.sqlite-shm', 'state_5.sqlite-wal'):
+            (folder / extra).unlink(missing_ok=True)
+        before = sorted(p.name for p in folder.iterdir())
+        listed, _, failure = collector.codex_db_threads(folder)
+        self.assertIsNone(failure)
+        self.assertEqual([t['preview'] for t in listed['data']], ['남은 작업'])
+        self.assertEqual(sorted(p.name for p in folder.iterdir()), before)
+
     def test_reading_a_thread_of_a_home_without_a_daemon_says_why(self):
         result = collector.read('codex', '019a0000-0000-7000-8000-000000000001', '.codex')
         self.assertEqual((result['messages'], result['code']), ([], 'app_server_off'))

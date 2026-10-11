@@ -6899,6 +6899,18 @@ test('opening a new session posts once per host and request, then opens its term
   assert.equal(c.terminalCloseCopy(terminal).danger, true);
 });
 
+test('a new-session terminal belongs to the session the server linked it to, and only then', () => {
+  const c = client(async () => ({ ok: true, status: 200, json: async () => ({ ok: true }) }), noChatTimers);
+  const s = recentSession('launched-here', { home: '.codex', id: '019a0000-0000-7000-8000-000000000004' });
+  const terminal = { id: 'e'.repeat(32), alive: true, title: 'zz', mode: 'new-session', host: 'workstation',
+    metadata: { mode: 'new-session', host: 'workstation', title: 'zz', createdAt: 1000 } };
+  c.state.terminals = [terminal];
+  assert.equal(c.terminalForSession(s), null, 'no session is guessed in the browser');
+  c.state.terminals = [{ ...terminal, nativeSource: { host: s.host, agent: 'codex', id: s.id, home: '.codex', cwd: '/work' },
+    metadata: { ...terminal.metadata, nativeSource: { host: s.host, agent: 'codex', id: s.id, home: '.codex', cwd: '/work' } } }];
+  assert.equal(c.terminalForSession(s)?.id, terminal.id);
+});
+
 // A Codex account without its app-server: listed from its state DB; "앱 서버 켜기" starts it.
 test('a conversation of an account whose app-server is off offers to start it, then reads again', async () => {
   const calls = [];

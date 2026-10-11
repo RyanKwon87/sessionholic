@@ -182,6 +182,8 @@ class WorkflowNewSessionTest(unittest.TestCase):
         self.assertEqual(len(self.terms.created), 1)
         created = self.terms.created[0]
         self.assertEqual((created['key'], created['argv'], created['cwd']), ('new-session:request-0001', ['/bin/sh'], '/tmp'))
+        opened = created['metadata'].pop('createdAt')
+        self.assertEqual(type(opened), int)
         self.assertEqual(created['metadata'], {'title': '런처', 'host': 'local', 'mode': 'new-session'})
         self.assertEqual(first['mode'], 'new-session')
         with self.assertRaisesRegex(ValueError, '이미 사용한 요청'):
@@ -236,6 +238,82 @@ class TransfersLauncherTest(unittest.TestCase):
                 missing = flow.launcher(REMOTE, refresh=True)
                 self.assertEqual((missing['available'], missing['label']), (False, None))
                 self.assertEqual(flow.launcher(REMOTE, refresh=True), {'available': False, 'label': None, 'reason': None})
+
+
+class LinkTerminals(FakeTerminals):
+    """Terminals as the board lists them, with the native session a terminal records."""
+    def __init__(self, rows):
+        super().__init__()
+        self.rows = rows
+        self.linked = []
+
+    def list(self):
+        return [dict(row) for row in self.rows]
+
+    def link_native(self, terminal_id, native):
+        row = next(row for row in self.rows if row['id'] == terminal_id)
+        if row.get('nativeSource'):
+            return False
+        row['nativeSource'] = native
+        self.linked.append((terminal_id, native))
+        return True
+
+
+def codex_row(suffix, started, **fields):
+    return {'id': '019a0000-0000-7000-8000-00000000000' + suffix, 'home': '.codex', 'cwd': '/work/project',
+            'startedAt': started, 'source': 'vscode', **fields}
+
+
+class LinkNewSessionTest(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(dir='/tmp', prefix='sh-link-')
+        self.addCleanup(self.temp.cleanup)
+        self.rows = {'local': {'codex': [], 'claude': []}, 'remote': {'codex': [], 'claude': []}}
+        runner = lambda host, args, timeout: {**self.rows[host['name']], 'errors': []}
+        self.board = server.Board([LOCAL, REMOTE], 60, runner)
+        self.terminal = {'id': 'f' * 32, 'mode': 'new-session', 'host': 'remote', 'alive': True, 'closed': False,
+                         'createdAt': 1000}
+        self.terms = LinkTerminals([self.terminal])
+        self.flow = server.Workflow(self.board, self.terms, self.temp.name)
+
+    def link(self):
+        for host in (LOCAL, REMOTE):
+            self.board.poll(host)
+        self.flow.link_new_sessions()
+        return [native for _, native in self.terms.linked]
+
+    def test_the_first_interactive_session_after_the_terminal_opened_on_its_host_is_its_own(self):
+        self.rows['remote']['codex'] = [codex_row('1', 900), codex_row('2', 1060, source='exec'),
+                                        codex_row('3', 1100), codex_row('4', 1050)]
+        self.rows['remote']['claude'] = [{'id': 'bg-agent-1', 'kind': 'background', 'cwd': '/work', 'startedAt': 1001}]
+        self.rows['local']['codex'] = [codex_row('5', 1001)]
+        self.assertEqual(self.link(), [{'host': 'remote', 'agent': 'codex', 'id': codex_row('4', 0)['id'],
+                                        'home': '.codex', 'cwd': '/work/project'}])
+        # Recorded once: a later, earlier-looking session never moves it.
+        self.rows['remote']['codex'].append(codex_row('6', 1010))
+        self.assertEqual(len(self.link()), 1)
+
+    def test_a_claude_session_counts_with_its_session_id(self):
+        self.rows['remote']['claude'] = [{'id': 'agent-0001', 'kind': 'interactive', 'cwd': '/work/project',
+                                          'sessionId': '0f9c3a52-1b7e-4c1a-9d6e-5a4b3c2d1e0f', 'startedAt': 1020}]
+        self.assertEqual(self.link(), [{'host': 'remote', 'agent': 'claude', 'id': 'agent-0001', 'home': None,
+                                        'cwd': '/work/project', 'kind': 'interactive',
+                                        'sessionId': '0f9c3a52-1b7e-4c1a-9d6e-5a4b3c2d1e0f'}])
+
+    def test_nothing_is_taken_late_twice_or_for_an_ended_terminal(self):
+        # Too late, already another terminal's, or the terminal ended: no link.
+        self.rows['remote']['codex'] = [codex_row('1', 1000 + server.Workflow.LINK_WINDOW + 1)]
+        self.assertEqual(self.link(), [])
+        self.rows['remote']['codex'] = [codex_row('2', 1005)]
+        self.terms.rows.append({'id': 'a' * 32, 'mode': 'handoff', 'host': 'remote', 'alive': True,
+                                'nativeSource': {'host': 'remote', 'agent': 'codex', 'id': codex_row('2', 0)['id'],
+                                                 'home': '.codex', 'cwd': '/work/project'}})
+        self.assertEqual(self.link(), [])
+        self.terms.rows.pop()
+        self.terminal['alive'] = False
+        self.assertEqual(self.link(), [])
+        self.terminal.update(alive=True, createdAt=None)
+        self.assertEqual(self.link(), [])
 
 
 if __name__ == '__main__':

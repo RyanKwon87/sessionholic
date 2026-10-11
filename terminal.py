@@ -686,6 +686,24 @@ class TerminalManager:
                 raise RuntimeError("터미널 크기를 변경하지 못했습니다.") from None
         return {"ok": True}
 
+    def link_native(self, terminal_id, native):
+        """Record, once, the native session a terminal turned out to run (a launcher's new
+        session). A terminal that already names one keeps it."""
+        with self.lock:
+            terminal = self._get(terminal_id)
+            if terminal.record["metadata"].get("nativeSource"):
+                return False
+            metadata = _metadata({**terminal.record["metadata"], "nativeSource": native})
+            previous = terminal.record["metadata"]
+            terminal.record["metadata"] = metadata
+            try:
+                self._save()
+            except BaseException:
+                terminal.record["metadata"] = previous
+                raise
+        self._changed()
+        return True
+
     def list(self):
         with self.lock:
             result = []

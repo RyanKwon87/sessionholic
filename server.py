@@ -29,6 +29,7 @@ import sys
 import threading
 import time
 import traceback
+import uuid
 from urllib.parse import parse_qs, urlparse, unquote
 import instance
 import settings
@@ -1271,12 +1272,83 @@ class Workflow:
                                                                  "new-session"], tty=True),
                             "cwd": str(Path.home()), "env": collector.tool_env()}
                 terminal = self.terminals.create(key, spec["argv"], spec["cwd"], spec["env"],
-                                                 {"title": label, "host": host["name"], "mode": "new-session"})
+                                                 {"title": label, "host": host["name"], "mode": "new-session",
+                                                  "createdAt": int(time.time())})
             result = {"terminal": terminal, "mode": "new-session"}
             self.requests[request_id] = (("new-session", host["name"]), result)
             if len(self.requests) > 256:
                 self.requests.pop(next(iter(self.requests)))
             return result
+
+    LINK_WINDOW = 1800  # a launcher's first session counts within 30 minutes of its terminal
+
+    def link_new_sessions(self):
+        """A "새 세션" terminal names no session when it opens; its launcher starts one later.
+        The earliest session that appears on its host after it opened (30 seconds of clock
+        difference allowed), and no other terminal names, is recorded as its own, once: its
+        card then shows "터미널 열림" and continuing it opens this terminal. Automated runs
+        (Codex `exec`, Claude background agents) are never taken."""
+        record = getattr(self.terminals, "link_native", None)
+        if record is None:
+            return
+        try:
+            terminals = self.terminals.list()
+        except (RuntimeError, OSError, ValueError):
+            return
+        pending = sorted((t for t in terminals if t.get("mode") == "new-session" and t.get("alive")
+                          and not t.get("closed") and not t.get("nativeSource")
+                          and type(t.get("createdAt")) is int), key=lambda t: t["createdAt"])
+        if not pending:
+            return
+        taken = {json.dumps(self.identity(t["nativeSource"]), sort_keys=True) for t in terminals
+                 if isinstance(t.get("nativeSource"), dict)}
+        for terminal in pending:
+            host = terminal.get("host")
+            data = (self.board.state.get(host) or {}).get("data") or {}
+            opened = terminal["createdAt"]
+            candidates = []
+            for agent in ("codex", "claude"):
+                for row in data.get(agent) or []:
+                    native = self._native_of(host, agent, row)
+                    started = row.get("startedAt")
+                    if (native is None or type(started) is not int
+                            or not opened - 30 <= started <= opened + self.LINK_WINDOW
+                            or json.dumps(self.identity(native), sort_keys=True) in taken):
+                        continue
+                    candidates.append((started, native))
+            if not candidates:
+                continue
+            native = min(candidates, key=lambda item: item[0])[1]
+            try:
+                if record(terminal["id"], native):
+                    taken.add(json.dumps(self.identity(native), sort_keys=True))
+            except (KeyError, ValueError, RuntimeError, OSError):
+                continue
+
+    @staticmethod
+    def _native_of(host, agent, row):
+        """A listed row as a terminal's native session, or None for rows that never count."""
+        cwd = row.get("cwd")
+        if not isinstance(cwd, str) or not cwd.startswith("/"):
+            return None
+        if agent == "codex":
+            if row.get("source") not in (None, "cli", "vscode") or not HOME_KEY.match(row.get("home") or ""):
+                return None
+            try:
+                identifier = str(uuid.UUID(str(row.get("id"))))
+            except ValueError:
+                return None
+            return {"host": host, "agent": "codex", "id": identifier, "home": row["home"], "cwd": cwd}
+        identifier = row.get("id")
+        if (row.get("kind") == "background" or not isinstance(identifier, str)
+                or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{3,127}", identifier)):
+            return None
+        native = {"host": host, "agent": "claude", "id": identifier, "home": None, "cwd": cwd}
+        if row.get("kind") == "interactive":
+            native["kind"] = "interactive"
+        if isinstance(row.get("sessionId"), str) and re.fullmatch(r"[0-9A-Za-z-]{8,64}", row["sessionId"]):
+            native["sessionId"] = row["sessionId"]
+        return native
 
     @staticmethod
     def identity(row):
@@ -1773,6 +1845,7 @@ class Handler(BaseHTTPRequestHandler):
                 if url.path == "/api/terminals":
                     # Read before the list: a change in between is announced with a newer
                     # version, so the client reads again rather than missing it.
+                    self.server.workflow.link_new_sessions()
                     version = self.server.events.terminals_version
                     records = self.server.terminals.list()
                     result = {"terminals": records, "version": version}
@@ -1800,6 +1873,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def snapshot(self):
         """The board's snapshot with this server process's bootId."""
+        # A "새 세션" terminal's session may have appeared in this snapshot.
+        self.server.workflow.link_new_sessions()
         return {**self.server.board.snapshot(), "bootId": self.server.boot_id}
 
     def stream_events(self, query):

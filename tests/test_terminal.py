@@ -611,6 +611,24 @@ class TmuxFixtureTest(unittest.TestCase):
                 return after
         self.fail("synthetic fixture terminal output did not arrive")
 
+    def test_a_terminal_records_its_native_session_once_and_keeps_it(self):
+        created = self.create()
+        changes = []
+        self.manager.add_listener(lambda: changes.append(1))
+        native = {"host": "local", "agent": "codex", "id": "019a0000-0000-7000-8000-000000000001",
+                  "home": ".codex", "cwd": "/tmp/work"}
+        with self.assertRaises(ValueError):
+            self.manager.link_native(created["id"], {**native, "id": "not-a-uuid"})
+        self.assertTrue(self.manager.link_native(created["id"], native))
+        self.assertFalse(self.manager.link_native(created["id"], {**native, "id": native["id"][:-1] + "2"}))
+        self.assertEqual(changes, [1])
+        listed = next(row for row in self.manager.list() if row["id"] == created["id"])
+        self.assertEqual(listed["nativeSource"], native)
+        self.manager.close()
+        replacement = terminal.TerminalManager(state_dir=self.directory.name, socket_name=self.socket)
+        self.managers.append(replacement)
+        self.assertEqual(next(row for row in replacement.list() if row["id"] == created["id"])["nativeSource"], native)
+
     def test_a_row_saved_without_a_socket_joins_the_socket_it_is_found_on(self):
         created = self.create()
         self.wait_for(self.manager, created["id"], b"FIXTURE_READY")

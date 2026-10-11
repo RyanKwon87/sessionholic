@@ -690,6 +690,16 @@ def state_db(path):
     return best[1] if best else None
 
 
+def _wal_without_index(database):
+    """A database in WAL mode (header byte 18 is 2) with no `-shm` beside it."""
+    try:
+        with open(str(database), "rb") as stream:
+            header = stream.read(20)
+    except OSError:
+        return False
+    return len(header) == 20 and header[18] == 2 and not Path(str(database) + "-shm").exists()
+
+
 def _open_read_only(sqlite3, database, immutable=False):
     connection = sqlite3.connect(database.resolve().as_uri() + "?mode=ro" + ("&immutable=1" if immutable else ""),
                                  uri=True, timeout=2)
@@ -709,12 +719,16 @@ def codex_db_threads(path):
     if database is None:
         return None, None, "read"
     try:
-        try:
-            connection = _open_read_only(sqlite3, database)
-        except sqlite3.OperationalError:
-            # A WAL database whose daemon left no -shm cannot be opened read only, and
-            # nothing may create one here. With no daemon writing, read it as immutable.
+        # A WAL database whose daemon left no -shm index: a read-only connection either
+        # fails (older SQLite) or creates the index (newer). Nothing may be created in the
+        # account's home, so with no daemon writing it is read as immutable.
+        if _wal_without_index(database):
             connection = _open_read_only(sqlite3, database, immutable=True)
+        else:
+            try:
+                connection = _open_read_only(sqlite3, database)
+            except sqlite3.OperationalError:
+                connection = _open_read_only(sqlite3, database, immutable=True)
         try:
             columns = {row[1] for row in connection.execute("PRAGMA table_info(threads)")}
             if not {"id", "cwd", "title", "created_at", "updated_at", "archived", "source"} <= columns:

@@ -58,7 +58,9 @@ class OfflineHomeTest(unittest.TestCase):
         self.assertEqual([key for key, _ in collector.codex_homes()], ['.codex-live'])
         self.assertEqual([key for key, _ in collector.codex_offline_homes()], ['.codex'])
         before = (self.home / '.codex/state_5.sqlite').read_bytes()
+        names = sorted(p.name for p in (self.home / '.codex').iterdir())
         listed, loaded, failure = collector.codex_db_threads(self.home / '.codex')
+        self.assertEqual(sorted(p.name for p in (self.home / '.codex').iterdir()), names)
         self.assertEqual((loaded, failure), (set(), None))
         # Interactive, not archived, newest first; no exec run.
         self.assertEqual([t['id'][-1] for t in listed['data']], ['2', '1'])

@@ -1230,8 +1230,17 @@ class Workflow:
                 allowed, reason = False, (profile or {}).get("reason") or "이 계정의 저장된 로그인을 확인해 주세요."
         elif same:
             profile = {"id": current, "agent": source["agent"], "home": source.get("home", ".claude"), "label": source.get("account") or "현재 계정", "available": True}
+        elif not self.board.state[host["name"]]["ok"]:
+            allowed, reason = False, "원격 기기의 연결을 확인한 뒤 다시 시도해 주세요."
         else:
-            allowed, reason = False, "원격 기기의 계정 전환은 해당 기기에 실행 연결을 설치한 뒤 사용할 수 있어요."
+            # Another agent or account on the same remote host: that host's helper prepares it.
+            try:
+                choices = self.transfers.profiles(host, refresh=True)
+                profile = next((p for p in choices if p["id"] == target["account"] and p["agent"] == target["agent"]), None)
+                if not profile or not profile.get("available"):
+                    allowed, reason = False, (profile or {}).get("reason") or "원격 기기의 대상 계정을 확인해 주세요."
+            except (ValueError, RuntimeError, OSError) as exc:
+                allowed, reason = False, str(exc) or "원격 기기의 실행 연결을 확인하지 못했습니다."
         if not source["online"]:
             allowed, reason = False, "원본 기기의 연결을 확인한 뒤 다시 시도해 주세요."
         if not same and not cross_host and source.get("phase") in ("working", "needs_input"):
@@ -1341,6 +1350,12 @@ class Workflow:
                     spec = build_launch(source, {**profile, "host": source["host"]}, messages, self.state_dir)
                     from managed_launch import bind
                     spec = bind(spec, profile, source["host"], receipt_path=self.state_dir / "native-launches" / (key_base + ".json"))
+                elif plan["mode"] == "handoff":
+                    result = self.board.read(source["host"], source["agent"], source.get("sessionId") or source["id"], source.get("home"), fresh=True)
+                    if result.get("error"):
+                        raise RuntimeError("원본 대화를 읽지 못해 인계를 중단했어요.")
+                    spec = self.remote_handoff(host, source, plan["target"], profile, request_id, key_base,
+                                               result.get("messages") or [])
                 else:
                     spec = self.remote_attach(host, source)
                 metadata = {"title": source.get("title") or "작업", "host": plan["target"]["host"], "agent": profile["agent"],
@@ -1382,6 +1397,57 @@ class Workflow:
                 if len(self.requests) > 256:
                     self.requests.pop(next(iter(self.requests)))
                 return result
+
+    def remote_handoff(self, host, source, target, profile, request_id, route_key, messages):
+        """Another agent or account on the same remote host, prepared and run by that host.
+
+        The host's helper decides the boundary again with its own rules, writes the handoff
+        document, binds the first input (`stage_handoff`) and reports the new native identity.
+        The terminal then runs its `handoff <token>` step, which execs the prepared launch once.
+        """
+        from transfer import PRE_BIND_STAGES, UNKNOWN_HANDOFF, WorkerError
+        from transfer_worker import handoff_token, SELECTOR
+        token = handoff_token(request_id)
+        # A durable request record: one board request never stages twice, even after a restart.
+        marker = self.state_dir / "handoffs" / (token + ".json")
+        if os.path.lexists(marker):
+            raise ValueError("이미 처리한 인계 요청입니다. 열린 터미널이나 원격 기기의 작업 목록을 확인해 주세요.")
+        record = {"token": token, "host": host["name"], "status": "staging", "startedAt": int(time.time())}
+        private_json(marker, record)
+        selector = {key: source.get(key) for key in SELECTOR}
+        try:
+            prepared = self.transfers.rpc(host, "stage_handoff", {
+                "source": selector, "target": target, "messages": messages,
+                "requestId": request_id, "routeKey": route_key}, timeout=120)
+            if (not isinstance(prepared, dict) or prepared.get("token") != token
+                    or not isinstance(prepared.get("cwd"), str) or not prepared["cwd"].startswith("/")):
+                raise RuntimeError("원격 인계 준비 응답이 올바르지 않습니다.")
+        except WorkerError as exc:
+            record.update(status="failed", error=str(exc)[:1000], updatedAt=int(time.time()))
+            private_json(marker, record)
+            # Refused before any native session was bound: nothing started there.
+            if exc.stage in PRE_BIND_STAGES or exc.stage == "prepared":
+                raise ValueError(str(exc)) from None
+            raise RuntimeError(UNKNOWN_HANDOFF) from None
+        except (OSError, RuntimeError, ValueError):
+            record.update(status="unknown", updatedAt=int(time.time()))
+            private_json(marker, record)
+            raise RuntimeError(UNKNOWN_HANDOFF) from None
+        native = prepared.get("nativeSource")
+        keys = ("host", "agent", "id", "home", "cwd", "kind", "sessionId")
+        if (not isinstance(native, dict) or native.get("host") != host["name"]
+                or native.get("agent") != profile["agent"]):
+            native = None
+        else:
+            native = {key: native[key] for key in keys if key in native}
+        record.update(status="prepared", updatedAt=int(time.time()))
+        private_json(marker, record)
+        import collector
+        return {"argv": self.transfers.command(host, ["-I", self.transfers.runtime_paths[host["name"]],
+                "handoff", token], tty=True),
+                "cwd": str(Path.home()), "env": collector.tool_env(), "destinationCwd": prepared["cwd"],
+                "nativeSource": native,
+                "connectionMode": "attach" if prepared.get("connectionMode") == "attach" else None}
 
     def remote_attach(self, host, source):
         # The owning helper resolves binaries and explicit environment settings.

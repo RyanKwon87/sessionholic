@@ -6,6 +6,7 @@ import hashlib
 import concurrent.futures
 import os
 import shutil
+import stat
 import subprocess
 import sys
 import threading
@@ -17,6 +18,8 @@ import unittest
 from unittest.mock import patch
 import zipfile
 
+import collector
+import launch
 import server
 import transfer
 from transfer import Transfers, WorkerError
@@ -850,6 +853,553 @@ class LocalTransferEndToEndTest(unittest.TestCase):
 def transfer_workspace_env():
     import transfer_workspace
     return transfer_workspace._git_env()
+
+
+# Another agent or account on the same remote host (remote handoff). The board plans with
+# names only, the remote helper stages (validate, build, bind) with its own rules, and the
+# terminal runs the helper's `handoff <token>` step. HOME is a temporary folder; app-servers,
+# CLIs and SSH are fixtures. No agent or model is started.
+HANDOFF_CONFIG = {
+    'version': 2,
+    'environments': {
+        'default': {'label': 'Standard'},
+        'private': {'label': 'Private', 'variables': {'GIT_CONFIG_NOSYSTEM': '1'}},
+    },
+    'profileRules': [{'agent': 'codex', 'homePrefix': '.codex-private', 'environment': 'private'}],
+    'projects': [{'id': 'private', 'label': 'Private', 'root': 'Private', 'match': 'component',
+                  'environment': 'private'}],
+}
+CLAUDE_SOURCE = {'host': 'air', 'agent': 'claude', 'id': 'claude-agent-0001', 'home': '.claude',
+                 'sessionId': '0f9c3a52-1b7e-4c1a-9d6e-5a4b3c2d1e0f', 'kind': 'interactive', 'phase': 'idle'}
+CODEX_SOURCE = {'host': 'air', 'agent': 'codex', 'id': '019aaaaa-0000-7000-8000-000000000001',
+                'home': '.codex', 'phase': 'idle'}
+HANDOFF_MESSAGES = [{'role': 'user', 'text': '이 작업을 이어서 진행해 주세요.'},
+            {'role': 'assistant', 'text': '테스트를 추가했습니다.'}]
+NATIVE_ID = '019bbbbb-0000-7000-8000-000000000002'
+HANDOFF_ROUTE = 'c' * 64
+
+
+def file_mode(path):
+    return stat.S_IMODE(os.stat(path).st_mode)
+
+
+class RemoteHandoffHome(unittest.TestCase):
+    """A fake remote HOME with two Codex homes, Claude and fixture binaries that never run."""
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(dir='/tmp', prefix='sh-handoff-')
+        self.addCleanup(self.temp.cleanup)
+        self.home = Path(self.temp.name).resolve()
+        config = self.home / '.config/sessionholic/config.json'
+        config.parent.mkdir(parents=True, mode=0o700)
+        config.write_text(json.dumps(HANDOFF_CONFIG))
+        for key in ('.codex', '.codex-private'):
+            (self.home / key).mkdir()
+            (self.home / key / 'auth.json').write_text('fixture-only-never-read')
+        (self.home / '.claude').mkdir()
+        binaries = self.home / '.local/bin'
+        binaries.mkdir(parents=True)
+        for name in ('claude', 'codex'):
+            (binaries / name).write_text('#!/bin/sh\nexit 1\n')
+            (binaries / name).chmod(0o700)
+        self.work = self.home / 'Work/project'
+        self.work.mkdir(parents=True)
+        self.private = self.home / 'Private/notes'
+        self.private.mkdir(parents=True)
+        self.native_calls = []
+        test = self
+
+        class Native:
+            def __enter__(self): return self
+            def __exit__(self, *args): pass
+            def call(self, method, params):
+                test.native_calls.append(method)
+                if method == 'thread/start':
+                    return {'thread': {'id': NATIVE_ID, 'cwd': params['cwd']}}
+                if method == 'thread/read':
+                    return {'thread': {'id': NATIVE_ID, 'turns': [{'id': 'fixture-turn'}]}}
+                return {'turn': {'id': 'fixture-turn'}}
+        self.socket = patch('transfer_native._socket_path', return_value=self.home / 'fixture.sock')
+        # Only the fixture binaries: an installed CLI on this machine is never chosen.
+        fixture = lambda agent, home: str(home / '.local/bin' / agent) if (home / '.local/bin' / agent).exists() else None
+        for patcher in (patch.dict(os.environ, {'HOME': str(self.home)}),
+                        patch.object(collector, 'HOME', self.home),
+                        patch.object(launch, '_binary', side_effect=fixture),
+                        self.socket,
+                        patch('native_chat._client', side_effect=lambda *a: Native())):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.handoffs = self.home / '.local/state/sessionholic-transfers/handoffs'
+
+    def args(self, source=CLAUDE_SOURCE, account='codex:.codex', agent='codex', request='request-0001',
+             cwd=None, messages=HANDOFF_MESSAGES):
+        return {'source': {**source, 'cwd': str(cwd or self.work)},
+                'target': {'host': source['host'], 'agent': agent, 'account': account},
+                'messages': messages, 'requestId': request, 'routeKey': HANDOFF_ROUTE}
+
+    def stage(self, **kwargs):
+        return transfer_worker.rpc({'op': 'stage_handoff', 'args': self.args(**kwargs)})
+
+    def refused(self, **kwargs):
+        with self.assertRaises(ValueError) as caught:
+            self.stage(**kwargs)
+        return caught.exception
+
+
+class StageHandoffTest(RemoteHandoffHome):
+    def test_stage_writes_private_launch_and_binds_the_first_input_once(self):
+        result = self.stage()
+        token = transfer_worker.handoff_token('request-0001')
+        self.assertEqual(result['token'], token)
+        self.assertEqual(result['cwd'], str(self.work))
+        self.assertEqual(result['connectionMode'], 'attach')
+        self.assertEqual(result['nativeSource'], {'host': 'air', 'agent': 'codex', 'home': '.codex',
+                                                  'cwd': str(self.work), 'id': NATIVE_ID})
+        self.assertEqual(self.native_calls.count('thread/start'), 1)
+        self.assertEqual(self.native_calls.count('turn/start'), 1)
+        folder = self.handoffs / token
+        for path in (self.handoffs, folder):
+            self.assertEqual(file_mode(path), 0o700, path)
+        launch_file = folder / 'launch.json'
+        document = next(folder.glob('handoff-*.md'))
+        receipt = self.handoffs / 'native-launches' / (HANDOFF_ROUTE + '.json')
+        for path in (launch_file, document, receipt):
+            self.assertEqual(file_mode(path), 0o600, path)
+        saved = json.loads(launch_file.read_text())
+        self.assertEqual(saved['requestId'], 'request-0001')
+        self.assertEqual(saved['source']['sessionId'], CLAUDE_SOURCE['sessionId'])
+        self.assertEqual(saved['target'], {'host': 'air', 'agent': 'codex', 'account': 'codex:.codex'})
+        self.assertEqual(saved['argv'][0], str(self.home / '.local/bin/codex'))
+        self.assertEqual(saved['argv'][1:3], ['resume', NATIVE_ID])
+        self.assertEqual(saved['env']['CODEX_HOME'], str(self.home / '.codex'))
+        self.assertEqual(saved['handoffPath'], str(document))
+        self.assertIn('이 작업을 이어서 진행해 주세요.', document.read_text())
+
+    def test_same_request_is_processed_once(self):
+        self.stage()
+        error = self.refused()
+        self.assertEqual(error.transfer_stage, 'prepared')
+        self.assertIn('이미 처리한 인계 요청', str(error))
+        self.assertEqual(self.native_calls.count('turn/start'), 1)
+        self.assertEqual(len(list((self.handoffs / transfer_worker.handoff_token('request-0001')).glob('handoff-*.md'))), 1)
+
+    def test_a_new_request_on_an_unattached_route_reopens_its_thread_without_resending(self):
+        self.stage()
+        again = self.stage(request='request-0002')
+        self.assertEqual(again['nativeSource']['id'], NATIVE_ID)
+        self.assertEqual(self.native_calls.count('turn/start'), 1)
+
+    def test_remote_boundary_is_decided_again_with_the_host_rules(self):
+        # The board's estimate may differ; the host resolves the real folder and refuses.
+        error = self.refused(cwd=self.private)
+        self.assertEqual(error.transfer_stage, 'validate')
+        self.assertIn('경계', str(error))
+        self.assertEqual(self.native_calls, [])
+        folder = self.handoffs / transfer_worker.handoff_token('request-0001')
+        self.assertEqual(sorted(p.name for p in folder.iterdir()), ['.operation.lock'])
+        allowed = self.stage(cwd=self.private, account='codex:.codex-private', request='request-0003')
+        self.assertEqual(allowed['nativeSource']['home'], '.codex-private')
+
+    def test_missing_or_unavailable_profile_is_refused_before_anything_starts(self):
+        self.assertEqual(self.refused(account='codex:.codex-none').transfer_stage, 'validate')
+        (self.home / '.codex-private/auth.json').unlink()
+        error = self.refused(cwd=self.private, account='codex:.codex-private', request='request-0004')
+        self.assertEqual(error.transfer_stage, 'validate')
+        self.assertIn('로그인 파일', str(error))
+        self.assertEqual(self.native_calls, [])
+
+    def test_codex_target_without_app_server_is_refused_before_bind(self):
+        self.socket.stop()
+        try:
+            error = self.refused()
+        finally:
+            self.socket.start()
+        self.assertEqual(error.transfer_stage, 'validate')
+        self.assertIn('app-server', str(error))
+        self.assertEqual(self.native_calls, [])
+
+    def test_same_account_and_other_hosts_are_not_staged(self):
+        error = self.refused(source=CODEX_SOURCE, account='codex:.codex')
+        self.assertIn('기존 세션 연결', str(error))
+        args = self.args()
+        args['target']['host'] = 'other'
+        with self.assertRaisesRegex(ValueError, '같은 기기'):
+            transfer_worker.rpc({'op': 'stage_handoff', 'args': args})
+
+    def test_working_source_and_empty_conversation_are_refused_at_build(self):
+        error = self.refused(source={**CLAUDE_SOURCE, 'phase': 'working'})
+        self.assertEqual(error.transfer_stage, 'build')
+        error = self.refused(messages=[], request='request-0005')
+        self.assertEqual(error.transfer_stage, 'build')
+        self.assertEqual(self.native_calls, [])
+
+    def test_request_identifiers_are_validated(self):
+        args = self.args()
+        args['routeKey'] = '../x'
+        with self.assertRaisesRegex(ValueError, '경로 식별자'):
+            transfer_worker.rpc({'op': 'stage_handoff', 'args': args})
+        with self.assertRaisesRegex(ValueError, '요청 식별자'):
+            self.stage(request='bad id')
+
+    def test_handoff_document_has_the_same_meaning_as_a_local_handoff(self):
+        # Same source, target and messages: the board's own build_launch writes the same text.
+        for source, agent, account in ((CODEX_SOURCE, 'claude', 'claude:default'),
+                                       (CLAUDE_SOURCE, 'codex', 'codex:.codex')):
+            request = 'request-' + agent
+            self.stage(source=source, agent=agent, account=account, request=request)
+            staged = next((self.handoffs / transfer_worker.handoff_token(request)).glob('handoff-*.md'))
+            profile = next(p for p in launch.discover_profiles() if p['id'] == account)
+            local = launch.build_launch({**source, 'cwd': str(self.work)}, {**profile, 'host': 'air'},
+                                        HANDOFF_MESSAGES, self.home / ('board-' + agent))
+            self.assertEqual(staged.read_text(), Path(local['handoffPath']).read_text())
+            self.assertEqual(local['mode'], 'handoff')
+
+
+class HandoffStepTest(RemoteHandoffHome):
+    def setUp(self):
+        super().setUp()
+        self.result = self.stage()
+        self.token = self.result['token']
+        self.folder = self.handoffs / self.token
+
+    @contextmanager
+    def no_exec(self):
+        with patch('transfer_worker.os.execve') as execve, patch('transfer_worker.os.chdir') as chdir:
+            yield execve, chdir
+
+    def main(self, *args, stdin=''):
+        out, err = io.StringIO(), io.StringIO()
+        code = 0
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err), patch.object(sys, 'stdin', io.StringIO(stdin)), \
+                patch.object(sys, 'argv', ['worker.pyz', 'handoff'] + list(args)):
+            try:
+                transfer_worker.main()
+            except SystemExit as exc:
+                code = exc.code
+        return code, out.getvalue(), err.getvalue()
+
+    def test_handoff_step_consumes_the_launch_and_execs_once(self):
+        saved = json.loads((self.folder / 'launch.json').read_text())
+        with self.no_exec() as (execve, chdir):
+            code, out, err = self.main(self.token)
+        self.assertEqual((code, out, err), (0, '', ''))
+        chdir.assert_called_once_with(str(self.work))
+        execve.assert_called_once_with(saved['argv'][0], saved['argv'], saved['env'])
+        self.assertFalse((self.folder / 'launch.json').exists())
+        self.assertEqual(file_mode(self.folder / 'started.json'), 0o600)
+        receipt = json.loads((self.handoffs / 'native-launches' / (HANDOFF_ROUTE + '.json')).read_text())
+        self.assertEqual(receipt['terminalId'], 'handoff-' + self.token)
+        with self.no_exec() as (execve, _):
+            code, out, err = self.main(self.token)
+        execve.assert_not_called()
+        self.assertEqual(code, 1)
+        self.assertIn('원격 인계를 시작하지 못했습니다. 이미 실행한 인계입니다.', err)
+        # After the step, a new request on this route starts a new native thread.
+        self.stage(request='request-0009')
+        self.assertEqual(self.native_calls.count('turn/start'), 2)
+
+    def test_failures_print_a_korean_reason_without_values(self):
+        with self.no_exec() as (execve, _):
+            code, out, err = self.main('f' * 32)
+            self.assertEqual(code, 1)
+            self.assertIn('준비된 인계를 찾지 못했습니다', err)
+            code, _, err = self.main('../escape')
+            self.assertEqual(code, 1)
+            self.assertIn('인계 식별자가 올바르지 않습니다', err)
+            (self.home / '.local/bin/codex').unlink()
+            code, _, err = self.main(self.token)
+        execve.assert_not_called()
+        self.assertEqual(code, 1)
+        self.assertIn('대상 CLI 실행 파일을 찾지 못했습니다', err)
+        self.assertTrue((self.folder / 'launch.json').exists())
+        self.assertFalse((self.folder / 'started.json').exists())
+
+    def test_check_mode_reports_names_only_and_runs_nothing(self):
+        saved = json.loads((self.folder / 'launch.json').read_text())
+        with self.no_exec() as (execve, chdir):
+            code, out, err = self.main('--check', self.token)
+        execve.assert_not_called()
+        chdir.assert_not_called()
+        self.assertEqual((code, err), (0, ''))
+        summary = json.loads(out)
+        self.assertEqual(summary, {'ok': True, 'mode': 'handoff', 'binary': 'codex', 'cwd': str(self.work),
+                                   'envKeys': sorted(saved['env']), 'connectionMode': 'attach', 'prepared': True,
+                                   'agent': 'codex', 'profile': 'codex:.codex', 'sourceEnvironment': 'default',
+                                   'firstInput': 'app-server'})
+        self.assertIn('CODEX_HOME', summary['envKeys'])
+        for value in (saved['env']['PATH'], saved['env']['HOME'] + '"', NATIVE_ID, 'unix://', 'fixture.sock'):
+            self.assertNotIn(value, out)
+        self.assertTrue((self.folder / 'launch.json').exists())
+        self.assertFalse((self.folder / 'started.json').exists())
+
+    def test_dry_run_check_validates_a_request_and_keeps_nothing(self):
+        request = {'source': {**CLAUDE_SOURCE, 'cwd': str(self.private)},
+                   'target': {'agent': 'codex', 'account': 'codex:.codex-private'}}
+        before = sorted(str(p) for p in self.handoffs.rglob('*'))
+        calls = list(self.native_calls)
+        code, out, err = self.main('--check', '-', stdin=json.dumps(request))
+        self.assertEqual((code, err), (0, ''))
+        summary = json.loads(out)
+        self.assertEqual((summary['prepared'], summary['binary'], summary['cwd']), (False, 'codex', str(self.private)))
+        self.assertEqual(summary['sourceEnvironment'], 'private')
+        self.assertIn('GIT_CONFIG_NOSYSTEM', summary['envKeys'])
+        self.assertEqual(summary['firstInput'], 'app-server')
+        self.assertEqual(self.native_calls, calls)
+        self.assertEqual(sorted(str(p) for p in self.handoffs.rglob('*')), before)
+        # The host's own boundary verdict is reported as a refusal.
+        request['target']['account'] = 'codex:.codex'
+        code, out, err = self.main('--check', '-', stdin=json.dumps(request))
+        self.assertEqual((code, out), (1, ''))
+        self.assertIn('인계 점검에 실패했습니다. 원본과 대상의 실행 환경 경계가 다릅니다.', err)
+        code, _, err = self.main('--check', '-', stdin='{not json')
+        self.assertEqual(code, 1)
+        self.assertIn('점검 요청 JSON', err)
+
+
+class RuntimeBundleTest(RemoteHandoffHome):
+    def test_runtime_bundle_carries_every_module_the_remote_handoff_imports(self):
+        for name in ('transfer_worker.py', 'launch.py', 'managed_launch.py', 'transfer_native.py',
+                     'native_chat.py', 'collector.py', 'settings.py', 'instance.py', 'agent_router.py'):
+            self.assertIn(name, transfer.RUNTIME_MODULES)
+        flow = Transfers([], self.home / 'board')
+        data = base64.b64decode(flow.runtime()['runtime'])
+        with zipfile.ZipFile(io.BytesIO(data)) as bundle:
+            self.assertIn(b'def stage_handoff', bundle.read('transfer_worker.py'))
+        # Any change to the helper changes the SHA, so hosts reinstall it automatically.
+        self.assertEqual(flow.runtime()['sha256'], hashlib.sha256(data).hexdigest())
+
+    def test_installed_helper_runs_the_check_in_its_own_process(self):
+        flow = Transfers([], self.home / 'board')
+        helper = self.home / 'worker.pyz'
+        helper.write_bytes(base64.b64decode(flow.runtime()['runtime']))
+        request = {'source': {**CODEX_SOURCE, 'cwd': str(self.work)},
+                   'target': {'agent': 'claude', 'account': 'claude:default'}}
+        env = {'HOME': str(self.home), 'PATH': '/usr/bin:/bin', 'LANG': 'en_US.UTF-8'}
+        result = subprocess.run([sys.executable, '-I', str(helper), 'handoff', '--check', '-'],
+                                input=json.dumps(request).encode(), stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, env=env, timeout=60)
+        self.assertEqual(result.returncode, 0, result.stderr.decode())
+        summary = json.loads(result.stdout)
+        self.assertEqual((summary['binary'], summary['agent'], summary['firstInput'], summary['connectionMode']),
+                         ('claude', 'claude', 'argument', 'direct'))
+        self.assertNotIn('CODEX_HOME', summary['envKeys'])
+
+
+HANDOFF_HOSTS = [{'name': 'board', 'label': '보드', 'local': True},
+         {'name': 'air', 'label': '원격', 'local': False, 'ssh': 'air', 'python': '/usr/bin/python3'}]
+HANDOFF_PROFILES = [
+    {'id': 'claude:default', 'agent': 'claude', 'home': '.claude', 'label': 'Claude', 'available': True,
+     'environment': 'default'},
+    {'id': 'codex:.codex', 'agent': 'codex', 'home': '.codex', 'label': 'Codex', 'available': True,
+     'environment': 'default'},
+    {'id': 'codex:.codex-private', 'agent': 'codex', 'home': '.codex-private', 'label': 'Private Codex',
+     'available': True, 'environment': 'private'},
+    {'id': 'codex:.codex-off', 'agent': 'codex', 'home': '.codex-off', 'label': 'Off', 'available': False,
+     'reason': '이 호스트에 저장된 로그인 파일이 없습니다.', 'environment': 'default'},
+]
+
+
+class HandoffTerminals:
+    max_terminals = 4
+
+    def __init__(self):
+        self.records, self.created = [], []
+
+    def list(self):
+        return [dict(row) for row in self.records]
+
+    @contextmanager
+    def reserve(self, key):
+        yield
+
+    def create(self, key, argv, cwd, env, metadata):
+        self.created.append((argv, cwd, metadata))
+        record = {'id': str(len(self.records) + 1) * 32, 'key': key, 'alive': True, **metadata}
+        self.records.append(record)
+        return dict(record)
+
+
+class WorkflowRemoteHandoffTest(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(dir='/tmp', prefix='sh-board-')
+        self.addCleanup(self.temp.cleanup)
+        self.home = Path(self.temp.name).resolve()
+        config = self.home / '.config/sessionholic/config.json'
+        config.parent.mkdir(parents=True, mode=0o700)
+        config.write_text(json.dumps(HANDOFF_CONFIG))
+        self.state = self.home / 'state'
+        self.row = {**CLAUDE_SOURCE, 'cwd': '/Users/u/Work/project', 'title': '원격 작업', 'account': 'Claude'}
+        self.reads = []
+
+        def runner(host, args, timeout):
+            if args[0] == 'snapshot':
+                return {'claude': [self.row] if host['name'] == 'air' else [], 'codex': [], 'errors': []}
+            self.reads.append((host['name'], args))
+            return {'messages': HANDOFF_MESSAGES}
+        self.board = server.Board(HANDOFF_HOSTS, 60, runner)
+        for host in HANDOFF_HOSTS:
+            self.board.poll(host)
+        self.terms = HandoffTerminals()
+        self.flow = server.Workflow(self.board, self.terms, self.state)
+        self.flow.profiles = lambda: []
+        self.profile_calls = []
+
+        def profiles(host, refresh=False):
+            self.profile_calls.append((host['name'], refresh))
+            return HANDOFF_PROFILES
+        self.flow.transfers.profiles = profiles
+        self.rpcs = []
+        self.reply = None
+
+        def rpc(host, op, args=None, timeout=30):
+            self.rpcs.append((host['name'], op, args, timeout))
+            self.flow.transfers.runtime_paths[host['name']] = '/Users/u/.local/state/rt/worker-' + 'a' * 64 + '.pyz'
+            if isinstance(self.reply, Exception):
+                raise self.reply
+            if self.reply is not None:
+                return self.reply
+            return {'token': transfer_worker.handoff_token(args['requestId']), 'cwd': args['source']['cwd'],
+                    'connectionMode': 'attach', 'warnings': [],
+                    'nativeSource': {'host': 'air', 'agent': 'codex', 'home': '.codex',
+                                     'cwd': args['source']['cwd'], 'id': NATIVE_ID}}
+        self.flow.transfers.rpc = rpc
+        for patcher in (patch.dict(os.environ, {'HOME': str(self.home)}),
+                        patch('server.shutil.which', side_effect=lambda name, **kw: '/usr/bin/' + name)):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def plan(self, account='codex:.codex', agent='codex', host='air'):
+        ref = {key: self.row[key] for key in ('agent', 'id', 'home')}
+        ref['host'] = 'air'
+        return self.flow.plan({'source': ref, 'target': {'host': host, 'agent': agent, 'account': account}})
+
+    def test_same_remote_handoff_is_planned_like_a_local_handoff(self):
+        plan = self.plan()
+        self.assertTrue(plan['allowed'], plan['reason'])
+        self.assertEqual(plan['mode'], 'handoff')
+        self.assertEqual(plan['summary'], '작업 맥락을 자동으로 넘겨 새 터미널을 준비합니다.')
+        self.assertEqual(plan['warnings'], ['최근 대화와 파일 변경 상태를 넘겨 새 실행을 준비합니다. 기존 프로세스·승인 상태는 이어지지 않습니다.'])
+        self.assertEqual(self.profile_calls, [('air', True)])
+        self.assertEqual(self.rpcs, [])
+        # The same account on the same remote host is still a plain attach.
+        self.assertEqual(self.plan(agent='claude', account='claude:default')['mode'], 'attach')
+
+    def test_missing_unavailable_or_unreachable_profiles_refuse(self):
+        plan = self.plan(account='codex:.codex-none')
+        self.assertFalse(plan['allowed'])
+        self.assertEqual(plan['reason'], '원격 기기의 대상 계정을 확인해 주세요.')
+        plan = self.plan(account='codex:.codex-off')
+        self.assertEqual((plan['allowed'], plan['reason']), (False, '이 호스트에 저장된 로그인 파일이 없습니다.'))
+
+        def failing(host, refresh=False):
+            raise RuntimeError('기기의 이전 도우미에 연결하지 못했습니다. SSH 연결을 확인해 주세요.')
+        self.flow.transfers.profiles = failing
+        plan = self.plan()
+        self.assertEqual((plan['allowed'], plan['reason']),
+                         (False, '기기의 이전 도우미에 연결하지 못했습니다. SSH 연결을 확인해 주세요.'))
+
+    def test_working_or_waiting_source_is_refused(self):
+        for phase in ('working', 'needs_input'):
+            self.row['phase'] = phase
+            self.board.poll(HANDOFF_HOSTS[1])
+            plan = self.plan()
+            self.assertFalse(plan['allowed'])
+            self.assertIn('진행 중인 실행', plan['reason'])
+
+    def test_board_estimate_of_the_boundary_refuses_first(self):
+        self.row['cwd'] = '/Users/u/Private/notes'
+        self.board.poll(HANDOFF_HOSTS[1])
+        plan = self.plan()
+        self.assertEqual((plan['allowed'], plan['reason']), (False, '원본과 대상의 실행 환경 경계가 다릅니다.'))
+        self.assertTrue(self.plan(account='codex:.codex-private')['allowed'])
+
+    def test_offline_remote_is_refused_without_contacting_it(self):
+        self.board.state['air']['ok'] = False
+        plan = self.plan()
+        self.assertFalse(plan['allowed'])
+        self.assertEqual(self.profile_calls, [])
+
+    def test_launch_stages_on_the_host_and_opens_its_handoff_step(self):
+        plan = self.plan()
+        result = self.flow.launch(plan['id'], 'request-0001')
+        token = transfer_worker.handoff_token('request-0001')
+        self.assertEqual(self.reads, [('air', ['read', 'claude', CLAUDE_SOURCE['sessionId']])])
+        (name, op, args, timeout), = self.rpcs
+        self.assertEqual((name, op), ('air', 'stage_handoff'))
+        self.assertGreaterEqual(timeout, 90)
+        route = hashlib.sha256(json.dumps([plan['source'], plan['target']], sort_keys=True).encode()).hexdigest()
+        self.assertEqual(args['routeKey'], route)
+        self.assertEqual(args['messages'], HANDOFF_MESSAGES)
+        self.assertEqual(args['target'], {'host': 'air', 'agent': 'codex', 'account': 'codex:.codex'})
+        self.assertEqual(set(args['source']), set(transfer_worker.SELECTOR))
+        self.assertEqual(args['source']['cwd'], '/Users/u/Work/project')
+        (argv, cwd, metadata), = self.terms.created
+        self.assertEqual(argv[0], '/usr/bin/ssh')
+        self.assertIn('-tt', argv)
+        self.assertEqual(argv[-2:], ['air', 'exec /usr/bin/python3 -I /Users/u/.local/state/rt/worker-'
+                                     + 'a' * 64 + '.pyz handoff ' + token])
+        self.assertEqual(cwd, str(self.home))
+        self.assertEqual((metadata['mode'], metadata['launchMode'], metadata['host']), ('attach', 'handoff', 'air'))
+        self.assertEqual(metadata['nativeSource']['id'], NATIVE_ID)
+        self.assertEqual(result['terminal']['nativeSource']['host'], 'air')
+        marker = self.state / 'handoffs' / (token + '.json')
+        self.assertEqual(file_mode(marker), 0o600)
+        self.assertEqual(json.loads(marker.read_text())['status'], 'prepared')
+        self.assertEqual(self.flow.launch(plan['id'], 'request-0001'), result)
+        self.assertEqual(len(self.rpcs), 1)
+
+    def test_a_request_is_staged_once_even_after_a_board_restart(self):
+        plan = self.plan()
+        self.reply = WorkerError('원본과 대상의 실행 환경 경계가 다릅니다.', 'validate')
+        with self.assertRaisesRegex(ValueError, '경계'):
+            self.flow.launch(plan['id'], 'request-0002')
+        marker = self.state / 'handoffs' / (transfer_worker.handoff_token('request-0002') + '.json')
+        self.assertEqual(json.loads(marker.read_text())['status'], 'failed')
+        restarted = server.Workflow(self.board, self.terms, self.state)
+        restarted.transfers.profiles, restarted.transfers.rpc = self.flow.transfers.profiles, self.flow.transfers.rpc
+        self.flow = restarted
+        with self.assertRaisesRegex(ValueError, '이미 처리한 인계 요청'):
+            self.flow.launch(self.plan()['id'], 'request-0002')
+        self.assertEqual(len(self.rpcs), 1)
+        self.assertEqual(self.terms.created, [])
+
+    def test_unknown_preparation_is_never_reported_as_not_started(self):
+        for number, reply in enumerate((WorkerError('bind failed', 'bind'), RuntimeError('기기 응답 시간이 초과됐습니다.'),
+                                        {'token': 'f' * 32, 'cwd': '/x'})):
+            self.reply = reply
+            with self.assertRaises(RuntimeError) as caught:
+                self.flow.launch(self.plan()['id'], 'request-unknown-%d' % number)
+            self.assertNotIsInstance(caught.exception, server.LaunchFailure)
+            self.assertEqual(str(caught.exception), transfer.UNKNOWN_HANDOFF)
+        self.assertEqual(self.terms.created, [])
+
+    def test_state_change_after_plan_blocks_before_staging(self):
+        plan = self.plan()
+        self.row['phase'] = 'working'
+        with self.assertRaisesRegex(ValueError, '실행 중이거나 승인'):
+            self.flow.launch(plan['id'], 'request-0003')
+        self.assertEqual(self.rpcs, [])
+
+    def test_unexpected_native_identity_is_not_recorded(self):
+        plan = self.plan()
+        self.reply = {'token': transfer_worker.handoff_token('request-0004'), 'cwd': '/Users/u/Work/project',
+                      'connectionMode': 'bogus',
+                      'nativeSource': {'host': 'elsewhere', 'agent': 'codex', 'home': '.codex', 'cwd': '/x', 'id': NATIVE_ID}}
+        self.flow.launch(plan['id'], 'request-0004')
+        (_, _, metadata), = self.terms.created
+        self.assertNotIn('nativeSource', metadata)
+        self.assertEqual(metadata['mode'], 'handoff')
+
+    def test_terminal_failure_after_staging_reports_the_prepared_target(self):
+        plan = self.plan()
+
+        def broken(*args):
+            raise RuntimeError('tmux fixture failure')
+        self.terms.create = broken
+        with self.assertRaises(server.LaunchFailure) as caught:
+            self.flow.launch(plan['id'], 'request-0005')
+        recovery = caught.exception.recovery
+        self.assertEqual((recovery['host'], recovery['destinationCwd']), ('air', '/Users/u/Work/project'))
+        self.assertEqual(recovery['nativeSource']['id'], NATIVE_ID)
 
 
 if __name__=='__main__':unittest.main()

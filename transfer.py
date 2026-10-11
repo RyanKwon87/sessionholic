@@ -30,6 +30,8 @@ RUNTIME_MODULES = ('collector.py', 'launch.py', 'transfer_native.py', 'transfer_
 PRE_BIND_STAGES = frozenset(('validate', 'import', 'build'))
 UNKNOWN_PREPARE = ('대상 준비 결과를 확인하지 못했습니다. 이미 작업이 시작되었을 수 있으므로 '
                    '대상 기기의 작업 목록과 이전 기록을 확인해 주세요.')
+UNKNOWN_HANDOFF = ('원격 기기의 인계 준비 결과를 확인하지 못했습니다. 새 작업이 이미 시작됐을 수 있으므로 '
+                   '다시 실행하지 말고 그 기기의 작업 목록을 먼저 확인해 주세요.')
 # Only this versioned helper is installed. Credentials, dotfile profiles and hooks are not copied.
 # A call normally carries only the helper's SHA-256. When `worker-<sha>.pyz` is missing or
 # corrupt the bootstrap answers {"needRuntime": true} without running anything, and the

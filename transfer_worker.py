@@ -9,12 +9,20 @@ import secrets
 import shutil
 import sys
 import stat
+import tempfile
+import time
 from contextlib import contextmanager
 from collector import RpcError
 import instance
 
 MAX_ARCHIVE = 128 * 1024 * 1024
 ID = re.compile(r'[a-f0-9]{32}\Z')
+ROUTE = re.compile(r'[a-f0-9]{64}\Z')
+REQUEST = re.compile(r'[A-Za-z0-9_-]{8,100}\Z')
+HOST = re.compile(r'[A-Za-z0-9_.-]{1,40}\Z')
+# The source fields a staged handoff keeps; the same selector a remote attach sends.
+SELECTOR = ('host', 'agent', 'id', 'home', 'cwd', 'kind', 'sessionId', 'phase')
+CHECK_MESSAGES = [{'role': 'user', 'text': '점검용 인계 메시지입니다. 실제 대화를 읽지 않았습니다.'}]
 
 
 def private_dir(path):
@@ -40,21 +48,27 @@ def job(transfer_id):
 
 
 @contextmanager
-def job_operation(transfer_id):
-    """A cleanup must never unlink archives used by an active finite worker."""
-    folder = job(transfer_id)
+def _folder_lock(folder, unsafe, busy):
     fd = os.open(str(folder / '.operation.lock'), os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
     try:
         info = os.fstat(fd)
         if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
-            raise ValueError('이전 작업 잠금 파일이 안전하지 않습니다.')
+            raise ValueError(unsafe)
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
-            raise ValueError('이전 파일을 사용 중입니다. 작업이 끝난 뒤 정리를 다시 확인해 주세요.') from None
-        yield
+            raise ValueError(busy) from None
+        yield folder
     finally:
         os.close(fd)
+
+
+@contextmanager
+def job_operation(transfer_id):
+    """A cleanup must never unlink archives used by an active finite worker."""
+    with _folder_lock(job(transfer_id), '이전 작업 잠금 파일이 안전하지 않습니다.',
+                      '이전 파일을 사용 중입니다. 작업이 끝난 뒤 정리를 다시 확인해 주세요.'):
+        yield
 
 
 def cleanup_archives(folder):
@@ -166,6 +180,198 @@ def prepare(args, profiles, import_workspace):
     return {'cwd': imported['cwd'], 'root': imported['root'], 'nativeSource': spec.get('nativeSource'), 'connectionMode': spec.get('connectionMode'), 'warnings': spec.get('warnings', []), 'summary': imported.get('summary', {})}
 
 
+# Same-host handoff (another agent or account on this host). Like `prepare` for a transfer,
+# `stage_handoff` validates, builds and binds here, so the board learns the new native
+# identity before its terminal opens; the terminal's `handoff <token>` only execs it once.
+
+def handoff_root():
+    return private_dir(instance.remote_path('transfersDir', Path.home()) / 'handoffs')
+
+
+def handoff_token(request_id):
+    """One folder per board request, so a repeated request finds its earlier work."""
+    if not isinstance(request_id, str) or not REQUEST.fullmatch(request_id):
+        raise ValueError('인계 요청 식별자가 올바르지 않습니다.')
+    return hashlib.sha256(('handoff:' + request_id).encode()).hexdigest()[:32]
+
+
+@contextmanager
+def handoff_operation(token):
+    if not isinstance(token, str) or not ID.fullmatch(token):
+        raise ValueError('인계 식별자가 올바르지 않습니다.')
+    with _folder_lock(private_dir(handoff_root() / token), '인계 작업 잠금 파일이 안전하지 않습니다.',
+                      '같은 인계를 처리하고 있습니다. 잠시 뒤 터미널이나 작업 목록을 확인해 주세요.') as folder:
+        yield folder
+
+
+def handoff_request(args, check=False):
+    """The source selector and target of a same-host handoff request, validated."""
+    if (not isinstance(args, dict) or not isinstance(args.get('source'), dict)
+            or not isinstance(args.get('target'), dict)):
+        raise ValueError('인계 요청 형식이 올바르지 않습니다.')
+    source, target = args['source'], args['target']
+    selector = {key: source[key] for key in SELECTOR if source.get(key) is not None}
+    if check:
+        selector.setdefault('host', 'check')
+        selector.setdefault('phase', 'idle')
+    if (any(not isinstance(value, str) for value in selector.values())
+            or not HOST.fullmatch(selector.get('host', ''))):
+        raise ValueError('원본 작업 정보가 올바르지 않습니다.')
+    if target.get('host', selector['host']) != selector['host']:
+        raise ValueError('같은 기기 안의 인계만 이 기기에서 준비할 수 있습니다.')
+    if target.get('agent') not in ('claude', 'codex') or not isinstance(target.get('account'), str):
+        raise ValueError('대상 에이전트와 계정을 확인해 주세요.')
+    return selector, {'host': selector['host'], 'agent': target['agent'], 'account': target['account']}
+
+
+def handoff_profile(selector, target):
+    """This host's target profile and its own boundary verdict; anything unclear refuses."""
+    from launch import discover_profiles, source_environment
+    import settings
+    profile = next((p for p in discover_profiles()
+                    if p['id'] == target['account'] and p['agent'] == target['agent']), None)
+    if not profile or not profile.get('available'):
+        raise ValueError((profile or {}).get('reason') or '이 기기의 대상 계정을 사용할 수 없습니다.')
+    source_home = selector.get('home') or ('.claude' if selector.get('agent') == 'claude' else None)
+    if selector.get('agent') == profile['agent'] and source_home == profile['home']:
+        raise ValueError('같은 계정은 기존 세션 연결로 열어 주세요.')
+    environment = source_environment(selector)
+    if settings.crosses_boundary(profile['agent'], environment, profile.get('environment', 'default'),
+                                 settings.load()):
+        raise ValueError('원본과 대상의 실행 환경 경계가 다릅니다.')
+    if profile['agent'] == 'codex':
+        # The first input goes through this home's app-server; without it nothing can start.
+        from transfer_native import _socket_path
+        try:
+            _socket_path({'home': profile['home']}, None)
+        except ValueError:
+            raise ValueError('이 기기에서 대상 Codex 계정의 app-server 연결을 찾지 못했습니다. '
+                             'Codex 앱 서버가 실행 중인지 확인해 주세요.') from None
+    return profile, environment
+
+
+def handoff_summary(spec, **extra):
+    """What `handoff` runs: the binary name, folder and variable names, never values or the prompt."""
+    argv = spec.get('argv') or []
+    return {'ok': True, 'mode': 'handoff', 'binary': os.path.basename(argv[0]) if argv else None,
+            'cwd': spec.get('cwd'), 'envKeys': sorted(spec.get('env') or {}),
+            'connectionMode': spec.get('connectionMode') or 'direct', **extra}
+
+
+def stage_handoff(args):
+    from launch import build_launch
+    from managed_launch import bind
+    with stage('validate'):
+        if not isinstance(args, dict):
+            raise ValueError('인계 요청 형식이 올바르지 않습니다.')
+        token = handoff_token(args.get('requestId'))
+        route = args.get('routeKey')
+        if not isinstance(route, str) or not ROUTE.fullmatch(route):
+            raise ValueError('인계 경로 식별자가 올바르지 않습니다.')
+        selector, target = handoff_request(args)
+    with handoff_operation(token) as folder:
+        with stage('validate'):
+            if (folder / 'launch.json').exists() or (folder / 'started.json').exists():
+                error = ValueError('이미 처리한 인계 요청입니다. 열린 터미널이나 이 기기의 작업 목록을 확인해 주세요.')
+                error.transfer_stage = 'prepared'
+                raise error
+            profile, environment = handoff_profile(selector, target)
+        with stage('build'):
+            # The handoff document stays in this request's private folder on this host.
+            spec = build_launch(selector, {**profile, 'host': selector['host']}, args.get('messages'), folder)
+            if spec.get('mode') != 'handoff':
+                raise ValueError('이 기기 안의 도구·계정 전환만 준비할 수 있습니다.')
+        with stage('bind'):
+            # Route-keyed like the board's own receipt: a later launch of the same route
+            # reopens an unattached thread instead of sending the first prompt again.
+            spec = bind(spec, profile, selector['host'],
+                        receipt_path=handoff_root() / 'native-launches' / (route + '.json'))
+        with stage('save'):
+            save(folder / 'launch.json', {**spec, 'requestId': args['requestId'], 'source': selector,
+                                          'target': target, 'sourceEnvironment': environment,
+                                          'preparedAt': int(time.time())})
+    return {'token': token, 'cwd': spec['cwd'], 'nativeSource': spec.get('nativeSource'),
+            'connectionMode': spec.get('connectionMode'), 'warnings': spec.get('warnings', [])}
+
+
+def check_handoff(args):
+    """`handoff --check -`: validate and build like `stage_handoff`, but bind nothing, start
+    nothing and keep no file. Prints what a prepared launch would run."""
+    from launch import build_launch
+    selector, target = handoff_request(args, check=True)
+    profile, environment = handoff_profile(selector, target)
+    messages = args.get('messages') or CHECK_MESSAGES
+    with tempfile.TemporaryDirectory(prefix='handoff-check-') as scratch:
+        spec = build_launch(selector, {**profile, 'host': selector['host']}, messages, Path(scratch) / 'state')
+    codex = profile['agent'] == 'codex'
+    return handoff_summary({**spec, 'connectionMode': 'attach' if codex else None}, prepared=False,
+                           agent=profile['agent'], profile=profile['id'], sourceEnvironment=environment,
+                           firstInput='app-server' if codex else 'argument')
+
+
+def _prepared_launch(folder):
+    path = folder / 'launch.json'
+    if not path.exists():
+        if (folder / 'started.json').exists():
+            raise ValueError('이미 실행한 인계입니다. 보드의 작업 목록에서 새 작업을 확인해 주세요.')
+        raise ValueError('준비된 인계를 찾지 못했습니다. 보드에서 다시 실행해 주세요.')
+    spec = read_private(path)
+    argv, cwd, env = spec.get('argv'), spec.get('cwd'), spec.get('env')
+    if (not isinstance(argv, list) or not argv or any(not isinstance(item, str) for item in argv)
+            or not os.path.isabs(argv[0]) or not isinstance(cwd, str) or not os.path.isabs(cwd)
+            or not isinstance(env, dict)
+            or any(not isinstance(k, str) or not isinstance(v, str) for k, v in env.items())):
+        raise ValueError('준비된 인계 기록이 올바르지 않습니다.')
+    return path, spec
+
+
+def run_handoff(token, check=False):
+    """The terminal step: read the prepared launch, remove it and exec it on this host, once."""
+    with handoff_operation(token) as folder:
+        path, spec = _prepared_launch(folder)
+        if check:
+            return handoff_summary(spec, prepared=True, agent=(spec.get('target') or {}).get('agent'),
+                                   profile=(spec.get('target') or {}).get('account'),
+                                   sourceEnvironment=spec.get('sourceEnvironment'),
+                                   firstInput='app-server' if spec.get('connectionMode') == 'attach' else 'argument')
+        if not os.path.isdir(spec['cwd']):
+            raise ValueError('작업 폴더가 이 기기에 없습니다.')
+        if not os.access(spec['argv'][0], os.X_OK):
+            raise ValueError('대상 CLI 실행 파일을 찾지 못했습니다.')
+        marker = os.open(str(folder / 'started.json'), os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(marker, 'w') as out:
+            json.dump({'startedAt': int(time.time())}, out)
+        path.unlink()
+        from managed_launch import mark_attached
+        mark_attached(spec, 'handoff-' + token)
+    os.chdir(spec['cwd'])
+    os.execve(spec['argv'][0], spec['argv'], spec['env'])
+
+
+def handoff_main(args):
+    check = '--check' in args
+    rest = [item for item in args if item != '--check']
+    try:
+        if len(rest) != 1:
+            raise ValueError('사용법: handoff [--check] <인계 식별자> 또는 handoff --check - (표준 입력에 요청 JSON)')
+        if check and rest[0] == '-':
+            try:
+                request = json.loads(sys.stdin.read(1024 * 1024))
+            except ValueError:
+                raise ValueError('점검 요청 JSON을 읽지 못했습니다.') from None
+            print(json.dumps(check_handoff(request), ensure_ascii=False, indent=2))
+        elif check:
+            print(json.dumps(run_handoff(rest[0], check=True), ensure_ascii=False, indent=2))
+        else:
+            run_handoff(rest[0])
+    except (ValueError, OSError, KeyError, RuntimeError, RpcError) as exc:
+        # A terminal shows this line: no input, environment value or traceback.
+        from launch import scrub_text
+        detail = scrub_text(str(exc))[:300] if isinstance(exc, ValueError) else '기기 상태를 확인해 주세요.'
+        print(('인계 점검에 실패했습니다. ' if check else '원격 인계를 시작하지 못했습니다. ') + detail, file=sys.stderr)
+        raise SystemExit(1)
+
+
 def _rpc(request):
     from transfer_native import profiles, source_state, interrupt_source
     from transfer_workspace import inspect_workspace, export_workspace, import_workspace
@@ -198,6 +404,8 @@ def _rpc(request):
         return result
     if op == 'prepare':
         return prepare(args, profiles, import_workspace)
+    if op == 'stage_handoff':
+        return stage_handoff(args)
     if op == 'cleanup':
         folder = job(args['transferId'])
         return cleanup_archives(folder)
@@ -233,6 +441,8 @@ def attach(source):
 
 
 def _main():
+    if len(sys.argv) >= 3 and sys.argv[1] == 'handoff':
+        return handoff_main(sys.argv[2:])
     if len(sys.argv) == 3 and sys.argv[1] == 'attach':
         try:
             attach(json.loads(sys.argv[2]))

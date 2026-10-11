@@ -126,7 +126,7 @@ function client(
   vm.runInContext(messageSource, context);
   vm.runInContext(source, context);
   const api = vm.runInContext(
-    "({state,api,sourceOf,accountOf,sendInput,pasteDraft,prepareDraftPaste,startDraftComposition,endDraftComposition,inputDraft,stopTerminalReader,startTerminalReader,closePlan,navigateView,backToList,backFromTerminal,closeTerminal,cancelTerminalClose,confirmTerminalClose,populateAccount,populateRoute,updateContinue,renderPlan,launchPlan,openTerminal,saveDraft,draftKey,refreshTerminals,renderTerminals,renderTerminalReturn,renderFilters,terminalCloseCopy,warnDraftUnload,preparePlan,renderGroups,renderMessages,loadDetail,chatKey,chatEntry,currentChat,chatSupported,chatAttachmentsSupported,buildChatComposer,sendChat,loadChatState,applyChatReceipt,uploadChatFiles,pasteChat,scheduleChatPoll,stopChatPolling,openNativeChat,allSessions,buildContinuePanel,chatReceiptCopy,returnToBoard,readChatClipboard,accountDisplay,sessionAccountLabel,closeChatToolsOutside,closeChatToolsEscape,drawDetail,refreshDetail,loadCapabilities,matches,recoverConnection,networkOffline,poll,select,focusDetailBack,restoreSelectedCardFocus,showLogin,lock,beginAuthEpoch,resizeChatInput,updateViewport,draftKeydown,configureTerminalKeyboard,queueTerminalScroll,flushTerminalScroll,terminalScrollEnd,renderAttention,chatPollDelay,pullRefresh,readingScroll,renderJump,pullDistance,listScroll,setReading,renderPrompt,promptAction,renderUsage,loadUsage,applyTheme,setTheme,updateThemeColor,haptic,navTransition,setDetailShown,chatVisible,sheetRelease,BottomSheet,sheet,openSettings,closeSettings,setTyping,pinchFontSize,setTerminalFontSize,loadXterm,assetUrl,syncEvents,closeEvents,eventsHealthy,renderFreshness,schedule,touchDevice,togglePhaseFilter,renderCounts,createLongPress,swipeIntent,swipeRelease,groupMessageRows,setTextSize,applyTextSize,renderConnectivity,terminalForSession,swipeActionFor,openMessageMenu,openCardMenu,messageActions,outboxShape,outboxMatches,outboxOrigin,settleOutbox,retryOutbox,renderAttachmentTiles,attachmentThumb,sendUpload,openActionSheet,closeActionSheet,setListCollapsed,closeSwipe,settleSwipe,prepareSwipe,runSwipeAction,GESTURE,setChromeVisible,toggleChrome,revealChrome,isChromeTap,snapshotAnnounced,updateChatComposer,capabilitiesRevision,toolKindOf,userMessageParts,formatElapsed,tickWorking})",
+    "({state,api,sourceOf,accountOf,sendInput,pasteDraft,prepareDraftPaste,startDraftComposition,endDraftComposition,inputDraft,stopTerminalReader,startTerminalReader,closePlan,navigateView,backToList,backFromTerminal,closeTerminal,cancelTerminalClose,confirmTerminalClose,populateAccount,populateRoute,updateContinue,renderPlan,launchPlan,openTerminal,saveDraft,draftKey,refreshTerminals,renderTerminals,renderTerminalReturn,renderFilters,terminalCloseCopy,warnDraftUnload,preparePlan,renderGroups,renderMessages,loadDetail,chatKey,chatEntry,currentChat,chatSupported,chatAttachmentsSupported,buildChatComposer,sendChat,loadChatState,applyChatReceipt,uploadChatFiles,pasteChat,scheduleChatPoll,stopChatPolling,openNativeChat,allSessions,buildContinuePanel,chatReceiptCopy,returnToBoard,readChatClipboard,accountDisplay,sessionAccountLabel,closeChatToolsOutside,closeChatToolsEscape,drawDetail,refreshDetail,loadCapabilities,matches,recoverConnection,networkOffline,poll,select,focusDetailBack,restoreSelectedCardFocus,showLogin,lock,beginAuthEpoch,resizeChatInput,updateViewport,draftKeydown,configureTerminalKeyboard,queueTerminalScroll,flushTerminalScroll,terminalScrollEnd,renderAttention,chatPollDelay,pullRefresh,readingScroll,renderJump,pullDistance,listScroll,setReading,renderPrompt,promptAction,renderUsage,loadUsage,applyTheme,setTheme,updateThemeColor,haptic,navTransition,setDetailShown,chatVisible,sheetRelease,BottomSheet,sheet,openSettings,closeSettings,setTyping,pinchFontSize,setTerminalFontSize,loadXterm,assetUrl,syncEvents,closeEvents,eventsHealthy,renderFreshness,schedule,touchDevice,togglePhaseFilter,renderCounts,createLongPress,swipeIntent,swipeRelease,groupMessageRows,setTextSize,applyTextSize,renderConnectivity,terminalForSession,swipeActionFor,openMessageMenu,openCardMenu,messageActions,outboxShape,outboxMatches,outboxOrigin,settleOutbox,retryOutbox,renderAttachmentTiles,attachmentThumb,sendUpload,openActionSheet,closeActionSheet,setListCollapsed,closeSwipe,settleSwipe,prepareSwipe,runSwipeAction,GESTURE,setChromeVisible,toggleChrome,revealChrome,isChromeTap,snapshotAnnounced,updateChatComposer,capabilitiesRevision,toolKindOf,userMessageParts,formatElapsed,tickWorking,renderTerminalMarks,renderDetailTerminal,terminalsAnnounced,goToSessionTerminal,rememberTerminal})",
     context,
   );
   api.state.csrf = "csrf-test";
@@ -3010,7 +3010,8 @@ test('recent cards give project and full task separate priority while retaining 
   assert.equal(byClass(card, 'card-title')[0].textContent, title.trim());
   assert.equal(byClass(card, 'card-snippet')[0].hidden, true);
   const meta = byClass(card, 'card-meta')[0];
-  assert.deepEqual(meta.children.map((child) => child.className.split(' ')[0]), ['badge', 'card-agent', 'card-project', 'stale-tag', 'card-time']);
+  assert.deepEqual(meta.children.map((child) => child.className.split(' ')[0]), ['badge', 'terminal-mark', 'card-agent', 'card-project', 'stale-tag', 'card-time']);
+  assert.equal(byClass(card, 'card-terminal')[0].hidden, true, '"터미널 열림" only with a live board terminal');
   assert.match(byClass(card, 'card-project')[0].textContent, new RegExp('^' + project.trim()));
   assert.equal(byClass(card, 'stale-tag')[0].hidden, false);
   assert.match(card.attributes['aria-label'], /프로젝트:.*작업:.*작업 중.*Codex.*기기: Workstation.*계정 설정: Sample profile.*마지막 확인 기준/s);
@@ -6176,4 +6177,227 @@ test('a hardware keyboard: the folded composer shows the send key once one is kn
   desk.updateChatComposer(onDesk.entry);
   assert.equal(desk.get('chat-key-hint').hidden, false, 'a mouse layout has a keyboard');
   assert.equal(desk.get('chat-key-hint').textContent, 'Ctrl+Enter 보내기');
+});
+
+// --- Open board terminals shown on cards and in the conversation header ------
+
+function attachedTo(s, fields = {}) {
+  return { id: 'attached', alive: true, title: '보드 터미널', mode: 'attach',
+    metadata: { nativeSource: { host: s.host, agent: s.agent, home: s.home, id: s.id }, mode: 'attach' }, ...fields };
+}
+function cardOf(c, s) {
+  return byClass(c.get('groups'), 'card').find((card) => card.dataset.sessionKey === s.key);
+}
+
+test('a card shows 터미널 열림 while its session has a live board terminal, by the same rule as the swipe, and follows each list read', async () => {
+  let rows = [];
+  const requests = [];
+  const c = client(async (url) => {
+    requests.push(url);
+    return { ok: true, status: 200, json: async () => ({ terminals: JSON.parse(JSON.stringify(rows)), version: 4 }) };
+  }, noChatTimers);
+  const s = recentSession('with-terminal');
+  const other = recentSession('launched-here');
+  setRecentSnapshot(c, [s, other]);
+  c.renderGroups([s, other], 1100);
+  const mark = (session) => byClass(cardOf(c, session), 'card-terminal')[0];
+  assert.equal(mark(s).hidden, true);
+  assert.doesNotMatch(cardOf(c, s).attributes['aria-label'], /터미널 열림/);
+  rows = [attachedTo(s)];
+  await c.refreshTerminals();
+  assert.deepEqual(requests, ['/api/terminals']);
+  assert.equal(c.state.terminalsVersion, 4);
+  assert.equal(mark(s).hidden, false, 'the mounted card shows it without a full render');
+  assert.match(textOf(mark(s)), /터미널 열림/);
+  assert.match(cardOf(c, s).attributes['aria-label'], /\. 터미널 열림$/);
+  assert.equal(mark(other).hidden, true);
+  assert.equal(c.swipeActionFor(s).kind, 'close', 'the swipe offers 연결 닫기 for the same terminal');
+  // A closed terminal no longer counts; one launched from a session (sourceKey) does.
+  rows = [attachedTo(s, { alive: false, closed: true }),
+    { id: 'launched', alive: true, mode: 'handoff', sourceKey: JSON.stringify({ agent: other.agent, home: other.home, host: other.host, id: other.id }) }];
+  await c.refreshTerminals();
+  assert.equal(mark(s).hidden, true);
+  assert.equal(mark(other).hidden, false);
+  assert.equal(c.swipeActionFor(other).kind, 'close');
+  // A full render keeps the marks.
+  c.renderGroups([s, other], 1100);
+  assert.equal(mark(s).hidden, true);
+  assert.equal(mark(other).hidden, false);
+});
+
+test('the conversation header shows 터미널 열림 and 터미널로 only with a live board terminal, and the button goes to that terminal', async () => {
+  const c = client(async () => ({ ok: true, status: 200, json: async () => ({ terminals: [] }) }), noChatTimers);
+  const s = recentSession('detail-terminal');
+  setRecentSnapshot(c, [s]);
+  c.state.selected = s.key;
+  c.drawDetail(s);
+  const box = c.get('detail-terminal');
+  assert.equal(box.hidden, true, 'no board terminal: nothing in the header (the composer keeps its own 터미널 열기)');
+  c.state.terminals = [attachedTo(s)];
+  c.renderTerminals();
+  assert.equal(box.hidden, false);
+  assert.match(textOf(box), /터미널 열림/);
+  const go = c.get('detail-terminal-open');
+  assert.equal(go.textContent, '터미널로');
+  assert.match(go.attributes['aria-label'], /열린 터미널로 가기: 보드 터미널/);
+  // A new header drawn while the terminal is live shows it at once.
+  c.drawDetail(s);
+  assert.equal(c.get('detail-terminal').hidden, false);
+  const opened = [];
+  c.context.openTerminal = (terminal) => { opened.push(terminal.id); };
+  c.get('detail-terminal-open').events.click();
+  assert.deepEqual(opened, ['attached']);
+  // Closed meanwhile (another device): the tap opens nothing and the header hides it.
+  c.state.terminals = [attachedTo(s, { alive: false, closed: true })];
+  c.get('detail-terminal-open').events.click();
+  assert.deepEqual(opened, ['attached']);
+  assert.equal(c.get('detail-terminal').hidden, true);
+  // The header of another session is never changed by this session's terminal.
+  const other = recentSession('other-detail');
+  setRecentSnapshot(c, [s, other]);
+  c.state.selected = other.key;
+  c.drawDetail(other);
+  c.state.terminals = [attachedTo(s)];
+  c.renderTerminals();
+  assert.equal(c.get('detail-terminal').hidden, true);
+});
+
+test('terminal events reread the list once per 300ms burst, only when newer, not on a first hello, and again after a read in flight', async () => {
+  const requests = [];
+  const batches = [];
+  let version = 5;
+  let hold = null;
+  const c = client(async (url) => {
+    requests.push(url);
+    if (hold) await hold;
+    const answered = version;
+    return { ok: true, status: 200, json: async () => ({ terminals: [], version: answered }) };
+  }, { setTimeout: (callback, ms) => { if (ms === 300) batches.push(callback); return batches.length; }, clearTimeout() {} });
+  c.state.authenticated = true;
+  // The first connection: login and startup read the list themselves.
+  c.terminalsAnnounced(3, { hello: true });
+  assert.equal(batches.length, 0);
+  await c.refreshTerminals();
+  assert.equal(c.state.terminalsVersion, 5);
+  requests.length = 0;
+  c.terminalsAnnounced(5);
+  assert.equal(batches.length, 0, 'a version already read reads nothing');
+  for (const announced of [6, 7, 8]) c.terminalsAnnounced(announced);
+  assert.equal(batches.length, 1, 'a burst arms one read');
+  assert.deepEqual(requests, [], 'nothing is read before the batch window ends');
+  version = 8;
+  batches.shift()();
+  await settle();
+  assert.deepEqual(requests, ['/api/terminals']);
+  assert.equal(c.state.terminalsVersion, 8);
+  // Announced while a read is in flight: that read may predate it, so one more follows.
+  requests.length = 0;
+  let release;
+  hold = new Promise((resolve) => { release = resolve; });
+  version = 9;
+  const reading = c.refreshTerminals();
+  c.terminalsAnnounced(10);
+  batches.shift()();
+  assert.equal(c.state.terminalsPending, true);
+  assert.deepEqual(requests, ['/api/terminals'], 'never two reads at once');
+  hold = null;
+  release();
+  await reading;
+  assert.equal(batches.length, 1, 'still behind (9 < 10): one more batched read');
+  version = 10;
+  batches.shift()();
+  await settle();
+  assert.deepEqual(requests, ['/api/terminals', '/api/terminals']);
+  assert.equal(c.state.terminalsVersion, 10);
+  // A reconnect's hello reads only a newer list.
+  c.terminalsAnnounced(10, { hello: true });
+  assert.equal(batches.length, 0);
+  c.terminalsAnnounced(12, { hello: true });
+  assert.equal(batches.length, 1);
+  // A batch from before a login change reads nothing.
+  c.state.authEpoch++;
+  requests.length = 0;
+  batches.shift()();
+  await settle();
+  assert.deepEqual(requests, []);
+});
+
+test('the live stream announces terminals, a restarted server is read on its hello, and the regular poll is the safety net', async () => {
+  const requests = [];
+  const batches = [];
+  let c;
+  c = client(async (url) => {
+    requests.push(url);
+    return { ok: true, status: 200, json: async () => (url === '/api/terminals' ? { terminals: [], version: 2 }
+      : url.startsWith('/api/snapshot') ? { hosts: c.state.snapshot.hosts, bootId: 'boot-a' } : {}) };
+  }, { setTimeout: (callback, ms) => { if (ms === 300) batches.push(callback); return 0; }, clearTimeout() {} });
+  const { FakeEventSource, sources } = fakeEventSource();
+  c.context.EventSource = FakeEventSource;
+  selectChat(c);
+  c.state.capabilities = {};
+  c.state.capabilitiesRevision = c.capabilitiesRevision(c.state.snapshot);
+  c.state.capabilitiesBoot = 'boot-a';
+  c.state.usageAt = Date.now();
+  c.state.serverBoot = 'boot-a';
+  await c.refreshTerminals();
+  c.syncEvents();
+  sources[0].emit('hello', { snapshotVersion: 1, bootId: 'boot-a', terminalsVersion: 2 });
+  assert.equal(batches.length, 0, 'the list read already shows version 2');
+  sources[0].emit('terminals', { version: 3 });
+  assert.equal(batches.length, 1);
+  await settle();
+  requests.length = 0;
+  batches.shift()();
+  await settle();
+  assert.deepEqual(requests.filter((url) => url === '/api/terminals'), ['/api/terminals']);
+  // Another server process counts from 0 again: its hello is read even at a lower number.
+  sources[0].emit('hello', { snapshotVersion: 0, bootId: 'boot-b', terminalsVersion: 0 });
+  assert.equal(c.state.terminalsVersion, null);
+  assert.equal(batches.length, 1);
+  await settle(6);
+  // Without live updates, a regular read rereads a list older than a minute.
+  c.closeEvents();
+  c.state.serverBoot = 'boot-a';
+  batches.length = 0;
+  requests.length = 0;
+  c.state.terminalsReadAt = Date.now();
+  await c.poll(false);
+  assert.deepEqual(requests.filter((url) => url === '/api/terminals'), [], 'a fresh list is not read again');
+  c.state.terminalsReadAt = Date.now() - 61000;
+  requests.length = 0;
+  await c.poll(false);
+  await settle();
+  assert.deepEqual(requests.filter((url) => url === '/api/terminals'), ['/api/terminals']);
+  requests.length = 0;
+  c.state.terminalsReadAt = Date.now() - 61000;
+  await c.poll(false, { capabilities: false });
+  assert.deepEqual(requests.filter((url) => url === '/api/terminals'), [], 'an announced snapshot read stays a snapshot read');
+});
+
+test('a terminal opened or closed here shows on its card and header at once, before the list is read again', async () => {
+  const s = recentSession('opened-here');
+  const opened = attachedTo(s, { id: 'b'.repeat(32) });
+  const requests = [];
+  const c = client(async (url) => {
+    requests.push(url);
+    if (url === '/api/terminals') return await new Promise(() => {});
+    if (url === '/api/launch') return { ok: true, status: 200, json: async () => ({ terminal: opened, mode: 'attach' }) };
+    return { ok: true, status: 200, json: async () => ({ ok: true }) };
+  }, noChatTimers);
+  setRecentSnapshot(c, [s]);
+  c.state.selected = s.key;
+  c.renderGroups([s], 1100);
+  c.drawDetail(s);
+  c.context.openTerminal = async () => {};
+  c.state.plan = { id: 'plan-1', allowed: true, mode: 'attach' };
+  await c.launchPlan();
+  assert.ok(requests.includes('/api/terminals'), 'the list is read again (still in flight here)');
+  assert.equal(byClass(cardOf(c, s), 'card-terminal')[0].hidden, false);
+  assert.equal(c.get('detail-terminal').hidden, false);
+  c.closeTerminal(opened.id);
+  c.confirmTerminalClose();
+  await settle();
+  assert.equal(byClass(cardOf(c, s), 'card-terminal')[0].hidden, true, 'the close answer alone hides it');
+  assert.equal(c.get('detail-terminal').hidden, true);
+  assert.equal(c.state.terminals.find((item) => item.id === opened.id).closed, true);
 });

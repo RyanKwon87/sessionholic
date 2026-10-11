@@ -1,7 +1,12 @@
 import json
+import os
 from pathlib import Path
 import random
+import secrets
+import shutil
+import subprocess
 import sys
+import tempfile
 import threading
 import time
 import unittest
@@ -465,6 +470,192 @@ class WatcherIntervalTest(unittest.TestCase):
         self.assertEqual(len(self.chat.calls), 2)
         hub.boost(dict(REF))
         wait_for(lambda: len(self.chat.calls) >= 3, timeout=2)
+
+
+class FakeTerminals:
+    """A terminal list: create/close/detach report themselves like TerminalManager; a
+    session that ends on its own (end) reports nothing."""
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.rows, self.listeners, self.reads, self.error = [], [], 0, None
+        self.threads = set()
+
+    def add_listener(self, callback):
+        self.listeners.append(callback)
+
+    def remove_listener(self, callback):
+        self.listeners.remove(callback)
+
+    def list(self):
+        with self.lock:
+            self.reads += 1
+            self.threads.add(threading.get_ident())
+            if self.error:
+                raise self.error
+            return [dict(row) for row in self.rows]
+
+    def _report(self):
+        for callback in list(self.listeners):
+            callback()
+
+    def create(self, tid):
+        with self.lock:
+            self.rows.append({"id": tid, "alive": True, "closed": False})
+        self._report()
+
+    def close(self, tid):
+        with self.lock:
+            next(row for row in self.rows if row["id"] == tid).update(alive=False, closed=True)
+        self._report()
+
+    def detach(self, tid):
+        self._report()
+
+    def end(self, tid):
+        with self.lock:
+            next(row for row in self.rows if row["id"] == tid).update(alive=False)
+
+
+class TerminalEventsTest(unittest.TestCase):
+    A, B = "a" * 32, "b" * 32
+
+    def setUp(self):
+        self.board, self.chat, self.terms = FakeBoard(), FakeChat(), FakeTerminals()
+        self.hub = events.EventHub(self.board, self.chat, heartbeat=0.1, grace=0.3, peer_check=0.02,
+                                   terminals=self.terms, terminal_interval=0.05, terminal_error=0.1)
+        self.addCleanup(self.hub.close)
+
+    def reads(self):
+        with self.terms.lock:
+            return self.terms.reads
+
+    def versions(self, reader):
+        return [item["version"] for item in reader.events("terminals")]
+
+    def test_hello_carries_the_list_version_and_create_close_detach_are_announced(self):
+        self.assertEqual(events.encode_event("terminals", {"version": 3}), b'event: terminals\ndata: {"version":3}\n\n')
+        self.terms.create(self.A)
+        self.assertEqual(self.hub.terminals_version, 1, "a change with nobody following still counts")
+        reader = Reader(self.hub, self.hub.open())
+        wait_for(lambda: reader.events("hello"))
+        self.assertEqual(reader.events("hello"), [{"snapshotVersion": 0, "terminalsVersion": 1}])
+        self.terms.create(self.B)
+        wait_for(lambda: self.versions(reader) and self.versions(reader)[-1] >= 2)
+        created = self.versions(reader)[-1]
+        self.terms.close(self.A)
+        wait_for(lambda: self.versions(reader)[-1] > created)
+        closed = self.versions(reader)[-1]
+        self.terms.detach(self.B)
+        wait_for(lambda: self.versions(reader)[-1] > closed)
+        versions = self.versions(reader)
+        self.assertEqual(versions, sorted(set(versions)), "versions only increase and are never repeated")
+        self.assertTrue(all(version > 1 for version in versions), "the hello version is not announced again")
+        reader.gone = True
+        reader.thread.join(2)
+
+    def test_a_session_that_ended_on_its_own_is_found_only_while_someone_follows(self):
+        with self.terms.lock:
+            self.terms.rows = [{"id": self.A, "alive": True}, {"id": self.B, "alive": True}]
+        time.sleep(0.2)
+        self.assertEqual(self.reads(), 0, "no stream, no terminal reads")
+        self.assertFalse(self.hub.terminal_watching)
+        first = Reader(self.hub, self.hub.open())
+        wait_for(lambda: self.reads() >= 2)
+        self.assertEqual(first.events("terminals"), [], "an unchanged list is not announced")
+        self.terms.end(self.A)
+        wait_for(lambda: first.events("terminals"))
+        self.assertEqual(self.versions(first), [1])
+        first.gone = True
+        first.thread.join(2)
+        # The last stream left: reads stop at once and the watcher leaves after the grace period.
+        wait_for(lambda: not self.hub.terminal_watching, timeout=3)
+        reads = self.reads()
+        # Ended while nobody followed: nothing reads the list meanwhile ...
+        self.terms.end(self.B)
+        time.sleep(0.2)
+        self.assertEqual(self.reads(), reads)
+        self.assertEqual(self.hub.terminals_version, 1)
+        # ... and the first read for a new stream announces it.
+        second = Reader(self.hub, self.hub.open())
+        wait_for(lambda: second.events("terminals"))
+        self.assertEqual(second.events("hello")[0]["terminalsVersion"], 1)
+        self.assertEqual(self.versions(second), [2])
+        second.gone = True
+        second.thread.join(2)
+
+    def test_one_watcher_for_all_streams_and_a_failed_read_backs_off_without_announcing(self):
+        readers = [Reader(self.hub, self.hub.open()) for _ in range(3)]
+        wait_for(lambda: self.reads() >= 3)
+        self.assertEqual(len(self.terms.threads), 1, "one watcher reads for every stream")
+        self.terms.error = RuntimeError("tmux fixture failure")
+        reads = self.reads()
+        time.sleep(0.25)
+        # 0.1 s apart after an error instead of 0.05 s.
+        self.assertLessEqual(self.reads() - reads, 4)
+        self.terms.error = None
+        self.assertTrue(all(reader.events("terminals") == [] for reader in readers))
+        self.hub.close()
+        for reader in readers:
+            reader.thread.join(2)
+        wait_for(lambda: not self.hub.terminal_watching)
+        self.assertEqual(self.terms.listeners, [], "closing the hub stops listening to the terminals")
+
+    def test_a_hub_without_terminals_reads_and_announces_nothing(self):
+        hub = events.EventHub(self.board, self.chat, heartbeat=0.1, peer_check=0.02, terminals=object())
+        self.addCleanup(hub.close)
+        reader = Reader(hub, hub.open())
+        wait_for(lambda: reader.events("hello"))
+        self.assertNotIn("terminalsVersion", reader.events("hello")[0])
+        self.assertFalse(hub.terminal_watching)
+        reader.gone = True
+        reader.thread.join(2)
+
+
+@unittest.skipUnless(shutil.which("tmux"), "tmux is not installed")
+class RealTerminalEventsTest(unittest.TestCase):
+    """A real TerminalManager (a Python echo fixture on its own tmux socket) and the hub."""
+
+    def setUp(self):
+        import terminal
+        self.directory = tempfile.TemporaryDirectory()
+        self.socket = "sb-test-" + secrets.token_hex(8)
+        self.manager = terminal.TerminalManager(state_dir=self.directory.name, socket_name=self.socket)
+        self.hub = events.EventHub(FakeBoard(), FakeChat(), heartbeat=0.2, grace=0.3, peer_check=0.02,
+                                   terminals=self.manager, terminal_interval=0.05, terminal_error=0.1)
+
+    def tearDown(self):
+        self.hub.close()
+        self.manager.close()
+        subprocess.run([shutil.which("tmux"), "-L", self.socket, "kill-server"],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
+        self.directory.cleanup()
+
+    def create(self, key):
+        code = "import sys\nprint('READY', flush=True)\nfor line in sys.stdin:\n print(line, flush=True)\n"
+        return self.manager.create(key, [sys.executable, "-u", "-c", code], self.directory.name,
+                                   {"PATH": os.environ.get("PATH", "")}, {"host": "local"})
+
+    def test_create_detach_close_and_a_killed_session_are_announced(self):
+        reader = Reader(self.hub, self.hub.open())
+        wait_for(lambda: reader.events("hello"))
+        latest = lambda: (reader.events("terminals") or [{"version": 0}])[-1]["version"]
+        first = self.create("first")
+        wait_for(lambda: latest() >= 1)
+        second = self.create("second")
+        seen = latest()
+        self.manager.detach(second["id"])
+        wait_for(lambda: latest() > seen)
+        seen = latest()
+        self.manager.close_terminal(first["id"])
+        wait_for(lambda: latest() > seen)
+        seen = latest()
+        # The CLI's tmux session ends without any board request: the watcher finds it.
+        subprocess.run([shutil.which("tmux"), "-L", self.socket, "kill-session", "-t", "=sb-" + second["id"]],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5, check=True)
+        wait_for(lambda: latest() > seen)
+        self.assertEqual(events.live_terminals(self.manager.list()), frozenset())
+        reader.gone = True
+        reader.thread.join(2)
 
 
 if __name__ == "__main__":

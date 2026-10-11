@@ -182,6 +182,9 @@ class TerminalManager:
         self.reservations = set()
         self._closed = False
         self._warned = set()
+        # Told (without arguments) when a terminal is created, closed, attached or
+        # detached. They may run under self.lock: a listener never calls back in here.
+        self._listeners = []
         lock_path = self.state_dir / ".lock"
         try:
             self._lock_fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
@@ -198,6 +201,20 @@ class TerminalManager:
         except BaseException:
             os.close(self._lock_fd)
             raise
+
+    def add_listener(self, callback):
+        self._listeners.append(callback)
+
+    def remove_listener(self, callback):
+        self._listeners.remove(callback)
+
+    def _changed(self):
+        """The terminal list may have changed; a listener's failure never fails the change."""
+        for callback in list(self._listeners):
+            try:
+                callback()
+            except Exception:
+                pass
 
     def _command(self, *args):
         if not self.tmux:
@@ -416,6 +433,7 @@ class TerminalManager:
             terminal.alive = True
             terminal.attached_fresh = True
             threading.Thread(target=self._reader, args=(terminal, process, master, generation), daemon=True).start()
+        self._changed()
 
     def _configure(self, terminal):
         # Unlike has-session/attach-session, option targets interpret '=' as part
@@ -725,6 +743,7 @@ class TerminalManager:
                 except subprocess.TimeoutExpired:
                     process.kill()
                     process.wait(timeout=2)
+        self._changed()
         return {"ok": True}
 
     def close_terminal(self, terminal_id):
@@ -767,6 +786,7 @@ class TerminalManager:
                     except subprocess.TimeoutExpired:
                         process.kill()
                         process.wait(timeout=2)
+        self._changed()
         return {"ok": True}
 
     def close(self):

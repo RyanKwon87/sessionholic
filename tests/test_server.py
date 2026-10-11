@@ -530,8 +530,9 @@ class EventStreamTest(unittest.TestCase):
         self.assertNotIn("content-encoding", headers)
         body = received.split(b"\r\n\r\n", 1)[1]
         version = self.board.version
-        self.assertTrue(body.startswith(b'retry: 3000\n\nevent: hello\ndata: {"snapshotVersion":%d,"bootId":"%s"}\n\n'
-                                        % (version, self.httpd.boot_id.encode())))
+        self.assertTrue(body.startswith(b'retry: 3000\n\nevent: hello\ndata: {"snapshotVersion":%d,"bootId":"%s",'
+                                        b'"terminalsVersion":%d}\n\n'
+                                        % (version, self.httpd.boot_id.encode(), self.httpd.events.terminals_version)))
         self.data = {"claude": [{"id": "a1b2c3d4", "title": "정산 완료", "phase": "done"}], "codex": []}
         self.board.poll(HOSTS[0])
         received = self.read_until(sock, b'event: snapshot\ndata: {"version":%d}\n\n' % self.board.version, received)

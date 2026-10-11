@@ -1620,8 +1620,11 @@ class Handler(BaseHTTPRequestHandler):
                     return self.send_json(200, {**result, "csrfToken": self.server.csrf,
                                                "authMode": "tailscale" if self.tailscale_authorized() else "token"})
                 if url.path == "/api/terminals":
+                    # Read before the list: a change in between is announced with a newer
+                    # version, so the client reads again rather than missing it.
+                    version = self.server.events.terminals_version
                     records = self.server.terminals.list()
-                    result = {"terminals": records}
+                    result = {"terminals": records, "version": version}
                     try:
                         self.server.terminal_inputs.prune_all_closed(records)
                     except (ValueError, RuntimeError, OSError):
@@ -1944,7 +1947,9 @@ def make_server(bind, port, board, token, terminals=None, workflow=None, state_d
     from chat import Chat
     server.chat = Chat(board, server.workflow, state_dir)
     from events import EventHub
-    server.events = EventHub(board, server.chat, boot_id=server.boot_id)
+    # Also announces the terminal list: what the board's terminals report, and while
+    # anyone follows the stream, terminals that ended on their own.
+    server.events = EventHub(board, server.chat, boot_id=server.boot_id, terminals=server.terminals)
     return server
 
 

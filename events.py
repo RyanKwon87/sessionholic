@@ -1,9 +1,13 @@
-"""Server-sent change feed: snapshot versions and watched conversation digests.
+"""Server-sent change feed: snapshot versions, watched conversation digests and the
+board terminal list version.
 
 Standard library only and Python 3.9 compatible. Streams never hold the board's
 collection locks: they wait on their own small mailbox and write outside every lock.
 A conversation is read by one shared watcher, however many streams follow it,
-through the existing conversation state path and its short cache.
+through the existing conversation state path and its short cache. The terminal list
+is announced when the terminal manager reports a change (create, close, attach,
+detach) and, only while someone follows the stream, when its periodic read finds
+that the set of live terminals changed (a tmux session that ended on its own).
 """
 import hashlib
 import json
@@ -34,6 +38,10 @@ IDLE_INTERVALS = (5.0, 10.0, 20.0, 30.0)
 ERROR_INTERVAL = 10.0
 # How often an idle stream checks whether its client went away.
 PEER_CHECK = 1.0
+# Seconds between terminal list reads while at least one stream is open (at most four
+# board terminals, so a read is a few tmux calls); after a failed read, the longer one.
+TERMINAL_INTERVAL = 5.0
+TERMINAL_ERROR_INTERVAL = 10.0
 CHAT_KEYS = ("host", "agent", "home", "id")
 EXPECTED = (ValueError, RuntimeError, OSError, KeyError)
 
@@ -44,6 +52,12 @@ def encode_event(name, data):
 
 def state_digest(state):
     return hashlib.sha256(json.dumps(state, sort_keys=True, ensure_ascii=False, default=str).encode()).hexdigest()[:24]
+
+
+def live_terminals(rows):
+    """IDs of the live (alive, not closed) terminals in a terminal list."""
+    return frozenset(row.get("id") for row in rows
+                     if isinstance(row, dict) and row.get("alive") and not row.get("closed"))
 
 
 def chat_ref(query):
@@ -72,6 +86,9 @@ class Stream:
         self.digest = None
         self.hello = 0
         self.sent_digest = None
+        # Terminal list versions: the one sent with hello and the newest announced since.
+        self.hello_terminals = None
+        self.terminals = None
 
 
 class Watcher:
@@ -94,7 +111,8 @@ class EventHub:
     def __init__(self, board, chat, heartbeat=HEARTBEAT, max_streams=MAX_STREAMS, grace=GRACE,
                  fast=FAST_INTERVAL, idle=IDLE_INTERVALS, error=ERROR_INTERVAL,
                  peer_check=PEER_CHECK, clock=time.monotonic, max_watchers=MAX_WATCHERS,
-                 room_wait=ROOM_WAIT, boot_id=None):
+                 room_wait=ROOM_WAIT, boot_id=None, terminals=None,
+                 terminal_interval=TERMINAL_INTERVAL, terminal_error=TERMINAL_ERROR_INTERVAL):
         self.board, self.chat = board, chat
         # The server process's bootId, sent with hello: snapshot versions restart with it.
         self.boot_id = boot_id
@@ -102,15 +120,29 @@ class EventHub:
         self.max_watchers, self.room_wait = max_watchers, room_wait
         self.fast, self.idle, self.error = fast, tuple(idle), error
         self.peer_check, self.clock = peer_check, clock
-        # Lock order: the board lock may be held when snapshot_changed takes this lock;
-        # nothing here calls into the board or a conversation while holding it.
+        # Lock order: the board lock or the terminal manager's lock may be held when
+        # snapshot_changed or terminals_changed takes this lock; nothing here calls into
+        # the board, the terminals or a conversation while holding it.
         self.lock = threading.Lock()
         # Signalled when a watcher leaves, stops reading or loses its last stream.
         self.room = threading.Condition(self.lock)
         self.streams = set()
         self.watchers = {}
         self.closed = False
+        # The board terminal list (terminal.TerminalManager), when this hub announces it.
+        self.terminals = terminals if callable(getattr(terminals, "list", None)) else None
+        self.terminal_interval, self.terminal_error = terminal_interval, terminal_error
+        # Counts within this server process, like snapshot versions; only ever increases.
+        self.terminals_version = 0
+        # Live terminal IDs at the terminal watcher's last read (kept while it is away, so
+        # a terminal that ended meanwhile is announced by its first read on return).
+        self.terminals_seen = None
+        self.terminal_watching = False
+        self.terminal_idle_since = None
+        self.terminal_wake = threading.Event()
         board.add_listener(self.snapshot_changed)
+        if self.terminals is not None and callable(getattr(self.terminals, "add_listener", None)):
+            self.terminals.add_listener(self.terminals_changed)
 
     # ---------- publishing ----------
     def snapshot_changed(self, version):
@@ -119,6 +151,21 @@ class EventHub:
                 if stream.version is None or version > stream.version:
                     stream.version = version
                     stream.ready.set()
+
+    def terminals_changed(self):
+        """The terminal manager created, closed, attached or detached a terminal: announce
+        a new list version, and let the terminal watcher read the list now so its own
+        comparison lands in the same batch instead of announcing again seconds later."""
+        with self.lock:
+            self._terminals_bump()
+            self.terminal_wake.set()
+
+    def _terminals_bump(self):
+        """Caller holds self.lock."""
+        self.terminals_version += 1
+        for stream in self.streams:
+            stream.terminals = self.terminals_version
+            stream.ready.set()
 
     def _chat_changed(self, watcher, digest):
         with self.lock:
@@ -176,6 +223,9 @@ class EventHub:
                     return None
                 self.room.wait(remaining)
             self.streams.add(stream)
+            # Read under the lock that announces versions: no later change is missed.
+            stream.hello_terminals = self.terminals_version
+            start_terminals = self._follow_terminals()
             if key is not None:
                 stream.key = key
                 if watcher is None:
@@ -191,6 +241,14 @@ class EventHub:
                 stream.sent_digest = watcher.digest
         # Registered before the version is read, so no later change can be missed.
         stream.hello = self.board.version
+        if start_terminals:
+            try:
+                threading.Thread(target=self._watch_terminals, daemon=True,
+                                 name=BRAND["threadPrefix"] + "-terminals").start()
+            except RuntimeError:
+                # The stream still serves snapshots and conversations; a later stream retries.
+                with self.lock:
+                    self.terminal_watching = False
         if start is not None:
             try:
                 threading.Thread(target=self._watch, args=(start,), daemon=True,
@@ -204,7 +262,11 @@ class EventHub:
 
     def close_stream(self, stream):
         with self.lock:
-            self.streams.discard(stream)
+            if stream in self.streams:
+                self.streams.discard(stream)
+                if not self.streams:
+                    # The terminal watcher stops reading and counts down its grace.
+                    self.terminal_idle_since = self.clock()
             watcher = self.watchers.get(stream.key) if stream.key else None
             if watcher is not None and stream in watcher.streams:
                 watcher.streams.discard(stream)
@@ -214,6 +276,20 @@ class EventHub:
                     watcher.wake.set()
                     # It may now make room for a conversation waiting for a place.
                     self.room.notify_all()
+
+    def _follow_terminals(self):
+        """A stream opened: True when the terminal watcher must be started. Caller holds self.lock."""
+        if self.terminals is None or self.closed:
+            return False
+        was_idle = self.terminal_idle_since is not None
+        self.terminal_idle_since = None
+        if self.terminal_watching:
+            if was_idle:
+                # Back within the grace period: read now instead of after the countdown.
+                self.terminal_wake.set()
+            return False
+        self.terminal_watching = True
+        return True
 
     def _retire_idle(self):
         """Ask the watcher without streams idle longest to leave, preferring one that is not
@@ -240,14 +316,18 @@ class EventHub:
             hello = {"snapshotVersion": stream.hello}
             if self.boot_id is not None:
                 hello["bootId"] = self.boot_id
+            if self.terminals is not None:
+                hello["terminalsVersion"] = stream.hello_terminals
             write(("retry: %d\n\n" % RETRY_MS).encode() + encode_event("hello", hello))
             sent_version, sent_digest = stream.hello, stream.sent_digest
+            sent_terminals = stream.hello_terminals
             next_ping = self.clock() + self.heartbeat
             while True:
                 stream.ready.wait(max(0.0, min(self.peer_check, next_ping - self.clock())))
                 with self.lock:
                     stream.ready.clear()
                     version, digest, closed = stream.version, stream.digest, self.closed
+                    terminals = stream.terminals
                 if closed:
                     return
                 out = b""
@@ -257,6 +337,10 @@ class EventHub:
                 if digest is not None and digest != sent_digest:
                     out += encode_event("chat", {"digest": digest})
                     sent_digest = digest
+                if terminals is not None and (sent_terminals is None or terminals > sent_terminals):
+                    # Several changes since the last write are one announcement.
+                    out += encode_event("terminals", {"version": terminals})
+                    sent_terminals = terminals
                 now = self.clock()
                 if now >= next_ping:
                     out += b": ping\n\n"
@@ -276,11 +360,56 @@ class EventHub:
                 stream.ready.set()
             for watcher in self.watchers.values():
                 watcher.wake.set()
+            self.terminal_wake.set()
             self.room.notify_all()
         try:
             self.board.remove_listener(self.snapshot_changed)
         except (AttributeError, ValueError):
             pass
+        try:
+            self.terminals.remove_listener(self.terminals_changed)
+        except (AttributeError, ValueError):
+            pass
+
+    # ---------- the terminal watcher ----------
+    def _read_terminals(self):
+        """One terminal list read; a changed set of live terminals is a new version.
+        Returns the seconds until the next read."""
+        try:
+            # No hub lock here: the list asks tmux about each terminal.
+            live = live_terminals(self.terminals.list())
+        except Exception as exc:
+            if not isinstance(exc, EXPECTED):
+                sys.stderr.write("%s: 터미널 목록 확인 중 예상하지 못한 오류 (%s)\n" % (BRAND["logPrefix"], type(exc).__name__))
+            return self.terminal_error
+        with self.lock:
+            if self.terminals_seen is not None and live != self.terminals_seen:
+                self._terminals_bump()
+            self.terminals_seen = live
+        return self.terminal_interval
+
+    def _watch_terminals(self):
+        """Reads the terminal list while any stream is open; leaves `grace` seconds after the
+        last one closed. Never reads while nobody follows the stream."""
+        try:
+            while True:
+                with self.lock:
+                    self.terminal_wake.clear()
+                    since = self.terminal_idle_since
+                    idle = None if self.streams else self.clock() - (since if since is not None else self.clock())
+                    if self.closed or (idle is not None and idle >= self.grace):
+                        self.terminal_watching = False
+                        return
+                    if idle is not None and since is None:
+                        self.terminal_idle_since = self.clock()
+                if idle is not None:
+                    self.terminal_wake.wait(self.grace - idle)
+                    continue
+                self.terminal_wake.wait(self._read_terminals())
+        except BaseException:
+            with self.lock:
+                self.terminal_watching = False
+            raise
 
     # ---------- conversation watchers ----------
     def _read(self, watcher):

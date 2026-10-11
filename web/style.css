@@ -62,6 +62,9 @@
   --warn-text: #8a4500;
   --green: #248a3d;
   --green-dot: #34c759;
+  --green-tint: rgba(52, 199, 89, 0.14);
+  --green-text: #1b7a34;
+  --terminal-mark-tile: #1c1c1e;
   --usage-green: #1f8a3c;
   --usage-orange: #c56a00;
   --usage-orange-bar: #e08a00;
@@ -218,6 +221,9 @@
     --warn-text: #ffcf87;
     --green: #30d158;
     --green-dot: #30d158;
+    --green-tint: rgba(48, 209, 88, 0.18);
+    --green-text: #30d158;
+    --terminal-mark-tile: #050505;
     --usage-green: #30d158;
     --usage-orange: #ffb340;
     --usage-orange-bar: #ff9f0a;
@@ -292,6 +298,9 @@
   --warn-text: #ffcf87;
   --green: #30d158;
   --green-dot: #30d158;
+  --green-tint: rgba(48, 209, 88, 0.18);
+  --green-text: #30d158;
+  --terminal-mark-tile: #050505;
   --usage-green: #30d158;
   --usage-orange: #ffb340;
   --usage-orange-bar: #ff9f0a;
@@ -5192,6 +5201,90 @@ select:disabled {
   justify-content: center;
   left: auto;
   width: 96px;
+}
+
+/* "터미널 열림": the session has a live board terminal. The list chip's terminal
+   glyph with a green dot, on cards (status line) and in the conversation header. */
+.terminal-mark {
+  display: inline-flex;
+  align-items: center;
+  flex: none;
+  gap: 6px;
+  height: 20px;
+  padding: 0 7px 0 4px;
+  border-radius: 6px;
+  background: var(--green-tint);
+  color: var(--green-text);
+  font-size: var(--fs-cap);
+  font-weight: 600;
+  white-space: nowrap;
+}
+.terminal-mark-icon {
+  position: relative;
+  display: grid;
+  place-items: center;
+  flex: none;
+  width: 17px;
+  height: 14px;
+  border-radius: 4px;
+  background: var(--terminal-mark-tile);
+  color: var(--t-green);
+  font: 700 8px/1 var(--mono);
+  letter-spacing: -0.02em;
+}
+.terminal-mark-icon::after {
+  content: "";
+  position: absolute;
+  top: -3px;
+  right: -3px;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--green-dot);
+  box-shadow: 0 0 0 1.5px var(--surface);
+}
+.detail-terminal {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px 10px;
+  margin-top: 10px;
+}
+.detail-terminal .terminal-mark {
+  height: 24px;
+  padding-right: 9px;
+  font-size: var(--fs-sub);
+}
+.detail-terminal-open {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  min-height: var(--tap-short);
+  padding: 0 12px 0 14px;
+  border: 0;
+  border-radius: 999px;
+  background: var(--accent-tint);
+  color: var(--accent);
+  font-size: var(--fs-sub);
+  font-weight: 600;
+  white-space: nowrap;
+}
+.detail-terminal-open::after {
+  content: "";
+  width: 6px;
+  height: 6px;
+  margin-left: 2px;
+  border-top: 2px solid currentColor;
+  border-right: 2px solid currentColor;
+  transform: rotate(45deg);
+}
+.detail-terminal-open:active {
+  background: var(--accent-tint-press);
+}
+/* The folded header (reading or typing) keeps only the title line. */
+.detail-pane.is-reading .detail-terminal,
+.detail-pane.is-typing .detail-terminal {
+  display: none;
 }
 
 /* --- Sheets ----------------------------------------------------------------- */

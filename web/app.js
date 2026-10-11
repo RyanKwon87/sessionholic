@@ -189,6 +189,13 @@ const state = {
   serverBoot: null,
   snapshotPending: false,
   snapshotEventTimer: null,
+  // The board terminal list's version: the one /api/terminals last returned, the
+  // newest a live update announced, and a read asked for while one was in flight.
+  terminalsVersion: null,
+  eventsTerminalsVersion: null,
+  terminalsPending: false,
+  terminalsEventTimer: null,
+  terminalsReadAt: 0,
 };
 
 // --- UI foundation: theme, haptics, screen transitions, bottom sheet -------
@@ -1180,11 +1187,13 @@ function card(s) {
   const project = el("span", "card-project");
   const stale = el("span", "stale-tag", "이전 정보");
   const time = el("span", "card-time");
-  meta.append(badge, agent, project, stale, time);
+  // A live board terminal of this session (renderTerminalMarks keeps it current).
+  const terminal = terminalMark("card-terminal");
+  meta.append(badge, terminal, agent, project, stale, time);
   const chevron = el("span", "card-chevron");
   chevron.setAttribute("aria-hidden", "true");
   node.append(title, snippet, meta, chevron);
-  node.cardParts = { title, snippet, badge, agent, project, stale, time };
+  node.cardParts = { title, snippet, badge, terminal, agent, project, stale, time };
   node.cardRow = row;
   row.append(action, node);
   row.card = node;
@@ -1206,10 +1215,11 @@ function updateCard(node, s, now, folderHint = "") {
   const time = ago(s.updatedAt, now);
   node.className = `card${state.selected === s.key ? " selected" : ""}`;
   node.setAttribute("aria-pressed", String(state.selected === s.key));
-  node.setAttribute("aria-label", ["프로젝트: " + project, "작업: " + title,
+  node.cardLabel = ["프로젝트: " + project, "작업: " + title,
     preview ? "대화 미리보기: " + preview : "", folderHint ? "작업 폴더: " + folderHint : "",
     label, agent, "기기: " + host, account ? "계정 설정: " + account : "", time,
-    s.stale ? "마지막 확인 기준" : ""].filter(Boolean).join(". "));
+    s.stale ? "마지막 확인 기준" : ""].filter(Boolean).join(". ");
+  markCardTerminal(node, s);
   node.title = `${project}\n${title}`;
   const place = folderHint ? `${project} · ${folderHint}` : project;
   write(p.title, title); p.title.title = title;
@@ -1373,6 +1383,55 @@ function terminalForSession(s) {
     const native = terminalInfo(terminal).nativeSource;
     return native?.host && chatKey(native) === key;
   }) || alive.find((terminal) => launchedFrom(terminalInfo(terminal)) === key) || null;
+}
+// "터미널 열림": the list chip's terminal glyph with a green dot. Hidden until the
+// session has a live board terminal (terminalForSession).
+function terminalMark(className) {
+  const mark = el("span", `terminal-mark ${className}`);
+  const icon = el("span", "terminal-mark-icon", "›_");
+  icon.setAttribute("aria-hidden", "true");
+  mark.append(icon, el("span", "terminal-mark-label", "터미널 열림"));
+  mark.hidden = true;
+  return mark;
+}
+function markCardTerminal(node, s) {
+  const mark = node?.cardParts?.terminal;
+  if (!mark) return;
+  const open = !!terminalForSession(s);
+  if (mark.hidden !== !open) mark.hidden = !open;
+  if (typeof node.cardLabel === "string")
+    node.setAttribute("aria-label", open ? `${node.cardLabel}. 터미널 열림` : node.cardLabel);
+}
+// The terminal list changed (a read, an open or a close here, or a live update):
+// mounted cards and the open conversation's header follow without a full render.
+function renderTerminalMarks() {
+  const sessions = new Map(allSessions().map((s) => [s.key, s]));
+  for (const section of $("groups")?.children || [])
+    for (const row of section.children || [])
+      if (row.card?.cardParts) markCardTerminal(row.card, sessions.get(row.dataset?.sessionKey));
+  const selected = sessions.get(state.selected);
+  if (selected) renderDetailTerminal(selected);
+}
+function renderDetailTerminal(s) {
+  if (!s || $("detail").dataset?.key !== s.key) return;
+  const box = $("detail-terminal");
+  if (!box) return;
+  const terminal = terminalForSession(s);
+  box.hidden = !terminal;
+  $("detail-terminal-open")?.setAttribute("aria-label",
+    terminal ? `열린 터미널로 가기: ${terminal.title || s.title || "열어 둔 터미널"}` : "열린 터미널로 가기");
+}
+// "터미널로" in the conversation header: the terminal is looked up again on the
+// tap, so one closed meanwhile is never opened (the header just hides it).
+function goToSessionTerminal(key) {
+  const s = selectedSession();
+  if (!s || s.key !== key || state.launchBusy || !state.authenticated) return;
+  const terminal = terminalForSession(s);
+  if (!terminal) {
+    renderDetailTerminal(s);
+    return;
+  }
+  openTerminal(terminal);
 }
 function openSessionTerminal(s) {
   if (!s || state.launchBusy || !state.authenticated) return;
@@ -1632,6 +1691,7 @@ function patchDetailMetadata(s) {
   } else note?.remove();
   const route = pane.querySelector(".chat-route");
   if (route) route.textContent = `${s.hostLabel || s.host} · ${AGENTS[s.agent] || s.agent} · ${sessionAccountLabel(s)}`;
+  renderDetailTerminal(s);
 }
 async function loadDetail(s, fresh = false) {
   const run = ++state.detailRun;
@@ -1702,9 +1762,20 @@ function drawDetail(s) {
   );
   const meta = el("div", "detail-meta");
   meta.append(...detailMetaChildren(s));
-  titles.append(meta);
+  // Shown while this session has a live board terminal (renderDetailTerminal);
+  // without one, the composer's own "터미널 열기" stays the way to open it.
+  const terminal = el("div", "detail-terminal");
+  terminal.id = "detail-terminal";
+  terminal.hidden = true;
+  const goTerminal = button("터미널로", "detail-terminal-open", () => goToSessionTerminal(s.key));
+  goTerminal.id = "detail-terminal-open";
+  const mark = terminalMark("detail-terminal-mark");
+  mark.hidden = false;
+  terminal.append(mark, goTerminal);
+  titles.append(meta, terminal);
   head.append(titles);
   pane.append(head);
+  renderDetailTerminal(s);
   if (s.stale)
     pane.append(
       el(
@@ -1734,7 +1805,8 @@ function drawDetail(s) {
   bindMessageGestures(list);
   // The folded one-line header unfolds when tapped (the back button keeps its job).
   head.addEventListener("click", (event) => {
-    if (!state.chromeVisible && !event.target?.closest?.(".back")) setChromeVisible(true, { stickBottom: messagesAtEnd(list) });
+    if (!state.chromeVisible && !event.target?.closest?.(".back, .detail-terminal-open"))
+      setChromeVisible(true, { stickBottom: messagesAtEnd(list) });
   });
   state.chromeVisible = true;
   pane.classList?.remove("is-reading");
@@ -1882,6 +1954,8 @@ async function promptAction(s, body) {
       entry.promptNote = result.status === "answered" ? "" : "선택이 반영됐는지 확인하지 못했습니다. 터미널에서 확인해 주세요.";
     if (body.action === "answer" && result.status === "answered") { toast("선택을 보냈습니다."); haptic("success"); }
     entry.data = { ...entry.data, prompt: result.prompt || null, promptOpenable: false };
+    // "질문 불러오기" may have attached a board terminal: its marks show it now.
+    if (body.action === "open") refreshTerminals();
   } catch (err) {
     if (!err.unauthorized && currentChat(entry)) { entry.promptNote = err.message; haptic("error"); }
   } finally {
@@ -4364,6 +4438,8 @@ async function launchPlan() {
       throw new Error("터미널 연결 정보를 받지 못했습니다.");
     $("plan-dialog").close();
     state.plan = null;
+    // Its card and conversation header show "터미널 열림" at once.
+    rememberTerminal(result.terminal);
     await openTerminal(result.terminal);
     assertAuthEpoch(authEpoch);
     if (plan.mode === "transfer" || result.mode === "transfer")
@@ -5232,6 +5308,9 @@ async function refreshTerminals(authEpoch = state.authEpoch) {
     assertAuthEpoch(authEpoch);
     state.terminals = result.terminals || [];
     state.terminalsError = "";
+    // The version the server read before this list; a newer announcement reads again.
+    state.terminalsVersion = Number.isInteger(result.version) ? result.version : null;
+    state.terminalsReadAt = Date.now();
     updateInputCleanupNotice(result.inputCleanupPending === true);
     const current = state.terminals.find((t) => t.id === state.terminal?.id);
     if (current) {
@@ -5261,8 +5340,48 @@ async function refreshTerminals(authEpoch = state.authEpoch) {
     if (authEpoch === state.authEpoch) {
       state.terminalsRefreshing = false;
       $("running-refresh").disabled = false;
+      // A change announced during this read: read once more if still behind.
+      if (state.terminalsPending) {
+        state.terminalsPending = false;
+        if (terminalsBehind()) terminalsAnnounced(state.eventsTerminalsVersion);
+      }
     }
   }
+}
+// Live updates announce the terminal list's version ("terminals"): creates,
+// closes, attaches and detaches on any device, and terminals that ended on
+// their own. A burst is read together after TERMINALS_EVENT_BATCH_MS.
+const TERMINALS_EVENT_BATCH_MS = 300;
+function terminalsBehind() {
+  return Number.isInteger(state.eventsTerminalsVersion) &&
+    !(Number.isInteger(state.terminalsVersion) && state.eventsTerminalsVersion <= state.terminalsVersion);
+}
+// hello: a stream's first message. On the first connection nothing was read
+// yet and the read after login shows the list, so only a reconnect reads.
+function terminalsAnnounced(version, { hello = false } = {}) {
+  if (!Number.isInteger(version)) return;
+  state.eventsTerminalsVersion = Math.max(version, state.eventsTerminalsVersion ?? version);
+  if (Number.isInteger(state.terminalsVersion) && version <= state.terminalsVersion) return;
+  if (hello && !Number.isInteger(state.terminalsVersion) && !state.terminalsReadAt) return;
+  if (state.terminalsEventTimer) return;
+  const authEpoch = state.authEpoch;
+  state.terminalsEventTimer = setTimeout(() => {
+    state.terminalsEventTimer = null;
+    if (authEpoch === state.authEpoch) readAnnouncedTerminals();
+  }, TERMINALS_EVENT_BATCH_MS);
+}
+function readAnnouncedTerminals() {
+  if (!state.authenticated || !terminalsBehind()) return;
+  if (state.terminalsRefreshing) state.terminalsPending = true;
+  else refreshTerminals();
+}
+// An open or a close made here shows at once; the list read that follows confirms it.
+function rememberTerminal(terminal, changes = {}) {
+  if (!terminal?.id) return;
+  const index = state.terminals.findIndex((item) => item.id === terminal.id);
+  const row = { ...(index < 0 ? {} : state.terminals[index]), ...terminal, ...changes };
+  state.terminals = index < 0 ? [...state.terminals, row] : state.terminals.map((item, i) => (i === index ? row : item));
+  renderTerminals();
 }
 function renderTerminals() {
   const list = $("running-list");
@@ -5310,7 +5429,9 @@ function renderTerminals() {
     if (restoreFocus?.id === terminal.id)
       (restoreFocus.action === "close" ? close : node).focus();
   }
-  // Cards and the open conversation offer "연결 닫기" for these terminals.
+  // Cards and the open conversation offer "연결 닫기" for these terminals, and
+  // show "터미널 열림" while one is live.
+  renderTerminalMarks();
   const selected = selectedSession();
   if (selected) updateChatComposer(chatEntry(selected));
 }
@@ -5349,6 +5470,9 @@ function cancelTerminalClose() {
   if (trigger?.isConnected !== false) trigger?.focus();
 }
 function finishTerminalClose(closing) {
+  // Cards and the conversation header drop "터미널 열림" at once.
+  if (state.terminals.some((item) => item.id === closing.id && item.alive !== false && !item.closed))
+    rememberTerminal({ id: closing.id }, { alive: false, closed: true });
   if (state.terminal?.id === closing.id) {
     const wasVisible = state.terminalVisible;
     saveDraft();
@@ -5489,9 +5613,13 @@ function syncEvents() {
     // A restarted server counts versions from 0 again: forget the old numbers first.
     serverBooted(hello.bootId);
     snapshotAnnounced(hello.snapshotVersion, { immediate: true });
+    terminalsAnnounced(hello.terminalsVersion, { hello: true });
   });
   source.addEventListener("snapshot", (event) => {
     if (current()) snapshotAnnounced(parse(event).version);
+  });
+  source.addEventListener("terminals", (event) => {
+    if (current()) terminalsAnnounced(parse(event).version);
   });
   source.addEventListener("chat", (event) => {
     if (!current()) return;
@@ -5595,6 +5723,9 @@ function serverBooted(bootId) {
   if (state.serverBoot !== null) {
     state.snapshotVersion = null;
     state.eventsSnapshotVersion = null;
+    // The terminal list is read again on the new process's first announcement.
+    state.terminalsVersion = null;
+    state.eventsTerminalsVersion = null;
   }
   state.serverBoot = bootId;
 }
@@ -5631,6 +5762,11 @@ async function poll(refresh = false, { capabilities = true } = {}) {
     state.pollFailures = 0;
     renderConnectivity();
     if (Date.now() - (state.usageAt || 0) > 55000) loadUsage();
+    // Safety net for missed (or unavailable) terminal announcements: a regular
+    // read also reads a terminal list older than a minute. The first list is
+    // read by login and startup themselves.
+    if (capabilities && state.terminalsReadAt && Date.now() - state.terminalsReadAt >= POLL_MS)
+      refreshTerminals(authEpoch);
     schedule();
     syncEvents();
   } catch (err) {
@@ -5806,6 +5942,12 @@ function showLogin() {
   clearTimeout(state.pollTimer);
   clearTimeout(state.snapshotEventTimer);
   state.snapshotEventTimer = null;
+  clearTimeout(state.terminalsEventTimer);
+  state.terminalsEventTimer = null;
+  state.terminalsVersion = null;
+  state.eventsTerminalsVersion = null;
+  state.terminalsPending = false;
+  state.terminalsReadAt = 0;
   stopTerminalReader();
   stopChatPolling();
   // Object URLs of picked images are released with their drafts.

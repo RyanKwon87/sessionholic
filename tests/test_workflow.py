@@ -241,6 +241,15 @@ class SecurityTest(unittest.TestCase):
         path = '/api/terminal/' + 'b'*32 + '/input'
         self.assertEqual(self.request('POST', path, payload, self.auth())[0].status, 200)
 
+    def test_terminal_list_carries_the_version_its_events_announce(self):
+        res, body = self.request('GET', '/api/terminals', headers=self.auth())
+        self.assertEqual(res.status, 200)
+        self.assertEqual(json.loads(body)['version'], 0)
+        # What a TerminalManager reports (create, close, attach, detach) is a new version.
+        self.httpd.events.terminals_changed()
+        res, body = self.request('GET', '/api/terminals', headers=self.auth())
+        self.assertEqual(json.loads(body)['version'], 1)
+
     def test_close_succeeds_and_reports_failed_receipt_cleanup_for_refresh_retry(self):
         self.terms.records = [{'id': 'a'*32, 'alive': True, 'closed': False}]
         with patch.object(self.httpd.terminal_inputs, 'prune_all_closed', side_effect=RuntimeError('fixture disk error')):

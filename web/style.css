@@ -3178,7 +3178,8 @@ select:disabled {
 .chat-input:focus {
   border-color: var(--accent);
 }
-.chat-input:disabled {
+.chat-input:disabled,
+.chat-input[readonly] {
   background: var(--fill-soft);
   color: var(--label-2);
 }
@@ -4248,6 +4249,53 @@ select:disabled {
 }
 .chat-prompt .primary {
   min-height: 44px;
+}
+
+/* Wide touch screens (tablets): phone-sized text, one reading column for the
+   transcript, the question card and the composer (42.5rem: about 40 Hangul
+   characters a line in a bubble, scaled with the board text size), and a
+   list column that leaves the conversation more room than a phone has.
+   Phones held sideways (short) keep their own rules. */
+@media (pointer: coarse) and (min-width: 701px) and (min-height: 521px) {
+  :root {
+    --fs-body: 1rem;
+    --fs-sub: 0.875rem;
+    --detail-pad: max(16px, calc((100% - 42.5rem) / 2));
+  }
+  .chat-prompt {
+    margin-inline: var(--detail-pad);
+  }
+}
+@media (pointer: coarse) and (min-width: 701px) and (max-width: 1023px) and (min-height: 521px) {
+  .layout {
+    grid-template-columns: clamp(256px, 33vw, 300px) minmax(0, 1fr);
+  }
+}
+
+/* The send key, in the folded composer's toolbar once a keyboard is known
+   (app.js keyboardPresent); the expanded composer's hint line says it. */
+.chat-key-hint {
+  flex: none;
+  margin-left: auto;
+  padding: 0 4px;
+  color: var(--label-2);
+  font-size: var(--fs-cap);
+  line-height: 1.2;
+  white-space: nowrap;
+}
+.chat-key-hint[hidden] {
+  display: none;
+}
+.chat-key-hint:not([hidden]) + .chat-tools {
+  margin-left: 0;
+}
+@media (max-width: 380px) {
+  .chat-key-hint {
+    display: none;
+  }
+  .chat-key-hint:not([hidden]) + .chat-tools {
+    margin-left: auto;
+  }
 }
 
 /* Agent usage strip under the work counts. */

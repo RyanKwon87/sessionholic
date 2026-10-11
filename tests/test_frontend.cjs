@@ -2327,7 +2327,8 @@ test('HTTP status without a not_started guarantee remains unknown and never auto
     const { entry } = selectChat(c); entry.text = '전송 결과를 모르는 초안';
     await c.sendChat(entry); await new Promise((resolve) => setImmediate(resolve)); await c.sendChat(entry);
     assert.equal(sends, 1); assert.equal(!!entry.pending, true); assert.equal(entry.receipt.status, 'unknown');
-    assert.equal(c.get('chat-input').disabled, true); assert.equal(entry.text, '전송 결과를 모르는 초안');
+    assert.equal(c.get('chat-input').readOnly, true); assert.equal(c.get('chat-input').disabled, false);
+    assert.equal(c.get('chat-input').attributes['aria-disabled'], 'true'); assert.equal(entry.text, '전송 결과를 모르는 초안');
   }
 });
 
@@ -3690,7 +3691,7 @@ test('typing on a phone folds the conversation chrome, sending keeps the keyboar
   const list = c.get('messages');
   Object.assign(list, { scrollHeight: 2000, clientHeight: 300, scrollTop: 1700 });
   const input = c.get('chat-input');
-  c.context.window.matchMedia = (query) => ({ matches: query === '(pointer: coarse)' });
+  c.context.window.matchMedia = (query) => ({ matches: query === '(pointer: coarse)' || query === '(max-width: 700px)' });
   input.events.focus();
   assert.equal(pane.classList.contains('is-typing'), true);
   assert.equal(list.scrollTop, 2000, 'the newest message stays in view');
@@ -5011,8 +5012,9 @@ test('a long question menu keeps its first choices inline and lists every choice
 
 // --- Phone conversation bars, explicit terminals, gesture thresholds, batched snapshot events ---
 
-// A phone conversation (coarse pointer) with a scrolled transcript and a controllable clock.
-function phoneConversation({ coarse = true, timers = noChatTimers, fetchImpl } = {}) {
+// A phone conversation (coarse pointer, phone width) with a scrolled transcript and a
+// controllable clock. `wide`: a tablet instead (coarse pointer, wide screen).
+function phoneConversation({ coarse = true, wide = false, timers = noChatTimers, fetchImpl } = {}) {
   const c = client(fetchImpl, timers);
   const { s, entry } = selectChat(c);
   c.drawDetail(s);
@@ -5020,7 +5022,9 @@ function phoneConversation({ coarse = true, timers = noChatTimers, fetchImpl } =
   const list = c.get('messages');
   // As after the first render (renderMessages keeps the position it set).
   Object.assign(list, { scrollHeight: 3000, clientHeight: 600, scrollTop: 2400, offsetTop: 80, lastScrollTop: 2400 });
-  c.context.window.matchMedia = (query) => ({ matches: coarse && query === '(pointer: coarse)' });
+  c.context.window.matchMedia = (query) => ({ matches: coarse &&
+    (query === '(pointer: coarse)' || (!wide && query === '(max-width: 700px)')) });
+  c.state.detailShown = true; // a phone shows the conversation screen
   const clock = { now: 1e13 };
   c.context.Date = class extends Date { static now() { return clock.now; } };
   const plain = { closest: () => null };
@@ -5909,4 +5913,267 @@ test('the working time does not tick on a phone\'s list or behind a terminal, an
   c.state.terminalVisible = true;
   ticking()[0].callback();
   assert.equal(ticking().length, 0, 'a terminal covers the conversation');
+});
+
+// --- Tablets (wide touch screens) and hardware keyboards ---
+
+test('a menu item runs only for a press that started on it after the menu opened, so a long press lifting over it runs nothing', () => {
+  const timers = [];
+  const c = client(undefined, { setTimeout: (callback, delay) => { timers.push({ callback, delay }); return timers.length; },
+    clearTimeout(id) { if (timers[id - 1]) timers[id - 1].cleared = true; } });
+  c.context.window.matchMedia = (query) => ({ matches: query === '(pointer: coarse)' }); // a tablet: the centered menu
+  const { s } = selectChat(c);
+  c.renderMessages(s, [{ role: 'assistant', text: '길게 눌러 볼 답변' }]);
+  const list = c.get('messages');
+  const row = list.children[0];
+  vm.runInContext('bindMessageGestures', c.context)(list);
+  const dialog = c.get('action-sheet');
+  const target = { closest: (selector) => (selector === '.msg' ? row : null) };
+  const longPress = (id) => {
+    list.events.pointerdown({ pointerId: id, pointerType: 'touch', isPrimary: true, clientX: 300, clientY: 600, target });
+    timers.filter((timer) => timer.delay === c.GESTURE.longPressMs && !timer.cleared).at(-1).callback();
+    assert.equal(dialog.open, true, 'the long press opened the menu');
+    return c.get('action-list').children.find((item) => item.textContent === '텍스트 선택');
+  };
+  let item = longPress(1);
+  // The finger lifts where the menu now is: its click lands on an item.
+  list.events.pointerup({ pointerId: 1, clientX: 300, clientY: 600 });
+  item.events.click({ detail: 1, target: item });
+  assert.equal(dialog.open, true, 'the opening finger runs nothing and the menu stays');
+  // A press on the backdrop (not on the item) does not arm the item either.
+  dialog.events.pointerdown({ pointerId: 2, pointerType: 'touch', target: dialog, clientX: 10, clientY: 10 });
+  item.events.click({ detail: 1, target: item });
+  assert.equal(dialog.open, true);
+  // A tap that starts on the item runs it.
+  dialog.events.pointerdown({ pointerId: 3, pointerType: 'touch', target: item, clientX: 300, clientY: 640 });
+  item.events.click({ detail: 1, target: item });
+  assert.equal(dialog.open, false, 'a deliberate tap on the item runs it');
+  // The next menu forgets that press.
+  item = longPress(4);
+  item.events.click({ detail: 1, target: item });
+  assert.equal(dialog.open, true);
+  // Keyboard (Enter/Space) and assistive clicks have no pointer: detail 0.
+  item.events.click({ detail: 0, target: item });
+  assert.equal(dialog.open, false, 'the keyboard still runs items');
+});
+
+test('sending locks the draft read-only instead of disabling the field, so the focus and the next ⌘↩ stay', async () => {
+  let release = null;
+  const sends = [];
+  const c = client(async (url, options) => {
+    const body = JSON.parse(options.body);
+    if (url === '/api/chat/send') {
+      sends.push(body);
+      await new Promise((resolve) => { release = resolve; });
+      return { ok: true, status: 200, json: async () => ({ status: 'accepted' }) };
+    }
+    return { ok: true, status: 200, json: async () => ({ route: body.source, capability: { supported: true, attachments: true }, phase: 'idle' }) };
+  }, noChatTimers);
+  const { s, entry } = selectChat(c);
+  entry.data.capability.attachments = true;
+  wireTree(c, c.buildChatComposer(s));
+  await settle();
+  const input = c.get('chat-input');
+  c.context.document.activeElement = input;
+  const key = { key: 'Enter', metaKey: true, isComposing: false, preventDefault() {} };
+  input.value = '첫 메시지'; input.events.input();
+  input.events.keydown(key);
+  assert.equal(entry.sending, true);
+  assert.equal(input.disabled, false, 'a disabled field would drop the focus (and the keyboard)');
+  assert.equal(input.readOnly, true, 'the text being sent cannot change');
+  assert.equal(input.attributes['aria-disabled'], 'true');
+  input.events.keydown(key);
+  input.events.paste({ clipboardData: { files: [{ name: 'a.png', size: 1, type: 'image/png' }], items: [], getData: () => '끼어든 글' },
+    preventDefault() {} });
+  assert.equal(entry.text, '첫 메시지', 'a paste cannot slip into the locked draft');
+  await settle();
+  assert.equal(sends.length, 1, 'a second ⌘↩ meanwhile sends nothing');
+  release(); await settle();
+  assert.equal(entry.pending, null);
+  assert.equal(input.readOnly, false);
+  assert.equal(input.attributes['aria-disabled'], 'false');
+  assert.equal(input.value, '', 'the sent draft is cleared');
+  // The next message goes out with the same key, without touching the field again.
+  input.value = '두 번째 메시지'; input.events.input();
+  input.events.keydown(key);
+  await settle();
+  assert.equal(sends.length, 2);
+  assert.equal(sends[1].text, '두 번째 메시지');
+  release(); await settle();
+  // A session that cannot take input at all is still disabled.
+  entry.data = { ...entry.data, capability: { supported: false, reason: '보드 밖 터미널' } };
+  c.updateChatComposer(entry);
+  assert.equal(input.disabled, true);
+  assert.equal(input.readOnly, false);
+  assert.match(styleSheet(), /\.chat-input:disabled,\n\.chat-input\[readonly\] \{/);
+});
+
+test('a wide touch screen keeps its bars: scrolling, a tap or typing on a hardware keyboard fold nothing; an on-screen keyboard does', () => {
+  const { c, pane, tap, scrollTo, reading } = phoneConversation({ wide: true });
+  const typing = () => pane.classList.contains('is-typing');
+  scrollTo(2350); scrollTo(2300); scrollTo(2200);
+  assert.equal(reading(), false, 'scrolling up keeps them');
+  scrollTo(2300); scrollTo(2400);
+  assert.equal(reading(), false, 'and down');
+  assert.equal(c.get('tap-hint').hidden, true, 'no tap hint');
+  tap();
+  assert.equal(reading(), false, 'a tap on the conversation does not toggle them');
+  assert.equal(c.state.chromeVisible, true);
+  // A hardware keyboard: nothing takes the screen (a shortcut bar stays below 150px).
+  const input = c.get('chat-input');
+  Object.assign(c.context.window, { innerWidth: 834, innerHeight: 1194, visualViewport: { height: 1194, scale: 1 } });
+  c.context.document.activeElement = input;
+  input.events.focus();
+  assert.equal(typing(), false, 'the tools stay while typing on a hardware keyboard');
+  c.context.window.visualViewport.height = 1194 - 55;
+  c.updateViewport();
+  assert.equal(typing(), false, 'a shortcut bar is not an on-screen keyboard');
+  // Safari: the on-screen keyboard shrinks the visual viewport after the focus.
+  c.context.window.visualViewport.height = 1194 - 360;
+  c.updateViewport();
+  assert.equal(typing(), true, 'an on-screen keyboard that took the space folds them as on a phone');
+  c.context.window.visualViewport = { height: 1194 / 2, scale: 2 };
+  c.updateViewport();
+  assert.equal(typing(), false, 'pinch zoom is not a keyboard');
+  // Chromium (resizes-content): the window shrinks too; the tallest one at this width counts.
+  Object.assign(c.context.window, { innerHeight: 834, visualViewport: { height: 834, scale: 1 } });
+  c.updateViewport();
+  assert.equal(typing(), true);
+  Object.assign(c.context.window, { innerHeight: 1194, visualViewport: { height: 1194, scale: 1 } });
+  c.updateViewport();
+  assert.equal(typing(), false, 'the keyboard went down while the input kept the focus');
+  c.context.document.activeElement = null; input.events.blur();
+  assert.equal(reading(), false);
+  // Stage Manager: the window itself gets shorter while no text field has the focus.
+  Object.assign(c.context.window, { innerHeight: 700, visualViewport: { height: 700, scale: 1 } });
+  c.updateViewport();
+  c.context.document.activeElement = input; input.events.focus();
+  assert.equal(typing(), false, 'a shorter window is not a keyboard');
+  c.context.document.activeElement = null; input.events.blur();
+  // A phone that hid them becomes a wide screen (rotation, split view): they come back.
+  const phone = phoneConversation();
+  phone.scrollTo(2350);
+  assert.equal(phone.reading(), true);
+  assert.equal(phone.c.get('tap-hint').hidden, false);
+  phone.c.context.window.matchMedia = (query) => ({ matches: query === '(pointer: coarse)' });
+  phone.c.updateViewport();
+  assert.equal(phone.reading(), false);
+  assert.equal(phone.c.state.chromeVisible, true);
+  assert.equal(phone.c.get('tap-hint').hidden, true);
+  // A phone held sideways (short) keeps the phone rules.
+  const sideways = phoneConversation({ wide: true });
+  sideways.c.context.window.matchMedia = (query) => ({ matches: query === '(pointer: coarse)' || query === '(max-height: 520px)' });
+  sideways.scrollTo(2350);
+  assert.equal(sideways.reading(), true);
+  sideways.tap();
+  assert.equal(sideways.reading(), false);
+  const sidewaysInput = sideways.c.get('chat-input');
+  sideways.c.context.document.activeElement = sidewaysInput; sidewaysInput.events.focus();
+  assert.equal(sideways.pane.classList.contains('is-typing'), true);
+});
+
+test('wide touch screens read like a phone: 16px text, one reading column for bubbles, question card and composer, and a narrower list', () => {
+  const css = styleSheet();
+  const wide = css.match(/@media \(pointer: coarse\) and \(min-width: 701px\) and \(min-height: 521px\) \{([\s\S]*?)\n\}/);
+  assert.ok(wide, 'a block for wide touch screens (phones held sideways excluded)');
+  assert.match(wide[1], /--fs-body: 1rem;/);
+  assert.match(wide[1], /--fs-sub: 0\.875rem;/);
+  // 42.5rem = 680px at 16px; a bubble's text is 680 - 28px padding = 652px, about 40 Hangul characters.
+  assert.match(wide[1], /--detail-pad: max\(16px, calc\(\(100% - 42\.5rem\) \/ 2\)\);/);
+  assert.match(wide[1], /\.chat-prompt \{\s*margin-inline: var\(--detail-pad\);/, 'the question card sits in the same column');
+  const list = css.match(/@media \(pointer: coarse\) and \(min-width: 701px\) and \(max-width: 1023px\) and \(min-height: 521px\) \{([\s\S]*?)\n\}/);
+  assert.ok(list);
+  assert.match(list[1], /\.layout \{\s*grid-template-columns: clamp\(256px, 33vw, 300px\) minmax\(0, 1fr\);/);
+  // Same specificity as the rules they refine, so they must come later.
+  for (const earlier of ['@media (max-width: 900px)', '.chat-prompt {', '.layout {'])
+    assert.ok(css.indexOf(wide[0]) > css.indexOf(earlier), earlier);
+  assert.ok(css.indexOf(list[0]) > css.indexOf('@media (max-width: 900px)'));
+  // Phones keep their own values.
+  const phone = cssBlock(css, '@media (max-width: 700px)');
+  assert.equal(phone['--fs-body'], '1rem'); assert.equal(phone['--detail-pad'], '16px');
+});
+
+test('a hardware keyboard: the folded composer shows the send key once one is known, Esc leaves the input, and 1-9 choose on a question card', async () => {
+  const requests = [];
+  const c = client(async (url) => { requests.push(url); return { ok: true, status: 200, json: async () => ({}) }; }, noChatTimers);
+  c.context.window.matchMedia = (query) => ({ matches: query === '(pointer: coarse)' }); // a tablet
+  c.context.navigator = { onLine: true, platform: 'MacIntel' }; // iPadOS Safari says Mac
+  Object.assign(c.context.window, { innerWidth: 834, innerHeight: 1194, visualViewport: { height: 1194 - 360, scale: 1 } });
+  const { s, entry } = selectChat(c);
+  c.drawDetail(s);
+  await settle();
+  const hint = c.get('chat-key-hint');
+  assert.equal(hint.textContent, '⌘↩ 보내기');
+  assert.equal(c.get('chat-send').attributes['aria-keyshortcuts'], 'Meta+Enter Control+Enter');
+  c.updateChatComposer(entry);
+  assert.equal(hint.hidden, true, 'a touch screen alone may have no keyboard');
+  const plain = { closest: () => null };
+  const field = { closest: (query) => (/textarea/.test(query) ? {} : null) };
+  const press = (extra) => c.context.documentKeydown?.({ target: plain, preventDefault() {}, ...extra });
+  const input = c.get('chat-input');
+  c.context.document.activeElement = input;
+  press({ key: 'a', target: field });
+  assert.equal(hint.hidden, true, 'typing on an on-screen keyboard that took the screen says nothing');
+  press({ key: 'Unidentified', keyCode: 229, isComposing: true, target: field });
+  assert.equal(hint.hidden, true);
+  c.context.window.visualViewport.height = 1194 - 55;
+  press({ key: 'a', target: field });
+  assert.equal(hint.hidden, false, 'typing while nothing took the screen: a hardware keyboard');
+  entry.expanded = true; c.updateChatComposer(entry);
+  assert.equal(hint.hidden, true, 'the expanded composer says it in its own hint');
+  entry.expanded = false; c.updateChatComposer(entry);
+  assert.equal(hint.hidden, false);
+  // Esc leaves the input; an IME or an open tools menu keep it.
+  let blurred = 0; input.blur = () => { blurred++; };
+  let prevented = 0;
+  const escape = (extra = {}) => input.events.keydown({ key: 'Escape', preventDefault() { prevented++; }, ...extra });
+  escape({ isComposing: true }); escape({ keyCode: 229 });
+  c.get('chat-tools').open = true; escape(); c.get('chat-tools').open = false;
+  assert.equal(blurred, 0);
+  escape();
+  assert.equal(blurred, 1); assert.equal(prevented, 1);
+  // A question card: 1-9 choose (any option, the sheet's too); sending stays the second step.
+  c.context.document.activeElement = null;
+  const prompt = { agent: 'claude', fingerprint: 'f'.repeat(64), current: 1, multi: false, question: '계속할까요?',
+    options: Array.from({ length: 7 }, (_, index) => ({ number: index + 1, label: `선택 ${index + 1}`, detail: '' })) };
+  entry.data = { ...entry.data, prompt, phase: 'needs_input' };
+  c.renderPrompt(s, entry.data);
+  press({ key: '2', target: field });
+  assert.equal(entry.promptChoice ?? null, null, 'a digit typed into a field is text');
+  press({ key: '2', metaKey: true }); press({ key: '2', isComposing: true }); press({ key: '0' });
+  assert.equal(entry.promptChoice ?? null, null);
+  press({ key: '2' });
+  assert.equal(entry.promptChoice.number, 2);
+  assert.match(findClass(c.get('chat-prompt'), 'primary')[0].textContent, /2번 보내기/);
+  press({ key: '6' });
+  assert.equal(entry.promptChoice.number, 6, 'beyond the inline four');
+  press({ key: '9' });
+  assert.equal(entry.promptChoice.number, 6, 'no such option');
+  c.get('action-sheet').open = true; press({ key: '1' }); c.get('action-sheet').open = false;
+  c.state.terminalVisible = true; press({ key: '1' }); c.state.terminalVisible = false;
+  entry.promptBusy = true; press({ key: '1' }); entry.promptBusy = false;
+  assert.equal(entry.promptChoice.number, 6, 'an open sheet, the terminal or a busy card leave the key alone');
+  assert.equal(requests.filter((url) => url === '/api/chat/prompt').length, 0, 'a key never sends');
+  c.renderPrompt(s, { ...entry.data, prompt: { ...prompt, fingerprint: 'g'.repeat(64), multi: true } });
+  press({ key: '3' });
+  assert.notEqual(entry.promptChoice?.number, 3, 'a multi-select menu is answered in the terminal');
+  // A phone: a modifier is evidence, typing is not; a mouse layout always has a keyboard.
+  const phone = client(undefined, noChatTimers);
+  phone.context.window.matchMedia = (query) => ({ matches: query === '(pointer: coarse)' || query === '(max-width: 700px)' });
+  const onPhone = selectChat(phone);
+  phone.state.detailShown = true;
+  phone.drawDetail(onPhone.s); await settle();
+  phone.context.document.activeElement = phone.get('chat-input');
+  phone.context.documentKeydown?.({ key: 'a', target: field, preventDefault() {} });
+  phone.updateChatComposer(onPhone.entry);
+  assert.equal(phone.get('chat-key-hint').hidden, true);
+  phone.context.documentKeydown?.({ key: 'Meta', metaKey: true, target: field, preventDefault() {} });
+  assert.equal(phone.get('chat-key-hint').hidden, false);
+  const desk = client(undefined, noChatTimers);
+  desk.context.navigator = { onLine: true, platform: 'Win32' };
+  const onDesk = selectChat(desk);
+  desk.drawDetail(onDesk.s); await settle();
+  desk.updateChatComposer(onDesk.entry);
+  assert.equal(desk.get('chat-key-hint').hidden, false, 'a mouse layout has a keyboard');
+  assert.equal(desk.get('chat-key-hint').textContent, 'Ctrl+Enter 보내기');
 });

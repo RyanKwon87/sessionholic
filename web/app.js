@@ -271,6 +271,44 @@ function prefersReducedMotion() {
 function phoneLayout() {
   return !!window.matchMedia?.("(max-width: 700px)")?.matches;
 }
+// A phone held sideways: as short as the board's other short-screen rules.
+function shortLayout() {
+  return !!window.matchMedia?.("(max-height: 520px)")?.matches;
+}
+// Height an on-screen keyboard takes from the page. Safari shrinks only the
+// visual viewport; Chromium (interactive-widget=resizes-content) shrinks the
+// window too, so both are compared with the window's height before a text
+// field took the focus (a keyboard only opens for one; a window resized
+// without one, as in Stage Manager, is the new full height). Pinch zoom
+// (scale) is not a keyboard. A hardware keyboard's shortcut bar stays below
+// KEYBOARD_MIN_PX.
+const KEYBOARD_MIN_PX = 150;
+function editingText() {
+  const node = document.activeElement;
+  return !!node && (node.isContentEditable === true || /^(INPUT|TEXTAREA|SELECT)$/.test(node.tagName || ""));
+}
+function keyboardInset() {
+  const width = window.innerWidth || 0;
+  const layout = window.innerHeight || 0;
+  const viewport = window.visualViewport;
+  const visible = viewport?.height ? viewport.height * (viewport.scale || 1) : layout;
+  if (state.viewportWidth !== width || !editingText()) {
+    state.viewportWidth = width;
+    state.viewportTall = layout;
+  } else state.viewportTall = Math.max(state.viewportTall || 0, layout);
+  return Math.max(0, state.viewportTall - visible);
+}
+function keyboardOpen() {
+  return keyboardInset() > KEYBOARD_MIN_PX;
+}
+// Phone rules for a conversation's bars (scrolling hides them, a tap toggles
+// them, typing folds them, the one-time tap hint) need a touch screen that is
+// small: phone-sized, or with an on-screen keyboard that really took the
+// space. A wide touch screen (a tablet, with a hardware keyboard or none)
+// keeps its bars in place.
+function compactChrome() {
+  return touchDevice() && (phoneLayout() || shortLayout() || keyboardOpen());
+}
 // Runs `update` inside a view transition sliding in `direction` ("push",
 // "pop", "present" or "dismiss"; style.css section 11). Without support,
 // with reduced motion or in a hidden tab it runs at once. Returns the
@@ -376,6 +414,7 @@ class BottomSheet {
     // A menu opened by a long press must not close on that finger's release:
     // only a press that starts on the open sheet's backdrop dismisses it.
     this.pressedSinceOpen = false;
+    this.pressTarget = null;
     if (!this.dialog.open) this.dialog.showModal();
   }
   close() {
@@ -395,7 +434,10 @@ class BottomSheet {
     this.dialog.style?.setProperty?.("--sheet-drag", `${Math.round(px)}px`);
   }
   start(event) {
-    if (this.dialog.open) this.pressedSinceOpen = true;
+    if (this.dialog.open) {
+      this.pressedSinceOpen = true;
+      this.pressTarget = event.target || null;
+    }
     if (this.drag) this.end({ pointerId: this.drag.id }, true);
     if (!this.dialog.open || !phoneLayout() || (event.button || 0) > 0) return;
     const zone = event.target?.closest?.(".sheet-handle, .dialog-top, h2");
@@ -1483,8 +1525,8 @@ function openActionSheet({ eyebrow = "", title = "", preview = "", actions = [],
   previewNode.textContent = preview;
   previewNode.hidden = !preview;
   const items = actions.map((action) => {
-    const item = button(action.label, `action-item${action.danger ? " danger" : ""}`, () => {
-      if (item.disabled) return;
+    const item = button(action.label, `action-item${action.danger ? " danger" : ""}`, (event) => {
+      if (item.disabled || !menuItemPressed(dialog, item, event)) return;
       closeActionSheet({ restoreFocus: false });
       action.run();
     });
@@ -1502,6 +1544,15 @@ function openActionSheet({ eyebrow = "", title = "", preview = "", actions = [],
     dialog.style.top = popover ? `${Math.round(Math.max(8, Math.min(at.y, height - 96 - 46 * items.length)))}px` : "";
   }
   sheet("action-sheet").open();
+}
+// A pointer click runs a menu item only when its press started on that item
+// after the menu opened. The finger that opened the menu by a long press
+// lifts over it (a centered menu on wide screens sits right under it) and
+// must run nothing. A keyboard's click (Enter, Space) has no pointer: detail 0.
+function menuItemPressed(dialog, item, event) {
+  if (!event?.detail) return true;
+  const target = dialog?.bottomSheet?.pressedSinceOpen ? dialog.bottomSheet.pressTarget : null;
+  return !!target && (target === item || !!item.contains?.(target));
 }
 function closeActionSheet({ restoreFocus = true } = {}) {
   const dialog = $("action-sheet");
@@ -1712,6 +1763,7 @@ function renderPrompt(s, data) {
   const openable = !prompt && data?.promptOpenable === true && data?.phase === "needs_input";
   if (!prompt && !openable) {
     card.hidden = true;
+    card.chooseNumber = null;
     card.dataset.fingerprint = "";
     card.dataset.question = "";
     entry.promptChoice = null;
@@ -1735,6 +1787,7 @@ function renderPrompt(s, data) {
   head.append(terminal);
   const nodes = [head];
   if (!prompt) {
+    card.chooseNumber = null;
     nodes.push(el("p", "chat-prompt-note", "질문 화면을 불러오면 여기서 바로 고를 수 있습니다."));
     const open = button(entry.promptBusy ? "불러오는 중…" : "질문 불러오기", "primary", () => promptAction(s, { action: "open" }));
     open.disabled = !!entry.promptBusy || networkOffline();
@@ -1747,6 +1800,18 @@ function renderPrompt(s, data) {
     nodes.push(question);
   }
   const selectable = !prompt.multi && Number.isInteger(prompt.current);
+  // A hardware keyboard's 1–9 (promptKeydown): the same choice as a tap,
+  // among every option (the sheet's too); false when there is no such one.
+  card.chooseNumber = selectable ? (number) => {
+    const option = prompt.options.find((item) => item.number === number);
+    if (!option || entry.promptBusy || !currentChat(entry) || card.dataset.question !== prompt.fingerprint) return false;
+    if (entry.promptChoice?.number !== option.number) {
+      entry.promptChoice = { fingerprint: prompt.fingerprint, number: option.number };
+      haptic("select");
+      renderPrompt(s, entry.data);
+    }
+    return true;
+  } : null;
   const options = el("div", "chat-prompt-options");
   options.setAttribute("role", "radiogroup");
   // A long menu keeps the card short: the first few choices (and the chosen
@@ -1924,13 +1989,26 @@ function setTyping(typing) {
   if (list && atBottom) setMessagesScroll(list, list.scrollHeight);
   renderJump();
 }
+// The viewport changed (an on-screen keyboard opened or closed, a rotation, a
+// split view): typing folds the bars only while the screen is compact, and a
+// wide touch screen never keeps them hidden or shows the tap hint.
+function syncChromeMode() {
+  if (!touchDevice()) return;
+  const compact = compactChrome();
+  if (chatTyping()) setTyping(compact);
+  if (compact) return;
+  const hint = $("tap-hint");
+  if (hint && !hint.hidden) hint.hidden = true;
+  if (!state.chromeVisible) setChromeVisible(true, { stickBottom: messagesAtEnd($("messages")) });
+}
 function readingScroll(list) {
   const top = list.scrollTop;
   const previous = list.lastScrollTop ?? top;
   list.lastScrollTop = top;
-  // While typing, the chrome is already folded (setTyping) and stays put.
+  // While typing, the chrome is already folded (setTyping) and stays put. A
+  // wide touch screen keeps its bars: its scroll is tracked but hides nothing.
   const typing = chatTyping();
-  if (touchDevice()) phoneReadingScroll(list, top - previous, typing);
+  if (touchDevice()) phoneReadingScroll(list, top - previous, typing || !compactChrome());
   else if (list.scrollHeight - top - list.clientHeight < GESTURE.readingBottomPx) {
     list.upTravel = 0;
     list.unread = 0;
@@ -1943,8 +2021,9 @@ function readingScroll(list) {
   renderJump();
 }
 // Phones: a deliberate scroll either way hides the bars; only a tap (or
-// something that needs attention) shows them again, even at the end.
-function phoneReadingScroll(list, delta, typing) {
+// something that needs attention) shows them again, even at the end. `keep`
+// (typing, or a wide touch screen) records the scroll without hiding.
+function phoneReadingScroll(list, delta, keep) {
   if (messagesAtEnd(list, GESTURE.readingBottomPx)) list.unread = 0;
   const height = list.clientHeight;
   const resized = Number.isFinite(list.lastClientHeight) && list.lastClientHeight !== height;
@@ -1953,7 +2032,7 @@ function phoneReadingScroll(list, delta, typing) {
   list.lastScrollAt = Date.now();
   // A keyboard, the bars themselves, a growing composer or the board's smooth
   // "맨 아래" also move the list: that is not reading.
-  if (typing || resized || Date.now() < (list.autoScrollUntil || 0)) {
+  if (keep || resized || Date.now() < (list.autoScrollUntil || 0)) {
     list.travel = 0;
     return;
   }
@@ -2173,10 +2252,12 @@ function buildChatComposer(s) {
   });
   // Phones fold the bars for typing and return to the reader's choice on blur
   // (hidden stays hidden); mouse layouts show them for the input, as before.
+  // A tablet folds them only once its on-screen keyboard takes the space
+  // (syncChromeMode on the viewport's resize); a hardware keyboard never does.
   input.addEventListener("focus", () => {
     if (!touchDevice()) state.chromeVisible = true;
     setReading(false);
-    setTyping(touchDevice());
+    setTyping(compactChrome());
   });
   input.addEventListener("blur", () => {
     setTyping(false);
@@ -2197,6 +2278,14 @@ function buildChatComposer(s) {
   });
   input.addEventListener("keydown", (event) => {
     if (!editorCurrent()) return;
+    // Esc leaves the input (a hardware keyboard's way out); an open tools menu
+    // closes first (closeChatToolsEscape), and an IME keeps its own Esc.
+    if (event.key === "Escape") {
+      if (event.isComposing || event.keyCode === 229 || entry.composing || tools.open) return;
+      event.preventDefault();
+      input.blur();
+      return;
+    }
     if (event.key !== "Enter" || !(event.ctrlKey || event.metaKey)) return;
     event.preventDefault();
     if (event.isComposing || event.keyCode === 229 || entry.composing) return;
@@ -2262,6 +2351,7 @@ function buildChatComposer(s) {
     sendChat(entry);
   });
   send.id = "chat-send";
+  send.setAttribute("aria-keyshortcuts", "Meta+Enter Control+Enter");
   // Sending keeps the keyboard and the folded typing layout; a blur first
   // would move the button away under the finger before the click lands.
   send.addEventListener("pointerdown", (event) => {
@@ -2270,6 +2360,12 @@ function buildChatComposer(s) {
   const hint = el("p", "chat-hint", "Ctrl/⌘ + Enter로 전송 · 초안과 첨부 선택은 이 탭에서만 보관됩니다.");
   hint.id = "chat-hint";
   hint.hidden = !entry.expanded;
+  // The folded composer's reminder of the send key, once a keyboard is known
+  // to be there (keyboardPresent); the expanded one says it in its hint.
+  const keyHint = el("span", "chat-key-hint", `${sendShortcutLabel()} 보내기`);
+  keyHint.id = "chat-key-hint";
+  keyHint.hidden = true;
+  keyHint.setAttribute("aria-hidden", "true");
   const expand = button(entry.expanded ? "접기" : "펼치기", "chat-toggle", () => {
     if (!editorCurrent()) return;
     const collapse = entry.expanded || input.dataset.grown === "true";
@@ -2293,7 +2389,7 @@ function buildChatComposer(s) {
   for (const action of [clipboard, check, native, closeTerm])
     action.addEventListener("pointerdown", (event) => event.preventDefault());
   tools.append(toolsActions);
-  actions.append(attach, expand, terminal, tools);
+  actions.append(attach, expand, terminal, keyHint, tools);
   const main = el("div", "chat-main");
   main.append(input, send);
   box.append(heading, status, gate, evidence, attachmentsLabel, attachments, main, files, actions, hint);
@@ -2359,6 +2455,51 @@ function closeChatToolsEscape(event) {
     event.preventDefault();
   }
 }
+// --- Hardware keyboard ----------------------------------------------------------
+// A keyboard is assumed with a mouse or trackpad as the main pointer. On a
+// touch screen it is known from a key an on-screen keyboard does not send
+// (a modifier, Esc, arrows) or from typing into the composer while no
+// on-screen keyboard takes the screen (an iPad's Magic Keyboard). Memory only.
+const HARDWARE_KEYS = new Set(["Escape", "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight",
+  "Home", "End", "PageUp", "PageDown", "Meta", "Control", "Alt"]);
+function keyboardPresent() {
+  return !touchDevice() || state.hardwareKeyboard === true;
+}
+function sendShortcutLabel() {
+  const nav = globalThis.navigator;
+  const platform = nav?.userAgentData?.platform || nav?.platform || "";
+  return /Mac|iPhone|iPad|iPod/i.test(platform) ? "⌘↩" : "Ctrl+Enter";
+}
+function noteHardwareKey(event) {
+  if (state.hardwareKeyboard || !event || event.isComposing || event.keyCode === 229) return;
+  const key = String(event.key || "");
+  const physical = event.metaKey || event.ctrlKey || event.altKey || HARDWARE_KEYS.has(key) ||
+    (key.length === 1 && chatTyping() && !phoneLayout() && !shortLayout() && !keyboardOpen());
+  if (!physical) return;
+  state.hardwareKeyboard = true;
+  const s = selectedSession();
+  if (s) updateChatComposer(chatEntry(s));
+}
+// 1–9 on a question card choose that option (only choose: sending stays the
+// card's second, explicit step). Typing in a field, a modifier, an IME, an
+// open sheet or the terminal leave the key alone.
+function promptKeydown(event) {
+  const key = String(event?.key || "");
+  if (!/^[1-9]$/.test(key) || event.metaKey || event.ctrlKey || event.altKey || event.isComposing ||
+      event.keyCode === 229 || event.defaultPrevented) return false;
+  const target = event.target;
+  if (target?.isContentEditable || target?.closest?.("input, textarea, select, [contenteditable]")) return false;
+  if (state.terminalVisible || !chatVisible() || Object.keys(SHEETS).some((id) => $(id)?.open)) return false;
+  const card = $("chat-prompt");
+  if (!card || card.hidden || typeof card.chooseNumber !== "function" || !card.chooseNumber(Number(key))) return false;
+  event.preventDefault();
+  return true;
+}
+function documentKeydown(event) {
+  noteHardwareKey(event);
+  closeChatToolsEscape(event);
+  promptKeydown(event);
+}
 function chatReceiptCopy(receipt) {
   if (receipt?.dispatchState === "not_started")
     return `${receipt.reason || "메시지 전송 조건을 확인해 주세요."} 메시지는 전송되지 않았습니다. 초안과 첨부는 유지됩니다.`;
@@ -2390,12 +2531,19 @@ function updateChatComposer(entry) {
   $("chat-terminal-gate").hidden = !gateOn;
   $("chat-terminal-gate-text").textContent = gateOn ? gateReason : "";
   $("chat-open-terminal").disabled = offline || state.launchBusy;
-  $("chat-input").disabled = (!supported && !gateOn) || entry.sending || !!entry.pending;
+  // A send in flight (or unconfirmed) locks the text but not the field: a
+  // disabled field would drop the focus, and with it the keyboard and the
+  // next ⌘↩. sendChat itself refuses a second send meanwhile.
+  const input = $("chat-input");
+  input.disabled = !supported && !gateOn;
+  input.readOnly = !input.disabled && (entry.sending || !!entry.pending);
+  input.setAttribute("aria-disabled", String(input.disabled || input.readOnly));
   $("chat-attach").disabled = offline || !chatAttachmentsSupported(entry) || entry.sending || !!entry.pending || !!entry.uploads;
   $("chat-clipboard").disabled = $("chat-attach").disabled;
   $("chat-send").disabled = blocked || entry.composing || (!entry.text.trim() && !entry.attachments.length);
   $("chat-send").textContent = entry.sending ? "전송 중" : "보내기";
   $("chat-send").setAttribute("aria-label", "메시지 보내기");
+  $("chat-key-hint").hidden = !!entry.expanded || !keyboardPresent();
   $("chat-check").disabled = offline || entry.checking;
   $("chat-terminal").disabled = state.launchBusy;
   const native = terminalInfo(state.terminal).nativeSource;
@@ -3106,7 +3254,7 @@ async function uploadChatFiles(entry, files) {
   updateChatComposer(entry);
 }
 function insertChatText(entry, input, text) {
-  if (!text || !currentChat(entry) || input.disabled) return;
+  if (!text || !currentChat(entry) || input.disabled || input.readOnly) return;
   const start = input.selectionStart ?? input.value.length;
   const end = input.selectionEnd ?? start;
   input.value = input.value.slice(0, start) + text + input.value.slice(end);
@@ -3688,7 +3836,7 @@ function bindMessageGestures(list) {
       list.autoScrollUntil = 0;
       // A touch that stops a moving list only stops it.
       const settled = Date.now() - (list.lastScrollAt || 0) >= GESTURE.scrollSettleMs;
-      tap = touchDevice() && event.pointerType !== "mouse" && event.isPrimary !== false && settled
+      tap = compactChrome() && event.pointerType !== "mouse" && event.isPrimary !== false && settled
         ? { id: event.pointerId, x: event.clientX, y: event.clientY, at: Date.now(), target: event.target } : null;
     },
     onMove(event) {
@@ -5734,6 +5882,7 @@ function updateViewport() {
     window.visualViewport?.height || window.innerHeight,
   );
   document.documentElement.style.setProperty("--app-height", `${height}px`);
+  syncChromeMode();
   const selected = selectedSession();
   if (selected) resizeChatInput(chatEntry(selected));
   fitTerminal();
@@ -5793,7 +5942,7 @@ function warnDraftUnload(event) {
 window.addEventListener("DOMContentLoaded", () => {
   navigateView("list", true);
   document.addEventListener("pointerdown", closeChatToolsOutside);
-  document.addEventListener("keydown", closeChatToolsEscape);
+  document.addEventListener("keydown", documentKeydown);
   window.addEventListener("popstate", (event) => {
     const view = event.state?.[INSTANCE.historyKey] ? event.state.view : "list";
     if (!state.authenticated) {

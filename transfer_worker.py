@@ -389,6 +389,9 @@ def _rpc(request):
     if op == 'profiles':
         from launch import new_session_status
         return {'profiles': profiles(), 'home': str(Path.home()), 'launcher': new_session_status()}
+    if op == 'resume_preview':
+        from launch import resume_preview
+        return resume_preview(args['source'])
     if op == 'state': return source_state(args['source'])
     if op == 'interrupt': return interrupt_source(args['source'])
     if op == 'inspect':
@@ -442,7 +445,7 @@ def attach(source):
     normalized = {**source, **identity}
     spec = build_launch(normalized, {**profile, 'host': normalized.get('host')}, [],
                         instance.remote_path('attachStateDir', Path.home()))
-    if spec['mode'] != 'attach':
+    if spec['mode'] not in ('attach', 'resume'):
         raise ValueError('원격 기존 세션 연결만 지원합니다.')
     os.chdir(spec['cwd'])
     os.execve(spec['argv'][0], spec['argv'], spec['env'])

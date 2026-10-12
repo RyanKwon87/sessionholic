@@ -265,6 +265,11 @@ class Chat:
     def rpc(self, host, action, source, **kwargs):
         return self.workflow.transfers.rpc(host, 'chat', {'action': action, 'source': source, **kwargs}, timeout=20)
 
+    def _direct_session(self, source):
+        guard = getattr(self.workflow, 'ensure_direct_session', None)
+        if guard is not None:
+            guard(source)
+
     @staticmethod
     def attachment_history(items):
         from launch import scrub_text
@@ -364,10 +369,24 @@ class Chat:
     def _read_state(self, source, host, identity, key, request_ids, kwargs, sequence, epoch):
         """One remote read with the receipts of `request_ids`, cached unless a send or a newer
         read came in meanwhile."""
-        result = self.rpc(host, 'read', source, **kwargs)
+        try:
+            result = self.rpc(host, 'read', source, **kwargs)
+        except (RuntimeError, OSError, ValueError):
+            if source.get('agent') != 'codex' or source.get('phase') not in ('closed', 'notLoaded'):
+                raise
+            # A disconnected daemon does not erase the saved conversation.
+            try:
+                result = self.board.read(source['host'], 'codex', source['id'], source['home'])
+            except (RuntimeError, OSError, ValueError):
+                result = {'error': 'unavailable'}
+            if result.get('error'):
+                result = {'messages': [], 'conversationUnavailable': True,
+                          'reason': '앱 서버 연결이 없어 대화 기록을 불러오지 못했습니다. 세션을 다시 열어 확인해 주세요.'}
+            result = {**result, 'phase': 'closed', 'capabilities': {'canSend': False}, 'readOnly': True}
         caps = result.get('capabilities', {})
         phase = result.get('phase', 'unavailable')
-        if phase in ('unknown', 'notLoaded') and not result.get('readOnly'): phase = 'unavailable'
+        if phase == 'notLoaded': phase = 'closed'
+        if phase == 'unknown' and not result.get('readOnly') and host.get('platform') != 'windows': phase = 'unavailable'
         from server import scrub_payload
         messages = scrub_payload(result.get('messages', []))
         claude = source.get('agent') == 'claude'
@@ -391,10 +410,7 @@ class Chat:
         except (RuntimeError, OSError, ValueError):
             terminal, terminal_failed = None, True
         action = None
-        if host.get('platform') == 'windows':
-            from server import WINDOWS_READ_ONLY
-            supported, reason, action = False, WINDOWS_READ_ONLY, None
-        elif claude:
+        if claude:
             supported, reason, action = self._claude_capability(source, terminal, terminal_failed)
         else:
             supported, reason = bool(caps.get('canSend')), caps.get('reason') or result.get('reason')
@@ -403,6 +419,22 @@ class Chat:
         if action:
             # What the user can do to make sending possible ("open_terminal": the board's terminal button).
             capability['action'] = action
+        recovery = None
+        if not claude and phase in ('closed', 'notLoaded'):
+            try:
+                preview = self.workflow.resume_preview(source)
+                recovery = {'supported': preview.get('allowed') is True,
+                            'closedByBoard': preview.get('blockedByBoard') is True,
+                            'action': 'resume_session' if preview.get('allowed') else None,
+                            'reason': preview.get('reason')}
+            except (RuntimeError, ValueError, OSError):
+                recovery = {'supported': True, 'closedByBoard': False, 'action': 'refresh_host',
+                            'reason': '재개 가능 여부를 확인하지 못했습니다. 기기 연결을 다시 확인해 주세요.'}
+            if recovery.get('action') == 'resume_session':
+                capability['action'] = 'resume_session'
+                capability['reason'] = '연결이 끝난 세션입니다. 같은 대화를 다시 열어 이어갈 수 있습니다.'
+            elif recovery.get('reason'):
+                capability['reason'] = recovery['reason']
         response = {'route': identity, 'phase': phase,
                     'capability': capability,
                     'messages': messages,
@@ -414,6 +446,15 @@ class Chat:
                     # A background Claude session can be attached to read its menu.
                     'promptOpenable': bool(claude and source.get('kind') == 'background'
                                            and terminal is None and not terminal_failed)}
+        if recovery is not None:
+            response['recovery'] = recovery
+        if result.get('conversationUnavailable'):
+            response['conversationUnavailable'] = True
+        bot_lookup = getattr(self.workflow, 'bot_request', None)
+        if bot_lookup is not None and bot_lookup(source):
+            response.update(readOnly=True, recovery=None, prompt=None, promptOpenable=False)
+            response['capability'] = {'supported': False, 'attachments': False,
+                                      'reason': '봇 요청입니다. 원래 봇의 권한과 사용 범위로 이어가 주세요.'}
         # Since when the agent works (epoch seconds), for "작업 중 · 12분 34초": Codex sends its
         # running turn's startedAt; Claude, which records no turn start, its newest prompt's
         # time (workingSinceApprox). Nothing while the agent is not working.
@@ -545,9 +586,7 @@ class Chat:
                 not isinstance(request_id, str) or not REQUEST.fullmatch(request_id)):
             raise ValueError('질문 응답 요청 식별자가 필요합니다.')
         source, host = self.source(data.get('source'))
-        if host.get('platform') == 'windows':
-            from server import WINDOWS_READ_ONLY
-            raise ValueError(WINDOWS_READ_ONLY)
+        self._direct_session(source)
         if action == 'open':
             return self._open_prompt(data.get('source'), source, request_id)
         fingerprint, number = data.get('fingerprint'), data.get('number')
@@ -826,9 +865,9 @@ class Chat:
 
     def upload(self, ref, name, content):
         source, host = self.source(ref)
+        self._direct_session(source)
         if host.get('platform') == 'windows':
-            from server import WINDOWS_READ_ONLY
-            raise ValueError(WINDOWS_READ_ONLY)
+            raise ValueError('Windows 세션에는 현재 텍스트만 보낼 수 있습니다.')
         if not isinstance(name, str) or len(name.encode()) > 512:
             raise ValueError('파일 이름이 너무 깁니다.')
         if not content or len(content) > MAX_FILE:
@@ -881,9 +920,9 @@ class Chat:
     def send(self, data):
         try:
             source, host, request_id, text, ids, manifest = self._prepare_send(data)
-            if host.get('platform') == 'windows':
-                from server import WINDOWS_READ_ONLY
-                raise ValueError(WINDOWS_READ_ONLY)
+            self._direct_session(source)
+            if host.get('platform') == 'windows' and ids:
+                raise ValueError('Windows 세션에는 현재 텍스트만 보낼 수 있습니다.')
         except (ValueError, RuntimeError, OSError, KeyError) as exc:
             reason = str(exc) if isinstance(exc, (ValueError, RuntimeError)) else '메시지와 첨부 정보를 다시 확인해 주세요.'
             raise SendRejected(reason, 409 if isinstance(exc, RuntimeError) else 400) from None

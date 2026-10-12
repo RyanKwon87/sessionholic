@@ -114,6 +114,8 @@ const state = {
   // active chip again clears it.
   phaseFilter: "",
   sessionCategory: "general",
+  selectedBotRequest: null,
+  botRequests: emptyBotRequests(),
   accountFilterRoutes: null,
   search: "",
   showOld: false,
@@ -744,6 +746,7 @@ function groupOf(s) {
       : "rest";
 }
 function matches(s, now, { phase = true, category = true, initiator = true } = {}) {
+  if (botRequestForNative(sourceOf(s))) return false;
   if (category && sessionCategoryOf(s) !== state.sessionCategory) return false;
   if (phase && state.phaseFilter && groupOf(s) !== state.phaseFilter) return false;
   for (const key of Object.keys(state.filters)) {
@@ -782,6 +785,8 @@ function matches(s, now, { phase = true, category = true, initiator = true } = {
 }
 
 function renderSessionList(sessions, now) {
+  setClass($("task-list-pane"), "is-bot-category", state.sessionCategory === "bot");
+  if (state.sessionCategory === "bot") { renderSessionCategories(sessions, now); renderBotRequests(); return; }
   // Updating list conditions must not redraw a retained conversation or reset
   // its scroll anchor when the same source is opened again from a work card.
   const base = sessions.filter((session) => matches(session, now, { phase: false }));
@@ -796,9 +801,11 @@ function render() {
   const now = state.snapshot.serverTime || Date.now() / 1000;
   const sessions = allSessions();
   const reading = state.detailShown && sessions.find((session) => session.key === state.selected);
+  if (reading && botRequestForNative(sourceOf(reading))) { selectBotRequest(botRequestKey(botRequestForNative(sourceOf(reading)))); return; }
   if (reading && sessionCategoryOf(reading) !== state.sessionCategory) setSessionCategory(sessionCategoryOf(reading), { renderView: false, clearSelection: false });
   renderHosts(now); renderFreshness(now); renderAttention(sessions);
   renderSessionList(sessions, now);
+  if (state.sessionCategory === "bot") { window.SessionholicGoals?.update?.(sessions); return; }
   const selected = sessions.find((s) => s.key === state.selected);
   if (!state.selected && !$("detail").children.length) {
     const welcome = el("div", "welcome");
@@ -967,7 +974,7 @@ async function loadUsage(force = false) {
 const BASE_TITLE = INSTANCE.title;
 function renderAttention(sessions) {
   // The tab title and app icon say when work waits for an answer while this view is elsewhere.
-  const waiting = sessions.filter((s) => groupOf(s) === "needs_input").length;
+  const waiting = sessions.filter((s) => !botRequestForNative(sourceOf(s)) && groupOf(s) === "needs_input").length;
   const title = waiting ? `(${waiting}) 답 필요 · ${INSTANCE.shortName}` : BASE_TITLE;
   if (document.title !== title) document.title = title;
   try {
@@ -1018,49 +1025,183 @@ function initiatorOf(s) { return ["human", "agent"].includes(s?.initiator) ? s.i
 function initiatorLabel(s) {
   return INITIATOR_LABELS[initiatorOf(s)] + (s?.initiatorName ? ` · ${s.initiatorName}` : "");
 }
-const SESSION_CATEGORIES = { general: "일반 세션", agent: "에이전트 세션" };
-function sessionCategoryOf(session) { return initiatorOf(session) === "agent" ? "agent" : "general"; }
+const BOT_CACHE_MS = 120000;
+const BOT_STATUS = { pending: "대기", queued: "대기", waiting: "대기", running: "진행 중", working: "진행 중", completed: "완료", done: "완료", failed: "실패", cancelled: "취소", canceled: "취소", stopped: "중단", closed: "종료", active: "진행 중", needs_input: "답변 필요", error: "실패" };
+function emptyBotRequests() { return { requests: [], sources: [], loaded: false, busy: false, error: "", readAt: 0, fetchedAt: null, promise: null }; }
+function botTimestamp(value) { return typeof value === "number" ? value * 1000 : Date.parse(value) || 0; }
+function botRequestKey(request) { return JSON.stringify([request.sourceId, request.id]); }
+function botLabel(value) { return typeof value === "string" && value.trim() && !["unknown", "unconfirmed"].includes(value.trim().toLowerCase()) ? value.trim() : "미확인"; }
+function botRequestStale(request) { return !!(request.stale || state.botRequests.error || state.botRequests.sources.some((source) => source.id === request.sourceId && source.stale)); }
+function botRequestForNative(source) {
+  return state.botRequests.requests.find((request) => request.nativeRef && request.host === source.host &&
+    request.nativeRef.agent === source.agent && request.nativeRef.id === source.id && request.nativeRef.home === source.home);
+}
+function botRequestMatches(request) {
+  const query = state.search.trim().toLocaleLowerCase();
+  return !query || [request.title, request.botName, request.host, request.channelLabel, request.requesterLabel,
+    request.authorityLabel, request.scopeLabel, BOT_STATUS[request.status]].some((value) => String(value || "").toLocaleLowerCase().includes(query));
+}
+function botSnapshot(data) {
+  if (!data || !Array.isArray(data.requests) || !Array.isArray(data.sources) ||
+      data.requests.some((request) => !request || typeof request.id !== "string" || !request.id || typeof request.sourceId !== "string" || !request.sourceId) ||
+      data.sources.some((source) => !source || typeof source.id !== "string"))
+    throw new Error("봇 요청 목록 형식을 확인하지 못했습니다. 잠시 후 다시 확인해 주세요.");
+  const unique = new Map();
+  for (const request of data.requests) unique.set(botRequestKey(request), request);
+  return { requests: [...unique.values()], sources: data.sources, fetchedAt: data.fetchedAt };
+}
+async function loadBotRequests({ refresh = false } = {}) {
+  if (!state.authenticated) return;
+  const cache = state.botRequests;
+  if (cache.promise) return cache.promise;
+  if (!refresh && cache.loaded && Date.now() - cache.readAt < BOT_CACHE_MS) return;
+  if (networkOffline()) { cache.error = "오프라인입니다. 연결 후 봇 요청을 다시 확인해 주세요."; render(); return; }
+  const authEpoch = state.authEpoch;
+  cache.busy = true; cache.error = "";
+  cache.promise = (async () => {
+    try {
+      // Refresh is explicit and bounded to this bot source service. A normal
+      // category visit is one GET; render/poll never starts another request.
+      const data = refresh
+        ? await api("/api/bot-requests/refresh", { method: "POST", body: {}, authEpoch, csrfRetry: false })
+        : await api("/api/bot-requests", { authEpoch });
+      assertAuthEpoch(authEpoch);
+      if (state.botRequests !== cache) return;
+      Object.assign(cache, botSnapshot(data), { loaded: true, readAt: Date.now() });
+      const selected = selectedSession();
+      const moved = selected && botRequestForNative(sourceOf(selected));
+      if (moved) selectBotRequest(botRequestKey(moved));
+    } catch (err) {
+      if (authEpoch === state.authEpoch && state.botRequests === cache && !err.staleAuth && !err.unauthorized)
+        cache.error = err.message || "봇 요청을 확인하지 못했습니다. 다시 확인해 주세요.";
+    } finally {
+      if (authEpoch === state.authEpoch && state.botRequests === cache) {
+        cache.busy = false; cache.promise = null; render();
+      }
+    }
+  })();
+  render();
+  return cache.promise;
+}
+function renderBotRequests() {
+  const cache = state.botRequests, box = $("groups");
+  const shown = cache.requests.filter(botRequestMatches).sort((a, b) => botTimestamp(b.updatedAt) - botTimestamp(a.updatedAt));
+  const tools = el("div", "bot-list-tools");
+  const note = el("p", "muted", cache.busy ? "봇 요청을 확인하고 있습니다…" : cache.loaded ? `확인된 요청 ${cache.requests.length}개` : "봇 요청을 확인해 주세요.");
+  const refresh = button(cache.busy ? "확인 중…" : "새로고침", "secondary", () => loadBotRequests({ refresh: true }));
+  refresh.id = "bot-requests-refresh"; refresh.disabled = cache.busy || networkOffline();
+  tools.append(note, refresh);
+  const nodes = [tools];
+  if (cache.error) { const error = el("p", "bot-source-notice", cache.error + (cache.loaded ? " 마지막으로 확인한 요청을 표시합니다." : "")); error.setAttribute("role", "status"); nodes.push(error); }
+  for (const source of cache.sources.filter((source) => source.ok !== true)) {
+    const error = typeof source.error === "string" ? source.error : source.error?.message;
+    const notice = el("div", "bot-source-notice");
+    notice.append(el("div", "", `${botLabel(source.label)} · ${error || "요청 목록을 확인하지 못했습니다. 연결 상태를 확인해 주세요."}`));
+    if (source.stale) notice.append(el("div", "", "마지막으로 확인한 요청을 표시합니다."));
+    nodes.push(notice);
+  }
+  if (cache.busy && !cache.loaded) nodes.push(skeletonList("봇 요청을 확인하고 있습니다…"));
+  for (const request of shown) {
+    const key = botRequestKey(request);
+    const card = button("", "bot-request-card", () => selectBotRequest(key)); card.dataset.botRequestKey = key;
+    card.setAttribute("aria-pressed", String(state.selectedBotRequest === key));
+    const meta = el("span", "bot-request-top"); meta.append(el("strong", "bot-name", botLabel(request.botName)), el("span", "bot-status", BOT_STATUS[request.status] || "상태 미확인"));
+    if (botRequestStale(request)) meta.append(el("span", "bot-stale-tag", "이전 정보"));
+    card.append(meta, el("span", "bot-request-title", botLabel(request.title)),
+      el("span", "bot-request-context", `요청자 ${botLabel(request.requesterLabel)} · 채널 ${botLabel(request.channelLabel)}`),
+      el("span", "bot-request-boundary", `권한 ${botLabel(request.authorityLabel)}`),
+      el("span", "bot-request-boundary", `범위 ${botLabel(request.scopeLabel)}`));
+    nodes.push(card);
+  }
+  if (!shown.length && !cache.busy) nodes.push(emptyState("none", state.search ? "검색에 맞는 봇 요청이 없습니다." : cache.error || cache.sources.some((source) => !source.ok) ? "봇 요청을 확인하지 못했습니다." : "표시할 봇 요청이 없습니다.", "봇에서 접수한 요청과 권한·사용 범위를 이곳에서 확인합니다."));
+  box.replaceChildren(...nodes); box.setAttribute("aria-busy", String(cache.busy));
+  $("session-count").textContent = cache.loaded ? `${shown.length}개` : "-";
+  const selected = cache.requests.find((request) => botRequestKey(request) === state.selectedBotRequest);
+  if (state.selectedBotRequest && !selected) {
+    state.selectedBotRequest = null; $("detail").replaceChildren(); setDetailShown(false); navigateView("list", true);
+  } else if (selected) drawBotRequest(selected);
+  else if (!$("detail").children.length) $("detail").append(emptyState("none", "봇 요청을 선택하세요.", "요청자와 채널, 권한과 사용 범위를 확인할 수 있습니다."));
+}
+function selectBotRequest(key) {
+  if (!state.authenticated || state.launchBusy) return;
+  const request = state.botRequests.requests.find((row) => botRequestKey(row) === key); if (!request) return;
+  rememberConversationView(); stopChatPolling();
+  state.selected = null; state.detailFor = null; state.detailRevision = null; state.detailRun += 1;
+  state.selectedBotRequest = key;
+  window.SessionholicGoals?.openTab?.("sessions");
+  setSessionCategory("bot", { renderView: false, clearSelection: false });
+  $("detail").replaceChildren();
+  render();
+  const entering = phoneLayout() && !state.detailShown;
+  if (entering) navigateView("detail");
+  setDetailShown(true, { direction: entering ? "push" : null, focus: phoneLayout() });
+}
+function drawBotRequest(request) {
+  const pane = $("detail");
+  const stale = botRequestStale(request);
+  const revision = JSON.stringify([request, stale]);
+  if (pane.dataset.botRevision === revision && pane.querySelector?.(".bot-request-detail")) return;
+  pane.replaceChildren(); pane.dataset.key = ""; pane.dataset.botRevision = revision;
+  pane.classList.remove("is-reading", "is-typing"); state.chromeVisible = true;
+  const head = el("div", "detail-head bot-detail-head");
+  const back = button("←", "back", backToList); back.setAttribute("aria-label", "봇 요청 목록으로 돌아가기");
+  const titles = el("div", "detail-titles"); titles.append(el("h1", "detail-title", botLabel(request.title)), el("p", "detail-project", botLabel(request.botName)));
+  head.append(back, titles);
+  const detail = el("section", "bot-request-detail"); detail.setAttribute("aria-label", "봇 요청 정보");
+  if (stale) detail.append(el("p", "bot-source-notice", "이전 정보 · 마지막으로 확인한 요청입니다. 새로고침으로 최신 상태를 확인해 주세요."));
+  detail.append(el("p", "bot-request-guidance", "이 요청은 원래 봇에서 이어가세요. 아래 권한과 사용 범위가 적용됩니다."));
+  const metadata = el("dl", "bot-request-metadata");
+  for (const [label, value] of [["봇", request.botName], ["요청자", request.requesterLabel], ["채널", request.channelLabel], ["권한", request.authorityLabel], ["사용 범위", request.scopeLabel], ["기기", request.host ? hostLabel(request.host) : null], ["상태", BOT_STATUS[request.status]]]) {
+    const row = el("div"); row.append(el("dt", "", label), el("dd", "", botLabel(value))); metadata.append(row);
+  }
+  detail.append(metadata);
+  if (request.nativeRef) detail.append(el("p", "bot-native-note", "연결된 세션 기록이 있습니다. 입력과 실행 관리는 원래 봇에서 진행해 주세요."));
+  pane.append(head, detail);
+}
+const SESSION_CATEGORIES = { general: "일반 세션", agent: "에이전트 세션", bot: "봇 요청" };
+function sessionCategoryOf(session) { return botRequestForNative(sourceOf(session)) ? "bot" : initiatorOf(session) === "agent" ? "agent" : "general"; }
 function setSessionCategory(category, { renderView = true, clearSelection = true } = {}) {
   if (!Object.hasOwn(SESSION_CATEGORIES, category) || state.launchBusy) return false;
   const changed = state.sessionCategory !== category;
   const selected = selectedSession();
-  if (clearSelection && selected && sessionCategoryOf(selected) !== category) {
+  if (clearSelection && ((selected && sessionCategoryOf(selected) !== category) || (state.selectedBotRequest && category !== "bot"))) {
     rememberConversationView(); stopChatPolling();
-    state.selected = null; state.detailFor = null; state.detailRevision = null; state.detailRun += 1;
+    state.selected = null; state.selectedBotRequest = null; state.detailFor = null; state.detailRevision = null; state.detailRun += 1;
     $("detail").replaceChildren(); $("detail").dataset.key = ""; setDetailShown(false); navigateView("list", true);
   }
   state.sessionCategory = category;
+  if (changed && !state.selected && !state.selectedBotRequest) $("detail").replaceChildren();
   const origin = state.filters.initiator;
-  if (origin && (origin === "agent" ? "agent" : "general") !== category) state.filters.initiator = "";
+  if (category !== "bot" && origin && (origin === "agent" ? "agent" : "general") !== category) state.filters.initiator = "";
   if (renderView) { render(); if (changed) $("task-list-pane").scrollTop = 0; }
+  if (category === "bot" && renderView) loadBotRequests();
   return changed;
 }
 function renderSessionCategories(sessions, now) {
-  const counts = { general: 0, agent: 0 };
+  const counts = { general: 0, agent: 0, bot: state.botRequests.loaded ? state.botRequests.requests.filter(botRequestMatches).length : null };
   for (const session of sessions) {
     const category = sessionCategoryOf(session);
-    // Switching classification clears an incompatible origin filter. Its count
-    // previews precisely those results while retaining search/device/status.
-    if (matches(session, now, { category: false, initiator: category === state.sessionCategory })) counts[category] += 1;
+    if (category !== "bot" && matches(session, now, { category: false, initiator: category === state.sessionCategory })) counts[category] += 1;
   }
   for (const [category, label] of Object.entries(SESSION_CATEGORIES)) {
     const control = $(`session-category-${category}`); const selected = state.sessionCategory === category;
     control.setAttribute("aria-selected", String(selected)); control.tabIndex = selected ? 0 : -1;
-    control.setAttribute("aria-label", `${label} ${counts[category]}개`);
-    $(`session-category-${category}-count`).textContent = String(counts[category]);
+    control.setAttribute("aria-label", counts[category] === null ? `${label}, 아직 확인하지 않음` : `${label} ${counts[category]}개`);
+    $(`session-category-${category}-count`).textContent = counts[category] === null ? "-" : String(counts[category]);
   }
   $("groups").setAttribute("aria-labelledby", `session-category-${state.sessionCategory}`);
   $("session-category-note").hidden = state.sessionCategory !== "general" || state.filters.initiator === "human";
-  const other = state.sessionCategory === "general" ? "agent" : "general";
-  const match = $("session-category-search");
-  match.hidden = !state.search.trim() || !counts[other];
-  $("session-category-search-action").textContent = `${SESSION_CATEGORIES[other]}에 검색 결과 ${counts[other]}개 · 보기`;
-  $("session-category-search-action").dataset.category = other;
+  const others = Object.keys(SESSION_CATEGORIES).filter((category) => category !== state.sessionCategory && counts[category] > 0);
+  const other = others[0];
+  $("session-category-search").hidden = !state.search.trim() || !other;
+  $("session-category-search-action").textContent = other ? `${SESSION_CATEGORIES[other]}에 검색 결과 ${counts[other]}개 · 보기` : "";
+  $("session-category-search-action").dataset.category = other || "general";
 }
 function sessionCategoryKeydown(event) {
   if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
   event.preventDefault();
-  const category = event.key === "Home" ? "general" : event.key === "End" ? "agent" : state.sessionCategory === "general" ? "agent" : "general";
+  const categories = Object.keys(SESSION_CATEGORIES), index = categories.indexOf(state.sessionCategory);
+  const category = event.key === "Home" ? categories[0] : event.key === "End" ? categories.at(-1) : categories[(index + (event.key === "ArrowRight" ? 1 : -1) + categories.length) % categories.length];
   setSessionCategory(category); $(`session-category-${category}`).focus();
 }
 function prepareSessionListFor(session) {
@@ -1792,6 +1933,8 @@ function closeSessionControl(force = false) {
 }
 async function manageSession(s, trigger = null) {
   if (!s || !state.authenticated || sessionControl?.busy) return;
+  const bot = botRequestForNative(sourceOf(s));
+  if (bot) { selectBotRequest(botRequestKey(bot)); return; }
   closeSessionControl(true);
   let dialog = $("session-control-dialog");
   if (!dialog) {
@@ -1841,6 +1984,7 @@ async function manageSession(s, trigger = null) {
       const capability = result.capabilities?.[action];
       $(`session-control-${action}`).disabled = !capability?.supported;
       if (!capability?.supported) $(`session-control-${action}-reason`).textContent = capability?.reason || "현재 실행에서 지원하지 않습니다.";
+      else if (capability.effect) $(`session-control-${action}-reason`).textContent = capability.effect;
     }
   } catch (err) {
     if (sessionControl === context && !err.staleAuth && !err.unauthorized) status.textContent = err.message || "실행 상태를 확인하지 못했습니다.";
@@ -1852,7 +1996,8 @@ function confirmSessionAction(context, action) {
   const label = action === "terminate" ? "실행 종료" : "응답 중단";
   const confirm = button(label, "primary", () => executeSessionAction(context, action));
   confirm.id = "session-control-confirm";
-  confirmation.replaceChildren(el("p", "", `${cardTitle(context.s)} · ${context.s.hostLabel || context.s.host}: ${label}합니다. 대화 기록은 남습니다.`),
+  const effect = context.preview.capabilities[action].effect || (action === "terminate" ? "이 세션의 원본 실행을 끝냅니다. 대화 기록은 남습니다." : "현재 생성 중인 응답을 멈춥니다. 대화 기록은 유지됩니다.");
+  confirmation.replaceChildren(el("p", "", `${cardTitle(context.s)} · ${context.s.hostLabel || context.s.host}: ${effect}`),
     confirm, button("취소", "secondary", () => { confirmation.hidden = true; }));
   confirm.focus();
 }
@@ -1908,7 +2053,9 @@ function focusDetailBack() {
   $("detail").querySelector(".back")?.focus({ preventScroll: true });
 }
 function restoreSelectedCardFocus() {
-  const card = [...$("groups").querySelectorAll(".card")].find((node) => node.dataset.sessionKey === state.selected);
+  const card = state.selectedBotRequest
+    ? [...$("groups").querySelectorAll(".bot-request-card")].find((node) => node.dataset.botRequestKey === state.selectedBotRequest)
+    : [...$("groups").querySelectorAll(".card")].find((node) => node.dataset.sessionKey === state.selected);
   (card || $("home")).focus({ preventScroll: true });
 }
 function rememberConversationView() {
@@ -1947,6 +2094,9 @@ function select(key) {
   if (state.launchBusy) return;
   if (state.selected !== key) rememberConversationView();
   const target = allSessions().find((session) => session.key === key);
+  const bot = target && botRequestForNative(sourceOf(target));
+  if (bot) { selectBotRequest(botRequestKey(bot)); return; }
+  state.selectedBotRequest = null;
   const listChanged = target && prepareSessionListFor(target);
   if (listChanged && state.selected === key) renderSessionList(allSessions(), state.snapshot?.serverTime || Date.now() / 1000);
   const mobile = phoneLayout();
@@ -2131,10 +2281,13 @@ function drawDetail(s) {
       ),
     );
   const bar = el("div", "conversation-bar");
-  bar.append(
-    el("strong", null, "최근 대화"),
-    button("맨 아래 ↓", "", () => scrollMessagesToEnd()),
-  );
+  const conversationActions = el("div", "conversation-actions");
+  const manage = button("세션 관리", "", (event) => {
+    if (state.authenticated && state.selected === s.key) manageSession(s, event.currentTarget);
+  });
+  manage.id = "detail-manage-session";
+  conversationActions.append(manage, button("맨 아래 ↓", "", () => scrollMessagesToEnd()));
+  bar.append(el("strong", null, "최근 대화"), conversationActions);
   const list = el("div", "messages");
   list.id = "messages";
   const savedView = state.conversationViews.get(conversationIdentity(s));
@@ -2647,8 +2800,23 @@ function networkOffline() {
 function chatVisible() {
   return !document.hidden && !state.terminalVisible && (!phoneLayout() || state.detailShown);
 }
+function chatHostOffline(entry) {
+  const session = selectedSession();
+  return state.snapshot?.hosts?.find((host) => host.name === entry.source.host)?.ok === false ||
+    capsHost(entry.source.host)?.online === false ||
+    (session && chatKey(sourceOf(session)) === chatKey(entry.source) && session.online === false);
+}
+function chatRecovery(entry) {
+  if (botRequestForNative(entry.source)) return null;
+  if (chatHostOffline(entry)) return { supported: true, action: "refresh_host",
+    reason: "기기에 연결되지 않았습니다. 연결을 확인한 뒤 같은 세션을 이어갈 수 있습니다." };
+  if (chatKey(entry.data?.route || {}) !== chatKey(entry.source)) return null;
+  const recovery = entry.data?.recovery;
+  if (recovery?.supported !== true || recovery.closedByBoard === true) return null;
+  return ["resume_session", "refresh_host"].includes(recovery.action) ? recovery : null;
+}
 function chatSupported(entry) {
-  return entry.data?.capability?.supported === true &&
+  return !botRequestForNative(entry.source) && !chatHostOffline(entry) && entry.data?.capability?.supported === true &&
     chatKey(entry.data.route || {}) === chatKey(entry.source);
 }
 // The server's capability says sending needs a board terminal the user opens.
@@ -2656,7 +2824,7 @@ function terminalRequired(entry) {
   return entry.data?.capability?.action === "open_terminal" && chatKey(entry.data.route || {}) === chatKey(entry.source);
 }
 function chatAttachmentsSupported(entry) {
-  return !!entry.data && chatKey(entry.data.route || {}) === chatKey(entry.source) &&
+  return !botRequestForNative(entry.source) && !!entry.data && chatKey(entry.data.route || {}) === chatKey(entry.source) &&
     entry.data.phase !== "unavailable" && entry.data.capability?.attachments !== false;
 }
 function buildChatComposer(s) {
@@ -2688,6 +2856,12 @@ function buildChatComposer(s) {
   const openTerminal = button("터미널 열기", "primary", () => { if (editorCurrent()) openChatTerminal(s); });
   openTerminal.id = "chat-open-terminal";
   gate.append(gateText, openTerminal);
+  const recovery = el("div", "chat-recovery");
+  recovery.id = "chat-recovery"; recovery.hidden = true;
+  const recoveryText = el("span", "chat-terminal-gate-text"); recoveryText.id = "chat-recovery-text";
+  const recover = button("세션 다시 열기", "primary", () => { if (editorCurrent()) return recoverChatSession(s); });
+  recover.id = "chat-recover";
+  recovery.append(recoveryText, recover);
   const evidence = el("div", "chat-delivery-evidence");
   evidence.id = "chat-delivery-evidence";
   evidence.hidden = true;
@@ -2856,7 +3030,7 @@ function buildChatComposer(s) {
   actions.append(attach, expand, terminal, keyHint, tools);
   const main = el("div", "chat-main");
   main.append(input, send);
-  box.append(heading, status, gate, evidence, attachmentsLabel, attachments, main, files, actions, hint);
+  box.append(heading, status, recovery, gate, evidence, attachmentsLabel, attachments, main, files, actions, hint);
   queueMicrotask(() => {
     if (!editorCurrent()) return;
     updateChatComposer(entry);
@@ -3014,7 +3188,12 @@ function updateChatComposer(entry) {
   const blocked = offline || !supported || entry.sending || !!entry.pending || !!entry.uploads;
   // No board terminal yet (Claude background): the draft can be written now and
   // sent once the user opened the terminal from the gate.
-  const gateOn = !supported && terminalRequired(entry);
+  const recovery = chatRecovery(entry);
+  const gateOn = !supported && !recovery && terminalRequired(entry);
+  $("chat-recovery").hidden = !recovery;
+  $("chat-recovery-text").textContent = recovery?.reason || (recovery?.action === "resume_session" ? "대화 기록과 초안을 유지하고 같은 세션을 다시 엽니다." : "");
+  $("chat-recover").textContent = entry.recovering ? "연결 확인 중…" : recovery?.action === "refresh_host" ? "기기 연결 다시 확인" : "세션 다시 열기";
+  $("chat-recover").disabled = offline || !!entry.recovering || state.launchBusy;
   const gateReason = entry.data?.capability?.reason || "보내려면 먼저 터미널을 여세요.";
   $("chat-terminal-gate").hidden = !gateOn;
   $("chat-terminal-gate-text").textContent = gateOn ? gateReason : "";
@@ -3023,7 +3202,7 @@ function updateChatComposer(entry) {
   // disabled field would drop the focus, and with it the keyboard and the
   // next ⌘↩. sendChat itself refuses a second send meanwhile.
   const input = $("chat-input");
-  input.disabled = !supported && !gateOn;
+  input.disabled = !supported && !gateOn && recovery?.action !== "resume_session";
   input.readOnly = !input.disabled && (entry.sending || !!entry.pending);
   input.setAttribute("aria-disabled", String(input.disabled || input.readOnly));
   $("chat-attach").disabled = offline || !chatAttachmentsSupported(entry) || entry.sending || !!entry.pending || !!entry.uploads;
@@ -3044,12 +3223,12 @@ function updateChatComposer(entry) {
   const budgetNote = state.chatPollCount >= CHAT_POLL_MAX ? " 자동 상태 확인을 잠시 멈췄습니다. 상태 다시 확인을 눌러 주세요." : "";
   // The gate itself says what to do; the status line only adds that a refused
   // message was not sent.
-  const unsupportedCopy = gateOn ? (entry.receipt?.dispatchState === "not_started"
+  const unsupportedCopy = (gateOn || recovery) ? (entry.receipt?.dispatchState === "not_started"
     ? "메시지는 전송되지 않았습니다. 초안과 첨부는 유지됩니다." : "") : !supported && entry.attachments.length
     ? "첨부는 이 작업 폴더에 저장됐습니다. 첨부의 ‘경로’를 복사해 터미널에 붙여넣으세요."
     : entry.data?.capability?.reason || "직접 입력을 지원하지 않습니다. 터미널을 사용해 주세요.";
   $("chat-status").textContent = (offline ? "오프라인입니다. 초안은 유지됩니다. 연결 후 상태를 확인하고 보내 주세요." : entry.error || entry.notice || (entry.uploads ? `첨부 ${entry.uploads}개를 올리고 있습니다…` : !entry.data ? (claudeWithoutId(selectedSession()) ? CLAUDE_NO_SEND : "메시지 전송 환경을 확인하고 있습니다…") : !supported ? unsupportedCopy : receiptNotice(entry) || phaseCopy)) + budgetNote;
-  $("chat-status").setAttribute("data-attention", String(!!(offline || entry.error || entry.receipt?.status === "unknown")));
+  $("chat-status").setAttribute("data-attention", String(!!(offline || chatHostOffline(entry) || entry.error || entry.receipt?.status === "unknown")));
   const deliveryVisible = updateChatDeliveryEvidence(entry);
   const chips = $("chat-attachments");
   // While a bubble resends its own message, another draft's files stay as they are.
@@ -3943,8 +4122,40 @@ async function readChatClipboard(entry, input, files, editorEpoch = entry.editor
     updateChatComposer(entry);
   }
 }
+async function recoverChatSession(s) {
+  if (!state.authenticated || state.selected !== s.key || state.launchBusy || networkOffline()) return;
+  const entry = chatEntry(s);
+  const recovery = chatRecovery(entry);
+  if (!recovery || entry.recovering) return;
+  if (recovery.action === "resume_session") {
+    state.route = { host: s.host, agent: s.agent, account: accountOf(s) };
+    return preparePlan({ resume: true });
+  }
+  const authEpoch = state.authEpoch;
+  entry.recovering = true;
+  entry.error = "";
+  updateChatComposer(entry);
+  try {
+    await api("/api/refresh", { method: "POST", body: { host: s.host }, authEpoch });
+    assertAuthEpoch(authEpoch);
+    await poll(false);
+    assertAuthEpoch(authEpoch);
+    if (currentChat(entry) && !chatHostOffline(entry)) {
+      state.chatPollCount = 0;
+      await loadChatState(selectedSession(), true, { join: true });
+    }
+  } catch (err) {
+    if (authEpoch === state.authEpoch && !err.unauthorized && !err.staleAuth)
+      entry.error = err.message || "기기 연결을 확인하지 못했습니다. 초안은 유지됩니다.";
+  } finally {
+    if (authEpoch === state.authEpoch) { entry.recovering = false; updateChatComposer(entry); }
+  }
+}
 function openChatTerminal(s) {
   if (state.selected !== s.key || state.launchBusy) return;
+  const bot = botRequestForNative(sourceOf(s));
+  if (bot) { selectBotRequest(botRequestKey(bot)); return; }
+  if (chatRecovery(chatEntry(s))) return recoverChatSession(s);
   if (state.terminalAlive && chatKey(terminalInfo(state.terminal).nativeSource || {}) === chatKey(sourceOf(s))) {
     openTerminal(state.terminal);
     return;
@@ -4492,7 +4703,7 @@ function navigateView(view, replace = false) {
 }
 function backToList() {
   rememberConversationView();
-  if (window.SessionholicGoals?.backFromSession?.()) return;
+  if (!state.selectedBotRequest && window.SessionholicGoals?.backFromSession?.()) return;
   stopChatPolling();
   if (
     window.history.state?.[INSTANCE.historyKey] &&
@@ -4778,14 +4989,17 @@ function updateContinue(s) {
               : "작업 맥락을 전달할 수 있는지 먼저 확인합니다.";
 }
 
-async function preparePlan() {
+async function preparePlan({ resume = false } = {}) {
   const s = selectedSession();
   if (!s || !state.route) return;
+  const bot = botRequestForNative(sourceOf(s));
+  if (bot) { selectBotRequest(botRequestKey(bot)); return; }
   if (state.launchBusy || $("plan-dialog").open) {
     $(state.launchBusy ? "plan-dialog" : "plan-cancel").focus();
     return;
   }
-  const target = { ...state.route };
+  if (resume && chatRecovery(chatEntry(s))?.action !== "resume_session") return;
+  const target = resume ? { host: s.host, agent: s.agent, account: accountOf(s) } : { ...state.route };
   const run = ++state.planRun;
   state.plan = null;
   $("plan-title").textContent = "이어서 할 준비를 확인합니다";
@@ -4801,7 +5015,7 @@ async function preparePlan() {
   try {
     const plan = await api("/api/plan", {
       method: "POST",
-      body: { source: sourceOf(s), target },
+      body: { source: sourceOf(s), target, ...(resume ? { resume: true } : {}) },
     });
     if (run !== state.planRun || !$("plan-dialog").open) return;
     state.plan = plan;
@@ -4824,7 +5038,9 @@ function progress(text) {
 }
 function renderPlan(s, plan, target) {
   $("plan-title").textContent = plan.allowed
-    ? plan.mode === "transfer"
+    ? plan.mode === "resume"
+      ? "같은 세션을 다시 열까요?"
+      : plan.mode === "transfer"
       ? "새 작업 폴더로 옮길까요?"
       : plan.mode === "reconnect"
       ? "열어 둔 터미널로 돌아갑니다"
@@ -4940,7 +5156,9 @@ function renderPlan(s, plan, target) {
     );
   $("plan-launch").disabled = !plan.allowed;
   $("plan-launch").textContent =
-    plan.mode === "transfer"
+    plan.mode === "resume"
+      ? "세션 다시 열기"
+      : plan.mode === "transfer"
       ? `${transfer.requiresInterrupt ? "중단하고 " : ""}${transfer.targetHostLabel || hostLabel(target.host)}로 넘기기`
       : plan.mode === "reconnect"
       ? "열어 둔 터미널로 ↗"
@@ -6469,7 +6687,11 @@ async function poll(refresh = false, { capabilities = true } = {}) {
     state.snapshot = snapshot;
     serverBooted(snapshot?.bootId);
     if (Number.isInteger(snapshot?.version)) state.snapshotVersion = snapshot.version;
+    const firstAuthentication = !state.authenticated;
     state.authenticated = true;
+    // One non-blocking metadata read separates known bot sessions immediately.
+    // An ordinary poll never retries this initial read, even after failure.
+    if (firstAuthentication) loadBotRequests();
     $("login").hidden = true;
     $("app").hidden = false;
     notice();
@@ -6525,6 +6747,7 @@ async function poll(refresh = false, { capabilities = true } = {}) {
   }
 }
 async function manualRefresh() {
+  if (state.sessionCategory === "bot" && !$("session-layout").hidden) return loadBotRequests({ refresh: true });
   if (state.pollBusy || state.launchBusy) return;
   const authEpoch = state.authEpoch;
   $("refresh").disabled = true;
@@ -6685,6 +6908,7 @@ function showLogin() {
   window.SessionholicGoals?.locked?.();
   state.phaseFilter = "";
   state.sessionCategory = "general"; state.filters.initiator = "";
+  state.selectedBotRequest = null; state.botRequests = emptyBotRequests();
   renderSessionCategories([], Date.now() / 1000);
   state.swipeOpen = null;
   state.pollFailures = 0;
@@ -6839,7 +7063,7 @@ window.addEventListener("DOMContentLoaded", () => {
     const fromTerminal = state.terminalVisible;
     if (fromTerminal) returnToBoard({ animate });
     if (window.SessionholicGoals?.handleHistory?.(event)) return;
-    const detail = view === "detail" && !!state.selected;
+    const detail = view === "detail" && !!(state.selected || state.selectedBotRequest);
     stopChatPolling();
     setDetailShown(detail, { direction: animate && !fromTerminal ? (detail ? "push" : "pop") : null, focus: true });
     const selected = selectedSession();

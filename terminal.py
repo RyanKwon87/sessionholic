@@ -12,7 +12,7 @@ import fcntl
 import json
 import math
 import os
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 import pty
 import re
 import secrets
@@ -77,7 +77,8 @@ def _metadata(value):
                 or any(not isinstance(v, (str, type(None))) for v in item.values())
                 or not re.fullmatch(r"[A-Za-z0-9_.-]{1,40}", item.get("host") or "")
                 or item.get("agent") not in ("codex", "claude")
-                or not isinstance(item.get("cwd"), str) or not item["cwd"].startswith("/")
+                or not isinstance(item.get("cwd"), str)
+                or not (item["cwd"].startswith("/") or PureWindowsPath(item["cwd"]).is_absolute())
                 or "\0" in item["cwd"] or len(item["cwd"].encode()) > 4096
                 or item.get("kind") not in (None, "interactive", "background")):
             raise ValueError("Native 세션 정보가 올바르지 않습니다.")
@@ -279,6 +280,7 @@ class TerminalManager:
                     or row.get("name") != "sb-" + row["id"] or not isinstance(row.get("key"), str)
                     or not isinstance(row.get("metadata"), dict)
                     or ("closed" in row and not isinstance(row["closed"], bool))
+                    or ("closedReason" in row and row["closedReason"] not in ("user", "connection_ended"))
                     or ("socket" in row and (not isinstance(row["socket"], str)
                                              or not SOCKET.fullmatch(row["socket"])))):
                 raise RuntimeError("터미널 상태 파일 형식이 올바르지 않습니다.")
@@ -297,7 +299,7 @@ class TerminalManager:
     def _public(terminal):
         return {**copy.deepcopy(terminal.record["metadata"]), "id": terminal.record["id"], "key": terminal.record["key"],
                 "metadata": copy.deepcopy(terminal.record["metadata"]), "alive": terminal.alive,
-                "closed": terminal.record.get("closed", False)}
+                "closed": terminal.record.get("closed", False), "closedReason": terminal.record.get("closedReason")}
 
     def _get(self, terminal_id):
         if self._closed:
@@ -725,6 +727,7 @@ class TerminalManager:
                     # A generated tmux session that ended is never restarted by
                     # this ID. Persist that fact before input receipts are pruned.
                     terminal.record["closed"] = True
+                    terminal.record["closedReason"] = "connection_ended"
                     changed.append(terminal)
                 result.append(self._public(terminal))
             if changed or adopted:
@@ -733,6 +736,7 @@ class TerminalManager:
                 except (ValueError, RuntimeError, OSError):
                     for terminal in changed:
                         terminal.record.pop("closed", None)
+                        terminal.record.pop("closedReason", None)
                     for terminal in adopted:
                         terminal.record.pop("socket", None)
                     raise
@@ -783,12 +787,14 @@ class TerminalManager:
                         # Possibly alive on an earlier socket: like a foreign row, never tombstoned.
                         raise RuntimeError(self._unrecorded_message())
                     terminal.record["closed"] = True
+                    terminal.record["closedReason"] = "user"
                     if unrecorded:
                         terminal.record["socket"] = self.socket_name
                     try:
                         self._save()
                     except (ValueError, RuntimeError, OSError):
                         terminal.record.pop("closed", None)
+                        terminal.record.pop("closedReason", None)
                         if unrecorded:
                             terminal.record.pop("socket", None)
                         raise

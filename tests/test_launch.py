@@ -1,7 +1,9 @@
+from contextlib import closing
 import json
 import os
 from pathlib import Path
 import socket
+import sqlite3
 import stat
 import subprocess
 import sys
@@ -201,6 +203,122 @@ class LaunchTest(unittest.TestCase):
         self.daemon(".codex")
         with self.assertRaisesRegex(ValueError, "UUID"):
             self.build(target, dict(self.source, id="--last"))
+
+    def saved_thread(self, key='.codex', archived=0):
+        database = self.home / key / 'state_5.sqlite'
+        with closing(sqlite3.connect(database)) as connection, connection:
+            connection.execute('CREATE TABLE threads (id TEXT,cwd TEXT,archived INTEGER)')
+            connection.execute('INSERT INTO threads VALUES (?,?,?)', (self.source['id'], str(self.cwd), archived))
+        return database
+
+    def test_offline_closed_codex_resumes_same_id_home_without_prompt(self):
+        self.saved_thread()
+        source = {**self.source, 'phase': 'closed', 'appServer': 'off', 'resume': True}
+        with patch.object(subprocess, 'run') as run:
+            preview = launch.resume_preview(source, self.home)
+            result = self.build(self.profile('codex', '.codex'), source, [])
+        self.assertTrue(preview['allowed'])
+        self.assertFalse(preview['blockedByBoard'])
+        self.assertEqual(result['mode'], 'resume')
+        self.assertEqual(result['argv'], ['/native/codex', 'resume', self.source['id'], '--cd', str(self.cwd)])
+        self.assertEqual(result['env']['CODEX_HOME'], str(self.home / '.codex'))
+        self.assertEqual(result['nativeSource']['id'], self.source['id'])
+        self.assertFalse(self.state.exists())
+        run.assert_not_called()
+
+    def test_closed_resume_keeps_private_profile_environment_and_live_socket(self):
+        profile = self.profile('codex', '.codex-isolated')
+        self.saved_thread('.codex-isolated')
+        path = self.daemon('.codex-isolated')
+        source = {**self.source, 'home': '.codex-isolated', 'phase': 'closed', 'resume': True}
+        with patch.object(launch, '_resume_runtime', return_value={
+                'allowed': True, 'runtimeKnown': True, 'remoteAvailable': True, 'reason': None}):
+            result = self.build(profile, source, [])
+        self.assertEqual(result['mode'], 'resume')
+        self.assertIn('unix://' + str(path), result['argv'])
+        self.assertEqual(result['env']['CODEX_HOME'], str(self.home / '.codex-isolated'))
+        self.assertIn('GH_CONFIG_DIR', result['env'])
+
+    def test_closed_resume_rejects_archive_wrong_account_cwd_and_board_close(self):
+        database = self.saved_thread()
+        source = {**self.source, 'phase': 'closed', 'resume': True}
+        for altered in ({'cwd': str(self.home)}, {'home': '.codex-beta'}, {'blockedByBoard': True}):
+            with self.subTest(altered=altered):
+                self.assertFalse(launch.resume_preview({**source, **altered}, self.home)['allowed'])
+        with self.assertRaisesRegex(ValueError, '원본 도구와 계정'):
+            self.build(self.profile('codex', '.codex-beta'), source)
+        with closing(sqlite3.connect(database)) as connection, connection:
+            connection.execute('UPDATE threads SET archived=1')
+        self.assertFalse(launch.resume_preview(source, self.home)['allowed'])
+        with self.assertRaisesRegex(ValueError, '보관'):
+            self.build(self.profile('codex', '.codex'), source)
+
+    def test_remote_resume_preview_rpc_and_attach_revalidate_same_source(self):
+        import transfer_worker
+        source = {**self.source, 'phase': 'closed', 'resume': True}
+        self.saved_thread()
+        with patch.object(Path, 'home', return_value=self.home), patch.object(os, 'chdir'), patch.object(os, 'execve') as execute:
+            result = transfer_worker.rpc({'op': 'resume_preview', 'args': {'source': source}})
+            self.assertTrue(result['allowed'])
+            transfer_worker.attach(source)
+        self.assertEqual(execute.call_args.args[1], ['/native/codex', 'resume', self.source['id'], '--cd', str(self.cwd)])
+
+    def test_resume_uses_fresh_native_status_instead_of_stale_list_phase(self):
+        import transfer_native
+        self.saved_thread()
+        self.daemon('.codex')
+        for status, allowed in [('notLoaded', True), ('idle', True), ('active', False), ('unknown', False)]:
+            with self.subTest(status=status), patch.object(transfer_native, '_client') as client:
+                rpc = client.return_value.__enter__.return_value
+                rpc.call.return_value = {'thread': {'id': self.source['id'], 'cwd': str(self.cwd),
+                                                    'status': {'type': status, 'activeFlags': []}}}
+                preview = launch.resume_preview(self.source, self.home)
+                self.assertIs(preview['allowed'], allowed)
+                self.assertTrue(preview['runtimeKnown'])
+                rpc.call.assert_called_once_with('thread/read', {'threadId': self.source['id'], 'includeTurns': False})
+
+    def test_resume_rechecks_durable_board_termination_marker_at_execution(self):
+        import session_control
+        import transfer_native
+        self.saved_thread()
+        source = {**self.source, 'phase': 'closed', 'resume': True}
+        self.assertTrue(launch.resume_preview(source, self.home)['allowed'])
+        api = session_control.SessionControl(self.home)
+        api.directory.mkdir(mode=0o700, parents=True)
+        identity = transfer_native._identity(source)
+        session_control._save(api.directory / ('closed-' + session_control._digest(identity) + '.json'),
+                              {'source': identity, 'status': 'unconfirmed'})
+        preview = launch.resume_preview(source, self.home)
+        self.assertFalse(preview['allowed'])
+        self.assertTrue(preview['blockedByBoard'])
+        with self.assertRaisesRegex(ValueError, '웹보드에서 종료'):
+            self.build(self.profile('codex', '.codex'), source, [])
+
+    def test_stale_safe_socket_uses_same_id_local_resume_and_unsafe_socket_is_rejected(self):
+        self.saved_thread()
+        path = self.daemon('.codex')
+        source = {**self.source, 'resume': True}
+        preview = launch.resume_preview(source, self.home)
+        self.assertTrue(preview['allowed'])
+        self.assertFalse(preview['remoteAvailable'])
+        result = self.build(self.profile('codex', '.codex'), source, [])
+        self.assertNotIn('--remote', result['argv'])
+        self.assertEqual(result['argv'][2], source['id'])
+        path.unlink()
+        path.symlink_to(self.home / 'missing')
+        self.assertFalse(launch.resume_preview(source, self.home)['allowed'])
+
+    def test_resume_rejects_native_wrong_cwd_and_timeout_without_fallback(self):
+        import transfer_native
+        self.saved_thread()
+        self.daemon('.codex')
+        with patch.object(transfer_native, '_client') as client:
+            rpc = client.return_value.__enter__.return_value
+            rpc.call.return_value = {'thread': {'id': self.source['id'], 'cwd': str(self.home),
+                                                'status': {'type': 'notLoaded'}}}
+            self.assertFalse(launch.resume_preview(self.source, self.home)['allowed'])
+            rpc.call.side_effect = TimeoutError()
+            self.assertFalse(launch.resume_preview(self.source, self.home)['allowed'])
 
     def test_claude_background_attach_never_uses_resume_or_session_name(self):
         source = dict(self.source, agent="claude", home=".claude", kind="background",

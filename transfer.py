@@ -175,20 +175,73 @@ class Transfers:
     def _needs_runtime(self, data):
         return data.get('needRuntime') is True and data.get('sha256') == self.runtime()['sha256']
 
+    def windows_rpc(self, host, op, args, timeout):
+        """Send reviewed code and one request on stdin; user input never enters argv."""
+        from server import WINDOWS_READ_ONLY, collector_command, SESSION_ID, HOME_KEY
+        if op not in ('chat', 'control_preview', 'control_execute', 'terminal_plan', 'resume_preview'):
+            raise ValueError(WINDOWS_READ_ONLY)
+        source = args.get('source') or {}
+        agent, sid, home = source.get('agent'), source.get('id'), source.get('home')
+        if (agent not in ('codex', 'claude') or not isinstance(sid, str) or not SESSION_ID.fullmatch(sid)
+                or agent == 'codex' and (not isinstance(home, str) or not HOME_KEY.fullmatch(home))):
+            raise ValueError('Windows 세션 정보를 확인해 주세요.')
+        if op == 'chat' and args.get('action') not in ('read', 'send', 'receipt'):
+            raise ValueError('지원하지 않는 Windows 대화 요청입니다.')
+        args = {**args, 'source': {**source, 'host': host['name']}}
+        root = Path(__file__).resolve().parent
+        program = 'import types,sys,json\n'
+        for name in ('windows_collector', 'windows_runtime'):
+            program += ("m=types.ModuleType(" + repr(name) + ");sys.modules[" + repr(name) + "]=m\nexec("
+                        + ascii((root / (name + '.py')).read_text(encoding='utf-8')) + ",m.__dict__)\n")
+        program += 'm.STORE_RELATIVE=' + ascii(instance.current()['remote']['chatLedgerDir'] + '/windows') + '\n'
+        program += ('try:\n result=m.handle(json.loads(' + ascii(json.dumps({'op': op, 'args': args})) + '))\n'
+                    ' print(json.dumps({"ok":True,"result":result},ensure_ascii=True))\n'
+                    'except ValueError as exc:\n print(json.dumps({"ok":False,"error":str(exc)},ensure_ascii=True))\n'
+                    'except Exception:\n print(json.dumps({"ok":False,"unknown":True}))\n')
+        try:
+            done = subprocess.run(collector_command(host, [], self.base_dir), input=program.encode(),
+                                  capture_output=True, timeout=min(timeout, 30))
+        except subprocess.TimeoutExpired:
+            raise RuntimeError('PC 응답을 확인하지 못했습니다. 요청은 자동으로 다시 보내지 않습니다.') from None
+        if done.returncode:
+            raise RuntimeError('PC 연결 결과를 확인하지 못했습니다. 현재 상태를 다시 확인해 주세요.')
+        try:
+            data = json.loads(done.stdout)
+        except (ValueError, UnicodeError):
+            raise RuntimeError('PC 응답 형식이 올바르지 않습니다.') from None
+        if not isinstance(data, dict) or data.get('unknown'):
+            raise RuntimeError('PC 요청 결과를 확인하지 못했습니다.')
+        if data.get('ok') is not True:
+            raise WorkerError(scrub_text(data.get('error') or 'PC 요청을 실행하지 못했습니다.')[:1000])
+        if not isinstance(data.get('result'), dict):
+            raise RuntimeError('PC 응답 형식이 올바르지 않습니다.')
+        return data['result']
+
+    def windows_terminal(self, host, spec):
+        """A literal PowerShell command in the Mini-owned SSH terminal."""
+        from pathlib import PureWindowsPath
+        argv, cwd, env = spec.get('argv'), spec.get('cwd'), spec.get('env') or {}
+        if (not isinstance(argv, list) or not argv or len(argv) > 32
+                or any(not isinstance(v, str) or not v or len(v) > 4096 or any(ord(c) < 32 for c in v) for v in argv)
+                or not PureWindowsPath(argv[0]).is_absolute() or not isinstance(cwd, str)
+                or not PureWindowsPath(cwd).is_absolute() or any(ord(c) < 32 for c in cwd)
+                or not isinstance(env, dict) or set(env) - {'CODEX_HOME'}
+                or any(not isinstance(v, str) or not PureWindowsPath(v).is_absolute()
+                       or any(ord(c) < 32 for c in v) for v in env.values())):
+            raise ValueError('PC 터미널 연결 정보가 올바르지 않습니다.')
+        quote = lambda value: "'" + value.replace("'", "''") + "'"
+        script = "$ErrorActionPreference='Stop'; Set-Location -LiteralPath " + quote(cwd) + '; '
+        for key, value in env.items():
+            script += '$env:' + key + '=' + quote(value) + '; '
+        script += '& ' + ' '.join(quote(value) for value in argv) + '; exit $LASTEXITCODE'
+        encoded = base64.b64encode(script.encode('utf-16le')).decode('ascii')
+        return [shutil.which('ssh') or '/usr/bin/ssh', '-tt', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=6',
+                '-o', 'ServerAliveInterval=10', '-o', 'ServerAliveCountMax=2'] + self.control_options() + [
+                '--', host['ssh'], 'powershell.exe -NoProfile -EncodedCommand ' + encoded]
+
     def rpc(self, host, op, args=None, timeout=30):
         if host.get('platform') == 'windows':
-            from server import WINDOWS_READ_ONLY, run_collector, SESSION_ID, HOME_KEY
-            args = args or {}
-            source = args.get('source') or {}
-            if op != 'chat' or args.get('action') != 'read':
-                raise ValueError(WINDOWS_READ_ONLY)
-            agent, sid, home = source.get('agent'), source.get('id'), source.get('home')
-            if (agent not in ('codex', 'claude') or not isinstance(sid, str) or not SESSION_ID.fullmatch(sid)
-                    or agent == 'codex' and (not isinstance(home, str) or not HOME_KEY.fullmatch(home))):
-                raise ValueError('Windows 세션 정보를 확인해 주세요.')
-            result = run_collector(host, ['read', agent, sid] + ([home] if agent == 'codex' else []),
-                                   min(timeout, 30), state_dir=self.base_dir)
-            return {**result, 'readOnly': True, 'capabilities': {'canSend': False, 'reason': WINDOWS_READ_ONLY}}
+            return self.windows_rpc(host, op, args or {}, timeout)
         request = {'op': op, 'args': args or {}}
         name = host['name']
         with self.lock:

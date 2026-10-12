@@ -148,7 +148,8 @@ class ValidationTest(unittest.TestCase):
                   "sessionId": native["id"]}
         self.assertEqual(terminal._metadata({"nativeSource": claude})["nativeSource"], claude)
         for change in ({"extra": "forbidden"}, {"id": "../session"}, {"home": "../account"},
-                       {"host": ["local"]}, {"cwd": "relative"}, {"cwd": "/" + "a" * 4096},
+                       {"host": ["local"]}, {"cwd": "relative"}, {"cwd": "C:relative"},
+                       {"cwd": "\\work"}, {"cwd": "/" + "a" * 4096},
                        {"kind": {"nested": True}}, {"sessionId": native["id"]}, {"agent": "unknown"}):
             with self.subTest(change=change), self.assertRaises(ValueError):
                 self.manager.create("key", ["/bin/echo"], self.directory.name, {},
@@ -629,6 +630,19 @@ class TmuxFixtureTest(unittest.TestCase):
         self.managers.append(replacement)
         self.assertEqual(next(row for row in replacement.list() if row["id"] == created["id"])["nativeSource"], native)
 
+    def test_windows_native_cwd_survives_terminal_creation_and_restart(self):
+        native = {"host": "windows-fixture", "agent": "codex", "id": "019a0000-0000-7000-8000-000000000001",
+                  "home": ".codex", "cwd": r"\\?\C:\Users\example\Work"}
+        created = self.manager.create("windows-metadata", [sys.executable, "-u", "-c", self.code, str(self.launch_count)],
+                                      self.directory.name, {"PATH": os.environ.get("PATH", "")},
+                                      {"host": native["host"], "nativeSource": native})
+        self.wait_for(self.manager, created["id"], b"FIXTURE_READY")
+        self.assertEqual(created["nativeSource"], native)
+        self.manager.close()
+        replacement = terminal.TerminalManager(state_dir=self.directory.name, socket_name=self.socket)
+        self.managers.append(replacement)
+        self.assertEqual(replacement.list()[0]["nativeSource"], native)
+
     def test_a_row_saved_without_a_socket_joins_the_socket_it_is_found_on(self):
         created = self.create()
         self.wait_for(self.manager, created["id"], b"FIXTURE_READY")
@@ -797,7 +811,8 @@ class TmuxFixtureTest(unittest.TestCase):
         saved = json.loads((Path(self.directory.name) / "sessions.json").read_text())
         closed = next(row for row in saved if row["id"] == first["id"])
         self.assertTrue(closed["closed"])
-        self.assertEqual(set(closed), {"id", "name", "key", "metadata", "closed", "socket"})
+        self.assertEqual(set(closed), {"id", "name", "key", "metadata", "closed", "closedReason", "socket"})
+        self.assertEqual(closed["closedReason"], "user")
         self.assertEqual(closed["socket"], self.socket)
         self.assertNotIn("FIXTURE_READY", json.dumps(saved))
 

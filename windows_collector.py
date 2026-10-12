@@ -238,7 +238,12 @@ class Proxy:
         raw = json.dumps(value).encode() if isinstance(value, dict) else value
         mask = os.urandom(4)
         length = len(raw)
-        prefix = bytes([0x80 | opcode, 0x80 | length]) if length < 126 else bytes([0x80 | opcode, 0xfe]) + struct.pack('!H', length)
+        if length < 126:
+            prefix = bytes([0x80 | opcode, 0x80 | length])
+        elif length <= 65535:
+            prefix = bytes([0x80 | opcode, 0xfe]) + struct.pack('!H', length)
+        else:
+            prefix = bytes([0x80 | opcode, 0xff]) + struct.pack('!Q', length)
         self._write(prefix + mask + bytes(byte ^ mask[index % 4] for index, byte in enumerate(raw)))
 
     def _write(self, raw):

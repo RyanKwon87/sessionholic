@@ -7,6 +7,7 @@ SSH, app-server or real native control can run. The reused terminal is echo only
 """
 import copy
 import hashlib
+import os
 from pathlib import Path
 import sys
 import threading
@@ -42,6 +43,14 @@ class AutomaticPreviewNative(fixture.FakeNative):
                          'parentSessionId': parent_id, 'agentName': '회귀 검토' if parent_id else None,
                          'initiatorName': '회귀 검토 에이전트' if parent_id else None,
                          'source': 'subagent' if parent_id else 'cli'})
+        if os.environ.get('SESSIONHOLIC_RECOVERY_PREVIEW') == '1':
+            for number, title, closed_by_board in [(104, '연결이 끝난 재개 가능 세션', False), (105, '웹보드에서 명시 종료한 세션', True)]:
+                cwd = directory / ('workspace-' + str(number)); cwd.mkdir(exist_ok=True, mode=0o700)
+                rows.append({'id': f'019aaaaa-0000-7000-8000-{number:012d}', 'agent': 'codex', 'home': '.codex-isolated',
+                             'title': title, 'phase': 'closed', 'cwd': str(cwd), 'kind': 'interactive',
+                             'account': '검증 계정', 'project': '합성 재개 검수', 'updatedAt': now - number,
+                             'fixtureHost': 'local', 'fixtureClosedByBoard': closed_by_board,
+                             'initiator': 'human', 'initiatorEvidence': 'explicit', 'source': 'vscode'})
         super().__init__(rows)
         self.control_calls = []
         self.control_receipts = {}
@@ -65,12 +74,19 @@ class AutomaticPreviewNative(fixture.FakeNative):
                                              'text': work['current'], 'work': work, 'ts': now - 5})
 
     def rpc(self, host, command, payload, timeout=20):
-        if command not in ('control_preview', 'control_execute'):
-            return super().rpc(host, command, payload, timeout)
+        if command not in ('control_preview', 'control_execute', 'resume_preview'):
+            result = super().rpc(host, command, payload, timeout)
+            if command == 'chat' and payload.get('action') == 'read' and self.rows[payload['source']['id']]['phase'] == 'closed':
+                result['capabilities'] = {'canSend': False, 'reason': '연결이 끝난 합성 세션입니다.'}
+            return result
         source = payload['source']; row = self.rows[source['id']]
         if source.get('agent') != row['agent'] or source.get('home') != row['home'] or host['name'] != row['fixtureHost']:
             raise ValueError('합성 제어 대상이 다릅니다.')
         with self.lock:
+            if command == 'resume_preview':
+                blocked = row.get('fixtureClosedByBoard', False)
+                return {'allowed': not blocked, 'blockedByBoard': blocked,
+                        'reason': '웹보드에서 명시적으로 종료한 세션입니다.' if blocked else None}
             if command == 'control_preview':
                 proof = 'synthetic.' + hashlib.sha256((row['id'] + row['phase'] + str(time.time_ns())).encode()).hexdigest()
                 self.control_proofs[proof] = (row['id'], row['phase'])
@@ -78,7 +94,8 @@ class AutomaticPreviewNative(fixture.FakeNative):
                         'capabilities': {
                             'interrupt': {'supported': row['agent'] == 'codex' and row['phase'] == 'working',
                                           'reason': None if row['agent'] == 'codex' and row['phase'] == 'working' else '현재 합성 세션은 응답 중단을 지원하지 않습니다.'},
-                            'terminate': {'supported': row['phase'] != 'closed', 'reason': None}}}
+                            'terminate': {'supported': row['phase'] != 'closed', 'reason': None,
+                                          'effect': '선택한 세션과 하위 에이전트를 종료하고 대화 기록을 보관합니다.'}}}
             rid = payload['requestId']
             if rid in self.control_receipts:
                 return copy.deepcopy(self.control_receipts[rid])
@@ -91,12 +108,47 @@ class AutomaticPreviewNative(fixture.FakeNative):
                 raise ValueError('합성 응답 중단을 지원하지 않습니다.')
             self.control_calls.append({'requestId': rid, 'source': copy.deepcopy(source), 'action': action})
             row['phase'] = 'idle' if action == 'interrupt' else 'closed'
+            if action == 'terminate': row['fixtureClosedByBoard'] = True
             row['updatedAt'] = int(time.time())
             self.running.pop(row['id'], None)
             result = {'requestId': rid, 'confirmed': True, 'applied': True,
                       'status': 'interrupted' if action == 'interrupt' else 'terminated', 'synthetic': True}
             self.control_receipts[rid] = result
             return copy.deepcopy(result)
+
+
+class SyntheticBotRequests:
+    """Metadata-only source fixtures; refresh never starts a native process."""
+    def __init__(self, native):
+        self.native = native
+        self.reads = 0
+        self.refreshes = 0
+
+    def snapshot(self, force=False):
+        self.reads += 1
+        self.refreshes += int(force)
+        now = int(time.time())
+        linked = next(row for row in self.native.rows.values() if row['id'].endswith('000000000001'))
+        requests = [
+            {'id': 'holic-team-request', 'sourceId': 'holic-team', 'botName': '홀릭이 팀 봇', 'host': 'local',
+             'channelLabel': '팀 업무 채널', 'requesterLabel': '합성 팀원', 'authorityLabel': '팀원 권한',
+             'scopeLabel': '공유된 업무 프로젝트', 'title': '팀 제품 자료 정리 요청', 'status': 'running', 'updatedAt': now,
+             'nativeRef': {'agent': 'codex', 'id': linked['id'], 'home': linked['home']}},
+            {'id': 'hermes-slack-request', 'sourceId': 'hermes-slack', 'botName': 'Hermes', 'host': 'local',
+             'channelLabel': 'Slack · 콘텐츠 채널', 'requesterLabel': '합성 요청자', 'authorityLabel': '콘텐츠 열람',
+             'scopeLabel': '콘텐츠 채널 자료', 'title': '행사 안내 문구 확인', 'status': 'completed', 'updatedAt': now - 30,
+             'nativeRef': None},
+            {'id': 'studio-pc-request', 'sourceId': 'studio-pc', 'botName': '스튜디오', 'host': 'offline-demo',
+             'channelLabel': 'PC 봇 요청', 'requesterLabel': None, 'authorityLabel': None,
+             'scopeLabel': '스튜디오 제품 작업공간', 'title': '제품 설명 번역 요청', 'status': 'pending', 'updatedAt': now - 60,
+             'nativeRef': None, 'stale': True},
+        ]
+        sources = [{'id': key, 'label': label, 'host': host, 'ok': True, 'error': None, 'updatedAt': now}
+                   for key, label, host in [('holic-team', '홀릭이 팀 봇', 'local'), ('hermes-slack', 'Hermes Slack', 'local'), ('studio-pc', '작업실 PC', 'offline-demo')]]
+        sources[-1].update(ok=False, stale=True, error='합성 봇 연결을 확인하지 못했습니다.')
+        sources.append({'id': 'schema-error-demo', 'label': '형식 확인 필요 샘플', 'host': 'local', 'ok': False,
+                        'error': '요청 목록 형식을 확인하지 못했습니다.', 'code': 'schema_error', 'updatedAt': now})
+        return {'requests': requests, 'sources': sources, 'fetchedAt': now}
 
 
 def main():
@@ -107,6 +159,8 @@ def main():
         kwargs['automatic_work'] = False
         httpd = make_server(*args, **kwargs)
         fake = httpd.workflow.transfers.rpc.__self__
+        httpd.bot_requests = SyntheticBotRequests(fake)
+        httpd.workflow.bot_requests = httpd.bot_requests
         offline = {'name': 'offline-demo', 'label': '오프라인 샘플', 'local': True}
         httpd.board.hosts.append(offline)
         httpd.board.host_locks[offline['name']] = threading.Lock()

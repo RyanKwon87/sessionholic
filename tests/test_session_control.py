@@ -1,8 +1,10 @@
 import copy
+from contextlib import closing
 import json
 import os
 from pathlib import Path
 import signal
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -18,9 +20,10 @@ import transfer_worker
 
 
 class Client:
-    def __init__(self, threads):
+    def __init__(self, threads, archive=None, loaded=None):
         self.threads = iter(threads)
         self.calls = []
+        self.archive, self.loaded = archive, loaded
 
     def __enter__(self):
         return self
@@ -34,6 +37,11 @@ class Client:
             return {'data': [], 'nextCursor': None}
         if method == 'turn/interrupt':
             return {}
+        if method == 'thread/archive' and self.archive:
+            self.archive()
+            return {}
+        if method == 'thread/loaded/list':
+            return {'data': self.loaded or [], 'nextCursor': None}
         if method == 'thread/read':
             result = next(self.threads)
             if isinstance(result, Exception):
@@ -73,6 +81,88 @@ class SessionControlTest(unittest.TestCase):
                 'target': {'identity': native._identity(source), 'process': control._process_key(self.process)},
                 'capabilities': {'interrupt': control._capability(False, reason='fixture'),
                                  'terminate': control._capability(True, method)}}
+
+    def codex_record(self):
+        folder = self.home / '.codex'
+        folder.mkdir()
+        cwd = self.home / 'project'
+        cwd.mkdir()
+        self.codex['cwd'] = str(cwd)
+        database = folder / 'state_5.sqlite'
+        with closing(sqlite3.connect(database)) as connection, connection:
+            connection.execute('CREATE TABLE threads (id TEXT,cwd TEXT,archived INTEGER)')
+            connection.execute('INSERT INTO threads VALUES (?,?,0)', (self.codex['id'], str(cwd)))
+        return database
+
+    def test_external_codex_without_exact_pid_can_archive_only_its_thread(self):
+        database = self.codex_record()
+        def archive():
+            with closing(sqlite3.connect(database)) as connection, connection:
+                connection.execute('UPDATE threads SET archived=1 WHERE id=?', (self.codex['id'],))
+        clients = [Client([self.thread()]), Client([self.thread()]), Client([self.thread()], archive=archive)]
+        with patch.object(native, '_client', side_effect=clients), patch.object(control, '_codex_process', return_value=None), patch.object(os, 'kill') as kill:
+            preview = self.api.preview(self.codex)
+            capability = preview['capabilities']['terminate']
+            self.assertEqual(capability['method'], 'codex-thread-archive')
+            self.assertIn('하위 에이전트', capability['effect'])
+            result = self.api.execute(self.codex, 'terminate', preview['targetProof'], 'request-archive')
+        self.assertTrue(result['confirmed'])
+        self.assertTrue(result['archived'])
+        self.assertEqual(result['scope'], 'thread_and_descendants')
+        self.assertEqual(result['scopeReadback'], 'selected-session')
+        self.assertEqual([call for call in clients[-1].calls if call[0] == 'thread/archive'],
+                         [('thread/archive', {'threadId': self.codex['id']})])
+        self.assertTrue(self.api.close_provenance(self.codex)['blockedByBoard'])
+        kill.assert_not_called()
+
+    def test_archive_without_both_readbacks_is_unconfirmed_and_blocks_resume(self):
+        self.codex_record()
+        clients = [Client([self.thread()]), Client([self.thread()]),
+                   Client([self.thread()], archive=lambda: None, loaded=[self.codex['id']])]
+        with patch.object(native, '_client', side_effect=clients), patch.object(control, '_codex_process', return_value=None):
+            preview = self.api.preview(self.codex)
+            result = self.api.execute(self.codex, 'terminate', preview['targetProof'], 'request-archive')
+        self.assertFalse(result['confirmed'])
+        self.assertEqual(result['status'], 'unconfirmed')
+        self.assertTrue(self.api.close_provenance(self.codex)['blockedByBoard'])
+
+    def test_archive_requires_exact_saved_cwd_and_account(self):
+        self.codex_record()
+        with patch.object(native, '_client', return_value=Client([self.thread()])), patch.object(control, '_codex_process', return_value=None):
+            view = self.api.preview({**self.codex, 'cwd': str(self.home)})
+        self.assertFalse(view['capabilities']['terminate']['supported'])
+
+    def test_archive_rechecks_native_revision_before_mutation(self):
+        self.codex_record()
+        clients = [Client([self.thread()]), Client([self.thread()]), Client([self.thread(updated=2)])]
+        with patch.object(native, '_client', side_effect=clients), patch.object(control, '_codex_process', return_value=None):
+            preview = self.api.preview(self.codex)
+            result = self.api.execute(self.codex, 'terminate', preview['targetProof'], 'request-archive')
+        self.assertFalse(result['applied'])
+        self.assertEqual(result['status'], 'stale')
+        self.assertNotIn('thread/archive', [call[0] for call in clients[-1].calls])
+        self.assertFalse(self.api.close_provenance(self.codex)['blockedByBoard'])
+
+    def test_unknown_termination_blocks_resume_but_interrupt_does_not(self):
+        with patch.object(self.api, '_observe', return_value=self.observed()), patch.object(self.api, '_apply', side_effect=TimeoutError()):
+            preview = self.api.preview(self.claude)
+            self.api.execute(self.claude, 'terminate', preview['targetProof'], 'request-unknown')
+        self.assertTrue(self.api.close_provenance(self.claude)['blockedByBoard'])
+        self.assertFalse(self.api.close_provenance(self.codex)['blockedByBoard'])
+
+    def test_legacy_confirmed_termination_receipt_remains_blocked(self):
+        self.api.directory.mkdir(mode=0o700)
+        record = {'result': {'source': native._identity(self.codex), 'action': 'terminate',
+                            'applied': True, 'status': 'terminated'}}
+        control._save(self.api.directory / 'request-legacy.json', record)
+        self.assertTrue(self.api.close_provenance(self.codex)['blockedByBoard'])
+
+    def test_stale_unapplied_termination_does_not_mark_closed(self):
+        with patch.object(self.api, '_observe', return_value=self.observed()), patch.object(self.api, '_apply',
+                return_value={'applied': False, 'confirmed': False, 'status': 'stale'}):
+            preview = self.api.preview(self.claude)
+            self.api.execute(self.claude, 'terminate', preview['targetProof'], 'request-stale')
+        self.assertFalse(self.api.close_provenance(self.claude)['blockedByBoard'])
 
     def test_exact_codex_active_turn_interrupt_without_board_origin(self):
         clients = [Client([self.thread()]), Client([self.thread(updated=2)]),

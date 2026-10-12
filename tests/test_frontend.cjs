@@ -126,7 +126,7 @@ function client(
   vm.runInContext(messageSource, context);
   vm.runInContext(source, context);
   const api = vm.runInContext(
-    "({state,api,sourceOf,accountOf,sendInput,pasteDraft,prepareDraftPaste,startDraftComposition,endDraftComposition,inputDraft,stopTerminalReader,startTerminalReader,closePlan,navigateView,backToList,backFromTerminal,closeTerminal,cancelTerminalClose,confirmTerminalClose,populateAccount,populateRoute,updateContinue,renderPlan,launchPlan,openTerminal,saveDraft,draftKey,refreshTerminals,renderTerminals,renderTerminalReturn,renderFilters,terminalCloseCopy,warnDraftUnload,preparePlan,renderGroups,renderMessages,loadDetail,chatKey,chatEntry,currentChat,chatSupported,chatAttachmentsSupported,buildChatComposer,sendChat,loadChatState,applyChatReceipt,uploadChatFiles,pasteChat,scheduleChatPoll,stopChatPolling,openNativeChat,allSessions,buildContinuePanel,chatReceiptCopy,returnToBoard,readChatClipboard,accountDisplay,sessionAccountLabel,closeChatToolsOutside,closeChatToolsEscape,drawDetail,refreshDetail,loadCapabilities,matches,recoverConnection,networkOffline,poll,select,focusDetailBack,restoreSelectedCardFocus,showLogin,lock,beginAuthEpoch,resizeChatInput,updateViewport,draftKeydown,configureTerminalKeyboard,queueTerminalScroll,flushTerminalScroll,terminalScrollEnd,renderAttention,chatPollDelay,pullRefresh,readingScroll,renderJump,pullDistance,listScroll,setReading,renderPrompt,promptAction,renderUsage,loadUsage,applyTheme,setTheme,updateThemeColor,haptic,navTransition,setDetailShown,chatVisible,sheetRelease,BottomSheet,sheet,openSettings,closeSettings,setTyping,pinchFontSize,setTerminalFontSize,loadXterm,assetUrl,syncEvents,closeEvents,eventsHealthy,renderFreshness,schedule,touchDevice,togglePhaseFilter,renderCounts,createLongPress,swipeIntent,swipeRelease,groupMessageRows,setTextSize,applyTextSize,renderConnectivity,terminalForSession,swipeActionFor,openMessageMenu,openCardMenu,messageActions,outboxShape,outboxMatches,outboxOrigin,settleOutbox,retryOutbox,renderAttachmentTiles,attachmentThumb,sendUpload,openActionSheet,closeActionSheet,setListCollapsed,closeSwipe,settleSwipe,prepareSwipe,runSwipeAction,GESTURE,setChromeVisible,toggleChrome,revealChrome,isChromeTap,snapshotAnnounced,updateChatComposer,capabilitiesRevision,toolKindOf,userMessageParts,formatElapsed,tickWorking,renderTerminalMarks,renderDetailTerminal,terminalsAnnounced,goToSessionTerminal,rememberTerminal,terminalMenu,updateTerminalMenu,chooseTerminalMenu,clearTerminalMenu,renderNewSession,openNewSession,startNewSession,startAppServer,rememberConversationView,restoreConversationView,conversationIdentity,initiatorOf,initiatorLabel,documentKeydown,sessionCategoryOf,setSessionCategory,renderSessionCategories,prepareSessionListFor,sessionCategoryKeydown,render,resetFilters})",
+    "({state,api,sourceOf,accountOf,sendInput,pasteDraft,prepareDraftPaste,startDraftComposition,endDraftComposition,inputDraft,stopTerminalReader,startTerminalReader,closePlan,navigateView,backToList,backFromTerminal,closeTerminal,cancelTerminalClose,confirmTerminalClose,populateAccount,populateRoute,updateContinue,renderPlan,launchPlan,openTerminal,saveDraft,draftKey,refreshTerminals,renderTerminals,renderTerminalReturn,renderFilters,terminalCloseCopy,warnDraftUnload,preparePlan,renderGroups,renderMessages,loadDetail,chatKey,chatEntry,currentChat,chatSupported,chatRecovery,recoverChatSession,openChatTerminal,chatAttachmentsSupported,buildChatComposer,sendChat,loadChatState,applyChatReceipt,uploadChatFiles,pasteChat,scheduleChatPoll,stopChatPolling,openNativeChat,allSessions,buildContinuePanel,chatReceiptCopy,returnToBoard,readChatClipboard,accountDisplay,sessionAccountLabel,closeChatToolsOutside,closeChatToolsEscape,drawDetail,refreshDetail,loadCapabilities,matches,recoverConnection,networkOffline,poll,select,focusDetailBack,restoreSelectedCardFocus,showLogin,lock,beginAuthEpoch,resizeChatInput,updateViewport,draftKeydown,configureTerminalKeyboard,queueTerminalScroll,flushTerminalScroll,terminalScrollEnd,renderAttention,chatPollDelay,pullRefresh,readingScroll,renderJump,pullDistance,listScroll,setReading,renderPrompt,promptAction,renderUsage,loadUsage,applyTheme,setTheme,updateThemeColor,haptic,navTransition,setDetailShown,chatVisible,sheetRelease,BottomSheet,sheet,openSettings,closeSettings,setTyping,pinchFontSize,setTerminalFontSize,loadXterm,assetUrl,syncEvents,closeEvents,eventsHealthy,renderFreshness,schedule,touchDevice,togglePhaseFilter,renderCounts,createLongPress,swipeIntent,swipeRelease,groupMessageRows,setTextSize,applyTextSize,renderConnectivity,terminalForSession,swipeActionFor,openMessageMenu,openCardMenu,messageActions,outboxShape,outboxMatches,outboxOrigin,settleOutbox,retryOutbox,renderAttachmentTiles,attachmentThumb,sendUpload,openActionSheet,closeActionSheet,setListCollapsed,closeSwipe,settleSwipe,prepareSwipe,runSwipeAction,GESTURE,setChromeVisible,toggleChrome,revealChrome,isChromeTap,snapshotAnnounced,updateChatComposer,capabilitiesRevision,toolKindOf,userMessageParts,formatElapsed,tickWorking,renderTerminalMarks,renderDetailTerminal,terminalsAnnounced,goToSessionTerminal,rememberTerminal,terminalMenu,updateTerminalMenu,chooseTerminalMenu,clearTerminalMenu,renderNewSession,openNewSession,startNewSession,startAppServer,rememberConversationView,restoreConversationView,conversationIdentity,initiatorOf,initiatorLabel,documentKeydown,sessionCategoryOf,setSessionCategory,renderSessionCategories,prepareSessionListFor,sessionCategoryKeydown,render,resetFilters})",
     context,
   );
   api.state.csrf = "csrf-test";
@@ -2231,7 +2231,7 @@ test('an offline first launch restores authentication and already-open terminal 
       ? { hosts: [], serverTime: Date.now() / 1000 }
       : url === '/api/terminals' ? { terminals: [{ id: 'existing-terminal', alive: true,
         host: 'workstation', agent: 'codex', title: '이미 열린 작업' }] }
-      : { hosts: [], csrfToken: 'test-csrf', authMode: 'token' } };
+      : url === '/api/bot-requests' ? { requests: [], sources: [] } : { hosts: [], csrfToken: 'test-csrf', authMode: 'token' } };
   }, noChatTimers);
   c.context.navigator = { onLine: false };
   c.get('app').hidden = true; c.get('login').hidden = true;
@@ -2244,13 +2244,13 @@ test('an offline first launch restores authentication and already-open terminal 
   assert.equal(requests.length, 0);
   c.context.navigator.onLine = true; c.windowEvents.online();
   await new Promise((resolve) => setImmediate(resolve));
-  assert.deepEqual(requests.filter((url) => url !== '/api/usage'), ['/api/snapshot', '/api/capabilities', '/api/terminals']);
+  assert.deepEqual(requests.filter((url) => url !== '/api/usage'), ['/api/snapshot', '/api/bot-requests', '/api/capabilities', '/api/terminals']);
   assert.match(textOf(c.get('running-list')), /이미 열린 작업/);
   assert.equal(c.state.terminal, null); assert.equal(c.state.terminalVisible, false);
   assert.equal(c.get('app').hidden, false); assert.equal(c.get('login').hidden, true);
   assert.equal(c.get('login-submit').disabled, false);
   c.windowEvents.online(); await new Promise((resolve) => setImmediate(resolve));
-  assert.deepEqual(requests.filter((url) => url !== '/api/usage'), ['/api/snapshot', '/api/capabilities', '/api/terminals', '/api/snapshot']);
+  assert.deepEqual(requests.filter((url) => url !== '/api/usage'), ['/api/snapshot', '/api/bot-requests', '/api/capabilities', '/api/terminals', '/api/snapshot']);
 });
 
 test('returning to a first-launch tab after online recovery while hidden reads login state without transmitting a token', async () => {
@@ -6150,7 +6150,7 @@ test('H3: after a restart the reconnected stream\'s hello (another bootId) reads
     requests.push(url);
     return { ok: true, status: 200, json: async () => (url.startsWith('/api/snapshot')
       ? { hosts: [{ name: 'workstation', ok: true, fetchedAt: 1, data: {} }], version, bootId: boot }
-      : url === '/api/capabilities' ? { hosts: [], csrfToken: csrf } : {}) };
+      : url === '/api/capabilities' ? { hosts: [], csrfToken: csrf } : { requests: [], sources: [] }) };
   }, { setTimeout: (callback, ms) => { if (ms === 300) setImmediate(callback); return 1; }, clearTimeout() {} });
   const { FakeEventSource, sources } = fakeEventSource();
   c.context.EventSource = FakeEventSource;
@@ -6159,7 +6159,7 @@ test('H3: after a restart the reconnected stream\'s hello (another bootId) reads
   assert.equal(sources.length, 1);
   sources[0].emit('hello', { snapshotVersion: 40, bootId: 'boot-a' });
   await settle();
-  assert.deepEqual(requests, ['/api/snapshot', '/api/capabilities'], 'the same process: nothing new to read');
+  assert.deepEqual(requests, ['/api/snapshot', '/api/bot-requests', '/api/capabilities'], 'initial bot metadata is read once; the same process adds no reads');
   // The server restarts with version 2; the browser reconnects the same stream.
   boot = 'boot-b'; version = 2; csrf = 'csrf-b';
   requests.length = 0;
@@ -7224,4 +7224,82 @@ test('잠금은 분류 선택과 시작 주체 조건을 일반 세션으로 초
   assert.equal(c.state.sessionCategory, 'general'); assert.equal(c.state.filters.initiator, '');
   assert.equal(c.get('session-category-general').attributes['aria-selected'], 'true');
   assert.equal(c.get('session-category-agent-count').textContent, '0');
+});
+
+
+test('closed-session recovery stays explicit, keeps its draft, and plans the same source exactly once', async () => {
+  const calls = []; let resolvePlan;
+  const c = client(async (url, options) => {
+    calls.push({ url, body: JSON.parse(options.body) });
+    return new Promise((resolve) => { resolvePlan = resolve; });
+  }, noChatTimers);
+  const { s, entry } = selectChat(c);
+  s.nativeSource = true; s.phase = 'closed'; entry.text = '이어갈 초안';
+  entry.data = { route: c.sourceOf(s), phase: 'closed', capability: { supported: false, action: 'resume_session' },
+    recovery: { supported: true, action: 'resume_session', closedByBoard: false } };
+  c.buildChatComposer(s); c.updateChatComposer(entry);
+  assert.equal(c.get('chat-recovery').hidden, false);
+  assert.equal(c.get('chat-recover').textContent, '세션 다시 열기');
+  assert.equal(c.get('chat-input').disabled, false); assert.equal(c.get('chat-send').disabled, true);
+  assert.equal(calls.length, 0, 'reading a closed session never starts a terminal or model turn');
+  c.state.route = { host: 'other-device', agent: 'claude', account: 'other-account' };
+  const pending = c.get('chat-recover').events.click();
+  await c.get('chat-recover').events.click();
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].url, '/api/plan');
+  assert.deepEqual(calls[0].body, { source: { host: s.host, agent: s.agent, home: s.home, id: s.id },
+    target: { host: s.host, agent: s.agent, account: 'codex:' + s.home }, resume: true });
+  resolvePlan({ ok: true, status: 200, json: async () => ({ allowed: true, mode: 'resume', id: 'resume-plan', warnings: [] }) });
+  await pending;
+  assert.equal(calls.length, 1, 'launch still requires the user confirmation');
+  assert.equal(c.get('plan-launch').textContent, '세션 다시 열기');
+  assert.equal(entry.text, '이어갈 초안');
+});
+
+test('board-terminated or mismatched-route recovery cannot open a session', async () => {
+  const calls = []; const c = client(async (url) => { calls.push(url); throw new Error('unexpected request'); }, noChatTimers);
+  const { s, entry } = selectChat(c);
+  c.buildChatComposer(s);
+  entry.data = { route: c.sourceOf(s), phase: 'closed', capability: { supported: false, reason: '웹보드에서 종료한 세션입니다.' },
+    recovery: { supported: true, action: 'resume_session', closedByBoard: true } };
+  c.updateChatComposer(entry); await c.recoverChatSession(s);
+  assert.equal(c.get('chat-recovery').hidden, true); assert.equal(c.get('chat-input').disabled, true);
+  assert.match(c.get('chat-status').textContent, /웹보드에서 종료/);
+  entry.data.recovery.closedByBoard = false; entry.data.route = { ...entry.data.route, home: '.codex-other' };
+  c.updateChatComposer(entry); await c.recoverChatSession(s);
+  assert.equal(c.get('chat-recovery').hidden, true); assert.equal(calls.length, 0);
+});
+
+test('offline recovery rechecks only its host once and never resumes from a cached capability', async () => {
+  const calls = []; let resolveRefresh;
+  const c = client(async (url, options) => {
+    calls.push({ url, body: JSON.parse(options.body) });
+    return new Promise((resolve) => { resolveRefresh = resolve; });
+  }, noChatTimers);
+  const { s, entry } = selectChat(c);
+  c.state.snapshot.hosts[0].ok = false;
+  entry.data.recovery = { supported: true, action: 'resume_session' };
+  entry.text = '연결 후 보낼 초안';
+  vm.runInContext('poll = async () => {}', c.context);
+  c.buildChatComposer(s); c.updateChatComposer(entry);
+  assert.equal(c.get('chat-recover').textContent, '기기 연결 다시 확인');
+  assert.equal(c.chatSupported(entry), false); assert.equal(c.get('chat-send').disabled, true);
+  const pending = c.get('chat-recover').events.click(); await c.get('chat-recover').events.click();
+  assert.deepEqual(calls, [{ url: '/api/refresh', body: { host: s.host } }]);
+  resolveRefresh({ ok: true, status: 200, json: async () => ({ ok: true }) }); await pending;
+  assert.equal(entry.text, '연결 후 보낼 초안'); assert.equal(calls.length, 1);
+  c.state.offline = true; await c.recoverChatSession(s); assert.equal(calls.length, 1);
+});
+
+test('external sessions expose management beside the conversation and Windows input follows server capability', () => {
+  const c = client(undefined, noChatTimers); const { s, entry } = selectChat(c);
+  s.source = 'vscode'; s.readOnly = true; s.runtimeKnown = false;
+  c.drawDetail(s); c.updateChatComposer(entry);
+  assert.equal(c.get('detail-manage-session').textContent, '세션 관리');
+  vm.runInContext('manageSession = (s) => { globalThis.managedSource = sourceOf(s); }', c.context);
+  c.get('detail-manage-session').events.click({ currentTarget: c.get('detail-manage-session') });
+  assert.deepEqual({ ...c.context.managedSource }, { host: s.host, agent: s.agent, home: s.home, id: s.id });
+  assert.equal(c.get('chat-input').disabled, false, 'snapshot read-only does not override live canSend');
+  entry.data.capability.supported = false; c.updateChatComposer(entry);
+  assert.equal(c.get('chat-input').disabled, true);
 });

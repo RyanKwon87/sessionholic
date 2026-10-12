@@ -5,6 +5,7 @@ from discover_profiles().  Neither object is a client-supplied command.  ``env``
 in the result is a complete environment, not an overlay for an inherited one.
 """
 
+import errno
 import json
 import os
 from pathlib import Path
@@ -12,7 +13,9 @@ import re
 import shlex
 import shutil
 import stat
+import sqlite3
 import subprocess
+import time
 import uuid
 
 import instance
@@ -55,6 +58,96 @@ def scrub_text(value):
 
 def _home(home=None):
     return Path(home if home is not None else Path.home()).expanduser().absolute()
+
+
+def saved_codex_thread(source, home=None):
+    """Read only exact native identity metadata; never scan transcripts or credentials."""
+    import collector
+    root = _home(home)
+    key = source.get("home")
+    if not isinstance(key, str) or not HOME_KEY.fullmatch(key):
+        raise ValueError("원본 Codex 계정 경로가 올바르지 않습니다.")
+    try:
+        sid = str(uuid.UUID(str(source.get("id"))))
+    except (ValueError, AttributeError):
+        raise ValueError("Codex 세션 UUID가 올바르지 않습니다.") from None
+    account = root / key
+    if not account.is_dir() or account.resolve() != account.absolute() or account.stat().st_uid != os.getuid():
+        raise ValueError("원본 계정 디렉터리를 확인하지 못했습니다.")
+    database = collector.state_db(account)
+    if database is None or database.parent != account or database.stat().st_uid != os.getuid():
+        raise ValueError("원본 계정의 저장된 세션을 확인하지 못했습니다.")
+    connection = collector._open_read_only(sqlite3, database, immutable=collector._wal_without_index(database))
+    deadline = time.monotonic() + 1
+    connection.set_progress_handler(lambda: int(time.monotonic() >= deadline), 1000)
+    try:
+        rows = connection.execute("SELECT id,cwd,archived FROM threads WHERE id=? LIMIT 2", (sid,)).fetchall()
+    finally:
+        connection.close()
+    if (len(rows) != 1 or not isinstance(rows[0][1], str) or not Path(rows[0][1]).is_absolute()
+            or rows[0][2] not in (0, 1)):
+        raise ValueError("원본 계정에서 정확한 세션을 확인하지 못했습니다.")
+    cwd = source.get("cwd")
+    if not isinstance(cwd, str) or not Path(cwd).is_absolute() or Path(cwd).resolve() != Path(rows[0][1]).resolve():
+        raise ValueError("저장된 세션과 원본 작업 경로가 다릅니다.")
+    return {"id": sid, "home": key, "cwd": rows[0][1], "archived": bool(rows[0][2])}
+
+
+def resume_preview(source, home=None):
+    """Validate an explicit same-session recovery without starting a native process."""
+    from session_control import SessionControl
+    from transfer_native import _identity
+    identity = _identity(source)
+    result = {"source": {**identity, "cwd": source.get("cwd")}, "mode": "resume",
+              "allowed": False, "blockedByBoard": False, "reason": None}
+    if identity["agent"] != "codex":
+        return {**result, "reason": "저장된 Codex 세션만 같은 ID로 재개할 수 있습니다."}
+    try:
+        if source.get("blockedByBoard") is True or SessionControl(home).close_provenance(identity)["blockedByBoard"]:
+            return {**result, "blockedByBoard": True, "reason": "웹보드에서 종료한 세션입니다. 자동으로 다시 시작하지 않습니다."}
+        record = saved_codex_thread(source, home)
+        if record["archived"]:
+            return {**result, "reason": "보관된 원본 세션은 자동으로 보관 해제하거나 재개하지 않습니다."}
+        if not Path(record["cwd"]).is_dir():
+            return {**result, "reason": "원본 작업 경로가 이 기기에 없습니다."}
+        profile = next((row for row in discover_profiles(home) if row["id"] == "codex:" + identity["home"]), None)
+        if not profile or not profile.get("available"):
+            return {**result, "reason": (profile or {}).get("reason") or "원본 계정을 사용할 수 없습니다."}
+        runtime = _resume_runtime(identity, record, home)
+        return {**result, **runtime}
+    except (OSError, ValueError, sqlite3.Error):
+        return {**result, "reason": "원본 계정과 저장된 세션을 확인하지 못했습니다."}
+
+
+def _resume_runtime(identity, record, home):
+    """Use current native metadata when connected; list-row phase may be stale."""
+    import collector
+    import transfer_native as native
+    unknown = {"allowed": True, "runtimeKnown": False, "remoteAvailable": False, "reason": None}
+    path = _home(home) / identity["home"] / SOCKET_REL
+    if not path.exists() and not path.is_symlink():
+        return unknown
+    # Validate ownership and socket type before treating a stale endpoint as offline.
+    native._socket_path(identity, home)
+    try:
+        with native._client(identity, home, time.monotonic() + 3) as client:
+            reply = client.call("thread/read", {"threadId": identity["id"], "includeTurns": False})
+        thread = reply.get("thread") if isinstance(reply, dict) else None
+        if (not isinstance(thread, dict) or thread.get("id") != identity["id"]
+                or not isinstance(thread.get("cwd"), str) or not Path(thread["cwd"]).is_absolute()
+                or Path(thread["cwd"]).resolve() != Path(record["cwd"]).resolve()):
+            raise ValueError("원본 runtime 세션과 저장된 작업 경로가 다릅니다.")
+        status = thread.get("status")
+        ready = (isinstance(status, dict) and status.get("type") in ("idle", "notLoaded")
+                 and not status.get("activeFlags"))
+        return {"allowed": ready, "runtimeKnown": True, "remoteAvailable": True,
+                "reason": None if ready else "원본 세션이 실행 중이거나 안전한 재개 상태를 확인하지 못했습니다."}
+    except OSError as error:
+        if error.errno in (errno.ECONNREFUSED, errno.ENOENT, errno.ECONNRESET):
+            return unknown
+        raise
+    except (collector.RpcError, TimeoutError):
+        return {**unknown, "allowed": False, "reason": "원본 runtime 상태를 확인하지 못했습니다. 다시 확인해 주세요."}
 
 
 def _binary(agent, home):
@@ -538,6 +631,8 @@ def build_launch(source, targetProfile, messages, state_dir, *, home=None):
     if source_agent == "codex" and (not isinstance(source_home, str) or not HOME_KEY.fullmatch(source_home)):
         raise ValueError("원본 Codex 계정 경로가 올바르지 않습니다.")
     same_route = source_agent == agent and source_home == key
+    if source.get("resume") is True and not same_route:
+        raise ValueError("세션 재개는 원본 도구와 계정에서만 가능합니다.")
     if not same_route and settings.crosses_boundary(agent, environment, known[target["id"]].get("environment", "default"),
                                                     settings.load(home)):
         raise ValueError("원본과 대상의 실행 환경 경계가 다릅니다.")
@@ -553,6 +648,14 @@ def build_launch(source, targetProfile, messages, state_dir, *, home=None):
                 session_id = str(uuid.UUID(str(source.get("id"))))
             except (ValueError, AttributeError):
                 raise ValueError("Codex 세션 UUID가 올바르지 않습니다.")
+            recovering = source.get("resume") is True
+            if recovering:
+                recovery = resume_preview(source, home)
+                if not recovery["allowed"]:
+                    raise ValueError(recovery["reason"])
+                result["mode"] = "resume"
+                result["nativeSource"] = {"agent": "codex", "id": session_id, "home": key,
+                                          "host": source_host, "cwd": str(cwd)}
             path = home / key / SOCKET_REL
             try:
                 resolved = path.resolve(strict=True)
@@ -565,10 +668,13 @@ def build_launch(source, targetProfile, messages, state_dir, *, home=None):
                         and stat.S_ISSOCK(socket_stat.st_mode))
             except (OSError, RuntimeError):
                 safe = False
-            if not safe:
-                raise ValueError("원본 계정의 로컬 Codex daemon socket을 찾지 못했습니다.")
-            result["argv"] = [binary, "resume", session_id, "--remote", "unix://" + str(path),
-                              "--cd", str(cwd)]
+            if not safe or (recovering and not recovery.get("remoteAvailable")):
+                if not recovering or (not safe and (path.exists() or path.is_symlink())):
+                    raise ValueError("원본 계정의 로컬 Codex daemon socket을 찾지 못했습니다.")
+                result["argv"] = [binary, "resume", session_id, "--cd", str(cwd)]
+            else:
+                result["argv"] = [binary, "resume", session_id, "--remote", "unix://" + str(path),
+                                  "--cd", str(cwd)]
         else:
             if source.get("kind") != "background":
                 raise ValueError("Claude background 세션만 exact attach를 지원합니다. interactive 세션은 기존 터미널에서 열어야 합니다.")

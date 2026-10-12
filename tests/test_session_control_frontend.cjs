@@ -38,7 +38,7 @@ function client(fetchImpl) {
   const context = vm.createContext({ console, state, el, $: (id) => nodes.get(id),
     document: { body: el('body') }, window: { SessionholicGoals: { async refresh() { counts.refresh++; } } },
     button(text, className, callback) { const value = el('button', className, text); value.events.click = callback; return value; },
-    cardTitle: (s) => s.title, sourceOf: undefined,
+    cardTitle: (s) => s.title, sourceOf: undefined, botRequestForNative: () => null,
     sheet: (id) => ({ open() { nodes.get(id).open = true; } }), requestId: () => `synthetic-request-${++request}`,
     poll() { counts.poll++; }, loadCapabilities: async () => { counts.capabilities++; },
     showLogin() { counts.login++; state.authenticated = false; state.authEpoch++; methods.closeSessionControl(true); },
@@ -137,4 +137,15 @@ test('보관과 되돌리기는 작업 보관 API만 호출하며 실행 중단�
   assert.deepEqual(c.calls.map((call) => call.url), ['/api/session/preview', '/api/session/archive', '/api/session/archive']);
   assert.deepEqual(c.calls.slice(1).map((call) => call.body.archived), [true, false]);
   assert.equal(c.counts.refresh, 2); assert.equal(c.counts.poll, 0);
+});
+
+
+test('세션과 하위 에이전트 종료 범위를 설명과 최종 확인 양쪽에 표시한다', async () => {
+  const effect = '선택한 세션과 하위 에이전트를 종료하고 대화 기록을 보관합니다.';
+  const c = client(async () => response(preview({ capabilities: { terminate: { supported: true, effect, method: 'codex-thread-archive' } } })));
+  await c.manageSession(source({ source: 'vscode' }));
+  assert.equal(c.get('session-control-terminate-reason').textContent, effect);
+  c.get('session-control-terminate').events.click();
+  assert.ok(c.get('session-control-confirmation').children[0].textContent.includes(effect));
+  assert.equal(c.calls.length, 1, '범위를 확인하는 동안 실행 요청은 보내지 않는다');
 });

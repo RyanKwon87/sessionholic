@@ -1,4 +1,4 @@
-"""Windows collection routing stays read-only; every transport here is synthetic."""
+"""Windows runtime routing; every transport here is synthetic."""
 import base64
 import copy
 import json
@@ -28,7 +28,7 @@ CLAUDE_ROW = {**CLAUDE_REF, 'cwd': r'C:\Example\project', 'phase': 'unknown', 'k
               'sessionId': CLAUDE_REF['id'], 'title': '예제 PC Claude 작업'}
 READ = {'phase': 'idle', 'messages': [{'role': 'assistant', 'messageId': 'answer-one', 'text': '예제 PC 결과'}],
         'readOnly': True, 'runtimeKnown': True}
-REASON = 'Windows 기기는 현재 세션 목록과 대화 읽기를 지원합니다.'
+REASON = server.WINDOWS_READ_ONLY
 
 
 class WindowsConfigurationTest(unittest.TestCase):
@@ -132,110 +132,93 @@ class WindowsRoutingTest(unittest.TestCase):
     def tearDown(self):
         self.temporary.cleanup()
 
-    def test_capabilities_are_read_only_without_remote_profile_or_launcher_bootstrap(self):
+    def test_existing_codex_accounts_allow_attach_but_new_session_is_unavailable(self):
         with patch.object(self.flow.transfers, 'rpc', side_effect=AssertionError('remote helper invoked')):
             result = self.flow.capabilities()['hosts'][0]
         self.assertFalse(result['newSession']['available'])
-        self.assertEqual(result['newSession']['reason'], REASON)
-        accounts = [account for agent in result['agents'] for account in agent['accounts']]
-        self.assertTrue(accounts)
-        self.assertTrue(all(account['available'] is False for account in accounts))
-        self.assertTrue(all(account['reason'] == REASON for account in accounts))
+        codex = next(agent for agent in result['agents'] if agent['id'] == 'codex')
+        self.assertTrue(all(account['available'] for account in codex['accounts']))
 
-    def test_launch_app_server_and_plan_are_rejected_before_native_work(self):
-        operations = [lambda: self.flow.start_app_server({'host': HOST['name'], 'home': '.codex'}),
-                      lambda: self.flow.new_session({'host': HOST['name'], 'requestId': 'fixture-launch-0001'}),
-                      lambda: self.flow.plan({'source': REF, 'target': {'host': HOST['name'], 'agent': 'codex', 'account': 'codex:.codex'}})]
+    def test_launch_app_server_and_new_session_remain_unsupported(self):
         with patch.object(self.flow.transfers, 'rpc', side_effect=AssertionError('write RPC')):
-            for operation in operations:
-                with self.assertRaisesRegex(ValueError, REASON):
-                    operation()
+            for call in (lambda: self.flow.start_app_server({'host': HOST['name'], 'home': '.codex'}),
+                         lambda: self.flow.new_session({'host': HOST['name'], 'requestId': 'fixture-launch-0001'})):
+                with self.assertRaisesRegex(ValueError, REASON): call()
         self.terms.reserve.assert_not_called()
-        self.assertEqual(self.flow.requests, {})
 
-    def test_windows_source_or_target_blocks_cross_host_transfer(self):
-        mac = {'name': 'example-mac', 'label': '예제 Mac', 'local': True, 'python': '/usr/bin/python3'}
-        self.board.hosts.append(mac)
-        mac_source = {**ROW, 'host': mac['name'], 'cwd': '/example/project'}
-        self.board.state[mac['name']] = {'name': mac['name'], 'label': mac['label'], 'ok': True, 'fetchedAt': 100, 'data': {'codex': [mac_source], 'claude': []}}
-        targets = [({'host': HOST['name'], 'agent': 'codex', 'id': SID, 'home': '.codex'}, mac['name']),
-                   ({'host': mac['name'], 'agent': 'codex', 'id': SID, 'home': '.codex'}, HOST['name'])]
-        with patch.object(self.flow.transfers, 'rpc', side_effect=AssertionError('transfer RPC')):
-            for source, target in targets:
-                with self.subTest(target=target):
-                    with self.assertRaisesRegex(ValueError, REASON):
-                        self.flow.plan({'source': source, 'target': {'host': target, 'agent': 'codex', 'account': 'codex:.codex'}})
+    def test_same_windows_session_can_plan_terminal_without_reserving_it(self):
+        with patch.object(self.flow.transfers, 'rpc', return_value={'argv': ['fixture'], 'cwd': ROW['cwd']}) as rpc, \
+                patch.object(server.shutil, 'which', return_value='/fixture/tmux'):
+            result = self.flow.plan({'source': REF, 'target': {'host': HOST['name'], 'agent': 'codex', 'account': 'codex:.codex'}})
+        self.assertTrue(result['allowed'])
+        self.assertEqual(result['mode'], 'attach')
+        self.assertEqual(rpc.call_args.args[1], 'terminal_plan')
+        self.terms.reserve.assert_not_called()
 
-    def test_windows_read_rpc_uses_standalone_collector_and_never_installs_runtime(self):
-        with patch.object(server, 'run_collector', return_value=READ) as read, \
-                patch.object(self.flow.transfers, '_exchange', side_effect=AssertionError('runtime installed')):
+    def test_cross_host_or_account_plan_remains_unsupported(self):
+        with self.assertRaisesRegex(ValueError, REASON):
+            self.flow.plan({'source': REF, 'target': {'host': HOST['name'], 'agent': 'codex', 'account': 'codex:.codex-other'}})
+
+    def test_windows_runtime_uses_stdin_and_does_not_install_posix_worker(self):
+        envelope = json.dumps({'ok': True, 'result': READ}).encode()
+        with patch('transfer.subprocess.run', return_value=SimpleNamespace(returncode=0, stdout=envelope)) as run, \
+                patch.object(self.flow.transfers, '_exchange', side_effect=AssertionError('POSIX runtime installed')):
             result = self.flow.transfers.rpc(HOST, 'chat', {'action': 'read', 'source': ROW}, timeout=20)
-        self.assertEqual(result['messages'], READ['messages'])
-        self.assertFalse(result['capabilities']['canSend'])
-        self.assertEqual(result['capabilities']['reason'], REASON)
-        self.assertEqual(read.call_args.args[0], HOST)
-        self.assertEqual(read.call_args.args[1], ['read', 'codex', SID, '.codex'])
+        self.assertEqual(result, READ)
+        self.assertIn(b'windows_runtime', run.call_args.kwargs['input'])
+        self.assertNotIn(SID, ' '.join(run.call_args.args[0]))
+        self.assertEqual(run.call_args.kwargs['timeout'], 20)
         self.assertFalse(self.flow.transfers.runtime_installed)
-        self.assertFalse(self.flow.transfers.runtime_paths)
 
-    def test_windows_transfer_rpc_refuses_every_unimplemented_operation(self):
-        cases = [('chat', {'action': 'send', 'source': ROW}), ('attachment', {'cwd': ROW['cwd']}),
-                 ('profiles', {}), ('start_app_server', {'home': '.codex'}), ('stage_handoff', {}),
-                 ('control_execute', {'source': ROW}), ('control_preview', {'source': ROW})]
-        with patch.object(server, 'run_collector', side_effect=AssertionError('unexpected collector')), \
-                patch.object(self.flow.transfers, '_exchange', side_effect=AssertionError('runtime installed')):
-            for operation, payload in cases:
-                with self.subTest(operation=operation, payload=payload):
-                    with self.assertRaisesRegex(ValueError, REASON):
-                        self.flow.transfers.rpc(HOST, operation, payload)
+    def test_unsupported_operations_rejected_before_transport(self):
+        for operation in ('attachment', 'profiles', 'start_app_server', 'stage_handoff'):
+            with patch('transfer.subprocess.run', side_effect=AssertionError('unexpected transport')):
+                with self.assertRaisesRegex(ValueError, REASON):
+                    self.flow.transfers.rpc(HOST, operation, {'source': ROW})
 
-    def test_chat_read_works_but_composer_attachment_and_terminal_actions_are_unavailable(self):
+    def test_text_capability_comes_from_native_runtime(self):
         service = chat.Chat(self.board, self.flow, self.root)
-        with patch.object(server, 'run_collector', return_value=READ):
+        with patch.object(self.flow.transfers, 'rpc', return_value={**READ, 'readOnly': False, 'capabilities': {'canSend': True}}):
             result = service.state({'source': REF})
-        self.assertEqual(result['messages'], READ['messages'])
-        self.assertFalse(result['capability']['supported'])
+        self.assertTrue(result['capability']['supported'])
         self.assertFalse(result['capability']['attachments'])
-        self.assertEqual(result['capability']['reason'], REASON)
-        self.assertNotIn('action', result['capability'])
-        self.assertFalse(result['promptOpenable'])
+        self.assertEqual(result['messages'], READ['messages'])
 
-    def test_wrong_host_or_account_reference_is_rejected_before_read_transport(self):
+    def test_wrong_scope_rejected_before_transport(self):
         service = chat.Chat(self.board, self.flow, self.root)
-        with patch.object(server, 'run_collector', side_effect=AssertionError('wrong scope read')):
+        with patch.object(self.flow.transfers, 'rpc', side_effect=AssertionError('wrong scope RPC')):
             for reference in ({**REF, 'host': 'not-registered'}, {**REF, 'home': '.codex-other'}):
-                with self.subTest(reference=reference):
-                    with self.assertRaises(ValueError):
-                        service.state({'source': reference})
+                with self.assertRaises(ValueError): service.state({'source': reference})
 
-    def test_unknown_windows_runtime_remains_readable_and_explicit_in_chat(self):
+    def test_unknown_runtime_remains_explicit(self):
         service = chat.Chat(self.board, self.flow, self.root)
-        historical = {**READ, 'phase': 'unknown', 'runtimeKnown': False}
-        with patch.object(server, 'run_collector', return_value=historical):
+        with patch.object(self.flow.transfers, 'rpc', return_value={**READ, 'phase': 'unknown', 'runtimeKnown': False}):
             result = service.state({'source': REF})
         self.assertEqual(result['phase'], 'unknown')
-        self.assertTrue(result['readOnly'])
         self.assertFalse(result['runtimeKnown'])
-        self.assertEqual(result['messages'], historical['messages'])
 
-    def test_windows_claude_read_does_not_suggest_opening_a_posix_terminal(self):
+    def test_text_send_is_once_and_upload_stays_unsupported(self):
         service = chat.Chat(self.board, self.flow, self.root)
-        with patch.object(server, 'run_collector', return_value=READ):
-            result = service.state({'source': CLAUDE_REF})
-        self.assertFalse(result['capability']['supported'])
-        self.assertFalse(result['capability']['attachments'])
-        self.assertEqual(result['capability']['reason'], REASON)
-        self.assertNotIn('action', result['capability'])
-        self.assertFalse(result['promptOpenable'])
-
-    def test_send_and_upload_are_rejected_before_any_remote_call_or_attachment_file(self):
-        service = chat.Chat(self.board, self.flow, self.root)
-        with patch.object(self.flow.transfers, 'rpc', side_effect=AssertionError('remote write')):
-            with self.assertRaisesRegex(ValueError, REASON):
-                service.send({'source': REF, 'requestId': 'fixture-send-0001', 'text': '합성 입력', 'attachments': []})
-            with self.assertRaisesRegex(ValueError, REASON):
+        with patch.object(self.flow.transfers, 'rpc', return_value={'delivery': 'accepted', 'confirmed': True}) as rpc:
+            result = service.send({'source': REF, 'requestId': 'fixture-send-0001', 'text': '합성 입력', 'attachments': []})
+        self.assertEqual(result['status'], 'accepted')
+        self.assertEqual(rpc.call_count, 1)
+        self.assertEqual(rpc.call_args.args[2]['action'], 'send')
+        with patch.object(self.flow.transfers, 'rpc', side_effect=AssertionError('attachment RPC')):
+            with self.assertRaisesRegex(ValueError, '텍스트만'):
                 service.upload(REF, 'fixture.txt', b'fixture')
-        self.assertFalse(list(self.root.rglob('attachments/*.json')))
+
+    def test_windows_terminal_quotes_literal_args_and_preserves_profile(self):
+        spec = {'argv': [r'C:\Program Files\Codex\codex.exe', 'resume', SID, '--remote', 'unix://C:/profile/app.sock'],
+                'cwd': "C:/Work/O'Brien $(literal)", 'env': {'CODEX_HOME': 'C:/Users/example/.codex-personal'}}
+        command = self.flow.transfers.windows_terminal(HOST, spec)
+        self.assertIn('-tt', command)
+        script = base64.b64decode(command[-1].split()[-1]).decode('utf-16le')
+        self.assertIn("'C:/Work/O''Brien $(literal)'", script)
+        self.assertIn("$env:CODEX_HOME='C:/Users/example/.codex-personal'", script)
+        self.assertIn("'" + SID + "'", script)
+        with self.assertRaises(ValueError):
+            self.flow.transfers.windows_terminal(HOST, {**spec, 'env': {'TOKEN': 'value'}})
 
 
 class WindowsHTTPTest(unittest.TestCase):
@@ -255,24 +238,28 @@ class WindowsHTTPTest(unittest.TestCase):
         self.cookie = response.getheader('Set-Cookie').split(';', 1)[0]
         self.csrf = result['csrfToken']
 
-    def test_preview_reports_unsupported_controls_without_native_rpc(self):
-        with patch.object(self.httpd.workflow.transfers, 'rpc', side_effect=AssertionError('native RPC')):
+    def test_external_windows_preview_routes_to_native_control(self):
+        preview = {'phase': 'idle', 'targetProof': 'aaa.' + 'a' * 64,
+                   'capabilities': {'terminate': {'supported': True}}}
+        with patch.object(self.httpd.workflow.transfers, 'rpc', return_value=preview) as rpc:
             response, result = self.request('POST', '/api/session/preview', {'source': REF})
         self.assertEqual(response.status, 200)
-        self.assertEqual(result['phase'], ROW['phase'])
-        self.assertIsNone(result['targetProof'])
-        self.assertFalse(result['capabilities']['interrupt']['supported'])
-        self.assertFalse(result['capabilities']['terminate']['supported'])
+        self.assertEqual(result, preview)
+        self.assertEqual(rpc.call_args.args[1], 'control_preview')
 
-    def test_terminate_is_rejected_and_board_archival_remains_available(self):
-        with patch.object(self.httpd.workflow.transfers, 'rpc', side_effect=AssertionError('native RPC')):
+    def test_external_terminate_dispatches_once_and_archive_remains_separate(self):
+        receipt = {'confirmed': True, 'applied': True, 'status': 'terminated'}
+        with patch.object(self.httpd.workflow.transfers, 'rpc', return_value=receipt) as rpc, \
+                patch.object(self.board, 'request_refresh'):
             response, result = self.request('POST', '/api/session/action', {'source': REF, 'action': 'terminate',
                                             'requestId': 'fixture-control-0001', 'targetProof': 'aaa.' + 'a' * 64})
-            self.assertEqual(response.status, 400)
-            self.assertEqual(result['error'], REASON)
+            self.assertEqual(response.status, 200)
+            self.assertEqual(result, receipt)
+            self.assertEqual(rpc.call_count, 1)
+            self.assertEqual(rpc.call_args.args[1], 'control_execute')
             response, result = self.request('POST', '/api/session/archive', {'source': REF, 'archived': True})
         self.assertEqual(response.status, 200)
-        self.assertEqual(result, {'archived': True, 'changed': 1, 'executionChanged': False})
+        self.assertFalse(result['executionChanged'])
 
 
 if __name__ == '__main__':

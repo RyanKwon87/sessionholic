@@ -41,7 +41,7 @@ HERE = Path(__file__).resolve().parent
 WEB = HERE / "web"
 COLLECTOR = HERE / "collector.py"
 WINDOWS_COLLECTOR = HERE / "windows_collector.py"
-WINDOWS_READ_ONLY = "Windows 기기는 현재 세션 목록과 대화 읽기를 지원합니다."
+WINDOWS_READ_ONLY = "이 Windows 작업은 아직 지원하지 않습니다. 기존 세션의 대화·터미널·종료 기능을 사용해 주세요."
 # Installation names (instance.json); without one these are the public names.
 NAMES = instance.current()
 BRAND = NAMES["brand"]
@@ -1213,7 +1213,9 @@ class Workflow:
                             accounts.append({**presentation, "id": key, "agent": agent,
                                              "home": home, "available": True})
             if host.get("platform") == "windows":
-                accounts = [{**p, "available": False, "launchEnabled": False, "reason": WINDOWS_READ_ONLY} for p in accounts]
+                accounts = [{**p, "available": p.get("agent") == "codex", "launchEnabled": False,
+                             "reason": None if p.get("agent") == "codex" else
+                             "Claude 대화형 세션은 실행한 터미널에서 입력할 수 있습니다."} for p in accounts]
             hosts.append({"name": host["name"], "label": host["label"], "online": status["ok"],
                 "newSession": self.new_session_status(host, status["ok"]),
                 "agents": [{"id": agent, "label": "Claude Code" if agent == "claude" else "Codex",
@@ -1389,8 +1391,51 @@ class Workflow:
     def identity(row):
         return {k: row.get(k) for k in ("host", "agent", "id", "home")}
 
+    def bot_request(self, source):
+        service = getattr(self, "bot_requests", None)
+        if service is None:
+            return None
+        for request in service.snapshot().get("requests", []):
+            native = request.get("nativeRef")
+            if isinstance(native, dict) and self.identity({**native, "host": request.get("host")}) == self.identity(source):
+                return request
+        return None
+
+    def ensure_direct_session(self, source):
+        if self.bot_request(source):
+            raise ValueError("봇을 통해 받은 요청입니다. 요청자의 권한과 사용 범위를 유지하도록 원래 봇에서 이어가 주세요.")
+
+    def ensure_direct_terminal(self, terminal_id):
+        for terminal in self.terminals.list():
+            if terminal.get("id") != terminal_id or terminal.get("linkConfidence") == "estimated":
+                continue
+            native = terminal.get("nativeSource") or (terminal.get("metadata") or {}).get("nativeSource")
+            if isinstance(native, dict):
+                self.ensure_direct_session(native)
+            return
+
+    def resume_preview(self, source):
+        host = next(h for h in self.board.hosts if h["name"] == source["host"])
+        if not self.board.state[host["name"]]["ok"]:
+            return {"allowed": False, "blockedByBoard": False,
+                    "reason": "기기가 다시 연결되면 같은 세션을 열 수 있습니다."}
+        # A tmux disconnect is recorded separately from an explicit close. Old
+        # ambiguous tombstones are not proof that the user ended the session.
+        for terminal in self.terminals.list():
+            native = terminal.get("nativeSource") or (terminal.get("metadata") or {}).get("nativeSource")
+            if (terminal.get("closedReason") == "user" and terminal.get("linkConfidence") != "estimated"
+                    and isinstance(native, dict) and self.identity(native) == self.identity(source)):
+                return {"allowed": False, "blockedByBoard": True,
+                        "reason": "웹보드에서 직접 닫은 세션입니다. 자동으로 다시 시작하지 않습니다."}
+        selector = {key: source.get(key) for key in ("host", "agent", "id", "home", "cwd", "kind", "sessionId", "phase")}
+        result = self.transfers.rpc(host, "resume_preview", {"source": selector}, timeout=12)
+        if not isinstance(result, dict) or type(result.get("allowed")) is not bool:
+            raise RuntimeError("원본 세션의 재개 가능 여부를 확인하지 못했습니다.")
+        return result
+
     def plan(self, payload):
         source = self.board.source(payload.get("source"))
+        self.ensure_direct_session(source)
         target = payload.get("target")
         if not isinstance(target, dict) or target.get("agent") not in ("claude", "codex"):
             raise ValueError("이어갈 에이전트와 계정을 선택해 주세요.")
@@ -1404,8 +1449,13 @@ class Workflow:
         same = source["host"] == target["host"] and source["agent"] == target["agent"] and current == target.get("account")
         cross_host = source["host"] != target["host"]
         source_host = next(h for h in self.board.hosts if h["name"] == source["host"])
-        if source_host.get("platform") == "windows" or host.get("platform") == "windows":
+        windows = source_host.get("platform") == "windows"
+        if (windows or host.get("platform") == "windows") and not same:
             raise ValueError(WINDOWS_READ_ONLY)
+        resume = payload.get("resume") is True
+        if resume and (not same or source["agent"] != "codex"):
+            raise ValueError("같은 기기·계정의 Codex 세션만 다시 열 수 있습니다.")
+        resume = resume or (same and source["agent"] == "codex" and source.get("phase") in ("closed", "notLoaded"))
         allowed, reason, profile = True, None, None
         warnings, transfer_preview = [], None
         if cross_host:
@@ -1441,6 +1491,14 @@ class Workflow:
             allowed, reason = False, "진행 중인 실행이나 승인 요청을 원래 터미널에서 마무리한 뒤 전환해 주세요."
         if same and source["agent"] == "claude" and source.get("kind") != "background":
             allowed, reason = False, "이 Claude 세션은 기존 터미널에서 실행 중입니다. 백그라운드 세션만 직접 연결할 수 있어요."
+        if allowed and resume:
+            preview = self.resume_preview(source)
+            allowed, reason = preview["allowed"], preview.get("reason")
+        elif allowed and windows:
+            try:
+                self.transfers.rpc(host, "terminal_plan", {"source": source}, timeout=12)
+            except (ValueError, RuntimeError, OSError) as exc:
+                allowed, reason = False, str(exc)
         config = settings.load()
         if source_host["local"]:
             from launch import source_environment as resolve_environment
@@ -1453,8 +1511,9 @@ class Workflow:
             allowed, reason = False, "원본과 대상의 실행 환경 경계가 다릅니다."
         if not shutil.which("tmux", path=collector_path()):
             allowed, reason = False, "이 기기에 tmux를 설치한 뒤 터미널을 열 수 있어요."
-        mode = "transfer" if cross_host else ("attach" if same else "handoff")
+        mode = "transfer" if cross_host else ("resume" if resume else "attach" if same else "handoff")
         summary = ("코드·미커밋 변경·최근 대화를 대상 기기로 넘겨 이어갑니다." if cross_host else
+                   "같은 기기·계정에서 저장된 대화를 다시 엽니다. 메시지는 보내지 않습니다." if resume else
                    "기존 작업의 터미널에 연결합니다." if same else "작업 맥락을 자동으로 넘겨 새 터미널을 준비합니다.")
         route_key = hashlib.sha256(json.dumps([self.identity(source), target], sort_keys=True).encode()).hexdigest()
         existing = next((item for item in self.terminals.list() if item.get("alive") and item.get("key", "").split(":")[0] == route_key), None)
@@ -1546,6 +1605,12 @@ class Workflow:
                 if plan["mode"] == "handoff" and fresh.get("phase") in ("working", "needs_input"):
                     raise ValueError("원래 작업이 실행 중이거나 승인을 기다리고 있어요. 마무리한 뒤 다시 전환해 주세요.")
                 source = fresh
+                self.ensure_direct_session(source)
+                if plan["mode"] == "resume":
+                    preview = self.resume_preview(source)
+                    if not preview["allowed"]:
+                        raise ValueError(preview.get("reason") or "이 세션은 다시 열 수 없습니다.")
+                    source = {**source, "resume": True}
                 if plan["mode"] == "transfer":
                     target_host = next(h for h in self.board.hosts if h["name"] == plan["target"]["host"])
                     def read_for_transfer():
@@ -1578,7 +1643,7 @@ class Workflow:
                 if spec.get("connectionMode"):
                     metadata.update(mode=spec["connectionMode"], launchMode=plan["mode"])
                 native_source = spec.get("nativeSource")
-                if plan["mode"] == "attach":
+                if plan["mode"] in ("attach", "resume"):
                     native_source = {**self.identity(source), "cwd": source.get("cwd"), "kind": source.get("kind")}
                 if native_source:
                     metadata["nativeSource"] = native_source
@@ -1668,13 +1733,17 @@ class Workflow:
         # The owning helper resolves binaries and explicit environment settings.
         # No configuration values or credentials cross back into an SSH command.
         if host.get("platform") == "windows":
-            raise ValueError(WINDOWS_READ_ONLY)
+            spec = self.transfers.rpc(host, "terminal_plan", {"source": source}, timeout=12)
+            import collector
+            return {"argv": self.transfers.windows_terminal(host, spec), "cwd": str(Path.home()),
+                    "env": collector.tool_env(), "connectionMode": spec.get("connectionMode") or "attach",
+                    "nativeSource": {**self.identity(source), "cwd": source.get("cwd"), "kind": source.get("kind")}}
         profiles = self.transfers.profiles(host, refresh=True)
         identity = "claude:default" if source["agent"] == "claude" else "codex:" + source["home"]
         profile = next((p for p in profiles if p.get("id") == identity and p.get("available")), None)
         if profile is None:
             raise ValueError("원격 기기의 원본 실행 프로필을 확인하지 못했습니다.")
-        selector = {key: source.get(key) for key in ("host", "agent", "id", "home", "cwd", "kind", "sessionId", "phase")}
+        selector = {key: source.get(key) for key in ("host", "agent", "id", "home", "cwd", "kind", "sessionId", "phase", "resume")}
         import collector
         return {"argv": self.transfers.command(host, ["-I", self.transfers.runtime_paths[host["name"]],
                 "attach", json.dumps(selector, ensure_ascii=False)], tty=True),
@@ -1886,14 +1955,10 @@ class Handler(BaseHTTPRequestHandler):
             if type(archived) is not bool:
                 raise ValueError("보관 여부를 확인해 주세요.")
             return self.server.work.archive_session(source, archived)
+        self.server.workflow.ensure_direct_session(source)
         if not source.get("online"):
             raise RuntimeError("기기에 연결할 수 없습니다. 마지막 실행 상태를 유지합니다.")
         host = next(h for h in self.server.board.hosts if h["name"] == source["host"])
-        if host.get("platform") == "windows":
-            if path == "/api/session/action":
-                raise ValueError(WINDOWS_READ_ONLY)
-            return {"source": {key: source.get(key) for key in ("agent", "id", "home")}, "phase": source.get("phase", "unknown"),
-                    "capabilities": {key: {"supported": False, "reason": WINDOWS_READ_ONLY} for key in ("interrupt", "terminate")}, "targetProof": None}
         selector = {key: source.get(key) for key in ("agent", "id", "home", "cwd", "kind", "sessionId", "phase")}
         args = {"source": selector}
         action = path == "/api/session/action"
@@ -1943,6 +2008,8 @@ class Handler(BaseHTTPRequestHandler):
                     return self.send_json(200, self.server.goals.snapshot())
                 if url.path == "/api/work":
                     return self.send_json(200, self.server.work.snapshot())
+                if url.path == "/api/bot-requests":
+                    return self.send_json(200, scrub_payload(self.server.bot_requests.snapshot()))
                 goal_match = re.fullmatch(r"/api/goals/([a-f0-9]{32})", url.path)
                 if goal_match:
                     return self.send_json(200, self.server.goals.get(goal_match[1]))
@@ -2131,6 +2198,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_json(403, {"error": "보안 연결을 갱신한 뒤 다시 시도해 주세요.",
                                         "code": "csrf_expired", **not_started})
         try:
+            if path == "/api/bot-requests/refresh":
+                return self.send_json(200, scrub_payload(self.server.bot_requests.snapshot(force=True)))
             work_match = re.fullmatch(r"/api/work/([a-f0-9]{32})", path)
             if work_match:
                 return self.send_json(200, self.server.work.update(work_match[1], data))
@@ -2179,6 +2248,8 @@ class Handler(BaseHTTPRequestHandler):
             match = re.fullmatch(r"/api/terminal/([a-f0-9]{32})/(input|resize|scroll|scroll-end|detach|close)", path)
             if match:
                 tid, action = match.groups()
+                if action in ("input", "close"):
+                    self.server.workflow.ensure_direct_terminal(tid)
                 if action == "input":
                     request_id = data.get("requestId")
                     if not isinstance(request_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{8,100}", request_id):
@@ -2315,6 +2386,9 @@ def make_server(bind, port, board, token, terminals=None, workflow=None, state_d
     server.workflow.goals = server.goals
     server.work = WorkService(board, server.goals, state_dir)
     server.workflow.work = server.work
+    from bot_requests import BotRequests
+    server.bot_requests = BotRequests(board.hosts, CONFIG_DIR / "bot-sources.json", state_dir)
+    server.workflow.bot_requests = server.bot_requests
     from chat import Chat
     server.chat = Chat(board, server.workflow, state_dir)
     from events import EventHub

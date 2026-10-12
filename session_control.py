@@ -19,6 +19,7 @@ from pathlib import Path
 import re
 import secrets
 import signal
+import sqlite3
 import stat
 import subprocess
 import sys
@@ -300,8 +301,8 @@ def _descendants(parent, deadline):
             for row in [_process_info(pid, deadline, start_label=False)] if row]
 
 
-def _capability(supported, method=None, reason=None):
-    return {"supported": bool(supported), "method": method if supported else None, "reason": reason}
+def _capability(supported, method=None, reason=None, **details):
+    return {"supported": bool(supported), "method": method if supported else None, "reason": reason, **details}
 
 
 class SessionControl:
@@ -309,6 +310,33 @@ class SessionControl:
         self.home = launch._home(home)
         # Remote workers use the injected instance's relative host state path.
         self.directory = Path(state_dir) if state_dir is not None else instance.remote_path("attachStateDir", self.home) / "control"
+
+    def close_provenance(self, source):
+        """Explicit board termination survives reconnects; unknown outcomes stay blocked."""
+        identity = native._identity(source)
+        result = {"blockedByBoard": False, "status": None}
+        if not self.directory.exists():
+            return result
+        folder = settings.safe_path(self.directory, directory=True, private=True)
+        try:
+            marker = json.loads(_private_read(folder / ("closed-" + _digest(identity) + ".json"), private=True))
+            if marker.get("source") != identity:
+                raise ValueError("세션 종료 기록의 대상이 다릅니다.")
+            return {"blockedByBoard": True, "status": marker.get("status")}
+        except FileNotFoundError:
+            pass
+        # Preserve intent recorded by the previous receipt-only implementation.
+        paths = list(folder.glob("*.json"))
+        if len(paths) > 4096:
+            raise ValueError("세션 종료 기록을 확인하지 못했습니다.")
+        for path in paths:
+            if not REQUEST.fullmatch(path.stem):
+                continue
+            record = json.loads(_private_read(path, private=True)).get("result", {})
+            if (record.get("source") == identity and record.get("action") == "terminate"
+                    and record.get("applied") is not False):
+                return {"blockedByBoard": True, "status": record.get("status")}
+        return result
 
     @contextmanager
     def _lock(self):
@@ -374,14 +402,26 @@ class SessionControl:
                     process = None
                 interrupt = state.get("canInterrupt") is True
                 stable = state.get("safeToTransfer") is True
-                terminate = process is not None and (interrupt or stable)
+                record = None
+                try:
+                    record = launch.saved_codex_thread({**source, **identity}, self.home)
+                except (OSError, ValueError, sqlite3.Error):
+                    pass
+                archive = bool(record and not record["archived"] and (interrupt or stable))
+                process_terminate = process is not None and (interrupt or stable)
+                terminate = process_terminate or archive
+                method = "codex-cli-process" if process_terminate else "codex-thread-archive"
                 target = {"identity": identity, "turnId": state.get("activeTurnId"), "phase": state["phase"],
-                          "process": _process_key(process), "canInterrupt": interrupt, "safe": stable}
+                          "process": _process_key(process), "canInterrupt": interrupt, "safe": stable,
+                          "record": record, "terminationMethod": method if terminate else None,
+                          "archiveRevision": state.get("revision") if archive and not process_terminate else None}
                 return {"source": identity, "phase": state["phase"], "target": target, "process": process,
                         "native": state, "capabilities": {
                             "interrupt": _capability(interrupt, "codex-turn-interrupt", None if interrupt else state.get("reason") or "진행 중인 응답이 없습니다."),
-                            "terminate": _capability(terminate, "codex-cli-process", None if terminate else
-                                "원본 CLI를 정확히 식별하지 못했습니다. 앱·공용 daemon 세션은 응답 중단을 사용할 수 있습니다.")}}
+                            "terminate": _capability(terminate, method, None if terminate else
+                                "원본 실행과 저장된 세션을 정확히 확인하지 못했습니다.",
+                                effect="선택한 세션을 종료하고 대화 기록을 보관합니다. 하위 에이전트도 함께 종료·보관을 요청합니다." if archive and not process_terminate else "원본 CLI 실행을 종료합니다.",
+                                scope="thread_and_descendants" if archive and not process_terminate else "exact_process")}}
             binary = native._claude_binary(self.home)
             rows = json.loads(native._claude_run(binary, ["agents", "--json", "--all"], deadline))
             if not isinstance(rows, list):
@@ -465,13 +505,31 @@ class SessionControl:
             pending = {**result, "applied": None, "status": "unconfirmed", "reason": "실행 요청 결과를 확인하지 못했습니다. 자동 재실행하지 않습니다."}
             _save(receipt_path, {"digest": digest, "result": pending})
             _save(proof_path, {"result": pending})
+            marker_path = folder / ("closed-" + _digest(identity) + ".json")
+            prior_marker = None
+            if action == "terminate":
+                try:
+                    prior_marker = json.loads(_private_read(marker_path, private=True))
+                except FileNotFoundError:
+                    pass
+                _save(marker_path, {"source": identity, "status": "pending", "requestId": request_id,
+                                    "requestedAt": int(time.time()), "method": capability["method"]})
             try:
                 details = self._apply(source, action, observed, deadline)
                 result.update(details)
-            except (OSError, ValueError, collector.RpcError, TimeoutError, subprocess.TimeoutExpired):
+            except (OSError, ValueError, sqlite3.Error, collector.RpcError, TimeoutError, subprocess.TimeoutExpired):
                 result = pending
             _save(receipt_path, {"digest": digest, "result": result})
             _save(proof_path, {"result": result})
+            if action == "terminate":
+                if result.get("applied") is False:
+                    if prior_marker is None:
+                        marker_path.unlink(missing_ok=True)
+                    else:
+                        _save(marker_path, prior_marker)
+                else:
+                    _save(marker_path, {"source": identity, "status": result["status"], "requestId": request_id,
+                                        "requestedAt": int(time.time()), "method": capability["method"]})
             return result
 
     def _interrupt_codex(self, observed, deadline):
@@ -517,6 +575,36 @@ class SessionControl:
         method = observed["capabilities"][action]["method"]
         if method == "codex-turn-interrupt":
             return self._interrupt_codex(observed, deadline)
+        if method == "codex-thread-archive":
+            identity = observed["source"]
+            # The API stops and archives the selected thread, and requests the
+            # same for its descendants. Never shut down the shared daemon.
+            with native._client(identity, self.home, deadline) as client:
+                state = native._codex_state(client, identity)
+                record = launch.saved_codex_thread({**source, **identity}, self.home)
+                if (record != observed["target"]["record"] or record["archived"]
+                        or state.get("activeTurnId") != observed["target"].get("turnId")
+                        or state.get("revision") != observed["target"].get("archiveRevision")
+                        or not (state.get("canInterrupt") or state.get("safeToTransfer"))):
+                    return {"applied": False, "confirmed": False, "status": "stale", "reason": "원본 세션이 변경되어 종료하지 않았습니다."}
+                client.call("thread/archive", {"threadId": identity["id"]})
+                cursor, loaded = None, None
+                for unused in range(3):
+                    reply = client.call("thread/loaded/list", {"limit": 100, **({"cursor": cursor} if cursor else {})})
+                    if not isinstance(reply, dict) or not isinstance(reply.get("data"), list):
+                        break
+                    if identity["id"] in reply["data"]:
+                        loaded = True
+                        break
+                    cursor = reply.get("nextCursor")
+                    if not cursor:
+                        loaded = False
+                        break
+                after = launch.saved_codex_thread({**source, **identity}, self.home)
+                confirmed = loaded is False and after["archived"] is True
+                return {"applied": True, "confirmed": confirmed, "status": "terminated" if confirmed else "unconfirmed",
+                        "archived": after["archived"], "scope": "thread_and_descendants", "scopeReadback": "selected-session",
+                        "reason": None if confirmed else "종료·보관 요청을 보냈지만 실행 종료와 보관 상태를 모두 확인하지 못했습니다."}
         if method == "claude-background-stop":
             row, binary = observed["native"], observed["binary"]
             native._claude_run(binary, ["stop", row["id"]], deadline)

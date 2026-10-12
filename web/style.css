@@ -6551,3 +6551,35 @@ input.switch:focus-visible {
 .session-category-search button { width: 100%; min-height: 44px; padding: 8px 10px; border: 0; border-radius: 8px; background: var(--accent-tint); color: var(--accent-strong); font-size: var(--fs-sub); text-align: left; }
 @media (hover: hover) { .session-categories > button:not([aria-selected="true"]):hover { background: var(--fill-soft); } }
 @media (max-width: 900px) { .session-categories > button { gap: 4px; padding-inline: 4px; font-size: 13px; } }
+
+/* Recovery is an explicit user action and stays available in focused reading. */
+.conversation-actions { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.conversation-actions button { min-height: 44px; white-space: nowrap; }
+.chat-recovery { display: flex; align-items: center; flex-wrap: wrap; gap: 8px 12px; min-width: 0; }
+.chat-recovery[hidden] { display: none; }
+.chat-recovery .chat-terminal-gate-text { flex: 1 1 170px; }
+.chat-recovery .primary { flex: none; min-height: 44px; padding-inline: 12px; font-size: var(--fs-sub); }
+
+/* Bot metadata belongs to its original bot's authority and execution surface. */
+.session-categories > button { flex-direction: column; justify-content: center; gap: 3px; line-height: 1.2; }
+.is-bot-category .list-chips, .is-bot-category #filter-open, .is-bot-category #list-freshness { display: none; }
+.bot-list-tools { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 4px 0 12px; }
+.bot-list-tools p { margin: 0; color: var(--label-2); font-size: var(--fs-cap); }
+.bot-list-tools button { flex: none; min-height: 44px; font-size: var(--fs-sub); }
+.bot-source-notice { margin: 0 0 12px; padding: 12px; border-radius: 10px; background: var(--warn-bg); color: var(--warn-text); font-size: var(--fs-sub); line-height: 1.5; overflow-wrap: anywhere; }
+.bot-request-card { display: flex; flex-direction: column; gap: 6px; width: 100%; min-width: 0; margin-bottom: 8px; padding: 14px 16px; border: 1px solid transparent; border-radius: 12px; background: var(--surface); color: var(--label); text-align: left; overflow-wrap: anywhere; }
+.bot-request-card[aria-pressed="true"] { background: var(--accent-tint); border-color: var(--accent); }
+.bot-request-top { display: flex; justify-content: space-between; flex-wrap: wrap; gap: 6px; }
+.bot-name { color: var(--accent-strong); font-size: var(--fs-sub); }
+.bot-stale-tag { padding: 1px 6px; border-radius: 5px; background: var(--warn-bg); color: var(--warn-text); font-size: var(--fs-cap); line-height: 1.5; }
+.bot-status, .bot-request-context { color: var(--label-2); font-size: var(--fs-cap); line-height: 1.5; }
+.bot-request-title { font-size: var(--fs-body); font-weight: 600; line-height: 1.4; }
+.bot-request-boundary { font-size: var(--fs-cap); line-height: 1.5; }
+.bot-detail-head .detail-titles { grid-column: 2 / -1; }
+.bot-request-detail { padding: 12px var(--detail-pad) 32px; overflow: auto; overscroll-behavior: contain; }
+.bot-request-guidance { margin: 0 0 20px; color: var(--label-2); line-height: 1.6; }
+.bot-request-metadata { margin: 0; }
+.bot-request-metadata > div { display: grid; grid-template-columns: minmax(70px, 1fr) minmax(0, 3fr); gap: 16px; padding: 14px 0; border-bottom: 1px solid var(--sep); }
+.bot-request-metadata dt { color: var(--label-2); }
+.bot-request-metadata dd { margin: 0; overflow-wrap: anywhere; }
+.bot-native-note { margin-top: 20px; font-size: var(--fs-sub); line-height: 1.6; color: var(--label-2); }

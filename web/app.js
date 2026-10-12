@@ -533,7 +533,35 @@ function closeSheet(id, returnFocus = null) {
 function openSettings() {
   applyTheme();
   applyTextSize();
+  window.SessionholicPush?.render?.();
   sheet("settings-dialog").open();
+}
+// A notification tap opens its session: from the page address on a cold start, or
+// from the service worker while the board is already open. The session may arrive
+// with a later snapshot, so the request waits briefly for it.
+function requestedSessionFrom(url) {
+  try {
+    const parsed = new URL(url, globalThis.location?.origin || "http://board.invalid");
+    const key = parsed.pathname === "/" ? parsed.searchParams.get("session") : null;
+    return key && key.length <= 600 ? key : null;
+  } catch {
+    return null;
+  }
+}
+function requestSessionOpen(url) {
+  const key = requestedSessionFrom(url);
+  if (!key) return false;
+  state.openRequest = { key, until: Date.now() + 120000 };
+  openRequestedSession();
+  return true;
+}
+function openRequestedSession() {
+  const request = state.openRequest;
+  if (!request) return;
+  if (Date.now() > request.until) { state.openRequest = null; return; }
+  if (!state.authenticated || state.launchBusy || !allSessions().some((session) => session.key === request.key)) return;
+  state.openRequest = null;
+  select(request.key);
 }
 function closeSettings() {
   if (!$("settings-dialog").open) return;
@@ -623,7 +651,8 @@ function beginAuthEpoch() {
 // deduplicates by requestId, are sent once more with a fresh token. A chat send
 // never is: it waits for a new press (sendChat).
 const CSRF_RETRY = new Set(["/api/chat/state", "/api/chat/prompt", "/api/plan", "/api/launch",
-  "/api/new-session", "/api/app-server", "/api/refresh", "/api/usage/refresh"]);
+  "/api/new-session", "/api/app-server", "/api/refresh", "/api/usage/refresh",
+  "/api/push/subscribe", "/api/push/unsubscribe"]);
 async function api(path, { method = "GET", body, signal, authEpoch = state.authEpoch, csrfRetry = true } = {}) {
   assertAuthEpoch(authEpoch);
   const headers = {};
@@ -6778,6 +6807,7 @@ async function poll(refresh = false, { capabilities = true } = {}) {
     notice();
     render();
     renameTerminals();
+    openRequestedSession();
     const revision = capabilitiesRevision(state.snapshot);
     const boot = typeof snapshot?.bootId === "string" ? snapshot.bootId : null;
     // Another server process: its CSRF token is read at once, even on a read an
@@ -7134,6 +7164,7 @@ window.addEventListener("DOMContentLoaded", () => {
       }
       render();
     } });
+  window.SessionholicPush?.init?.({ api, toast });
   window.SessionholicGoals?.init?.({ api, sessions: allSessions, openSession: select,
     startWork: openNewSession, manageSession,
     hideSession: () => setDetailShown(false), getSheet: sheet,
@@ -7416,8 +7447,15 @@ window.addEventListener("DOMContentLoaded", () => {
   for (const id of Object.keys(SHEETS)) sheet(id);
   window.visualViewport?.addEventListener("resize", updateViewport);
   updateViewport();
-  if ("serviceWorker" in navigator)
+  if ("serviceWorker" in navigator) {
     navigator.serviceWorker.register("/sw.js").catch(() => {});
+    navigator.serviceWorker.addEventListener?.("message", (event) => {
+      if (event.data?.type === "sessionholic-open") requestSessionOpen(event.data.url);
+    });
+  }
+  // Opened from a notification: remember the session, then drop it from the address.
+  if (globalThis.location?.search && requestSessionOpen(globalThis.location.href))
+    window.history.replaceState(window.history.state, "", "/");
   if (networkOffline()) {
     showOfflineStart();
   } else {

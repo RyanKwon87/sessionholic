@@ -26,6 +26,7 @@
     <!-- The terminal library (vendor/xterm.*, addon-fit) loads on first terminal open. -->
     <script src="/message-format.js" defer></script>
     <script src="/session_labels.js" defer></script>
+    <script src="/push.js" defer></script>
     <script src="/app.js" defer></script>
   </head>
   <body>
@@ -451,6 +452,12 @@
           보드의 글자 크기입니다. 터미널 글자 크기는 터미널 설정에서 따로
           바꿉니다. 이 선택들은 이 브라우저에만 저장됩니다.
         </p>
+        <p id="push-label" class="theme-label settings-section">알림</p>
+        <p id="push-status" class="plan-preserve" role="status" aria-live="polite"></p>
+        <div class="push-actions">
+          <button id="push-toggle" class="push-button" type="button" aria-describedby="push-status" hidden>알림 켜기</button>
+          <button id="push-test" class="push-button" type="button" hidden>테스트 알림</button>
+        </div>
         <button id="settings-lock" class="settings-lock" type="button">보드 잠그기</button>
       </div>
       <div class="dialog-actions">

@@ -13,9 +13,8 @@
 const CACHE = "sessionholic-shell-v14";
 const ASSETS = new Set([
   "/app.js",
-  "/goals.js",
   "/session_labels.js",
-  "/goals.css",
+  "/push.js",
   "/theme-init.js",
   "/message-format.js",
   "/style.css",
@@ -139,3 +138,74 @@ async function cacheFirst(event, request, url) {
   if (cacheable(response) && immutable(response)) event.waitUntil(storeVersion(cache, request, url, response.clone()));
   return response;
 }
+
+// Phone notifications. The board sends an empty push; what to show is read from the
+// board itself, so no conversation text passes through a push service. Every push shows
+// a notification (`userVisibleOnly`): the queued ones, else the latest one shown again
+// quietly, else a generic one.
+const PUSH_URL = /^\/(?:\?session=[A-Za-z0-9%._~-]{1,600})?$/;
+function pushUrl(value) {
+  return typeof value === "string" && PUSH_URL.test(value) ? value : "/";
+}
+async function pushId() {
+  const subscription = await self.registration.pushManager.getSubscription();
+  if (!subscription) return null;
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(subscription.endpoint));
+  return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("").slice(0, 32);
+}
+async function pendingNotifications() {
+  const id = await pushId();
+  if (!id) return [];
+  const response = await fetch(`/api/push/pending?id=${id}`, {
+    credentials: "same-origin", cache: "no-store", headers: { "X-Sessionholic-Push": "1" },
+  });
+  if (!response.ok) return [];
+  const data = await response.json();
+  return (Array.isArray(data?.notifications) ? data.notifications : [])
+    .filter((item) => item && typeof item.title === "string" && typeof item.tag === "string")
+    .slice(-20);
+}
+async function showPushed() {
+  let items = [];
+  try {
+    items = await pendingNotifications();
+  } catch {
+    items = [];
+  }
+  if (items.length) {
+    await Promise.all(items.map((item) => self.registration.showNotification(item.title.slice(0, 120), {
+      body: String(item.body || "").slice(0, 300), tag: item.tag.slice(0, 700), renotify: true,
+      icon: "/icon-192.png", data: { url: pushUrl(item.url) },
+    })));
+    return;
+  }
+  const shown = await self.registration.getNotifications();
+  const latest = shown[shown.length - 1];
+  if (latest) {
+    await self.registration.showNotification(latest.title, {
+      body: latest.body, tag: latest.tag, renotify: false, icon: "/icon-192.png", data: latest.data,
+    });
+    return;
+  }
+  await self.registration.showNotification("세션홀릭", {
+    body: "확인할 세션이 있어요. 눌러서 보드를 열어 주세요.", tag: "sessionholic-generic",
+    icon: "/icon-192.png", data: { url: "/" },
+  });
+}
+self.addEventListener("push", (event) => {
+  event.waitUntil(showPushed());
+});
+async function openFromNotification(url) {
+  const windows = await self.clients.matchAll({ type: "window", includeUncontrolled: true });
+  const board = windows.find((client) => new URL(client.url).origin === self.location.origin);
+  if (board) {
+    await board.focus();
+    board.postMessage({ type: "sessionholic-open", url });
+    return;
+  }
+  await self.clients.openWindow(url);
+}
+self.addEventListener("notificationclick", (event) => {
+  event.notification.close();
+  event.waitUntil(openFromNotification(pushUrl(event.notification.data?.url)));
+});

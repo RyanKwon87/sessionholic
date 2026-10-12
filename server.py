@@ -2039,6 +2039,14 @@ class Handler(BaseHTTPRequestHandler):
                     return self.send_json(200, self.server.work.snapshot())
                 if url.path == "/api/bot-requests":
                     return self.send_json(200, scrub_payload(self.server.bot_requests.snapshot()))
+                if url.path == "/api/push":
+                    return self.send_json(200, self.server.push.status(query.get("id")))
+                if url.path == "/api/push/pending":
+                    # Only this board's service worker reads (and so clears) a device's queue:
+                    # a cross-site request cannot add this header without a preflight.
+                    if self.headers.get("X-Sessionholic-Push") != "1":
+                        return self.send_json(403, {"error": "이 보드의 알림에서만 읽을 수 있습니다."})
+                    return self.send_json(200, self.server.push.pending_for(query.get("id")))
                 goal_match = re.fullmatch(r"/api/goals/([a-f0-9]{32})", url.path)
                 if goal_match:
                     return self.send_json(200, self.server.goals.get(goal_match[1]))
@@ -2230,6 +2238,12 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if path == "/api/bot-requests/refresh":
                 return self.send_json(200, scrub_payload(self.server.bot_requests.snapshot(force=True)))
+            if path == "/api/push/subscribe":
+                return self.send_json(200, self.server.push.subscribe(data))
+            if path == "/api/push/unsubscribe":
+                return self.send_json(200, self.server.push.unsubscribe(data))
+            if path == "/api/push/test":
+                return self.send_json(200, self.server.push.test(data))
             work_match = re.fullmatch(r"/api/work/([a-f0-9]{32})", path)
             if work_match:
                 return self.send_json(200, self.server.work.update(work_match[1], data))
@@ -2371,6 +2385,9 @@ class BoardHTTPServer(ThreadingHTTPServer):
         work = getattr(self, "work", None)
         if work is not None:
             work.close()
+        push = getattr(self, "push", None)
+        if push is not None:
+            push.close()
         # Open event streams and conversation watchers end instead of outliving the server.
         events = getattr(self, "events", None)
         if events is not None:
@@ -2385,7 +2402,7 @@ class BoardHTTPServer(ThreadingHTTPServer):
 
 
 def make_server(bind, port, board, token, terminals=None, workflow=None, state_dir=STATE_DIR, max_terminals=None,
-                tailscale_user=None, usage=None, automatic_work=False):
+                tailscale_user=None, usage=None, automatic_work=False, push=True):
     """`usage` (usage.UsageMeter) serves /api/usage; without it the routes stay 404."""
     if bind not in ("127.0.0.1", "::1"):
         raise ValueError("서버는 loopback에서만 실행할 수 있습니다.")
@@ -2428,6 +2445,20 @@ def make_server(bind, port, board, token, terminals=None, workflow=None, state_d
     # Also announces the terminal list: what the board's terminals report, and while
     # anyone follows the stream, terminals that ended on their own.
     server.events = EventHub(board, server.chat, boot_id=server.boot_id, terminals=server.terminals)
+    from push import PushService
+
+    def push_category(host, row):
+        """The list's 일반/에이전트/봇 split: only 일반 sessions notify."""
+        source = {"host": host.get("name"), "agent": row.get("agent"), "id": row.get("id"), "home": row.get("home")}
+        try:
+            if server.workflow.bot_request(source):
+                return "bot"
+        except (RuntimeError, OSError, ValueError):
+            return "unknown"
+        return "agent" if row.get("initiator") == "agent" else "general"
+    server.push = PushService(board, state_dir, classify=push_category, labels=server.session_labels.decorate)
+    if push:
+        server.push.start()
     if automatic_work:
         server.work.start()
     return server
@@ -2456,6 +2487,7 @@ def main(argv=None):
     # The automatic work tab is retired: its off-screen conversation reads are opt-in.
     parser.add_argument("--auto-work", action="store_true", help="화면 밖 자동 작업 관찰을 켬(기본 꺼짐)")
     parser.add_argument("--no-auto-work", action="store_true", help="화면 밖 자동 작업 관찰을 끔(기본값, 이전 설정 호환)")
+    parser.add_argument("--no-push", action="store_true", help="폰 알림을 끔(구독이 있어도 화면 밖 수집과 발송을 하지 않음)")
     parser.add_argument("--tailscale-user-file", type=Path,
                         help="비공개 파일에 적힌 Tailscale 사용자에게 HTTPS Serve 자동 인증 허용")
     parser.add_argument("--open", action="store_true",
@@ -2486,7 +2518,7 @@ def main(argv=None):
         meter = UsageMeter(config["usage"])
     httpd = make_server(args.bind, args.port, board, token, state_dir=args.state_dir,
                         max_terminals=args.max_terminals, tailscale_user=tailscale_user, usage=meter,
-                        automatic_work=args.auto_work and not args.no_auto_work)
+                        automatic_work=args.auto_work and not args.no_auto_work, push=not args.no_push)
     print(f"{LOG_PREFIX}: http://127.0.0.1:{args.port}/ · 화면을 열 때만 수집합니다.", file=sys.stderr)
     if args.open:
         print(issue_login_link(httpd), flush=True)

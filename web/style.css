@@ -5607,6 +5607,29 @@ select:disabled {
 .text-size-sample.large {
   font-size: 1.375rem;
 }
+.push-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 10px;
+}
+.push-actions:not(:has(button:not([hidden]))) {
+  display: none;
+}
+.push-button {
+  flex: 1 1 140px;
+  min-height: var(--tap);
+  padding: 0 16px;
+  border: 0;
+  border-radius: var(--radius);
+  background: var(--fill-soft);
+  color: var(--accent);
+  font-size: var(--fs-body);
+  font-weight: 600;
+}
+.push-button:disabled {
+  opacity: 0.55;
+}
 .settings-lock {
   align-items: center;
   justify-content: center;

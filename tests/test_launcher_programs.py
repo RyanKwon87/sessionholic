@@ -75,6 +75,12 @@ class ProgramTest(unittest.TestCase):
         self.assertEqual(result["d" * 32], {"program": None})
         self.assertEqual(result["f" * 32], {"program": None}, "another user's launcher never names this terminal")
         self.assertEqual(set(result), {FIRST, SECOND, "c" * 32, "d" * 32, "f" * 32})
+        # Only behind an interpreter: another command ending in the launcher path never matches.
+        other = lp.describe([{"id": "a" * 32, "createdAt": started("Mon Oct 12 19:00:00 2026")}], ["bin/zz-launcher"],
+                            [(1, 0, started("Mon Oct 12 19:00:00 2026"), "vim /Users/example/bin/zz-launcher"),
+                             (2, 1, started("Mon Oct 12 19:00:01 2026"), "claude")])
+        self.assertEqual(other["a" * 32], {"program": None})
+        self.assertEqual(lp.program_of("claude agents --cwd /Users/example/p -- extra"), {"program": "claude-agents", "cwd": "/Users/example/p"})
         # A script launcher appears behind its interpreter.
         script = lp.describe([{"id": "a" * 32, "createdAt": started("Mon Oct 12 19:00:00 2026")}], ["/Users/example/bin/zz-launcher"], rows)
         self.assertEqual(script["a" * 32], {"program": "claude", "cwd": None, "pid": 90001})

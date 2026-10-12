@@ -73,6 +73,7 @@
       if (!subscription) { if (mine === run) show(COPY.off, 'off'); return; }
       const status = await options.api('/api/push?id=' + await deviceId(subscription.endpoint));
       if (mine !== run) return;
+      if (status?.available === false) { show(status.reason || COPY.unsupported, 'none', { toggle: false }); return; }
       const live = status?.registered === true && (!status.publicKey || sameKey(subscription, serverKey(status.publicKey)));
       show(live ? COPY.on : COPY.stale, live ? 'on' : 'stale', { test: live });
     } catch (error) {

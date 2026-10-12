@@ -4341,7 +4341,7 @@ test('the usage line is one chip that opens a sheet of per-account bars, and ope
   c.get('usage-close').events.click();
   assert.equal(c.get('usage-dialog').open, false);
   assert.equal(c.get('usage').focusCount, 1, 'focus returns to the chip');
-  c.state.terminals = [{ id: 'one', alive: true, title: '열어 둔 작업', host: 'workstation', agent: 'codex', mode: 'attach' }];
+  c.state.terminals = [{ id: 'one', alive: true, title: '열어 둔 작업', host: 'workstation', agent: 'claude', mode: 'attach' }];
   c.renderTerminals();
   assert.equal(c.get('running-terminals').hidden, false);
   assert.equal(c.get('running-count').textContent, 1);
@@ -6652,7 +6652,7 @@ test('a 새 세션 terminal is named by what it runs, and a second view of the s
     launcher('other-folder', 1791790000, 'claude-agents', '/Users/example/project-b'),
     launcher('codex', 1791791000, 'codex', null),
     launcher('mini', 1791791500, 'claude-agents', '/Users/example/project-a', 'mini'),
-    { id: 'link', alive: true, title: '세션 연결', mode: 'attach', metadata: { mode: 'attach' } },
+    { id: 'link', alive: true, title: '세션 연결', mode: 'attach', agent: 'claude', metadata: { mode: 'attach', agent: 'claude' } },
   ];
   c.renderTerminals();
   const rows = byClass(c.get('running-list'), 'running-terminal-row');
@@ -6669,7 +6669,7 @@ test('a 새 세션 terminal is named by what it runs, and a second view of the s
 
 test('the folded session connections row keeps the keyboard focus as it opens', () => {
   const c = client(undefined, noChatTimers);
-  c.state.terminals = [{ id: 'link', alive: true, title: '세션 연결', mode: 'attach', metadata: { mode: 'attach' } }];
+  c.state.terminals = [{ id: 'link', alive: true, title: '세션 연결', mode: 'attach', agent: 'claude', metadata: { mode: 'attach', agent: 'claude' } }];
   c.renderTerminals();
   const first = byClass(c.get('running-list'), 'running-connections')[0];
   c.context.document.activeElement = first;
@@ -6713,17 +6713,17 @@ test('an open terminal is named after the session it runs and follows a renamed 
   c.state.showConnections = true;
   c.renderTerminals();
   const titles = () => byClass(c.get('running-list'), 'running-terminal-title').map((node) => node.textContent);
-  // Terminals the user opened come first, then the folded session connections.
-  assert.deepEqual(titles(), ['zz · 10. 12. 오후 05:14 시작', 'zz · 10. 12. 오후 03:16 시작', '검토할 작업']);
+  // A Codex connection the user opened is listed with the other terminals (only Claude ones fold).
+  assert.deepEqual(titles(), ['검토할 작업', 'zz · 10. 12. 오후 05:14 시작', 'zz · 10. 12. 오후 03:16 시작']);
   // A newer snapshot with the session renamed renames its terminal.
   // An open sheet is not rebuilt under the finger; it renames once it is not open.
   setRecentSnapshot(c, [{ ...s, title: '바뀐 작업 이름' }]);
   c.get('terminals-dialog').open = true;
   c.renameTerminals();
-  assert.equal(titles()[2], '검토할 작업');
+  assert.equal(titles()[0], '검토할 작업');
   c.get('terminals-dialog').open = false;
   c.renameTerminals();
-  assert.equal(titles()[2], '바뀐 작업 이름');
+  assert.equal(titles()[0], '바뀐 작업 이름');
   // A link estimated from start times says so.
   assert.equal(c.terminalTitle({ ...attached, metadata: { ...attached.metadata, linkConfidence: 'estimated' } }),
     '바뀐 작업 이름 · 연결 추정');

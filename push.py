@@ -14,6 +14,7 @@ even with no screen open; with none, nothing runs in the background.
 """
 import base64
 import hashlib
+import http.client
 import json
 import os
 import re
@@ -41,7 +42,9 @@ MAX_ENDPOINT = 2048
 MAX_LABEL = 80
 MAX_PENDING = 20
 MIN_WORK = 120            # seconds of work (until the row's last update) before a stop counts as finished
-RETRY = 60                # a device whose last wake-up failed for a passing reason is tried again
+RETRY = 60                # a device whose last wake-up failed for a passing reason is tried again,
+RETRY_LIMIT = 6           # ... with doubling waits (1, 2, 4 ... minutes), this many times at most
+PENDING_TTL = 3600        # a notice nobody read for an hour is dropped, not shown late
 FRESH = 30 * 60           # a row last updated longer ago never notifies
 SEEN_LIMIT = 4000
 SEEN_TTL = 7 * 24 * 3600
@@ -292,7 +295,7 @@ class PushService:
         if not isinstance(identifier, str) or not re.fullmatch(r"[a-f0-9]{32}", identifier):
             raise ValueError("알림 기기 정보가 올바르지 않습니다.")
         with self.lock:
-            return {"notifications": self.pending.pop(identifier, [])}
+            return {"notifications": self._fresh(self.pending.pop(identifier, []))}
 
     def test(self, data):
         if not self.enabled:
@@ -364,9 +367,15 @@ class PushService:
         5xx) while its notices still wait; a refusal like 400 or 403 waits for the next alert."""
         now = self.monotonic()
         with self.lock:
-            due = [target for target in self.subscriptions if self.pending.get(target["id"])
-                   and target["id"] in self.failed and self.failed[target["id"]][1]
-                   and now >= max(self.retry_after.get(target["id"], 0), self.failed[target["id"]][0] + RETRY)]
+            for identifier in list(self.pending):
+                self.pending[identifier] = self._fresh(self.pending[identifier])
+            due = []
+            for target in self.subscriptions:
+                failed = self.failed.get(target["id"])
+                if not self.pending.get(target["id"]) or not failed or not failed[1] or failed[2] > RETRY_LIMIT:
+                    continue
+                if now >= max(self.retry_after.get(target["id"], 0), failed[0] + RETRY * 2 ** (failed[2] - 1)):
+                    due.append(target)
             urgent = {target["id"]: any(item.get("kind") == "needs_input" for item in self.pending[target["id"]])
                       for target in due}
         for target in due:
@@ -469,8 +478,12 @@ class PushService:
         with self.lock:
             for target in targets:
                 queue = self.pending.setdefault(target["id"], [])
-                queue[:] = [item for item in queue if item.get("tag") != notice["tag"]][-(MAX_PENDING - 1):]
+                queue[:] = [item for item in self._fresh(queue) if item.get("tag") != notice["tag"]][-(MAX_PENDING - 1):]
                 queue.append(dict(notice))
+
+    def _fresh(self, items):
+        now = int(self.clock())
+        return [item for item in items if now - (item.get("createdAt") or now) <= PENDING_TTL]
 
     def _send(self, target, ttl, urgency):
         """One device's wake-up; whatever goes wrong stays with this device."""
@@ -482,7 +495,8 @@ class PushService:
                        "Authorization": self.vapid.authorization(target["endpoint"])}
             status, response_headers, body = self.sender(target["endpoint"], headers)
         except Exception as exc:  # noqa: BLE001 - one device must never stop the others
-            self.failed[identifier] = (self.monotonic(), True)
+            # A network or protocol error passes; a local one (signing) would only repeat.
+            self._fail(identifier, isinstance(exc, (OSError, http.client.HTTPException)))
             self._report(identifier, "network", type(exc).__name__)
             return 0
         try:
@@ -499,14 +513,19 @@ class PushService:
                 except (ValueError, TypeError):
                     delay = 60
                 self.retry_after[identifier] = self.monotonic() + delay
-                self.failed[identifier] = (self.monotonic(), True)
+                self._fail(identifier, True)
             else:
-                self.failed[identifier] = (self.monotonic(), status >= 500)
+                self._fail(identifier, status >= 500)
                 reason = body.decode("utf-8", "replace")[:160] if isinstance(body, bytes) else ""
                 self._report(identifier, status, re.sub(r"\s+", " ", reason))
         except Exception as exc:  # noqa: BLE001
             self._report(identifier, "local", type(exc).__name__)
         return status
+
+    def _fail(self, identifier, passing):
+        """(when, whether it may pass, how many times in a row)."""
+        count = (self.failed.get(identifier) or (0, False, 0))[2] + 1
+        self.failed[identifier] = (self.monotonic(), passing, count)
 
     def _report(self, identifier, status, reason):
         mark = (identifier, status)

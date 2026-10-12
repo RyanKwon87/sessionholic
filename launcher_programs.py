@@ -18,6 +18,7 @@ MAX_TERMINALS = 32
 PS = "/bin/ps"
 LSTART = "%a %b %d %H:%M:%S %Y"
 # Claude's own helpers under the agent view, never a program a person runs.
+INTERPRETERS = {"zsh", "bash", "sh", "env", "python3", "python"}
 CLAUDE_HELPERS = {"daemon", "bg-pty-host", "bg-spare", "--chrome-native-host", "mcp", "doctor"}
 
 
@@ -61,7 +62,7 @@ def program_of(command):
     if name == "claude":
         if rest[:1] == ["agents"]:
             # `ps` joins arguments with spaces, so a folder runs until the next option.
-            found = re.search(r"\s--cwd(?:=|\s+)(.+?)(?=\s+-{1,2}[A-Za-z]|$)", command)
+            found = re.search(r"\s--cwd(?:=|\s+)(.+?)(?=\s+-|$)", command)
             cwd = found[1].strip() if found else None
             return {"program": "claude-agents", "cwd": cwd if cwd and cwd.startswith("/") else None}
         if rest[:1] and rest[0] in CLAUDE_HELPERS:
@@ -83,7 +84,8 @@ def describe(terminals, launcher, rows):
     by_pid = {pid: (ppid, started, command) for pid, ppid, started, command in rows}
     # A script launcher shows its interpreter first (`/bin/zsh /path/launcher`).
     launchers = [(pid, started) for pid, _, started, command in rows
-                 if command == expected or command.endswith(" " + expected)]
+                 if command == expected or (command.endswith(" " + expected)
+                                            and Path(command.split()[0]).name in INTERPRETERS)]
     result = {}
     for terminal in terminals[:MAX_TERMINALS]:
         identifier, created = terminal.get("id"), terminal.get("createdAt")

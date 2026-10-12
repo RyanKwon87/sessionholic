@@ -306,6 +306,46 @@ class ServiceTest(unittest.TestCase):
         self.service.step()
         self.assertEqual(len(calls), 3, "a delivered wake-up is not repeated")
 
+    def test_retries_back_off_stop_after_a_limit_and_old_notices_expire(self):
+        self.subscribe()
+        target = self.service.subscriptions[0]
+        self.service._queue([target], {"tag": "t", "title": "x", "kind": "needs_input", "createdAt": self.clock.now})
+        self.status = 503
+        self.service._send(target, 60, "high")
+        waits = []
+        for _ in range(push.RETRY_LIMIT + 2):
+            before = len(self.sent)
+            for seconds in range(0, 4000, 15):
+                self.clock.now += 15
+                # Kept fresh here so the limit, not the hour-long expiry, ends the retries.
+                for item in self.service.pending.get(target["id"], []):
+                    item["createdAt"] = self.clock.now
+                self.service.retry()
+                if len(self.sent) > before:
+                    waits.append(seconds + 15)
+                    break
+        self.assertEqual(waits[:3], [60, 120, 240], "waits double after each failure")
+        self.assertEqual(len(self.sent), 1 + push.RETRY_LIMIT, "no wake-up after the limit")
+        # A notice older than an hour is dropped instead of shown late.
+        self.service.failed.clear()
+        self.clock.now += push.PENDING_TTL + 1
+        self.assertEqual(self.service.pending_for(target["id"]), {"notifications": []})
+
+    def test_a_local_signing_error_is_not_retried(self):
+        self.subscribe()
+        target = self.service.subscriptions[0]
+
+        class Broken(FakeVapid):
+            def authorization(self, endpoint):
+                raise RuntimeError("알림 서명 키를 준비하지 못했습니다.")
+        self.service.vapid = Broken()
+        self.service._queue([target], {"tag": "t", "title": "x", "createdAt": self.clock.now})
+        self.assertEqual(self.service._send(target, 60, "high"), 0)
+        self.clock.now += 10 * push.RETRY
+        self.service.retry()
+        self.assertEqual(self.sent, [])
+        self.assertFalse(self.service.failed[target["id"]][1])
+
     def test_a_redirect_is_never_followed(self):
         import http.server
         hits = []

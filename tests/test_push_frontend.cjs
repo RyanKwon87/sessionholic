@@ -176,6 +176,15 @@ test("turning on asks permission, subscribes with the board key and registers th
   assert.equal(s.nodes["push-toggle"].textContent, "알림 켜기");
 });
 
+test("a board run without notifications says why even for a device it registered before", async () => {
+  const device = { endpoint: ENDPOINT, options: {}, toJSON: () => ({ endpoint: ENDPOINT }), unsubscribe: async () => true };
+  const s = settings({ existing: device, registered: true, status: { available: false, reason: "이 보드는 알림을 끈 채 실행 중입니다(--no-push)." } });
+  await s.module.render();
+  assert.equal(s.nodes["push-status"].textContent, "이 보드는 알림을 끈 채 실행 중입니다(--no-push).");
+  assert.equal(s.nodes["push-toggle"].hidden, true);
+  assert.equal(s.nodes["push-test"].hidden, true);
+});
+
 test("a refused permission or an unavailable board leaves notifications off with the reason", async () => {
   const refused = settings({ grant: "denied" });
   await refused.module.toggle();

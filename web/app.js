@@ -5394,10 +5394,11 @@ function terminalTitle(terminal, fallback = "열어 둔 터미널") {
   }
   return title;
 }
-// A board connection to an existing session: the board opens and closes these itself.
+// A Claude connection to an existing session: the board opens these to send or answer
+// and closes them after ten unused minutes. A Codex connection the user opened stays listed.
 function connectionTerminal(terminal) {
   const info = terminalInfo(terminal);
-  return info.mode === "attach" && (!info.launchMode || info.launchMode === "attach");
+  return info.mode === "attach" && (!info.launchMode || info.launchMode === "attach") && info.agent === "claude";
 }
 // Two 새 세션 terminals on one host showing the same Claude agent view (same folder):
 // every later one repeats the first. {terminal id: the first terminal}.
@@ -6371,7 +6372,7 @@ function renderTerminals() {
   direct.forEach(row);
   if (connections.length) {
     // Connections the board opened to send or answer: folded, since they close by themselves.
-    const toggle = button(`세션 연결 ${connections.length}개 · 10분 쓰지 않으면 보드가 닫아요`, "running-connections",
+    const toggle = button(`Claude 세션 연결 ${connections.length}개 · 10분 쓰지 않으면 보드가 닫아요`, "running-connections",
       () => { state.showConnections = !state.showConnections; renderTerminals(); });
     toggle.setAttribute("aria-expanded", String(!!state.showConnections));
     toggle.dataset.action = "connections";

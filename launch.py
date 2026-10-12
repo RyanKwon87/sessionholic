@@ -150,9 +150,12 @@ def _resume_runtime(identity, record, home):
         return {**unknown, "allowed": False, "reason": "원본 runtime 상태를 확인하지 못했습니다. 다시 확인해 주세요."}
 
 
+def _tool_directories(home):
+    return ["/opt/homebrew/bin", str(home / ".local/bin"), "/usr/local/bin", "/usr/bin", "/bin"]
+
+
 def _binary(agent, home):
-    search = os.pathsep.join(("/opt/homebrew/bin", str(home / ".local/bin"),
-                              "/usr/local/bin", "/usr/bin", "/bin", os.environ.get("PATH", "")))
+    search = os.pathsep.join(_tool_directories(home) + [os.environ.get("PATH", "")])
     return shutil.which(agent, path=search)
 
 
@@ -248,7 +251,11 @@ def _environment(home, agent, key, environment):
             "USER", "LOGNAME", "SHELL")
     env = {name: os.environ[name] for name in keep if name in os.environ}
     env["HOME"] = str(home)
-    env.setdefault("PATH", "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin")
+    # `_binary` finds the CLI in these directories, and an npm CLI there is a
+    # `#!/usr/bin/env node` script: from a non-login SSH PATH its interpreter
+    # would be missing. Missing directories go first, inherited order is kept.
+    inherited = [entry for entry in env.get("PATH", "").split(os.pathsep) if entry]
+    env["PATH"] = os.pathsep.join([entry for entry in _tool_directories(home) if entry not in inherited] + inherited)
     env.setdefault("TERM", "xterm-256color")
     if agent == "codex":
         env["CODEX_HOME"] = str(home / key)

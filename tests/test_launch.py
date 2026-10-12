@@ -263,6 +263,40 @@ class LaunchTest(unittest.TestCase):
             transfer_worker.attach(source)
         self.assertEqual(execute.call_args.args[1], ['/native/codex', 'resume', self.source['id'], '--cd', str(self.cwd)])
 
+    def test_remote_attach_from_non_login_ssh_path_keeps_tool_directories(self):
+        import transfer_worker
+        source = {**self.source, 'phase': 'closed', 'resume': True}
+        self.saved_thread()
+        with patch.object(Path, 'home', return_value=self.home), patch.object(os, 'chdir'), \
+                patch.object(os, 'execve') as execute, patch.dict(os.environ, {'PATH': '/usr/bin:/bin:/usr/sbin:/sbin'}):
+            transfer_worker.attach(source)
+        self.assertEqual(execute.call_args.args[2]['PATH'].split(os.pathsep),
+                         ['/opt/homebrew/bin', str(self.home / '.local/bin'), '/usr/local/bin',
+                          '/usr/bin', '/bin', '/usr/sbin', '/sbin'])
+
+    def test_npm_cli_interpreter_resolves_from_non_login_ssh_path(self):
+        # npm installs codex as `#!/usr/bin/env node`; with only the SSH PATH the
+        # resumed CLI exited 127 before the terminal was attached.
+        tools = self.home / '.local/bin'
+        tools.mkdir(parents=True)
+        interpreter, cli = tools / 'fixture-node', tools / 'codex'
+        interpreter.write_text('#!/bin/sh\nexec /bin/sh "$@"\n')
+        cli.write_text('#!/usr/bin/env fixture-node\necho started\n')
+        for path in (interpreter, cli):
+            path.chmod(0o755)
+        minimal = '/usr/bin:/bin:/usr/sbin:/sbin'
+        with patch.dict(os.environ, {'PATH': minimal}, clear=True):
+            env = launch._environment(self.home, 'codex', '.codex', 'default')
+        done = subprocess.run([str(cli)], env=env, capture_output=True, text=True, timeout=10)
+        self.assertEqual((done.returncode, done.stdout), (0, 'started\n'))
+        before = subprocess.run([str(cli)], env={**env, 'PATH': minimal}, capture_output=True, timeout=10)
+        self.assertEqual(before.returncode, 127)
+        # A PATH the host already set up keeps its order; only missing directories are added.
+        with patch.dict(os.environ, {'PATH': '/opt/homebrew/opt/node@24/bin:/usr/bin:/opt/homebrew/bin'}, clear=True):
+            env = launch._environment(self.home, 'codex', '.codex', 'default')
+        self.assertEqual(env['PATH'].split(os.pathsep),
+                         [str(tools), '/usr/local/bin', '/bin', '/opt/homebrew/opt/node@24/bin', '/usr/bin', '/opt/homebrew/bin'])
+
     def test_resume_uses_fresh_native_status_instead_of_stale_list_phase(self):
         import transfer_native
         self.saved_thread()

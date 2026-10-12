@@ -1277,6 +1277,8 @@ class Workflow:
                              "reason": None if p.get("agent") == "codex" else
                              "Claude 대화형 세션은 실행한 터미널에서 입력할 수 있습니다."} for p in accounts]
             hosts.append({"name": host["name"], "label": host["label"], "online": status["ok"],
+                # The terminal's keys follow the host (⌘ and ⌥ mean Windows keys there).
+                **({"platform": "windows"} if host.get("platform") == "windows" else {}),
                 "newSession": self.new_session_status(host, status["ok"]),
                 "agents": [{"id": agent, "label": "Claude Code" if agent == "claude" else "Codex",
                     "accounts": [{k: p.get(k) for k in ("id", "label", "available", "reason", "home",

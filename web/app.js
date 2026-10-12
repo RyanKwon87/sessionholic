@@ -175,6 +175,8 @@ const state = {
   terminalScrollMode: null,
   terminalScrollInFlight: false,
   terminalScrollGeneration: 0,
+  terminalMods: { ctrl: false, alt: false, meta: false },
+  terminalKeyHandled: false,
   terminalMomentum: null,
   toastTimer: null,
   chats: new Map(),
@@ -3283,7 +3285,16 @@ function promptKeydown(event) {
   return true;
 }
 function documentKeydown(event) {
-  if ((event.metaKey || event.ctrlKey) && String(event.key).toLowerCase() === "k" && !event.isComposing) {
+  if (event.defaultPrevented) {
+    noteHardwareKey(event);
+    return;
+  }
+  closeChatToolsEscape(event);
+  if (terminalDocumentKey(event)) {
+    noteHardwareKey(event);
+    return;
+  }
+  if (!state.terminalVisible && (event.metaKey || event.ctrlKey) && String(event.key).toLowerCase() === "k" && !event.isComposing) {
     event.preventDefault();
     const search = window.SessionholicGoals?.searchElement?.() || $("search");
     search?.focus();
@@ -3291,7 +3302,6 @@ function documentKeydown(event) {
     return;
   }
   noteHardwareKey(event);
-  closeChatToolsEscape(event);
   promptKeydown(event);
 }
 function chatReceiptCopy(receipt) {
@@ -5527,6 +5537,7 @@ function terminalError(text = "") {
 }
 function stopTerminalReader() {
   cancelDraftPaste();
+  clearTerminalMods();
   state.terminalRun++;
   state.terminalAbort?.abort();
   state.terminalAbort = null;
@@ -5558,6 +5569,7 @@ function settleDraftComposition() {
 }
 function startDraftComposition(event) {
   if (event?.target && event.target !== $("terminal-draft")) return;
+  clearTerminalMods();
   if (state.draftPaste) {
     cancelDraftPaste();
     $("draft-note").textContent = "새 입력을 보관했습니다. 조합이 끝나면 붙여넣기를 눌러 주세요.";
@@ -5604,6 +5616,7 @@ function bindDraftInput(node) {
     resizeDraft();
   });
   node.addEventListener("keydown", draftKeydown);
+  node.addEventListener("beforeinput", draftBeforeInput);
   node.addEventListener("compositionstart", startDraftComposition);
   node.addEventListener("compositionend", endDraftComposition);
 }
@@ -5757,6 +5770,7 @@ async function openTerminal(terminal, { recordHistory = true } = {}) {
   }
   stopTerminalReader();
   if (changing) resetTerminalScroll();
+  renderTerminalMods();
   state.inputEpoch++;
   state.inputQueue = Promise.resolve();
   state.inputFailed = false;
@@ -5823,6 +5837,8 @@ async function openTerminal(terminal, { recordHistory = true } = {}) {
       cursorBlink: true,
       scrollback: 5000,
       screenReaderMode: state.screenReaderMode,
+      // ⌥ with a key is Meta (ESC first) for the CLI, not a special character.
+      macOptionIsMeta: true,
       convertEol: false,
       allowProposedApi: false,
       theme: {
@@ -5839,6 +5855,7 @@ async function openTerminal(terminal, { recordHistory = true } = {}) {
     // An app that asked for the mouse gets the wheel from xterm itself (tmux
     // forwards it); otherwise the wheel scrolls tmux history instead of
     // reaching the CLI as arrow keys.
+    state.term.attachCustomKeyEventHandler?.(xtermKeyEvent);
     state.term.attachCustomWheelEventHandler?.((event) => {
       if ((state.term?.modes?.mouseTrackingMode || "none") !== "none") return true;
       queueTerminalScroll(event.deltaY / terminalLineHeight());
@@ -6230,7 +6247,209 @@ function resizeDraft() {
   // A taller or shorter input bar changes the terminal's rows; refit so no line is hidden.
   if (input.style.height !== before) requestAnimationFrame(fitTerminal);
 }
+// --- Terminal keys: modifiers on the key bar and a hardware keyboard -------------
+// What a key sends to the CLI, as a terminal emulator would (xterm's sequences).
+// Ctrl, ⌥ and ⌘ on the key bar hold for the next key. ⌘ has line-editing meanings only:
+// macOS conventions on a Mac host, the Windows console's own keys on a Windows host.
+const TERMINAL_KEY_ALIASES = {
+  Esc: "Escape", Up: "ArrowUp", Down: "ArrowDown", Left: "ArrowLeft", Right: "ArrowRight",
+  UIKeyInputUpArrow: "ArrowUp", UIKeyInputDownArrow: "ArrowDown", UIKeyInputLeftArrow: "ArrowLeft",
+  UIKeyInputRightArrow: "ArrowRight", UIKeyInputEscape: "Escape", UIKeyInputPageUp: "PageUp",
+  UIKeyInputPageDown: "PageDown", UIKeyInputHome: "Home", UIKeyInputEnd: "End",
+};
+const TERMINAL_CURSOR_KEYS = { ArrowUp: "A", ArrowDown: "B", ArrowRight: "C", ArrowLeft: "D", Home: "H", End: "F" };
+const TERMINAL_TILDE_KEYS = { Insert: 2, Delete: 3, PageUp: 5, PageDown: 6, F5: 15, F6: 17, F7: 18, F8: 19,
+  F9: 20, F10: 21, F11: 23, F12: 24 };
+const TERMINAL_FUNCTION_KEYS = { F1: "P", F2: "Q", F3: "R", F4: "S" };
+const TERMINAL_CTRL_DIGITS = { 2: "\x00", 3: "\x1b", 4: "\x1c", 5: "\x1d", 6: "\x1e", 7: "\x1f", 8: "\x7f" };
+const TERMINAL_EDIT_KEYS = new Set(["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", "Home", "End", "Tab",
+  "Backspace", "Delete", "Escape"]);
+const TERMINAL_ALWAYS_KEYS = /^(F([1-9]|1[0-2])|PageUp|PageDown|Insert)$/;
+// The bar's own keys as names, for when a held modifier combines with one.
+const TERMINAL_BAR_KEYS = {
+  escape: ["Escape"], tab: ["Tab"], backtab: ["Tab", { shift: true }], interrupt: ["c", { ctrl: true }],
+  "ctrl-j": ["j", { ctrl: true }], "ctrl-u": ["u", { ctrl: true }], "ctrl-x": ["x", { ctrl: true }],
+  "ctrl-l": ["l", { ctrl: true }], up: ["ArrowUp"], left: ["ArrowLeft"], down: ["ArrowDown"],
+  right: ["ArrowRight"], enter: ["Enter"],
+};
+const TERMINAL_BAR_BYTES = {
+  escape: "\x1b",
+  tab: "\t",
+  backtab: "\x1b[Z",
+  up: "\x1b[A",
+  down: "\x1b[B",
+  left: "\x1b[D",
+  right: "\x1b[C",
+  interrupt: "\x03",
+  "ctrl-j": "\n",
+  "ctrl-u": "\x15",
+  "ctrl-x": "\x18",
+  "ctrl-l": "\x0c",
+  enter: "\r",
+};
+function terminalKeyBytes(key, mods = {}, { windows = false } = {}) {
+  key = TERMINAL_KEY_ALIASES[key] || key;
+  const ctrl = !!mods.ctrl, alt = !!mods.alt, shift = !!mods.shift, meta = !!mods.meta;
+  if (meta) {
+    // ⌘←/→ to the line's start or end, ⌘⌫ deletes back to its start.
+    const edits = windows ? { ArrowLeft: "\x1b[H", ArrowRight: "\x1b[F", Backspace: "\x1b[1;5H" }
+      : { ArrowLeft: "\x01", ArrowRight: "\x05", Backspace: "\x15" };
+    return ctrl || alt ? null : edits[key] || null;
+  }
+  if (alt && !ctrl && !shift && ["ArrowLeft", "ArrowRight", "Backspace"].includes(key)) {
+    // ⌥←/→ by word and ⌥⌫ deletes a word, as Terminal and the Windows console do it.
+    return (windows ? { ArrowLeft: "\x1b[1;5D", ArrowRight: "\x1b[1;5C", Backspace: "\x08" }
+      : { ArrowLeft: "\x1bb", ArrowRight: "\x1bf", Backspace: "\x1b\x7f" })[key];
+  }
+  const level = 1 + (shift ? 1 : 0) + (alt ? 2 : 0) + (ctrl ? 4 : 0);
+  if (TERMINAL_CURSOR_KEYS[key]) return level > 1 ? `\x1b[1;${level}${TERMINAL_CURSOR_KEYS[key]}` : `\x1b[${TERMINAL_CURSOR_KEYS[key]}`;
+  if (TERMINAL_TILDE_KEYS[key]) return level > 1 ? `\x1b[${TERMINAL_TILDE_KEYS[key]};${level}~` : `\x1b[${TERMINAL_TILDE_KEYS[key]}~`;
+  if (TERMINAL_FUNCTION_KEYS[key]) return level > 1 ? `\x1b[1;${level}${TERMINAL_FUNCTION_KEYS[key]}` : `\x1bO${TERMINAL_FUNCTION_KEYS[key]}`;
+  const prefix = alt ? "\x1b" : "";
+  if (key === "Tab") return shift ? "\x1b[Z" : prefix + "\t";
+  if (key === "Enter") return prefix + "\r";
+  if (key === "Escape") return "\x1b";
+  if (key === "Backspace") return prefix + (ctrl ? "\x08" : "\x7f");
+  if (typeof key !== "string" || [...key].length !== 1) return null;
+  if (!ctrl) return prefix + key;
+  if (key === " ") return prefix + "\x00";
+  if (TERMINAL_CTRL_DIGITS[key]) return prefix + TERMINAL_CTRL_DIGITS[key];
+  if (key === "?") return prefix + "\x7f";
+  const code = key.toUpperCase().charCodeAt(0);
+  return code >= 64 && code <= 95 ? prefix + String.fromCharCode(code & 0x1f) : null;
+}
+// A key pressed with a modifier, by its place on the keyboard: a Korean layout prints ㅊ
+// and ⌥ prints å, but Ctrl+C is meant.
+function hardwareKeyName(event) {
+  const key = TERMINAL_KEY_ALIASES[event.key] || String(event.key || "");
+  if (!(event.ctrlKey || event.altKey || event.metaKey || anyTerminalMod()) || typeof event.code !== "string") return key;
+  const letter = /^Key([A-Z])$/.exec(event.code);
+  if (letter) return event.shiftKey ? letter[1] : letter[1].toLowerCase();
+  const digit = /^Digit([0-9])$/.exec(event.code);
+  if (digit) return digit[1];
+  return { Space: " ", Minus: "-", Equal: "=", BracketLeft: "[", BracketRight: "]", Backslash: "\\",
+    Semicolon: ";", Quote: "'", Comma: ",", Period: ".", Slash: "/", Backquote: "`" }[event.code] || key;
+}
+function appleBrowser() {
+  return /Mac|iPhone|iPad|iPod/.test(String(globalThis.navigator?.platform || globalThis.navigator?.userAgent || ""));
+}
+// The bytes a hardware key sends while a terminal shows, or null to leave it to the page
+// (or to the input bar's own editing: a typed draft keeps its cursor keys, Tab and Esc).
+function terminalKeyFromEvent(event, { draftEmpty = true, focusless = false } = {}) {
+  if (!event || event.isComposing || event.keyCode === 229) return null;
+  const sticky = state.terminalMods || {};
+  const mods = { ctrl: !!(event.ctrlKey || sticky.ctrl), alt: !!(event.altKey || sticky.alt),
+    shift: !!event.shiftKey, meta: !!(event.metaKey || sticky.meta) };
+  const key = hardwareKeyName(event);
+  if (["Process", "Unidentified", "Dead", "Shift", "Control", "Alt", "Meta", "CapsLock", "HangulMode",
+    "HanjaMode", "KanaMode", "Lang1", "Lang2"].includes(key)) return null;
+  const options = { windows: terminalOnWindows() };
+  // ⌘C, ⌘V and the rest stay the browser's; ⌘ only edits the line.
+  if (mods.meta) return ["ArrowLeft", "ArrowRight", "Backspace"].includes(key) ? terminalKeyBytes(key, mods, options) : null;
+  if (TERMINAL_ALWAYS_KEYS.test(key)) return terminalKeyBytes(key, mods, options);
+  if ([...key].length === 1) {
+    // A PC browser keeps Ctrl+C/V/X/A/Z for a typed draft; on Apple keyboards ⌘ does those.
+    if (mods.ctrl && !focusless && !draftEmpty && !appleBrowser() && "cvxaz".includes(key.toLowerCase())) return null;
+    if (mods.ctrl || mods.alt || focusless) return terminalKeyBytes(key, mods, options);
+    return null;
+  }
+  if (key === "Enter") return focusless ? terminalKeyBytes(key, mods, options) : null;
+  if (TERMINAL_EDIT_KEYS.has(key) && (draftEmpty || focusless || mods.ctrl || mods.alt))
+    return terminalKeyBytes(key, mods, options);
+  return null;
+}
+function terminalOnWindows() {
+  return capsHost(terminalInfo(state.terminal).host)?.platform === "windows";
+}
+function anyTerminalMod() {
+  const mods = state.terminalMods || {};
+  return !!(mods.ctrl || mods.alt || mods.meta);
+}
+function renderTerminalMods() {
+  const windows = terminalOnWindows();
+  for (const node of $("terminal-keys")?.querySelectorAll?.("button[data-mod]") || []) {
+    const name = node.dataset.mod;
+    node.setAttribute("aria-pressed", String(!!state.terminalMods[name]));
+    if (name === "alt") node.textContent = windows ? "Alt" : "⌥";
+    // A Windows host has no ⌘; Ctrl and Alt do its editing there.
+    if (name === "meta") node.hidden = windows;
+  }
+}
+function toggleTerminalMod(name) {
+  if (!(name in state.terminalMods)) return;
+  state.terminalMods = { ...state.terminalMods, [name]: !state.terminalMods[name] };
+  renderTerminalMods();
+}
+function clearTerminalMods() {
+  if (!anyTerminalMod()) return;
+  state.terminalMods = { ctrl: false, alt: false, meta: false };
+  renderTerminalMods();
+}
+function sendTerminalBytes(bytes) {
+  if (!bytes || state.composing || state.draftPaste) return;
+  state.terminalScrollLines = 0;
+  renderTerminalScroll();
+  sendInput(bytes).catch(() => {});
+}
+// A key on the bar: its own bytes, or combined with the held modifiers (then released).
+function pressTerminalKey(name) {
+  if (state.composing || state.draftPaste) return;
+  let bytes = TERMINAL_BAR_BYTES[name];
+  if (anyTerminalMod()) {
+    const [key, base = {}] = TERMINAL_BAR_KEYS[name] || [];
+    const mods = state.terminalMods;
+    const combined = key && terminalKeyBytes(key, { ...base, ctrl: base.ctrl || mods.ctrl, alt: mods.alt, meta: mods.meta },
+      { windows: terminalOnWindows() });
+    if (combined) bytes = combined;
+    clearTerminalMods();
+  }
+  sendTerminalBytes(bytes);
+}
+// A held modifier and a character typed into the input bar: sent as that combination.
+function draftBeforeInput(event) {
+  if (!anyTerminalMod() || event.inputType !== "insertText" || typeof event.data !== "string" || [...event.data].length !== 1) return;
+  const bytes = terminalKeyBytes(event.data, { ...state.terminalMods }, { windows: terminalOnWindows() });
+  if (!bytes) return;
+  event.preventDefault();
+  clearTerminalMods();
+  sendTerminalBytes(bytes);
+}
+// With nothing focused (the terminal just opened), a hardware keyboard types into the CLI.
+function terminalDocumentKey(event) {
+  if (!state.terminalVisible || event.defaultPrevented || editingText()) return false;
+  if (event.target?.closest?.(".xterm, dialog[open], details[open]")) return false;
+  if (document.querySelector?.("dialog[open]")) return false;
+  const bytes = terminalKeyFromEvent(event, { focusless: true });
+  if (!bytes) return false;
+  event.preventDefault();
+  clearTerminalMods();
+  sendTerminalBytes(bytes);
+  return true;
+}
+// xterm has the focus: it sends most keys itself; ⌘ edits, ⌥ word moves and held bar
+// modifiers are ours (the keypress that follows a handled keydown is swallowed too).
+function xtermKeyEvent(event) {
+  if (event.type !== "keydown") return !state.terminalKeyHandled;
+  state.terminalKeyHandled = false;
+  const ours = anyTerminalMod() || event.metaKey || (event.altKey && ["ArrowLeft", "ArrowRight", "Backspace"].includes(event.key));
+  if (!ours) return true;
+  const bytes = terminalKeyFromEvent(event, { focusless: true });
+  if (!bytes) return true;
+  event.preventDefault?.();
+  state.terminalKeyHandled = true;
+  clearTerminalMods();
+  sendTerminalBytes(bytes);
+  return false;
+}
 function draftKeydown(event) {
+  // A hardware keyboard's terminal keys go to the CLI (see terminalKeyFromEvent).
+  const bytes = state.terminalVisible ? terminalKeyFromEvent(event, { draftEmpty: !event.target?.value }) : null;
+  if (bytes) {
+    event.preventDefault();
+    clearTerminalMods();
+    sendTerminalBytes(bytes);
+    return;
+  }
   // Enter sends like a chat box; Shift+Enter keeps a newline in the draft.
   if (event.key !== "Enter" || event.shiftKey || event.isComposing || event.keyCode === 229) return;
   event.preventDefault();
@@ -7514,29 +7733,13 @@ window.addEventListener("DOMContentLoaded", () => {
       toast("클립보드에 접근할 수 없습니다.");
     }
   });
-  const keys = {
-    escape: "\x1b",
-    tab: "\t",
-    backtab: "\x1b[Z",
-    up: "\x1b[A",
-    down: "\x1b[B",
-    left: "\x1b[D",
-    right: "\x1b[C",
-    interrupt: "\x03",
-    "ctrl-j": "\n",
-    "ctrl-u": "\x15",
-    "ctrl-x": "\x18",
-    "ctrl-l": "\x0c",
-    enter: "\r",
-  };
-  for (const node of $("terminal-keys").querySelectorAll("button")) {
+  for (const node of $("terminal-keys").querySelectorAll("button[data-key]")) {
     node.addEventListener("pointerdown", (event) => event.preventDefault());
-    node.addEventListener("click", () => {
-      if (state.composing || state.draftPaste) return;
-      state.terminalScrollLines = 0;
-      renderTerminalScroll();
-      sendInput(keys[node.dataset.key]).catch(() => {});
-    });
+    node.addEventListener("click", () => pressTerminalKey(node.dataset.key));
+  }
+  for (const node of $("terminal-keys").querySelectorAll("button[data-mod]")) {
+    node.addEventListener("pointerdown", (event) => event.preventDefault());
+    node.addEventListener("click", () => toggleTerminalMod(node.dataset.mod));
   }
   $("draft-paste").addEventListener("pointerdown", prepareDraftPaste);
   $("draft-paste").addEventListener("click", () => pasteDraft(true));

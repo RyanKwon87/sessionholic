@@ -126,7 +126,7 @@ function client(
   vm.runInContext(messageSource, context);
   vm.runInContext(source, context);
   const api = vm.runInContext(
-    "({state,api,sourceOf,accountOf,sendInput,pasteDraft,prepareDraftPaste,startDraftComposition,endDraftComposition,inputDraft,stopTerminalReader,startTerminalReader,closePlan,navigateView,backToList,backFromTerminal,closeTerminal,cancelTerminalClose,confirmTerminalClose,populateAccount,populateRoute,updateContinue,renderPlan,launchPlan,openTerminal,saveDraft,draftKey,refreshTerminals,renderTerminals,renderTerminalReturn,renderFilters,terminalCloseCopy,warnDraftUnload,preparePlan,renderGroups,renderMessages,loadDetail,chatKey,chatEntry,currentChat,chatSupported,chatRecovery,recoverChatSession,openChatTerminal,chatAttachmentsSupported,buildChatComposer,sendChat,loadChatState,applyChatReceipt,uploadChatFiles,pasteChat,scheduleChatPoll,stopChatPolling,openNativeChat,allSessions,buildContinuePanel,chatReceiptCopy,returnToBoard,readChatClipboard,accountDisplay,sessionAccountLabel,closeChatToolsOutside,closeChatToolsEscape,drawDetail,refreshDetail,loadCapabilities,matches,recoverConnection,networkOffline,poll,select,focusDetailBack,restoreSelectedCardFocus,showLogin,lock,beginAuthEpoch,resizeChatInput,updateViewport,draftKeydown,configureTerminalKeyboard,queueTerminalScroll,flushTerminalScroll,terminalScrollEnd,resetTerminalScroll,renderAttention,chatPollDelay,pullRefresh,readingScroll,renderJump,pullDistance,listScroll,setReading,renderPrompt,promptAction,renderUsage,loadUsage,applyTheme,setTheme,updateThemeColor,haptic,navTransition,setDetailShown,chatVisible,sheetRelease,BottomSheet,sheet,openSettings,closeSettings,setTyping,pinchFontSize,setTerminalFontSize,loadXterm,assetUrl,syncEvents,closeEvents,eventsHealthy,renderFreshness,schedule,touchDevice,togglePhaseFilter,renderCounts,createLongPress,swipeIntent,swipeRelease,groupMessageRows,setTextSize,applyTextSize,renderConnectivity,terminalForSession,swipeActionFor,openMessageMenu,openCardMenu,messageActions,outboxShape,outboxMatches,outboxOrigin,settleOutbox,retryOutbox,renderAttachmentTiles,attachmentThumb,sendUpload,openActionSheet,closeActionSheet,setListCollapsed,closeSwipe,settleSwipe,prepareSwipe,runSwipeAction,GESTURE,setChromeVisible,toggleChrome,revealChrome,isChromeTap,snapshotAnnounced,updateChatComposer,capabilitiesRevision,toolKindOf,userMessageParts,formatElapsed,tickWorking,renderTerminalMarks,renderDetailTerminal,terminalsAnnounced,goToSessionTerminal,rememberTerminal,terminalMenu,updateTerminalMenu,chooseTerminalMenu,clearTerminalMenu,renderNewSession,openNewSession,startNewSession,startAppServer,rememberConversationView,restoreConversationView,conversationIdentity,initiatorOf,initiatorLabel,documentKeydown,sessionCategoryOf,setSessionCategory,renderSessionCategories,prepareSessionListFor,sessionCategoryKeydown,render,resetFilters,terminalTitle,renameTerminals,requestedSessionFrom,requestSessionOpen,openRequestedSession,answerOnOpen,hardReload})",
+    "({state,api,sourceOf,accountOf,sendInput,pasteDraft,prepareDraftPaste,startDraftComposition,endDraftComposition,inputDraft,stopTerminalReader,startTerminalReader,closePlan,navigateView,backToList,backFromTerminal,closeTerminal,cancelTerminalClose,confirmTerminalClose,populateAccount,populateRoute,updateContinue,renderPlan,launchPlan,openTerminal,saveDraft,draftKey,refreshTerminals,renderTerminals,renderTerminalReturn,renderFilters,terminalCloseCopy,warnDraftUnload,preparePlan,renderGroups,renderMessages,loadDetail,chatKey,chatEntry,currentChat,chatSupported,chatRecovery,recoverChatSession,openChatTerminal,chatAttachmentsSupported,buildChatComposer,sendChat,loadChatState,applyChatReceipt,uploadChatFiles,pasteChat,scheduleChatPoll,stopChatPolling,openNativeChat,allSessions,buildContinuePanel,chatReceiptCopy,returnToBoard,readChatClipboard,accountDisplay,sessionAccountLabel,closeChatToolsOutside,closeChatToolsEscape,drawDetail,refreshDetail,loadCapabilities,matches,recoverConnection,networkOffline,poll,select,focusDetailBack,restoreSelectedCardFocus,showLogin,lock,beginAuthEpoch,resizeChatInput,updateViewport,draftKeydown,configureTerminalKeyboard,queueTerminalScroll,flushTerminalScroll,terminalScrollEnd,resetTerminalScroll,renderAttention,chatPollDelay,pullRefresh,readingScroll,renderJump,pullDistance,listScroll,setReading,renderPrompt,promptAction,renderUsage,loadUsage,applyTheme,setTheme,updateThemeColor,haptic,navTransition,setDetailShown,chatVisible,sheetRelease,BottomSheet,sheet,openSettings,closeSettings,setTyping,pinchFontSize,setTerminalFontSize,loadXterm,assetUrl,syncEvents,closeEvents,eventsHealthy,renderFreshness,schedule,touchDevice,togglePhaseFilter,renderCounts,createLongPress,swipeIntent,swipeRelease,groupMessageRows,setTextSize,applyTextSize,renderConnectivity,terminalForSession,swipeActionFor,openMessageMenu,openCardMenu,messageActions,outboxShape,outboxMatches,outboxOrigin,settleOutbox,retryOutbox,renderAttachmentTiles,attachmentThumb,sendUpload,openActionSheet,closeActionSheet,setListCollapsed,closeSwipe,settleSwipe,prepareSwipe,runSwipeAction,GESTURE,setChromeVisible,toggleChrome,revealChrome,isChromeTap,snapshotAnnounced,updateChatComposer,capabilitiesRevision,toolKindOf,userMessageParts,formatElapsed,tickWorking,renderTerminalMarks,renderDetailTerminal,terminalsAnnounced,goToSessionTerminal,rememberTerminal,terminalMenu,updateTerminalMenu,chooseTerminalMenu,clearTerminalMenu,renderNewSession,openNewSession,startNewSession,startAppServer,rememberConversationView,restoreConversationView,conversationIdentity,initiatorOf,initiatorLabel,documentKeydown,sessionCategoryOf,setSessionCategory,renderSessionCategories,prepareSessionListFor,sessionCategoryKeydown,render,resetFilters,terminalTitle,renameTerminals,requestedSessionFrom,requestSessionOpen,openRequestedSession,answerOnOpen,hardReload,terminalKeyBytes,terminalKeyFromEvent,pressTerminalKey,toggleTerminalMod,clearTerminalMods,renderTerminalMods,draftBeforeInput,terminalDocumentKey,xtermKeyEvent})",
     context,
   );
   api.state.csrf = "csrf-test";
@@ -3229,15 +3229,161 @@ test('changing list filters removes hidden cards without changing the selected s
   assert.equal(byClass(c.get('groups'), 'card')[0].dataset.sessionKey, second.key);
 });
 
-test('terminal keys sit in two rows with an inverted-T arrow cluster and the requested control keys', () => {
+test('terminal keys sit in two rows with held modifiers, an inverted-T arrow cluster and the requested control keys', () => {
   const html = fs.readFileSync(path.join(__dirname, '../web/index.html'), 'utf8');
   const css = fs.readFileSync(path.join(__dirname, '../web/style.css'), 'utf8');
   for (const key of ['escape', 'tab', 'backtab', 'interrupt', 'ctrl-j', 'ctrl-u', 'ctrl-x', 'ctrl-l', 'up', 'left', 'down', 'right', 'enter'])
     assert.match(html, new RegExp(`data-key="${key}"`));
-  assert.match(css, /"k1 k2 k3 k4 \.\s+up\s+\.\s+enter"/);
-  assert.match(css, /"k5 k6 k7 k8 left down right enter"/);
+  for (const mod of ['ctrl', 'alt', 'meta'])
+    assert.match(html, new RegExp(`data-mod="${mod}" aria-pressed="false"`));
+  assert.match(css, /"ctrl k1 k2 k3 k4 meta up\s+\.\s+enter"/);
+  assert.match(css, /"alt\s+k5 k6 k7 k8 left down right enter"/);
+  // Modifier buttons are not keys: a key loop over every button would send undefined.
+  assert.ok(source.includes('querySelectorAll("button[data-key]")'));
   for (const [key, bytes] of [['backtab', '\\x1b[Z'], ['"ctrl-j"', '\\n'], ['"ctrl-u"', '\\x15'], ['"ctrl-x"', '\\x18'], ['"ctrl-l"', '\\x0c']])
     assert.ok(source.includes(`${key}: "${bytes}"`), key);
+});
+
+test('terminal keys encode modifiers, cursor and function keys as a terminal does, and ⌘ edits the line by host', () => {
+  const c = client(undefined, noChatTimers);
+  const k = (key, mods = {}, windows = false) => c.terminalKeyBytes(key, mods, { windows });
+  const cases = [
+    ['c', { ctrl: true }, '\x03'], [' ', { ctrl: true }, '\x00'], ['[', { ctrl: true }, '\x1b'], ['2', { ctrl: true }, '\x00'],
+    ['?', { ctrl: true }, '\x7f'], ['x', { alt: true }, '\x1bx'], ['c', { ctrl: true, alt: true }, '\x1b\x03'],
+    ['ArrowUp', {}, '\x1b[A'], ['ArrowUp', { shift: true }, '\x1b[1;2A'], ['ArrowLeft', { ctrl: true }, '\x1b[1;5D'],
+    ['Home', {}, '\x1b[H'], ['End', { ctrl: true }, '\x1b[1;5F'], ['PageUp', {}, '\x1b[5~'], ['Delete', { ctrl: true }, '\x1b[3;5~'],
+    ['F1', {}, '\x1bOP'], ['F4', { shift: true }, '\x1b[1;2S'], ['F5', {}, '\x1b[15~'], ['F12', { ctrl: true }, '\x1b[24;5~'],
+    ['Tab', {}, '\t'], ['Tab', { shift: true }, '\x1b[Z'], ['Enter', { alt: true }, '\x1b\r'], ['Escape', {}, '\x1b'],
+    ['Backspace', {}, '\x7f'], ['Backspace', { ctrl: true }, '\x08'], ['UIKeyInputUpArrow', {}, '\x1b[A'],
+    // macOS editing on a Mac host.
+    ['ArrowLeft', { meta: true }, '\x01'], ['ArrowRight', { meta: true }, '\x05'], ['Backspace', { meta: true }, '\x15'],
+    ['ArrowLeft', { alt: true }, '\x1bb'], ['ArrowRight', { alt: true }, '\x1bf'], ['Backspace', { alt: true }, '\x1b\x7f'],
+    ['c', { meta: true }, null], ['1', { ctrl: true }, null], ['ArrowUp', { meta: true }, null],
+  ];
+  for (const [key, mods, bytes] of cases) assert.equal(k(key, mods), bytes, `${key} ${JSON.stringify(mods)}`);
+  // The Windows console's own keys on a Windows host.
+  for (const [key, mods, bytes] of [['ArrowLeft', { meta: true }, '\x1b[H'], ['ArrowRight', { meta: true }, '\x1b[F'],
+    ['Backspace', { meta: true }, '\x1b[1;5H'], ['ArrowLeft', { alt: true }, '\x1b[1;5D'], ['ArrowRight', { alt: true }, '\x1b[1;5C'],
+    ['Backspace', { alt: true }, '\x08'], ['c', { ctrl: true }, '\x03']])
+    assert.equal(k(key, mods, true), bytes, `windows ${key} ${JSON.stringify(mods)}`);
+});
+
+test('a hardware keyboard reaches the CLI: by key place, without taking a typed draft\'s editing or the browser\'s ⌘ keys', () => {
+  const c = client(undefined, noChatTimers);
+  const key = (fields, options) => c.terminalKeyFromEvent({ key: '', code: '', ...fields }, options);
+  c.context.navigator = { platform: 'MacIntel' };
+  assert.equal(key({ key: 'ㅊ', code: 'KeyC', ctrlKey: true }, { draftEmpty: false }), '\x03', 'a Korean layout still means Ctrl+C');
+  assert.equal(key({ key: 'å', code: 'KeyA', altKey: true }, { draftEmpty: false }), '\x1ba');
+  assert.equal(key({ key: 'ArrowLeft' }, { draftEmpty: false }), null, 'a typed draft keeps its cursor');
+  assert.equal(key({ key: 'ArrowLeft' }, { draftEmpty: true }), '\x1b[D');
+  assert.equal(key({ key: 'Tab' }, { draftEmpty: false }), null, 'Tab leaves a typed draft (no keyboard trap)');
+  assert.equal(key({ key: 'Escape' }, { draftEmpty: false }), null);
+  assert.equal(key({ key: 'Escape' }, { draftEmpty: true }), '\x1b');
+  assert.equal(key({ key: 'F2' }, { draftEmpty: false }), '\x1bOQ', 'function keys always');
+  assert.equal(key({ key: 'PageDown' }, { draftEmpty: false }), '\x1b[6~');
+  assert.equal(key({ key: 'v', code: 'KeyV', metaKey: true }, { draftEmpty: true }), null, '⌘V stays the browser paste');
+  assert.equal(key({ key: 'ArrowLeft', metaKey: true }, { draftEmpty: false }), '\x01');
+  assert.equal(key({ key: 'a' }, { draftEmpty: true }), null, 'typing goes to the input bar');
+  assert.equal(key({ key: 'a' }, { focusless: true }), 'a', 'with nothing focused it goes to the CLI');
+  assert.equal(key({ key: 'Enter' }, { draftEmpty: true }), null, "the input bar's own Enter");
+  assert.equal(key({ key: 'Enter' }, { focusless: true }), '\r');
+  assert.equal(key({ key: 'ㅎ', isComposing: true }, { focusless: true }), null);
+  assert.equal(key({ key: 'Process', keyCode: 229 }, { focusless: true }), null);
+  assert.equal(key({ key: 'Shift', shiftKey: true }, { focusless: true }), null);
+  // A PC browser keeps Ctrl+C/V for a typed draft; an empty one interrupts.
+  c.context.navigator = { platform: 'Win32' };
+  assert.equal(key({ key: 'v', code: 'KeyV', ctrlKey: true }, { draftEmpty: false }), null);
+  assert.equal(key({ key: 'c', code: 'KeyC', ctrlKey: true }, { draftEmpty: true }), '\x03');
+});
+
+test('held bar modifiers combine with the next key from the bar, the input bar or xterm, then release', async () => {
+  const calls = [];
+  const c = client(async (url, opts) => {
+    calls.push(JSON.parse(opts.body).text);
+    return { ok: true, status: 200, json: async () => ({ ok: true }) };
+  }, noChatTimers);
+  const settle = () => new Promise((resolve) => setImmediate(resolve));
+  c.state.connected = true;
+  c.state.terminal = { id: 'term-1' };
+  c.pressTerminalKey('up');
+  await settle();
+  assert.deepEqual(calls, ['\x1b[A'], 'a bar key alone sends its own bytes');
+  c.toggleTerminalMod('ctrl');
+  assert.equal(c.state.terminalMods.ctrl, true);
+  c.pressTerminalKey('up');
+  await settle();
+  assert.equal(calls.at(-1), '\x1b[1;5A');
+  assert.equal(c.state.terminalMods.ctrl, false, 'released after one key');
+  c.toggleTerminalMod('alt');
+  c.pressTerminalKey('interrupt');
+  await settle();
+  assert.equal(calls.at(-1), '\x1b\x03');
+  // A character typed into the input bar with Ctrl held.
+  c.toggleTerminalMod('ctrl');
+  let prevented = false;
+  c.draftBeforeInput({ inputType: 'insertText', data: 'r', preventDefault() { prevented = true; } });
+  await settle();
+  assert.equal(prevented, true);
+  assert.equal(calls.at(-1), '\x12');
+  assert.equal(c.state.terminalMods.ctrl, false);
+  const before = calls.length;
+  c.draftBeforeInput({ inputType: 'insertText', data: 'r', preventDefault() { throw new Error('no modifier'); } });
+  await settle();
+  assert.equal(calls.length, before, 'plain typing stays in the draft');
+  // xterm: its own keys pass through; ⌘← and a held modifier are ours, and its keypress is swallowed.
+  assert.equal(c.xtermKeyEvent({ type: 'keydown', key: 'a', code: 'KeyA' }), true);
+  assert.equal(c.xtermKeyEvent({ type: 'keydown', key: 'ArrowLeft', metaKey: true, preventDefault() {} }), false);
+  assert.equal(c.xtermKeyEvent({ type: 'keypress', key: 'ArrowLeft', metaKey: true }), false);
+  await settle();
+  assert.equal(calls.at(-1), '\x01');
+  c.toggleTerminalMod('ctrl');
+  assert.equal(c.xtermKeyEvent({ type: 'keydown', key: 'd', code: 'KeyD', preventDefault() {} }), false);
+  await settle();
+  assert.equal(calls.at(-1), '\x04');
+  assert.equal(c.xtermKeyEvent({ type: 'keydown', key: 'c', code: 'KeyC', metaKey: true }), true, '⌘C copies');
+});
+
+test('with nothing focused a hardware keyboard types into the shown terminal, Ctrl+K included, but not past an open dialog', async () => {
+  const calls = [];
+  const c = client(async (url, opts) => {
+    calls.push(JSON.parse(opts.body).text);
+    return { ok: true, status: 200, json: async () => ({ ok: true }) };
+  }, noChatTimers);
+  const settle = () => new Promise((resolve) => setImmediate(resolve));
+  c.state.connected = true;
+  c.state.terminal = { id: 'term-1' };
+  c.state.terminalVisible = true;
+  c.context.document.activeElement = null;
+  const event = (fields) => ({ key: '', code: '', target: { closest: () => null }, defaultPrevented: false,
+    preventDefault() { this.defaultPrevented = true; }, ...fields });
+  assert.equal(c.terminalDocumentKey(event({ key: 'x', code: 'KeyX' })), true);
+  assert.equal(c.terminalDocumentKey(event({ key: 'k', code: 'KeyK', ctrlKey: true })), true);
+  await settle();
+  assert.deepEqual(calls, ['x', '\x0b']);
+  c.context.document.activeElement = { tagName: 'INPUT' };
+  assert.equal(c.terminalDocumentKey(event({ key: 'y', code: 'KeyY' })), false, 'a focused field types for itself');
+  c.context.document.activeElement = null;
+  assert.equal(c.terminalDocumentKey(event({ key: 'y', code: 'KeyY', target: { closest: (q) => (q.includes('.xterm') ? {} : null) } })), false,
+    'xterm sends its own keys');
+  c.state.terminalVisible = false;
+  assert.equal(c.terminalDocumentKey(event({ key: 'y', code: 'KeyY' })), false);
+});
+
+test('a Windows host terminal hides ⌘ and names ⌥ Alt, and its word keys are the console\'s', () => {
+  const c = client(undefined, noChatTimers);
+  const meta = { dataset: { mod: 'meta' }, setAttribute() {}, hidden: false, textContent: '⌘' };
+  const alt = { dataset: { mod: 'alt' }, setAttribute() {}, hidden: false, textContent: '⌥' };
+  c.get('terminal-keys').querySelectorAll = (selector) => (selector === 'button[data-mod]' ? [meta, alt] : []);
+  c.state.capabilities = { hosts: [{ name: 'pc', platform: 'windows' }, { name: 'mac' }] };
+  c.state.terminal = { id: 'term-1', host: 'pc' };
+  c.renderTerminalMods();
+  assert.equal(meta.hidden, true);
+  assert.equal(alt.textContent, 'Alt');
+  assert.equal(c.terminalKeyFromEvent({ key: 'ArrowLeft', code: 'ArrowLeft', altKey: true }, { draftEmpty: true }), '\x1b[1;5D');
+  c.state.terminal = { id: 'term-2', host: 'mac' };
+  c.renderTerminalMods();
+  assert.equal(meta.hidden, false);
+  assert.equal(alt.textContent, '⌥');
 });
 
 test('the input bar sends a paste then a separate Enter, while input-only never adds Enter', async () => {

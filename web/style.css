@@ -2552,13 +2552,13 @@ select:disabled {
    and a tall Enter, all within one thumb's reach. */
 .terminal-keys {
   display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr)) repeat(3, minmax(0, 1fr)) minmax(0, 1.3fr);
+  grid-template-columns: minmax(0, 1fr) repeat(4, minmax(0, 1fr)) repeat(3, minmax(0, 1fr)) minmax(0, 1.3fr);
   grid-template-rows: repeat(2, 42px);
   grid-template-areas:
-    "k1 k2 k3 k4 .    up   .     enter"
-    "k5 k6 k7 k8 left down right enter";
+    "ctrl k1 k2 k3 k4 meta up   .     enter"
+    "alt  k5 k6 k7 k8 left down right enter";
   gap: 5px;
-  max-width: 560px;
+  max-width: 620px;
 }
 .terminal-keys button {
   min-width: 0;
@@ -2572,6 +2572,13 @@ select:disabled {
   font-size: 13px;
   touch-action: manipulation;
 }
+/* Held for the next key (aria-pressed), released once it is sent. */
+.terminal-keys [data-mod="ctrl"] { grid-area: ctrl; }
+.terminal-keys [data-mod="alt"] { grid-area: alt; }
+.terminal-keys [data-mod="meta"] { grid-area: meta; margin-left: 4px; }
+.terminal-keys [data-mod] { color: var(--t-label-2); }
+.terminal-keys [data-mod][aria-pressed="true"] { background: var(--accent); box-shadow: none; color: var(--on-accent); }
+.terminal-keys [data-mod][hidden] { display: none; }
 .terminal-keys [data-key="escape"] { grid-area: k1; }
 .terminal-keys [data-key="tab"] { grid-area: k2; }
 .terminal-keys [data-key="backtab"] { grid-area: k3; }

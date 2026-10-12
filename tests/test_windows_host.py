@@ -148,6 +148,7 @@ class WindowsRoutingTest(unittest.TestCase):
     def test_existing_codex_accounts_allow_attach_but_new_session_is_unavailable(self):
         with patch.object(self.flow.transfers, 'rpc', side_effect=AssertionError('remote helper invoked')):
             result = self.flow.capabilities()['hosts'][0]
+        self.assertEqual(result['platform'], 'windows', "the terminal's keys follow the host")
         self.assertFalse(result['newSession']['available'])
         codex = next(agent for agent in result['agents'] if agent['id'] == 'codex')
         self.assertTrue(all(account['available'] for account in codex['accounts']))

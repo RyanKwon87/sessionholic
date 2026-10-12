@@ -329,6 +329,23 @@ class SecurityTest(unittest.TestCase):
         for value in ([], {'text': 'x'*70000}):
             res, _ = self.request('POST', '/api/plan', value, self.auth())
             self.assertEqual(res.status, 400)
+    def test_an_oversized_body_already_sent_gets_its_answer_not_a_reset(self):
+        # The whole body is in the server's socket before it answers: closing with it unread
+        # would reset the connection and drop the answer.
+        import socket
+        body = json.dumps({'text': 'x' * 70000}).encode()
+        head = ('POST /api/plan HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\n'
+                'Cookie: %s\r\nX-CSRF-Token: %s\r\nContent-Length: %d\r\n\r\n' % (self.cookie, self.csrf, len(body)))
+        with socket.create_connection(('127.0.0.1', self.port), timeout=5) as client:
+            client.sendall(head.encode() + body)
+            time.sleep(0.3)
+            answer = b''
+            while True:
+                chunk = client.recv(65536)
+                if not chunk:
+                    break
+                answer += chunk
+        self.assertTrue(answer.startswith(b'HTTP/1.0 400') or answer.startswith(b'HTTP/1.1 400'), answer[:40])
     def test_terminal_stream_requires_auth(self):
         res, _ = self.request('GET', '/api/terminal/'+'a'*32+'/events')
         self.assertEqual(res.status, 401)

@@ -3460,7 +3460,7 @@ test('pull distance is elastic and the large title collapses into the bar on pho
   pane.scrollTop = 800; c.listScroll(pane);
   assert.equal(collapsed(), false, 'wide screens keep their plain bar');
   const html = indexPage();
-  assert.match(html, /id="nav-title"[^>]*aria-label="작업 목록 맨 위로"/);
+  assert.match(html, /id="nav-title"[^>]*aria-label="세션 목록 맨 위로"[^>]*>세션</);
   assert.match(styleSheet(), /body\.list-collapsed \.top \{[^}]*backdrop-filter: saturate\(180%\) blur\(20px\)/);
 });
 

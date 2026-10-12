@@ -2453,7 +2453,9 @@ def main(argv=None):
     parser.add_argument("--state-dir", type=Path, default=STATE_DIR)
     parser.add_argument("--no-live", action="store_true",
                         help="상주 수집기를 쓰지 않고 화면 요청 때만 일회성으로 수집")
-    parser.add_argument("--no-auto-work", action="store_true", help="화면 밖 자동 작업 관찰을 끔")
+    # The automatic work tab is retired: its off-screen conversation reads are opt-in.
+    parser.add_argument("--auto-work", action="store_true", help="화면 밖 자동 작업 관찰을 켬(기본 꺼짐)")
+    parser.add_argument("--no-auto-work", action="store_true", help="화면 밖 자동 작업 관찰을 끔(기본값, 이전 설정 호환)")
     parser.add_argument("--tailscale-user-file", type=Path,
                         help="비공개 파일에 적힌 Tailscale 사용자에게 HTTPS Serve 자동 인증 허용")
     parser.add_argument("--open", action="store_true",
@@ -2484,8 +2486,8 @@ def main(argv=None):
         meter = UsageMeter(config["usage"])
     httpd = make_server(args.bind, args.port, board, token, state_dir=args.state_dir,
                         max_terminals=args.max_terminals, tailscale_user=tailscale_user, usage=meter,
-                        automatic_work=not args.no_auto_work)
-    print(f"{LOG_PREFIX}: http://127.0.0.1:{args.port}/ · 제한된 주기로 세션 작업을 정리합니다.", file=sys.stderr)
+                        automatic_work=args.auto_work and not args.no_auto_work)
+    print(f"{LOG_PREFIX}: http://127.0.0.1:{args.port}/ · 화면을 열 때만 수집합니다.", file=sys.stderr)
     if args.open:
         print(issue_login_link(httpd), flush=True)
         print(f"표준 출력의 일회용 로그인 링크를 {ONCE_TTL // 60}분 안에 개인 브라우저에서 여세요. 한 번만 사용할 수 있습니다.",

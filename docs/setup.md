@@ -17,7 +17,7 @@ python3 scripts/sessionholic.py serve --port 8791
 1. 원격 기기에 Python 3.9 이상, Git, tmux, 사용할 native CLI를 설치합니다.
 2. 같은 원격 OS 사용자로 native CLI에 로그인하고 작업을 시작합니다.
 3. 보드 서버 기기의 SSH 설정에 연결 별칭을 등록하고 비대화식 연결을 직접 확인합니다.
-4. `hosts.json`에 SSH 별칭과 원격 Python 경로를 추가합니다. 설정 예시는 `examples/hosts.json`입니다. 세션 없이 하드웨어 상태만 볼 기기는 `"monitorOnly": true`로 등록합니다. 그 기기의 세션은 수집하지 않고 터미널·새 세션·알림에도 나오지 않습니다. 보드 기기 자신은 모니터링 전용이 될 수 없고, 세션을 수집할 기기가 하나 이상 있어야 합니다. 하드웨어 표시는 보드 기기 `config.json`의 `hardware` 섹션으로 켭니다(`docs/architecture.md`).
+4. `hosts.json`에 SSH 별칭과 원격 Python 경로를 추가합니다. 설정 예시는 `examples/hosts.json`입니다. 세션 없이 하드웨어 상태만 볼 기기는 `"monitorOnly": true`로 등록합니다. 그 기기의 세션은 수집하지 않고 터미널·새 세션·알림에도 나오지 않습니다. 보드 기기 자신은 모니터링 전용이 될 수 없고, 세션을 수집할 기기가 하나 이상 있어야 합니다. 하드웨어 표시는 보드 기기 `config.json`의 `hardware` 섹션으로 켭니다(`docs/architecture.md`). Windows PC는 `"platform": "windows"`와 PC Python 경로(`python.exe` 또는 `C:\…\python.exe`)로 등록하고, 새 세션을 쓰려면 같은 항목에 `launcher`를 적습니다.
 5. 원격 계정 라벨·프로젝트·환경 그룹이 필요하면 원격 기기 자신의 `~/.config/sessionholic/config.json`에 등록합니다.
 
 환경 그룹은 두 기기에서 같은 의미의 이름을 사용해야 합니다. 원격 설정·로그인·인증 파일은 자동 생성하거나 동기화하지 않습니다. 전송 기능은 필요한 실행 도우미만 원격 사용자 상태 폴더에 저장합니다.

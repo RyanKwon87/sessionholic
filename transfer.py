@@ -185,7 +185,7 @@ class Transfers:
         if (agent not in ('codex', 'claude') or not isinstance(sid, str) or not SESSION_ID.fullmatch(sid)
                 or agent == 'codex' and (not isinstance(home, str) or not HOME_KEY.fullmatch(home))):
             raise ValueError('Windows 세션 정보를 확인해 주세요.')
-        if op == 'chat' and args.get('action') not in ('read', 'send', 'receipt'):
+        if op == 'chat' and args.get('action') not in ('read', 'capabilities', 'send', 'receipt'):
             raise ValueError('지원하지 않는 Windows 대화 요청입니다.')
         args = {**args, 'source': {**source, 'host': host['name']}}
         root = Path(__file__).resolve().parent
@@ -234,10 +234,35 @@ class Transfers:
         for key, value in env.items():
             script += '$env:' + key + '=' + quote(value) + '; '
         script += '& ' + ' '.join(quote(value) for value in argv) + '; exit $LASTEXITCODE'
+        return self._windows_ssh(host, script)
+
+    def _windows_ssh(self, host, script):
         encoded = base64.b64encode(script.encode('utf-16le')).decode('ascii')
         return [shutil.which('ssh') or '/usr/bin/ssh', '-tt', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=6',
                 '-o', 'ServerAliveInterval=10', '-o', 'ServerAliveCountMax=2'] + self.control_options() + [
                 '--', host['ssh'], 'powershell.exe -NoProfile -EncodedCommand ' + encoded]
+
+    def windows_launcher(self, host, launcher):
+        """A PC's 새 세션 (the host settings' `launcher` choices): a numbered menu the board
+        shows as buttons (`  1. 이름` rows, then `선택:`; one choice runs at once), then the
+        chosen command in its folder. Only those literal values run; the script travels
+        base64-encoded, so nothing in it is parsed again on the way."""
+        quote = lambda value: "'" + value.replace("'", "''") + "'"
+        rows = ['@{Label=%s; Exe=%s; Args=@(%s); Cwd=%s}' % (
+            quote(choice['label']), quote(choice['command'][0]), ', '.join(quote(arg) for arg in choice['command'][1:]),
+            quote(choice.get('cwd') or '')) for choice in launcher['choices']]
+        run = ("if ($c.Cwd) { Set-Location -LiteralPath $c.Cwd } else { Set-Location -LiteralPath $env:USERPROFILE }; "
+               "& $c.Exe @($c.Args); exit $LASTEXITCODE")
+        if len(rows) == 1:
+            return self._windows_ssh(host, "$ErrorActionPreference='Stop'; $c=" + rows[0] + "; " + run)
+        script = ("$ErrorActionPreference='Stop'; $choices=@(" + ', '.join(rows) + "); "
+                  "Write-Host " + quote(launcher['label']) + "; "
+                  "for ($i=0; $i -lt $choices.Count; $i++) { Write-Host ('  {0}. {1}' -f ($i+1), $choices[$i].Label) }; "
+                  "Write-Host '  q. 닫기'; $n=0; "
+                  "while ($true) { $pick=Read-Host '선택'; if ($pick -eq 'q') { exit 0 }; "
+                  "if ([int]::TryParse($pick, [ref]$n) -and $n -ge 1 -and $n -le $choices.Count) { break }; "
+                  "Write-Host '번호를 다시 골라 주세요.' }; $c=$choices[$n-1]; " + run)
+        return self._windows_ssh(host, script)
 
     def rpc(self, host, op, args=None, timeout=30):
         if host.get('platform') == 'windows':

@@ -24,6 +24,10 @@ import uuid
 import windows_collector as wc
 
 REQUEST = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.:-]{7,127}\Z')
+
+
+class NotLoaded(ValueError):
+    """No PC server has this stored session open: it may be resumed into its project's server."""
 CONTROL_REQUEST = re.compile(r'[A-Za-z0-9_-]{8,100}\Z')
 PROOF_TTL = 45
 ARCHIVE_EFFECT = '선택한 세션을 종료하고 대화 기록을 보관합니다. 하위 에이전트도 함께 종료·보관을 요청합니다.'
@@ -285,9 +289,67 @@ class WindowsRuntime:
                                 'server': {'pid': process['pid'], 'start': process['start'], 'exe': wc._norm(process['exe'])}})
             except (OSError, ValueError, TimeoutError):
                 failures = True
+        if not matches and not failures:
+            raise NotLoaded('PC 원본 세션이 현재 서버에 열려 있지 않습니다.')
         if len(matches) != 1 or failures:
             raise ValueError('PC 세션의 정확한 소유 서버를 확인하지 못했습니다.')
         return matches[0]
+
+    def _project_endpoint(self, cwd):
+        """The running project server a stored session resumes into: the one named after its
+        Projects folder, else the only one named `<folder>-…`; None when none or several."""
+        folder = self.reader.project(cwd)
+        names = [path.parent.name for path in self.reader.endpoints()]
+        named = [name for name in names if name == folder] or [name for name in names if name.startswith(folder + '-')]
+        return self.reader.endpoint(named[0]) if len(named) == 1 else None
+
+    def _codex_resume(self, source):
+        identity = _identity(source)
+        rows = self.reader.database_rows(identity['id'])
+        if len(rows) != 1 or rows[0].get('archived') or source.get('cwd') and wc._norm(source['cwd']) != wc._norm(rows[0]['cwd']):
+            raise ValueError('PC 저장 기록과 작업 폴더를 확인하지 못했습니다.')
+        cwd = rows[0]['cwd']
+        if not isinstance(cwd, str) or not Path(wc._windows_path(cwd)).is_dir() or not self.reader.binary.is_file():
+            raise ValueError('PC 원본 작업 폴더나 Codex 실행 파일을 확인하지 못했습니다.')
+        endpoint = self._project_endpoint(cwd)
+        if endpoint is None:
+            # An SSH session is elevated: without its project's own (non-elevated) server, Codex
+            # would run an embedded runtime in that session instead.
+            raise ValueError('이 기록의 프로젝트 Codex 서버가 PC에서 꺼져 있습니다. 새 세션으로 그 프로젝트를 열어 서버를 켠 뒤 이어갈 수 있습니다.')
+        argv = [str(self.reader.binary), 'resume', identity['id'], '--remote', 'unix://' + Path(endpoint).as_posix(), '--cd', cwd]
+        return {'argv': argv, 'cwd': cwd, 'env': {'CODEX_HOME': str(self.reader.codex_home)},
+                'nativeSource': {**identity, 'cwd': cwd, 'kind': source.get('kind')}, 'connectionMode': 'attach', 'resumed': True}
+
+    def _claude_running(self, sid):
+        """Whether a live Claude process on this PC owns the session (its registry record)."""
+        for path in sorted((self.reader.claude_home / 'sessions').glob('[0-9]*.json'))[:256]:
+            try:
+                row = wc._json(path, self.reader.claude_home)
+            except (OSError, ValueError, TypeError):
+                continue
+            if not isinstance(row, dict) or row.get('sessionId') != sid or not path.stem.isdigit():
+                continue
+            process = self.reader.process_reader(int(path.stem))
+            if process and (not isinstance(row.get('procStart'), str) or row.get('procStart') == process.get('start')):
+                return True
+        return False
+
+    def _claude_resume(self, source):
+        """A stored Claude conversation no PC process runs, continued in a board terminal."""
+        identity = _identity(source)
+        if self._claude_running(identity['id']):
+            raise ValueError('이 Claude 세션은 PC 터미널에서 실행 중입니다. 그 터미널에서 이어가세요.')
+        path = self.reader._transcripts().get(identity['id'])
+        if path is None:
+            raise ValueError('PC Claude 기록을 확인하지 못했습니다.')
+        cwd = next((entry['cwd'] for entry in wc._head(path) if isinstance(entry.get('cwd'), str)), '')
+        if source.get('cwd') and wc._norm(source['cwd']) != wc._norm(cwd):
+            raise ValueError('PC Claude 기록의 작업 폴더가 바뀌었습니다.')
+        binary = self.reader.home / '.local/bin/claude.exe'
+        if not cwd or not Path(wc._windows_path(cwd)).is_dir() or not binary.is_file():
+            raise ValueError('PC 원본 작업 폴더나 Claude 실행 파일을 확인하지 못했습니다.')
+        return {'argv': [str(binary), '--resume', identity['id']], 'cwd': cwd, 'env': {},
+                'nativeSource': {**identity, 'cwd': cwd, 'kind': 'interactive'}, 'connectionMode': 'resume', 'resumed': True}
 
     def _claude(self, source):
         identity = _identity(source)
@@ -534,11 +596,16 @@ class WindowsRuntime:
     def terminal_plan(self, source):
         identity = _identity(source)
         if identity['agent'] == 'codex':
-            observed = self._codex(source, time.monotonic() + 12)
+            try:
+                observed = self._codex(source, time.monotonic() + 12)
+            except NotLoaded:
+                return self._codex_resume(source)
             self._verify_endpoint(observed)
             argv = [str(self.reader.binary), 'resume', identity['id'], '--remote', 'unix://' + Path(observed['path']).as_posix(), '--cd', observed['cwd']]
             cwd = observed['cwd']
         else:
+            if source.get('kind') != 'background' and not self._claude_running(identity['id']):
+                return self._claude_resume(source)
             observed = self._claude(source)
             if observed['row'].get('kind') != 'bg':
                 raise ValueError('이 Claude 세션은 원래 대화형 터미널에서 실행 중입니다. 정확한 연결을 지원하는 background 세션만 열 수 있습니다.')
@@ -550,15 +617,18 @@ class WindowsRuntime:
 
     def resume_preview(self, source):
         identity = _identity(source)
-        if identity['agent'] != 'codex':
-            return {'source': identity, 'allowed': False, 'blockedByBoard': False,
-                    'reason': '이 PC Claude 실행은 원본 터미널에서 이어가세요.'}
         try:
-            self._codex(source, time.monotonic() + 12)
+            if identity['agent'] != 'codex':
+                self._claude_resume(source)
+            else:
+                try:
+                    self._codex(source, time.monotonic() + 12)
+                except NotLoaded:
+                    self._codex_resume(source)
             return {'source': identity, 'allowed': True, 'blockedByBoard': False, 'reason': None}
-        except (OSError, ValueError, TimeoutError):
+        except (OSError, ValueError, TimeoutError) as exc:
             return {'source': identity, 'allowed': False, 'blockedByBoard': False,
-                    'reason': '이 PC 기록은 현재 원본 프로젝트 서버에 열려 있지 않습니다. PC에서 같은 세션을 연 뒤 연결할 수 있습니다.'}
+                    'reason': str(exc) or '이 PC 기록을 다시 열 수 없습니다.'}
 
 
 def handle(request):

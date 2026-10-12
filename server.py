@@ -123,6 +123,30 @@ SECURITY_HEADERS = {
 }
 
 
+def windows_launcher_setting(value):
+    """`{label, choices: [{label, command, cwd}]}`: each command a program on a PC drive
+    (C:\\…, not a network share) and literal arguments (no control characters or double
+    quotes, which PowerShell 5.1 would pass on altered), each cwd a folder on a PC drive."""
+    bad = ValueError("PC 새 세션 선택지 형식이 올바르지 않습니다.")
+    text = lambda v, limit: isinstance(v, str) and 0 < len(v) <= limit and not any(ord(c) < 32 or c == '"' for c in v)
+    absolute = lambda v: text(v, 1024) and re.fullmatch(r"[A-Za-z]:[\\/].*", v) is not None
+    if not isinstance(value, dict) or set(value) - {"label", "choices"}:
+        raise bad
+    label, choices = value.get("label", "새 세션"), value.get("choices")
+    if not text(label, 64) or not isinstance(choices, list) or not 1 <= len(choices) <= 12:
+        raise bad
+    result = []
+    for choice in choices:
+        if (not isinstance(choice, dict) or set(choice) - {"label", "command", "cwd"} or not text(choice.get("label"), 64)
+                or not isinstance(choice.get("command"), list) or not 1 <= len(choice["command"]) <= 16
+                or not absolute(choice["command"][0]) or not all(text(arg, 4096) for arg in choice["command"][1:])
+                or "cwd" in choice and not absolute(choice["cwd"])):
+            raise bad
+        result.append({"label": choice["label"], "command": list(choice["command"]),
+                       **({"cwd": choice["cwd"]} if "cwd" in choice else {})})
+    return {"label": label, "choices": result}
+
+
 def load_hosts(path):
     hosts = []
     path = settings.safe_path(path, allow_missing=True)
@@ -134,7 +158,7 @@ def load_hosts(path):
     if not isinstance(rows, list) or not 1 <= len(rows) <= 16:
         raise ValueError("기기 설정은 1~16개 항목의 JSON 목록이어야 합니다.")
     for row in rows:
-        if (not isinstance(row, dict) or set(row) - {"name", "label", "local", "ssh", "python", "platform", "monitorOnly"}
+        if (not isinstance(row, dict) or set(row) - {"name", "label", "local", "ssh", "python", "platform", "monitorOnly", "launcher"}
                 or type(row.get("local", False)) is not bool or type(row.get("monitorOnly", False)) is not bool
                 or not isinstance(row.get("name"), str)
                 or not isinstance(row.get("python") or "/usr/bin/python3", str)
@@ -158,6 +182,11 @@ def load_hosts(path):
                       "ssh": row.get("ssh"), "python": python})
         if platform == "windows":
             hosts[-1]["platform"] = "windows"
+        if "launcher" in row:
+            # A Mac reads its own config.json launcher; a PC's 새 세션 choices live here.
+            if platform != "windows":
+                raise ValueError("기기 설정의 새 세션 선택지는 Windows 기기에만 둘 수 있습니다.")
+            hosts[-1]["launcher"] = windows_launcher_setting(row["launcher"])
         if row.get("monitorOnly"):
             # Only its hardware is read (설정 `hardware`): no sessions, terminals or launches.
             if row.get("local"):
@@ -1305,9 +1334,9 @@ class Workflow:
                             accounts.append({**presentation, "id": key, "agent": agent,
                                              "home": home, "available": True})
             if host.get("platform") == "windows":
-                accounts = [{**p, "available": p.get("agent") == "codex", "launchEnabled": False,
-                             "reason": None if p.get("agent") == "codex" else
-                             "Claude 대화형 세션은 실행한 터미널에서 입력할 수 있습니다."} for p in accounts]
+                # Opening and resuming a PC session is decided by the PC (terminal_plan); launching
+                # a new one is the host's 새 세션 menu.
+                accounts = [{**p, "available": True, "launchEnabled": False, "reason": None} for p in accounts]
             hosts.append({"name": host["name"], "label": host["label"], "online": status["ok"],
                 # The terminal's keys follow the host (⌘ and ⌥ mean Windows keys there).
                 **({"platform": "windows"} if host.get("platform") == "windows" else {}),
@@ -1323,7 +1352,11 @@ class Workflow:
     def new_session_status(self, host, online=True):
         """Whether this host's launcher can open "새 세션", read from that host's own settings."""
         if host.get("platform") == "windows":
-            return {"available": False, "label": None, "reason": WINDOWS_READ_ONLY}
+            if not host.get("launcher"):
+                return {"available": False, "label": None, "reason": "이 PC의 새 세션 선택지가 기기 설정에 없습니다."}
+            if not online:
+                return {"available": False, "label": None, "reason": "기기에 연결할 수 없습니다."}
+            return {"available": True, "label": host["launcher"]["label"], "reason": None}
         if host["local"]:
             from launch import new_session_status
             return new_session_status()
@@ -1376,8 +1409,8 @@ class Workflow:
         host = next((h for h in self.board.hosts if h["name"] == host_name), None)
         if host is None:
             raise ValueError("새 세션을 열 기기를 선택해 주세요.")
-        if host.get("platform") == "windows":
-            raise ValueError(WINDOWS_READ_ONLY)
+        if host.get("platform") == "windows" and not host.get("launcher"):
+            raise ValueError("이 PC의 새 세션 선택지가 기기 설정에 없습니다.")
         with self.lock:
             if request_id in self.requests:
                 previous, result = self.requests[request_id]
@@ -1392,6 +1425,11 @@ class Workflow:
                     from launch import new_session
                     spec = new_session()
                     label = spec["label"]
+                elif host.get("platform") == "windows":
+                    import collector
+                    label = host["launcher"]["label"]
+                    spec = {"argv": self.transfers.windows_launcher(host, host["launcher"]), "cwd": str(Path.home()),
+                            "env": collector.tool_env()}
                 else:
                     # Asked fresh: the host's settings decide, and its helper path is then known.
                     status = self.transfers.launcher(host, refresh=True)
@@ -1460,7 +1498,8 @@ class Workflow:
     def _native_of(host, agent, row):
         """A listed row as a terminal's native session, or None for rows that never count."""
         cwd = row.get("cwd")
-        if not isinstance(cwd, str) or not cwd.startswith("/"):
+        from pathlib import PureWindowsPath
+        if not isinstance(cwd, str) or not (cwd.startswith("/") or PureWindowsPath(cwd).drive and PureWindowsPath(cwd).is_absolute()):
             return None
         if agent == "codex":
             if row.get("source") not in (None, "cli", "vscode") or not HOME_KEY.match(row.get("home") or ""):
@@ -1584,14 +1623,16 @@ class Workflow:
             allowed, reason = False, "원본 기기의 연결을 확인한 뒤 다시 시도해 주세요."
         if not same and not cross_host and source.get("phase") in ("working", "needs_input"):
             allowed, reason = False, "진행 중인 실행이나 승인 요청을 원래 터미널에서 마무리한 뒤 전환해 주세요."
-        if same and source["agent"] == "claude" and source.get("kind") != "background":
+        if same and source["agent"] == "claude" and source.get("kind") != "background" and not windows:
             allowed, reason = False, "이 Claude 세션은 기존 터미널에서 실행 중입니다. 백그라운드 세션만 직접 연결할 수 있어요."
+        windows_resumed = False
         if allowed and resume:
             preview = self.resume_preview(source)
             allowed, reason = preview["allowed"], preview.get("reason")
         elif allowed and windows:
             try:
-                self.transfers.rpc(host, "terminal_plan", {"source": source}, timeout=12)
+                spec = self.transfers.rpc(host, "terminal_plan", {"source": source}, timeout=12)
+                windows_resumed = spec.get("resumed") is True
             except (ValueError, RuntimeError, OSError) as exc:
                 allowed, reason = False, str(exc)
         config = settings.load()
@@ -1610,6 +1651,8 @@ class Workflow:
         summary = ("코드·미커밋 변경·최근 대화를 대상 기기로 넘겨 이어갑니다." if cross_host else
                    "같은 기기·계정에서 저장된 대화를 다시 엽니다. 메시지는 보내지 않습니다." if resume else
                    "기존 작업의 터미널에 연결합니다." if same else "작업 맥락을 자동으로 넘겨 새 터미널을 준비합니다.")
+        if windows_resumed:
+            summary = "PC에 저장된 대화를 그 PC의 터미널에서 다시 엽니다. 메시지는 보내지 않습니다."
         route_key = hashlib.sha256(json.dumps([self.identity(source), target], sort_keys=True).encode()).hexdigest()
         existing = next((item for item in self.terminals.list() if item.get("alive") and item.get("key", "").split(":")[0] == route_key), None)
         if allowed and existing:

@@ -29,6 +29,16 @@ CLAUDE_ROW = {**CLAUDE_REF, 'cwd': r'C:\Example\project', 'phase': 'unknown', 'k
 READ = {'phase': 'idle', 'messages': [{'role': 'assistant', 'messageId': 'answer-one', 'text': '예제 PC 결과'}],
         'readOnly': True, 'runtimeKnown': True}
 REASON = server.WINDOWS_READ_ONLY
+LAUNCHER = {'label': 'PC 새 세션', 'choices': [
+    {'label': 'Codex · 예제', 'command': ['C:\\Tools\\codex.exe', '--cd', 'C:\\Example\\project'], 'cwd': 'C:\\Example\\project'},
+    {'label': "Claude · it's", 'command': ['C:\\Tools\\claude.exe']}]}
+
+
+def decoded(argv):
+    command = argv[-1]
+    prefix = 'powershell.exe -NoProfile -EncodedCommand '
+    assert command.startswith(prefix), command
+    return base64.b64decode(command[len(prefix):]).decode('utf-16le')
 
 
 def setUpModule():
@@ -50,6 +60,24 @@ class WindowsConfigurationTest(unittest.TestCase):
             path = Path(temp) / 'hosts.json'
             path.write_text(json.dumps(rows))
             return server.load_hosts(path)
+
+    def test_only_a_pc_takes_literal_new_session_choices(self):
+        pc = {'name': 'example-pc', 'ssh': 'example-pc', 'platform': 'windows', 'launcher': LAUNCHER}
+        self.assertEqual(self.load([pc])[0]['launcher'], {'label': 'PC 새 세션', 'choices': LAUNCHER['choices']})
+        self.assertEqual(self.load([{**pc, 'launcher': {'choices': LAUNCHER['choices'][1:]}}])[0]['launcher']['label'], '새 세션')
+        with self.assertRaisesRegex(ValueError, 'Windows 기기에만'):
+            self.load([{'name': 'example-mac', 'ssh': 'example-mac', 'launcher': LAUNCHER}])
+        choice = LAUNCHER['choices'][0]
+        for bad in ({'choices': []}, {'choices': [choice] * 13}, {'choices': [choice], 'extra': 1},
+                    {'choices': [{**choice, 'command': ['codex.exe']}]},
+                    {'choices': [{**choice, 'command': ['\\\\server\\share\\codex.exe']}]},
+                    {'choices': [{**choice, 'command': [choice['command'][0], 'say "hi"']}]},
+                    {'choices': [{**choice, 'command': [choice['command'][0], 'line\nbreak']}]},
+                    {'choices': [{**choice, 'cwd': 'relative'}]},
+                    {'choices': [{**choice, 'label': ''}]},
+                    {'choices': [{**choice, 'run': 'x'}]}):
+            with self.assertRaisesRegex(ValueError, '새 세션 선택지 형식'):
+                self.load([{**pc, 'launcher': bad}])
 
     def test_existing_mac_shape_and_posix_command_remain_unchanged(self):
         mac = {'name': 'example-mac', 'label': '예제 Mac', 'local': False,
@@ -153,12 +181,51 @@ class WindowsRoutingTest(unittest.TestCase):
         codex = next(agent for agent in result['agents'] if agent['id'] == 'codex')
         self.assertTrue(all(account['available'] for account in codex['accounts']))
 
-    def test_launch_app_server_and_new_session_remain_unsupported(self):
+    def test_app_server_stays_unsupported_and_new_session_needs_the_hosts_choices(self):
         with patch.object(self.flow.transfers, 'rpc', side_effect=AssertionError('write RPC')):
-            for call in (lambda: self.flow.start_app_server({'host': HOST['name'], 'home': '.codex'}),
-                         lambda: self.flow.new_session({'host': HOST['name'], 'requestId': 'fixture-launch-0001'})):
-                with self.assertRaisesRegex(ValueError, REASON): call()
+            with self.assertRaisesRegex(ValueError, REASON):
+                self.flow.start_app_server({'host': HOST['name'], 'home': '.codex'})
+            with self.assertRaisesRegex(ValueError, '새 세션 선택지가 기기 설정에 없습니다'):
+                self.flow.new_session({'host': HOST['name'], 'requestId': 'fixture-launch-0001'})
         self.terms.reserve.assert_not_called()
+
+    def test_new_session_opens_the_hosts_menu_in_a_board_terminal(self):
+        host = self.board.hosts[0]
+        host['launcher'] = server.windows_launcher_setting(LAUNCHER)
+        created = []
+        reserve = Mock()
+        reserve.return_value.__enter__ = Mock(return_value=None)
+        reserve.return_value.__exit__ = Mock(return_value=False)
+        self.terms.reserve = reserve
+        self.terms.create = lambda key, argv, cwd, env, meta: created.append((key, argv, meta)) or {'id': 'fixture-term'}
+        with patch.object(self.flow.transfers, 'rpc', side_effect=AssertionError('no helper for a PC menu')), \
+                patch.object(self.flow.transfers, 'launcher', side_effect=AssertionError('no Mac launcher read')):
+            status = self.flow.new_session_status(host)
+            result = self.flow.new_session({'host': HOST['name'], 'requestId': 'fixture-launch-0002'})
+            again = self.flow.new_session({'host': HOST['name'], 'requestId': 'fixture-launch-0002'})
+        self.assertEqual(status, {'available': True, 'label': 'PC 새 세션', 'reason': None})
+        self.assertEqual((result, again), ({'terminal': {'id': 'fixture-term'}, 'mode': 'new-session'},) * 2)
+        self.assertEqual(len(created), 1, 'a repeated request opens no second terminal')
+        key, argv, meta = created[0]
+        self.assertEqual((meta['title'], meta['host'], meta['mode']), ('PC 새 세션', HOST['name'], 'new-session'))
+        self.assertEqual(argv[-2:-1], [HOST['ssh']])
+        self.assertIn('-tt', argv)
+        script = decoded(argv)
+        self.assertIn("Write-Host 'PC 새 세션'", script)
+        self.assertIn("@{Label='Codex · 예제'; Exe='C:\\Tools\\codex.exe'; Args=@('--cd', 'C:\\Example\\project'); "
+                      "Cwd='C:\\Example\\project'}", script)
+        self.assertIn("@{Label='Claude · it''s'; Exe='C:\\Tools\\claude.exe'; Args=@(); Cwd=''}", script)
+        self.assertIn("Read-Host '선택'", script)
+        self.assertNotIn(HOST['label'], script)
+        # One choice runs straight away, with no menu.
+        one = decoded(self.flow.transfers.windows_launcher(HOST, server.windows_launcher_setting(
+            {'choices': LAUNCHER['choices'][:1]})))
+        self.assertNotIn('Read-Host', one)
+        self.assertIn("& $c.Exe @($c.Args)", one)
+        self.board.state[HOST['name']]['ok'] = False
+        self.assertFalse(self.flow.new_session_status(host, online=False)['available'])
+        with self.assertRaisesRegex(RuntimeError, '연결할 수 없어'):
+            self.flow.new_session({'host': HOST['name'], 'requestId': 'fixture-launch-0003'})
 
     def test_same_windows_session_can_plan_terminal_without_reserving_it(self):
         with patch.object(self.flow.transfers, 'rpc', return_value={'argv': ['fixture'], 'cwd': ROW['cwd']}) as rpc, \

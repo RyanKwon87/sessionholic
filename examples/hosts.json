@@ -1,5 +1,6 @@
 [
   {"name": "local", "label": "이 컴퓨터", "local": true},
   {"name": "home", "label": "집 컴퓨터", "ssh": "my-home-computer", "python": "/usr/bin/python3"},
-  {"name": "office", "label": "사무실 컴퓨터", "ssh": "my-office-computer", "python": "/usr/bin/python3", "monitorOnly": true}
+  {"name": "office", "label": "사무실 컴퓨터", "ssh": "my-office-computer", "python": "/usr/bin/python3", "monitorOnly": true},
+  {"name": "pc", "label": "작업실 PC", "ssh": "my-windows-pc", "platform": "windows", "python": "C:\\Users\\example\\AppData\\Local\\Programs\\Python\\Python313\\python.exe", "launcher": {"label": "새 세션", "choices": [{"label": "Codex · project", "command": ["C:\\Users\\example\\AppData\\Local\\Programs\\Python\\Python313\\python.exe", "C:\\Users\\example\\scripts\\start-agent.py", "--agent", "codex", "--project", "project"], "cwd": "C:\\Users\\example\\Projects\\project"}, {"label": "Claude · project", "command": ["C:\\Users\\example\\AppData\\Local\\Programs\\Python\\Python313\\python.exe", "C:\\Users\\example\\scripts\\start-agent.py", "--agent", "claude", "--project", "project"], "cwd": "C:\\Users\\example\\Projects\\project"}]}}
 ]

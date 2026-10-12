@@ -111,6 +111,21 @@ class MonitorTest(unittest.TestCase):
         second = monitor.snapshot(refresh=True)["hosts"][0]
         self.assertEqual(second["cpu"]["percent"], 30)
 
+    def test_cpu_use_is_not_shown_across_a_restart_or_after_a_long_gap(self):
+        monitor, clock, _ = self.monitor([reading(100, 1000), reading(150, 1200, uptimeSeconds=60),
+                                          reading(250, 1400, uptimeSeconds=90), reading(900, 9000, uptimeSeconds=4000)])
+        monitor.snapshot(refresh=True)
+        clock[0] += 30
+        restarted = monitor.snapshot(refresh=True)["hosts"][0]
+        self.assertIsNone(restarted["cpu"]["percent"], "ticks before a restart are not compared")
+        clock[0] += 30
+        self.assertEqual(monitor.snapshot(refresh=True)["hosts"][0]["cpu"]["percent"], 50)
+        clock[0] += 3601
+        self.assertIsNone(monitor.snapshot(refresh=True)["hosts"][0]["cpu"]["percent"], "an hour's average is not now")
+        # A Windows power line it cannot tell is neither mains nor battery.
+        unknown = hardware_monitor.normalize(reading(1, 2, battery={"percent": 50, "charging": False, "power": None}))
+        self.assertEqual(unknown["battery"], {"percent": 50, "charging": False, "power": None})
+
     def test_a_failure_keeps_the_last_numbers_marked_and_waits_longer(self):
         monitor, clock, calls = self.monitor([reading(1, 10), RuntimeError("SSH 연결 실패"), RuntimeError("x"), reading(2, 20)])
         monitor.snapshot(refresh=True)
@@ -120,11 +135,14 @@ class MonitorTest(unittest.TestCase):
         self.assertEqual(stale["memory"]["total"], 16 * 2 ** 30)
         self.assertIn("연결하지 못했습니다", stale["error"])
         clock[0] += 30
-        monitor.snapshot(force=True)
-        self.assertEqual(len(calls), 2, "a failing machine waits interval × 2, even for a manual refresh")
-        clock[0] += 30
         monitor.snapshot(refresh=True)
-        clock[0] += 120
+        self.assertEqual(len(calls), 2, "a failing machine waits interval × 2")
+        monitor.snapshot(force=True)
+        self.assertEqual(len(calls), 3, "a manual refresh (a machine that just woke) skips the backoff")
+        clock[0] += 60
+        monitor.snapshot(refresh=True)
+        self.assertEqual(len(calls), 3, "then interval × 4")
+        clock[0] += 60
         recovered = monitor.snapshot(refresh=True)["hosts"][0]
         self.assertEqual((recovered["status"], recovered["error"]), ("ready", None))
         self.assertEqual(len(calls), 4)

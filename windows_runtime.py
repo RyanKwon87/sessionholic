@@ -296,11 +296,24 @@ class WindowsRuntime:
         return matches[0]
 
     def _project_endpoint(self, cwd):
-        """The running project server a stored session resumes into: the one named after its
-        Projects folder, else the only one named `<folder>-…`; None when none or several."""
-        folder = self.reader.project(cwd)
-        names = [path.parent.name for path in self.reader.endpoints()]
-        named = [name for name in names if name == folder] or [name for name in names if name.startswith(folder + '-')]
+        """The running project server a stored session under ~/Projects resumes into: the one
+        named after its Projects folder (any case). With no server of that name, the only
+        `<folder>-…` server that no Projects folder of its own name owns (a project whose
+        folder name differs). None otherwise, or when that server is not running."""
+        root = wc._windows_path(self.reader.home / 'Projects').rstrip('/') + '/'
+        path = wc._windows_path(cwd).rstrip('/')
+        if not path.casefold().startswith(root.casefold()):
+            return None
+        folder = path[len(root):].split('/')[0].casefold()
+        try:
+            names = sorted(entry.name for entry in (self.reader.codex_home / 'agents-servers').iterdir()
+                           if entry.is_dir())[:256]
+        except OSError:
+            return None
+        named = [name for name in names if name.casefold() == folder]
+        if not named:
+            named = [name for name in names if name.casefold().startswith(folder + '-')
+                     and not (self.reader.home / 'Projects' / name).exists()]
         return self.reader.endpoint(named[0]) if len(named) == 1 else None
 
     def _codex_resume(self, source):
@@ -321,13 +334,19 @@ class WindowsRuntime:
                 'nativeSource': {**identity, 'cwd': cwd, 'kind': source.get('kind')}, 'connectionMode': 'attach', 'resumed': True}
 
     def _claude_running(self, sid):
-        """Whether a live Claude process on this PC owns the session (its registry record)."""
+        """Whether a live Claude process on this PC owns the session (its registry record).
+        A record that cannot be read while its Claude process lives may be this one: unknown."""
         for path in sorted((self.reader.claude_home / 'sessions').glob('[0-9]*.json'))[:256]:
+            if not path.stem.isdigit():
+                continue
             try:
                 row = wc._json(path, self.reader.claude_home)
             except (OSError, ValueError, TypeError):
+                process = self.reader.process_reader(int(path.stem))
+                if process and self.reader._claude_executable(process.get('exe')):
+                    raise ValueError('PC Claude 실행 기록을 읽지 못했습니다. 잠시 뒤 다시 시도해 주세요.')
                 continue
-            if not isinstance(row, dict) or row.get('sessionId') != sid or not path.stem.isdigit():
+            if not isinstance(row, dict) or row.get('sessionId') != sid:
                 continue
             process = self.reader.process_reader(int(path.stem))
             if process and (not isinstance(row.get('procStart'), str) or row.get('procStart') == process.get('start')):
@@ -604,7 +623,8 @@ class WindowsRuntime:
             argv = [str(self.reader.binary), 'resume', identity['id'], '--remote', 'unix://' + Path(observed['path']).as_posix(), '--cd', observed['cwd']]
             cwd = observed['cwd']
         else:
-            if source.get('kind') != 'background' and not self._claude_running(identity['id']):
+            # No process runs it (a background run's record may outlive it): it continues here.
+            if not self._claude_running(identity['id']):
                 return self._claude_resume(source)
             observed = self._claude(source)
             if observed['row'].get('kind') != 'bg':

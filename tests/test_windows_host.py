@@ -79,6 +79,33 @@ class WindowsConfigurationTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, '새 세션 선택지 형식'):
                 self.load([{**pc, 'launcher': bad}])
 
+    def test_every_powershell_single_quote_is_doubled_and_altered_arguments_are_refused(self):
+        import transfer
+        # PowerShell also ends a single-quoted string at ‘ ’ ‚ ‛.
+        self.assertEqual(transfer.ps_quote("Ryan’s ‘x’ ‚y‛ 'z' $a `b; c"), "'Ryan’’s ‘‘x’’ ‚‚y‛‛ ''z'' $a `b; c'")
+        launcher = server.windows_launcher_setting({'label': 'Ryan’s PC', 'choices': [
+            {'label': 'Codex ’; Start-Process calc; ’', 'command': ['C:\\Tools\\codex.exe', 'it’s']},
+            {'label': 'two', 'command': ['C:\\Tools\\codex.exe']}]})
+        script = decoded([transfer.windows_encoded_command(transfer.windows_launcher_script(launcher))])
+        self.assertIn("Write-Host 'Ryan’’s PC'", script)
+        self.assertIn("Label='Codex ’’; Start-Process calc; ’’'", script)
+        self.assertIn("Args=@('it’’s')", script)
+        choice = LAUNCHER['choices'][0]
+        for argument in ('C:\\My Folder\\', 'say "hi"'):
+            with self.assertRaisesRegex(ValueError, '새 세션 선택지 형식'):
+                server.windows_launcher_setting({'choices': [{**choice, 'command': [choice['command'][0], argument]}]})
+        server.windows_launcher_setting({'choices': [{**choice, 'command': [choice['command'][0], 'C:\\Folder\\']}]})
+        long = [{**choice, 'command': [choice['command'][0]] + ['x' * 300] * 4} for _ in range(12)]
+        with self.assertRaisesRegex(ValueError, '너무 많거나 깁니다'):
+            server.windows_launcher_setting({'choices': long})
+        # A PC folder named with a curly quote stays one literal path in the terminal command.
+        spec = {'argv': ['C:\\Tools\\claude.exe', '--resume', SID], 'cwd': 'C:\\Projects\\b’; whoami; ’', 'env': {}}
+        script = decoded(Transfers([HOST], Path(tempfile.mkdtemp())).windows_terminal(HOST, spec))
+        self.assertIn("Set-Location -LiteralPath 'C:\\Projects\\b’’; whoami; ’’'; & ", script)
+        for argv in (['C:\\Tools\\codex.exe', '--cd', 'C:\\My Folder\\'], ['C:\\Tools\\codex.exe', 'a"b']):
+            with self.assertRaisesRegex(ValueError, '연결 정보'):
+                Transfers([HOST], Path(tempfile.mkdtemp())).windows_terminal(HOST, {**spec, 'argv': argv})
+
     def test_existing_mac_shape_and_posix_command_remain_unchanged(self):
         mac = {'name': 'example-mac', 'label': '예제 Mac', 'local': False,
                'ssh': 'example-mac', 'python': '/usr/bin/python3'}

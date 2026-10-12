@@ -131,7 +131,7 @@ def windows():
     if kernel32.GetSystemPowerStatus(ctypes.byref(power)) and power.BatteryFlag not in (128, 255) \
             and power.BatteryLifePercent <= 100:
         battery = {"percent": int(power.BatteryLifePercent), "charging": bool(power.BatteryFlag & 8),
-                   "power": "ac" if power.ACLineStatus == 1 else "battery"}
+                   "power": {1: "ac", 0: "battery"}.get(power.ACLineStatus)}  # 255: unknown
     model = None
     try:
         import winreg

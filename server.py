@@ -125,10 +125,13 @@ SECURITY_HEADERS = {
 
 def windows_launcher_setting(value):
     """`{label, choices: [{label, command, cwd}]}`: each command a program on a PC drive
-    (C:\\…, not a network share) and literal arguments (no control characters or double
-    quotes, which PowerShell 5.1 would pass on altered), each cwd a folder on a PC drive."""
+    (C:\\…, not a network share) and literal arguments (no control characters, nothing
+    PowerShell 5.1 would pass on altered), each cwd a folder on a PC drive. The whole menu
+    must fit one remote command line."""
+    from transfer import WINDOWS_COMMAND_LIMIT, windows_encoded_command, windows_launcher_script, windows_literal_argument
     bad = ValueError("PC 새 세션 선택지 형식이 올바르지 않습니다.")
-    text = lambda v, limit: isinstance(v, str) and 0 < len(v) <= limit and not any(ord(c) < 32 or c == '"' for c in v)
+    text = lambda v, limit: (isinstance(v, str) and 0 < len(v) <= limit and not any(ord(c) < 32 for c in v)
+                             and windows_literal_argument(v))
     absolute = lambda v: text(v, 1024) and re.fullmatch(r"[A-Za-z]:[\\/].*", v) is not None
     if not isinstance(value, dict) or set(value) - {"label", "choices"}:
         raise bad
@@ -144,7 +147,10 @@ def windows_launcher_setting(value):
             raise bad
         result.append({"label": choice["label"], "command": list(choice["command"]),
                        **({"cwd": choice["cwd"]} if "cwd" in choice else {})})
-    return {"label": label, "choices": result}
+    launcher = {"label": label, "choices": result}
+    if len(windows_encoded_command(windows_launcher_script(launcher))) > WINDOWS_COMMAND_LIMIT:
+        raise ValueError("PC 새 세션 선택지가 너무 많거나 깁니다.")
+    return launcher
 
 
 def load_hosts(path):
@@ -274,9 +280,9 @@ def collector_command(host, args, state_dir=None):
     if host["local"]:
         return [sys.executable, "-I", str(COLLECTOR)] + list(args)
     if host.get("platform") == "windows":
-        quote = lambda value: "'" + str(value).replace("'", "''") + "'"
+        from transfer import ps_quote as quote
         script = "$ErrorActionPreference='Stop'; $env:PYTHONIOENCODING='utf-8'; & " + " ".join(
-            quote(value) for value in [host.get("python") or "python.exe", "-I", "-"] + list(args)) + "; exit $LASTEXITCODE"
+            quote(str(value)) for value in [host.get("python") or "python.exe", "-I", "-"] + list(args)) + "; exit $LASTEXITCODE"
         encoded = base64.b64encode(script.encode("utf-16le")).decode("ascii")
         return ssh_command(host, "powershell.exe -NoProfile -NonInteractive -EncodedCommand " + encoded, state_dir)
     remote = (f"PATH={REMOTE_PATH} {shlex.quote(host['python'])} -I - "

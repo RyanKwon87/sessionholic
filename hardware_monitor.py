@@ -10,6 +10,7 @@ import threading
 import time
 
 MAX_BACKOFF = 8  # a failing machine is read at most every interval × 8
+MAX_CPU_WINDOW = 3600  # CPU use is shown only from two readings at most an hour apart
 
 
 def _count(value, limit=1 << 62):
@@ -38,7 +39,7 @@ def normalize(raw):
     battery = raw.get("battery")
     if isinstance(battery, dict) and type(battery.get("percent")) is int and 0 <= battery["percent"] <= 100:
         battery = {"percent": battery["percent"], "charging": battery.get("charging") is True,
-                   "power": "ac" if battery.get("power") == "ac" else "battery"}
+                   "power": battery.get("power") if battery.get("power") in ("ac", "battery") else None}
     else:
         battery = None
     return {"system": raw["system"],
@@ -70,7 +71,8 @@ class HardwareMonitor:
                 row = self.state[host["name"]]
                 if row["refreshing"] or not (refresh or force):
                     continue
-                spacing = self.manual_interval if force and not row["failures"] else \
+                # A refresh the user asks for (a machine that just woke, say) skips the backoff.
+                spacing = self.manual_interval if force else \
                     self.interval * min(2 ** row["failures"], MAX_BACKOFF) if row["failures"] else self.interval
                 if row["attemptedAt"] is None or now - row["attemptedAt"] >= spacing:
                     row.update(refreshing=True, attemptedAt=now)
@@ -95,10 +97,16 @@ class HardwareMonitor:
                 row["error"] = ("연결하지 못했습니다. 잠자기·오프라인이면 깨어난 뒤 다시 읽습니다."
                                 if isinstance(error, (RuntimeError, OSError)) else "기기 정보를 읽지 못했습니다.")
                 return
-            before = (row["data"] or {}).get("cpu", {}).get("ticks")
+            previous = row["data"] or {}
+            before = previous.get("cpu", {}).get("ticks")
             after = data["cpu"]["ticks"]
             row["cpuPercent"] = None
-            if before and after and after["total"] > before["total"] and after["busy"] >= before["busy"]:
+            # Ticks across a restart, or over more than an hour, are not "now".
+            restarted = (previous.get("uptimeSeconds") is not None and data["uptimeSeconds"] is not None
+                         and data["uptimeSeconds"] < previous["uptimeSeconds"])
+            recent = row["fetchedAt"] is not None and self.clock() - row["fetchedAt"] <= MAX_CPU_WINDOW
+            if (before and after and recent and not restarted
+                    and after["total"] > before["total"] and after["busy"] >= before["busy"]):
                 row["cpuPercent"] = max(0, min(100, _share(after["busy"] - before["busy"], after["total"] - before["total"])))
             row.update(data=data, fetchedAt=int(self.clock()), failures=0, error=None)
 

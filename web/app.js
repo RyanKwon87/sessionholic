@@ -1728,7 +1728,7 @@ function renderDetailTerminal(s) {
   if (mark) mark.textContent = terminalEstimated(terminal) ? "터미널 연결 추정" : "터미널 열림";
   box.title = terminalEstimated(terminal) ? "시작 시각으로 추정한 연결입니다. 터미널의 대화가 맞는지 확인해 주세요." : "";
   $("detail-terminal-open")?.setAttribute("aria-label",
-    terminal ? `열린 터미널로 가기: ${terminal.title || s.title || "열어 둔 터미널"}` : "열린 터미널로 가기");
+    terminal ? `열린 터미널로 가기: ${terminalTitle(terminal, s.title || "열어 둔 터미널")}` : "열린 터미널로 가기");
 }
 // "터미널로" in the conversation header: the terminal is looked up again on the
 // tap, so one closed meanwhile is never opened (the header just hides it).
@@ -5322,6 +5322,28 @@ function terminalStatus(text, connected = false) {
 function terminalInfo(terminal) {
   return { ...terminal?.metadata, ...terminal };
 }
+// A terminal is named after the session it runs once the board knows it (its
+// nativeSource): that session's board title, a 제목 수정 alias included. A
+// "새 세션" terminal that names no session keeps its launcher label with the
+// time it opened, so several of them stay apart.
+function terminalTitle(terminal, fallback = "열어 둔 터미널") {
+  const info = terminalInfo(terminal);
+  if (info.nativeSource?.host) {
+    const key = chatKey(info.nativeSource);
+    const session = allSessions().find((s) => chatKey(sourceOf(s)) === key);
+    if (session?.title) return session.title;
+  }
+  const title = info.title || fallback;
+  return info.mode === "new-session" && !info.nativeSource && Number.isInteger(info.createdAt)
+    ? `${title} · ${clock(info.createdAt)} 시작` : title;
+}
+// Session titles arrive with each snapshot: open terminals follow them.
+function renameTerminals() {
+  renderTerminals();
+  if (state.terminal && state.terminalVisible)
+    $("terminal-title").textContent = terminalTitle(state.terminal, "진행 중인 작업");
+  renderTerminalReturn();
+}
 function terminalCloseCopy(terminal) {
   const mode = terminal?.mode || terminal?.metadata?.mode;
   if (mode === "attach") return {
@@ -5605,7 +5627,7 @@ async function openTerminal(terminal, { recordHistory = true } = {}) {
   const shown = presenting ? navTransition("present", () => showTerminalScreen(true)) : (showTerminalScreen(true), null);
   updateThemeColor();
   closeEvents();
-  $("terminal-title").textContent = terminal.title || "진행 중인 작업";
+  $("terminal-title").textContent = terminalTitle(terminal, "진행 중인 작업");
   $("terminal-route").textContent = targetLabel(terminalInfo(terminal));
   const nativeHost = terminalInfo(terminal).nativeSource?.host || terminalInfo(terminal).host;
   $("terminal-back").setAttribute("aria-label", `${hostLabel(nativeHost)}의 작업을 보드에서 보기`);
@@ -5863,7 +5885,7 @@ function renderTerminalReturn() {
   const info = terminalInfo(state.terminal);
   const host = capsHost(info.host)?.label || info.host;
   $("terminal-return-label").textContent = exists
-    ? [state.terminal.title || "열어 둔 터미널", host].filter(Boolean).join(" · ")
+    ? [terminalTitle(state.terminal), host].filter(Boolean).join(" · ")
     : "";
   $("return-terminal").setAttribute?.("aria-label", exists ? `열린 터미널로 돌아가기: ${$("terminal-return-label").textContent}` : "열린 터미널로 돌아가기");
 }
@@ -6241,7 +6263,7 @@ function renderTerminals() {
     node.dataset.action = "open";
     const labels = el("span", "running-terminal-copy");
     labels.append(
-      el("strong", "running-terminal-title", terminal.title || "열어 둔 터미널"),
+      el("strong", "running-terminal-title", terminalTitle(terminal)),
       el("span", "running-terminal-meta", targetLabel(terminalInfo(terminal))),
     );
     const arrow = el("span", null, "↗");
@@ -6256,7 +6278,7 @@ function renderTerminals() {
     const close = button(copy.action, `running-terminal-close${copy.danger ? " danger-quiet" : ""}`, () => closeTerminal(terminal.id));
     close.dataset.terminalId = terminal.id;
     close.dataset.action = "close";
-    close.setAttribute("aria-label", `${terminal.title || "터미널"} ${copy.action}`);
+    close.setAttribute("aria-label", `${terminalTitle(terminal, "터미널")} ${copy.action}`);
     row.append(node, close);
     list.append(row);
     if (restoreFocus?.id === terminal.id)
@@ -6447,7 +6469,7 @@ function closeTerminal(id) {
     (state.terminal?.id === id ? state.terminal : null);
   if (!terminal) return;
   const copy = terminalCloseCopy(terminal);
-  state.closingTerminal = { ...terminal, id, title: terminal.title || "열어 둔 터미널", copy, trigger: document.activeElement };
+  state.closingTerminal = { ...terminal, id, title: terminalTitle(terminal), copy, trigger: document.activeElement };
   $("close-terminal-title").textContent = copy.title;
   $("close-terminal-description").textContent = copy.description;
   $("close-terminal-name").textContent = state.closingTerminal.title;
@@ -6754,6 +6776,7 @@ async function poll(refresh = false, { capabilities = true } = {}) {
     $("app").hidden = false;
     notice();
     render();
+    renameTerminals();
     const revision = capabilitiesRevision(state.snapshot);
     const boot = typeof snapshot?.bootId === "string" ? snapshot.bootId : null;
     // Another server process: its CSRF token is read at once, even on a read an

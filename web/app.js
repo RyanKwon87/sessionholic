@@ -2301,9 +2301,9 @@ function setChromeVisible(visible, { stickBottom = false } = {}) {
   setReading(!visible, { stickBottom });
   const toggle = $("focus-toggle");
   if (toggle) {
-    toggle.textContent = visible ? "집중 모드" : "복원";
+    toggle.textContent = visible ? "집중 모드" : "집중 모드 해제";
     toggle.setAttribute("aria-pressed", String(!visible));
-    toggle.setAttribute("aria-label", visible ? "대화 집중 모드" : "대화 도구 복원");
+    toggle.setAttribute("aria-label", visible ? "대화 집중 모드" : "집중 모드 해제");
   }
   rememberConversationView();
 }

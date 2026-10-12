@@ -38,4 +38,12 @@
   }
   var size = read("textSize");
   if (size === "small" || size === "large") root.setAttribute("data-text-size", size);
+  // An iPad home-screen app: iPadOS draws its window controls over the top-left corner
+  // (style.css gives it more top room). iPadOS Safari names itself a Mac with touch.
+  var nav = window.navigator || {};
+  var agent = String(nav.userAgent || "");
+  var ipad = /iPad/.test(agent) || (/Macintosh/.test(agent) && (nav.maxTouchPoints || 0) > 1);
+  var standalone = nav.standalone === true ||
+    !!(window.matchMedia && window.matchMedia("(display-mode: standalone)").matches);
+  if (ipad && standalone) root.setAttribute("data-ipad-app", "");
 })();

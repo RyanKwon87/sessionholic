@@ -10,6 +10,7 @@ const INSTANCE = (() => {
     shortName: "세션홀릭",
     storagePrefix: "sessionholic:",
     historyKey: "sessionholic",
+    cachePrefix: "sessionholic-",
     attachmentsDir: ".sessionholic-attachments",
   };
   const valid = {
@@ -17,6 +18,7 @@ const INSTANCE = (() => {
     shortName: (value) => value.length > 0 && value.length <= 256,
     storagePrefix: (value) => /^[A-Za-z0-9_.:-]{1,32}$/.test(value),
     historyKey: (value) => /^[A-Za-z][A-Za-z0-9_]{0,31}$/.test(value),
+    cachePrefix: (value) => /^[A-Za-z0-9][A-Za-z0-9_.-]{0,39}$/.test(value),
     attachmentsDir: (value) => /^[A-Za-z0-9._-]{1,64}$/.test(value) && value !== "." && value !== "..",
   };
   try {
@@ -54,6 +56,8 @@ const POLL_MS = 60000;
 const RECENT_SECONDS = 3 * 24 * 3600;
 // Every touch decision reads its thresholds here, so tuning on a real phone
 // changes only this object (distances in CSS px, times in ms, speeds in px/ms).
+// Conversations open with their bars folded (집중 모드); 집중 모드 해제 or a tap brings them back.
+const CONVERSATION_OPENS_FOCUSED = true;
 const GESTURE = Object.freeze({
   longPressMs: 450, // a press held this long opens the menu (cards, messages)
   pressSlopPx: 10, // drift allowed before a press becomes a drag (long press, swipe, pull)
@@ -579,6 +583,27 @@ function openRequestedSession() {
 // as "질문 불러오기" would, so the choices are there without another tap.
 function answerOnOpen(s) {
   state.answerOnOpen = { key: s.key, until: Date.now() + 30000 };
+}
+// 설정 › 캐시 지우고 새로고침: this board's shell caches go, and a worker that receives no
+// notifications is unregistered (one that does keeps its subscription and only updates).
+// Other applications' caches and every stored preference stay.
+async function hardReload() {
+  const button = $("hard-reload");
+  if (button) button.disabled = true;
+  try {
+    const keys = (await globalThis.caches?.keys?.()) || [];
+    await Promise.all(keys.filter((key) => typeof key === "string" && key.startsWith(INSTANCE.cachePrefix))
+      .map((key) => globalThis.caches.delete(key)));
+    const registrations = (await globalThis.navigator?.serviceWorker?.getRegistrations?.()) || [];
+    for (const registration of registrations) {
+      const subscribed = await Promise.resolve(registration.pushManager?.getSubscription?.()).catch(() => null);
+      if (subscribed) await Promise.resolve(registration.update?.()).catch(() => {});
+      else await Promise.resolve(registration.unregister?.()).catch(() => {});
+    }
+  } catch {
+    // Reload anyway: the fresh page reads everything from the board again.
+  }
+  window.location.reload();
 }
 function closeSettings() {
   if (!$("settings-dialog").open) return;
@@ -2387,10 +2412,11 @@ function drawDetail(s) {
   jump.setAttribute("aria-label", "대화 맨 아래로");
   list.addEventListener("scroll", () => readingScroll(list), { passive: true });
   bindMessageGestures(list);
-  state.chromeVisible = savedView ? savedView.chromeVisible : true;
+  // A conversation opens in focus mode; the same tab reopening it keeps how it was left.
+  state.chromeVisible = savedView ? savedView.chromeVisible : !CONVERSATION_OPENS_FOCUSED;
   pane.classList?.remove("is-reading");
   pane.classList?.remove("is-typing");
-  // Shown once, the first time scrolling hides the bars on a phone.
+  // Shown once on a touch screen, the first time the bars are folded away.
   const hint = el("p", "tap-hint", "화면을 탭하면 메뉴가 나타나요");
   hint.id = "tap-hint";
   hint.hidden = true;
@@ -2401,6 +2427,7 @@ function drawDetail(s) {
   prompt.setAttribute("aria-live", "polite");
   pane.append(bar, sync, list, jump, hint, prompt, buildChatComposer(s), buildContinuePanel(s));
   setChromeVisible(state.chromeVisible);
+  if (!state.chromeVisible && touchDevice()) showTapHint();
 }
 // Questions and approvals drawn by the CLI in the board's terminal, answered
 // here with the same keys a person would press. Nothing is sent until the
@@ -7331,6 +7358,7 @@ window.addEventListener("DOMContentLoaded", () => {
   $("settings").addEventListener("click", openSettings);
   $("settings-close").addEventListener("click", closeSettings);
   $("settings-done").addEventListener("click", closeSettings);
+  $("hard-reload")?.addEventListener("click", hardReload);
   $("settings-dialog").addEventListener("cancel", (event) => {
     event.preventDefault();
     closeSettings();

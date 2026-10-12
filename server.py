@@ -393,7 +393,7 @@ def page_names(names=None):
     names = names if names is not None else NAMES
     return {"title": names["brand"]["title"], "shortName": names["brand"]["shortName"],
             "storagePrefix": names["web"]["storagePrefix"], "historyKey": names["web"]["historyKey"],
-            "attachmentsDir": names["remote"]["attachmentsDir"]}
+            "cachePrefix": names["web"]["cachePrefix"], "attachmentsDir": names["remote"]["attachmentsDir"]}
 
 
 def render_page(text, names=None):

@@ -126,7 +126,7 @@ function client(
   vm.runInContext(messageSource, context);
   vm.runInContext(source, context);
   const api = vm.runInContext(
-    "({state,api,sourceOf,accountOf,sendInput,pasteDraft,prepareDraftPaste,startDraftComposition,endDraftComposition,inputDraft,stopTerminalReader,startTerminalReader,closePlan,navigateView,backToList,backFromTerminal,closeTerminal,cancelTerminalClose,confirmTerminalClose,populateAccount,populateRoute,updateContinue,renderPlan,launchPlan,openTerminal,saveDraft,draftKey,refreshTerminals,renderTerminals,renderTerminalReturn,renderFilters,terminalCloseCopy,warnDraftUnload,preparePlan,renderGroups,renderMessages,loadDetail,chatKey,chatEntry,currentChat,chatSupported,chatRecovery,recoverChatSession,openChatTerminal,chatAttachmentsSupported,buildChatComposer,sendChat,loadChatState,applyChatReceipt,uploadChatFiles,pasteChat,scheduleChatPoll,stopChatPolling,openNativeChat,allSessions,buildContinuePanel,chatReceiptCopy,returnToBoard,readChatClipboard,accountDisplay,sessionAccountLabel,closeChatToolsOutside,closeChatToolsEscape,drawDetail,refreshDetail,loadCapabilities,matches,recoverConnection,networkOffline,poll,select,focusDetailBack,restoreSelectedCardFocus,showLogin,lock,beginAuthEpoch,resizeChatInput,updateViewport,draftKeydown,configureTerminalKeyboard,queueTerminalScroll,flushTerminalScroll,terminalScrollEnd,resetTerminalScroll,renderAttention,chatPollDelay,pullRefresh,readingScroll,renderJump,pullDistance,listScroll,setReading,renderPrompt,promptAction,renderUsage,loadUsage,applyTheme,setTheme,updateThemeColor,haptic,navTransition,setDetailShown,chatVisible,sheetRelease,BottomSheet,sheet,openSettings,closeSettings,setTyping,pinchFontSize,setTerminalFontSize,loadXterm,assetUrl,syncEvents,closeEvents,eventsHealthy,renderFreshness,schedule,touchDevice,togglePhaseFilter,renderCounts,createLongPress,swipeIntent,swipeRelease,groupMessageRows,setTextSize,applyTextSize,renderConnectivity,terminalForSession,swipeActionFor,openMessageMenu,openCardMenu,messageActions,outboxShape,outboxMatches,outboxOrigin,settleOutbox,retryOutbox,renderAttachmentTiles,attachmentThumb,sendUpload,openActionSheet,closeActionSheet,setListCollapsed,closeSwipe,settleSwipe,prepareSwipe,runSwipeAction,GESTURE,setChromeVisible,toggleChrome,revealChrome,isChromeTap,snapshotAnnounced,updateChatComposer,capabilitiesRevision,toolKindOf,userMessageParts,formatElapsed,tickWorking,renderTerminalMarks,renderDetailTerminal,terminalsAnnounced,goToSessionTerminal,rememberTerminal,terminalMenu,updateTerminalMenu,chooseTerminalMenu,clearTerminalMenu,renderNewSession,openNewSession,startNewSession,startAppServer,rememberConversationView,restoreConversationView,conversationIdentity,initiatorOf,initiatorLabel,documentKeydown,sessionCategoryOf,setSessionCategory,renderSessionCategories,prepareSessionListFor,sessionCategoryKeydown,render,resetFilters,terminalTitle,renameTerminals,requestedSessionFrom,requestSessionOpen,openRequestedSession,answerOnOpen})",
+    "({state,api,sourceOf,accountOf,sendInput,pasteDraft,prepareDraftPaste,startDraftComposition,endDraftComposition,inputDraft,stopTerminalReader,startTerminalReader,closePlan,navigateView,backToList,backFromTerminal,closeTerminal,cancelTerminalClose,confirmTerminalClose,populateAccount,populateRoute,updateContinue,renderPlan,launchPlan,openTerminal,saveDraft,draftKey,refreshTerminals,renderTerminals,renderTerminalReturn,renderFilters,terminalCloseCopy,warnDraftUnload,preparePlan,renderGroups,renderMessages,loadDetail,chatKey,chatEntry,currentChat,chatSupported,chatRecovery,recoverChatSession,openChatTerminal,chatAttachmentsSupported,buildChatComposer,sendChat,loadChatState,applyChatReceipt,uploadChatFiles,pasteChat,scheduleChatPoll,stopChatPolling,openNativeChat,allSessions,buildContinuePanel,chatReceiptCopy,returnToBoard,readChatClipboard,accountDisplay,sessionAccountLabel,closeChatToolsOutside,closeChatToolsEscape,drawDetail,refreshDetail,loadCapabilities,matches,recoverConnection,networkOffline,poll,select,focusDetailBack,restoreSelectedCardFocus,showLogin,lock,beginAuthEpoch,resizeChatInput,updateViewport,draftKeydown,configureTerminalKeyboard,queueTerminalScroll,flushTerminalScroll,terminalScrollEnd,resetTerminalScroll,renderAttention,chatPollDelay,pullRefresh,readingScroll,renderJump,pullDistance,listScroll,setReading,renderPrompt,promptAction,renderUsage,loadUsage,applyTheme,setTheme,updateThemeColor,haptic,navTransition,setDetailShown,chatVisible,sheetRelease,BottomSheet,sheet,openSettings,closeSettings,setTyping,pinchFontSize,setTerminalFontSize,loadXterm,assetUrl,syncEvents,closeEvents,eventsHealthy,renderFreshness,schedule,touchDevice,togglePhaseFilter,renderCounts,createLongPress,swipeIntent,swipeRelease,groupMessageRows,setTextSize,applyTextSize,renderConnectivity,terminalForSession,swipeActionFor,openMessageMenu,openCardMenu,messageActions,outboxShape,outboxMatches,outboxOrigin,settleOutbox,retryOutbox,renderAttachmentTiles,attachmentThumb,sendUpload,openActionSheet,closeActionSheet,setListCollapsed,closeSwipe,settleSwipe,prepareSwipe,runSwipeAction,GESTURE,setChromeVisible,toggleChrome,revealChrome,isChromeTap,snapshotAnnounced,updateChatComposer,capabilitiesRevision,toolKindOf,userMessageParts,formatElapsed,tickWorking,renderTerminalMarks,renderDetailTerminal,terminalsAnnounced,goToSessionTerminal,rememberTerminal,terminalMenu,updateTerminalMenu,chooseTerminalMenu,clearTerminalMenu,renderNewSession,openNewSession,startNewSession,startAppServer,rememberConversationView,restoreConversationView,conversationIdentity,initiatorOf,initiatorLabel,documentKeydown,sessionCategoryOf,setSessionCategory,renderSessionCategories,prepareSessionListFor,sessionCategoryKeydown,render,resetFilters,terminalTitle,renameTerminals,requestedSessionFrom,requestSessionOpen,openRequestedSession,answerOnOpen,hardReload})",
     context,
   );
   api.state.csrf = "csrf-test";
@@ -5414,7 +5414,7 @@ test('the board text size is its own stored choice scaling the rem type scale, a
 
 test('theme-init applies a forced theme and text size before paint, keeps meta originals for auto, and survives blocked storage', () => {
   const source = fs.readFileSync(path.join(__dirname, '../web/theme-init.js'), 'utf8');
-  const run = (stored, { throws = false } = {}) => {
+  const run = (stored, { throws = false, extra = {} } = {}) => {
     const attributes = {};
     const meta = (content) => ({ attributes: { content }, getAttribute(name) { return this.attributes[name] ?? null; },
       setAttribute(name, value) { this.attributes[name] = String(value); } });
@@ -5422,7 +5422,7 @@ test('theme-init applies a forced theme and text size before paint, keeps meta o
     const document = { documentElement: { setAttribute(name, value) { attributes[name] = String(value); } },
       querySelectorAll: (selector) => (selector === 'meta[name="theme-color"]' ? metas : []) };
     const localStorage = { getItem(key) { if (throws) throw new Error('blocked'); return stored[key] ?? null; } };
-    vm.runInNewContext(source, { window: { localStorage }, document, JSON });
+    vm.runInNewContext(source, { window: { localStorage, ...extra }, document, JSON });
     return { attributes, metas };
   };
   const dark = run({ 'sessionholic:ui:theme': '"dark"', 'sessionholic:ui:textSize': '"large"' });
@@ -5435,6 +5435,18 @@ test('theme-init applies a forced theme and text size before paint, keeps meta o
   assert.equal(auto.metas[0].attributes['data-original'], undefined);
   assert.deepEqual(run({ 'sessionholic:ui:theme': '{not json' }).attributes, {});
   assert.deepEqual(run({}, { throws: true }).attributes, {}, 'blocked storage keeps the device defaults');
+  // An iPad home-screen app gets room for iPadOS's window controls; nothing else does.
+  const device = (userAgent, maxTouchPoints, standalone) => ({ navigator: { userAgent, maxTouchPoints },
+    matchMedia: (query) => ({ matches: standalone && query === '(display-mode: standalone)' }) });
+  const ipadOS = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15';
+  assert.deepEqual(run({}, { extra: device(ipadOS, 5, true) }).attributes, { 'data-ipad-app': '' });
+  assert.deepEqual(run({}, { extra: device('Mozilla/5.0 (iPad; CPU OS 18_0 like Mac OS X)', 5, true) }).attributes, { 'data-ipad-app': '' });
+  assert.deepEqual(run({}, { extra: device(ipadOS, 5, false) }).attributes, {}, 'the same iPad in a Safari tab');
+  assert.deepEqual(run({}, { extra: device('Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X)', 5, true) }).attributes, {});
+  assert.deepEqual(run({}, { extra: device(ipadOS, 0, true) }).attributes, {}, 'a Mac browser has no touch points');
+  const css = styleSheet();
+  assert.match(css, /:root\[data-ipad-app\] \{\s*--top-inset: max\(env\(safe-area-inset-top\), 36px\);/);
+  assert.equal((css.match(/env\(safe-area-inset-top\)/g) || []).length, 2, 'every other top inset reads --top-inset');
   const html = indexPage();
   const init = html.indexOf('<script src="/theme-init.js"></script>');
   assert.ok(init > 0, 'loaded without defer');
@@ -5535,11 +5547,13 @@ test('a long question menu keeps its first choices inline and lists every choice
 
 // A phone conversation (coarse pointer, phone width) with a scrolled transcript and a
 // controllable clock. `wide`: a tablet instead (coarse pointer, wide screen).
-function phoneConversation({ coarse = true, wide = false, timers = noChatTimers, fetchImpl } = {}) {
+// `folded`: as a conversation opens (집중 모드); otherwise the bars were brought back first.
+function phoneConversation({ coarse = true, wide = false, timers = noChatTimers, fetchImpl, folded = false } = {}) {
   const c = client(fetchImpl, timers);
   const { s, entry } = selectChat(c);
   c.drawDetail(s);
   const pane = c.get('detail'); pane.classList = classes();
+  if (!folded) c.setChromeVisible(true);
   const list = c.get('messages');
   // As after the first render (renderMessages keeps the position it set).
   Object.assign(list, { scrollHeight: 3000, clientHeight: 600, scrollTop: 2400, offsetTop: 80, lastScrollTop: 2400 });
@@ -5744,7 +5758,30 @@ test('questions and failures remain visible without overriding focus mode', asyn
   assert.equal(reading(), true, 'going offline keeps the tools folded');
 });
 
-test('a new conversation shows tools, and revisiting preserves focus mode and the one-time hint', () => {
+test('a conversation opens in focus mode; on a touch screen it says once how to bring the bars back', () => {
+  const writes = [];
+  const c = client(undefined, noChatTimers);
+  c.context.window.matchMedia = (query) => ({ matches: query === '(pointer: coarse)' });
+  c.context.localStorage = { getItem: () => null, setItem: (key, value) => writes.push([key, value]) };
+  const { s } = selectChat(c);
+  c.drawDetail(s);
+  assert.equal(c.state.chromeVisible, false, 'the bars are folded');
+  assert.equal(c.get('focus-toggle').textContent, '집중 모드 해제');
+  assert.equal(c.get('focus-toggle').attributes['aria-pressed'], 'true');
+  assert.equal(c.get('tap-hint').hidden, false, 'a touch screen is told how to bring them back');
+  assert.deepEqual(writes, [['sessionholic:ui:tapHint', 'true']]);
+  c.toggleChrome();
+  assert.equal(c.state.chromeVisible, true, 'one tap brings them back');
+  // A mouse screen opens folded too; its button says how to leave, so no hint.
+  const d = client(undefined, noChatTimers);
+  d.context.localStorage = { getItem: () => null, setItem() { throw new Error('no write'); } };
+  const { s: other } = selectChat(d);
+  d.drawDetail(other);
+  assert.equal(d.state.chromeVisible, false);
+  assert.equal(d.get('tap-hint').hidden, true);
+});
+
+test('bars brought back fold on a deliberate scroll, and revisiting preserves focus mode and the one-time hint', () => {
   const writes = [];
   const { c, list, scrollTo, reading } = phoneConversation();
   c.context.localStorage = { getItem: () => null, setItem: (key, value) => writes.push([key, value]) };
@@ -6153,6 +6190,31 @@ test('a long press on a tool group line (a button) opens the group menu and its 
   const before = timers.length;
   list.events.pointerdown({ pointerId: 2, pointerType: 'touch', clientX: 50, clientY: 50, target: onCopy });
   assert.equal(timers.slice(before).some((timer) => timer.delay === c.GESTURE.longPressMs), false);
+});
+
+test('clearing the cache removes only this board\'s shells and keeps the worker of a device that gets notifications', async () => {
+  const c = client(undefined, noChatTimers);
+  const deleted = [], actions = [];
+  let reloaded = 0;
+  c.context.caches = { keys: async () => ['sessionholic-shell-1a2b3c4d', 'another-app-shell', 'xsessionholic-shell', 'sessionholic-shell-v13'],
+    delete: async (key) => { deleted.push(key); return true; } };
+  const worker = (subscription, name) => ({ pushManager: { getSubscription: async () => subscription },
+    update: async () => actions.push('update ' + name), unregister: async () => actions.push('unregister ' + name) });
+  c.context.navigator = { serviceWorker: { getRegistrations: async () => [worker({ endpoint: 'x' }, 'notified'), worker(null, 'quiet')] } };
+  c.context.window.location = { reload: () => { reloaded += 1; } };
+  c.context.localStorage = { getItem: () => null, setItem() { throw new Error('no preference changes'); }, removeItem() { throw new Error('no preference changes'); } };
+  await c.hardReload();
+  assert.deepEqual(deleted, ['sessionholic-shell-1a2b3c4d', 'sessionholic-shell-v13'], "only this board's caches");
+  assert.deepEqual(actions, ['update notified', 'unregister quiet'], 'a notified device keeps its subscription');
+  assert.equal(reloaded, 1);
+  // Without caches or a worker (an old browser) it still reloads.
+  const d = client(undefined, noChatTimers);
+  let again = 0;
+  d.context.window.location = { reload: () => { again += 1; } };
+  await d.hardReload();
+  assert.equal(again, 1);
+  const html = indexPage();
+  assert.match(html, /<button id="hard-reload" class="push-button" type="button" aria-describedby="reload-help">캐시 지우고 새로고침<\/button>/);
 });
 
 test('the installation meta names preferences, titles, history and attachment folders', () => {

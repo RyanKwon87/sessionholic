@@ -3273,7 +3273,12 @@ test('a hardware keyboard reaches the CLI: by key place, without taking a typed 
   const key = (fields, options) => c.terminalKeyFromEvent({ key: '', code: '', ...fields }, options);
   c.context.navigator = { platform: 'MacIntel' };
   assert.equal(key({ key: 'ㅊ', code: 'KeyC', ctrlKey: true }, { draftEmpty: false }), '\x03', 'a Korean layout still means Ctrl+C');
-  assert.equal(key({ key: 'å', code: 'KeyA', altKey: true }, { draftEmpty: false }), '\x1ba');
+  assert.equal(key({ key: 'å', code: 'KeyA', altKey: true }, { draftEmpty: false }), null, '⌥ prints into the input bar');
+  assert.equal(key({ key: '\\', code: 'Backslash', altKey: true }, { draftEmpty: true }), null, '⌥₩ is \\ on a Korean Mac');
+  assert.equal(key({ key: 'å', code: 'KeyA', altKey: true }, { focusless: true }), '\x1ba', 'with nothing focused ⌥ is Meta');
+  c.state.terminalMods = { ctrl: false, alt: true, meta: false };
+  assert.equal(key({ key: 'b', code: 'KeyB' }, { draftEmpty: false }), '\x1bb', "the bar's ⌥ is meant for the CLI");
+  c.state.terminalMods = { ctrl: false, alt: false, meta: false };
   assert.equal(key({ key: 'ArrowLeft' }, { draftEmpty: false }), null, 'a typed draft keeps its cursor');
   assert.equal(key({ key: 'ArrowLeft' }, { draftEmpty: true }), '\x1b[D');
   assert.equal(key({ key: 'Tab' }, { draftEmpty: false }), null, 'Tab leaves a typed draft (no keyboard trap)');
@@ -3282,7 +3287,11 @@ test('a hardware keyboard reaches the CLI: by key place, without taking a typed 
   assert.equal(key({ key: 'F2' }, { draftEmpty: false }), '\x1bOQ', 'function keys always');
   assert.equal(key({ key: 'PageDown' }, { draftEmpty: false }), '\x1b[6~');
   assert.equal(key({ key: 'v', code: 'KeyV', metaKey: true }, { draftEmpty: true }), null, '⌘V stays the browser paste');
-  assert.equal(key({ key: 'ArrowLeft', metaKey: true }, { draftEmpty: false }), '\x01');
+  assert.equal(key({ key: 'ArrowLeft', metaKey: true }, { draftEmpty: true }), '\x01');
+  for (const fields of [{ key: 'ArrowLeft', metaKey: true }, { key: 'Backspace', metaKey: true },
+    { key: 'Backspace', altKey: true }, { key: 'ArrowRight', altKey: true }, { key: 'ArrowLeft', ctrlKey: true }])
+    assert.equal(key(fields, { draftEmpty: false }), null, 'a typed draft keeps ⌘/⌥/Ctrl editing: ' + JSON.stringify(fields));
+  assert.equal(key({ key: 'Backspace', altKey: true }, { draftEmpty: true }), '\x1b\x7f');
   assert.equal(key({ key: 'a' }, { draftEmpty: true }), null, 'typing goes to the input bar');
   assert.equal(key({ key: 'a' }, { focusless: true }), 'a', 'with nothing focused it goes to the CLI');
   assert.equal(key({ key: 'Enter' }, { draftEmpty: true }), null, "the input bar's own Enter");
@@ -3293,7 +3302,14 @@ test('a hardware keyboard reaches the CLI: by key place, without taking a typed 
   // A PC browser keeps Ctrl+C/V for a typed draft; an empty one interrupts.
   c.context.navigator = { platform: 'Win32' };
   assert.equal(key({ key: 'v', code: 'KeyV', ctrlKey: true }, { draftEmpty: false }), null);
+  assert.equal(key({ key: 'v', code: 'KeyV', ctrlKey: true }, { draftEmpty: true }), null, 'Ctrl+V pastes into an empty bar too');
   assert.equal(key({ key: 'c', code: 'KeyC', ctrlKey: true }, { draftEmpty: true }), '\x03');
+  // AltGr (Ctrl+Alt on a PC) prints its character.
+  assert.equal(key({ key: '@', code: 'KeyQ', ctrlKey: true, altKey: true }, { draftEmpty: false }), null);
+  assert.equal(key({ key: '@', code: 'KeyQ', ctrlKey: true, altKey: true }, { focusless: true }), '@');
+  // A Mac: Ctrl+V reaches the CLI (it pastes images there).
+  c.context.navigator = { platform: 'MacIntel' };
+  assert.equal(key({ key: 'v', code: 'KeyV', ctrlKey: true }, { draftEmpty: true }), '\x16');
 });
 
 test('held bar modifiers combine with the next key from the bar, the input bar or xterm, then release', async () => {
@@ -3367,6 +3383,62 @@ test('with nothing focused a hardware keyboard types into the shown terminal, Ct
     'xterm sends its own keys');
   c.state.terminalVisible = false;
   assert.equal(c.terminalDocumentKey(event({ key: 'y', code: 'KeyY' })), false);
+});
+
+test('a focused control and Tab keep their keys, and a held bar modifier never waits for a later key', async () => {
+  const calls = [];
+  const c = client(async (url, opts) => {
+    calls.push(JSON.parse(opts.body).text);
+    return { ok: true, status: 200, json: async () => ({ ok: true }) };
+  }, noChatTimers);
+  const settle = () => new Promise((resolve) => setImmediate(resolve));
+  c.state.connected = true;
+  c.state.terminal = { id: 'term-1' };
+  c.state.terminalVisible = true;
+  const event = (fields) => ({ key: '', code: '', target: { closest: () => null }, defaultPrevented: false,
+    preventDefault() { this.defaultPrevented = true; }, ...fields });
+  // A button (보드, 닫기…) has the focus: its Enter, Space and Tab are its own.
+  c.context.document.activeElement = { tagName: 'BUTTON' };
+  for (const key of ['Enter', ' ', 'Tab', 'ArrowDown'])
+    assert.equal(c.terminalDocumentKey(event({ key })), false, key);
+  // Nothing focused: Tab still moves the focus to the page's controls.
+  c.context.document.activeElement = null;
+  assert.equal(c.terminalDocumentKey(event({ key: 'Tab' })), false);
+  assert.equal(c.terminalDocumentKey(event({ key: 'Tab', shiftKey: true })), false);
+  // ⌘ held on the bar and a letter it does not combine with: the letter types, ⌘ is released.
+  c.toggleTerminalMod('meta');
+  assert.equal(c.terminalDocumentKey(event({ key: 'a', code: 'KeyA' })), false);
+  assert.equal(c.state.terminalMods.meta, false);
+  c.toggleTerminalMod('ctrl');
+  c.draftKeydown({ key: '1', code: 'Digit1', target: { value: '' }, preventDefault() {} });
+  assert.equal(c.state.terminalMods.ctrl, false, 'Ctrl+1 is nothing: released before the next key');
+  c.toggleTerminalMod('alt');
+  c.draftKeydown({ key: 'Shift', code: 'ShiftLeft', shiftKey: true, target: { value: '' }, preventDefault() {} });
+  c.draftKeydown({ key: 'Process', keyCode: 229, target: { value: '' }, preventDefault() {} });
+  assert.equal(c.state.terminalMods.alt, true, 'a modifier or a composing key is not the next key');
+  c.clearTerminalMods();
+  c.toggleTerminalMod('ctrl');
+  c.draftBeforeInput({ inputType: 'insertText', data: '1', preventDefault() { throw new Error('typed as it is'); } });
+  assert.equal(c.state.terminalMods.ctrl, false, 'a soft keyboard key Ctrl does not combine with: typed, Ctrl released');
+  c.toggleTerminalMod('ctrl');
+  c.startDraftComposition({ target: c.get('terminal-draft') });
+  assert.equal(c.state.terminalMods.ctrl, false);
+  assert.match(c.get('draft-note').textContent, /보조키가 풀립니다/, 'released with a word, not silently');
+  c.endDraftComposition?.({ target: c.get('terminal-draft'), data: '' });
+  c.state.composing = false;
+  // ⌫ held from a typed draft stops at its start; held from an empty one it goes on.
+  const press = (value, repeat) => {
+    const keyEvent = { key: 'Backspace', code: 'Backspace', repeat, target: { value }, defaultPrevented: false,
+      preventDefault() { this.defaultPrevented = true; } };
+    c.draftKeydown(keyEvent);
+    return keyEvent.defaultPrevented;
+  };
+  assert.equal(press('hi', false), false);
+  assert.equal(press('', true), false, 'the draft emptied under a held ⌫: the CLI line is not touched');
+  assert.equal(press('', false), true);
+  assert.equal(press('', true), true);
+  await settle();
+  assert.deepEqual(calls, ['\x7f', '\x7f']);
 });
 
 test('a Windows host terminal hides ⌘ and names ⌥ Alt, and its word keys are the console\'s', () => {
@@ -6391,6 +6463,14 @@ test('clearing the cache removes only this board\'s shells and keeps the worker 
   d.context.window.location = { reload: () => { again += 1; } };
   await d.hardReload();
   assert.equal(again, 1);
+  // Offline, nothing is cleared: a shell without its cache could not come back.
+  const e = client(undefined, noChatTimers);
+  let cleared = 0;
+  e.context.caches = { keys: async () => { cleared += 1; return []; }, delete: async () => true };
+  e.context.window.location = { reload: () => { cleared += 1; } };
+  e.state.offline = true;
+  await e.hardReload();
+  assert.equal(cleared, 0);
   const html = indexPage();
   assert.match(html, /<button id="hard-reload" class="push-button" type="button" aria-describedby="reload-help">캐시 지우고 새로고침<\/button>/);
 });

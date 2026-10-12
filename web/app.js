@@ -592,6 +592,11 @@ function answerOnOpen(s) {
 // Other applications' caches and every stored preference stay.
 async function hardReload() {
   const button = $("hard-reload");
+  if (networkOffline()) {
+    // A cleared shell could not load again until the board is reachable.
+    toast("오프라인이라 캐시를 지우지 않았습니다. 연결된 뒤 다시 눌러 주세요.");
+    return;
+  }
   if (button) button.disabled = true;
   try {
     const keys = (await globalThis.caches?.keys?.()) || [];
@@ -607,6 +612,8 @@ async function hardReload() {
     // Reload anyway: the fresh page reads everything from the board again.
   }
   window.location.reload();
+  // Still here (a draft's leave prompt was declined): the button works again.
+  setTimeout(() => { if (button) button.disabled = false; }, 3000);
 }
 function closeSettings() {
   if (!$("settings-dialog").open) return;
@@ -2804,8 +2811,15 @@ function showTapHint() {
   prefs.set("tapHint", true);
   const hint = $("tap-hint");
   if (!hint) return;
-  const list = $("messages");
-  if (hint.style && Number.isFinite(list?.offsetTop)) hint.style.top = `${list.offsetTop + 12}px`;
+  // Below the header once the conversation is laid out (a phone still shows the list when a
+  // conversation is drawn); until then the stylesheet's place.
+  const place = () => {
+    const list = $("messages");
+    if (hint.style && list && list.offsetParent !== null && Number.isFinite(list.offsetTop) && list.offsetTop > 0)
+      hint.style.top = `${list.offsetTop + 12}px`;
+  };
+  place();
+  globalThis.requestAnimationFrame?.(place);
   hint.hidden = false;
   clearTimeout(state.tapHintTimer);
   state.tapHintTimer = setTimeout(() => { hint.hidden = true; }, TAP_HINT_MS);
@@ -5688,7 +5702,11 @@ function settleDraftComposition() {
 }
 function startDraftComposition(event) {
   if (event?.target && event.target !== $("terminal-draft")) return;
-  clearTerminalMods();
+  if (anyTerminalMod()) {
+    // An input method composing (한글, say) gives no key to combine with: said, not silent.
+    clearTerminalMods();
+    $("draft-note").textContent = "한글 등 조합 입력에서는 보조키가 풀립니다. 영문 입력으로 바꿔 다시 눌러 주세요.";
+  }
   if (state.draftPaste) {
     cancelDraftPaste();
     $("draft-note").textContent = "새 입력을 보관했습니다. 조합이 끝나면 붙여넣기를 눌러 주세요.";
@@ -6452,30 +6470,52 @@ function hardwareKeyName(event) {
 function appleBrowser() {
   return /Mac|iPhone|iPad|iPod/.test(String(globalThis.navigator?.platform || globalThis.navigator?.userAgent || ""));
 }
+const TERMINAL_MODIFIER_NAMES = ["Process", "Unidentified", "Dead", "Shift", "Control", "Alt", "Meta", "CapsLock",
+  "HangulMode", "HanjaMode", "KanaMode", "Lang1", "Lang2"];
 // The bytes a hardware key sends while a terminal shows, or null to leave it to the page
-// (or to the input bar's own editing: a typed draft keeps its cursor keys, Tab and Esc).
+// (or to the input bar: a typed draft keeps the keyboard's own editing, see below).
 function terminalKeyFromEvent(event, { draftEmpty = true, focusless = false } = {}) {
   if (!event || event.isComposing || event.keyCode === 229) return null;
   const sticky = state.terminalMods || {};
   const mods = { ctrl: !!(event.ctrlKey || sticky.ctrl), alt: !!(event.altKey || sticky.alt),
     shift: !!event.shiftKey, meta: !!(event.metaKey || sticky.meta) };
   const key = hardwareKeyName(event);
-  if (["Process", "Unidentified", "Dead", "Shift", "Control", "Alt", "Meta", "CapsLock", "HangulMode",
-    "HanjaMode", "KanaMode", "Lang1", "Lang2"].includes(key)) return null;
+  if (TERMINAL_MODIFIER_NAMES.includes(key)) return null;
   const options = { windows: terminalOnWindows() };
+  // A typed draft keeps the keyboard's own editing: ⌘ and ⌥ (Ctrl on a PC) arrows and ⌫ move
+  // and delete in it, and ⌥ prints its characters (⌥₩ is \ on a Korean Mac). Modifiers held
+  // on the bar are meant for the CLI.
+  const typed = !focusless && !draftEmpty;
   // ⌘C, ⌘V and the rest stay the browser's; ⌘ only edits the line.
-  if (mods.meta) return ["ArrowLeft", "ArrowRight", "Backspace"].includes(key) ? terminalKeyBytes(key, mods, options) : null;
+  if (mods.meta) {
+    if (!["ArrowLeft", "ArrowRight", "Backspace"].includes(key) || (typed && !sticky.meta)) return null;
+    return terminalKeyBytes(key, mods, options);
+  }
   if (TERMINAL_ALWAYS_KEYS.test(key)) return terminalKeyBytes(key, mods, options);
   if ([...key].length === 1) {
-    // A PC browser keeps Ctrl+C/V/X/A/Z for a typed draft; on Apple keyboards ⌘ does those.
-    if (mods.ctrl && !focusless && !draftEmpty && !appleBrowser() && "cvxaz".includes(key.toLowerCase())) return null;
+    const raw = String(event.key || "");
+    if (!appleBrowser() && event.ctrlKey && !sticky.ctrl) {
+      // AltGr (Ctrl+Alt on a PC) prints a character: into the input bar, or as it is.
+      if (event.altKey && [...raw].length === 1 && raw.toLowerCase() !== key.toLowerCase())
+        return focusless ? raw : null;
+      // A PC browser pastes with Ctrl+V and keeps Ctrl+C/X/A/Z for a typed draft;
+      // on Apple keyboards ⌘ does those (and Ctrl+V reaches the CLI, which pastes images).
+      if (!focusless && (key.toLowerCase() === "v" || (typed && "cxaz".includes(key.toLowerCase())))) return null;
+    }
+    if (!focusless && event.altKey && !sticky.alt && !mods.ctrl) return null;
     if (mods.ctrl || mods.alt || focusless) return terminalKeyBytes(key, mods, options);
     return null;
   }
   if (key === "Enter") return focusless ? terminalKeyBytes(key, mods, options) : null;
-  if (TERMINAL_EDIT_KEYS.has(key) && (draftEmpty || focusless || mods.ctrl || mods.alt))
+  if (TERMINAL_EDIT_KEYS.has(key) && (!typed || sticky.ctrl || sticky.alt))
     return terminalKeyBytes(key, mods, options);
   return null;
+}
+// A real key (not a modifier, nor one an input method is still composing): a held bar
+// modifier it does not combine with is released, so it never lands on a later key.
+function releasesTerminalMods(event) {
+  return !!event && !event.isComposing && event.keyCode !== 229
+    && !TERMINAL_MODIFIER_NAMES.includes(TERMINAL_KEY_ALIASES[event.key] || String(event.key || ""));
 }
 function terminalOnWindows() {
   return capsHost(terminalInfo(state.terminal).host)?.platform === "windows";
@@ -6528,18 +6568,29 @@ function pressTerminalKey(name) {
 function draftBeforeInput(event) {
   if (!anyTerminalMod() || event.inputType !== "insertText" || typeof event.data !== "string" || [...event.data].length !== 1) return;
   const bytes = terminalKeyBytes(event.data, { ...state.terminalMods }, { windows: terminalOnWindows() });
-  if (!bytes) return;
+  if (!bytes) {
+    // Typed as it is; the held modifier does not wait for a later key.
+    clearTerminalMods();
+    return;
+  }
   event.preventDefault();
   clearTerminalMods();
   sendTerminalBytes(bytes);
 }
 // With nothing focused (the terminal just opened), a hardware keyboard types into the CLI.
+// A focused control keeps its keys, and Tab moves the focus as on any page.
 function terminalDocumentKey(event) {
   if (!state.terminalVisible || event.defaultPrevented || editingText()) return false;
+  const active = document.activeElement;
+  if (active && active !== document.body && active !== document.documentElement) return false;
+  if (event.key === "Tab") return false;
   if (event.target?.closest?.(".xterm, dialog[open], details[open]")) return false;
   if (document.querySelector?.("dialog[open]")) return false;
   const bytes = terminalKeyFromEvent(event, { focusless: true });
-  if (!bytes) return false;
+  if (!bytes) {
+    if (releasesTerminalMods(event)) clearTerminalMods();
+    return false;
+  }
   event.preventDefault();
   clearTerminalMods();
   sendTerminalBytes(bytes);
@@ -6553,7 +6604,10 @@ function xtermKeyEvent(event) {
   const ours = anyTerminalMod() || event.metaKey || (event.altKey && ["ArrowLeft", "ArrowRight", "Backspace"].includes(event.key));
   if (!ours) return true;
   const bytes = terminalKeyFromEvent(event, { focusless: true });
-  if (!bytes) return true;
+  if (!bytes) {
+    if (releasesTerminalMods(event)) clearTerminalMods();
+    return true;
+  }
   event.preventDefault?.();
   state.terminalKeyHandled = true;
   clearTerminalMods();
@@ -6561,14 +6615,19 @@ function xtermKeyEvent(event) {
   return false;
 }
 function draftKeydown(event) {
-  // A hardware keyboard's terminal keys go to the CLI (see terminalKeyFromEvent).
-  const bytes = state.terminalVisible ? terminalKeyFromEvent(event, { draftEmpty: !event.target?.value }) : null;
+  // A hardware keyboard's terminal keys go to the CLI (see terminalKeyFromEvent). A key held
+  // down from a typed draft (⌫, say) stops at its start instead of going on into the CLI line.
+  const empty = !event.target?.value;
+  if (!event.repeat) state.draftPressEmpty = empty;
+  const draftEmpty = empty && (!event.repeat || state.draftPressEmpty !== false);
+  const bytes = state.terminalVisible ? terminalKeyFromEvent(event, { draftEmpty }) : null;
   if (bytes) {
     event.preventDefault();
     clearTerminalMods();
     sendTerminalBytes(bytes);
     return;
   }
+  if (state.terminalVisible && releasesTerminalMods(event)) clearTerminalMods();
   // Enter sends like a chat box; Shift+Enter keeps a newline in the draft.
   if (event.key !== "Enter" || event.shiftKey || event.isComposing || event.keyCode === 229) return;
   event.preventDefault();

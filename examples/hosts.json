@@ -1,4 +1,5 @@
 [
   {"name": "local", "label": "이 컴퓨터", "local": true},
-  {"name": "home", "label": "집 컴퓨터", "ssh": "my-home-computer", "python": "/usr/bin/python3"}
+  {"name": "home", "label": "집 컴퓨터", "ssh": "my-home-computer", "python": "/usr/bin/python3"},
+  {"name": "office", "label": "사무실 컴퓨터", "ssh": "my-office-computer", "python": "/usr/bin/python3", "monitorOnly": true}
 ]

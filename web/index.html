@@ -158,6 +158,13 @@
               aria-haspopup="dialog"
               hidden
             ><span id="usage-summary" class="usage-summary"></span></button>
+            <button
+              id="hardware"
+              class="list-chip usage-chip hardware-chip"
+              type="button"
+              aria-haspopup="dialog"
+              hidden
+            ><span id="hardware-summary" class="usage-summary"></span></button>
           </div>
           <div class="filters">
             <label class="search-wrap"
@@ -484,6 +491,17 @@
       <h2 id="usage-title">남은 사용량</h2>
       <div class="dialog-body">
         <div id="usage-body" class="usage-body"></div>
+      </div>
+    </dialog>
+    <dialog id="hardware-dialog" class="plan-dialog sheet" aria-labelledby="hardware-title">
+      <div class="sheet-handle" aria-hidden="true"></div>
+      <div class="dialog-top">
+        <p class="eyebrow">기기</p>
+        <button id="hardware-close" class="icon-button" type="button" aria-label="기기 상태 닫기">×</button>
+      </div>
+      <h2 id="hardware-title">기기 상태</h2>
+      <div class="dialog-body">
+        <div id="hardware-body" class="usage-body hardware-body"></div>
       </div>
     </dialog>
     <dialog id="filter-dialog" class="plan-dialog sheet" aria-labelledby="filter-title">

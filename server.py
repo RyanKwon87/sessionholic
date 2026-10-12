@@ -42,6 +42,7 @@ HERE = Path(__file__).resolve().parent
 WEB = HERE / "web"
 COLLECTOR = HERE / "collector.py"
 WINDOWS_COLLECTOR = HERE / "windows_collector.py"
+HARDWARE = HERE / "hardware.py"
 WINDOWS_READ_ONLY = "이 Windows 작업은 아직 지원하지 않습니다. 기존 세션의 대화·터미널·종료 기능을 사용해 주세요."
 # Installation names (instance.json); without one these are the public names.
 NAMES = instance.current()
@@ -133,8 +134,8 @@ def load_hosts(path):
     if not isinstance(rows, list) or not 1 <= len(rows) <= 16:
         raise ValueError("기기 설정은 1~16개 항목의 JSON 목록이어야 합니다.")
     for row in rows:
-        if (not isinstance(row, dict) or set(row) - {"name", "label", "local", "ssh", "python", "platform"}
-                or type(row.get("local", False)) is not bool
+        if (not isinstance(row, dict) or set(row) - {"name", "label", "local", "ssh", "python", "platform", "monitorOnly"}
+                or type(row.get("local", False)) is not bool or type(row.get("monitorOnly", False)) is not bool
                 or not isinstance(row.get("name"), str)
                 or not isinstance(row.get("python") or "/usr/bin/python3", str)
                 or not isinstance(row.get("label", row["name"]), str)
@@ -157,10 +158,17 @@ def load_hosts(path):
                       "ssh": row.get("ssh"), "python": python})
         if platform == "windows":
             hosts[-1]["platform"] = "windows"
+        if row.get("monitorOnly"):
+            # Only its hardware is read (설정 `hardware`): no sessions, terminals or launches.
+            if row.get("local"):
+                raise ValueError("이 보드의 기기는 모니터링 전용으로 둘 수 없습니다.")
+            hosts[-1]["monitorOnly"] = True
     if len({h["name"] for h in hosts}) != len(hosts):
         raise ValueError("기기 이름이 중복됩니다.")
     if sum(bool(h["local"]) for h in hosts) > 1:
         raise ValueError("로컬 기기는 한 항목만 등록할 수 있습니다.")
+    if all(h.get("monitorOnly") for h in hosts):
+        raise ValueError("세션을 수집할 기기가 하나 이상 있어야 합니다.")
     return hosts
 
 
@@ -319,6 +327,30 @@ def run_collector(host, args, timeout, state_dir=None):
         raise RuntimeError("수집기 응답 형식 오류")
     if args and args[0] == "snapshot" and result.get("error"):
         raise RuntimeError("세션 목록을 읽지 못했습니다. 마지막 기록은 유지됩니다.")
+    return result
+
+
+def run_hardware(host, state_dir=None, timeout=20):
+    """hardware.py's JSON for one machine: run here, or sent over SSH as stdin (no session code
+    and nothing left there), on a Mac or Windows alike."""
+    if host["local"]:
+        command, stdin = [sys.executable, "-I", str(HARDWARE)], None
+    else:
+        command, stdin = collector_command(host, [], state_dir), HARDWARE.read_bytes()
+    try:
+        done = subprocess.run(command, input=stdin, capture_output=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError("응답 시간 초과") from None
+    except OSError:
+        raise RuntimeError("기기 정보를 읽지 못했습니다") from None
+    if done.returncode != 0:
+        raise RuntimeError("SSH 연결 실패" if done.returncode == 255 else "기기 정보를 읽지 못했습니다")
+    try:
+        result = json.loads(done.stdout)
+    except ValueError:
+        raise ValueError("기기 정보 형식이 올바르지 않습니다.") from None
+    if not isinstance(result, dict) or result.get("error"):
+        raise ValueError("기기 정보를 읽지 못했습니다.")
     return result
 
 
@@ -2151,6 +2183,8 @@ class Handler(BaseHTTPRequestHandler):
                     return self.send_json(200, result)
                 if url.path == "/api/usage" and self.server.usage is not None:
                     return self.send_json(200, self.server.usage.snapshot(refresh=True))
+                if url.path == "/api/hardware" and getattr(self.server, "hardware", None) is not None:
+                    return self.send_json(200, self.server.hardware.snapshot(refresh=True))
                 if url.path == "/api/capabilities":
                     result = self.server.workflow.capabilities()
                     return self.send_json(200, {**result, "csrfToken": self.server.csrf,
@@ -2362,6 +2396,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_json(200, self.snapshot())
             if path == "/api/usage/refresh" and self.server.usage is not None:
                 return self.send_json(200, self.server.usage.snapshot(force=True))
+            if path == "/api/hardware/refresh" and getattr(self.server, "hardware", None) is not None:
+                return self.send_json(200, self.server.hardware.snapshot(force=True))
             if path == "/api/chat/state":
                 result = self.server.chat.state(data)
                 self.observe_work(result.get("route") or data.get("source"), result)
@@ -2499,7 +2535,7 @@ class BoardHTTPServer(ThreadingHTTPServer):
 
 
 def make_server(bind, port, board, token, terminals=None, workflow=None, state_dir=STATE_DIR, max_terminals=None,
-                tailscale_user=None, usage=None, automatic_work=False, push=True):
+                tailscale_user=None, usage=None, automatic_work=False, push=True, hardware=None):
     """`usage` (usage.UsageMeter) serves /api/usage; without it the routes stay 404."""
     if bind not in ("127.0.0.1", "::1"):
         raise ValueError("서버는 loopback에서만 실행할 수 있습니다.")
@@ -2511,6 +2547,7 @@ def make_server(bind, port, board, token, terminals=None, workflow=None, state_d
     server.daemon_threads = True
     server.board, server.token, server.tailscale_user = board, token, tailscale_user
     server.usage = usage
+    server.hardware = hardware
     server.goals = Goals(state_dir)
     server.session_labels = SessionLabels(state_dir)
     server.cookie_name = COOKIE + "_" + str(server.server_address[1])
@@ -2609,13 +2646,21 @@ def main(argv=None):
         parser.error(str(exc))
     if args.local_only:
         hosts = [h for h in hosts if h["local"]]
-    board = Board(hosts, max(args.interval, 60), state_dir=args.state_dir, live=not args.no_live)
+    # A monitoring-only machine never reaches the board: no sessions, launches or notices.
+    board = Board([h for h in hosts if not h.get("monitorOnly")], max(args.interval, 60), state_dir=args.state_dir,
+                  live=not args.no_live)
     meter = None
     if config["usage"] is not None:
         from usage import UsageMeter
         meter = UsageMeter(config["usage"])
+    hardware = None
+    if config["hardware"] is not None:
+        from hardware_monitor import HardwareMonitor
+        hardware = HardwareMonitor(hosts, lambda host: run_hardware(host, args.state_dir),
+                                   interval=config["hardware"]["intervalSeconds"],
+                                   manual_interval=config["hardware"]["manualIntervalSeconds"])
     httpd = make_server(args.bind, args.port, board, token, state_dir=args.state_dir,
-                        max_terminals=args.max_terminals, tailscale_user=tailscale_user, usage=meter,
+                        max_terminals=args.max_terminals, tailscale_user=tailscale_user, usage=meter, hardware=hardware,
                         automatic_work=args.auto_work and not args.no_auto_work, push=not args.no_push)
     collecting = "화면을 열 때와 알림을 받는 기기가 있을 때 수집합니다." if not args.no_push else "화면을 열 때만 수집합니다."
     print(f"{LOG_PREFIX}: http://127.0.0.1:{args.port}/ · {collecting}", file=sys.stderr)

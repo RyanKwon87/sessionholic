@@ -126,7 +126,7 @@ function client(
   vm.runInContext(messageSource, context);
   vm.runInContext(source, context);
   const api = vm.runInContext(
-    "({state,api,sourceOf,accountOf,sendInput,pasteDraft,prepareDraftPaste,startDraftComposition,endDraftComposition,inputDraft,stopTerminalReader,startTerminalReader,closePlan,navigateView,backToList,backFromTerminal,closeTerminal,cancelTerminalClose,confirmTerminalClose,populateAccount,populateRoute,updateContinue,renderPlan,launchPlan,openTerminal,saveDraft,draftKey,refreshTerminals,renderTerminals,renderTerminalReturn,renderFilters,terminalCloseCopy,warnDraftUnload,preparePlan,renderGroups,renderMessages,loadDetail,chatKey,chatEntry,currentChat,chatSupported,chatRecovery,recoverChatSession,openChatTerminal,chatAttachmentsSupported,buildChatComposer,sendChat,loadChatState,applyChatReceipt,uploadChatFiles,pasteChat,scheduleChatPoll,stopChatPolling,openNativeChat,allSessions,buildContinuePanel,chatReceiptCopy,returnToBoard,readChatClipboard,accountDisplay,sessionAccountLabel,closeChatToolsOutside,closeChatToolsEscape,drawDetail,refreshDetail,loadCapabilities,matches,recoverConnection,networkOffline,poll,select,focusDetailBack,restoreSelectedCardFocus,showLogin,lock,beginAuthEpoch,resizeChatInput,updateViewport,draftKeydown,configureTerminalKeyboard,queueTerminalScroll,flushTerminalScroll,terminalScrollEnd,resetTerminalScroll,renderAttention,chatPollDelay,pullRefresh,readingScroll,renderJump,pullDistance,listScroll,setReading,renderPrompt,promptAction,renderUsage,loadUsage,applyTheme,setTheme,updateThemeColor,haptic,navTransition,setDetailShown,chatVisible,sheetRelease,BottomSheet,sheet,openSettings,closeSettings,setTyping,pinchFontSize,setTerminalFontSize,loadXterm,assetUrl,syncEvents,closeEvents,eventsHealthy,renderFreshness,schedule,touchDevice,togglePhaseFilter,renderCounts,createLongPress,swipeIntent,swipeRelease,groupMessageRows,setTextSize,applyTextSize,renderConnectivity,terminalForSession,swipeActionFor,openMessageMenu,openCardMenu,messageActions,outboxShape,outboxMatches,outboxOrigin,settleOutbox,retryOutbox,renderAttachmentTiles,attachmentThumb,sendUpload,openActionSheet,closeActionSheet,setListCollapsed,closeSwipe,settleSwipe,prepareSwipe,runSwipeAction,GESTURE,setChromeVisible,toggleChrome,revealChrome,isChromeTap,snapshotAnnounced,updateChatComposer,capabilitiesRevision,toolKindOf,userMessageParts,formatElapsed,tickWorking,renderTerminalMarks,renderDetailTerminal,terminalsAnnounced,goToSessionTerminal,rememberTerminal,terminalMenu,updateTerminalMenu,chooseTerminalMenu,clearTerminalMenu,renderNewSession,openNewSession,startNewSession,startAppServer,rememberConversationView,restoreConversationView,conversationIdentity,initiatorOf,initiatorLabel,documentKeydown,sessionCategoryOf,setSessionCategory,renderSessionCategories,prepareSessionListFor,sessionCategoryKeydown,render,resetFilters,terminalTitle,renameTerminals,requestedSessionFrom,requestSessionOpen,openRequestedSession,answerOnOpen,hardReload,terminalKeyBytes,terminalKeyFromEvent,pressTerminalKey,toggleTerminalMod,clearTerminalMods,renderTerminalMods,draftBeforeInput,terminalDocumentKey,xtermKeyEvent})",
+    "({state,api,sourceOf,accountOf,sendInput,pasteDraft,prepareDraftPaste,startDraftComposition,endDraftComposition,inputDraft,stopTerminalReader,startTerminalReader,closePlan,navigateView,backToList,backFromTerminal,closeTerminal,cancelTerminalClose,confirmTerminalClose,populateAccount,populateRoute,updateContinue,renderPlan,launchPlan,openTerminal,saveDraft,draftKey,refreshTerminals,renderTerminals,renderTerminalReturn,renderFilters,terminalCloseCopy,warnDraftUnload,preparePlan,renderGroups,renderMessages,loadDetail,chatKey,chatEntry,currentChat,chatSupported,chatRecovery,recoverChatSession,openChatTerminal,chatAttachmentsSupported,buildChatComposer,sendChat,loadChatState,applyChatReceipt,uploadChatFiles,pasteChat,scheduleChatPoll,stopChatPolling,openNativeChat,allSessions,buildContinuePanel,chatReceiptCopy,returnToBoard,readChatClipboard,accountDisplay,sessionAccountLabel,closeChatToolsOutside,closeChatToolsEscape,drawDetail,refreshDetail,loadCapabilities,matches,recoverConnection,networkOffline,poll,select,focusDetailBack,restoreSelectedCardFocus,showLogin,lock,beginAuthEpoch,resizeChatInput,updateViewport,draftKeydown,configureTerminalKeyboard,queueTerminalScroll,flushTerminalScroll,terminalScrollEnd,resetTerminalScroll,renderAttention,chatPollDelay,pullRefresh,readingScroll,renderJump,pullDistance,listScroll,setReading,renderPrompt,promptAction,renderUsage,loadUsage,applyTheme,setTheme,updateThemeColor,haptic,navTransition,setDetailShown,chatVisible,sheetRelease,BottomSheet,sheet,openSettings,closeSettings,setTyping,pinchFontSize,setTerminalFontSize,loadXterm,assetUrl,syncEvents,closeEvents,eventsHealthy,renderFreshness,schedule,touchDevice,togglePhaseFilter,renderCounts,createLongPress,swipeIntent,swipeRelease,groupMessageRows,setTextSize,applyTextSize,renderConnectivity,terminalForSession,swipeActionFor,openMessageMenu,openCardMenu,messageActions,outboxShape,outboxMatches,outboxOrigin,settleOutbox,retryOutbox,renderAttachmentTiles,attachmentThumb,sendUpload,openActionSheet,closeActionSheet,setListCollapsed,closeSwipe,settleSwipe,prepareSwipe,runSwipeAction,GESTURE,setChromeVisible,toggleChrome,revealChrome,isChromeTap,snapshotAnnounced,updateChatComposer,capabilitiesRevision,toolKindOf,userMessageParts,formatElapsed,tickWorking,renderTerminalMarks,renderDetailTerminal,terminalsAnnounced,goToSessionTerminal,rememberTerminal,terminalMenu,updateTerminalMenu,chooseTerminalMenu,clearTerminalMenu,renderNewSession,openNewSession,startNewSession,startAppServer,rememberConversationView,restoreConversationView,conversationIdentity,initiatorOf,initiatorLabel,documentKeydown,sessionCategoryOf,setSessionCategory,renderSessionCategories,prepareSessionListFor,sessionCategoryKeydown,render,resetFilters,terminalTitle,renameTerminals,requestedSessionFrom,requestSessionOpen,openRequestedSession,answerOnOpen,hardReload,terminalKeyBytes,terminalKeyFromEvent,pressTerminalKey,toggleTerminalMod,clearTerminalMods,renderTerminalMods,draftBeforeInput,terminalDocumentKey,xtermKeyEvent,renderHardware,loadHardware})",
     context,
   );
   api.state.csrf = "csrf-test";
@@ -2142,7 +2142,7 @@ test('offline visibility and return-online events restart only bounded reads and
   c.context.navigator.onLine = true; c.windowEvents.online();
   await new Promise((resolve) => setImmediate(resolve));
   // The usage strip is another bounded read alongside the list.
-  assert.deepEqual(requests.filter((url) => url !== '/api/usage'), ['/api/snapshot', '/api/chat/state']);
+  assert.deepEqual(requests.filter((url) => url !== '/api/usage' && url !== '/api/hardware'), ['/api/snapshot', '/api/chat/state']);
   assert.equal(entry.text, '미전송 초안'); assert.equal(entry.pending, null);
 });
 
@@ -2256,13 +2256,13 @@ test('an offline first launch restores authentication and already-open terminal 
   assert.equal(requests.length, 0);
   c.context.navigator.onLine = true; c.windowEvents.online();
   await new Promise((resolve) => setImmediate(resolve));
-  assert.deepEqual(requests.filter((url) => url !== '/api/usage'), ['/api/snapshot', '/api/bot-requests', '/api/capabilities', '/api/terminals']);
+  assert.deepEqual(requests.filter((url) => url !== '/api/usage' && url !== '/api/hardware'), ['/api/snapshot', '/api/bot-requests', '/api/capabilities', '/api/terminals']);
   assert.match(textOf(c.get('running-list')), /이미 열린 작업/);
   assert.equal(c.state.terminal, null); assert.equal(c.state.terminalVisible, false);
   assert.equal(c.get('app').hidden, false); assert.equal(c.get('login').hidden, true);
   assert.equal(c.get('login-submit').disabled, false);
   c.windowEvents.online(); await new Promise((resolve) => setImmediate(resolve));
-  assert.deepEqual(requests.filter((url) => url !== '/api/usage'), ['/api/snapshot', '/api/bot-requests', '/api/capabilities', '/api/terminals', '/api/snapshot']);
+  assert.deepEqual(requests.filter((url) => url !== '/api/usage' && url !== '/api/hardware'), ['/api/snapshot', '/api/bot-requests', '/api/capabilities', '/api/terminals', '/api/snapshot']);
 });
 
 test('returning to a first-launch tab after online recovery while hidden reads login state without transmitting a token', async () => {
@@ -3894,6 +3894,38 @@ test('an input error (a file too large) stays until the user acts again; a state
   assert.doesNotMatch(status(), /확인하지 못했습니다/);
 });
 
+test('the machines chip says how many answer and the sheet shows each one\'s CPU, memory, disk, battery and uptime', async () => {
+  const c = client(undefined, noChatTimers);
+  const box = c.get('hardware');
+  const ready = { name: 'board', label: '보드 기기', status: 'ready', refreshing: false, fetchedAt: 1791600000, error: null, system: 'macos',
+    cpu: { model: 'Fixture M1', cores: 8, load: [1.5, 1.2, 1.0], percent: 37 }, memory: { total: 16 * 1024 ** 3, used: 4 * 1024 ** 3, percent: 25 },
+    disk: { total: 500 * 1024 ** 3, free: 20 * 1024 ** 3, percent: 96 }, battery: { percent: 80, charging: true, power: 'ac' }, uptimeSeconds: 90000 };
+  const offline = { name: 'office', label: '사무실 PC', status: 'offline', refreshing: false, fetchedAt: null,
+    error: '연결하지 못했습니다. 잠자기·오프라인이면 깨어난 뒤 다시 읽습니다.' };
+  c.renderHardware({ available: true, refreshing: false, hosts: [ready, offline] });
+  assert.equal(box.hidden, false);
+  assert.match(textOf(c.get("hardware-summary")), /기기\s*1\/2/);
+  assert.match(c.get('hardware-summary').children[0].className, /red/, 'an unanswered machine or a full disk shows red');
+  const text = textOf(c.get('hardware-body'));
+  for (const part of ['보드 기기', '37%', 'Fixture M1 · 8코어 · 부하 1.5', '4.0GB / 16GB', '여유 20GB', '배터리 80% · 충전 중',
+    '가동 1일 1시간', '사무실 PC', '연결 안 됨', '연결하지 못했습니다'])
+    assert.ok(text.includes(part), part);
+  const fills = [];
+  const walk = (node) => { if (String(node.className || '').includes('usage-fill')) fills.push(node.className); (node.children || []).forEach(walk); };
+  walk(c.get('hardware-body'));
+  assert.deepEqual(fills, ['usage-fill green', 'usage-fill green', 'usage-fill red'], 'busier is warmer, the opposite of remaining usage');
+  // A Mac's first reading has no CPU share yet: its load says how busy it is.
+  c.renderHardware({ available: true, refreshing: true, hosts: [{ ...ready, cpu: { ...ready.cpu, percent: null } }] });
+  assert.match(textOf(c.get('hardware-body')), /CPU.*부하 1\.5/);
+  assert.match(textOf(c.get('hardware-body')), /갱신 중|읽는 중…/);
+  // A board without the endpoint never shows the chip.
+  const d = client(async () => ({ ok: false, status: 404, json: async () => ({}) }), noChatTimers);
+  d.state.authenticated = true;
+  await d.loadHardware();
+  assert.equal(d.get('hardware').hidden, true);
+  assert.equal(d.state.hardwareUnsupported, true);
+});
+
 test('the usage strip shows remaining limits per provider and hides on boards without the endpoint', async () => {
   const c = client(undefined, noChatTimers);
   const box = c.get('usage');
@@ -4448,7 +4480,7 @@ test('live updates follow the open conversation, reread only on newer events, sl
   c.state.detailShown = true;
   c.state.capabilities = {};
   c.state.capabilitiesRevision = c.capabilitiesRevision(c.state.snapshot);
-  c.state.usageAt = Date.now();
+  c.state.usageAt = Date.now(); c.state.hardwareAt = Date.now();
   c.state.detailFor = s.key; c.state.detailUpdatedAt = s.updatedAt;
   c.state.detailRevision = vm.runInContext('detailRevision', c.context)(c.allSessions().find((item) => item.key === s.key));
   c.syncEvents();
@@ -6053,7 +6085,7 @@ test('snapshot events are read together after 300ms and never reload capabilitie
   c.state.snapshotVersion = 6;
   c.state.capabilities = { hosts: [] };
   c.state.capabilitiesRevision = 'old';
-  c.state.usageAt = Date.now();
+  c.state.usageAt = Date.now(); c.state.hardwareAt = Date.now();
   for (const announced of [7, 8, 9]) c.snapshotAnnounced(announced);
   assert.equal(pending.length, 1, 'a burst arms one read');
   assert.deepEqual(requests, [], 'nothing is read before the batch window ends');
@@ -6093,7 +6125,7 @@ test('the 60s safety poll reads /api/capabilities only when a host recovers or i
     return { ok: true, status: 200, json: async () => (url.startsWith('/api/snapshot')
       ? { hosts: JSON.parse(JSON.stringify(hosts)) } : url === '/api/capabilities' ? { hosts: [], csrfToken: 'csrf-test' } : {}) };
   }, noChatTimers);
-  c.state.usageAt = Date.now();
+  c.state.usageAt = Date.now(); c.state.hardwareAt = Date.now();
   const reads = async () => { requests.length = 0; await c.poll(false); return requests.filter((url) => url === '/api/capabilities').length; };
   assert.equal(await reads(), 1, 'the first read loads capabilities');
   hosts[0].fetchedAt = 2;
@@ -6456,7 +6488,7 @@ test('H3: a restarted server (another bootId) has its CSRF token read again, eve
       ? { hosts: [{ name: 'workstation', ok: true, fetchedAt: 1, data: {} }], version, bootId: boot }
       : url === '/api/capabilities' ? { hosts: [], csrfToken: csrf } : {}) };
   }, noChatTimers);
-  c.state.usageAt = Date.now();
+  c.state.usageAt = Date.now(); c.state.hardwareAt = Date.now();
   await c.poll(false);
   assert.equal(c.state.csrf, 'csrf-a');
   assert.equal(requests.filter((url) => url === '/api/capabilities').length, 1);
@@ -6488,7 +6520,7 @@ test('H3: after a restart the reconnected stream\'s hello (another bootId) reads
   }, { setTimeout: (callback, ms) => { if (ms === 300) setImmediate(callback); return 1; }, clearTimeout() {} });
   const { FakeEventSource, sources } = fakeEventSource();
   c.context.EventSource = FakeEventSource;
-  c.state.usageAt = Date.now();
+  c.state.usageAt = Date.now(); c.state.hardwareAt = Date.now();
   await c.poll(false);
   assert.equal(sources.length, 1);
   sources[0].emit('hello', { snapshotVersion: 40, bootId: 'boot-a' });
@@ -7223,7 +7255,7 @@ test('the live stream announces terminals, a restarted server is read on its hel
   c.state.capabilities = {};
   c.state.capabilitiesRevision = c.capabilitiesRevision(c.state.snapshot);
   c.state.capabilitiesBoot = 'boot-a';
-  c.state.usageAt = Date.now();
+  c.state.usageAt = Date.now(); c.state.hardwareAt = Date.now();
   c.state.serverBoot = 'boot-a';
   await c.refreshTerminals();
   c.syncEvents();

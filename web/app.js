@@ -524,6 +524,7 @@ const SHEETS = {
   "close-terminal-dialog": { onDismiss: () => cancelTerminalClose() },
   "settings-dialog": { onDismiss: () => closeSettings() },
   "usage-dialog": { onDismiss: () => closeSheet("usage-dialog", "usage") },
+  "hardware-dialog": { onDismiss: () => closeSheet("hardware-dialog", "hardware") },
   "filter-dialog": { onDismiss: () => closeSheet("filter-dialog", "filter-open") },
   "terminals-dialog": { onDismiss: () => closeSheet("terminals-dialog", "running-terminals") },
   "new-session-dialog": { onDismiss: () => closeNewSession() },
@@ -695,7 +696,7 @@ function beginAuthEpoch() {
 // deduplicates by requestId, are sent once more with a fresh token. A chat send
 // never is: it waits for a new press (sendChat).
 const CSRF_RETRY = new Set(["/api/chat/state", "/api/chat/prompt", "/api/plan", "/api/launch",
-  "/api/new-session", "/api/app-server", "/api/refresh", "/api/usage/refresh",
+  "/api/new-session", "/api/app-server", "/api/refresh", "/api/usage/refresh", "/api/hardware/refresh",
   "/api/push/subscribe", "/api/push/unsubscribe"]);
 async function api(path, { method = "GET", body, signal, authEpoch = state.authEpoch, csrfRetry = true } = {}) {
   assertAuthEpoch(authEpoch);
@@ -1055,6 +1056,116 @@ async function loadUsage(force = false) {
     if (err.status === 404) { state.usageUnsupported = true; renderUsage(null); }
   } finally {
     state.usageBusy = false;
+  }
+}
+// The board machines' hardware (설정 `hardware`): a chip with how many answer and a sheet
+// with each one's CPU, memory, disk, battery and uptime. Read every 15 seconds while the
+// sheet is open, the chip's summary every 5 minutes otherwise.
+const HARDWARE_OPEN_MS = 15000;
+const HARDWARE_CLOSED_MS = 300000;
+function hardwareTone(percent) {
+  return !Number.isFinite(percent) ? "muted" : percent >= 90 ? "red" : percent >= 75 ? "orange" : "green";
+}
+function hardwareBytes(value) {
+  if (!Number.isFinite(value)) return "—";
+  const gb = value / 1024 ** 3;
+  return gb >= 1000 ? `${(gb / 1024).toFixed(1)}TB` : gb >= 10 ? `${Math.round(gb)}GB` : `${gb.toFixed(1)}GB`;
+}
+function hardwareUptime(seconds) {
+  if (!Number.isFinite(seconds)) return "";
+  const days = Math.floor(seconds / 86400), hours = Math.floor((seconds % 86400) / 3600);
+  return days ? `${days}일 ${hours}시간` : hours ? `${hours}시간 ${Math.floor((seconds % 3600) / 60)}분` : `${Math.floor(seconds / 60)}분`;
+}
+function hardwareLine(label, percent, value) {
+  const line = el("div", "usage-window");
+  const bar = el("div", "usage-bar");
+  const fill = el("span", `usage-fill ${hardwareTone(percent)}`);
+  if (fill.style) fill.style.width = `${Number.isFinite(percent) ? Math.max(0, Math.min(100, percent)) : 0}%`;
+  bar.append(fill);
+  line.append(el("span", "usage-window-label", label), bar, el("span", "usage-window-value", value), el("span", "usage-window-reset", ""));
+  return line;
+}
+function renderHardware(data) {
+  const box = $("hardware");
+  if (!box) return;
+  const hosts = data?.available && Array.isArray(data.hosts) ? data.hosts.filter((item) => item && typeof item === "object") : [];
+  if (!hosts.length) {
+    box.hidden = true;
+    box.dataset.revision = "";
+    if ($("hardware-dialog")?.open) closeSheet("hardware-dialog", "hardware");
+    return;
+  }
+  box.hidden = false;
+  const revision = JSON.stringify([hosts, data.refreshing]);
+  if (box.dataset.revision === revision) return;
+  box.dataset.revision = revision;
+  const answering = hosts.filter((host) => host.status === "ready" || host.status === "stale").length;
+  const hot = hosts.filter((host) => [host.cpu?.percent, host.memory?.percent, host.disk?.percent]
+    .some((value) => Number.isFinite(value) && value >= 90)).length;
+  const pill = el("span", `usage-pill ${answering < hosts.length || hot ? "red" : "green"}`);
+  pill.append(el("span", "usage-short", "기기"), el("strong", null, `${answering}/${hosts.length}`));
+  $("hardware-summary").replaceChildren(pill);
+  box.setAttribute("aria-label", `기기 상태: ${hosts.length}대 중 ${answering}대 응답${hot ? `, ${hot}대 사용률 높음` : ""}. 기기별로 보기`);
+  const sections = hosts.map((host) => {
+    const section = el("section", "usage-provider hardware-host");
+    const head = el("div", "usage-row-head");
+    head.append(el("strong", null, host.label || host.name));
+    const status = host.status === "offline" ? "연결 안 됨" : host.status === "stale" ? "이전 값" :
+      host.status === "pending" ? (host.refreshing ? "읽는 중" : "확인 전") : host.refreshing ? "갱신 중" : "";
+    if (status) head.append(el("span", "usage-credits", status));
+    section.append(head);
+    if (host.error) section.append(el("p", "usage-note", host.error));
+    const cpu = host.cpu || {};
+    if (host.cpu) {
+      const cores = Number.isFinite(cpu.cores) ? `${cpu.cores}코어` : "";
+      const load = Array.isArray(cpu.load) ? `부하 ${cpu.load[0]}` : "";
+      section.append(hardwareLine("CPU", cpu.percent, Number.isFinite(cpu.percent) ? `${cpu.percent}%` : load || "측정 중"));
+      const detail = [cpu.model, cores, Number.isFinite(cpu.percent) ? load : ""].filter(Boolean).join(" · ");
+      if (detail) section.append(el("p", "usage-note", detail));
+    }
+    if (host.memory) section.append(hardwareLine("메모리", host.memory.percent,
+      `${hardwareBytes(host.memory.used)} / ${hardwareBytes(host.memory.total)}`));
+    if (host.disk) section.append(hardwareLine("디스크", host.disk.percent, `여유 ${hardwareBytes(host.disk.free)}`));
+    const facts = [];
+    if (host.battery) facts.push(`배터리 ${host.battery.percent}%${host.battery.charging ? " · 충전 중" : host.battery.power === "ac" ? " · 전원 연결" : ""}`);
+    if (Number.isFinite(host.uptimeSeconds)) facts.push(`가동 ${hardwareUptime(host.uptimeSeconds)}`);
+    if (Number.isFinite(host.fetchedAt)) facts.push(`${clock(host.fetchedAt)} 확인`);
+    if (facts.length) section.append(el("p", "usage-note", facts.join(" · ")));
+    return section;
+  });
+  const foot = el("div", "usage-foot");
+  foot.append(el("span", null, "CPU는 두 번 읽은 사이의 사용률입니다. 맥은 부하(1분 평균)도 함께 보여 줍니다."));
+  const refresh = button(data.refreshing ? "읽는 중…" : "새로고침", "usage-refresh", () => loadHardware(true));
+  refresh.disabled = !!data.refreshing;
+  foot.append(refresh);
+  $("hardware-body").replaceChildren(...sections, foot);
+}
+function openHardware() {
+  if ($("hardware")?.hidden) return;
+  sheet("hardware-dialog").open();
+  loadHardware();
+  clearInterval(state.hardwareTimer);
+  state.hardwareTimer = setInterval(() => {
+    if (!$("hardware-dialog")?.open) { clearInterval(state.hardwareTimer); state.hardwareTimer = null; return; }
+    loadHardware();
+  }, HARDWARE_OPEN_MS);
+}
+async function loadHardware(force = false) {
+  if (state.hardwareUnsupported || !state.authenticated || networkOffline() || document.hidden || state.hardwareBusy) return;
+  state.hardwareBusy = true;
+  state.hardwareAt = Date.now();
+  try {
+    const data = force ? await api("/api/hardware/refresh", { method: "POST", body: {} }) : await api("/api/hardware");
+    state.hardware = data;
+    renderHardware(data);
+    // Follow the reads the board is making, a few times.
+    if (data?.refreshing && (state.hardwareFollow = (state.hardwareFollow || 0) + 1) <= 10)
+      setTimeout(() => loadHardware(false), 3000);
+    else if (!data?.refreshing) state.hardwareFollow = 0;
+  } catch (err) {
+    if (err.status === 404) { state.hardwareUnsupported = true; renderHardware(null); }
+  } finally {
+    state.hardwareBusy = false;
   }
 }
 const BASE_TITLE = INSTANCE.title;
@@ -7202,6 +7313,7 @@ async function poll(refresh = false, { capabilities = true } = {}) {
     renderConnectivity();
     if (refresh) window.SessionholicGoals?.refresh?.();
     if (Date.now() - (state.usageAt || 0) > 55000) loadUsage();
+    if (Date.now() - (state.hardwareAt || 0) > HARDWARE_CLOSED_MS - 5000) loadHardware();
     // Safety net for missed (or unavailable) terminal announcements: a regular
     // read also reads a terminal list older than a minute. The first list is
     // read by login and startup themselves; when that read failed, this tries again.
@@ -7446,7 +7558,7 @@ function showLogin() {
   $("login").hidden = false;
   if ($("plan-dialog").open) $("plan-dialog").close();
   if ($("settings-dialog").open) $("settings-dialog").close();
-  for (const id of ["usage-dialog", "filter-dialog", "terminals-dialog", "new-session-dialog", "action-sheet"]) if ($(id)?.open) $(id).close();
+  for (const id of ["usage-dialog", "hardware-dialog", "filter-dialog", "terminals-dialog", "new-session-dialog", "action-sheet"]) if ($(id)?.open) $(id).close();
   renderConnectivity();
   updateThemeColor();
   $("login-token").focus();
@@ -7599,6 +7711,8 @@ window.addEventListener("DOMContentLoaded", () => {
   // List chips and their sheets.
   $("usage").addEventListener("click", openUsage);
   $("usage-close").addEventListener("click", () => closeSheet("usage-dialog", "usage"));
+  $("hardware").addEventListener("click", openHardware);
+  $("hardware-close").addEventListener("click", () => closeSheet("hardware-dialog", "hardware"));
   $("filter-open").addEventListener("click", () => sheet("filter-dialog").open());
   $("filter-close").addEventListener("click", () => closeSheet("filter-dialog", "filter-open"));
   $("filter-done").addEventListener("click", () => closeSheet("filter-dialog", "filter-open"));
@@ -7616,6 +7730,7 @@ window.addEventListener("DOMContentLoaded", () => {
   $("new-session-close").addEventListener("click", () => closeNewSession());
   $("action-close").addEventListener("click", () => closeActionSheet());
   for (const [id, close] of [["usage-dialog", () => closeSheet("usage-dialog", "usage")],
+    ["hardware-dialog", () => closeSheet("hardware-dialog", "hardware")],
     ["filter-dialog", () => closeSheet("filter-dialog", "filter-open")],
     ["terminals-dialog", () => closeSheet("terminals-dialog", "running-terminals")],
     ["new-session-dialog", () => closeNewSession()],

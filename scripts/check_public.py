@@ -23,8 +23,9 @@ SECRET_PATTERNS = {
 }
 HOME_PATH = re.compile(r"/Users/([A-Za-z0-9._-]+)/")
 # C:\Users\example, C:/users/example and the doubled backslashes of a JSON or code string.
-# The whole folder name counts (spaces, any script); in prose it ends at the first space.
-WINDOWS_HOME_PATH = re.compile(r"\b[A-Za-z]:(?:\\{1,2}|/)[Uu][Ss][Ee][Rr][Ss](?:\\{1,2}|/)([^\\/:*?\"<>|\r\n'`]+)(\\|/)?")
+# The whole folder name counts (spaces, any script) before a separator or a quote; in prose it ends at
+# the first space. A Windows user name never holds , ; = + [ ], so prose stops there.
+WINDOWS_HOME_PATH = re.compile(r"\b[A-Za-z]:(?:\\{1,2}|/)[Uu][Ss][Ee][Rr][Ss](?:\\{1,2}|/)([^\\/:*?\"<>|\r\n'`,;=+\[\]]+)(\\|/|[\"'`])?")
 EXAMPLE_USERS = {"example", "test", "user", "u", "sample", "demo", "runner", "local", "source", "other", "fixture"}
 TAILNET_URL = re.compile(r"https?://[a-zA-Z0-9.-]+\.ts\.net(?=[:/\s\"'`]|$)")
 # A host name on a tailnet without its scheme: the label before `.ts.net` names the tailnet.

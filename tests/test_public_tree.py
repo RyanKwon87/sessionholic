@@ -39,7 +39,7 @@ class PublicTreeTest(unittest.TestCase):
 
     def test_keys_in_strings_windows_homes_and_bare_tailnet_names_are_reported(self):
         names = ["key.json", "encrypted.json", "fixture.py", "pattern.py", "win.md", "win-json.json", "win-lower.md",
-                 "win-space.md", "win-unicode.md", "examples.md", "tailnet.py"]
+                 "win-space.md", "win-quoted.json", "win-unicode.md", "examples.md", "tailnet.py"]
         self.allow(*names)
         # Headers and names are joined at run time, so this test file is no finding itself.
         header = "-----BEGIN " + "PRIVATE KEY-----"
@@ -52,12 +52,13 @@ class PublicTreeTest(unittest.TestCase):
         (self.root / "win-json.json").write_text(json.dumps({"cwd": "C:\\Users\\" + person + "\\x"}))
         (self.root / "win-lower.md").write_text("C:/users/" + person + "/x")
         (self.root / "win-space.md").write_text("C:/Users/user " + person + "/x")
+        (self.root / "win-quoted.json").write_text(json.dumps({"cwd": "C:/Users/user " + person}))
         (self.root / "win-unicode.md").write_text("C:\\Users\\" + "홍길동" + "\\x")
         (self.root / "examples.md").write_text("C:\\Users\\example\\x C:/Users/fixture/y (C:/Users/example, 폴더) "
                                                "remote.tail-example.ts.net *.ts.net")
         (self.root / "tailnet.py").write_text('HOST = "board.' + "tail0a1b2c" + '.ts.net"')
         found = {(item["file"], item["category"]) for item in public.audit(self.root)["findings"]}
-        windows = {(name, "non-example-windows-home-path") for name in ("win.md", "win-json.json", "win-lower.md", "win-space.md", "win-unicode.md")}
+        windows = {(name, "non-example-windows-home-path") for name in ("win.md", "win-json.json", "win-lower.md", "win-space.md", "win-quoted.json", "win-unicode.md")}
         self.assertEqual(found, {("key.json", "escaped-private-key"), ("encrypted.json", "escaped-private-key"),
                                  ("fixture.py", "escaped-private-key"), ("tailnet.py", "non-example-tailnet-name")} | windows)
 

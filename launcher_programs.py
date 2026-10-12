@@ -6,6 +6,7 @@ agent CLI below it is the program: Claude's agent view (`claude agents`, with it
 Claude, or Codex. Only `ps` is read; nothing is signalled. A terminal whose launcher cannot
 be named exactly (none, or two within the window) reports no program rather than a guess.
 """
+import itertools
 import os
 from pathlib import Path
 import re
@@ -15,6 +16,7 @@ import time
 # The launcher's process starts a little after the board created the terminal (SSH setup).
 BEFORE, AFTER = 3, 15
 MAX_TERMINALS = 32
+PAIRING_LIMIT = 6  # terminals weighed together at most; more name none
 PS = "/bin/ps"
 LSTART = "%a %b %d %H:%M:%S %Y"
 # Claude's own helpers under the agent view, never a program a person runs.
@@ -86,7 +88,6 @@ def describe(terminals, launcher, rows):
     launchers = [(pid, started) for pid, _, started, command in rows
                  if command == expected or (command.endswith(" " + expected)
                                             and Path(command.split()[0]).name in INTERPRETERS)]
-    started_at = dict(launchers)
     named = [(terminal["id"], terminal["createdAt"]) for terminal in terminals[:MAX_TERMINALS]
              if isinstance(terminal.get("id"), str) and re.fullmatch(r"[0-9a-f]{32}", terminal["id"])
              and type(terminal.get("createdAt")) is int]
@@ -94,9 +95,10 @@ def describe(terminals, launcher, rows):
               for identifier, created in named}
     owned = {}
     # Terminals whose windows share a launcher are weighed together. As many launchers as
-    # terminals, each in its own terminal's window in the order both started: each takes its
-    # own. Otherwise (one ended, one is another program's) only a launcher that a single
-    # terminal could have opened, and the only one in its window, names it.
+    # terminals that pair up in only one way: each takes its own (a launcher slow to start or
+    # two started in the other order may pair two ways, and then names neither). Otherwise
+    # (one ended, one is another program's) only a launcher that a single terminal could have
+    # opened, and the only one in its window, names it.
     left = [identifier for identifier, _ in named]
     while left:
         group, queue = set(), [left[0]]
@@ -108,12 +110,13 @@ def describe(terminals, launcher, rows):
             queue.extend(other for other in left if other not in group and window[other] & window[identifier])
         left = [identifier for identifier in left if identifier not in group]
         members = sorted((created, identifier) for identifier, created in named if identifier in group)
-        pids = sorted({pid for identifier in group for pid in window[identifier]}, key=lambda pid: (started_at[pid], pid))
-        times = [created for created, _ in members]
-        if (len(pids) == len(members) and len(set(times)) == len(times)
-                and all(pid in window[identifier] for pid, (_, identifier) in zip(pids, members))):
-            owned.update({identifier: [pid] for pid, (_, identifier) in zip(pids, members)})
-            continue
+        pids = sorted({pid for identifier in group for pid in window[identifier]})
+        if len(pids) == len(members) <= PAIRING_LIMIT:
+            pairings = [order for order in itertools.permutations(pids)
+                        if all(pid in window[identifier] for pid, (_, identifier) in zip(order, members))]
+            if len(pairings) == 1:
+                owned.update({identifier: [pid] for pid, (_, identifier) in zip(pairings[0], members)})
+                continue
         for _, identifier in members:
             if len(window[identifier]) == 1:
                 pid = next(iter(window[identifier]))

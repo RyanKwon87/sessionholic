@@ -569,7 +569,7 @@ function openRequestedSession() {
   // Over an open terminal too: the conversation shows, and back returns to the terminal.
   if (state.terminalVisible) {
     returnToBoard({ selectLaunchedSource: false, animate: false });
-    navigateView("detail");
+    navigateView("detail", false, { notice: request.key });
   }
   const target = allSessions().find((session) => session.key === request.key);
   if (target && groupOf(target) === "needs_input") answerOnOpen(target);
@@ -4832,11 +4832,13 @@ function updateReadNotice(data) {
   note.textContent = `기기에 연결되지 않아 ${data.fetchedAt ? `${ago(data.fetchedAt)} 저장한` : "저장된"} 대화를 표시합니다. 실행 상태는 연결 후 확인해 주세요.`;
 }
 
-function navigateView(view, replace = false) {
+function navigateView(view, replace = false, extra = {}) {
   const current = window.history.state;
   if (!replace && current?.[INSTANCE.historyKey] && current.view === view) return;
+  // `notice` belongs to the one entry a notification opened.
+  const { notice, ...kept } = current || {};
   window.history[replace ? "replaceState" : "pushState"](
-    { ...current, [INSTANCE.historyKey]: true, view },
+    { ...kept, ...extra, [INSTANCE.historyKey]: true, view },
     "",
   );
 }
@@ -7317,7 +7319,8 @@ window.addEventListener("DOMContentLoaded", () => {
     // A browser that already animated its own back swipe gets no second slide.
     const animate = !event.hasUAVisualTransition;
     const fromTerminal = state.terminalVisible;
-    if (fromTerminal) returnToBoard({ animate });
+    // Forward again to a notification's conversation shows it, not the terminal's launch.
+    if (fromTerminal) returnToBoard({ animate, selectLaunchedSource: !event.state?.notice });
     if (window.SessionholicGoals?.handleHistory?.(event)) return;
     const detail = view === "detail" && !!(state.selected || state.selectedBotRequest);
     stopChatPolling();

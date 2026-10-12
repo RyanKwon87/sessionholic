@@ -288,9 +288,6 @@ def _verify_native_home(rows, home, deadline):
         row.pop("_candidate", None)
 
 
-OWNER_LIMIT = 65536  # bot sessions remembered after they leave the ledgers (about 6 MiB)
-
-
 class BotRequests:
     def __init__(self, hosts, config_path, state_dir):
         self.hosts = {row["name"]: dict(row) for row in hosts}
@@ -312,7 +309,7 @@ class BotRequests:
                 data = json.loads((self.state_dir / "bot-owners.json").read_text(encoding="utf-8"))
             except (OSError, ValueError, UnicodeError):
                 data = []
-            self._owner_keys = [key for key in data if isinstance(key, str)][-OWNER_LIMIT:] if isinstance(data, list) else []
+            self._owner_keys = [key for key in data if isinstance(key, str)] if isinstance(data, list) else []
         return self._owner_keys
 
     def _remember(self, rows):
@@ -323,8 +320,8 @@ class BotRequests:
         # A write that failed is tried again by the next read, with or without new sessions.
         if not new and not self._owners_unsaved:
             return
+        # Never dropped for room: a session that left the ledgers stays the bot's (about 100 bytes each).
         keys.extend(new)
-        del keys[:-OWNER_LIMIT]
         self._owners_unsaved = True
         try:
             self.state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)

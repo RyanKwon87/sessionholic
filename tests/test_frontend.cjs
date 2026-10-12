@@ -6813,6 +6813,27 @@ test('a notification link opens its session once it is listed, and an old reques
   // A conversation entry over the terminal's: back returns to the terminal.
   assert.deepEqual(pushed, ['detail']);
   assert.equal(c.context.window.history.state.view, 'detail');
+  assert.equal(c.context.window.history.state.notice, other.key);
+  // Any later entry leaves the notice behind.
+  c.navigateView('terminal');
+  assert.equal(c.context.window.history.state.notice, undefined);
+});
+
+test('forward again to a conversation a notification opened shows it, not the handoff the terminal launched', () => {
+  const c = client(async () => ({ ok: true, status: 200, json: async () => ({ terminals: [] }) }), noChatTimers);
+  c.context.navigator = { onLine: false };
+  c.windowEvents.DOMContentLoaded();
+  const s = recentSession('notified-forward');
+  c.state.authenticated = true;
+  setRecentSnapshot(c, [s]);
+  c.select(s.key);
+  const destination = { host: s.host, agent: 'codex', id: 'handoff-destination', home: '.codex-example', cwd: '/fixture' };
+  c.state.terminal = { id: 'h'.repeat(32), alive: true, mode: 'handoff', launchMode: 'handoff', nativeSource: destination,
+    metadata: { mode: 'handoff', launchMode: 'handoff', nativeSource: destination } };
+  c.state.terminalVisible = true;
+  c.windowEvents.popstate({ state: { sessionholic: true, view: 'detail', notice: s.key } });
+  assert.equal(c.state.terminalVisible, false);
+  assert.equal(c.state.selected, s.key, 'the notified conversation stays chosen');
 });
 
 test('an open terminal is named after the session it runs and follows a renamed session; a new-session terminal without one shows when it opened', async () => {

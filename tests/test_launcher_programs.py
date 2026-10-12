@@ -98,6 +98,10 @@ class ProgramTest(unittest.TestCase):
         late = [launcher(10, 8), program(11, 10, 9), launcher(20, 16), program(21, 20, 17)]
         self.assertEqual(lp.describe([first, second], LAUNCHER, late),
                          {FIRST: {"program": "claude", "cwd": None, "pid": 11}, SECOND: {"program": "claude", "cwd": None, "pid": 21}})
+        # Two launchers that started in the other order (SSH delays) pair up two ways: neither is named.
+        swapped = [launcher(10, 10), program(11, 10, 11), launcher(20, 6), program(21, 20, 7)]
+        self.assertEqual(lp.describe([first, {**second, "createdAt": opened + 5}], LAUNCHER, swapped),
+                         {FIRST: {"program": None}, SECOND: {"program": None}})
         # The first one's launcher is gone: the one left could be either's, so it names neither.
         self.assertEqual(lp.describe([first, second], LAUNCHER, rows[2:]),
                          {FIRST: {"program": None}, SECOND: {"program": None}})

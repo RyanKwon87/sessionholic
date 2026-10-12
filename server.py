@@ -2471,6 +2471,11 @@ class Handler(BaseHTTPRequestHandler):
 
 
 class BoardHTTPServer(ThreadingHTTPServer):
+    # A page asks for its styles, scripts and first reads at once, and Tailscale Serve opens an
+    # upstream connection for each: socketserver's backlog of 5 reset the rest (a 502, and a
+    # page without its stylesheet that scrolls as one long sheet).
+    request_queue_size = 128
+
     def server_close(self):
         work = getattr(self, "work", None)
         if work is not None:

@@ -36,6 +36,7 @@ function node() {
     setAttribute(name, value) { this.attributes[name] = String(value); },
     events: {},
     addEventListener(type, callback) { this.events[type] = callback; },
+    dispatchEvent(event) { this.events[event.type]?.(event); return true; },
     classList: { add() {}, remove() {} },
   };
 }
@@ -126,7 +127,7 @@ function client(
   vm.runInContext(messageSource, context);
   vm.runInContext(source, context);
   const api = vm.runInContext(
-    "({state,api,sourceOf,accountOf,sendInput,pasteDraft,prepareDraftPaste,startDraftComposition,endDraftComposition,inputDraft,stopTerminalReader,startTerminalReader,closePlan,navigateView,backToList,backFromTerminal,closeTerminal,cancelTerminalClose,confirmTerminalClose,populateAccount,populateRoute,updateContinue,renderPlan,launchPlan,openTerminal,saveDraft,draftKey,refreshTerminals,renderTerminals,renderTerminalReturn,renderFilters,terminalCloseCopy,warnDraftUnload,preparePlan,renderGroups,renderMessages,loadDetail,chatKey,chatEntry,currentChat,chatSupported,chatRecovery,recoverChatSession,openChatTerminal,chatAttachmentsSupported,buildChatComposer,sendChat,loadChatState,applyChatReceipt,uploadChatFiles,pasteChat,scheduleChatPoll,stopChatPolling,openNativeChat,allSessions,buildContinuePanel,chatReceiptCopy,returnToBoard,readChatClipboard,accountDisplay,sessionAccountLabel,closeChatToolsOutside,closeChatToolsEscape,drawDetail,refreshDetail,loadCapabilities,matches,recoverConnection,networkOffline,poll,select,focusDetailBack,restoreSelectedCardFocus,showLogin,lock,beginAuthEpoch,resizeChatInput,updateViewport,draftKeydown,configureTerminalKeyboard,queueTerminalScroll,flushTerminalScroll,terminalScrollEnd,resetTerminalScroll,renderAttention,chatPollDelay,pullRefresh,readingScroll,renderJump,pullDistance,listScroll,setReading,renderPrompt,promptAction,renderUsage,loadUsage,applyTheme,setTheme,updateThemeColor,haptic,navTransition,setDetailShown,chatVisible,sheetRelease,BottomSheet,sheet,openSettings,closeSettings,setTyping,pinchFontSize,setTerminalFontSize,loadXterm,assetUrl,syncEvents,closeEvents,eventsHealthy,renderFreshness,schedule,touchDevice,togglePhaseFilter,renderCounts,createLongPress,swipeIntent,swipeRelease,groupMessageRows,setTextSize,applyTextSize,renderConnectivity,terminalForSession,swipeActionFor,openMessageMenu,openCardMenu,messageActions,outboxShape,outboxMatches,outboxOrigin,settleOutbox,retryOutbox,renderAttachmentTiles,attachmentThumb,sendUpload,openActionSheet,closeActionSheet,setListCollapsed,closeSwipe,settleSwipe,prepareSwipe,runSwipeAction,GESTURE,setChromeVisible,toggleChrome,revealChrome,isChromeTap,snapshotAnnounced,updateChatComposer,capabilitiesRevision,toolKindOf,userMessageParts,formatElapsed,tickWorking,renderTerminalMarks,renderDetailTerminal,terminalsAnnounced,goToSessionTerminal,rememberTerminal,terminalMenu,updateTerminalMenu,chooseTerminalMenu,clearTerminalMenu,renderNewSession,openNewSession,startNewSession,startAppServer,rememberConversationView,restoreConversationView,conversationIdentity,initiatorOf,initiatorLabel,documentKeydown,sessionCategoryOf,setSessionCategory,renderSessionCategories,prepareSessionListFor,sessionCategoryKeydown,render,resetFilters,terminalTitle,renameTerminals,requestedSessionFrom,requestSessionOpen,openRequestedSession,answerOnOpen,hardReload,terminalKeyBytes,terminalKeyFromEvent,pressTerminalKey,toggleTerminalMod,clearTerminalMods,renderTerminalMods,draftBeforeInput,terminalDocumentKey,xtermKeyEvent,renderHardware,loadHardware})",
+    "({state,api,sourceOf,accountOf,sendInput,pasteDraft,prepareDraftPaste,startDraftComposition,endDraftComposition,inputDraft,stopTerminalReader,startTerminalReader,closePlan,navigateView,backToList,backFromTerminal,closeTerminal,cancelTerminalClose,confirmTerminalClose,populateAccount,populateRoute,updateContinue,renderPlan,launchPlan,openTerminal,saveDraft,draftKey,refreshTerminals,renderTerminals,renderTerminalReturn,renderFilters,terminalCloseCopy,warnDraftUnload,preparePlan,renderGroups,renderMessages,loadDetail,chatKey,chatEntry,currentChat,chatSupported,chatRecovery,recoverChatSession,openChatTerminal,chatAttachmentsSupported,buildChatComposer,sendChat,loadChatState,applyChatReceipt,uploadChatFiles,pasteChat,scheduleChatPoll,stopChatPolling,openNativeChat,allSessions,buildContinuePanel,chatReceiptCopy,returnToBoard,readChatClipboard,accountDisplay,sessionAccountLabel,closeChatToolsOutside,closeChatToolsEscape,drawDetail,refreshDetail,loadCapabilities,matches,recoverConnection,networkOffline,poll,select,focusDetailBack,restoreSelectedCardFocus,showLogin,lock,beginAuthEpoch,resizeChatInput,updateViewport,draftKeydown,configureTerminalKeyboard,queueTerminalScroll,flushTerminalScroll,terminalScrollEnd,resetTerminalScroll,renderAttention,chatPollDelay,pullRefresh,readingScroll,renderJump,pullDistance,listScroll,setReading,renderPrompt,promptAction,renderUsage,loadUsage,applyTheme,setTheme,updateThemeColor,haptic,navTransition,setDetailShown,chatVisible,sheetRelease,BottomSheet,sheet,openSettings,closeSettings,setTyping,pinchFontSize,setTerminalFontSize,loadXterm,assetUrl,syncEvents,closeEvents,eventsHealthy,renderFreshness,schedule,touchDevice,togglePhaseFilter,renderCounts,createLongPress,swipeIntent,swipeRelease,groupMessageRows,setTextSize,applyTextSize,renderConnectivity,terminalForSession,swipeActionFor,openMessageMenu,openCardMenu,messageActions,outboxShape,outboxMatches,outboxOrigin,settleOutbox,retryOutbox,renderAttachmentTiles,attachmentThumb,sendUpload,openActionSheet,closeActionSheet,setListCollapsed,closeSwipe,settleSwipe,prepareSwipe,runSwipeAction,GESTURE,setChromeVisible,toggleChrome,revealChrome,isChromeTap,snapshotAnnounced,updateChatComposer,capabilitiesRevision,toolKindOf,userMessageParts,formatElapsed,tickWorking,renderTerminalMarks,renderDetailTerminal,terminalsAnnounced,goToSessionTerminal,rememberTerminal,terminalMenu,updateTerminalMenu,chooseTerminalMenu,clearTerminalMenu,renderNewSession,openNewSession,startNewSession,startAppServer,rememberConversationView,restoreConversationView,conversationIdentity,initiatorOf,initiatorLabel,documentKeydown,sessionCategoryOf,setSessionCategory,renderSessionCategories,prepareSessionListFor,sessionCategoryKeydown,render,resetFilters,terminalTitle,renameTerminals,requestedSessionFrom,requestSessionOpen,openRequestedSession,answerOnOpen,hardReload,terminalKeyBytes,terminalKeyFromEvent,pressTerminalKey,toggleTerminalMod,clearTerminalMods,renderTerminalMods,draftBeforeInput,terminalDocumentKey,xtermKeyEvent,renderHardware,loadHardware,startDictation,stopDictation,dictationText,toggleDraftDictation,renderDictation,DICTATION_LISTENING,DICTATION_ERRORS})",
     context,
   );
   api.state.csrf = "csrf-test";
@@ -8078,4 +8079,195 @@ test('보드 표시명은 목록·검색에 반영되고 원본 제목·세션 �
   assert.equal(decorated.metadata.revision, 4);
   const html = fs.readFileSync(path.join(__dirname, '../web/index.html'), 'utf8');
   assert.ok(html.indexOf('src="/session_labels.js"') < html.indexOf('src="/app.js"'), 'module loads before app initialization');
+});
+
+// 음성 입력: the browser's own recognition, faked here.
+function dictationClient() {
+  const calls = [];
+  const c = client(async (url, opts) => {
+    calls.push(url);
+    return { ok: true, status: 200, json: async () => ({ ok: true }) };
+  }, noChatTimers);
+  const intervals = [];
+  c.context.setInterval = (callback) => { intervals.push(callback); return intervals.length; };
+  c.context.clearInterval = () => {};
+  c.context.Event = class { constructor(type) { this.type = type; } };
+  const recognitions = [];
+  class FakeRecognition {
+    constructor() { recognitions.push(this); this.started = 0; this.stopped = 0; this.aborted = 0; }
+    start() { this.started++; }
+    stop() { this.stopped++; }
+    abort() { this.aborted++; }
+  }
+  const result = (...texts) => ({ results: texts.map((text) => [{ transcript: text }]) });
+  return { c, calls, intervals, recognitions, FakeRecognition, result };
+}
+
+test('a browser without speech recognition shows no mic', () => {
+  const { c } = dictationClient();
+  const { s } = selectChat(c);
+  const composer = c.buildChatComposer(s);
+  assert.equal(findId(composer, 'chat-mic').hidden, true);
+  c.renderDictation();
+  assert.equal(c.get('draft-mic').hidden, true);
+  c.toggleDraftDictation();
+  assert.equal(c.state.dictation, null);
+});
+
+test('the chat mic writes what the device hears at the cursor in Korean, live, and never sends it', async () => {
+  const { c, calls, recognitions, FakeRecognition, result } = dictationClient();
+  c.context.webkitSpeechRecognition = FakeRecognition;
+  const { s, entry } = selectChat(c);
+  entry.text = '앞 뒤';
+  const composer = c.buildChatComposer(s);
+  const input = findId(composer, 'chat-input');
+  const mic = findId(composer, 'chat-mic');
+  assert.equal(mic.hidden, false);
+  assert.equal(mic.attributes['aria-label'], '음성 입력');
+  input.selectionStart = input.selectionEnd = 2;
+  let kept = 0;
+  c.context.document.activeElement = input;
+  mic.events.pointerdown({ preventDefault() { kept++; } });
+  assert.equal(kept, 1, 'a focused input keeps its keyboard');
+  mic.events.click();
+  const [rec] = recognitions;
+  assert.equal(rec.started, 1);
+  assert.equal(rec.lang, 'ko-KR');
+  assert.equal(rec.continuous, true);
+  assert.equal(rec.interimResults, true);
+  assert.equal(mic.attributes['aria-pressed'], 'true');
+  assert.equal(mic.attributes['aria-label'], '음성 입력 끝내기');
+  assert.equal(entry.notice, c.DICTATION_LISTENING);
+  rec.onresult(result('안녕하세요'));
+  assert.equal(input.value, '앞 안녕하세요 뒤', 'at the cursor, spaced from the words around it');
+  assert.equal(entry.text, input.value, 'the draft follows as typed text would');
+  rec.onresult(result('안녕하세요', ' 오늘   날씨'));
+  assert.equal(input.value, '앞 안녕하세요 오늘 날씨 뒤');
+  rec.onresult(result('안녕하세요', '안녕하세요 오늘 날씨'));
+  assert.equal(input.value, '앞 안녕하세요 오늘 날씨 뒤', 'a result repeating the earlier ones replaces them');
+  // Pressed again: the last words still land, then it ends quietly.
+  mic.events.click();
+  assert.equal(rec.stopped, 1);
+  rec.onresult(result('안녕하세요 오늘 날씨 어때'));
+  rec.onend();
+  assert.equal(input.value, '앞 안녕하세요 오늘 날씨 어때 뒤');
+  assert.equal(c.state.dictation, null);
+  assert.equal(entry.notice, '');
+  assert.equal(mic.attributes['aria-pressed'], 'false');
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(calls.filter((url) => url === '/api/chat/send').length, 0, 'dictation never sends');
+});
+
+test('typing, sending, an error or the input leaving the screen ends the chat dictation', async () => {
+  const { c, intervals, recognitions, FakeRecognition, result } = dictationClient();
+  c.context.webkitSpeechRecognition = FakeRecognition;
+  const { s, entry } = selectChat(c);
+  const composer = c.buildChatComposer(s);
+  const input = findId(composer, 'chat-input');
+  const mic = findId(composer, 'chat-mic');
+  // The user types: their words win and nothing more lands.
+  mic.events.click();
+  recognitions[0].onresult(result('하나'));
+  input.value = '하나 직접';
+  input.events.input();
+  assert.equal(recognitions[0].aborted, 1);
+  assert.equal(c.state.dictation, null);
+  recognitions[0].onresult(result('하나 둘'));
+  assert.equal(input.value, '하나 직접');
+  // An input method composing (한글 keyboard) also ends it.
+  mic.events.click();
+  input.events.compositionstart();
+  assert.equal(recognitions[1].aborted, 1);
+  input.events.compositionend();
+  // Sending: what is sent is the draft as it is; later words never land after it.
+  mic.events.click();
+  recognitions[2].onresult(result('보낼 말'));
+  entry.text = input.value;
+  await c.sendChat(entry);
+  assert.equal(recognitions[2].aborted, 1);
+  assert.equal(c.state.dictation, null);
+  // Errors say why, in the input's status line.
+  for (const [code, words] of [['not-allowed', /마이크 사용이 허용되지/], ['service-not-allowed', /이 화면에서는 기기 음성 인식/],
+    ['network', /음성 인식 서비스에 연결/], ['strange', /음성 입력을 마치지 못했습니다/]]) {
+    entry.pending = null; entry.sending = false;
+    c.updateChatComposer(entry);
+    mic.events.click();
+    const rec = recognitions.at(-1);
+    rec.onerror({ error: code });
+    rec.onend();
+    assert.match(entry.notice, words, code);
+  }
+  mic.events.click();
+  recognitions.at(-1).onend();
+  assert.match(entry.notice, /말소리를 듣지 못했습니다/, 'nothing heard');
+  mic.events.click();
+  recognitions.at(-1).onerror({ error: 'aborted' });
+  recognitions.at(-1).onend();
+  assert.match(entry.notice, /말소리를 듣지 못했습니다/, 'an abort says nothing new');
+  // The conversation leaves the screen (a terminal opens over it): the mic closes.
+  mic.events.click();
+  const rec = recognitions.at(-1);
+  c.state.terminalVisible = true;
+  intervals.at(-1)();
+  assert.equal(rec.aborted, 1);
+  assert.equal(c.state.dictation, null);
+  rec.onresult(result('늦은 말'));
+  assert.doesNotMatch(input.value, /늦은 말/);
+  c.state.terminalVisible = false;
+  // A start the browser refuses ends at once.
+  c.context.webkitSpeechRecognition = class extends FakeRecognition { start() { throw new Error('busy'); } };
+  mic.events.click();
+  assert.equal(c.state.dictation, null);
+  assert.match(entry.notice, /음성 입력을 마치지 못했습니다/);
+});
+
+test('the terminal input mic dictates into that terminal draft and stops for a paste or another terminal', () => {
+  const { c, intervals, recognitions, FakeRecognition, result } = dictationClient();
+  c.context.webkitSpeechRecognition = FakeRecognition;
+  c.renderDictation();
+  assert.equal(c.get('draft-mic').hidden, false);
+  c.state.terminal = { id: 'term-1' };
+  c.state.terminalVisible = true;
+  const draft = c.get('terminal-draft');
+  draft.value = 'git';
+  c.toggleDraftDictation();
+  assert.equal(recognitions[0].started, 1);
+  assert.equal(c.get('draft-note').textContent, c.DICTATION_LISTENING);
+  assert.equal(c.get('draft-mic').attributes['aria-pressed'], 'true');
+  recognitions[0].onresult(result('상태 보여 줘'));
+  assert.equal(draft.value, 'git 상태 보여 줘');
+  c.toggleDraftDictation();
+  assert.equal(recognitions[0].stopped, 1);
+  recognitions[0].onend();
+  assert.equal(c.get('draft-note').textContent, '');
+  // A paste takes the draft as it is.
+  c.toggleDraftDictation();
+  c.state.connected = false;
+  c.pasteDraft(true);
+  assert.equal(recognitions[1].aborted, 1);
+  // Another terminal on screen: this draft no longer listens.
+  c.toggleDraftDictation();
+  c.state.terminal = { id: 'term-2' };
+  recognitions[2].onresult(result('다른 터미널'));
+  assert.equal(recognitions[2].aborted, 1);
+  assert.doesNotMatch(draft.value, /다른 터미널/);
+  // While a Korean composition or a paste is in progress it does not start.
+  c.state.composing = true;
+  c.toggleDraftDictation();
+  assert.equal(recognitions.length, 3);
+  c.state.composing = false;
+  c.state.terminal = { id: 'term-2' };
+  c.toggleDraftDictation();
+  c.state.terminalVisible = false;
+  intervals.at(-1)();
+  assert.equal(recognitions[3].aborted, 1, 'leaving the terminal closes the mic');
+});
+
+test('what was heard is joined in order and a repeated head replaces the earlier results', () => {
+  const { c } = dictationClient();
+  const results = (...texts) => texts.map((text) => [{ transcript: text }]);
+  assert.equal(c.dictationText(results('안녕', ' 하세요 ')), '안녕 하세요');
+  assert.equal(c.dictationText(results('오늘', '오늘 날씨', '오늘 날씨 어때', '내일')), '오늘 날씨 어때 내일');
+  assert.equal(c.dictationText(results('', '  ', '끝')), '끝');
+  assert.equal(c.dictationText(undefined), '');
 });

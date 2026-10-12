@@ -176,6 +176,8 @@ const state = {
   terminalScrollInFlight: false,
   terminalScrollGeneration: 0,
   terminalMods: { ctrl: false, alt: false, meta: false },
+  // 음성 입력 in progress: { field, recognition, … } (startDictation), at most one.
+  dictation: null,
   terminalKeyHandled: false,
   terminalMomentum: null,
   toastTimer: null,
@@ -3103,6 +3105,180 @@ function chatAttachmentsSupported(entry) {
   return !botRequestForNative(entry.source) && !chatOneShot(entry) && !!entry.data && chatKey(entry.data.route || {}) === chatKey(entry.source) &&
     entry.data.phase !== "unavailable" && entry.data.capability?.attachments !== false;
 }
+// ---------- 음성 입력 ----------
+// The browser's own speech recognition (Safari: Apple's, Chrome: Google's, the service its
+// keyboard dictation uses); the board adds no model or service of its own. Words land at the
+// cursor as they are heard and are never sent by themselves. Typing, a send, or the field
+// leaving the screen (another session, the list, a hidden page) ends the listening.
+const DICTATION_LANG = "ko-KR";
+const DICTATION_LISTENING = "듣는 중… 말을 마치면 마이크를 다시 누르세요.";
+const DICTATION_STOP_WAIT_MS = 3000;
+const DICTATION_ERRORS = {
+  "not-allowed": "마이크 사용이 허용되지 않았습니다. 기기 설정에서 이 브라우저(홈 화면 앱이면 그 앱)의 마이크를 허용해 주세요.",
+  "service-not-allowed": "이 화면에서는 기기 음성 인식을 쓸 수 없습니다. 키보드의 마이크를 쓰거나, 기기 설정에서 받아쓰기가 켜져 있는지 확인해 주세요.",
+  "audio-capture": "마이크를 찾지 못했습니다. 다른 앱이 마이크를 쓰고 있는지 확인해 주세요.",
+  network: "음성 인식 서비스에 연결하지 못했습니다. 인터넷 연결을 확인해 주세요.",
+  "no-speech": "말소리를 듣지 못했습니다. 마이크를 다시 눌러 말해 주세요.",
+  "language-not-supported": "이 기기에서는 한국어 음성 인식을 쓸 수 없습니다.",
+};
+const MIC_ICON = '<svg aria-hidden="true" viewBox="0 0 20 20" width="20" height="20" fill="none" stroke="currentColor" ' +
+  'stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><rect x="7" y="2.5" width="6" height="10" rx="3"/>' +
+  '<path d="M4.5 9.5a5.5 5.5 0 0 0 11 0M10 15v2.5"/></svg>';
+function speechRecognitionClass() {
+  return globalThis.SpeechRecognition || globalThis.webkitSpeechRecognition || null;
+}
+// What was heard so far, final and still-changing results in order. Some Android builds
+// repeat the earlier results at the head of a later one: that one replaces them.
+function dictationText(results) {
+  const parts = [];
+  for (const result of Array.from(results || [])) {
+    const text = String(result?.[0]?.transcript || "").replace(/\s+/g, " ").trim();
+    if (!text) continue;
+    if (parts.length && text.startsWith(parts[parts.length - 1])) parts[parts.length - 1] = text;
+    else parts.push(text);
+  }
+  return parts.join(" ");
+}
+function dictationListening(field) {
+  return !!state.dictation && (!field || state.dictation.field === field);
+}
+function renderDictation() {
+  const supported = !!speechRecognitionClass();
+  for (const [id, fieldId] of [["chat-mic", "chat-input"], ["draft-mic", "terminal-draft"]]) {
+    const node = $(id);
+    if (!node) continue;
+    const listening = !!state.dictation && state.dictation.field === $(fieldId);
+    node.hidden = !supported;
+    node.setAttribute("aria-pressed", String(listening));
+    node.setAttribute("aria-label", listening ? "음성 입력 끝내기" : "음성 입력");
+    node.title = listening ? "음성 입력 끝내기" : "음성 입력 (기기 음성 인식)";
+    setClass(node, "is-listening", listening);
+  }
+}
+// report(text): the field's own status line ("" clears what this said); active(): whether
+// the field is still the one on screen.
+function startDictation(field, { report, active }) {
+  const Recognition = speechRecognitionClass();
+  if (!Recognition || !field || field.disabled || field.readOnly) return false;
+  stopDictation({ abort: true });
+  let recognition;
+  try {
+    recognition = new Recognition();
+    recognition.lang = DICTATION_LANG;
+    recognition.interimResults = true;
+    recognition.continuous = true;
+    recognition.maxAlternatives = 1;
+  } catch {
+    report("이 브라우저에서 음성 입력을 시작하지 못했습니다. 키보드의 마이크를 써 주세요.");
+    return false;
+  }
+  const value = String(field.value || "");
+  const start = Number.isInteger(field.selectionStart) ? Math.min(field.selectionStart, value.length) : value.length;
+  const end = Number.isInteger(field.selectionEnd) ? Math.min(Math.max(start, field.selectionEnd), value.length) : start;
+  const session = { field, recognition, report, active, prefix: value.slice(0, start), suffix: value.slice(end),
+    results: [], heard: false, error: "", applying: false, timer: null, stopTimer: null };
+  recognition.onresult = (event) => {
+    if (state.dictation !== session) return;
+    if (!session.active()) {
+      stopDictation({ abort: true });
+      return;
+    }
+    session.results = event.results;
+    session.heard = true;
+    applyDictation(session);
+  };
+  recognition.onerror = (event) => {
+    if (state.dictation === session) session.error = String(event?.error || "unknown");
+  };
+  recognition.onend = () => finishDictation(session);
+  state.dictation = session;
+  session.timer = setInterval(() => {
+    if (state.dictation === session && !session.active()) stopDictation({ abort: true });
+  }, 1000);
+  try {
+    recognition.start();
+  } catch {
+    session.error = "start";
+    finishDictation(session);
+    return false;
+  }
+  report(DICTATION_LISTENING);
+  renderDictation();
+  return true;
+}
+function applyDictation(session) {
+  const { field } = session;
+  const text = dictationText(session.results);
+  const lead = text && session.prefix && !/\s$/.test(session.prefix) ? " " : "";
+  const trail = text && session.suffix && !/^\s/.test(session.suffix) ? " " : "";
+  const before = session.prefix + lead + text;
+  field.value = before + trail + session.suffix;
+  if (document.activeElement === field) field.setSelectionRange?.(before.length, before.length);
+  // The field's own input handling (draft saving, sizing) runs as for typing.
+  session.applying = true;
+  try {
+    field.dispatchEvent(new Event("input", { bubbles: true }));
+  } finally {
+    session.applying = false;
+  }
+}
+function finishDictation(session) {
+  if (state.dictation !== session) return;
+  state.dictation = null;
+  clearInterval(session.timer);
+  clearTimeout(session.stopTimer);
+  const error = session.error === "aborted" ? "" : session.error;
+  session.report(error ? DICTATION_ERRORS[error] || "음성 입력을 마치지 못했습니다. 다시 눌러 주세요."
+    : session.heard ? "" : DICTATION_ERRORS["no-speech"]);
+  renderDictation();
+}
+// stop: the last words still arrive (onend finishes). abort: nothing more lands.
+function stopDictation({ abort = false, field = null } = {}) {
+  const session = state.dictation;
+  if (!session || (field && session.field !== field)) return;
+  if (!abort) {
+    clearTimeout(session.stopTimer);
+    session.stopTimer = setTimeout(() => {
+      if (state.dictation === session) stopDictation({ abort: true });
+    }, DICTATION_STOP_WAIT_MS);
+    try {
+      session.recognition.stop();
+    } catch {
+      stopDictation({ abort: true });
+    }
+    return;
+  }
+  state.dictation = null;
+  clearInterval(session.timer);
+  clearTimeout(session.stopTimer);
+  try {
+    session.recognition.abort();
+  } catch {
+    // Already ended.
+  }
+  session.report("");
+  renderDictation();
+}
+// A key typed or an input method composing in the field: the user's own words win.
+function dictationTyped(field) {
+  if (state.dictation?.field === field && !state.dictation.applying) stopDictation({ abort: true });
+}
+function toggleDraftDictation() {
+  const field = $("terminal-draft");
+  if (dictationListening(field)) {
+    stopDictation({ field });
+    return;
+  }
+  if (!state.terminal || state.composing || state.draftPaste) return;
+  const terminalId = state.terminal.id;
+  startDictation(field, {
+    report: (text) => {
+      const note = $("draft-note");
+      if (text || note.textContent === DICTATION_LISTENING) note.textContent = text;
+    },
+    active: () => state.terminalVisible && !document.hidden && state.terminal?.id === terminalId && !state.draftPaste,
+  });
+}
 function buildChatComposer(s) {
   const entry = chatEntry(s);
   // Detached editors can still emit Android IME events after a session switch.
@@ -3153,6 +3329,7 @@ function buildChatComposer(s) {
   input.setAttribute("aria-label", "메시지");
   input.value = entry.text;
   input.addEventListener("input", () => {
+    dictationTyped(input);
     if (!editorCurrent()) return;
     entry.inputCollapsed = false;
     entry.text = input.value;
@@ -3175,6 +3352,7 @@ function buildChatComposer(s) {
     if (!state.chromeVisible) setReading(true, { stickBottom: messagesAtEnd($("messages")) });
   });
   input.addEventListener("compositionstart", () => {
+    dictationTyped(input);
     if (!editorCurrent()) return;
     entry.composing = true;
     updateChatComposer(entry);
@@ -3264,6 +3442,30 @@ function buildChatComposer(s) {
   });
   send.id = "chat-send";
   send.setAttribute("aria-keyshortcuts", "Meta+Enter Control+Enter");
+  const reportDictation = (text) => {
+    if (!text && entry.notice !== DICTATION_LISTENING) return;
+    entry.notice = text;
+    if (editorCurrent()) updateChatComposer(entry);
+  };
+  const mic = button("", "chat-mic", () => {
+    if (!editorCurrent()) return;
+    if (dictationListening(input)) {
+      stopDictation({ field: input });
+      return;
+    }
+    startDictation(input, { report: reportDictation,
+      active: () => editorCurrent() && chatVisible() && !input.disabled && !input.readOnly });
+  });
+  mic.id = "chat-mic";
+  mic.innerHTML = MIC_ICON;
+  mic.hidden = !speechRecognitionClass();
+  mic.setAttribute("aria-label", "음성 입력");
+  mic.setAttribute("aria-pressed", "false");
+  mic.title = "음성 입력 (기기 음성 인식)";
+  // Like the send key: a focused field keeps its keyboard and layout.
+  mic.addEventListener("pointerdown", (event) => {
+    if (document.activeElement === input) event.preventDefault();
+  });
   // Sending keeps the keyboard and the folded typing layout; a blur first
   // would move the button away under the finger before the click lands.
   send.addEventListener("pointerdown", (event) => {
@@ -3305,7 +3507,7 @@ function buildChatComposer(s) {
   tools.append(toolsActions);
   actions.append(attach, expand, terminal, keyHint, tools);
   const main = el("div", "chat-main");
-  main.append(input, send);
+  main.append(input, mic, send);
   box.append(heading, status, recovery, gate, evidence, attachmentsLabel, attachments, main, files, actions, hint);
   queueMicrotask(() => {
     if (!editorCurrent()) return;
@@ -3494,6 +3696,8 @@ function updateChatComposer(entry) {
   $("chat-attach").disabled = offline || !chatAttachmentsSupported(entry) || entry.sending || !!entry.pending || !!entry.uploads;
   $("chat-clipboard").disabled = $("chat-attach").disabled;
   $("chat-send").disabled = blocked || entry.composing || (!entry.text.trim() && !entry.attachments.length);
+  $("chat-mic").disabled = input.disabled || input.readOnly || entry.composing;
+  renderDictation();
   $("chat-send").textContent = entry.sending ? "전송 중" : "보내기";
   $("chat-send").setAttribute("aria-label", "메시지 보내기");
   $("chat-key-hint").hidden = oneShot || !!entry.expanded || !keyboardPresent();
@@ -3808,6 +4012,8 @@ async function sendChat(entry, message = null) {
     updateChatComposer(entry);
     return;
   }
+  // The draft is what is sent: words still being heard never land after it.
+  if (!message) stopDictation({ abort: true, field: $("chat-input") });
   // Keep the exact source and idempotency key even if selection changes during transport.
   const authEpoch = state.authEpoch;
   const pending = { requestId: requestId(), revision: entry.revision, source: entry.source,
@@ -5702,6 +5908,7 @@ function settleDraftComposition() {
 }
 function startDraftComposition(event) {
   if (event?.target && event.target !== $("terminal-draft")) return;
+  dictationTyped($("terminal-draft"));
   if (anyTerminalMod()) {
     // An input method composing (한글, say) gives no key to combine with: said, not silent.
     clearTerminalMods();
@@ -5749,6 +5956,7 @@ function prepareDraftPaste(event) {
 }
 function bindDraftInput(node) {
   node.addEventListener("input", (event) => {
+    dictationTyped(node);
     inputDraft(event);
     resizeDraft();
   });
@@ -6640,6 +6848,7 @@ function draftKeydown(event) {
 }
 async function pasteDraft(submit = false) {
   if (state.draftPaste) return;
+  stopDictation({ abort: true, field: $("terminal-draft") });
   if (!state.connected || !state.terminal) {
     $("draft-note").textContent = "터미널에 다시 연결한 뒤 붙여넣어 주세요.";
     return;
@@ -7932,6 +8141,11 @@ window.addEventListener("DOMContentLoaded", () => {
   $("draft-paste").addEventListener("click", () => pasteDraft(true));
   $("draft-type").addEventListener("pointerdown", prepareDraftPaste);
   $("draft-type").addEventListener("click", () => pasteDraft(false));
+  $("draft-mic").addEventListener("pointerdown", (event) => {
+    if (document.activeElement === $("terminal-draft")) event.preventDefault();
+  });
+  $("draft-mic").addEventListener("click", toggleDraftDictation);
+  renderDictation();
   bindDraftInput($("terminal-draft"));
   for (const [id, delta] of [
     ["terminal-font-down", -1],
@@ -7944,6 +8158,8 @@ window.addEventListener("DOMContentLoaded", () => {
     // The working time stops counting while the page is hidden and catches up when shown.
     if (document.hidden) stopWorkingClock();
     else tickWorking();
+    // A hidden page does not keep the microphone open.
+    if (document.hidden) stopDictation({ abort: true });
     if (document.hidden) {
       // Live updates stop with the page; a visible page reconnects after its read.
       closeEvents();

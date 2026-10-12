@@ -42,6 +42,7 @@ HERE = Path(__file__).resolve().parent
 WEB = HERE / "web"
 COLLECTOR = HERE / "collector.py"
 WINDOWS_COLLECTOR = HERE / "windows_collector.py"
+HARDWARE = HERE / "hardware.py"
 WINDOWS_READ_ONLY = "이 Windows 작업은 아직 지원하지 않습니다. 기존 세션의 대화·터미널·종료 기능을 사용해 주세요."
 # Installation names (instance.json); without one these are the public names.
 NAMES = instance.current()
@@ -122,6 +123,38 @@ SECURITY_HEADERS = {
 }
 
 
+def windows_launcher_setting(value):
+    """`{label, choices: [{label, command, cwd}]}`: each command a program on a PC drive
+    (C:\\…, not a network share) and literal arguments (no control characters, nothing
+    PowerShell 5.1 would pass on altered), each cwd a folder on a PC drive (any name: it is
+    not an argument). The whole menu must fit one remote command line."""
+    from transfer import WINDOWS_COMMAND_LIMIT, windows_encoded_command, windows_launcher_script, windows_literal_argument
+    bad = ValueError("PC 새 세션 선택지 형식이 올바르지 않습니다.")
+    text = lambda v, limit: isinstance(v, str) and 0 < len(v) <= limit and not any(ord(c) < 32 for c in v)
+    absolute = lambda v: text(v, 1024) and re.fullmatch(r"[A-Za-z]:[\\/].*", v) is not None
+    # Only a program and its arguments pass through PowerShell's native argument quoting.
+    argument = lambda v, limit: text(v, limit) and windows_literal_argument(v)
+    if not isinstance(value, dict) or set(value) - {"label", "choices"}:
+        raise bad
+    label, choices = value.get("label", "새 세션"), value.get("choices")
+    if not text(label, 64) or not isinstance(choices, list) or not 1 <= len(choices) <= 12:
+        raise bad
+    result = []
+    for choice in choices:
+        if (not isinstance(choice, dict) or set(choice) - {"label", "command", "cwd"} or not text(choice.get("label"), 64)
+                or not isinstance(choice.get("command"), list) or not 1 <= len(choice["command"]) <= 16
+                or not absolute(choice["command"][0]) or not argument(choice["command"][0], 1024)
+                or not all(argument(arg, 4096) for arg in choice["command"][1:])
+                or "cwd" in choice and not absolute(choice["cwd"])):
+            raise bad
+        result.append({"label": choice["label"], "command": list(choice["command"]),
+                       **({"cwd": choice["cwd"]} if "cwd" in choice else {})})
+    launcher = {"label": label, "choices": result}
+    if len(windows_encoded_command(windows_launcher_script(launcher))) > WINDOWS_COMMAND_LIMIT:
+        raise ValueError("PC 새 세션 선택지가 너무 많거나 깁니다.")
+    return launcher
+
+
 def load_hosts(path):
     hosts = []
     path = settings.safe_path(path, allow_missing=True)
@@ -133,8 +166,8 @@ def load_hosts(path):
     if not isinstance(rows, list) or not 1 <= len(rows) <= 16:
         raise ValueError("기기 설정은 1~16개 항목의 JSON 목록이어야 합니다.")
     for row in rows:
-        if (not isinstance(row, dict) or set(row) - {"name", "label", "local", "ssh", "python", "platform"}
-                or type(row.get("local", False)) is not bool
+        if (not isinstance(row, dict) or set(row) - {"name", "label", "local", "ssh", "python", "platform", "monitorOnly", "launcher"}
+                or type(row.get("local", False)) is not bool or type(row.get("monitorOnly", False)) is not bool
                 or not isinstance(row.get("name"), str)
                 or not isinstance(row.get("python") or "/usr/bin/python3", str)
                 or not isinstance(row.get("label", row["name"]), str)
@@ -157,10 +190,22 @@ def load_hosts(path):
                       "ssh": row.get("ssh"), "python": python})
         if platform == "windows":
             hosts[-1]["platform"] = "windows"
+        if "launcher" in row:
+            # A Mac reads its own config.json launcher; a PC's 새 세션 choices live here.
+            if platform != "windows":
+                raise ValueError("기기 설정의 새 세션 선택지는 Windows 기기에만 둘 수 있습니다.")
+            hosts[-1]["launcher"] = windows_launcher_setting(row["launcher"])
+        if row.get("monitorOnly"):
+            # Only its hardware is read (설정 `hardware`): no sessions, terminals or launches.
+            if row.get("local"):
+                raise ValueError("이 보드의 기기는 모니터링 전용으로 둘 수 없습니다.")
+            hosts[-1]["monitorOnly"] = True
     if len({h["name"] for h in hosts}) != len(hosts):
         raise ValueError("기기 이름이 중복됩니다.")
     if sum(bool(h["local"]) for h in hosts) > 1:
         raise ValueError("로컬 기기는 한 항목만 등록할 수 있습니다.")
+    if all(h.get("monitorOnly") for h in hosts):
+        raise ValueError("세션을 수집할 기기가 하나 이상 있어야 합니다.")
     return hosts
 
 
@@ -237,9 +282,9 @@ def collector_command(host, args, state_dir=None):
     if host["local"]:
         return [sys.executable, "-I", str(COLLECTOR)] + list(args)
     if host.get("platform") == "windows":
-        quote = lambda value: "'" + str(value).replace("'", "''") + "'"
+        from transfer import ps_quote as quote
         script = "$ErrorActionPreference='Stop'; $env:PYTHONIOENCODING='utf-8'; & " + " ".join(
-            quote(value) for value in [host.get("python") or "python.exe", "-I", "-"] + list(args)) + "; exit $LASTEXITCODE"
+            quote(str(value)) for value in [host.get("python") or "python.exe", "-I", "-"] + list(args)) + "; exit $LASTEXITCODE"
         encoded = base64.b64encode(script.encode("utf-16le")).decode("ascii")
         return ssh_command(host, "powershell.exe -NoProfile -NonInteractive -EncodedCommand " + encoded, state_dir)
     remote = (f"PATH={REMOTE_PATH} {shlex.quote(host['python'])} -I - "
@@ -322,6 +367,30 @@ def run_collector(host, args, timeout, state_dir=None):
     return result
 
 
+def run_hardware(host, state_dir=None, timeout=20):
+    """hardware.py's JSON for one machine: run here, or sent over SSH as stdin (no session code
+    and nothing left there), on a Mac or Windows alike."""
+    if host["local"]:
+        command, stdin = [sys.executable, "-I", str(HARDWARE)], None
+    else:
+        command, stdin = collector_command(host, [], state_dir), HARDWARE.read_bytes()
+    try:
+        done = subprocess.run(command, input=stdin, capture_output=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError("응답 시간 초과") from None
+    except OSError:
+        raise RuntimeError("기기 정보를 읽지 못했습니다") from None
+    if done.returncode != 0:
+        raise RuntimeError("SSH 연결 실패" if done.returncode == 255 else "기기 정보를 읽지 못했습니다")
+    try:
+        result = json.loads(done.stdout)
+    except ValueError:
+        raise ValueError("기기 정보 형식이 올바르지 않습니다.") from None
+    if not isinstance(result, dict) or result.get("error"):
+        raise ValueError("기기 정보를 읽지 못했습니다.")
+    return result
+
+
 def scrub_payload(value):
     from launch import scrub_text
     if isinstance(value, list):
@@ -393,7 +462,7 @@ def page_names(names=None):
     names = names if names is not None else NAMES
     return {"title": names["brand"]["title"], "shortName": names["brand"]["shortName"],
             "storagePrefix": names["web"]["storagePrefix"], "historyKey": names["web"]["historyKey"],
-            "attachmentsDir": names["remote"]["attachmentsDir"]}
+            "cachePrefix": names["web"]["cachePrefix"], "attachmentsDir": names["remote"]["attachmentsDir"]}
 
 
 def render_page(text, names=None):
@@ -1273,10 +1342,12 @@ class Workflow:
                             accounts.append({**presentation, "id": key, "agent": agent,
                                              "home": home, "available": True})
             if host.get("platform") == "windows":
-                accounts = [{**p, "available": p.get("agent") == "codex", "launchEnabled": False,
-                             "reason": None if p.get("agent") == "codex" else
-                             "Claude 대화형 세션은 실행한 터미널에서 입력할 수 있습니다."} for p in accounts]
+                # Opening and resuming a PC session is decided by the PC (terminal_plan); launching
+                # a new one is the host's 새 세션 menu.
+                accounts = [{**p, "available": True, "launchEnabled": False, "reason": None} for p in accounts]
             hosts.append({"name": host["name"], "label": host["label"], "online": status["ok"],
+                # The terminal's keys follow the host (⌘ and ⌥ mean Windows keys there).
+                **({"platform": "windows"} if host.get("platform") == "windows" else {}),
                 "newSession": self.new_session_status(host, status["ok"]),
                 "agents": [{"id": agent, "label": "Claude Code" if agent == "claude" else "Codex",
                     "accounts": [{k: p.get(k) for k in ("id", "label", "available", "reason", "home",
@@ -1289,7 +1360,11 @@ class Workflow:
     def new_session_status(self, host, online=True):
         """Whether this host's launcher can open "새 세션", read from that host's own settings."""
         if host.get("platform") == "windows":
-            return {"available": False, "label": None, "reason": WINDOWS_READ_ONLY}
+            if not host.get("launcher"):
+                return {"available": False, "label": None, "reason": "이 PC의 새 세션 선택지가 기기 설정에 없습니다."}
+            if not online:
+                return {"available": False, "label": None, "reason": "기기에 연결할 수 없습니다."}
+            return {"available": True, "label": host["launcher"]["label"], "reason": None}
         if host["local"]:
             from launch import new_session_status
             return new_session_status()
@@ -1342,8 +1417,8 @@ class Workflow:
         host = next((h for h in self.board.hosts if h["name"] == host_name), None)
         if host is None:
             raise ValueError("새 세션을 열 기기를 선택해 주세요.")
-        if host.get("platform") == "windows":
-            raise ValueError(WINDOWS_READ_ONLY)
+        if host.get("platform") == "windows" and not host.get("launcher"):
+            raise ValueError("이 PC의 새 세션 선택지가 기기 설정에 없습니다.")
         with self.lock:
             if request_id in self.requests:
                 previous, result = self.requests[request_id]
@@ -1358,6 +1433,11 @@ class Workflow:
                     from launch import new_session
                     spec = new_session()
                     label = spec["label"]
+                elif host.get("platform") == "windows":
+                    import collector
+                    label = host["launcher"]["label"]
+                    spec = {"argv": self.transfers.windows_launcher(host, host["launcher"]), "cwd": str(Path.home()),
+                            "env": collector.tool_env()}
                 else:
                     # Asked fresh: the host's settings decide, and its helper path is then known.
                     status = self.transfers.launcher(host, refresh=True)
@@ -1426,7 +1506,8 @@ class Workflow:
     def _native_of(host, agent, row):
         """A listed row as a terminal's native session, or None for rows that never count."""
         cwd = row.get("cwd")
-        if not isinstance(cwd, str) or not cwd.startswith("/"):
+        from pathlib import PureWindowsPath
+        if not isinstance(cwd, str) or not (cwd.startswith("/") or PureWindowsPath(cwd).drive and PureWindowsPath(cwd).is_absolute()):
             return None
         if agent == "codex":
             if row.get("source") not in (None, "cli", "vscode") or not HOME_KEY.match(row.get("home") or ""):
@@ -1550,14 +1631,19 @@ class Workflow:
             allowed, reason = False, "원본 기기의 연결을 확인한 뒤 다시 시도해 주세요."
         if not same and not cross_host and source.get("phase") in ("working", "needs_input"):
             allowed, reason = False, "진행 중인 실행이나 승인 요청을 원래 터미널에서 마무리한 뒤 전환해 주세요."
-        if same and source["agent"] == "claude" and source.get("kind") != "background":
+        if same and source["agent"] == "claude" and source.get("kind") != "background" and not windows:
             allowed, reason = False, "이 Claude 세션은 기존 터미널에서 실행 중입니다. 백그라운드 세션만 직접 연결할 수 있어요."
+        windows_resumed = False
+        route_key = hashlib.sha256(json.dumps([self.identity(source), target], sort_keys=True).encode()).hexdigest()
+        existing = next((item for item in self.terminals.list() if item.get("alive") and item.get("key", "").split(":")[0] == route_key), None)
         if allowed and resume:
             preview = self.resume_preview(source)
             allowed, reason = preview["allowed"], preview.get("reason")
-        elif allowed and windows:
+        elif allowed and windows and not existing:
+            # A PC conversation resumed in an open board terminal now runs there: that one is reopened.
             try:
-                self.transfers.rpc(host, "terminal_plan", {"source": source}, timeout=12)
+                spec = self.transfers.rpc(host, "terminal_plan", {"source": source}, timeout=12)
+                windows_resumed = spec.get("resumed") is True
             except (ValueError, RuntimeError, OSError) as exc:
                 allowed, reason = False, str(exc)
         config = settings.load()
@@ -1576,8 +1662,8 @@ class Workflow:
         summary = ("코드·미커밋 변경·최근 대화를 대상 기기로 넘겨 이어갑니다." if cross_host else
                    "같은 기기·계정에서 저장된 대화를 다시 엽니다. 메시지는 보내지 않습니다." if resume else
                    "기존 작업의 터미널에 연결합니다." if same else "작업 맥락을 자동으로 넘겨 새 터미널을 준비합니다.")
-        route_key = hashlib.sha256(json.dumps([self.identity(source), target], sort_keys=True).encode()).hexdigest()
-        existing = next((item for item in self.terminals.list() if item.get("alive") and item.get("key", "").split(":")[0] == route_key), None)
+        if windows_resumed:
+            summary = "PC에 저장된 대화를 그 PC의 터미널에서 다시 엽니다. 메시지는 보내지 않습니다."
         if allowed and existing:
             mode, summary = "reconnect", "이미 열어 둔 터미널에 다시 연결합니다."
             if not same:
@@ -2149,6 +2235,8 @@ class Handler(BaseHTTPRequestHandler):
                     return self.send_json(200, result)
                 if url.path == "/api/usage" and self.server.usage is not None:
                     return self.send_json(200, self.server.usage.snapshot(refresh=True))
+                if url.path == "/api/hardware" and getattr(self.server, "hardware", None) is not None:
+                    return self.send_json(200, self.server.hardware.snapshot(refresh=True))
                 if url.path == "/api/capabilities":
                     result = self.server.workflow.capabilities()
                     return self.send_json(200, {**result, "csrfToken": self.server.csrf,
@@ -2360,6 +2448,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_json(200, self.snapshot())
             if path == "/api/usage/refresh" and self.server.usage is not None:
                 return self.send_json(200, self.server.usage.snapshot(force=True))
+            if path == "/api/hardware/refresh" and getattr(self.server, "hardware", None) is not None:
+                return self.send_json(200, self.server.hardware.snapshot(force=True))
             if path == "/api/chat/state":
                 result = self.server.chat.state(data)
                 self.observe_work(result.get("route") or data.get("source"), result)
@@ -2497,7 +2587,7 @@ class BoardHTTPServer(ThreadingHTTPServer):
 
 
 def make_server(bind, port, board, token, terminals=None, workflow=None, state_dir=STATE_DIR, max_terminals=None,
-                tailscale_user=None, usage=None, automatic_work=False, push=True):
+                tailscale_user=None, usage=None, automatic_work=False, push=True, hardware=None):
     """`usage` (usage.UsageMeter) serves /api/usage; without it the routes stay 404."""
     if bind not in ("127.0.0.1", "::1"):
         raise ValueError("서버는 loopback에서만 실행할 수 있습니다.")
@@ -2509,6 +2599,7 @@ def make_server(bind, port, board, token, terminals=None, workflow=None, state_d
     server.daemon_threads = True
     server.board, server.token, server.tailscale_user = board, token, tailscale_user
     server.usage = usage
+    server.hardware = hardware
     server.goals = Goals(state_dir)
     server.session_labels = SessionLabels(state_dir)
     server.cookie_name = COOKIE + "_" + str(server.server_address[1])
@@ -2607,13 +2698,21 @@ def main(argv=None):
         parser.error(str(exc))
     if args.local_only:
         hosts = [h for h in hosts if h["local"]]
-    board = Board(hosts, max(args.interval, 60), state_dir=args.state_dir, live=not args.no_live)
+    # A monitoring-only machine never reaches the board: no sessions, launches or notices.
+    board = Board([h for h in hosts if not h.get("monitorOnly")], max(args.interval, 60), state_dir=args.state_dir,
+                  live=not args.no_live)
     meter = None
     if config["usage"] is not None:
         from usage import UsageMeter
         meter = UsageMeter(config["usage"])
+    hardware = None
+    if config["hardware"] is not None:
+        from hardware_monitor import HardwareMonitor
+        hardware = HardwareMonitor(hosts, lambda host: run_hardware(host, args.state_dir),
+                                   interval=config["hardware"]["intervalSeconds"],
+                                   manual_interval=config["hardware"]["manualIntervalSeconds"])
     httpd = make_server(args.bind, args.port, board, token, state_dir=args.state_dir,
-                        max_terminals=args.max_terminals, tailscale_user=tailscale_user, usage=meter,
+                        max_terminals=args.max_terminals, tailscale_user=tailscale_user, usage=meter, hardware=hardware,
                         automatic_work=args.auto_work and not args.no_auto_work, push=not args.no_push)
     collecting = "화면을 열 때와 알림을 받는 기기가 있을 때 수집합니다." if not args.no_push else "화면을 열 때만 수집합니다."
     print(f"{LOG_PREFIX}: http://127.0.0.1:{args.port}/ · {collecting}", file=sys.stderr)

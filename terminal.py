@@ -458,7 +458,12 @@ class TerminalManager:
     def _configure(self, terminal):
         # Unlike has-session/attach-session, option targets interpret '=' as part
         # of the name. These complete names are generated here, never by clients.
-        done = self._run("set-option", "-t", terminal.record["name"], "status", "off")
+        # No prefix key: Ctrl+B (and every key after it) belongs to the CLI, never to this
+        # board's own tmux client, which Ctrl+B d would otherwise detach.
+        name = terminal.record["name"]
+        done = self._run("set-option", "-t", name, "status", "off", ";",
+                         "set-option", "-t", name, "prefix", "None", ";",
+                         "set-option", "-t", name, "prefix2", "None")
         if done.returncode != 0:
             raise RuntimeError("터미널 화면 설정을 적용하지 못했습니다.")
 

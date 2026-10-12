@@ -60,7 +60,7 @@ flowchart LR
 | `agentName`, `agentRole` | 현재 세션의 워커 이름·역할. 시작한 부모 이름과 별도 |
 | `source`, `originator` | native 시작 경로와 원본 originator 메타데이터 |
 
-Codex RPC의 `source.subAgent`와 DB의 `source.subagent` 구조를 보존하고, 알려진 하위 에이전트 source는 에이전트 시작으로 분류합니다. `cli / exec`, Claude `interactive / background`, agent 이름이나 부모 ID만으로 사람·에이전트 시작을 추정하지 않습니다. Claude 목록의 명시 initiator·부모 필드도 전달합니다. 공통 스키마가 모든 에이전트 adapter를 만드는 것은 아니며 현재 Codex·Claude Code만 지원합니다. Windows PC 연결은 목록과 대화 읽기 경로를 제공하며 macOS의 터미널·입력·실행 제어 경로와 지원 범위를 분리합니다.
+Codex RPC의 `source.subAgent`와 DB의 `source.subagent` 구조를 보존하고, 알려진 하위 에이전트 source는 에이전트 시작으로 분류합니다. `cli / exec`, Claude `interactive / background`, agent 이름이나 부모 ID만으로 사람·에이전트 시작을 추정하지 않습니다. Claude 목록의 명시 initiator·부모 필드도 전달합니다. 공통 스키마가 모든 에이전트 adapter를 만드는 것은 아니며 현재 Codex·Claude Code만 지원합니다. Windows PC 연결은 목록·대화 읽기와 함께 Codex 입력·제어, 저장 대화의 터미널 재개, 설정된 새 세션 메뉴를 PowerShell(SSH stdin, 터미널은 `-EncodedCommand`)로 제공하며, macOS의 tmux 도우미 경로와 지원 범위를 분리합니다.
 
 ## 세션 목록과 대화 보기
 
@@ -108,8 +108,9 @@ Codex RPC의 `source.subAgent`와 DB의 `source.subagent` 구조를 보존하고
 - `transfer.agentConfig`: `"exclude-private"`(기본, `.claude`·`.codex*`의 개인 상태만 제외) 또는 `"exclude-all"`(이 이름의 폴더·파일 전체 제외).
 - `attachments.gitExclude`: 기본 `true`. `false`면 업로드 때 저장소의 `.git/info/exclude`를 쓰지 않습니다.
 - `usage`: 보드 호스트의 사용량 도우미(`usage.py`). `provider: "helper"`, `resources`·`python`·`path`, Codex(`codex`, `codexHelper`, `codexAccounts: [{key, label}]`)·Claude(`claude`, `claudeHelper`) 중 하나 이상, `intervalSeconds`(기본 300)·`manualIntervalSeconds`(기본 20). 없으면 `/api/usage`는 404이고 화면은 사용량을 숨깁니다.
+- `hardware`: `{intervalSeconds, manualIntervalSeconds}`(기본 30·10초, 최소 30·5초). 켜면 목록의 "기기" 칩과 창이 보드가 아는 모든 기기의 CPU·메모리·디스크·배터리·가동 시간을 보여 줍니다. 값은 `hardware.py`가 읽습니다. 보드 기기에서는 직접 실행하고, 원격 기기에는 수집기와 같은 방식으로 SSH stdin에 보내므로 원격에 파일을 남기지 않습니다. 맥은 커널 CPU tick·`vm_stat`·`pmset`·`kern.boottime`, Windows는 kernel32(GlobalMemoryStatusEx·GetSystemTimes·GetSystemPowerStatus·GetTickCount64)를 씁니다. CPU 사용률은 두 번 읽은 사이의 차이이고, 맥은 1분 평균 부하도 보여 줍니다. 화면이 열려 있을 때만 읽고, 실패한 기기는 마지막 값을 "이전 값"으로 남긴 채 간격을 늘립니다(최대 8배). 없으면 `/api/hardware`는 404이고 칩은 숨겨집니다.
 
-- `launcher`: `{command, label, cwd}`. 목록의 "새 세션"이 이 기기의 터미널에서 여는 실행 명령입니다. `command[0]`은 절대 경로나 `~/` 경로이고, `label`(기본 "새 세션")은 화면 이름, `cwd`(기본 홈 폴더)는 시작 폴더입니다. 보드는 명령을 열기만 하고, 프로젝트·에이전트·계정 선택과 그 검사는 실행 명령이 맡습니다. 원격 기기는 그 기기의 설정으로 실행하며, 환경 변수는 일반 터미널 변수(`PATH`·`LANG`·`TERM` 등과 사용자의 `SSH_AUTH_SOCK`)만 넘깁니다. 실행 명령이 `  1. 이름` 줄과 `선택:` 같은 입력 줄로 번호 메뉴를 보이면, 화면은 그 메뉴를 버튼으로 보여 주고 누르면 번호와 Enter를 입력합니다. 없으면 "새 세션"은 숨겨집니다. 이 임의 실행 명령 내부의 계정 정책은 명령 자체가 책임지며 보드의 `launchEnabled` 설정을 자동 주입하지 않습니다.
+- `launcher`: `{command, label, cwd}`. 목록의 "새 세션"이 이 기기의 터미널에서 여는 실행 명령입니다. `command[0]`은 절대 경로나 `~/` 경로이고, `label`(기본 "새 세션")은 화면 이름, `cwd`(기본 홈 폴더)는 시작 폴더입니다. 보드는 명령을 열기만 하고, 프로젝트·에이전트·계정 선택과 그 검사는 실행 명령이 맡습니다. 원격 기기는 그 기기의 설정으로 실행하며, 환경 변수는 일반 터미널 변수(`PATH`·`LANG`·`TERM` 등과 사용자의 `SSH_AUTH_SOCK`)만 넘깁니다. 실행 명령이 `  1. 이름` 줄과 `선택:` 같은 입력 줄로 번호 메뉴를 보이면, 화면은 그 메뉴를 버튼으로 보여 주고 누르면 번호와 Enter를 입력합니다. 없으면 "새 세션"은 숨겨집니다. Windows 기기는 원격 설정 파일을 읽지 않고 보드의 `hosts.json` 항목에 `launcher: {label, choices: [{label, command, cwd}]}`(1~12개)를 둡니다. `command[0]`과 `cwd`는 드라이브 문자로 시작하는 PC 경로이고, 인자에는 큰따옴표·제어 문자를 쓸 수 없습니다(PowerShell 5.1이 바꿔 전달함). 보드는 이 값만 PowerShell 번호 메뉴로 만들어 SSH 터미널에서 열고, 선택지가 하나면 바로 실행합니다. 이 임의 실행 명령 내부의 계정 정책은 명령 자체가 책임지며 보드의 `launchEnabled` 설정을 자동 주입하지 않습니다.
 
 새 세션 터미널과 이후 나타난 native 대화를 시각으로 짝짓는 기존 경로는 `linkConfidence: "estimated"`입니다. 보드에서 실행 버튼을 누른 사실만으로 그 native 대화를 직접 시작으로 확정하거나 목표를 자동 연결하지 않습니다. 외부 라우터가 launch ID와 native session ID를 정확하게 기록하더라도 보드 터미널 요청과 그 launch ID를 연결하는 계약은 별도로 필요하며 현재 지원하지 않습니다.
 

@@ -126,7 +126,7 @@ function client(
   vm.runInContext(messageSource, context);
   vm.runInContext(source, context);
   const api = vm.runInContext(
-    "({state,api,sourceOf,accountOf,sendInput,pasteDraft,prepareDraftPaste,startDraftComposition,endDraftComposition,inputDraft,stopTerminalReader,startTerminalReader,closePlan,navigateView,backToList,backFromTerminal,closeTerminal,cancelTerminalClose,confirmTerminalClose,populateAccount,populateRoute,updateContinue,renderPlan,launchPlan,openTerminal,saveDraft,draftKey,refreshTerminals,renderTerminals,renderTerminalReturn,renderFilters,terminalCloseCopy,warnDraftUnload,preparePlan,renderGroups,renderMessages,loadDetail,chatKey,chatEntry,currentChat,chatSupported,chatRecovery,recoverChatSession,openChatTerminal,chatAttachmentsSupported,buildChatComposer,sendChat,loadChatState,applyChatReceipt,uploadChatFiles,pasteChat,scheduleChatPoll,stopChatPolling,openNativeChat,allSessions,buildContinuePanel,chatReceiptCopy,returnToBoard,readChatClipboard,accountDisplay,sessionAccountLabel,closeChatToolsOutside,closeChatToolsEscape,drawDetail,refreshDetail,loadCapabilities,matches,recoverConnection,networkOffline,poll,select,focusDetailBack,restoreSelectedCardFocus,showLogin,lock,beginAuthEpoch,resizeChatInput,updateViewport,draftKeydown,configureTerminalKeyboard,queueTerminalScroll,flushTerminalScroll,terminalScrollEnd,resetTerminalScroll,renderAttention,chatPollDelay,pullRefresh,readingScroll,renderJump,pullDistance,listScroll,setReading,renderPrompt,promptAction,renderUsage,loadUsage,applyTheme,setTheme,updateThemeColor,haptic,navTransition,setDetailShown,chatVisible,sheetRelease,BottomSheet,sheet,openSettings,closeSettings,setTyping,pinchFontSize,setTerminalFontSize,loadXterm,assetUrl,syncEvents,closeEvents,eventsHealthy,renderFreshness,schedule,touchDevice,togglePhaseFilter,renderCounts,createLongPress,swipeIntent,swipeRelease,groupMessageRows,setTextSize,applyTextSize,renderConnectivity,terminalForSession,swipeActionFor,openMessageMenu,openCardMenu,messageActions,outboxShape,outboxMatches,outboxOrigin,settleOutbox,retryOutbox,renderAttachmentTiles,attachmentThumb,sendUpload,openActionSheet,closeActionSheet,setListCollapsed,closeSwipe,settleSwipe,prepareSwipe,runSwipeAction,GESTURE,setChromeVisible,toggleChrome,revealChrome,isChromeTap,snapshotAnnounced,updateChatComposer,capabilitiesRevision,toolKindOf,userMessageParts,formatElapsed,tickWorking,renderTerminalMarks,renderDetailTerminal,terminalsAnnounced,goToSessionTerminal,rememberTerminal,terminalMenu,updateTerminalMenu,chooseTerminalMenu,clearTerminalMenu,renderNewSession,openNewSession,startNewSession,startAppServer,rememberConversationView,restoreConversationView,conversationIdentity,initiatorOf,initiatorLabel,documentKeydown,sessionCategoryOf,setSessionCategory,renderSessionCategories,prepareSessionListFor,sessionCategoryKeydown,render,resetFilters,terminalTitle,renameTerminals,requestedSessionFrom,requestSessionOpen,openRequestedSession,answerOnOpen})",
+    "({state,api,sourceOf,accountOf,sendInput,pasteDraft,prepareDraftPaste,startDraftComposition,endDraftComposition,inputDraft,stopTerminalReader,startTerminalReader,closePlan,navigateView,backToList,backFromTerminal,closeTerminal,cancelTerminalClose,confirmTerminalClose,populateAccount,populateRoute,updateContinue,renderPlan,launchPlan,openTerminal,saveDraft,draftKey,refreshTerminals,renderTerminals,renderTerminalReturn,renderFilters,terminalCloseCopy,warnDraftUnload,preparePlan,renderGroups,renderMessages,loadDetail,chatKey,chatEntry,currentChat,chatSupported,chatRecovery,recoverChatSession,openChatTerminal,chatAttachmentsSupported,buildChatComposer,sendChat,loadChatState,applyChatReceipt,uploadChatFiles,pasteChat,scheduleChatPoll,stopChatPolling,openNativeChat,allSessions,buildContinuePanel,chatReceiptCopy,returnToBoard,readChatClipboard,accountDisplay,sessionAccountLabel,closeChatToolsOutside,closeChatToolsEscape,drawDetail,refreshDetail,loadCapabilities,matches,recoverConnection,networkOffline,poll,select,focusDetailBack,restoreSelectedCardFocus,showLogin,lock,beginAuthEpoch,resizeChatInput,updateViewport,draftKeydown,configureTerminalKeyboard,queueTerminalScroll,flushTerminalScroll,terminalScrollEnd,resetTerminalScroll,renderAttention,chatPollDelay,pullRefresh,readingScroll,renderJump,pullDistance,listScroll,setReading,renderPrompt,promptAction,renderUsage,loadUsage,applyTheme,setTheme,updateThemeColor,haptic,navTransition,setDetailShown,chatVisible,sheetRelease,BottomSheet,sheet,openSettings,closeSettings,setTyping,pinchFontSize,setTerminalFontSize,loadXterm,assetUrl,syncEvents,closeEvents,eventsHealthy,renderFreshness,schedule,touchDevice,togglePhaseFilter,renderCounts,createLongPress,swipeIntent,swipeRelease,groupMessageRows,setTextSize,applyTextSize,renderConnectivity,terminalForSession,swipeActionFor,openMessageMenu,openCardMenu,messageActions,outboxShape,outboxMatches,outboxOrigin,settleOutbox,retryOutbox,renderAttachmentTiles,attachmentThumb,sendUpload,openActionSheet,closeActionSheet,setListCollapsed,closeSwipe,settleSwipe,prepareSwipe,runSwipeAction,GESTURE,setChromeVisible,toggleChrome,revealChrome,isChromeTap,snapshotAnnounced,updateChatComposer,capabilitiesRevision,toolKindOf,userMessageParts,formatElapsed,tickWorking,renderTerminalMarks,renderDetailTerminal,terminalsAnnounced,goToSessionTerminal,rememberTerminal,terminalMenu,updateTerminalMenu,chooseTerminalMenu,clearTerminalMenu,renderNewSession,openNewSession,startNewSession,startAppServer,rememberConversationView,restoreConversationView,conversationIdentity,initiatorOf,initiatorLabel,documentKeydown,sessionCategoryOf,setSessionCategory,renderSessionCategories,prepareSessionListFor,sessionCategoryKeydown,render,resetFilters,terminalTitle,renameTerminals,requestedSessionFrom,requestSessionOpen,openRequestedSession,answerOnOpen,hardReload,terminalKeyBytes,terminalKeyFromEvent,pressTerminalKey,toggleTerminalMod,clearTerminalMods,renderTerminalMods,draftBeforeInput,terminalDocumentKey,xtermKeyEvent,renderHardware,loadHardware})",
     context,
   );
   api.state.csrf = "csrf-test";
@@ -2142,7 +2142,7 @@ test('offline visibility and return-online events restart only bounded reads and
   c.context.navigator.onLine = true; c.windowEvents.online();
   await new Promise((resolve) => setImmediate(resolve));
   // The usage strip is another bounded read alongside the list.
-  assert.deepEqual(requests.filter((url) => url !== '/api/usage'), ['/api/snapshot', '/api/chat/state']);
+  assert.deepEqual(requests.filter((url) => url !== '/api/usage' && url !== '/api/hardware'), ['/api/snapshot', '/api/chat/state']);
   assert.equal(entry.text, '미전송 초안'); assert.equal(entry.pending, null);
 });
 
@@ -2256,13 +2256,13 @@ test('an offline first launch restores authentication and already-open terminal 
   assert.equal(requests.length, 0);
   c.context.navigator.onLine = true; c.windowEvents.online();
   await new Promise((resolve) => setImmediate(resolve));
-  assert.deepEqual(requests.filter((url) => url !== '/api/usage'), ['/api/snapshot', '/api/bot-requests', '/api/capabilities', '/api/terminals']);
+  assert.deepEqual(requests.filter((url) => url !== '/api/usage' && url !== '/api/hardware'), ['/api/snapshot', '/api/bot-requests', '/api/capabilities', '/api/terminals']);
   assert.match(textOf(c.get('running-list')), /이미 열린 작업/);
   assert.equal(c.state.terminal, null); assert.equal(c.state.terminalVisible, false);
   assert.equal(c.get('app').hidden, false); assert.equal(c.get('login').hidden, true);
   assert.equal(c.get('login-submit').disabled, false);
   c.windowEvents.online(); await new Promise((resolve) => setImmediate(resolve));
-  assert.deepEqual(requests.filter((url) => url !== '/api/usage'), ['/api/snapshot', '/api/bot-requests', '/api/capabilities', '/api/terminals', '/api/snapshot']);
+  assert.deepEqual(requests.filter((url) => url !== '/api/usage' && url !== '/api/hardware'), ['/api/snapshot', '/api/bot-requests', '/api/capabilities', '/api/terminals', '/api/snapshot']);
 });
 
 test('returning to a first-launch tab after online recovery while hidden reads login state without transmitting a token', async () => {
@@ -3229,15 +3229,245 @@ test('changing list filters removes hidden cards without changing the selected s
   assert.equal(byClass(c.get('groups'), 'card')[0].dataset.sessionKey, second.key);
 });
 
-test('terminal keys sit in two rows with an inverted-T arrow cluster and the requested control keys', () => {
+test('terminal keys sit in two rows with held modifiers, an inverted-T arrow cluster and the requested control keys', () => {
   const html = fs.readFileSync(path.join(__dirname, '../web/index.html'), 'utf8');
   const css = fs.readFileSync(path.join(__dirname, '../web/style.css'), 'utf8');
   for (const key of ['escape', 'tab', 'backtab', 'interrupt', 'ctrl-j', 'ctrl-u', 'ctrl-x', 'ctrl-l', 'up', 'left', 'down', 'right', 'enter'])
     assert.match(html, new RegExp(`data-key="${key}"`));
-  assert.match(css, /"k1 k2 k3 k4 \.\s+up\s+\.\s+enter"/);
-  assert.match(css, /"k5 k6 k7 k8 left down right enter"/);
+  for (const mod of ['ctrl', 'alt', 'meta'])
+    assert.match(html, new RegExp(`data-mod="${mod}" aria-pressed="false"`));
+  assert.match(css, /"ctrl k1 k2 k3 k4 meta up\s+\.\s+enter"/);
+  assert.match(css, /"alt\s+k5 k6 k7 k8 left down right enter"/);
+  // Modifier buttons are not keys: a key loop over every button would send undefined.
+  assert.ok(source.includes('querySelectorAll("button[data-key]")'));
   for (const [key, bytes] of [['backtab', '\\x1b[Z'], ['"ctrl-j"', '\\n'], ['"ctrl-u"', '\\x15'], ['"ctrl-x"', '\\x18'], ['"ctrl-l"', '\\x0c']])
     assert.ok(source.includes(`${key}: "${bytes}"`), key);
+});
+
+test('terminal keys encode modifiers, cursor and function keys as a terminal does, and ⌘ edits the line by host', () => {
+  const c = client(undefined, noChatTimers);
+  const k = (key, mods = {}, windows = false) => c.terminalKeyBytes(key, mods, { windows });
+  const cases = [
+    ['c', { ctrl: true }, '\x03'], [' ', { ctrl: true }, '\x00'], ['[', { ctrl: true }, '\x1b'], ['2', { ctrl: true }, '\x00'],
+    ['?', { ctrl: true }, '\x7f'], ['x', { alt: true }, '\x1bx'], ['c', { ctrl: true, alt: true }, '\x1b\x03'],
+    ['ArrowUp', {}, '\x1b[A'], ['ArrowUp', { shift: true }, '\x1b[1;2A'], ['ArrowLeft', { ctrl: true }, '\x1b[1;5D'],
+    ['Home', {}, '\x1b[H'], ['End', { ctrl: true }, '\x1b[1;5F'], ['PageUp', {}, '\x1b[5~'], ['Delete', { ctrl: true }, '\x1b[3;5~'],
+    ['F1', {}, '\x1bOP'], ['F4', { shift: true }, '\x1b[1;2S'], ['F5', {}, '\x1b[15~'], ['F12', { ctrl: true }, '\x1b[24;5~'],
+    ['Tab', {}, '\t'], ['Tab', { shift: true }, '\x1b[Z'], ['Enter', { alt: true }, '\x1b\r'], ['Escape', {}, '\x1b'],
+    ['Backspace', {}, '\x7f'], ['Backspace', { ctrl: true }, '\x08'], ['UIKeyInputUpArrow', {}, '\x1b[A'],
+    // macOS editing on a Mac host.
+    ['ArrowLeft', { meta: true }, '\x01'], ['ArrowRight', { meta: true }, '\x05'], ['Backspace', { meta: true }, '\x15'],
+    ['ArrowLeft', { alt: true }, '\x1bb'], ['ArrowRight', { alt: true }, '\x1bf'], ['Backspace', { alt: true }, '\x1b\x7f'],
+    ['c', { meta: true }, null], ['1', { ctrl: true }, null], ['ArrowUp', { meta: true }, null],
+  ];
+  for (const [key, mods, bytes] of cases) assert.equal(k(key, mods), bytes, `${key} ${JSON.stringify(mods)}`);
+  // The Windows console's own keys on a Windows host.
+  for (const [key, mods, bytes] of [['ArrowLeft', { meta: true }, '\x1b[H'], ['ArrowRight', { meta: true }, '\x1b[F'],
+    ['Backspace', { meta: true }, '\x1b[1;5H'], ['ArrowLeft', { alt: true }, '\x1b[1;5D'], ['ArrowRight', { alt: true }, '\x1b[1;5C'],
+    ['Backspace', { alt: true }, '\x08'], ['c', { ctrl: true }, '\x03']])
+    assert.equal(k(key, mods, true), bytes, `windows ${key} ${JSON.stringify(mods)}`);
+});
+
+test('a hardware keyboard reaches the CLI: by key place, without taking a typed draft\'s editing or the browser\'s ⌘ keys', () => {
+  const c = client(undefined, noChatTimers);
+  const key = (fields, options) => c.terminalKeyFromEvent({ key: '', code: '', ...fields }, options);
+  c.context.navigator = { platform: 'MacIntel' };
+  assert.equal(key({ key: 'ㅊ', code: 'KeyC', ctrlKey: true }, { draftEmpty: false }), '\x03', 'a Korean layout still means Ctrl+C');
+  assert.equal(key({ key: 'å', code: 'KeyA', altKey: true }, { draftEmpty: false }), null, '⌥ prints into the input bar');
+  assert.equal(key({ key: '\\', code: 'Backslash', altKey: true }, { draftEmpty: true }), null, '⌥₩ is \\ on a Korean Mac');
+  assert.equal(key({ key: 'å', code: 'KeyA', altKey: true }, { focusless: true }), '\x1ba', 'with nothing focused ⌥ is Meta');
+  c.state.terminalMods = { ctrl: false, alt: true, meta: false };
+  assert.equal(key({ key: 'b', code: 'KeyB' }, { draftEmpty: false }), '\x1bb', "the bar's ⌥ is meant for the CLI");
+  c.state.terminalMods = { ctrl: false, alt: false, meta: false };
+  assert.equal(key({ key: 'ArrowLeft' }, { draftEmpty: false }), null, 'a typed draft keeps its cursor');
+  assert.equal(key({ key: 'ArrowLeft' }, { draftEmpty: true }), '\x1b[D');
+  assert.equal(key({ key: 'Tab' }, { draftEmpty: false }), null, 'Tab leaves a typed draft (no keyboard trap)');
+  assert.equal(key({ key: 'Escape' }, { draftEmpty: false }), null);
+  assert.equal(key({ key: 'Escape' }, { draftEmpty: true }), '\x1b');
+  assert.equal(key({ key: 'F2' }, { draftEmpty: false }), '\x1bOQ', 'function keys always');
+  assert.equal(key({ key: 'PageDown' }, { draftEmpty: false }), '\x1b[6~');
+  assert.equal(key({ key: 'v', code: 'KeyV', metaKey: true }, { draftEmpty: true }), null, '⌘V stays the browser paste');
+  assert.equal(key({ key: 'ArrowLeft', metaKey: true }, { draftEmpty: true }), '\x01');
+  for (const fields of [{ key: 'ArrowLeft', metaKey: true }, { key: 'Backspace', metaKey: true },
+    { key: 'Backspace', altKey: true }, { key: 'ArrowRight', altKey: true }, { key: 'ArrowLeft', ctrlKey: true }])
+    assert.equal(key(fields, { draftEmpty: false }), null, 'a typed draft keeps ⌘/⌥/Ctrl editing: ' + JSON.stringify(fields));
+  assert.equal(key({ key: 'Backspace', altKey: true }, { draftEmpty: true }), '\x1b\x7f');
+  assert.equal(key({ key: 'a' }, { draftEmpty: true }), null, 'typing goes to the input bar');
+  assert.equal(key({ key: 'a' }, { focusless: true }), 'a', 'with nothing focused it goes to the CLI');
+  assert.equal(key({ key: 'Enter' }, { draftEmpty: true }), null, "the input bar's own Enter");
+  assert.equal(key({ key: 'Enter' }, { focusless: true }), '\r');
+  assert.equal(key({ key: 'ㅎ', isComposing: true }, { focusless: true }), null);
+  assert.equal(key({ key: 'Process', keyCode: 229 }, { focusless: true }), null);
+  assert.equal(key({ key: 'Shift', shiftKey: true }, { focusless: true }), null);
+  // A PC browser keeps Ctrl+C/V for a typed draft; an empty one interrupts.
+  c.context.navigator = { platform: 'Win32' };
+  assert.equal(key({ key: 'v', code: 'KeyV', ctrlKey: true }, { draftEmpty: false }), null);
+  assert.equal(key({ key: 'v', code: 'KeyV', ctrlKey: true }, { draftEmpty: true }), null, 'Ctrl+V pastes into an empty bar too');
+  assert.equal(key({ key: 'c', code: 'KeyC', ctrlKey: true }, { draftEmpty: true }), '\x03');
+  // AltGr (Ctrl+Alt on a PC) prints its character.
+  assert.equal(key({ key: '@', code: 'KeyQ', ctrlKey: true, altKey: true }, { draftEmpty: false }), null);
+  assert.equal(key({ key: '@', code: 'KeyQ', ctrlKey: true, altKey: true }, { focusless: true }), '@');
+  // A PC's Alt types nothing: it stays Meta for the CLI (Claude Code's Alt+P, Alt+T), and Alt+←
+  // in a typed draft never becomes the browser's Back.
+  assert.equal(key({ key: 'p', code: 'KeyP', altKey: true }, { draftEmpty: true }), '\x1bp');
+  assert.equal(key({ key: 'p', code: 'KeyP', altKey: true }, { draftEmpty: false }), '\x1bp');
+  assert.equal(key({ key: 'ArrowLeft', altKey: true }, { draftEmpty: false }), '\x1bb');
+  assert.equal(key({ key: 'ArrowLeft', ctrlKey: true }, { draftEmpty: false }), null, 'Ctrl+← moves by word in the draft');
+  // A Mac: Ctrl+V reaches the CLI (it pastes images there).
+  c.context.navigator = { platform: 'MacIntel' };
+  assert.equal(key({ key: 'v', code: 'KeyV', ctrlKey: true }, { draftEmpty: true }), '\x16');
+  assert.equal(key({ key: 'π', code: 'KeyP', altKey: true }, { draftEmpty: true }), null, "a Mac's ⌥ prints π");
+});
+
+test('held bar modifiers combine with the next key from the bar, the input bar or xterm, then release', async () => {
+  const calls = [];
+  const c = client(async (url, opts) => {
+    calls.push(JSON.parse(opts.body).text);
+    return { ok: true, status: 200, json: async () => ({ ok: true }) };
+  }, noChatTimers);
+  const settle = () => new Promise((resolve) => setImmediate(resolve));
+  c.state.connected = true;
+  c.state.terminal = { id: 'term-1' };
+  c.pressTerminalKey('up');
+  await settle();
+  assert.deepEqual(calls, ['\x1b[A'], 'a bar key alone sends its own bytes');
+  c.toggleTerminalMod('ctrl');
+  assert.equal(c.state.terminalMods.ctrl, true);
+  c.pressTerminalKey('up');
+  await settle();
+  assert.equal(calls.at(-1), '\x1b[1;5A');
+  assert.equal(c.state.terminalMods.ctrl, false, 'released after one key');
+  c.toggleTerminalMod('alt');
+  c.pressTerminalKey('interrupt');
+  await settle();
+  assert.equal(calls.at(-1), '\x1b\x03');
+  // A character typed into the input bar with Ctrl held.
+  c.toggleTerminalMod('ctrl');
+  let prevented = false;
+  c.draftBeforeInput({ inputType: 'insertText', data: 'r', preventDefault() { prevented = true; } });
+  await settle();
+  assert.equal(prevented, true);
+  assert.equal(calls.at(-1), '\x12');
+  assert.equal(c.state.terminalMods.ctrl, false);
+  const before = calls.length;
+  c.draftBeforeInput({ inputType: 'insertText', data: 'r', preventDefault() { throw new Error('no modifier'); } });
+  await settle();
+  assert.equal(calls.length, before, 'plain typing stays in the draft');
+  // xterm: its own keys pass through; ⌘← and a held modifier are ours, and its keypress is swallowed.
+  assert.equal(c.xtermKeyEvent({ type: 'keydown', key: 'a', code: 'KeyA' }), true);
+  assert.equal(c.xtermKeyEvent({ type: 'keydown', key: 'ArrowLeft', metaKey: true, preventDefault() {} }), false);
+  assert.equal(c.xtermKeyEvent({ type: 'keypress', key: 'ArrowLeft', metaKey: true }), false);
+  await settle();
+  assert.equal(calls.at(-1), '\x01');
+  c.toggleTerminalMod('ctrl');
+  assert.equal(c.xtermKeyEvent({ type: 'keydown', key: 'd', code: 'KeyD', preventDefault() {} }), false);
+  await settle();
+  assert.equal(calls.at(-1), '\x04');
+  assert.equal(c.xtermKeyEvent({ type: 'keydown', key: 'c', code: 'KeyC', metaKey: true }), true, '⌘C copies');
+});
+
+test('with nothing focused a hardware keyboard types into the shown terminal, Ctrl+K included, but not past an open dialog', async () => {
+  const calls = [];
+  const c = client(async (url, opts) => {
+    calls.push(JSON.parse(opts.body).text);
+    return { ok: true, status: 200, json: async () => ({ ok: true }) };
+  }, noChatTimers);
+  const settle = () => new Promise((resolve) => setImmediate(resolve));
+  c.state.connected = true;
+  c.state.terminal = { id: 'term-1' };
+  c.state.terminalVisible = true;
+  c.context.document.activeElement = null;
+  const event = (fields) => ({ key: '', code: '', target: { closest: () => null }, defaultPrevented: false,
+    preventDefault() { this.defaultPrevented = true; }, ...fields });
+  assert.equal(c.terminalDocumentKey(event({ key: 'x', code: 'KeyX' })), true);
+  assert.equal(c.terminalDocumentKey(event({ key: 'k', code: 'KeyK', ctrlKey: true })), true);
+  await settle();
+  assert.deepEqual(calls, ['x', '\x0b']);
+  c.context.document.activeElement = { tagName: 'INPUT' };
+  assert.equal(c.terminalDocumentKey(event({ key: 'y', code: 'KeyY' })), false, 'a focused field types for itself');
+  c.context.document.activeElement = null;
+  assert.equal(c.terminalDocumentKey(event({ key: 'y', code: 'KeyY', target: { closest: (q) => (q.includes('.xterm') ? {} : null) } })), false,
+    'xterm sends its own keys');
+  c.state.terminalVisible = false;
+  assert.equal(c.terminalDocumentKey(event({ key: 'y', code: 'KeyY' })), false);
+});
+
+test('a focused control and Tab keep their keys, and a held bar modifier never waits for a later key', async () => {
+  const calls = [];
+  const c = client(async (url, opts) => {
+    calls.push(JSON.parse(opts.body).text);
+    return { ok: true, status: 200, json: async () => ({ ok: true }) };
+  }, noChatTimers);
+  const settle = () => new Promise((resolve) => setImmediate(resolve));
+  c.state.connected = true;
+  c.state.terminal = { id: 'term-1' };
+  c.state.terminalVisible = true;
+  const event = (fields) => ({ key: '', code: '', target: { closest: () => null }, defaultPrevented: false,
+    preventDefault() { this.defaultPrevented = true; }, ...fields });
+  // A button (보드, 닫기…) has the focus: its Enter, Space and Tab are its own.
+  c.context.document.activeElement = { tagName: 'BUTTON' };
+  for (const key of ['Enter', ' ', 'Tab', 'ArrowDown'])
+    assert.equal(c.terminalDocumentKey(event({ key })), false, key);
+  c.toggleTerminalMod('ctrl');
+  assert.equal(c.terminalDocumentKey(event({ key: ' ' })), false);
+  assert.equal(c.state.terminalMods.ctrl, false, 'a key left to a control releases a held modifier');
+  // Nothing focused: Tab still moves the focus to the page's controls.
+  c.context.document.activeElement = null;
+  c.toggleTerminalMod('ctrl');
+  assert.equal(c.terminalDocumentKey(event({ key: 'Tab' })), false);
+  assert.equal(c.state.terminalMods.ctrl, false, 'Ctrl does not wait past Tab to interrupt a later c');
+  assert.equal(c.terminalDocumentKey(event({ key: 'Tab', shiftKey: true })), false);
+  // ⌘ held on the bar and a letter it does not combine with: the letter types, ⌘ is released.
+  c.toggleTerminalMod('meta');
+  assert.equal(c.terminalDocumentKey(event({ key: 'a', code: 'KeyA' })), false);
+  assert.equal(c.state.terminalMods.meta, false);
+  c.toggleTerminalMod('ctrl');
+  c.draftKeydown({ key: '1', code: 'Digit1', target: { value: '' }, preventDefault() {} });
+  assert.equal(c.state.terminalMods.ctrl, false, 'Ctrl+1 is nothing: released before the next key');
+  c.toggleTerminalMod('alt');
+  c.draftKeydown({ key: 'Shift', code: 'ShiftLeft', shiftKey: true, target: { value: '' }, preventDefault() {} });
+  c.draftKeydown({ key: 'Process', keyCode: 229, target: { value: '' }, preventDefault() {} });
+  assert.equal(c.state.terminalMods.alt, true, 'a modifier or a composing key is not the next key');
+  c.clearTerminalMods();
+  c.toggleTerminalMod('ctrl');
+  c.draftBeforeInput({ inputType: 'insertText', data: '1', preventDefault() { throw new Error('typed as it is'); } });
+  assert.equal(c.state.terminalMods.ctrl, false, 'a soft keyboard key Ctrl does not combine with: typed, Ctrl released');
+  c.toggleTerminalMod('ctrl');
+  c.startDraftComposition({ target: c.get('terminal-draft') });
+  assert.equal(c.state.terminalMods.ctrl, false);
+  assert.match(c.get('draft-note').textContent, /보조키가 풀립니다/, 'released with a word, not silently');
+  c.endDraftComposition?.({ target: c.get('terminal-draft'), data: '' });
+  c.state.composing = false;
+  // ⌫ held from a typed draft stops at its start; held from an empty one it goes on.
+  const press = (value, repeat) => {
+    const keyEvent = { key: 'Backspace', code: 'Backspace', repeat, target: { value }, defaultPrevented: false,
+      preventDefault() { this.defaultPrevented = true; } };
+    c.draftKeydown(keyEvent);
+    return keyEvent.defaultPrevented;
+  };
+  assert.equal(press('hi', false), false);
+  assert.equal(press('', true), false, 'the draft emptied under a held ⌫: the CLI line is not touched');
+  assert.equal(press('', false), true);
+  assert.equal(press('', true), true);
+  await settle();
+  assert.deepEqual(calls, ['\x7f', '\x7f']);
+});
+
+test('a Windows host terminal hides ⌘ and names ⌥ Alt, and its word keys are the console\'s', () => {
+  const c = client(undefined, noChatTimers);
+  const meta = { dataset: { mod: 'meta' }, setAttribute() {}, hidden: false, textContent: '⌘' };
+  const alt = { dataset: { mod: 'alt' }, setAttribute() {}, hidden: false, textContent: '⌥' };
+  c.get('terminal-keys').querySelectorAll = (selector) => (selector === 'button[data-mod]' ? [meta, alt] : []);
+  c.state.capabilities = { hosts: [{ name: 'pc', platform: 'windows' }, { name: 'mac' }] };
+  c.state.terminal = { id: 'term-1', host: 'pc' };
+  c.renderTerminalMods();
+  assert.equal(meta.hidden, true);
+  assert.equal(alt.textContent, 'Alt');
+  assert.equal(c.terminalKeyFromEvent({ key: 'ArrowLeft', code: 'ArrowLeft', altKey: true }, { draftEmpty: true }), '\x1b[1;5D');
+  c.state.terminal = { id: 'term-2', host: 'mac' };
+  c.renderTerminalMods();
+  assert.equal(meta.hidden, false);
+  assert.equal(alt.textContent, '⌥');
 });
 
 test('the input bar sends a paste then a separate Enter, while input-only never adds Enter', async () => {
@@ -3746,6 +3976,38 @@ test('an input error (a file too large) stays until the user acts again; a state
   entry.error = '상태를 확인하지 못했습니다. 상태 다시 확인을 눌러 주세요.';
   await c.loadChatState(s, false);
   assert.doesNotMatch(status(), /확인하지 못했습니다/);
+});
+
+test('the machines chip says how many answer and the sheet shows each one\'s CPU, memory, disk, battery and uptime', async () => {
+  const c = client(undefined, noChatTimers);
+  const box = c.get('hardware');
+  const ready = { name: 'board', label: '보드 기기', status: 'ready', refreshing: false, fetchedAt: 1791600000, error: null, system: 'macos',
+    cpu: { model: 'Fixture M1', cores: 8, load: [1.5, 1.2, 1.0], percent: 37 }, memory: { total: 16 * 1024 ** 3, used: 4 * 1024 ** 3, percent: 25 },
+    disk: { total: 500 * 1024 ** 3, free: 20 * 1024 ** 3, percent: 96 }, battery: { percent: 80, charging: true, power: 'ac' }, uptimeSeconds: 90000 };
+  const offline = { name: 'office', label: '사무실 PC', status: 'offline', refreshing: false, fetchedAt: null,
+    error: '연결하지 못했습니다. 잠자기·오프라인이면 깨어난 뒤 다시 읽습니다.' };
+  c.renderHardware({ available: true, refreshing: false, hosts: [ready, offline] });
+  assert.equal(box.hidden, false);
+  assert.match(textOf(c.get("hardware-summary")), /기기\s*1\/2/);
+  assert.match(c.get('hardware-summary').children[0].className, /red/, 'an unanswered machine or a full disk shows red');
+  const text = textOf(c.get('hardware-body'));
+  for (const part of ['보드 기기', '37%', 'Fixture M1 · 8코어 · 부하 1.5', '4.0GB / 16GB', '여유 20GB', '배터리 80% · 충전 중',
+    '가동 1일 1시간', '사무실 PC', '연결 안 됨', '연결하지 못했습니다'])
+    assert.ok(text.includes(part), part);
+  const fills = [];
+  const walk = (node) => { if (String(node.className || '').includes('usage-fill')) fills.push(node.className); (node.children || []).forEach(walk); };
+  walk(c.get('hardware-body'));
+  assert.deepEqual(fills, ['usage-fill green', 'usage-fill green', 'usage-fill red'], 'busier is warmer, the opposite of remaining usage');
+  // A Mac's first reading has no CPU share yet: its load says how busy it is.
+  c.renderHardware({ available: true, refreshing: true, hosts: [{ ...ready, cpu: { ...ready.cpu, percent: null } }] });
+  assert.match(textOf(c.get('hardware-body')), /CPU.*부하 1\.5/);
+  assert.match(textOf(c.get('hardware-body')), /갱신 중|읽는 중…/);
+  // A board without the endpoint never shows the chip.
+  const d = client(async () => ({ ok: false, status: 404, json: async () => ({}) }), noChatTimers);
+  d.state.authenticated = true;
+  await d.loadHardware();
+  assert.equal(d.get('hardware').hidden, true);
+  assert.equal(d.state.hardwareUnsupported, true);
 });
 
 test('the usage strip shows remaining limits per provider and hides on boards without the endpoint', async () => {
@@ -4302,7 +4564,7 @@ test('live updates follow the open conversation, reread only on newer events, sl
   c.state.detailShown = true;
   c.state.capabilities = {};
   c.state.capabilitiesRevision = c.capabilitiesRevision(c.state.snapshot);
-  c.state.usageAt = Date.now();
+  c.state.usageAt = Date.now(); c.state.hardwareAt = Date.now();
   c.state.detailFor = s.key; c.state.detailUpdatedAt = s.updatedAt;
   c.state.detailRevision = vm.runInContext('detailRevision', c.context)(c.allSessions().find((item) => item.key === s.key));
   c.syncEvents();
@@ -5414,7 +5676,7 @@ test('the board text size is its own stored choice scaling the rem type scale, a
 
 test('theme-init applies a forced theme and text size before paint, keeps meta originals for auto, and survives blocked storage', () => {
   const source = fs.readFileSync(path.join(__dirname, '../web/theme-init.js'), 'utf8');
-  const run = (stored, { throws = false } = {}) => {
+  const run = (stored, { throws = false, extra = {} } = {}) => {
     const attributes = {};
     const meta = (content) => ({ attributes: { content }, getAttribute(name) { return this.attributes[name] ?? null; },
       setAttribute(name, value) { this.attributes[name] = String(value); } });
@@ -5422,7 +5684,7 @@ test('theme-init applies a forced theme and text size before paint, keeps meta o
     const document = { documentElement: { setAttribute(name, value) { attributes[name] = String(value); } },
       querySelectorAll: (selector) => (selector === 'meta[name="theme-color"]' ? metas : []) };
     const localStorage = { getItem(key) { if (throws) throw new Error('blocked'); return stored[key] ?? null; } };
-    vm.runInNewContext(source, { window: { localStorage }, document, JSON });
+    vm.runInNewContext(source, { window: { localStorage, ...extra }, document, JSON });
     return { attributes, metas };
   };
   const dark = run({ 'sessionholic:ui:theme': '"dark"', 'sessionholic:ui:textSize': '"large"' });
@@ -5435,6 +5697,18 @@ test('theme-init applies a forced theme and text size before paint, keeps meta o
   assert.equal(auto.metas[0].attributes['data-original'], undefined);
   assert.deepEqual(run({ 'sessionholic:ui:theme': '{not json' }).attributes, {});
   assert.deepEqual(run({}, { throws: true }).attributes, {}, 'blocked storage keeps the device defaults');
+  // An iPad home-screen app gets room for iPadOS's window controls; nothing else does.
+  const device = (userAgent, maxTouchPoints, standalone) => ({ navigator: { userAgent, maxTouchPoints },
+    matchMedia: (query) => ({ matches: standalone && query === '(display-mode: standalone)' }) });
+  const ipadOS = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15';
+  assert.deepEqual(run({}, { extra: device(ipadOS, 5, true) }).attributes, { 'data-ipad-app': '' });
+  assert.deepEqual(run({}, { extra: device('Mozilla/5.0 (iPad; CPU OS 18_0 like Mac OS X)', 5, true) }).attributes, { 'data-ipad-app': '' });
+  assert.deepEqual(run({}, { extra: device(ipadOS, 5, false) }).attributes, {}, 'the same iPad in a Safari tab');
+  assert.deepEqual(run({}, { extra: device('Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X)', 5, true) }).attributes, {});
+  assert.deepEqual(run({}, { extra: device(ipadOS, 0, true) }).attributes, {}, 'a Mac browser has no touch points');
+  const css = styleSheet();
+  assert.match(css, /:root\[data-ipad-app\] \{\s*--top-inset: max\(env\(safe-area-inset-top\), 36px\);/);
+  assert.equal((css.match(/env\(safe-area-inset-top\)/g) || []).length, 2, 'every other top inset reads --top-inset');
   const html = indexPage();
   const init = html.indexOf('<script src="/theme-init.js"></script>');
   assert.ok(init > 0, 'loaded without defer');
@@ -5535,11 +5809,13 @@ test('a long question menu keeps its first choices inline and lists every choice
 
 // A phone conversation (coarse pointer, phone width) with a scrolled transcript and a
 // controllable clock. `wide`: a tablet instead (coarse pointer, wide screen).
-function phoneConversation({ coarse = true, wide = false, timers = noChatTimers, fetchImpl } = {}) {
+// `folded`: as a conversation opens (집중 모드); otherwise the bars were brought back first.
+function phoneConversation({ coarse = true, wide = false, timers = noChatTimers, fetchImpl, folded = false } = {}) {
   const c = client(fetchImpl, timers);
   const { s, entry } = selectChat(c);
   c.drawDetail(s);
   const pane = c.get('detail'); pane.classList = classes();
+  if (!folded) c.setChromeVisible(true);
   const list = c.get('messages');
   // As after the first render (renderMessages keeps the position it set).
   Object.assign(list, { scrollHeight: 3000, clientHeight: 600, scrollTop: 2400, offsetTop: 80, lastScrollTop: 2400 });
@@ -5744,7 +6020,30 @@ test('questions and failures remain visible without overriding focus mode', asyn
   assert.equal(reading(), true, 'going offline keeps the tools folded');
 });
 
-test('a new conversation shows tools, and revisiting preserves focus mode and the one-time hint', () => {
+test('a conversation opens in focus mode; on a touch screen it says once how to bring the bars back', () => {
+  const writes = [];
+  const c = client(undefined, noChatTimers);
+  c.context.window.matchMedia = (query) => ({ matches: query === '(pointer: coarse)' });
+  c.context.localStorage = { getItem: () => null, setItem: (key, value) => writes.push([key, value]) };
+  const { s } = selectChat(c);
+  c.drawDetail(s);
+  assert.equal(c.state.chromeVisible, false, 'the bars are folded');
+  assert.equal(c.get('focus-toggle').textContent, '집중 모드 해제');
+  assert.equal(c.get('focus-toggle').attributes['aria-pressed'], 'true');
+  assert.equal(c.get('tap-hint').hidden, false, 'a touch screen is told how to bring them back');
+  assert.deepEqual(writes, [['sessionholic:ui:tapHint', 'true']]);
+  c.toggleChrome();
+  assert.equal(c.state.chromeVisible, true, 'one tap brings them back');
+  // A mouse screen opens folded too; its button says how to leave, so no hint.
+  const d = client(undefined, noChatTimers);
+  d.context.localStorage = { getItem: () => null, setItem() { throw new Error('no write'); } };
+  const { s: other } = selectChat(d);
+  d.drawDetail(other);
+  assert.equal(d.state.chromeVisible, false);
+  assert.equal(d.get('tap-hint').hidden, true);
+});
+
+test('bars brought back fold on a deliberate scroll, and revisiting preserves focus mode and the one-time hint', () => {
   const writes = [];
   const { c, list, scrollTo, reading } = phoneConversation();
   c.context.localStorage = { getItem: () => null, setItem: (key, value) => writes.push([key, value]) };
@@ -5870,7 +6169,7 @@ test('snapshot events are read together after 300ms and never reload capabilitie
   c.state.snapshotVersion = 6;
   c.state.capabilities = { hosts: [] };
   c.state.capabilitiesRevision = 'old';
-  c.state.usageAt = Date.now();
+  c.state.usageAt = Date.now(); c.state.hardwareAt = Date.now();
   for (const announced of [7, 8, 9]) c.snapshotAnnounced(announced);
   assert.equal(pending.length, 1, 'a burst arms one read');
   assert.deepEqual(requests, [], 'nothing is read before the batch window ends');
@@ -5910,7 +6209,7 @@ test('the 60s safety poll reads /api/capabilities only when a host recovers or i
     return { ok: true, status: 200, json: async () => (url.startsWith('/api/snapshot')
       ? { hosts: JSON.parse(JSON.stringify(hosts)) } : url === '/api/capabilities' ? { hosts: [], csrfToken: 'csrf-test' } : {}) };
   }, noChatTimers);
-  c.state.usageAt = Date.now();
+  c.state.usageAt = Date.now(); c.state.hardwareAt = Date.now();
   const reads = async () => { requests.length = 0; await c.poll(false); return requests.filter((url) => url === '/api/capabilities').length; };
   assert.equal(await reads(), 1, 'the first read loads capabilities');
   hosts[0].fetchedAt = 2;
@@ -6155,6 +6454,39 @@ test('a long press on a tool group line (a button) opens the group menu and its 
   assert.equal(timers.slice(before).some((timer) => timer.delay === c.GESTURE.longPressMs), false);
 });
 
+test('clearing the cache removes only this board\'s shells and keeps the worker of a device that gets notifications', async () => {
+  const c = client(undefined, noChatTimers);
+  const deleted = [], actions = [];
+  let reloaded = 0;
+  c.context.caches = { keys: async () => ['sessionholic-shell-1a2b3c4d', 'another-app-shell', 'xsessionholic-shell', 'sessionholic-shell-v13'],
+    delete: async (key) => { deleted.push(key); return true; } };
+  const worker = (subscription, name) => ({ pushManager: { getSubscription: async () => subscription },
+    update: async () => actions.push('update ' + name), unregister: async () => actions.push('unregister ' + name) });
+  c.context.navigator = { serviceWorker: { getRegistrations: async () => [worker({ endpoint: 'x' }, 'notified'), worker(null, 'quiet')] } };
+  c.context.window.location = { reload: () => { reloaded += 1; } };
+  c.context.localStorage = { getItem: () => null, setItem() { throw new Error('no preference changes'); }, removeItem() { throw new Error('no preference changes'); } };
+  await c.hardReload();
+  assert.deepEqual(deleted, ['sessionholic-shell-1a2b3c4d', 'sessionholic-shell-v13'], "only this board's caches");
+  assert.deepEqual(actions, ['update notified', 'unregister quiet'], 'a notified device keeps its subscription');
+  assert.equal(reloaded, 1);
+  // Without caches or a worker (an old browser) it still reloads.
+  const d = client(undefined, noChatTimers);
+  let again = 0;
+  d.context.window.location = { reload: () => { again += 1; } };
+  await d.hardReload();
+  assert.equal(again, 1);
+  // Offline, nothing is cleared: a shell without its cache could not come back.
+  const e = client(undefined, noChatTimers);
+  let cleared = 0;
+  e.context.caches = { keys: async () => { cleared += 1; return []; }, delete: async () => true };
+  e.context.window.location = { reload: () => { cleared += 1; } };
+  e.state.offline = true;
+  await e.hardReload();
+  assert.equal(cleared, 0);
+  const html = indexPage();
+  assert.match(html, /<button id="hard-reload" class="push-button" type="button" aria-describedby="reload-help">캐시 지우고 새로고침<\/button>/);
+});
+
 test('the installation meta names preferences, titles, history and attachment folders', () => {
   const names = JSON.stringify({ title: '데모 보드', shortName: '데모', storagePrefix: 'db:', historyKey: 'demoBoard',
     attachmentsDir: '.demo-board-attachments' });
@@ -6248,7 +6580,7 @@ test('H3: a restarted server (another bootId) has its CSRF token read again, eve
       ? { hosts: [{ name: 'workstation', ok: true, fetchedAt: 1, data: {} }], version, bootId: boot }
       : url === '/api/capabilities' ? { hosts: [], csrfToken: csrf } : {}) };
   }, noChatTimers);
-  c.state.usageAt = Date.now();
+  c.state.usageAt = Date.now(); c.state.hardwareAt = Date.now();
   await c.poll(false);
   assert.equal(c.state.csrf, 'csrf-a');
   assert.equal(requests.filter((url) => url === '/api/capabilities').length, 1);
@@ -6280,7 +6612,7 @@ test('H3: after a restart the reconnected stream\'s hello (another bootId) reads
   }, { setTimeout: (callback, ms) => { if (ms === 300) setImmediate(callback); return 1; }, clearTimeout() {} });
   const { FakeEventSource, sources } = fakeEventSource();
   c.context.EventSource = FakeEventSource;
-  c.state.usageAt = Date.now();
+  c.state.usageAt = Date.now(); c.state.hardwareAt = Date.now();
   await c.poll(false);
   assert.equal(sources.length, 1);
   sources[0].emit('hello', { snapshotVersion: 40, bootId: 'boot-a' });
@@ -7015,7 +7347,7 @@ test('the live stream announces terminals, a restarted server is read on its hel
   c.state.capabilities = {};
   c.state.capabilitiesRevision = c.capabilitiesRevision(c.state.snapshot);
   c.state.capabilitiesBoot = 'boot-a';
-  c.state.usageAt = Date.now();
+  c.state.usageAt = Date.now(); c.state.hardwareAt = Date.now();
   c.state.serverBoot = 'boot-a';
   await c.refreshTerminals();
   c.syncEvents();
@@ -7190,6 +7522,11 @@ test('opening a new session posts once per host and request, then opens its term
   assert.ok(c.state.terminals.some((item) => item.id === terminal.id));
   assert.equal(c.terminalCloseCopy(terminal).action, '실행 종료');
   assert.equal(c.terminalCloseCopy(terminal).danger, true);
+  // A PC conversation resumed in a board terminal runs there: closing it ends the run.
+  const resumed = c.terminalCloseCopy({ metadata: { mode: 'resume', launchMode: 'attach' } });
+  assert.equal(resumed.action, '실행 종료');
+  assert.equal(resumed.danger, true);
+  assert.match(resumed.description, /다시 연 대화/);
 });
 
 // The conversation keeps its newest message in view (pinnedToEnd, keepAtEnd).

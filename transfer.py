@@ -22,6 +22,11 @@ from launch import scrub_text
 import settings
 
 MAX_ARCHIVE = 128 * 1024 * 1024
+# PowerShell ends a single-quoted string at any of these (not only '); doubled, each stays literal.
+PS_SINGLE_QUOTES = "'\u2018\u2019\u201a\u201b"
+# The longest remote command a PC terminal is opened with (cmd.exe, a possible default shell,
+# stops at 8191 characters); a longer menu would end without saying why.
+WINDOWS_COMMAND_LIMIT = 8000
 PROFILE_FAILURE_TTL = 120
 RUNTIME_MODULES = ('collector.py', 'launch.py', 'transfer_native.py', 'transfer_workspace.py', 'transfer_worker.py',
                    'native_chat.py', 'attachments.py', 'managed_launch.py', 'settings.py', 'instance.py',
@@ -95,6 +100,43 @@ class WorkerError(RuntimeError):
 def _save(path, value):
     from server import private_json
     private_json(path, value)
+
+
+def ps_quote(value):
+    """A PowerShell single-quoted string holding exactly `value`."""
+    return "'" + "".join(c + c if c in PS_SINGLE_QUOTES else c for c in value) + "'"
+
+
+def windows_literal_argument(value):
+    """Whether Windows PowerShell 5.1 passes `value` to a program unchanged: it drops a double
+    quote, and a quoted argument ending in a backslash would escape its closing quote."""
+    return '"' not in value and not (any(c.isspace() for c in value) and value.endswith('\\'))
+
+
+def windows_encoded_command(script):
+    return 'powershell.exe -NoProfile -EncodedCommand ' + base64.b64encode(script.encode('utf-16le')).decode('ascii')
+
+
+def windows_launcher_script(launcher):
+    """A PC's 새 세션: a numbered menu the board shows as buttons (`  1. 이름` rows, then
+    `선택:`; one choice runs at once), then the chosen command in its folder. Only those
+    literal values run; the script travels base64-encoded, so nothing in it is parsed again
+    on the way."""
+    quote = ps_quote
+    rows = ['@{Label=%s; Exe=%s; Args=@(%s); Cwd=%s}' % (
+        quote(choice['label']), quote(choice['command'][0]), ', '.join(quote(arg) for arg in choice['command'][1:]),
+        quote(choice.get('cwd') or '')) for choice in launcher['choices']]
+    run = ("if ($c.Cwd) { Set-Location -LiteralPath $c.Cwd } else { Set-Location -LiteralPath $env:USERPROFILE }; "
+           "& $c.Exe @($c.Args); exit $LASTEXITCODE")
+    if len(rows) == 1:
+        return "$ErrorActionPreference='Stop'; $c=" + rows[0] + "; " + run
+    return ("$ErrorActionPreference='Stop'; $choices=@(" + ', '.join(rows) + "); "
+            "Write-Host " + quote(launcher['label']) + "; "
+            "for ($i=0; $i -lt $choices.Count; $i++) { Write-Host ('  {0}. {1}' -f ($i+1), $choices[$i].Label) }; "
+            "Write-Host '  q. 닫기'; $n=0; "
+            "while ($true) { $pick=Read-Host '선택'; if ($pick -eq 'q') { exit 0 }; "
+            "if ([int]::TryParse($pick, [ref]$n) -and $n -ge 1 -and $n -le $choices.Count) { break }; "
+            "Write-Host '번호를 다시 골라 주세요.' }; $c=$choices[$n-1]; " + run)
 
 
 class Transfers:
@@ -185,7 +227,7 @@ class Transfers:
         if (agent not in ('codex', 'claude') or not isinstance(sid, str) or not SESSION_ID.fullmatch(sid)
                 or agent == 'codex' and (not isinstance(home, str) or not HOME_KEY.fullmatch(home))):
             raise ValueError('Windows 세션 정보를 확인해 주세요.')
-        if op == 'chat' and args.get('action') not in ('read', 'send', 'receipt'):
+        if op == 'chat' and args.get('action') not in ('read', 'capabilities', 'send', 'receipt'):
             raise ValueError('지원하지 않는 Windows 대화 요청입니다.')
         args = {**args, 'source': {**source, 'host': host['name']}}
         root = Path(__file__).resolve().parent
@@ -229,15 +271,26 @@ class Transfers:
                 or any(not isinstance(v, str) or not PureWindowsPath(v).is_absolute()
                        or any(ord(c) < 32 for c in v) for v in env.values())):
             raise ValueError('PC 터미널 연결 정보가 올바르지 않습니다.')
-        quote = lambda value: "'" + value.replace("'", "''") + "'"
+        if any(not windows_literal_argument(value) for value in argv[1:]):
+            raise ValueError('PC 터미널 연결 정보가 올바르지 않습니다.')
+        quote = ps_quote
         script = "$ErrorActionPreference='Stop'; Set-Location -LiteralPath " + quote(cwd) + '; '
         for key, value in env.items():
             script += '$env:' + key + '=' + quote(value) + '; '
         script += '& ' + ' '.join(quote(value) for value in argv) + '; exit $LASTEXITCODE'
-        encoded = base64.b64encode(script.encode('utf-16le')).decode('ascii')
+        return self._windows_ssh(host, script)
+
+    def _windows_ssh(self, host, script):
+        command = windows_encoded_command(script)
+        if len(command) > WINDOWS_COMMAND_LIMIT:
+            raise ValueError('PC 터미널 명령이 너무 깁니다.')
         return [shutil.which('ssh') or '/usr/bin/ssh', '-tt', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=6',
                 '-o', 'ServerAliveInterval=10', '-o', 'ServerAliveCountMax=2'] + self.control_options() + [
-                '--', host['ssh'], 'powershell.exe -NoProfile -EncodedCommand ' + encoded]
+                '--', host['ssh'], command]
+
+    def windows_launcher(self, host, launcher):
+        """A PC's 새 세션 (the host settings' `launcher` choices, `windows_launcher_script`)."""
+        return self._windows_ssh(host, windows_launcher_script(launcher))
 
     def rpc(self, host, op, args=None, timeout=30):
         if host.get('platform') == 'windows':

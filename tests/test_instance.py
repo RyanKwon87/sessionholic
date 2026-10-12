@@ -349,7 +349,7 @@ class RenderTest(unittest.TestCase):
         self.assertEqual(re.sub(r'(name="sessionholic-instance" content=")[^"]*', r"\1{}", rendered), self.page)
         self.assertEqual(self.meta(rendered), {
             "title": "세션홀릭 - 에이전트 세션 매니저", "shortName": "세션홀릭", "storagePrefix": "sessionholic:",
-            "historyKey": "sessionholic", "attachmentsDir": ".sessionholic-attachments"})
+            "historyKey": "sessionholic", "cachePrefix": "sessionholic-", "attachmentsDir": ".sessionholic-attachments"})
         self.assertEqual(server.render_manifest(self.manifest), self.manifest)
         worker = server.render_service_worker(self.worker, "sessionholic-shell-0a1b2c3d")
         changed = [(a, b) for a, b in zip(self.worker.splitlines(), worker.splitlines()) if a != b]
@@ -371,7 +371,8 @@ class RenderTest(unittest.TestCase):
         self.assertNotIn('name="description"', rendered)
         self.assertNotIn("세션홀릭", rendered)
         self.assertEqual(self.meta(rendered), {"title": "데모 <보드>", "shortName": "데모 & 보드", "storagePrefix": "db:",
-                                               "historyKey": "demoBoard", "attachmentsDir": ".demo-board-attachments"})
+                                               "historyKey": "demoBoard", "cachePrefix": "demo-board-",
+                                               "attachmentsDir": ".demo-board-attachments"})
         manifest = json.loads(server.render_manifest(self.manifest, self.demo))
         self.assertEqual((manifest["id"], manifest["name"], manifest["short_name"], manifest["description"]),
                          ("/", "데모 · 보드", "데모 & 보드", '합성 "설명"'))

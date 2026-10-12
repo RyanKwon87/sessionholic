@@ -46,6 +46,14 @@ class FakeReader:
     def endpoints(self):
         return self.paths
 
+    def project(self, cwd):
+        relative = Path(cwd).relative_to(self.home / 'Projects') if str(cwd).startswith(str(self.home / 'Projects')) else Path(cwd)
+        return relative.parts[0] if relative.parts else '기타'
+
+    def _transcripts(self):
+        folder = self.claude_home / 'projects/fixture'
+        return {path.stem: path for path in folder.glob('*.jsonl')} if folder.is_dir() else {}
+
     def endpoint(self, project):
         return next((path for path in self.paths if path.parent.name == project), None)
 
@@ -363,10 +371,100 @@ class WindowsRuntimeTest(unittest.TestCase):
     def test_resume_preview_distinguishes_loaded_from_stored(self):
         self.assertTrue(self.runtime.resume_preview(self.source)['allowed'])
         self.reader.loaded = []
+        # Stored, its project's server running: it resumes into that server.
+        self.assertTrue(self.runtime.resume_preview(self.source)['allowed'])
+        self.reader.paths = []
         result = self.runtime.resume_preview(self.source)
         self.assertFalse(result['allowed'])
         self.assertFalse(result['blockedByBoard'])
-        self.assertIn('원본 프로젝트 서버', result['reason'])
+        self.assertIn('서버가 PC에서 꺼져', result['reason'])
+
+    def test_a_stored_codex_session_resumes_into_its_projects_running_server_only(self):
+        self.reader.loaded = []
+        plan = self.runtime.terminal_plan(self.source)
+        self.assertEqual(plan['argv'], [str(self.reader.binary), 'resume', self.reader.sid, '--remote',
+                                        'unix://' + self.reader.path.as_posix(), '--cd', str(self.reader.cwd)])
+        self.assertEqual((plan['resumed'], plan['connectionMode']), (True, 'attach'))
+        self.assertEqual(plan['env'], {'CODEX_HOME': str(self.reader.codex_home)})
+        # The folder's own server, in any case; while it exists, never another one.
+        other = self.reader.codex_home / 'agents-servers/fixture-us/app.sock'
+        other.parent.mkdir(parents=True)
+        other.touch()
+        self.reader.paths = [other]
+        with self.assertRaisesRegex(ValueError, '꺼져'):
+            self.runtime.terminal_plan(self.source)
+        self.reader.path.parent.rename(self.reader.path.parent.with_name('FIXTURE'))
+        upper = self.reader.codex_home / 'agents-servers/FIXTURE/app.sock'
+        self.reader.paths = [upper, other]
+        self.assertIn('unix://' + upper.as_posix(), self.runtime.terminal_plan(self.source)['argv'])
+        # With none of its name, the only <folder>-… server is the folder's (a project named apart)...
+        upper.parent.rename(upper.parent.with_name('retired'))
+        self.reader.paths = [other]
+        self.assertIn('unix://' + other.as_posix(), self.runtime.terminal_plan(self.source)['argv'])
+        # ...unless a project folder of that name owns it, or another such server exists.
+        (self.home / 'Projects/fixture-us').mkdir()
+        with self.assertRaisesRegex(ValueError, '꺼져'):
+            self.runtime.terminal_plan(self.source)
+        (self.home / 'Projects/fixture-us').rmdir()
+        twin = self.reader.codex_home / 'agents-servers/fixture-eu'
+        twin.mkdir()
+        with self.assertRaisesRegex(ValueError, '꺼져'):
+            self.runtime.terminal_plan(self.source)
+        twin.rmdir()
+        # Outside ~/Projects no server is guessed from the folder name.
+        outside = self.home / 'Elsewhere/fixture'
+        outside.mkdir(parents=True)
+        self.reader.row['cwd'] = str(outside)
+        with self.assertRaisesRegex(ValueError, '꺼져'):
+            self.runtime.terminal_plan({**self.source, 'cwd': str(outside)})
+        self.reader.row['cwd'] = str(self.reader.cwd)
+        # Never an embedded runtime in the elevated SSH session.
+        self.reader.paths = []
+        with self.assertRaisesRegex(ValueError, '꺼져'):
+            self.runtime.terminal_plan(self.source)
+        self.reader.row['archived'] = 1
+        with self.assertRaises(ValueError):
+            self.runtime.terminal_plan(self.source)
+
+    def test_an_unreadable_claude_record_of_a_live_claude_process_blocks_a_resume(self):
+        source, row, registry = self.claude()
+        transcript = self.reader.claude_home / 'projects/fixture' / (source['id'] + '.jsonl')
+        transcript.parent.mkdir(parents=True, exist_ok=True)
+        transcript.write_text(json.dumps({'type': 'user', 'cwd': str(self.reader.cwd), 'sessionId': source['id']}) + '\n')
+        registry.write_text('{')  # being rewritten, say
+        with self.assertRaisesRegex(ValueError, '실행 기록을 읽지 못했습니다'):
+            self.runtime.terminal_plan(source)
+        self.reader.processes.pop(45)  # that process is gone: the record cannot be this run
+        self.assertTrue(self.runtime.terminal_plan(source)['resumed'])
+
+    def test_a_background_run_whose_process_ended_resumes_like_any_stored_conversation(self):
+        source, row, registry = self.claude(kind='bg')
+        self.assertEqual(source['kind'], 'background')
+        transcript = self.reader.claude_home / 'projects/fixture' / (source['id'] + '.jsonl')
+        transcript.parent.mkdir(parents=True, exist_ok=True)
+        transcript.write_text(json.dumps({'type': 'user', 'cwd': str(self.reader.cwd), 'sessionId': source['id']}) + '\n')
+        self.reader.processes.pop(45)  # its registry record stays
+        self.assertEqual(self.runtime.terminal_plan(source)['argv'][1:], ['--resume', source['id']])
+
+    def test_a_stored_claude_conversation_no_pc_process_runs_resumes_in_a_board_terminal(self):
+        source, row, registry = self.claude()
+        transcript = self.reader.claude_home / 'projects/fixture' / (source['id'] + '.jsonl')
+        transcript.parent.mkdir(parents=True, exist_ok=True)
+        transcript.write_text(json.dumps({'type': 'user', 'cwd': str(self.reader.cwd), 'sessionId': source['id']}) + '\n')
+        with self.assertRaisesRegex(ValueError, '실행 중'):
+            self.runtime.terminal_plan(source)
+        self.assertFalse(self.runtime.resume_preview(source)['allowed'])
+        # The process ended (its record may stay): the conversation continues here.
+        self.reader.processes.pop(45)
+        plan = self.runtime.terminal_plan(source)
+        self.assertEqual(plan['argv'], [str(self.home / '.local/bin/claude.exe'), '--resume', source['id']])
+        self.assertEqual((plan['cwd'], plan['env'], plan['resumed']), (str(self.reader.cwd), {}, True))
+        self.assertEqual(plan['nativeSource']['kind'], 'interactive')
+        self.assertTrue(self.runtime.resume_preview(source)['allowed'])
+        registry.unlink()
+        transcript.unlink()
+        with self.assertRaisesRegex(ValueError, '기록'):
+            self.runtime.terminal_plan(source)
 
     def test_windows_process_termination_never_executes_on_non_windows(self):
         with self.assertRaises(ValueError):

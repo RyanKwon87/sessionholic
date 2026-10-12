@@ -1071,18 +1071,49 @@ class ChatClaudeTest(unittest.TestCase):
         self.assertEqual(self.send()['status'], 'accepted')
         self.assertEqual(len(self.terms.pastes), 1)
 
-    def test_a_windows_claude_session_says_it_cannot_take_input(self):
+    def test_a_windows_claude_background_session_says_it_cannot_take_input(self):
         self.board.hosts[0]['platform'] = 'windows'
         try:
             self.phase = 'needs_input'
+            self.terminal()
             state = self.state()
             self.assertEqual((state['capability']['supported'], state['capability']['reason']), (False, chat.CLAUDE_WINDOWS))
+            self.assertNotIn('action', state['capability'])
             self.assertFalse(state['promptOpenable'], 'no question to open where no terminal can attach')
             with self.assertRaises(chat.PromptRejected):
                 self.chat.prompt({'action': 'open', 'source': CLAUDE_REF})
             self.assertEqual(self.rejected(), chat.CLAUDE_WINDOWS)
             self.assertEqual(self.terms.pastes, [])
             self.assertNotIn(('chat', 'capabilities'), self.calls)
+        finally:
+            self.board.hosts[0].pop('platform')
+
+    def test_a_windows_claude_conversation_takes_input_through_its_resumed_board_terminal(self):
+        self.board.hosts[0]['platform'] = 'windows'
+        self.kind('interactive')
+        try:
+            # No terminal yet: its terminal button resumes it on the PC (or says it still runs there).
+            state = self.state()
+            self.assertEqual(state['capability'], {'supported': False, 'attachments': False,
+                                                   'reason': chat.CLAUDE_WINDOWS_OPEN, 'action': 'open_terminal'})
+            self.assertFalse(state['promptOpenable'])
+            with patch.object(self.flow, 'plan', side_effect=AssertionError('a send never opens a PC terminal')):
+                with self.assertRaises(chat.SendRejected) as caught:
+                    self.send()
+            self.assertEqual((str(caught.exception), caught.exception.code), (chat.CLAUDE_WINDOWS_OPEN, 'terminal_required'))
+            self.assertEqual((self.terms.pastes, self.records()), ([], []))
+            # Resumed in a board terminal: the text is pasted there, like a Mac session.
+            self.terminal(kind='interactive')
+            state = self.state()
+            self.assertTrue(state['capability']['supported'])
+            self.assertFalse(state['capability']['attachments'], 'a PC session takes text only')
+            self.assertEqual(self.send()['status'], 'accepted')
+            self.assertEqual(len(self.terms.pastes), 1)
+            self.assertNotIn(('chat', 'send'), self.calls)
+            # A menu on that screen is still answered only from what it shows.
+            self.terms.screen = CLAUDE_PERMISSION
+            self.assertEqual(self.rejected(rid='request-0002'), chat.CLAUDE_BLOCKED)
+            self.assertIsNotNone(self.state()['prompt'])
         finally:
             self.board.hosts[0].pop('platform')
 

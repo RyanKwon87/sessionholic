@@ -15,8 +15,12 @@ REQUEST = re.compile(r'[A-Za-z0-9_-]{8,100}\Z')
 STATE_REQUEST = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.:-]{7,127}\Z')
 CLAUDE_BLOCKED = ('Claude 터미널에 승인·선택 메뉴가 떠 있어 보내지 않았습니다. '
                   '입력이 메뉴 선택으로 처리될 수 있으니 터미널에서 먼저 선택해 주세요.')
-CLAUDE_WINDOWS = ('Windows PC의 Claude 세션은 아직 보드에서 입력할 수 없습니다. '
+CLAUDE_WINDOWS = ('Windows PC의 Claude 백그라운드 세션은 보드에서 입력할 수 없습니다. '
                   '그 PC의 터미널에서 이어 주세요.')
+# A PC Claude conversation takes input through the board terminal it was resumed in
+# (windows_runtime._claude_resume), which opens only while no PC process runs it.
+CLAUDE_WINDOWS_OPEN = ('보내려면 먼저 터미널을 열어 이 대화를 이어 주세요. 그 PC에서 아직 실행 중이면 '
+                       '그 PC의 터미널에서 입력해 주세요.')
 CLAUDE_EXTERNAL = ('이 Claude 세션은 보드 밖 터미널에서 실행 중이라 웹에서 입력할 수 없습니다. '
                    '그 터미널에서 입력하거나 백그라운드 세션(claude --bg)으로 실행해 주세요.')
 # A background session takes web input only through a board terminal the user opened.
@@ -416,8 +420,8 @@ class Chat:
             terminal, terminal_failed = None, True
         action = None
         if claude:
-            supported, reason, action = ((False, CLAUDE_WINDOWS, None) if host.get('platform') == 'windows'
-                                         else self._claude_capability(source, terminal, terminal_failed))
+            supported, reason, action = self._claude_capability(source, terminal, terminal_failed,
+                                                                host.get('platform') == 'windows')
         else:
             supported, reason = bool(caps.get('canSend')), caps.get('reason') or result.get('reason')
         capability = {'supported': supported, 'attachments': bool(source.get('cwd')) and host.get('platform') != 'windows',
@@ -561,15 +565,20 @@ class Chat:
                 return terminal
         return None
 
-    def _claude_capability(self, source, terminal, failed):
+    def _claude_capability(self, source, terminal, failed, windows=False):
         """(supported, reason, action). Input goes through a live board terminal; for a background
         session without one, sending attaches it first (`_send_claude`)."""
         # A session waiting for the user can still take a reply; a menu on its
         # screen is checked at send time, right before anything is pasted.
+        if windows and source.get('kind') == 'background':
+            return False, CLAUDE_WINDOWS, None
         if failed:
             return False, TERMINAL_STATE, None
         if terminal:
             return True, None, None
+        if windows:
+            # Its terminal button resumes it there (or says it still runs on the PC).
+            return False, CLAUDE_WINDOWS_OPEN, 'open_terminal'
         if source.get('kind') == 'background':
             return True, None, None
         # An interactive session cannot be attached (launch.build_launch), so no button is offered.
@@ -608,7 +617,7 @@ class Chat:
             raise ValueError('질문 응답 요청 식별자가 필요합니다.')
         source, host = self.source(data.get('source'))
         self._direct_session(source)
-        if source.get('agent') == 'claude' and host.get('platform') == 'windows':
+        if source.get('agent') == 'claude' and host.get('platform') == 'windows' and source.get('kind') == 'background':
             raise PromptRejected(CLAUDE_WINDOWS, code='terminal_required')
         if action == 'open':
             return self._open_prompt(data.get('source'), source, request_id)
@@ -817,8 +826,9 @@ class Chat:
         return receipt
 
     def _send_claude(self, ref, source, host, request_id, text, ids, manifest):
-        if host.get('platform') == 'windows':
-            # No board terminal reaches a Windows Claude session (windows_runtime.terminal_plan).
+        windows = host.get('platform') == 'windows'
+        if windows and source.get('kind') == 'background':
+            # Only a PC conversation resumed in a board terminal takes input (windows_runtime.terminal_plan).
             raise SendRejected(CLAUDE_WINDOWS, 409)
         if not self.claude_lock.acquire(timeout=30):
             raise SendRejected('다른 메시지를 전달하고 있습니다. 잠시 뒤 다시 보내 주세요.', 409)
@@ -837,6 +847,8 @@ class Chat:
             except (RuntimeError, OSError):
                 raise SendRejected('보드 터미널 상태를 확인하지 못해 보내지 않았습니다. 잠시 뒤 다시 시도해 주세요.', 409) from None
             if terminal is None:
+                if windows:
+                    raise SendRejected(CLAUDE_WINDOWS_OPEN, 409, code='terminal_required')
                 if source.get('kind') != 'background':
                     raise SendRejected(CLAUDE_EXTERNAL, 409)
                 # The user pressed 보내기: attach this exact background session first. A failure

@@ -10,6 +10,7 @@ const INSTANCE = (() => {
     shortName: "세션홀릭",
     storagePrefix: "sessionholic:",
     historyKey: "sessionholic",
+    cachePrefix: "sessionholic-",
     attachmentsDir: ".sessionholic-attachments",
   };
   const valid = {
@@ -17,6 +18,7 @@ const INSTANCE = (() => {
     shortName: (value) => value.length > 0 && value.length <= 256,
     storagePrefix: (value) => /^[A-Za-z0-9_.:-]{1,32}$/.test(value),
     historyKey: (value) => /^[A-Za-z][A-Za-z0-9_]{0,31}$/.test(value),
+    cachePrefix: (value) => /^[A-Za-z0-9][A-Za-z0-9_.-]{0,39}$/.test(value),
     attachmentsDir: (value) => /^[A-Za-z0-9._-]{1,64}$/.test(value) && value !== "." && value !== "..",
   };
   try {
@@ -54,6 +56,8 @@ const POLL_MS = 60000;
 const RECENT_SECONDS = 3 * 24 * 3600;
 // Every touch decision reads its thresholds here, so tuning on a real phone
 // changes only this object (distances in CSS px, times in ms, speeds in px/ms).
+// Conversations open with their bars folded (집중 모드); 집중 모드 해제 or a tap brings them back.
+const CONVERSATION_OPENS_FOCUSED = true;
 const GESTURE = Object.freeze({
   longPressMs: 450, // a press held this long opens the menu (cards, messages)
   pressSlopPx: 10, // drift allowed before a press becomes a drag (long press, swipe, pull)
@@ -171,6 +175,8 @@ const state = {
   terminalScrollMode: null,
   terminalScrollInFlight: false,
   terminalScrollGeneration: 0,
+  terminalMods: { ctrl: false, alt: false, meta: false },
+  terminalKeyHandled: false,
   terminalMomentum: null,
   toastTimer: null,
   chats: new Map(),
@@ -518,6 +524,7 @@ const SHEETS = {
   "close-terminal-dialog": { onDismiss: () => cancelTerminalClose() },
   "settings-dialog": { onDismiss: () => closeSettings() },
   "usage-dialog": { onDismiss: () => closeSheet("usage-dialog", "usage") },
+  "hardware-dialog": { onDismiss: () => closeSheet("hardware-dialog", "hardware") },
   "filter-dialog": { onDismiss: () => closeSheet("filter-dialog", "filter-open") },
   "terminals-dialog": { onDismiss: () => closeSheet("terminals-dialog", "running-terminals") },
   "new-session-dialog": { onDismiss: () => closeNewSession() },
@@ -579,6 +586,34 @@ function openRequestedSession() {
 // as "질문 불러오기" would, so the choices are there without another tap.
 function answerOnOpen(s) {
   state.answerOnOpen = { key: s.key, until: Date.now() + 30000 };
+}
+// 설정 › 캐시 지우고 새로고침: this board's shell caches go, and a worker that receives no
+// notifications is unregistered (one that does keeps its subscription and only updates).
+// Other applications' caches and every stored preference stay.
+async function hardReload() {
+  const button = $("hard-reload");
+  if (networkOffline()) {
+    // A cleared shell could not load again until the board is reachable.
+    toast("오프라인이라 캐시를 지우지 않았습니다. 연결된 뒤 다시 눌러 주세요.");
+    return;
+  }
+  if (button) button.disabled = true;
+  try {
+    const keys = (await globalThis.caches?.keys?.()) || [];
+    await Promise.all(keys.filter((key) => typeof key === "string" && key.startsWith(INSTANCE.cachePrefix))
+      .map((key) => globalThis.caches.delete(key)));
+    const registrations = (await globalThis.navigator?.serviceWorker?.getRegistrations?.()) || [];
+    for (const registration of registrations) {
+      const subscribed = await Promise.resolve(registration.pushManager?.getSubscription?.()).catch(() => null);
+      if (subscribed) await Promise.resolve(registration.update?.()).catch(() => {});
+      else await Promise.resolve(registration.unregister?.()).catch(() => {});
+    }
+  } catch {
+    // Reload anyway: the fresh page reads everything from the board again.
+  }
+  window.location.reload();
+  // Still here (a draft's leave prompt was declined): the button works again.
+  setTimeout(() => { if (button) button.disabled = false; }, 3000);
 }
 function closeSettings() {
   if (!$("settings-dialog").open) return;
@@ -668,7 +703,7 @@ function beginAuthEpoch() {
 // deduplicates by requestId, are sent once more with a fresh token. A chat send
 // never is: it waits for a new press (sendChat).
 const CSRF_RETRY = new Set(["/api/chat/state", "/api/chat/prompt", "/api/plan", "/api/launch",
-  "/api/new-session", "/api/app-server", "/api/refresh", "/api/usage/refresh",
+  "/api/new-session", "/api/app-server", "/api/refresh", "/api/usage/refresh", "/api/hardware/refresh",
   "/api/push/subscribe", "/api/push/unsubscribe"]);
 async function api(path, { method = "GET", body, signal, authEpoch = state.authEpoch, csrfRetry = true } = {}) {
   assertAuthEpoch(authEpoch);
@@ -1028,6 +1063,116 @@ async function loadUsage(force = false) {
     if (err.status === 404) { state.usageUnsupported = true; renderUsage(null); }
   } finally {
     state.usageBusy = false;
+  }
+}
+// The board machines' hardware (설정 `hardware`): a chip with how many answer and a sheet
+// with each one's CPU, memory, disk, battery and uptime. Read every 15 seconds while the
+// sheet is open, the chip's summary every 5 minutes otherwise.
+const HARDWARE_OPEN_MS = 15000;
+const HARDWARE_CLOSED_MS = 300000;
+function hardwareTone(percent) {
+  return !Number.isFinite(percent) ? "muted" : percent >= 90 ? "red" : percent >= 75 ? "orange" : "green";
+}
+function hardwareBytes(value) {
+  if (!Number.isFinite(value)) return "—";
+  const gb = value / 1024 ** 3;
+  return gb >= 1000 ? `${(gb / 1024).toFixed(1)}TB` : gb >= 10 ? `${Math.round(gb)}GB` : `${gb.toFixed(1)}GB`;
+}
+function hardwareUptime(seconds) {
+  if (!Number.isFinite(seconds)) return "";
+  const days = Math.floor(seconds / 86400), hours = Math.floor((seconds % 86400) / 3600);
+  return days ? `${days}일 ${hours}시간` : hours ? `${hours}시간 ${Math.floor((seconds % 3600) / 60)}분` : `${Math.floor(seconds / 60)}분`;
+}
+function hardwareLine(label, percent, value) {
+  const line = el("div", "usage-window");
+  const bar = el("div", "usage-bar");
+  const fill = el("span", `usage-fill ${hardwareTone(percent)}`);
+  if (fill.style) fill.style.width = `${Number.isFinite(percent) ? Math.max(0, Math.min(100, percent)) : 0}%`;
+  bar.append(fill);
+  line.append(el("span", "usage-window-label", label), bar, el("span", "usage-window-value", value), el("span", "usage-window-reset", ""));
+  return line;
+}
+function renderHardware(data) {
+  const box = $("hardware");
+  if (!box) return;
+  const hosts = data?.available && Array.isArray(data.hosts) ? data.hosts.filter((item) => item && typeof item === "object") : [];
+  if (!hosts.length) {
+    box.hidden = true;
+    box.dataset.revision = "";
+    if ($("hardware-dialog")?.open) closeSheet("hardware-dialog", "hardware");
+    return;
+  }
+  box.hidden = false;
+  const revision = JSON.stringify([hosts, data.refreshing]);
+  if (box.dataset.revision === revision) return;
+  box.dataset.revision = revision;
+  const answering = hosts.filter((host) => host.status === "ready" || host.status === "stale").length;
+  const hot = hosts.filter((host) => [host.cpu?.percent, host.memory?.percent, host.disk?.percent]
+    .some((value) => Number.isFinite(value) && value >= 90)).length;
+  const pill = el("span", `usage-pill ${answering < hosts.length || hot ? "red" : "green"}`);
+  pill.append(el("span", "usage-short", "기기"), el("strong", null, `${answering}/${hosts.length}`));
+  $("hardware-summary").replaceChildren(pill);
+  box.setAttribute("aria-label", `기기 상태: ${hosts.length}대 중 ${answering}대 응답${hot ? `, ${hot}대 사용률 높음` : ""}. 기기별로 보기`);
+  const sections = hosts.map((host) => {
+    const section = el("section", "usage-provider hardware-host");
+    const head = el("div", "usage-row-head");
+    head.append(el("strong", null, host.label || host.name));
+    const status = host.status === "offline" ? "연결 안 됨" : host.status === "stale" ? "이전 값" :
+      host.status === "pending" ? (host.refreshing ? "읽는 중" : "확인 전") : host.refreshing ? "갱신 중" : "";
+    if (status) head.append(el("span", "usage-credits", status));
+    section.append(head);
+    if (host.error) section.append(el("p", "usage-note", host.error));
+    const cpu = host.cpu || {};
+    if (host.cpu) {
+      const cores = Number.isFinite(cpu.cores) ? `${cpu.cores}코어` : "";
+      const load = Array.isArray(cpu.load) ? `부하 ${cpu.load[0]}` : "";
+      section.append(hardwareLine("CPU", cpu.percent, Number.isFinite(cpu.percent) ? `${cpu.percent}%` : load || "측정 중"));
+      const detail = [cpu.model, cores, Number.isFinite(cpu.percent) ? load : ""].filter(Boolean).join(" · ");
+      if (detail) section.append(el("p", "usage-note", detail));
+    }
+    if (host.memory) section.append(hardwareLine("메모리", host.memory.percent,
+      `${hardwareBytes(host.memory.used)} / ${hardwareBytes(host.memory.total)}`));
+    if (host.disk) section.append(hardwareLine("디스크", host.disk.percent, `여유 ${hardwareBytes(host.disk.free)}`));
+    const facts = [];
+    if (host.battery) facts.push(`배터리 ${host.battery.percent}%${host.battery.charging ? " · 충전 중" : host.battery.power === "ac" ? " · 전원 연결" : ""}`);
+    if (Number.isFinite(host.uptimeSeconds)) facts.push(`가동 ${hardwareUptime(host.uptimeSeconds)}`);
+    if (Number.isFinite(host.fetchedAt)) facts.push(`${clock(host.fetchedAt)} 확인`);
+    if (facts.length) section.append(el("p", "usage-note", facts.join(" · ")));
+    return section;
+  });
+  const foot = el("div", "usage-foot");
+  foot.append(el("span", null, "CPU는 두 번 읽은 사이의 사용률입니다. 맥은 부하(1분 평균)도 함께 보여 줍니다."));
+  const refresh = button(data.refreshing ? "읽는 중…" : "새로고침", "usage-refresh", () => loadHardware(true));
+  refresh.disabled = !!data.refreshing;
+  foot.append(refresh);
+  $("hardware-body").replaceChildren(...sections, foot);
+}
+function openHardware() {
+  if ($("hardware")?.hidden) return;
+  sheet("hardware-dialog").open();
+  loadHardware();
+  clearInterval(state.hardwareTimer);
+  state.hardwareTimer = setInterval(() => {
+    if (!$("hardware-dialog")?.open) { clearInterval(state.hardwareTimer); state.hardwareTimer = null; return; }
+    loadHardware();
+  }, HARDWARE_OPEN_MS);
+}
+async function loadHardware(force = false) {
+  if (state.hardwareUnsupported || !state.authenticated || networkOffline() || document.hidden || state.hardwareBusy) return;
+  state.hardwareBusy = true;
+  state.hardwareAt = Date.now();
+  try {
+    const data = force ? await api("/api/hardware/refresh", { method: "POST", body: {} }) : await api("/api/hardware");
+    state.hardware = data;
+    renderHardware(data);
+    // Follow the reads the board is making, a few times.
+    if (data?.refreshing && (state.hardwareFollow = (state.hardwareFollow || 0) + 1) <= 10)
+      setTimeout(() => loadHardware(false), 3000);
+    else if (!data?.refreshing) state.hardwareFollow = 0;
+  } catch (err) {
+    if (err.status === 404) { state.hardwareUnsupported = true; renderHardware(null); }
+  } finally {
+    state.hardwareBusy = false;
   }
 }
 const BASE_TITLE = INSTANCE.title;
@@ -2387,10 +2532,11 @@ function drawDetail(s) {
   jump.setAttribute("aria-label", "대화 맨 아래로");
   list.addEventListener("scroll", () => readingScroll(list), { passive: true });
   bindMessageGestures(list);
-  state.chromeVisible = savedView ? savedView.chromeVisible : true;
+  // A conversation opens in focus mode; the same tab reopening it keeps how it was left.
+  state.chromeVisible = savedView ? savedView.chromeVisible : !CONVERSATION_OPENS_FOCUSED;
   pane.classList?.remove("is-reading");
   pane.classList?.remove("is-typing");
-  // Shown once, the first time scrolling hides the bars on a phone.
+  // Shown once on a touch screen, the first time the bars are folded away.
   const hint = el("p", "tap-hint", "화면을 탭하면 메뉴가 나타나요");
   hint.id = "tap-hint";
   hint.hidden = true;
@@ -2401,6 +2547,7 @@ function drawDetail(s) {
   prompt.setAttribute("aria-live", "polite");
   pane.append(bar, sync, list, jump, hint, prompt, buildChatComposer(s), buildContinuePanel(s));
   setChromeVisible(state.chromeVisible);
+  if (!state.chromeVisible && touchDevice()) showTapHint();
 }
 // Questions and approvals drawn by the CLI in the board's terminal, answered
 // here with the same keys a person would press. Nothing is sent until the
@@ -2664,8 +2811,15 @@ function showTapHint() {
   prefs.set("tapHint", true);
   const hint = $("tap-hint");
   if (!hint) return;
-  const list = $("messages");
-  if (hint.style && Number.isFinite(list?.offsetTop)) hint.style.top = `${list.offsetTop + 12}px`;
+  // Below the header once the conversation is laid out (a phone still shows the list when a
+  // conversation is drawn); until then the stylesheet's place.
+  const place = () => {
+    const list = $("messages");
+    if (hint.style && list && list.offsetParent !== null && Number.isFinite(list.offsetTop) && list.offsetTop > 0)
+      hint.style.top = `${list.offsetTop + 12}px`;
+  };
+  place();
+  globalThis.requestAnimationFrame?.(place);
   hint.hidden = false;
   clearTimeout(state.tapHintTimer);
   state.tapHintTimer = setTimeout(() => { hint.hidden = true; }, TAP_HINT_MS);
@@ -3256,7 +3410,16 @@ function promptKeydown(event) {
   return true;
 }
 function documentKeydown(event) {
-  if ((event.metaKey || event.ctrlKey) && String(event.key).toLowerCase() === "k" && !event.isComposing) {
+  if (event.defaultPrevented) {
+    noteHardwareKey(event);
+    return;
+  }
+  closeChatToolsEscape(event);
+  if (terminalDocumentKey(event)) {
+    noteHardwareKey(event);
+    return;
+  }
+  if (!state.terminalVisible && (event.metaKey || event.ctrlKey) && String(event.key).toLowerCase() === "k" && !event.isComposing) {
     event.preventDefault();
     const search = window.SessionholicGoals?.searchElement?.() || $("search");
     search?.focus();
@@ -3264,7 +3427,6 @@ function documentKeydown(event) {
     return;
   }
   noteHardwareKey(event);
-  closeChatToolsEscape(event);
   promptKeydown(event);
 }
 function chatReceiptCopy(receipt) {
@@ -5473,6 +5635,14 @@ function terminalCloseCopy(terminal) {
     ended: "새 세션의 실행이 종료되었습니다. 대화 기록은 보드의 작업 목록에서 확인하세요.",
     done: "새 세션의 실행을 종료했습니다. 대화 기록은 보드의 작업 목록에서 확인하세요.",
   };
+  // A PC conversation resumed in this terminal runs in it: closing it ends that run.
+  if (mode === "resume") return {
+    action: "실행 종료", title: "이 터미널의 실행을 종료할까요?", danger: true,
+    description: "이 보드에서 다시 연 대화의 실행을 종료합니다. 진행 중인 응답이 중단될 수 있고, 대화 기록은 남습니다.",
+    context: "저장된 대화를 이 보드 터미널에서 다시 열었습니다. 보드로 돌아가거나 브라우저를 닫아도 실행은 유지됩니다.",
+    ended: "다시 연 대화의 실행이 종료되었습니다. 대화 기록은 보드의 작업 목록에서 확인하세요.",
+    done: "다시 연 대화의 실행을 종료했습니다. 대화 기록은 보드의 작업 목록에서 확인하세요.",
+  };
   if (mode === "handoff" || mode === "transfer") return {
     action: "실행 종료", title: "이 터미널의 실행을 종료할까요?", danger: true,
     description: "이 보드에서 새로 시작한 작업을 종료합니다. 진행 중인 응답이 중단될 수 있고, 대화 기록은 남습니다. 이어서 하려면 실행 기기의 최근 작업을 선택하세요.",
@@ -5500,6 +5670,7 @@ function terminalError(text = "") {
 }
 function stopTerminalReader() {
   cancelDraftPaste();
+  clearTerminalMods();
   state.terminalRun++;
   state.terminalAbort?.abort();
   state.terminalAbort = null;
@@ -5531,6 +5702,11 @@ function settleDraftComposition() {
 }
 function startDraftComposition(event) {
   if (event?.target && event.target !== $("terminal-draft")) return;
+  if (anyTerminalMod()) {
+    // An input method composing (한글, say) gives no key to combine with: said, not silent.
+    clearTerminalMods();
+    $("draft-note").textContent = "한글 등 조합 입력에서는 보조키가 풀립니다. 영문 입력으로 바꿔 다시 눌러 주세요.";
+  }
   if (state.draftPaste) {
     cancelDraftPaste();
     $("draft-note").textContent = "새 입력을 보관했습니다. 조합이 끝나면 붙여넣기를 눌러 주세요.";
@@ -5577,6 +5753,7 @@ function bindDraftInput(node) {
     resizeDraft();
   });
   node.addEventListener("keydown", draftKeydown);
+  node.addEventListener("beforeinput", draftBeforeInput);
   node.addEventListener("compositionstart", startDraftComposition);
   node.addEventListener("compositionend", endDraftComposition);
 }
@@ -5730,6 +5907,7 @@ async function openTerminal(terminal, { recordHistory = true } = {}) {
   }
   stopTerminalReader();
   if (changing) resetTerminalScroll();
+  renderTerminalMods();
   state.inputEpoch++;
   state.inputQueue = Promise.resolve();
   state.inputFailed = false;
@@ -5796,6 +5974,8 @@ async function openTerminal(terminal, { recordHistory = true } = {}) {
       cursorBlink: true,
       scrollback: 5000,
       screenReaderMode: state.screenReaderMode,
+      // ⌥ with a key is Meta (ESC first) for the CLI, not a special character.
+      macOptionIsMeta: true,
       convertEol: false,
       allowProposedApi: false,
       theme: {
@@ -5812,6 +5992,7 @@ async function openTerminal(terminal, { recordHistory = true } = {}) {
     // An app that asked for the mouse gets the wheel from xterm itself (tmux
     // forwards it); otherwise the wheel scrolls tmux history instead of
     // reaching the CLI as arrow keys.
+    state.term.attachCustomKeyEventHandler?.(xtermKeyEvent);
     state.term.attachCustomWheelEventHandler?.((event) => {
       if ((state.term?.modes?.mouseTrackingMode || "none") !== "none") return true;
       queueTerminalScroll(event.deltaY / terminalLineHeight());
@@ -6203,7 +6384,255 @@ function resizeDraft() {
   // A taller or shorter input bar changes the terminal's rows; refit so no line is hidden.
   if (input.style.height !== before) requestAnimationFrame(fitTerminal);
 }
+// --- Terminal keys: modifiers on the key bar and a hardware keyboard -------------
+// What a key sends to the CLI, as a terminal emulator would (xterm's sequences).
+// Ctrl, ⌥ and ⌘ on the key bar hold for the next key. ⌘ has line-editing meanings only:
+// macOS conventions on a Mac host, the Windows console's own keys on a Windows host.
+const TERMINAL_KEY_ALIASES = {
+  Esc: "Escape", Up: "ArrowUp", Down: "ArrowDown", Left: "ArrowLeft", Right: "ArrowRight",
+  UIKeyInputUpArrow: "ArrowUp", UIKeyInputDownArrow: "ArrowDown", UIKeyInputLeftArrow: "ArrowLeft",
+  UIKeyInputRightArrow: "ArrowRight", UIKeyInputEscape: "Escape", UIKeyInputPageUp: "PageUp",
+  UIKeyInputPageDown: "PageDown", UIKeyInputHome: "Home", UIKeyInputEnd: "End",
+};
+const TERMINAL_CURSOR_KEYS = { ArrowUp: "A", ArrowDown: "B", ArrowRight: "C", ArrowLeft: "D", Home: "H", End: "F" };
+const TERMINAL_TILDE_KEYS = { Insert: 2, Delete: 3, PageUp: 5, PageDown: 6, F5: 15, F6: 17, F7: 18, F8: 19,
+  F9: 20, F10: 21, F11: 23, F12: 24 };
+const TERMINAL_FUNCTION_KEYS = { F1: "P", F2: "Q", F3: "R", F4: "S" };
+const TERMINAL_CTRL_DIGITS = { 2: "\x00", 3: "\x1b", 4: "\x1c", 5: "\x1d", 6: "\x1e", 7: "\x1f", 8: "\x7f" };
+const TERMINAL_EDIT_KEYS = new Set(["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", "Home", "End", "Tab",
+  "Backspace", "Delete", "Escape"]);
+const TERMINAL_ALWAYS_KEYS = /^(F([1-9]|1[0-2])|PageUp|PageDown|Insert)$/;
+// The bar's own keys as names, for when a held modifier combines with one.
+const TERMINAL_BAR_KEYS = {
+  escape: ["Escape"], tab: ["Tab"], backtab: ["Tab", { shift: true }], interrupt: ["c", { ctrl: true }],
+  "ctrl-j": ["j", { ctrl: true }], "ctrl-u": ["u", { ctrl: true }], "ctrl-x": ["x", { ctrl: true }],
+  "ctrl-l": ["l", { ctrl: true }], up: ["ArrowUp"], left: ["ArrowLeft"], down: ["ArrowDown"],
+  right: ["ArrowRight"], enter: ["Enter"],
+};
+const TERMINAL_BAR_BYTES = {
+  escape: "\x1b",
+  tab: "\t",
+  backtab: "\x1b[Z",
+  up: "\x1b[A",
+  down: "\x1b[B",
+  left: "\x1b[D",
+  right: "\x1b[C",
+  interrupt: "\x03",
+  "ctrl-j": "\n",
+  "ctrl-u": "\x15",
+  "ctrl-x": "\x18",
+  "ctrl-l": "\x0c",
+  enter: "\r",
+};
+function terminalKeyBytes(key, mods = {}, { windows = false } = {}) {
+  key = TERMINAL_KEY_ALIASES[key] || key;
+  const ctrl = !!mods.ctrl, alt = !!mods.alt, shift = !!mods.shift, meta = !!mods.meta;
+  if (meta) {
+    // ⌘←/→ to the line's start or end, ⌘⌫ deletes back to its start.
+    const edits = windows ? { ArrowLeft: "\x1b[H", ArrowRight: "\x1b[F", Backspace: "\x1b[1;5H" }
+      : { ArrowLeft: "\x01", ArrowRight: "\x05", Backspace: "\x15" };
+    return ctrl || alt ? null : edits[key] || null;
+  }
+  if (alt && !ctrl && !shift && ["ArrowLeft", "ArrowRight", "Backspace"].includes(key)) {
+    // ⌥←/→ by word and ⌥⌫ deletes a word, as Terminal and the Windows console do it.
+    return (windows ? { ArrowLeft: "\x1b[1;5D", ArrowRight: "\x1b[1;5C", Backspace: "\x08" }
+      : { ArrowLeft: "\x1bb", ArrowRight: "\x1bf", Backspace: "\x1b\x7f" })[key];
+  }
+  const level = 1 + (shift ? 1 : 0) + (alt ? 2 : 0) + (ctrl ? 4 : 0);
+  if (TERMINAL_CURSOR_KEYS[key]) return level > 1 ? `\x1b[1;${level}${TERMINAL_CURSOR_KEYS[key]}` : `\x1b[${TERMINAL_CURSOR_KEYS[key]}`;
+  if (TERMINAL_TILDE_KEYS[key]) return level > 1 ? `\x1b[${TERMINAL_TILDE_KEYS[key]};${level}~` : `\x1b[${TERMINAL_TILDE_KEYS[key]}~`;
+  if (TERMINAL_FUNCTION_KEYS[key]) return level > 1 ? `\x1b[1;${level}${TERMINAL_FUNCTION_KEYS[key]}` : `\x1bO${TERMINAL_FUNCTION_KEYS[key]}`;
+  const prefix = alt ? "\x1b" : "";
+  if (key === "Tab") return shift ? "\x1b[Z" : prefix + "\t";
+  if (key === "Enter") return prefix + "\r";
+  if (key === "Escape") return "\x1b";
+  if (key === "Backspace") return prefix + (ctrl ? "\x08" : "\x7f");
+  if (typeof key !== "string" || [...key].length !== 1) return null;
+  if (!ctrl) return prefix + key;
+  if (key === " ") return prefix + "\x00";
+  if (TERMINAL_CTRL_DIGITS[key]) return prefix + TERMINAL_CTRL_DIGITS[key];
+  if (key === "?") return prefix + "\x7f";
+  const code = key.toUpperCase().charCodeAt(0);
+  return code >= 64 && code <= 95 ? prefix + String.fromCharCode(code & 0x1f) : null;
+}
+// A key pressed with a modifier, by its place on the keyboard: a Korean layout prints ㅊ
+// and ⌥ prints å, but Ctrl+C is meant.
+function hardwareKeyName(event) {
+  const key = TERMINAL_KEY_ALIASES[event.key] || String(event.key || "");
+  if (!(event.ctrlKey || event.altKey || event.metaKey || anyTerminalMod()) || typeof event.code !== "string") return key;
+  const letter = /^Key([A-Z])$/.exec(event.code);
+  if (letter) return event.shiftKey ? letter[1] : letter[1].toLowerCase();
+  const digit = /^Digit([0-9])$/.exec(event.code);
+  if (digit) return digit[1];
+  return { Space: " ", Minus: "-", Equal: "=", BracketLeft: "[", BracketRight: "]", Backslash: "\\",
+    Semicolon: ";", Quote: "'", Comma: ",", Period: ".", Slash: "/", Backquote: "`" }[event.code] || key;
+}
+function appleBrowser() {
+  return /Mac|iPhone|iPad|iPod/.test(String(globalThis.navigator?.platform || globalThis.navigator?.userAgent || ""));
+}
+const TERMINAL_MODIFIER_NAMES = ["Process", "Unidentified", "Dead", "Shift", "Control", "Alt", "Meta", "CapsLock",
+  "HangulMode", "HanjaMode", "KanaMode", "Lang1", "Lang2"];
+// The bytes a hardware key sends while a terminal shows, or null to leave it to the page
+// (or to the input bar: a typed draft keeps the keyboard's own editing, see below).
+function terminalKeyFromEvent(event, { draftEmpty = true, focusless = false } = {}) {
+  if (!event || event.isComposing || event.keyCode === 229) return null;
+  const sticky = state.terminalMods || {};
+  const mods = { ctrl: !!(event.ctrlKey || sticky.ctrl), alt: !!(event.altKey || sticky.alt),
+    shift: !!event.shiftKey, meta: !!(event.metaKey || sticky.meta) };
+  const key = hardwareKeyName(event);
+  if (TERMINAL_MODIFIER_NAMES.includes(key)) return null;
+  const options = { windows: terminalOnWindows() };
+  // A typed draft keeps the keyboard's own editing: ⌘ and ⌥ (Ctrl on a PC) arrows and ⌫ move
+  // and delete in it, and a Mac's ⌥ prints its characters (⌥₩ is \ on a Korean Mac). A PC's
+  // Alt types nothing (and Alt+← is the browser's Back), so it stays Meta for the CLI, as do
+  // modifiers held on the bar.
+  const typed = !focusless && !draftEmpty;
+  const apple = appleBrowser();
+  // ⌘C, ⌘V and the rest stay the browser's; ⌘ only edits the line.
+  if (mods.meta) {
+    if (!["ArrowLeft", "ArrowRight", "Backspace"].includes(key) || (typed && !sticky.meta)) return null;
+    return terminalKeyBytes(key, mods, options);
+  }
+  if (TERMINAL_ALWAYS_KEYS.test(key)) return terminalKeyBytes(key, mods, options);
+  if ([...key].length === 1) {
+    const raw = String(event.key || "");
+    if (!apple && event.ctrlKey && !sticky.ctrl) {
+      // AltGr (Ctrl+Alt on a PC) prints a character: into the input bar, or as it is.
+      if (event.altKey && [...raw].length === 1 && raw.toLowerCase() !== key.toLowerCase())
+        return focusless ? raw : null;
+      // A PC browser pastes with Ctrl+V and keeps Ctrl+C/X/A/Z for a typed draft;
+      // on Apple keyboards ⌘ does those (and Ctrl+V reaches the CLI, which pastes images).
+      if (!focusless && (key.toLowerCase() === "v" || (typed && "cxaz".includes(key.toLowerCase())))) return null;
+    }
+    if (!focusless && apple && event.altKey && !sticky.alt && !mods.ctrl) return null;
+    if (mods.ctrl || mods.alt || focusless) return terminalKeyBytes(key, mods, options);
+    return null;
+  }
+  if (key === "Enter") return focusless ? terminalKeyBytes(key, mods, options) : null;
+  if (TERMINAL_EDIT_KEYS.has(key) && (!typed || sticky.ctrl || sticky.alt || (event.altKey && !apple)))
+    return terminalKeyBytes(key, mods, options);
+  return null;
+}
+// A real key (not a modifier, nor one an input method is still composing): a held bar
+// modifier it does not combine with is released, so it never lands on a later key.
+function releasesTerminalMods(event) {
+  return !!event && !event.isComposing && event.keyCode !== 229
+    && !TERMINAL_MODIFIER_NAMES.includes(TERMINAL_KEY_ALIASES[event.key] || String(event.key || ""));
+}
+function terminalOnWindows() {
+  return capsHost(terminalInfo(state.terminal).host)?.platform === "windows";
+}
+function anyTerminalMod() {
+  const mods = state.terminalMods || {};
+  return !!(mods.ctrl || mods.alt || mods.meta);
+}
+function renderTerminalMods() {
+  const windows = terminalOnWindows();
+  for (const node of $("terminal-keys")?.querySelectorAll?.("button[data-mod]") || []) {
+    const name = node.dataset.mod;
+    node.setAttribute("aria-pressed", String(!!state.terminalMods[name]));
+    if (name === "alt") node.textContent = windows ? "Alt" : "⌥";
+    // A Windows host has no ⌘; Ctrl and Alt do its editing there.
+    if (name === "meta") node.hidden = windows;
+  }
+}
+function toggleTerminalMod(name) {
+  if (!(name in state.terminalMods)) return;
+  state.terminalMods = { ...state.terminalMods, [name]: !state.terminalMods[name] };
+  renderTerminalMods();
+}
+function clearTerminalMods() {
+  if (!anyTerminalMod()) return;
+  state.terminalMods = { ctrl: false, alt: false, meta: false };
+  renderTerminalMods();
+}
+function sendTerminalBytes(bytes) {
+  if (!bytes || state.composing || state.draftPaste) return;
+  state.terminalScrollLines = 0;
+  renderTerminalScroll();
+  sendInput(bytes).catch(() => {});
+}
+// A key on the bar: its own bytes, or combined with the held modifiers (then released).
+function pressTerminalKey(name) {
+  if (state.composing || state.draftPaste) return;
+  let bytes = TERMINAL_BAR_BYTES[name];
+  if (anyTerminalMod()) {
+    const [key, base = {}] = TERMINAL_BAR_KEYS[name] || [];
+    const mods = state.terminalMods;
+    const combined = key && terminalKeyBytes(key, { ...base, ctrl: base.ctrl || mods.ctrl, alt: mods.alt, meta: mods.meta },
+      { windows: terminalOnWindows() });
+    if (combined) bytes = combined;
+    clearTerminalMods();
+  }
+  sendTerminalBytes(bytes);
+}
+// A held modifier and a character typed into the input bar: sent as that combination.
+function draftBeforeInput(event) {
+  if (!anyTerminalMod() || event.inputType !== "insertText" || typeof event.data !== "string" || [...event.data].length !== 1) return;
+  const bytes = terminalKeyBytes(event.data, { ...state.terminalMods }, { windows: terminalOnWindows() });
+  if (!bytes) {
+    // Typed as it is; the held modifier does not wait for a later key.
+    clearTerminalMods();
+    return;
+  }
+  event.preventDefault();
+  clearTerminalMods();
+  sendTerminalBytes(bytes);
+}
+// With nothing focused (the terminal just opened), a hardware keyboard types into the CLI.
+// A focused control keeps its keys, and Tab moves the focus as on any page.
+function terminalDocumentKey(event) {
+  if (!state.terminalVisible || event.defaultPrevented || editingText()) return false;
+  const active = document.activeElement;
+  if ((active && active !== document.body && active !== document.documentElement) || event.key === "Tab") {
+    // Not for the CLI: a held bar modifier must not wait for a later key either.
+    if (releasesTerminalMods(event)) clearTerminalMods();
+    return false;
+  }
+  if (event.target?.closest?.(".xterm, dialog[open], details[open]")) return false;
+  if (document.querySelector?.("dialog[open]")) return false;
+  const bytes = terminalKeyFromEvent(event, { focusless: true });
+  if (!bytes) {
+    if (releasesTerminalMods(event)) clearTerminalMods();
+    return false;
+  }
+  event.preventDefault();
+  clearTerminalMods();
+  sendTerminalBytes(bytes);
+  return true;
+}
+// xterm has the focus: it sends most keys itself; ⌘ edits, ⌥ word moves and held bar
+// modifiers are ours (the keypress that follows a handled keydown is swallowed too).
+function xtermKeyEvent(event) {
+  if (event.type !== "keydown") return !state.terminalKeyHandled;
+  state.terminalKeyHandled = false;
+  const ours = anyTerminalMod() || event.metaKey || (event.altKey && ["ArrowLeft", "ArrowRight", "Backspace"].includes(event.key));
+  if (!ours) return true;
+  const bytes = terminalKeyFromEvent(event, { focusless: true });
+  if (!bytes) {
+    if (releasesTerminalMods(event)) clearTerminalMods();
+    return true;
+  }
+  event.preventDefault?.();
+  state.terminalKeyHandled = true;
+  clearTerminalMods();
+  sendTerminalBytes(bytes);
+  return false;
+}
 function draftKeydown(event) {
+  // A hardware keyboard's terminal keys go to the CLI (see terminalKeyFromEvent). A key held
+  // down from a typed draft (⌫, say) stops at its start instead of going on into the CLI line.
+  const empty = !event.target?.value;
+  if (!event.repeat) state.draftPressEmpty = empty;
+  const draftEmpty = empty && (!event.repeat || state.draftPressEmpty !== false);
+  const bytes = state.terminalVisible ? terminalKeyFromEvent(event, { draftEmpty }) : null;
+  if (bytes) {
+    event.preventDefault();
+    clearTerminalMods();
+    sendTerminalBytes(bytes);
+    return;
+  }
+  if (state.terminalVisible && releasesTerminalMods(event)) clearTerminalMods();
   // Enter sends like a chat box; Shift+Enter keeps a newline in the draft.
   if (event.key !== "Enter" || event.shiftKey || event.isComposing || event.keyCode === 229) return;
   event.preventDefault();
@@ -6956,6 +7385,7 @@ async function poll(refresh = false, { capabilities = true } = {}) {
     renderConnectivity();
     if (refresh) window.SessionholicGoals?.refresh?.();
     if (Date.now() - (state.usageAt || 0) > 55000) loadUsage();
+    if (Date.now() - (state.hardwareAt || 0) > HARDWARE_CLOSED_MS - 5000) loadHardware();
     // Safety net for missed (or unavailable) terminal announcements: a regular
     // read also reads a terminal list older than a minute. The first list is
     // read by login and startup themselves; when that read failed, this tries again.
@@ -7200,7 +7630,7 @@ function showLogin() {
   $("login").hidden = false;
   if ($("plan-dialog").open) $("plan-dialog").close();
   if ($("settings-dialog").open) $("settings-dialog").close();
-  for (const id of ["usage-dialog", "filter-dialog", "terminals-dialog", "new-session-dialog", "action-sheet"]) if ($(id)?.open) $(id).close();
+  for (const id of ["usage-dialog", "hardware-dialog", "filter-dialog", "terminals-dialog", "new-session-dialog", "action-sheet"]) if ($(id)?.open) $(id).close();
   renderConnectivity();
   updateThemeColor();
   $("login-token").focus();
@@ -7331,6 +7761,7 @@ window.addEventListener("DOMContentLoaded", () => {
   $("settings").addEventListener("click", openSettings);
   $("settings-close").addEventListener("click", closeSettings);
   $("settings-done").addEventListener("click", closeSettings);
+  $("hard-reload")?.addEventListener("click", hardReload);
   $("settings-dialog").addEventListener("cancel", (event) => {
     event.preventDefault();
     closeSettings();
@@ -7352,6 +7783,8 @@ window.addEventListener("DOMContentLoaded", () => {
   // List chips and their sheets.
   $("usage").addEventListener("click", openUsage);
   $("usage-close").addEventListener("click", () => closeSheet("usage-dialog", "usage"));
+  $("hardware").addEventListener("click", openHardware);
+  $("hardware-close").addEventListener("click", () => closeSheet("hardware-dialog", "hardware"));
   $("filter-open").addEventListener("click", () => sheet("filter-dialog").open());
   $("filter-close").addEventListener("click", () => closeSheet("filter-dialog", "filter-open"));
   $("filter-done").addEventListener("click", () => closeSheet("filter-dialog", "filter-open"));
@@ -7369,6 +7802,7 @@ window.addEventListener("DOMContentLoaded", () => {
   $("new-session-close").addEventListener("click", () => closeNewSession());
   $("action-close").addEventListener("click", () => closeActionSheet());
   for (const [id, close] of [["usage-dialog", () => closeSheet("usage-dialog", "usage")],
+    ["hardware-dialog", () => closeSheet("hardware-dialog", "hardware")],
     ["filter-dialog", () => closeSheet("filter-dialog", "filter-open")],
     ["terminals-dialog", () => closeSheet("terminals-dialog", "running-terminals")],
     ["new-session-dialog", () => closeNewSession()],
@@ -7486,29 +7920,13 @@ window.addEventListener("DOMContentLoaded", () => {
       toast("클립보드에 접근할 수 없습니다.");
     }
   });
-  const keys = {
-    escape: "\x1b",
-    tab: "\t",
-    backtab: "\x1b[Z",
-    up: "\x1b[A",
-    down: "\x1b[B",
-    left: "\x1b[D",
-    right: "\x1b[C",
-    interrupt: "\x03",
-    "ctrl-j": "\n",
-    "ctrl-u": "\x15",
-    "ctrl-x": "\x18",
-    "ctrl-l": "\x0c",
-    enter: "\r",
-  };
-  for (const node of $("terminal-keys").querySelectorAll("button")) {
+  for (const node of $("terminal-keys").querySelectorAll("button[data-key]")) {
     node.addEventListener("pointerdown", (event) => event.preventDefault());
-    node.addEventListener("click", () => {
-      if (state.composing || state.draftPaste) return;
-      state.terminalScrollLines = 0;
-      renderTerminalScroll();
-      sendInput(keys[node.dataset.key]).catch(() => {});
-    });
+    node.addEventListener("click", () => pressTerminalKey(node.dataset.key));
+  }
+  for (const node of $("terminal-keys").querySelectorAll("button[data-mod]")) {
+    node.addEventListener("pointerdown", (event) => event.preventDefault());
+    node.addEventListener("click", () => toggleTerminalMod(node.dataset.mod));
   }
   $("draft-paste").addEventListener("pointerdown", prepareDraftPaste);
   $("draft-paste").addEventListener("click", () => pasteDraft(true));

@@ -1054,6 +1054,30 @@ class TmuxFixtureTest(unittest.TestCase):
         keys = received(b"\r")[before:]
         self.assertIn(keys, (b"\x1b[B\x1b[A\r", b"\x1bOB\x1bOA\r"))
 
+    def test_ctrl_b_reaches_the_cli_instead_of_the_boards_own_tmux_client(self):
+        record = Path(self.directory.name) / "prefix.bin"
+        code = ("import os,sys,tty\n"
+                "out=open(sys.argv[1],'ab',buffering=0)\n"
+                "tty.setraw(0)\n"
+                "os.write(1,b'RECORDER_READY')\n"
+                "while True:\n"
+                " data=os.read(0,1024)\n"
+                " if not data: break\n"
+                " out.write(data)\n")
+        created = self.manager.create("prefix-fixture", [sys.executable, "-u", "-c", code, str(record)],
+                                      self.directory.name, {"PATH": os.environ.get("PATH", ""), "LANG": "en_US.UTF-8"},
+                                      {"agent": "fixture", "host": "local"})
+        tid = created["id"]
+        self.wait_for(self.manager, tid, b"RECORDER_READY")
+        self.manager.write(tid, "\x02d\x02%")
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and (record.read_bytes() if record.exists() else b"") != b"\x02d\x02%":
+            time.sleep(0.05)
+        self.assertEqual(record.read_bytes(), b"\x02d\x02%")
+        self.assertTrue(self.manager.terminals[tid].alive if hasattr(self.manager.terminals[tid], "alive") else True)
+        self.assertEqual(self.tmux("list-clients", "-t", "sb-" + tid, "-F", "#{client_session}").stdout.strip(), "sb-" + tid,
+                         "the board's client is still attached")
+
     def test_empty_history_never_traps_input_in_copy_mode(self):
         created = self.create()
         tid = created["id"]

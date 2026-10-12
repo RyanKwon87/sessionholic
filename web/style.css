@@ -108,6 +108,9 @@
   --fs-sub: 0.8125rem;
   --fs-cap: 0.75rem;
   --nav-h: 52px;
+  /* The top safe area. An iPad home-screen app (theme-init.js marks it) keeps room for
+     iPadOS's window controls, which no safe area reports in a narrowed window. */
+  --top-inset: env(safe-area-inset-top);
 
   --detail-pad: max(28px, calc((100% - 820px) / 2));
   --sheet-pad: 24px;
@@ -328,6 +331,10 @@
   --chip-bg: #1c1c1e;
   --chevron-select: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='14' viewBox='0 0 10 14'%3E%3Cpath d='M2 5l3-3 3 3M2 9l3 3 3-3' fill='none' stroke='%23aeaeb2' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
   color-scheme: dark;
+}
+
+:root[data-ipad-app] {
+  --top-inset: max(env(safe-area-inset-top), 36px);
 }
 
 /* 2. Base ---------------------------------------------------------------- */
@@ -568,7 +575,7 @@ select:disabled {
   min-height: var(--app-height, 100dvh);
   display: grid;
   place-items: center;
-  padding: max(24px, env(safe-area-inset-top)) 20px
+  padding: max(24px, var(--top-inset)) 20px
     max(24px, env(safe-area-inset-bottom));
   background: var(--bg);
 }
@@ -650,7 +657,7 @@ select:disabled {
   flex-direction: column;
   height: 100dvh;
   height: var(--app-height, 100dvh);
-  padding-top: env(safe-area-inset-top);
+  padding-top: var(--top-inset);
   background: var(--bg);
 }
 .top {
@@ -2250,7 +2257,7 @@ select:disabled {
   flex-direction: column;
   height: 100dvh;
   height: var(--app-height, 100dvh);
-  padding-top: env(safe-area-inset-top);
+  padding-top: var(--top-inset);
   padding-left: env(safe-area-inset-left);
   padding-right: env(safe-area-inset-right);
   overflow: hidden;
@@ -2545,13 +2552,13 @@ select:disabled {
    and a tall Enter, all within one thumb's reach. */
 .terminal-keys {
   display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr)) repeat(3, minmax(0, 1fr)) minmax(0, 1.3fr);
+  grid-template-columns: minmax(0, 1fr) repeat(4, minmax(0, 1fr)) repeat(3, minmax(0, 1fr)) minmax(0, 1.3fr);
   grid-template-rows: repeat(2, 42px);
   grid-template-areas:
-    "k1 k2 k3 k4 .    up   .     enter"
-    "k5 k6 k7 k8 left down right enter";
+    "ctrl k1 k2 k3 k4 meta up   .     enter"
+    "alt  k5 k6 k7 k8 left down right enter";
   gap: 5px;
-  max-width: 560px;
+  max-width: 620px;
 }
 .terminal-keys button {
   min-width: 0;
@@ -2565,6 +2572,13 @@ select:disabled {
   font-size: 13px;
   touch-action: manipulation;
 }
+/* Held for the next key (aria-pressed), released once it is sent. */
+.terminal-keys [data-mod="ctrl"] { grid-area: ctrl; }
+.terminal-keys [data-mod="alt"] { grid-area: alt; }
+.terminal-keys [data-mod="meta"] { grid-area: meta; margin-left: 4px; }
+.terminal-keys [data-mod] { color: var(--t-label-2); }
+.terminal-keys [data-mod][aria-pressed="true"] { background: var(--accent); box-shadow: none; color: var(--on-accent); }
+.terminal-keys [data-mod][hidden] { display: none; }
 .terminal-keys [data-key="escape"] { grid-area: k1; }
 .terminal-keys [data-key="tab"] { grid-area: k2; }
 .terminal-keys [data-key="backtab"] { grid-area: k3; }
@@ -4283,7 +4297,7 @@ select:disabled {
 /* Pull to refresh indicator, slid in from above the board. */
 .pull-refresh {
   position: fixed;
-  top: max(8px, env(safe-area-inset-top));
+  top: max(8px, var(--top-inset));
   left: 50%;
   z-index: 40;
   display: flex;
@@ -4750,7 +4764,7 @@ select:disabled {
     );
   }
   .sheet[data-detent="large"] {
-    height: calc(var(--app-height, 100dvh) - max(16px, env(safe-area-inset-top)) - 4px);
+    height: calc(var(--app-height, 100dvh) - max(16px, var(--top-inset)) - 4px);
     max-height: none;
   }
   .sheet-handle {
@@ -4999,8 +5013,8 @@ select:disabled {
     left: 0;
     right: 0;
     z-index: 30;
-    min-height: calc(var(--nav-h) + env(safe-area-inset-top));
-    padding-top: env(safe-area-inset-top);
+    min-height: calc(var(--nav-h) + var(--top-inset));
+    padding-top: var(--top-inset);
     border-bottom: 0.5px solid transparent;
     background: transparent;
     transition:
@@ -5069,7 +5083,7 @@ select:disabled {
   /* Notices float under the bar instead of pushing the list down. */
   body:not(.show-detail) .connection-notice {
     position: absolute;
-    top: calc(env(safe-area-inset-top) + var(--nav-h) + 6px);
+    top: calc(var(--top-inset) + var(--nav-h) + 6px);
     left: 12px;
     right: 12px;
     z-index: 25;
@@ -6440,7 +6454,7 @@ input.switch:focus-visible {
 }
 .offline-banner {
   position: fixed;
-  top: calc(env(safe-area-inset-top) + 60px);
+  top: calc(var(--top-inset) + 60px);
   left: 50%;
   z-index: 60;
   display: inline-flex;
@@ -6472,10 +6486,10 @@ input.switch:focus-visible {
 }
 @media (max-width: 700px) {
   .offline-banner {
-    top: calc(env(safe-area-inset-top) + var(--nav-h) + 6px);
+    top: calc(var(--top-inset) + var(--nav-h) + 6px);
   }
   body.show-detail .offline-banner {
-    top: calc(env(safe-area-inset-top) + 8px);
+    top: calc(var(--top-inset) + 8px);
   }
 }
 

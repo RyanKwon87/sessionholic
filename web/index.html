@@ -158,6 +158,13 @@
               aria-haspopup="dialog"
               hidden
             ><span id="usage-summary" class="usage-summary"></span></button>
+            <button
+              id="hardware"
+              class="list-chip usage-chip hardware-chip"
+              type="button"
+              aria-haspopup="dialog"
+              hidden
+            ><span id="hardware-summary" class="usage-summary"></span></button>
           </div>
           <div class="filters">
             <label class="search-wrap"
@@ -315,7 +322,10 @@
           role="group"
           aria-label="터미널 특수키"
         >
-          <button type="button" data-key="escape">Esc</button
+          <button type="button" data-mod="ctrl" aria-pressed="false" aria-label="Ctrl, 다음 키와 함께">Ctrl</button
+          ><button type="button" data-mod="alt" aria-pressed="false" aria-label="Option, 다음 키와 함께">⌥</button
+          ><button type="button" data-mod="meta" aria-pressed="false" aria-label="Command, 다음 키와 함께">⌘</button
+          ><button type="button" data-key="escape">Esc</button
           ><button type="button" data-key="tab">Tab</button
           ><button type="button" data-key="backtab" aria-label="Shift+Tab">⇧Tab</button
           ><button type="button" data-key="interrupt" aria-label="Ctrl+C 중단">^C</button
@@ -331,9 +341,11 @@
         </div>
         <div id="draft-panel" class="draft-panel">
           <label for="terminal-draft" class="sr-only">터미널에 보낼 입력</label>
+          <p id="terminal-draft-keys" class="sr-only">비어 있을 때 방향키·Tab·Esc는 터미널로 갑니다. 입력줄을 벗어나려면 글자를 입력한 뒤 Tab을 누르세요.</p>
           <div class="draft-row">
             <textarea
               id="terminal-draft"
+              aria-describedby="terminal-draft-keys"
               rows="1"
               maxlength="32000"
               placeholder="입력 후 보내기 · 한글·음성 입력 가능"
@@ -458,6 +470,14 @@
           <button id="push-toggle" class="push-button" type="button" aria-describedby="push-status" hidden>알림 켜기</button>
           <button id="push-test" class="push-button" type="button" hidden>테스트 알림</button>
         </div>
+        <p id="reload-label" class="theme-label settings-section">앱 새로 고침</p>
+        <p id="reload-help" class="plan-preserve">
+          화면이 깨지거나 예전 화면이 남아 있으면 이 기기에 저장된 보드 화면을
+          지우고 다시 불러옵니다. 대화·설정·알림은 그대로입니다.
+        </p>
+        <div class="push-actions">
+          <button id="hard-reload" class="push-button" type="button" aria-describedby="reload-help">캐시 지우고 새로고침</button>
+        </div>
         <button id="settings-lock" class="settings-lock" type="button">보드 잠그기</button>
       </div>
       <div class="dialog-actions">
@@ -473,6 +493,17 @@
       <h2 id="usage-title">남은 사용량</h2>
       <div class="dialog-body">
         <div id="usage-body" class="usage-body"></div>
+      </div>
+    </dialog>
+    <dialog id="hardware-dialog" class="plan-dialog sheet" aria-labelledby="hardware-title">
+      <div class="sheet-handle" aria-hidden="true"></div>
+      <div class="dialog-top">
+        <p class="eyebrow">기기</p>
+        <button id="hardware-close" class="icon-button" type="button" aria-label="기기 상태 닫기">×</button>
+      </div>
+      <h2 id="hardware-title">기기 상태</h2>
+      <div class="dialog-body">
+        <div id="hardware-body" class="usage-body hardware-body"></div>
       </div>
     </dialog>
     <dialog id="filter-dialog" class="plan-dialog sheet" aria-labelledby="filter-title">

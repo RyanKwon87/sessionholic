@@ -612,6 +612,52 @@ class TmuxFixtureTest(unittest.TestCase):
                 return after
         self.fail("synthetic fixture terminal output did not arrive")
 
+    def connection(self, key, mode, idle=True, **metadata):
+        created = self.manager.create(key, [sys.executable, "-u", "-c", self.code, str(self.launch_count)],
+                                      self.directory.name, {"PATH": os.environ.get("PATH", "")},
+                                      {"agent": "fixture", "host": "local", "mode": mode, **metadata})
+        if idle:
+            self.manager.terminals[created["id"]].touched = time.monotonic() - terminal.RELEASE_IDLE - 1
+        return created
+
+    def test_an_idle_connection_to_a_session_is_released_for_a_new_terminal(self):
+        old = self.connection("old", "attach")
+        changes = []
+        self.manager.add_listener(lambda: changes.append(1))
+        with self.manager.reserve("next"):
+            new = self.connection("next", "attach", idle=False)
+        rows = {row["id"]: row for row in self.manager.list()}
+        self.assertEqual((rows[old["id"]]["closed"], rows[old["id"]]["closedReason"]), (True, "released"))
+        self.assertFalse(rows[old["id"]]["alive"])
+        self.assertTrue(rows[new["id"]]["alive"])
+        self.assertTrue(changes)
+        # The tombstone survives a gateway restart and the session's next connection uses a new key.
+        self.manager.close()
+        reloaded = terminal.TerminalManager(state_dir=self.directory.name, socket_name=self.socket, max_terminals=1)
+        self.managers.append(reloaded)
+        self.assertEqual({row["key"]: row["closedReason"] for row in reloaded.list()}, {"old": "released", "next": None})
+
+    def test_recent_owned_or_launching_terminals_are_never_released(self):
+        self.manager.max_terminals = 4
+        recent = self.connection("recent", "attach", idle=False)
+        owned = self.connection("owned", "new-session")
+        handoff = self.connection("handoff", "attach", launchMode="handoff")
+        with self.manager.reserve("launching"):
+            self.connection("launching", "attach")
+            with self.assertRaisesRegex(RuntimeError, "열린 터미널 4개가 가득 찼습니다"):
+                with self.manager.reserve("next"):
+                    self.fail("a terminal that must stay open was released")
+        alive = {row["key"]: row["alive"] for row in self.manager.list()}
+        self.assertEqual(alive, {"recent": True, "owned": True, "handoff": True, "launching": True})
+
+    def test_a_browser_read_keeps_a_connection_from_being_released(self):
+        old = self.connection("old", "attach")
+        self.manager.read(old["id"], 0, 0)
+        with self.assertRaisesRegex(RuntimeError, "가득"):
+            with self.manager.reserve("next"):
+                self.fail("a connection a browser just read was released")
+        self.assertTrue(next(row for row in self.manager.list() if row["id"] == old["id"])["alive"])
+
     def test_a_terminal_records_its_native_session_once_and_keeps_it(self):
         created = self.create()
         changes = []

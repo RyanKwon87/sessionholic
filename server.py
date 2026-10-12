@@ -2384,7 +2384,7 @@ class BoardHTTPServer(ThreadingHTTPServer):
         super().server_close()
 
 
-def make_server(bind, port, board, token, terminals=None, workflow=None, state_dir=STATE_DIR, max_terminals=4,
+def make_server(bind, port, board, token, terminals=None, workflow=None, state_dir=STATE_DIR, max_terminals=None,
                 tailscale_user=None, usage=None, automatic_work=False):
     """`usage` (usage.UsageMeter) serves /api/usage; without it the routes stay 404."""
     if bind not in ("127.0.0.1", "::1"):
@@ -2392,7 +2392,7 @@ def make_server(bind, port, board, token, terminals=None, workflow=None, state_d
     if tailscale_user is not None and (not isinstance(tailscale_user, str) or not tailscale_user
             or len(tailscale_user) > 4096 or any(char.isspace() or ord(char) < 32 for char in tailscale_user)):
         raise ValueError("허용할 Tailscale 로그인 하나가 필요합니다.")
-    from terminal import TerminalManager
+    from terminal import MAX_TERMINALS, TerminalManager
     server = BoardHTTPServer((bind, port), Handler)
     server.daemon_threads = True
     server.board, server.token, server.tailscale_user = board, token, tailscale_user
@@ -2409,7 +2409,7 @@ def make_server(bind, port, board, token, terminals=None, workflow=None, state_d
     server.upload_gate = threading.BoundedSemaphore(2)
     server.assets = StaticAssets(WEB)
     try:
-        server.terminals = terminals if terminals is not None else TerminalManager(state_dir=Path(state_dir) / "terminals", max_terminals=max_terminals)
+        server.terminals = terminals if terminals is not None else TerminalManager(state_dir=Path(state_dir) / "terminals", max_terminals=max_terminals or MAX_TERMINALS)
         from terminal_input import TerminalInputs
         server.terminal_inputs = TerminalInputs(state_dir)
     except BaseException:
@@ -2442,12 +2442,13 @@ def issue_login_link(httpd, ttl=ONCE_TTL):
 
 
 def main(argv=None):
+    from terminal import MAX_TERMINALS
     parser = argparse.ArgumentParser(description=BRAND["title"])
     parser.add_argument("--port", type=int, default=8790)
     parser.add_argument("--bind", default="127.0.0.1")
     parser.add_argument("--hosts", default=str(DEFAULT_HOSTS))
     parser.add_argument("--interval", type=int, default=60, help="보이는 화면의 기기별 최소 수집 간격(초)")
-    parser.add_argument("--max-terminals", type=int, choices=range(1, 5), default=4, help="동시에 유지할 보드 터미널 수(1~4)")
+    parser.add_argument("--max-terminals", type=int, choices=range(1, 33), default=MAX_TERMINALS, help="동시에 유지할 보드 터미널 수(1~32)")
     parser.add_argument("--local-only", action="store_true", help="이 기기만 수집·검증")
     parser.add_argument("--state-dir", type=Path, default=STATE_DIR)
     parser.add_argument("--no-live", action="store_true",

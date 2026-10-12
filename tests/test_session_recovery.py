@@ -106,7 +106,8 @@ class SessionRecoveryTest(unittest.TestCase):
 
     def test_only_explicit_terminal_close_is_recovery_block(self):
         native = {**REF, 'cwd': SOURCE['cwd']}
-        for reason, blocked in ((None, False), ('connection_ended', False), ('user', True)):
+        # "released": the board freed an idle connection for another terminal.
+        for reason, blocked in ((None, False), ('connection_ended', False), ('released', False), ('user', True)):
             with self.subTest(reason=reason):
                 self.terms.records = [{'id': 'fixture', 'closed': True, 'alive': False,
                                        'closedReason': reason, 'nativeSource': native}]

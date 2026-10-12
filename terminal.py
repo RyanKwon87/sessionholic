@@ -39,7 +39,10 @@ ID = re.compile(r"^[0-9a-f]{32}$")
 SOCKET = re.compile(r"^[A-Za-z0-9_-]{1,60}$")
 BUFFER_LIMIT = 1024 * 1024
 INPUT_LIMIT = 32 * 1024
-MAX_TERMINALS = 4
+MAX_TERMINALS = 16
+# A board connection to an existing session left unused this long may be released
+# for a new terminal; the session itself keeps running.
+RELEASE_IDLE = 60
 HISTORY_LIMIT = 20000
 SCROLL_LIMIT = 200
 WHEEL_LIMIT = 40
@@ -139,6 +142,8 @@ class _Terminal:
         # Set when a new attach client starts: the first input then also leaves any
         # copy-mode, whose in-memory flag a gateway restart would have lost.
         self.attached_fresh = False
+        # Last read, input or resize from a browser (monotonic); 0 until one is seen.
+        self.touched = 0.0
 
     def append(self, data):
         with self.condition:
@@ -280,7 +285,7 @@ class TerminalManager:
                     or row.get("name") != "sb-" + row["id"] or not isinstance(row.get("key"), str)
                     or not isinstance(row.get("metadata"), dict)
                     or ("closed" in row and not isinstance(row["closed"], bool))
-                    or ("closedReason" in row and row["closedReason"] not in ("user", "connection_ended"))
+                    or ("closedReason" in row and row["closedReason"] not in ("user", "connection_ended", "released"))
                     or ("socket" in row and (not isinstance(row["socket"], str)
                                              or not SOCKET.fullmatch(row["socket"])))):
                 raise RuntimeError("터미널 상태 파일 형식이 올바르지 않습니다.")
@@ -311,15 +316,22 @@ class TerminalManager:
             raise KeyError("터미널을 찾을 수 없습니다.")
         return terminal
 
+    def _use(self, terminal_id):
+        """A terminal a browser reads, types into or resizes; marks it recently used."""
+        terminal = self._get(terminal_id)
+        terminal.touched = time.monotonic()
+        return terminal
+
     @contextmanager
     def reserve(self, key):
         """Reserve capacity before a launch can submit its first model input."""
         with self.lock:
             if self._closed:
                 raise RuntimeError("터미널 연결 관리자가 종료되었습니다.")
-            live = sum(self._exists(t) for t in self.terminals.values())
-            if key in self.reservations or live + len(self.reservations) >= self.max_terminals:
-                raise RuntimeError("열린 터미널이 가득 찼습니다. 연결 하나를 정리한 뒤 다시 실행해 주세요.")
+            if key in self.reservations or not self._make_room(len(self.reservations), key):
+                live = sum(self._exists(t) for t in self.terminals.values())
+                raise RuntimeError("열린 터미널 %d개가 가득 찼습니다. 세션 목록의 '터미널'에서 쓰지 않는 "
+                                   "터미널을 닫은 뒤 다시 실행해 주세요." % live)
             self.reservations.add(key)
         try:
             yield
@@ -355,14 +367,15 @@ class TerminalManager:
                         raise RuntimeError("이 터미널의 CLI가 종료되었습니다. 새 작업으로 시작하세요.")
                     self._adopt(terminal)
                     self._attach(terminal)
+                    terminal.touched = time.monotonic()
                     return self._public(terminal)
-            live = sum(self._exists(t) for t in self.terminals.values())
-            if live + len(self.reservations - {key}) >= self.max_terminals:
+            if not self._make_room(len(self.reservations - {key}), key):
                 raise RuntimeError("열 수 있는 터미널 수를 초과했습니다.")
             terminal_id = secrets.token_hex(16)
             record = {"id": terminal_id, "name": "sb-" + terminal_id, "key": key,
                       "metadata": dict(metadata), "socket": self.socket_name}
             terminal = _Terminal(record, self.buffer_limit)
+            terminal.touched = time.monotonic()
             launch_path = self.state_dir / (terminal_id + ".launch.json")
             launch_env = dict(env)
             launch_env.setdefault("TERM", "xterm-256color")
@@ -491,7 +504,7 @@ class TerminalManager:
         if epoch is not None and (not isinstance(epoch, str) or not ID.fullmatch(epoch)):
             raise ValueError("출력 식별자가 올바르지 않습니다.")
         with self.lock:
-            terminal = self._get(terminal_id)
+            terminal = self._use(terminal_id)
             self._attach(terminal)
         return terminal.read(after, wait, epoch)
 
@@ -502,7 +515,7 @@ class TerminalManager:
         if len(data) > INPUT_LIMIT:
             raise ValueError("입력은 32KiB 이하여야 합니다.")
         with self.lock:
-            terminal = self._get(terminal_id)
+            terminal = self._use(terminal_id)
             self._attach(terminal)
         self._leave_scroll(terminal)
         with terminal.io_lock:
@@ -560,7 +573,7 @@ class TerminalManager:
         if isinstance(lines, bool) or not isinstance(lines, int) or not 0 < abs(lines) <= SCROLL_LIMIT:
             raise ValueError("스크롤 범위가 올바르지 않습니다.")
         with self.lock:
-            terminal = self._get(terminal_id)
+            terminal = self._use(terminal_id)
         if terminal.record.get("closed", False) or not terminal.alive:
             raise RuntimeError("터미널 연결이 종료되었습니다.")
         pane = self._pane(terminal)
@@ -608,7 +621,7 @@ class TerminalManager:
     def capture(self, terminal_id):
         """Visible screen text of the live pane (no history, no escape sequences)."""
         with self.lock:
-            terminal = self._get(terminal_id)
+            terminal = self._use(terminal_id)
         if terminal.record.get("closed", False) or not terminal.alive:
             raise RuntimeError("터미널 연결이 종료되었습니다.")
         try:
@@ -626,7 +639,7 @@ class TerminalManager:
                 or any(not isinstance(key, str) or key not in KEY_NAMES for key in keys)):
             raise ValueError("보낼 수 없는 키 입력입니다.")
         with self.lock:
-            terminal = self._get(terminal_id)
+            terminal = self._use(terminal_id)
         if terminal.record.get("closed", False) or not terminal.alive:
             raise RuntimeError("터미널 연결이 종료되었습니다.")
         self._leave_scroll(terminal)
@@ -638,7 +651,7 @@ class TerminalManager:
 
     def scroll_end(self, terminal_id):
         with self.lock:
-            terminal = self._get(terminal_id)
+            terminal = self._use(terminal_id)
         self._leave_scroll(terminal)
         return {"ok": True}
 
@@ -650,7 +663,7 @@ class TerminalManager:
         if len(data) > INPUT_LIMIT:
             raise ValueError("입력은 32KiB 이하여야 합니다.")
         with self.lock:
-            terminal = self._get(terminal_id)
+            terminal = self._use(terminal_id)
             self._attach(terminal)
         if terminal.record.get("closed", False) or not terminal.alive:
             raise InputNotSent("터미널 연결이 종료되었습니다.")
@@ -676,7 +689,7 @@ class TerminalManager:
                 or not isinstance(rows, int) or not 2 <= cols <= 500 or not 2 <= rows <= 300):
             raise ValueError("터미널 크기가 올바르지 않습니다.")
         with self.lock:
-            terminal = self._get(terminal_id)
+            terminal = self._use(terminal_id)
             self._attach(terminal)
         with terminal.io_lock:
             if terminal.record.get("closed", False) or terminal.fd is None:
@@ -773,47 +786,80 @@ class TerminalManager:
     def close_terminal(self, terminal_id):
         """Stop one generated tmux session; retain its key as a closed record."""
         with self.lock:
-            terminal = self._get(terminal_id)
-            with terminal.io_lock:
-                if not terminal.record.get("closed", False):
-                    if self._foreign(terminal):
-                        raise RuntimeError(self._foreign_message(terminal))
-                    unrecorded = self._unrecorded(terminal)
-                    if self._exists(terminal):
-                        done = self._run("kill-session", "-t", "=" + terminal.record["name"])
-                        if done.returncode != 0 and self._exists(terminal):
-                            raise RuntimeError("터미널을 닫지 못했습니다.")
-                    elif unrecorded:
-                        # Possibly alive on an earlier socket: like a foreign row, never tombstoned.
-                        raise RuntimeError(self._unrecorded_message())
-                    terminal.record["closed"] = True
-                    terminal.record["closedReason"] = "user"
-                    if unrecorded:
-                        terminal.record["socket"] = self.socket_name
-                    try:
-                        self._save()
-                    except (ValueError, RuntimeError, OSError):
-                        terminal.record.pop("closed", None)
-                        terminal.record.pop("closedReason", None)
-                        if unrecorded:
-                            terminal.record.pop("socket", None)
-                        raise
-                with terminal.condition:
-                    terminal.alive = False
-                    terminal.condition.notify_all()
-                # Wait only for our attach client, never for the reader (which
-                # needs io_lock). Writes and resizes check the tombstone under
-                # this same lock, including requests queued before the close.
-                process = terminal.process
-                if process is not None and process.poll() is None:
-                    process.terminate()
-                    try:
-                        process.wait(timeout=2)
-                    except subprocess.TimeoutExpired:
-                        process.kill()
-                        process.wait(timeout=2)
+            self._end(self._get(terminal_id), "user")
         self._changed()
         return {"ok": True}
+
+    def _end(self, terminal, reason):
+        """Kill one generated tmux session and save its tombstone; the caller holds self.lock."""
+        with terminal.io_lock:
+            if not terminal.record.get("closed", False):
+                if self._foreign(terminal):
+                    raise RuntimeError(self._foreign_message(terminal))
+                unrecorded = self._unrecorded(terminal)
+                if self._exists(terminal):
+                    done = self._run("kill-session", "-t", "=" + terminal.record["name"])
+                    if done.returncode != 0 and self._exists(terminal):
+                        raise RuntimeError("터미널을 닫지 못했습니다.")
+                elif unrecorded:
+                    # Possibly alive on an earlier socket: like a foreign row, never tombstoned.
+                    raise RuntimeError(self._unrecorded_message())
+                terminal.record["closed"] = True
+                terminal.record["closedReason"] = reason
+                if unrecorded:
+                    terminal.record["socket"] = self.socket_name
+                try:
+                    self._save()
+                except (ValueError, RuntimeError, OSError):
+                    terminal.record.pop("closed", None)
+                    terminal.record.pop("closedReason", None)
+                    if unrecorded:
+                        terminal.record.pop("socket", None)
+                    raise
+            with terminal.condition:
+                terminal.alive = False
+                terminal.condition.notify_all()
+            # Wait only for our attach client, never for the reader (which
+            # needs io_lock). Writes and resizes check the tombstone under
+            # this same lock, including requests queued before the close.
+            process = terminal.process
+            if process is not None and process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=2)
+
+    def _make_room(self, reserved, keep):
+        """Whether one more terminal fits, releasing idle connections to existing sessions
+        for it; the caller holds self.lock."""
+        live = sum(self._exists(t) for t in self.terminals.values())
+        while live + reserved >= self.max_terminals:
+            if not self._release_idle(keep):
+                return False
+            live -= 1
+        return True
+
+    def _release_idle(self, keep):
+        """Close the least recently used board connection to an existing session.
+
+        Only an "attach" connection is chosen: closing it stops this board's client,
+        not the session (as "연결 닫기" does), and its "released" tombstone does not
+        count as the user ending the session. A terminal that runs its own CLI, one in
+        use within RELEASE_IDLE seconds, or one being launched is never released.
+        """
+        now = time.monotonic()
+        idle = [t for t in self.terminals.values()
+                if t.record["metadata"].get("mode") == "attach"
+                and t.record["metadata"].get("launchMode") in (None, "attach")
+                and t.record["key"] != keep and t.record["key"] not in self.reservations
+                and now - t.touched >= RELEASE_IDLE and not self._unrecorded(t) and self._exists(t)]
+        if not idle:
+            return False
+        self._end(min(idle, key=lambda t: t.touched), "released")
+        self._changed()
+        return True
 
     def close(self):
         with self.lock:

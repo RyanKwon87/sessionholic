@@ -1,4 +1,5 @@
 import base64
+import io
 import json
 import os
 from pathlib import Path
@@ -10,7 +11,7 @@ import tempfile
 import threading
 import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import terminal  # noqa: E402
@@ -96,7 +97,8 @@ class ValidationTest(unittest.TestCase):
             self.assertEqual(run.call_count, 1)
 
     def test_natural_exit_tombstone_is_not_exposed_before_it_is_saved(self):
-        row = {'id': 'a'*32, 'name': 'sb-'+'a'*32, 'key': 'fixture', 'metadata': {}}
+        row = {'id': 'a'*32, 'name': 'sb-'+'a'*32, 'key': 'fixture', 'metadata': {},
+               'socket': self.manager.socket_name}
         instance = terminal._Terminal(row, 1024)
         self.manager.terminals[row['id']] = instance
         with patch.object(self.manager, '_exists', return_value=False), \
@@ -146,7 +148,8 @@ class ValidationTest(unittest.TestCase):
                   "sessionId": native["id"]}
         self.assertEqual(terminal._metadata({"nativeSource": claude})["nativeSource"], claude)
         for change in ({"extra": "forbidden"}, {"id": "../session"}, {"home": "../account"},
-                       {"host": ["local"]}, {"cwd": "relative"}, {"cwd": "/" + "a" * 4096},
+                       {"host": ["local"]}, {"cwd": "relative"}, {"cwd": "C:relative"},
+                       {"cwd": "\\work"}, {"cwd": "/" + "a" * 4096},
                        {"kind": {"nested": True}}, {"sessionId": native["id"]}, {"agent": "unknown"}):
             with self.subTest(change=change), self.assertRaises(ValueError):
                 self.manager.create("key", ["/bin/echo"], self.directory.name, {},
@@ -194,6 +197,378 @@ class ValidationTest(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "화면 설정"):
                 self.manager._configure(stream)
 
+    def fake_terminal(self):
+        row = {"id": "b" * 32, "name": "sb-" + "b" * 32, "key": "fixture", "metadata": {}}
+        stream = terminal._Terminal(row, 1024)
+        self.manager.terminals[row["id"]] = stream
+        self.addCleanup(self.manager.terminals.clear)
+        return stream
+
+    def test_new_session_sets_history_limit_in_the_same_tmux_call(self):
+        self.assertEqual(terminal.HISTORY_LIMIT, 20000)
+        with patch.object(self.manager, "_run") as run:
+            run.return_value.returncode = 1
+            with self.assertRaisesRegex(RuntimeError, "시작하지"):
+                self.manager.create("history", ["/bin/cat"], self.directory.name, {})
+        run.assert_called_once()
+        self.assertEqual(run.call_args.args[:6], ("set-option", "-g", "history-limit", "20000", ";", "new-session"))
+
+    def test_run_keeps_stdin_closed_unless_input_is_supplied(self):
+        self.manager.tmux = "/fixture/tmux"
+        with patch.object(terminal.subprocess, "run") as run:
+            self.manager._run("has-session", "-t", "=sb-fixture")
+            self.assertIs(run.call_args.kwargs["stdin"], subprocess.DEVNULL)
+            self.assertNotIn("input", run.call_args.kwargs)
+            self.manager._run("load-buffer", "-", input=b"fixture")
+            self.assertEqual(run.call_args.kwargs["input"], b"fixture")
+            self.assertNotIn("stdin", run.call_args.kwargs)
+            self.assertEqual(run.call_args.args[0][:5], ["/fixture/tmux", "-L", "sb-fixture-unused", "-f", "/dev/null"])
+
+    def test_paste_and_scroll_validate_before_tmux(self):
+        with patch.object(self.manager, "_run") as run:
+            for text in ("", "a\0b", "x" * (terminal.INPUT_LIMIT + 1), "가" * 11000, b"bytes", None):
+                with self.subTest(text=str(text)[:8]), self.assertRaises(ValueError):
+                    self.manager.paste("a" * 32, text)
+            for lines in (0, terminal.SCROLL_LIMIT + 1, -terminal.SCROLL_LIMIT - 1, True, 1.5, "5", None):
+                with self.subTest(lines=lines), self.assertRaises(ValueError):
+                    self.manager.scroll("a" * 32, lines)
+            for call in (lambda: self.manager.paste("a" * 32, "ok"), lambda: self.manager.scroll("a" * 32, 5),
+                         lambda: self.manager.scroll_end("a" * 32)):
+                with self.assertRaises(KeyError):
+                    call()
+            with self.assertRaises(ValueError):
+                self.manager.scroll("../x", 5)
+            run.assert_not_called()
+
+    def test_paste_uses_one_private_buffer_then_a_separate_enter(self):
+        stream = self.fake_terminal()
+        name = stream.record["name"]
+        ok, failed = subprocess.CompletedProcess([], 0), subprocess.CompletedProcess([], 1)
+        with patch.object(self.manager, "_attach"), patch.object(terminal.time, "sleep") as sleep, \
+                patch.object(self.manager, "_run", return_value=ok) as run:
+            self.assertEqual(self.manager.paste(stream.record["id"], "한글 본문\n둘째 줄"), {"ok": True})
+            self.manager.paste(stream.record["id"], "draft", submit=False)
+        first, enter, draft = run.call_args_list
+        buffer = first.args[2]
+        self.assertRegex(buffer, r"^sh-[0-9a-f]{16}$")
+        self.assertEqual(first.args, ("load-buffer", "-b", buffer, "-", ";",
+                                      "paste-buffer", "-p", "-d", "-b", buffer, "-t", name))
+        self.assertEqual(first.kwargs, {"input": "한글 본문\n둘째 줄".encode()})
+        self.assertEqual(enter.args, ("send-keys", "-t", name, "Enter"))
+        sleep.assert_called_once_with(0.15)
+        self.assertEqual(draft.args[0], "load-buffer")
+        self.assertNotEqual(draft.args[2], buffer)
+        # tmux refused the paste: nothing reached the CLI, so no Enter either, and
+        # a buffer that load-buffer may have filled is deleted rather than left behind.
+        with patch.object(self.manager, "_attach"), patch.object(self.manager, "_run", return_value=failed) as run:
+            with self.assertRaises(terminal.InputNotSent):
+                self.manager.paste(stream.record["id"], "fixture")
+        refused, cleanup = run.call_args_list
+        self.assertEqual(refused.args[0], "load-buffer")
+        self.assertEqual(cleanup.args, ("delete-buffer", "-b", refused.args[2]))
+        # The text was pasted but Enter failed: this is not a pre-send failure.
+        with patch.object(self.manager, "_attach"), patch.object(terminal.time, "sleep"), \
+                patch.object(self.manager, "_run", side_effect=[ok, failed]):
+            with self.assertRaises(RuntimeError) as caught:
+                self.manager.paste(stream.record["id"], "fixture")
+        self.assertNotIsInstance(caught.exception, terminal.InputNotSent)
+        # A terminal shown in history first leaves copy-mode so the paste reaches the CLI.
+        stream.scrolled = True
+        with patch.object(self.manager, "_attach"), patch.object(terminal.time, "sleep"), \
+                patch.object(self.manager, "_run", return_value=ok) as run:
+            self.manager.paste(stream.record["id"], "fixture")
+        self.assertEqual(run.call_args_list[0].args, ("send-keys", "-t", name, "-X", "cancel"))
+        self.assertEqual(run.call_args_list[1].args[0], "load-buffer")
+        self.assertFalse(stream.scrolled)
+        for change in ({"alive": False}, {"closed": True}):
+            with self.subTest(change=change):
+                stream.alive = "alive" not in change
+                stream.record["closed"] = "closed" in change
+                with patch.object(self.manager, "_attach"), patch.object(self.manager, "_run") as run:
+                    with self.assertRaises(terminal.InputNotSent):
+                        self.manager.paste(stream.record["id"], "fixture")
+                run.assert_not_called()
+
+    @staticmethod
+    def pane(**values):
+        state = {"alternate": 0, "mouse": 0, "sgr": 0, "width": 120, "height": 30,
+                 "inMode": 0, "position": 0, "history": 300}
+        state.update(values)
+        return state
+
+    def test_scroll_drives_tmux_history_never_the_cli(self):
+        stream = self.fake_terminal()
+        tid, name = stream.record["id"], stream.record["name"]
+        ok, failed = subprocess.CompletedProcess([], 0), subprocess.CompletedProcess([], 1)
+        history = {"ok": True, "mode": "history"}
+        with patch.object(self.manager, "_run", return_value=ok) as run, \
+                patch.object(self.manager, "_pane") as pane:
+            # Below the live screen there is nothing to scroll to.
+            pane.side_effect = [self.pane(), self.pane()]
+            self.assertEqual(self.manager.scroll(tid, 5), {**history, "position": 0})
+            run.assert_not_called()
+            pane.side_effect = [self.pane(), self.pane(inMode=1, position=12)]
+            self.assertEqual(self.manager.scroll(tid, -12), {**history, "position": 12})
+            self.assertEqual(run.call_args.args, ("copy-mode", "-e", "-t", name, ";",
+                                                  "send-keys", "-t", name, "-X", "-N", "12", "scroll-up"))
+            self.assertTrue(stream.scrolled)
+            pane.side_effect = [self.pane(inMode=1, position=12), self.pane(inMode=1, position=5)]
+            self.assertEqual(self.manager.scroll(tid, 7), {**history, "position": 5})
+            self.assertEqual(run.call_args.args, ("send-keys", "-t", name, "-X", "-N", "7", "scroll-down"))
+            self.assertEqual(self.manager.scroll_end(tid), {"ok": True})
+            self.assertEqual(run.call_args.args, ("send-keys", "-t", name, "-X", "cancel"))
+            self.assertFalse(stream.scrolled)
+            calls = run.call_count
+            self.manager.scroll_end(tid)
+            self.assertEqual(run.call_count, calls)
+            # The live pane, not the in-memory flag, decides: a pane left in copy-mode by an
+            # earlier gateway still scrolls down, and a stale flag is cleared without keys.
+            pane.side_effect = [self.pane(inMode=1, position=3), self.pane()]
+            self.assertEqual(self.manager.scroll(tid, 3), {**history, "position": 0})
+            self.assertEqual(run.call_args.args, ("send-keys", "-t", name, "-X", "-N", "3", "scroll-down"))
+            stream.scrolled = True
+            calls = run.call_count
+            pane.side_effect = [self.pane(), self.pane()]
+            self.assertEqual(self.manager.scroll(tid, 3), {**history, "position": 0})
+            self.assertEqual(run.call_count, calls)
+            self.assertFalse(stream.scrolled)
+            # An empty history never enters copy-mode, which would only trap later input.
+            pane.side_effect = [self.pane(history=0)]
+            self.assertEqual(self.manager.scroll(tid, -3), {**history, "position": 0})
+            self.assertEqual(run.call_count, calls)
+            self.assertFalse(stream.scrolled)
+        with patch.object(self.manager, "_run", return_value=failed), \
+                patch.object(self.manager, "_pane", return_value=self.pane()):
+            with self.assertRaisesRegex(RuntimeError, "스크롤"):
+                self.manager.scroll(tid, -3)
+            self.assertFalse(stream.scrolled)
+        stream.record["closed"] = True
+        with patch.object(self.manager, "_run") as run, patch.object(self.manager, "_pane") as pane:
+            with self.assertRaises(RuntimeError):
+                self.manager.scroll(tid, -1)
+            run.assert_not_called()
+            pane.assert_not_called()
+
+    def test_full_screen_mouse_app_receives_wheel_events_instead_of_history(self):
+        stream = self.fake_terminal()
+        tid, name = stream.record["id"], stream.record["name"]
+        ok, failed = subprocess.CompletedProcess([], 0), subprocess.CompletedProcess([], 1)
+        app = {"ok": True, "mode": "app", "position": None}
+        cases = [  # lines, pane, expected one -l argument
+            (-7, self.pane(alternate=1, mouse=1, sgr=1), "\x1b[<64;60;15M" * 3),
+            (1, self.pane(alternate=1, mouse=1, sgr=1, width=81, height=25), "\x1b[<65;40;12M"),
+            (200, self.pane(alternate=1, mouse=1, sgr=1), "\x1b[<65;60;15M" * 40),
+            (-3, self.pane(alternate=1, mouse=1, width=1, height=1), "\x1b[M" + chr(96) + chr(33) + chr(33)),
+            (6, self.pane(alternate=1, mouse=1, width=600, height=40), ("\x1b[M" + chr(97) + chr(255) + chr(52)) * 2),
+        ]
+        for lines, state, expected in cases:
+            with self.subTest(lines=lines, state=state):
+                with patch.object(self.manager, "_run", return_value=ok) as run, \
+                        patch.object(self.manager, "_pane", return_value=state) as pane:
+                    self.assertEqual(self.manager.scroll(tid, lines), app)
+                self.assertEqual([call.args for call in run.call_args_list], [("send-keys", "-t", name, "-l", expected)])
+                pane.assert_called_once_with(stream)
+        # A pane stuck in copy-mode is released first so the app itself gets the wheel.
+        stream.scrolled = True
+        with patch.object(self.manager, "_run", return_value=ok) as run, \
+                patch.object(self.manager, "_pane", return_value=self.pane(alternate=1, mouse=1, sgr=1, inMode=1)):
+            self.assertEqual(self.manager.scroll(tid, -3), app)
+        self.assertEqual([call.args for call in run.call_args_list],
+                         [("send-keys", "-t", name, "-X", "cancel"), ("send-keys", "-t", name, "-l", "\x1b[<64;60;15M")])
+        self.assertFalse(stream.scrolled)
+        # The alternate screen without mouse reporting keeps the tmux history path.
+        with patch.object(self.manager, "_run", return_value=ok) as run, \
+                patch.object(self.manager, "_pane", side_effect=[self.pane(alternate=1), self.pane(inMode=1, position=3)]):
+            self.assertEqual(self.manager.scroll(tid, -3), {"ok": True, "mode": "history", "position": 3})
+        self.assertEqual(run.call_args.args[0], "copy-mode")
+        with patch.object(self.manager, "_run", return_value=failed), \
+                patch.object(self.manager, "_pane", return_value=self.pane(alternate=1, mouse=1, sgr=1)):
+            with self.assertRaisesRegex(RuntimeError, "스크롤"):
+                self.manager.scroll(tid, -3)
+
+    def test_pane_state_is_one_captured_display_query(self):
+        stream = self.fake_terminal()
+        self.manager.tmux = "/fixture/tmux"
+        with patch.object(terminal.subprocess, "run") as run:
+            run.return_value = subprocess.CompletedProcess([], 0, stdout=b"1|1|0|100|30|0||0\n")
+            self.assertEqual(self.manager._pane(stream), {"alternate": 1, "mouse": 1, "sgr": 0, "width": 100,
+                                                          "height": 30, "inMode": 0, "position": 0, "history": 0})
+            self.assertEqual(run.call_args.args[0][5:], ["display-message", "-p", "-t", stream.record["name"],
+                                                         terminal.PANE_FORMAT])
+            self.assertIs(run.call_args.kwargs["stdin"], subprocess.DEVNULL)
+            for done in (subprocess.CompletedProcess([], 1, stdout=b"1|1|0|100|30|0||0"),
+                         subprocess.CompletedProcess([], 0, stdout=b"1|1|0"),
+                         subprocess.CompletedProcess([], 0, stdout=b"x|1|0|100|30|0||0")):
+                run.return_value = done
+                with self.subTest(done=done), self.assertRaisesRegex(RuntimeError, "상태"):
+                    self.manager._pane(stream)
+            run.side_effect = subprocess.TimeoutExpired("tmux", 10)
+            with self.assertRaisesRegex(RuntimeError, "상태"):
+                self.manager._pane(stream)
+
+    def test_send_keys_presses_only_named_navigation_keys_in_one_call(self):
+        stream = self.fake_terminal()
+        tid, name = stream.record["id"], stream.record["name"]
+        ok, failed = subprocess.CompletedProcess([], 0), subprocess.CompletedProcess([], 1)
+        with patch.object(self.manager, "_run", return_value=ok) as run:
+            for keys in ([], ["Left"], ["enter"], ["Down", "C-c"], ["Enter "], "Enter", ("Up", 1),
+                         [["Up"]], ["Down"] * (terminal.KEY_LIMIT + 1), None, {"Up": 1}):
+                with self.subTest(keys=keys), self.assertRaises(ValueError):
+                    self.manager.send_keys(tid, keys)
+            with self.assertRaises(KeyError):
+                self.manager.send_keys("c" * 32, ["Enter"])
+            with self.assertRaises(ValueError):
+                self.manager.send_keys("../x", ["Enter"])
+            run.assert_not_called()
+            self.assertEqual(self.manager.send_keys(tid, ["Down", "Down", "Enter"]), {"ok": True})
+            self.assertEqual(run.call_args_list[-1].args, ("send-keys", "-t", name, "Down", "Down", "Enter"))
+            self.manager.send_keys(tid, ("Up",) * terminal.KEY_LIMIT)
+            self.assertEqual(run.call_count, 2)
+            # A terminal shown in history first leaves copy-mode so the keys reach the CLI.
+            stream.scrolled = True
+            self.manager.send_keys(tid, ["Enter"])
+            self.assertEqual([call.args for call in run.call_args_list[-2:]],
+                             [("send-keys", "-t", name, "-X", "cancel"), ("send-keys", "-t", name, "Enter")])
+            self.assertFalse(stream.scrolled)
+        with patch.object(self.manager, "_run", return_value=failed):
+            with self.assertRaises(terminal.InputNotSent):
+                self.manager.send_keys(tid, ["Enter"])
+        for change in ({"alive": False}, {"closed": True}):
+            with self.subTest(change=change):
+                stream.alive = "alive" not in change
+                stream.record["closed"] = "closed" in change
+                with patch.object(self.manager, "_run") as run:
+                    with self.assertRaises(RuntimeError):
+                        self.manager.send_keys(tid, ["Enter"])
+                run.assert_not_called()
+
+    def test_new_attach_client_and_its_first_input_leave_stale_copy_mode(self):
+        stream = self.fake_terminal()
+        tid, name = stream.record["id"], stream.record["name"]
+        cancel = ("send-keys", "-t", name, "-X", "cancel")
+        process = Mock(pid=0)
+        process.poll.return_value = None
+        # Popen is a fixture: no installed tmux is needed, only a path to name in its command.
+        with patch.object(self.manager, "tmux", "/usr/bin/false"), \
+                patch.object(self.manager, "_exists", return_value=True), patch.object(self.manager, "_configure"), \
+                patch.object(self.manager, "_run", side_effect=RuntimeError("fixture tmux")) as run, \
+                patch.object(terminal.subprocess, "Popen", return_value=process), \
+                patch.object(terminal.threading, "Thread") as thread:
+            self.manager._attach(stream)
+        self.addCleanup(os.close, stream.fd)
+        # The cancel result is ignored: outside copy-mode tmux reports "not in a mode".
+        self.assertEqual([call.args for call in run.call_args_list], [cancel])
+        thread.return_value.start.assert_called_once()
+        self.assertTrue(stream.attached_fresh)
+        ok = subprocess.CompletedProcess([], 0)
+        with patch.object(self.manager, "_run", return_value=ok) as run:
+            self.manager.send_keys(tid, ["Enter"])
+            self.manager.send_keys(tid, ["Down"])
+            # A running attach client is reused, so nothing is cancelled again.
+            self.manager._attach(stream)
+        self.assertEqual([call.args for call in run.call_args_list],
+                         [cancel, ("send-keys", "-t", name, "Enter"), ("send-keys", "-t", name, "Down")])
+        self.assertFalse(stream.attached_fresh)
+
+
+class SocketRecordTest(unittest.TestCase):
+    """A board started on another tmux socket must never tombstone live sessions (R1)."""
+
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.state = Path(self.directory.name)
+        self.managers = []
+
+    def tearDown(self):
+        for manager in self.managers:
+            manager.close()
+        self.directory.cleanup()
+
+    def rows(self, **extra):
+        return [{"id": char * 32, "name": "sb-" + char * 32, "key": "fixture-" + char, "metadata": {}, **extra}
+                for char in "ab"]
+
+    def manager(self, socket="sb-fixture-current"):
+        # tmux is a program that always fails: no session exists on this socket.
+        manager = terminal.TerminalManager(state_dir=self.state, socket_name=socket, tmux="/usr/bin/false")
+        self.managers.append(manager)
+        return manager
+
+    def saved(self):
+        return json.loads((self.state / "sessions.json").read_text())
+
+    def test_default_socket_is_the_instance_name(self):
+        manager = terminal.TerminalManager(state_dir=self.state, tmux="/usr/bin/false")
+        self.managers.append(manager)
+        self.assertEqual(manager.socket_name, terminal.DEFAULT_SOCKET)
+        self.assertEqual(terminal.DEFAULT_SOCKET, terminal.instance.current()["names"]["tmuxSocket"])
+
+    def test_rows_saved_without_a_socket_are_neither_given_this_socket_nor_closed_when_not_found(self):
+        # M3: the first start after sockets were recorded may run on a new socket name while
+        # these rows still live on the old one; not finding them here proves nothing.
+        (self.state / "sessions.json").write_text(json.dumps(self.rows()))
+        before = (self.state / "sessions.json").read_bytes()
+        manager = self.manager()
+        self.assertEqual((self.state / "sessions.json").read_bytes(), before, "nothing is written at load")
+        listed = manager.list()
+        manager.list()
+        self.assertEqual([(row["alive"], row["closed"]) for row in listed], [(False, False)] * 2)
+        self.assertEqual((self.state / "sessions.json").read_bytes(), before)
+        self.assertTrue(all("socket" not in row and "closed" not in row for row in self.saved()))
+        # An explicit close or reopen cannot tombstone it either.
+        with self.assertRaisesRegex(RuntimeError, "소켓 기록 없이"):
+            manager.close_terminal("a" * 32)
+        with self.assertRaisesRegex(RuntimeError, "소켓 기록 없이"):
+            manager.create("fixture-a", ["/bin/echo"], self.directory.name, {})
+        self.assertEqual((self.state / "sessions.json").read_bytes(), before)
+        # Found on this socket, the row joins it (and is judged like any other from then on).
+        with patch.object(manager, "_exists", side_effect=lambda t: t.record["id"] == "a" * 32):
+            listed = manager.list()
+        self.assertEqual([(row["alive"], row["closed"]) for row in listed], [(True, False), (False, False)])
+        self.assertEqual([row.get("socket") for row in self.saved()], ["sb-fixture-current", None])
+        self.assertTrue(all("closed" not in row for row in self.saved()))
+        # A failed save leaves the row unrecorded.
+        with patch.object(manager, "_exists", return_value=True), \
+                patch.object(manager, "_save", side_effect=OSError("fixture full disk")):
+            with self.assertRaises(OSError):
+                manager.list()
+        self.assertNotIn("socket", manager.terminals["b" * 32].record)
+
+    def test_rows_of_another_socket_are_not_closed_by_listing_closing_or_reopening(self):
+        (self.state / "sessions.json").write_text(json.dumps(self.rows(socket="sb-fixture-old")))
+        before = (self.state / "sessions.json").read_bytes()
+        manager = self.manager()
+        with patch("sys.stderr", new_callable=io.StringIO) as log:
+            listed = manager.list()
+            manager.list()
+        self.assertEqual([(row["alive"], row["closed"]) for row in listed], [(False, False)] * 2)
+        self.assertEqual((self.state / "sessions.json").read_bytes(), before)
+        warnings = log.getvalue().splitlines()
+        self.assertEqual(len(warnings), 2, "one warning per terminal, not per listing")
+        self.assertIn("sb-fixture-old", warnings[0])
+        with self.assertRaisesRegex(RuntimeError, "다른 tmux 소켓"):
+            manager.close_terminal("a" * 32)
+        with self.assertRaisesRegex(RuntimeError, "다른 tmux 소켓"):
+            manager.create("fixture-a", ["/bin/echo"], self.directory.name, {})
+        self.assertEqual((self.state / "sessions.json").read_bytes(), before)
+        # Back on the recorded socket, the same rows are judged normally again.
+        manager.close()
+        self.managers.remove(manager)
+        again = self.manager("sb-fixture-old")
+        self.assertEqual([row["closed"] for row in again.list()], [True, True])
+
+    def test_rows_of_the_current_socket_that_ended_are_still_closed(self):
+        (self.state / "sessions.json").write_text(json.dumps(self.rows(socket="sb-fixture-current")))
+        manager = self.manager()
+        self.assertEqual([row["closed"] for row in manager.list()], [True, True])
+        self.assertEqual([row["closed"] for row in self.saved()], [True, True])
+
+    def test_invalid_socket_records_are_rejected(self):
+        for value in (5, "", "bad socket", "../x"):
+            (self.state / "sessions.json").write_text(json.dumps(self.rows(socket=value)))
+            with self.assertRaisesRegex(RuntimeError, "상태 파일 형식"):
+                self.manager()
+
 
 @unittest.skipUnless(shutil.which("tmux"), "tmux fixture requires installed tmux")
 class TmuxFixtureTest(unittest.TestCase):
@@ -238,6 +613,151 @@ class TmuxFixtureTest(unittest.TestCase):
             if expected in collected:
                 return after
         self.fail("synthetic fixture terminal output did not arrive")
+
+    def connection(self, key, mode, idle=True, **metadata):
+        created = self.manager.create(key, [sys.executable, "-u", "-c", self.code, str(self.launch_count)],
+                                      self.directory.name, {"PATH": os.environ.get("PATH", "")},
+                                      {"agent": "fixture", "host": "local", "mode": mode, **metadata})
+        if idle:
+            self.manager.terminals[created["id"]].touched = time.monotonic() - terminal.RELEASE_IDLE - 1
+        return created
+
+    def test_an_idle_connection_to_a_session_is_released_for_a_new_terminal(self):
+        old = self.connection("old", "attach")
+        changes = []
+        self.manager.add_listener(lambda: changes.append(1))
+        with self.manager.reserve("next"):
+            new = self.connection("next", "attach", idle=False)
+        rows = {row["id"]: row for row in self.manager.list()}
+        self.assertEqual((rows[old["id"]]["closed"], rows[old["id"]]["closedReason"]), (True, "released"))
+        self.assertFalse(rows[old["id"]]["alive"])
+        self.assertTrue(rows[new["id"]]["alive"])
+        self.assertTrue(changes)
+        # The tombstone survives a gateway restart and the session's next connection uses a new key.
+        self.manager.close()
+        reloaded = terminal.TerminalManager(state_dir=self.directory.name, socket_name=self.socket, max_terminals=1)
+        self.managers.append(reloaded)
+        self.assertEqual({row["key"]: row["closedReason"] for row in reloaded.list()}, {"old": "released", "next": None})
+
+    def test_recent_owned_or_launching_terminals_are_never_released(self):
+        self.manager.max_terminals = 4
+        recent = self.connection("recent", "attach", idle=False)
+        owned = self.connection("owned", "new-session")
+        handoff = self.connection("handoff", "attach", launchMode="handoff")
+        with self.manager.reserve("launching"):
+            self.connection("launching", "attach")
+            with self.assertRaisesRegex(RuntimeError, "열린 터미널 4개가 가득 찼습니다"):
+                with self.manager.reserve("next"):
+                    self.fail("a terminal that must stay open was released")
+        alive = {row["key"]: row["alive"] for row in self.manager.list()}
+        self.assertEqual(alive, {"recent": True, "owned": True, "handoff": True, "launching": True})
+
+    def test_a_connection_loaded_after_a_restart_is_not_released_at_once(self):
+        self.connection("old", "attach")
+        self.manager.close()
+        self.manager = terminal.TerminalManager(state_dir=self.directory.name, socket_name=self.socket, max_terminals=1)
+        self.managers.append(self.manager)
+        with self.assertRaisesRegex(RuntimeError, "가득"):
+            with self.manager.reserve("next"):
+                self.fail("a connection loaded after a restart was released before its browser read again")
+
+    def test_a_connection_unused_for_ten_minutes_closes_even_with_room(self):
+        self.manager.max_terminals = 5
+        old = self.connection("old", "attach", agent="claude")
+        self.manager.terminals[old["id"]].touched = time.monotonic() - terminal.CLOSE_IDLE - 1
+        codex = self.connection("codex", "attach", agent="codex")
+        self.manager.terminals[codex["id"]].touched = time.monotonic() - terminal.CLOSE_IDLE - 1
+        recent = self.connection("recent", "attach", agent="claude")
+        owned = self.connection("owned", "new-session")
+        self.manager.terminals[owned["id"]].touched = time.monotonic() - terminal.CLOSE_IDLE - 1
+        changes = []
+        self.manager.add_listener(lambda: changes.append(1))
+        rows = {row["key"]: row for row in self.manager.list()}
+        self.assertEqual((rows["old"]["alive"], rows["old"]["closedReason"]), (False, "released"))
+        self.assertTrue(rows["recent"]["alive"])
+        self.assertTrue(rows["owned"]["alive"], "a terminal running its own CLI never closes by itself")
+        self.assertTrue(rows["codex"]["alive"], "a Codex connection closes only when room is needed")
+        self.assertTrue(changes)
+        self.assertIsNotNone(recent)
+
+    def test_a_new_session_terminal_records_what_it_runs_and_announces_only_a_change(self):
+        self.manager.max_terminals = 4
+        launched = self.connection("launched", "new-session", idle=False)
+        attached = self.connection("attached", "attach", idle=False)
+        changes = []
+        self.manager.add_listener(lambda: changes.append(1))
+        self.assertTrue(self.manager.set_program(launched["id"], {"program": "claude-agents", "cwd": "/Users/example/project"}))
+        self.assertEqual(len(changes), 1)
+        self.assertTrue(self.manager.set_program(launched["id"], {"program": "claude-agents", "cwd": "/Users/example/project"}))
+        self.assertEqual(len(changes), 1, "the same program read again is saved without an announcement")
+        row = next(item for item in self.manager.list() if item["key"] == "launched")
+        self.assertEqual((row["program"], row["programCwd"]), ("claude-agents", "/Users/example/project"))
+        self.assertIsInstance(row["programAt"], int)
+        self.assertFalse(self.manager.set_program(attached["id"], {"program": "codex"}))
+        self.manager.set_program(launched["id"], {"program": "codex", "cwd": "relative"})
+        self.assertIsNone(next(item for item in self.manager.list() if item["key"] == "launched")["programCwd"])
+        with self.assertRaises(ValueError):
+            self.manager.set_program(launched["id"], {"program": "rm -rf"})
+
+    def test_a_browser_read_keeps_a_connection_from_being_released(self):
+        old = self.connection("old", "attach")
+        self.manager.read(old["id"], 0, 0)
+        with self.assertRaisesRegex(RuntimeError, "가득"):
+            with self.manager.reserve("next"):
+                self.fail("a connection a browser just read was released")
+        self.assertTrue(next(row for row in self.manager.list() if row["id"] == old["id"])["alive"])
+
+    def test_a_terminal_records_its_native_session_once_and_keeps_it(self):
+        created = self.create()
+        changes = []
+        self.manager.add_listener(lambda: changes.append(1))
+        native = {"host": "local", "agent": "codex", "id": "019a0000-0000-7000-8000-000000000001",
+                  "home": ".codex", "cwd": "/tmp/work"}
+        with self.assertRaises(ValueError):
+            self.manager.link_native(created["id"], {**native, "id": "not-a-uuid"})
+        self.assertTrue(self.manager.link_native(created["id"], native))
+        self.assertFalse(self.manager.link_native(created["id"], {**native, "id": native["id"][:-1] + "2"}))
+        self.assertEqual(changes, [1])
+        listed = next(row for row in self.manager.list() if row["id"] == created["id"])
+        self.assertEqual(listed["nativeSource"], native)
+        self.manager.close()
+        replacement = terminal.TerminalManager(state_dir=self.directory.name, socket_name=self.socket)
+        self.managers.append(replacement)
+        self.assertEqual(next(row for row in replacement.list() if row["id"] == created["id"])["nativeSource"], native)
+
+    def test_windows_native_cwd_survives_terminal_creation_and_restart(self):
+        native = {"host": "windows-fixture", "agent": "codex", "id": "019a0000-0000-7000-8000-000000000001",
+                  "home": ".codex", "cwd": r"\\?\C:\Users\example\Work"}
+        created = self.manager.create("windows-metadata", [sys.executable, "-u", "-c", self.code, str(self.launch_count)],
+                                      self.directory.name, {"PATH": os.environ.get("PATH", "")},
+                                      {"host": native["host"], "nativeSource": native})
+        self.wait_for(self.manager, created["id"], b"FIXTURE_READY")
+        self.assertEqual(created["nativeSource"], native)
+        self.manager.close()
+        replacement = terminal.TerminalManager(state_dir=self.directory.name, socket_name=self.socket)
+        self.managers.append(replacement)
+        self.assertEqual(replacement.list()[0]["nativeSource"], native)
+
+    def test_a_row_saved_without_a_socket_joins_the_socket_it_is_found_on(self):
+        created = self.create()
+        self.wait_for(self.manager, created["id"], b"FIXTURE_READY")
+        self.manager.close()
+        state = Path(self.directory.name) / "sessions.json"
+        rows = json.loads(state.read_text())
+        for row in rows:
+            row.pop("socket")
+        state.write_text(json.dumps(rows))
+        # Another socket name first: not found there, nothing is recorded (M3).
+        other = terminal.TerminalManager(state_dir=self.directory.name, socket_name=self.socket + "-other")
+        self.assertEqual([(row["alive"], row["closed"]) for row in other.list()], [(False, False)])
+        other.close()
+        self.assertNotIn("socket", json.loads(state.read_text())[0])
+        replacement = terminal.TerminalManager(state_dir=self.directory.name, socket_name=self.socket)
+        self.managers.append(replacement)
+        self.assertEqual([(row["alive"], row["closed"]) for row in replacement.list()], [(True, False)])
+        self.assertEqual(json.loads(state.read_text())[0]["socket"], self.socket)
+        replacement.write(created["id"], "after-adoption\n")
+        self.wait_for(replacement, created["id"], b"FIXTURE_REPLY:after-adoption")
 
     def test_real_pty_echo_resize_reuse_detach_and_server_restart(self):
         created = self.create()
@@ -386,7 +906,9 @@ class TmuxFixtureTest(unittest.TestCase):
         saved = json.loads((Path(self.directory.name) / "sessions.json").read_text())
         closed = next(row for row in saved if row["id"] == first["id"])
         self.assertTrue(closed["closed"])
-        self.assertEqual(set(closed), {"id", "name", "key", "metadata", "closed"})
+        self.assertEqual(set(closed), {"id", "name", "key", "metadata", "closed", "closedReason", "socket"})
+        self.assertEqual(closed["closedReason"], "user")
+        self.assertEqual(closed["socket"], self.socket)
         self.assertNotIn("FIXTURE_READY", json.dumps(saved))
 
     def test_close_with_concurrent_input_does_not_deadlock_or_accept_later_input(self):
@@ -413,6 +935,134 @@ class TmuxFixtureTest(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             self.manager.write(created["id"], "after-close\n")
         self.assertFalse(self.manager.read(created["id"], wait=20)["alive"])
+
+    def tmux(self, *args):
+        return subprocess.run([shutil.which("tmux"), "-L", self.socket] + list(args),
+                              capture_output=True, text=True, timeout=5)
+
+    def mode(self, terminal_id):
+        done = self.tmux("display-message", "-p", "-t", "sb-" + terminal_id, "#{pane_in_mode} #{scroll_position}")
+        self.assertEqual(done.returncode, 0)
+        return done.stdout.strip()
+
+    def output_since(self, terminal_id, after):
+        return base64.b64decode(self.manager.read(terminal_id, after, 0)["data"])
+
+    def test_history_limit_paste_and_scroll_use_real_tmux(self):
+        code = ("import sys\n"
+                "for i in range(300): print('HISTORY-%03d' % i)\n"
+                "print('FIXTURE_READY', flush=True)\n"
+                "for line in sys.stdin:\n"
+                " print('FIXTURE_REPLY:' + line.strip(), flush=True)\n")
+        created = self.manager.create("scroll-fixture", [sys.executable, "-u", "-c", code], self.directory.name,
+                                      {"PATH": os.environ.get("PATH", ""), "LANG": "en_US.UTF-8"},
+                                      {"agent": "fixture", "host": "local"})
+        tid = created["id"]
+        cursor = self.wait_for(self.manager, tid, b"FIXTURE_READY")
+        self.assertEqual(self.tmux("show-options", "-g", "-v", "history-limit").stdout.strip(), "20000")
+        self.assertEqual(self.tmux("display-message", "-p", "-t", "sb-" + tid, "#{history_limit}").stdout.strip(), "20000")
+
+        self.assertEqual(self.manager.paste(tid, "pasted-fixture"), {"ok": True})
+        cursor = self.wait_for(self.manager, tid, b"FIXTURE_REPLY:pasted-fixture", cursor)
+        before = cursor
+        self.manager.paste(tid, "line-one\nline-two")
+        cursor = self.wait_for(self.manager, tid, b"FIXTURE_REPLY:line-two", cursor)
+        self.assertIn(b"FIXTURE_REPLY:line-one", self.output_since(tid, before))
+        # paste-buffer -d removed every private buffer.
+        buffers = self.tmux("list-buffers", "-F", "#{buffer_name}").stdout.split()
+        self.assertFalse([name for name in buffers if name.startswith("sh-")])
+        # Without submit the text waits in the CLI input until the user's own Enter.
+        before = cursor
+        self.manager.paste(tid, "draft-fixture", submit=False)
+        time.sleep(0.6)
+        self.assertNotIn(b"FIXTURE_REPLY:draft-fixture", self.output_since(tid, before))
+        self.manager.write(tid, "\n")
+        cursor = self.wait_for(self.manager, tid, b"FIXTURE_REPLY:draft-fixture", cursor)
+
+        self.assertEqual(self.manager.scroll(tid, -10), {"ok": True, "mode": "history", "position": 10})
+        self.assertEqual(self.mode(tid), "1 10")
+        self.assertEqual(self.manager.scroll(tid, 4), {"ok": True, "mode": "history", "position": 6})
+        self.assertEqual(self.mode(tid), "1 6")
+        # copy-mode -e leaves history once the view is back at the live screen.
+        self.manager.scroll(tid, 6)
+        self.assertEqual(self.mode(tid).split()[0], "0")
+        self.manager.scroll(tid, 5)
+        self.assertFalse(self.manager.terminals[tid].scrolled)
+        self.assertEqual(self.mode(tid).split()[0], "0")
+        # Typed input and pasted input both leave history first and reach the CLI.
+        self.manager.scroll(tid, -3)
+        self.assertEqual(self.mode(tid), "1 3")
+        self.manager.write(tid, "typed-after-scroll\n")
+        cursor = self.wait_for(self.manager, tid, b"FIXTURE_REPLY:typed-after-scroll", cursor)
+        self.assertEqual(self.mode(tid).split()[0], "0")
+        self.manager.scroll(tid, -3)
+        self.manager.paste(tid, "pasted-after-scroll")
+        cursor = self.wait_for(self.manager, tid, b"FIXTURE_REPLY:pasted-after-scroll", cursor)
+        self.assertEqual(self.mode(tid).split()[0], "0")
+        self.manager.scroll(tid, -5)
+        self.assertEqual(self.manager.scroll_end(tid), {"ok": True})
+        self.assertEqual(self.mode(tid).split()[0], "0")
+
+        self.manager.close_terminal(tid)
+        with self.assertRaises(terminal.InputNotSent):
+            self.manager.paste(tid, "after-close")
+        with self.assertRaises(RuntimeError):
+            self.manager.scroll(tid, -1)
+
+    def test_full_screen_mouse_app_gets_wheel_and_menu_keys_through_real_tmux(self):
+        record = Path(self.directory.name) / "received.bin"
+        # Like a remote TUI over ssh: alternate screen, mouse reporting, raw input.
+        code = ("import os,sys,tty\n"
+                "out=open(sys.argv[1],'ab',buffering=0)\n"
+                "tty.setraw(0)\n"
+                "os.write(1,b'\\x1b[?1049h\\x1b[?1000h\\x1b[?1006hRECORDER_READY')\n"
+                "while True:\n"
+                " data=os.read(0,1024)\n"
+                " if not data: break\n"
+                " out.write(data)\n")
+        created = self.manager.create("wheel-fixture", [sys.executable, "-u", "-c", code, str(record)],
+                                      self.directory.name, {"PATH": os.environ.get("PATH", ""), "LANG": "en_US.UTF-8"},
+                                      {"agent": "fixture", "host": "local"})
+        tid = created["id"]
+        self.wait_for(self.manager, tid, b"RECORDER_READY")
+        deadline = time.monotonic() + 5
+        while self.tmux("display-message", "-p", "-t", "sb-" + tid,
+                        "#{alternate_on}|#{mouse_any_flag}|#{mouse_sgr_flag}").stdout.strip() != "1|1|1":
+            if time.monotonic() > deadline:
+                self.fail("fixture app did not enable alternate screen and mouse reporting")
+            time.sleep(0.05)
+        size = self.tmux("display-message", "-p", "-t", "sb-" + tid, "#{pane_width} #{pane_height}").stdout.split()
+        x, y = max(int(size[0]) // 2, 1), max(int(size[1]) // 2, 1)
+
+        def received(expected):
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                data = record.read_bytes() if record.exists() else b""
+                if expected in data:
+                    return data
+                time.sleep(0.05)
+            self.fail("fixture app did not receive the expected input")
+
+        self.assertEqual(self.manager.scroll(tid, -3), {"ok": True, "mode": "app", "position": None})
+        wheel = ("\x1b[<64;%d;%dM" % (x, y)).encode()
+        self.assertEqual(received(wheel), wheel)
+        self.assertEqual(self.mode(tid).split()[0], "0")
+        self.manager.scroll(tid, 6)
+        self.assertEqual(received(("\x1b[<65;%d;%dM" % (x, y)).encode() * 2), wheel + ("\x1b[<65;%d;%dM" % (x, y)).encode() * 2)
+        before = len(record.read_bytes())
+        self.assertEqual(self.manager.send_keys(tid, ["Down", "Up", "Enter"]), {"ok": True})
+        keys = received(b"\r")[before:]
+        self.assertIn(keys, (b"\x1b[B\x1b[A\r", b"\x1bOB\x1bOA\r"))
+
+    def test_empty_history_never_traps_input_in_copy_mode(self):
+        created = self.create()
+        tid = created["id"]
+        self.wait_for(self.manager, tid, b"FIXTURE_READY")
+        self.assertEqual(self.manager.scroll(tid, -3), {"ok": True, "mode": "history", "position": 0})
+        self.assertEqual(self.mode(tid).split()[0], "0")
+        self.assertFalse(self.manager.terminals[tid].scrolled)
+        self.manager.write(tid, "typed-after-empty-scroll\n")
+        self.wait_for(self.manager, tid, b"FIXTURE_REPLY:typed-after-empty-scroll")
 
     def test_immediate_exit_and_missing_executable_are_reported_as_failed(self):
         for key, command in (("exit", [sys.executable, "-c", "raise SystemExit(9)"]),

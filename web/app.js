@@ -1,47 +1,125 @@
 "use strict";
 
 // Session content is rendered as text. No transcript, draft, auth or terminal data is persisted here.
+// The server names this installation in <meta name="sessionholic-instance">: titles, the
+// preference prefix, the history marker and the attachment folder. A missing or broken
+// value keeps the public name.
+const INSTANCE = (() => {
+  const names = {
+    title: "세션홀릭 - 에이전트 세션 매니저",
+    shortName: "세션홀릭",
+    storagePrefix: "sessionholic:",
+    historyKey: "sessionholic",
+    attachmentsDir: ".sessionholic-attachments",
+  };
+  const valid = {
+    title: (value) => value.length > 0 && value.length <= 256,
+    shortName: (value) => value.length > 0 && value.length <= 256,
+    storagePrefix: (value) => /^[A-Za-z0-9_.:-]{1,32}$/.test(value),
+    historyKey: (value) => /^[A-Za-z][A-Za-z0-9_]{0,31}$/.test(value),
+    attachmentsDir: (value) => /^[A-Za-z0-9._-]{1,64}$/.test(value) && value !== "." && value !== "..",
+  };
+  try {
+    const meta = document.querySelector?.('meta[name="sessionholic-instance"]');
+    const given = JSON.parse(meta?.getAttribute?.("content") || "{}");
+    if (given && typeof given === "object" && !Array.isArray(given)) {
+      for (const key of Object.keys(names)) {
+        if (typeof given[key] === "string" && valid[key](given[key])) names[key] = given[key];
+      }
+    }
+  } catch {
+    /* a broken name list keeps the public names */
+  }
+  return Object.freeze(names);
+})();
+// The list reads top to bottom as what needs you, what is running, what just
+// stopped (FINISHED_SECONDS) and everything else.
 const GROUPS = [
-  { key: "needs_input", label: "내 답이 필요한 작업", tone: "red" },
-  { key: "working", label: "진행 중", tone: "amber" },
-  { key: "rest", label: "최근 작업", tone: "gray" },
+  { key: "needs_input", label: "답 필요", tone: "red" },
+  { key: "working", label: "작업 중", tone: "amber" },
+  { key: "finished", label: "최근 끝남", tone: "green" },
+  { key: "rest", label: "이전", tone: "gray" },
 ];
+const FINISHED_SECONDS = 3 * 3600;
 const BADGES = {
   needs_input: ["답 필요", "red"],
   working: ["작업 중", "amber"],
   idle: ["열림", "gray"],
   done: ["완료", "gray"],
   closed: ["닫힘", "gray"],
+  unknown: ["실행 확인 전", "gray"],
 };
 const AGENTS = { claude: "Claude Code", codex: "Codex" };
 const POLL_MS = 60000;
 const RECENT_SECONDS = 3 * 24 * 3600;
+// Every touch decision reads its thresholds here, so tuning on a real phone
+// changes only this object (distances in CSS px, times in ms, speeds in px/ms).
+const GESTURE = Object.freeze({
+  longPressMs: 450, // a press held this long opens the menu (cards, messages)
+  pressSlopPx: 10, // drift allowed before a press becomes a drag (long press, swipe, pull)
+  tapSlopPx: 10, // a tap moves at most this far between finger down and up
+  tapMaxMs: 300, // and lifts within this time
+  scrollSettleMs: 120, // a touch this soon after the list moved only stops the scroll
+  swipeRatio: 1.7, // |dx| ≥ |dy| × this (within about 30° of horizontal) swipes a card
+  swipeRevealPx: 96, // width of the action a card swipe reveals
+  swipeActionRatio: 0.6, // a swipe past this share of the card runs its action
+  swipeFlickSpeed: 0.4, // a flick this fast opens (left) or closes (right) the swipe
+  pullTriggerPx: 64, // pull to refresh fires past this (elastic) distance
+  pullMaxPx: 110, // the indicator never travels further
+  pullResistPx: 160, // larger: the indicator follows the finger longer
+  readingHideTravelPx: 32, // scrolling this far one way hides the conversation's top and bottom bars
+  readingBottomPx: 24, // mouse layouts: this close to the end shows them again
+  jumpShowPx: 160, // the "맨 아래" button appears this far above the end
+  largeTitleCollapsePx: 36, // the list's large title folds into the bar past this
+  pinchMinFont: 10, // terminal text size range (pinch and A−/A+)
+  pinchMaxFont: 24,
+  momentumMinSpeed: 0.35, // a terminal flick at least this fast keeps scrolling
+  momentumDecay: 0.94, // share of the speed kept per 16 ms frame
+  momentumStopSpeed: 0.03, // below this the scroll stops
+  momentumMaxMs: 1600, // and it never runs longer
+  sheetDismissRatio: 0.25, // a sheet dragged down past this share of its height closes
+  sheetDismissSpeed: 0.5, // or flicked down this fast
+  sheetFarRatio: 0.5, // past this (or this fast) a large sheet closes instead of shrinking
+  sheetFarSpeed: 1.4,
+  sheetExpandPx: 48, // a medium sheet dragged up this far (or flicked) grows
+  sheetExpandSpeed: 0.5,
+});
 const INPUT_CLEANUP_NOTICE = "터미널은 닫혔지만 입력 기록 정리가 남았습니다. 목록을 새로고침해 다시 확인해 주세요.";
 const $ = (id) => document.getElementById(id);
 const prefs = {
   get(key, fallback) {
     try {
-      return JSON.parse(localStorage.getItem("sessionholic:ui:" + key)) ?? fallback;
+      return JSON.parse(localStorage.getItem(INSTANCE.storagePrefix + "ui:" + key)) ?? fallback;
     } catch {
       return fallback;
     }
   },
   set(key, value) {
     try {
-      localStorage.setItem("sessionholic:ui:" + key, JSON.stringify(value));
+      localStorage.setItem(INSTANCE.storagePrefix + "ui:" + key, JSON.stringify(value));
     } catch {
       /* optional preferences */
     }
   },
 };
+const THEMES = ["auto", "light", "dark"];
+const TEXT_SIZES = ["small", "default", "large"];
 const state = {
   snapshot: null,
   capabilities: null,
   capabilitiesRevision: null,
+  // The server process (bootId) the capabilities and their CSRF token were read from.
+  capabilitiesBoot: null,
   refreshDeadline: 0,
   csrf: "",
   selected: null,
-  filters: { host: "", agent: "", project: "", account: "" },
+  filters: { host: "", agent: "", project: "", account: "", initiator: "" },
+  // The status chips above the list ("needs_input" or "working"); tapping the
+  // active chip again clears it.
+  phaseFilter: "",
+  sessionCategory: "general",
+  selectedBotRequest: null,
+  botRequests: emptyBotRequests(),
   accountFilterRoutes: null,
   search: "",
   showOld: false,
@@ -86,19 +164,444 @@ const state = {
   lastSize: "",
   fontSize: prefs.get("fontSize", 14),
   screenReaderMode: prefs.get("screenReaderMode", false) === true,
+  directTerminalInput: prefs.get("directTerminalInput", null),
+  terminalScrollLines: 0,
+  terminalScrollPending: 0,
+  terminalScrollTimer: null,
+  terminalScrollMode: null,
+  terminalScrollInFlight: false,
+  terminalScrollGeneration: 0,
+  terminalMomentum: null,
   toastTimer: null,
   chats: new Map(),
+  // Private view state lives in this authenticated tab, never browser storage.
+  conversationViews: new Map(),
   nativeSessions: new Map(),
+  // Session key -> { phase, base }: the phase an open conversation's own read
+  // found, shown while the list still has the phase `base` it had then.
+  livePhases: new Map(),
   chatPollTimer: null,
   chatPollRun: 0,
   chatPollCount: 0,
+  // Board look (UI preference only) and phone navigation state.
+  theme: normalizeTheme(prefs.get("theme", "auto")),
+  // Board text size (UI preference only); the terminal has its own size.
+  textSize: normalizeTextSize(prefs.get("textSize", "default")),
+  detailShown: false,
+  // The conversation's top and bottom bars (phones: a tap shows or hides them).
+  chromeVisible: true,
+  tapHintShown: false,
+  tapHintTimer: null,
+  terminalOpenRun: 0,
+  assetVersions: null,
+  // Live updates (/api/events) and the snapshot version they announce.
+  events: null,
+  eventsRetryAt: 0,
+  snapshotVersion: null,
+  eventsSnapshotVersion: null,
+  // The server process those versions count in: a restart counts from 0 again.
+  serverBoot: null,
+  snapshotPending: false,
+  snapshotEventTimer: null,
+  // The board terminal list's version: the one /api/terminals last returned, the
+  // newest a live update announced, and a read asked for while one was in flight.
+  terminalsVersion: null,
+  eventsTerminalsVersion: null,
+  terminalsPending: false,
+  terminalsEventTimer: null,
+  terminalsReadAt: 0,
 };
+
+// --- UI foundation: theme, haptics, screen transitions, bottom sheet -------
+// Theme: "auto" follows the device; "light"/"dark" force the board. Only this
+// choice is stored, as a UI preference (THEMES is declared above `state`). The
+// terminal is always dark, so the browser bar turns dark while it is open.
+const THEME_COLORS = { light: "#f2f2f7", dark: "#000000", terminal: "#1c1c1e" };
+function normalizeTheme(value) {
+  return THEMES.includes(value) ? value : "auto";
+}
+function applyTheme(theme = state.theme) {
+  state.theme = normalizeTheme(theme);
+  const root = document.documentElement;
+  if (state.theme === "auto") root?.removeAttribute?.("data-theme");
+  else root?.setAttribute?.("data-theme", state.theme);
+  for (const value of THEMES) {
+    const input = $(`theme-${value}`);
+    if (input) input.checked = value === state.theme;
+  }
+  updateThemeColor();
+}
+function setTheme(theme) {
+  const next = normalizeTheme(theme);
+  if (next === state.theme) return;
+  applyTheme(next);
+  prefs.set("theme", next);
+  haptic("select");
+}
+// Board text size: "small"/"large" scale the root font size (style.css section
+// 12); "default" removes the attribute. theme-init.js applies the stored
+// choice before the first paint.
+function normalizeTextSize(value) {
+  return TEXT_SIZES.includes(value) ? value : "default";
+}
+function applyTextSize(size = state.textSize) {
+  state.textSize = normalizeTextSize(size);
+  const root = document.documentElement;
+  if (state.textSize === "default") root?.removeAttribute?.("data-text-size");
+  else root?.setAttribute?.("data-text-size", state.textSize);
+  for (const value of TEXT_SIZES) {
+    const input = $(`text-size-${value}`);
+    if (input) input.checked = value === state.textSize;
+  }
+}
+function setTextSize(size) {
+  const next = normalizeTextSize(size);
+  if (next === state.textSize) return;
+  applyTextSize(next);
+  prefs.set("textSize", next);
+  haptic("select");
+  // The composer and terminal measure text; let them follow the new size.
+  updateViewport();
+}
+function updateThemeColor() {
+  // Both media-specific metas take the forced color; "auto" restores them.
+  const forced = state.terminalVisible ? THEME_COLORS.terminal
+    : state.theme === "auto" ? null : THEME_COLORS[state.theme];
+  for (const meta of document.querySelectorAll?.('meta[name="theme-color"]') || []) {
+    if (meta.dataset && meta.dataset.original == null) meta.dataset.original = meta.getAttribute?.("content") || "";
+    const value = forced || meta.dataset?.original;
+    if (value && meta.getAttribute?.("content") !== value) meta.setAttribute?.("content", value);
+  }
+}
+
+// Haptic ticks where the platform has them (Android); silent elsewhere.
+const HAPTICS = { select: 8, success: [12, 60, 18], error: [30, 50, 30, 50, 30] };
+function haptic(kind = "select") {
+  const pattern = HAPTICS[kind];
+  if (pattern == null) return false;
+  try {
+    return globalThis.navigator?.vibrate?.(pattern) === true;
+  } catch {
+    return false;
+  }
+}
+
+function prefersReducedMotion() {
+  return !!window.matchMedia?.("(prefers-reduced-motion: reduce)")?.matches;
+}
+function phoneLayout() {
+  return !!window.matchMedia?.("(max-width: 700px)")?.matches;
+}
+// A phone held sideways: as short as the board's other short-screen rules.
+function shortLayout() {
+  return !!window.matchMedia?.("(max-height: 520px)")?.matches;
+}
+// Height an on-screen keyboard takes from the page. Safari shrinks only the
+// visual viewport; Chromium (interactive-widget=resizes-content) shrinks the
+// window too, so both are compared with the window's height before a text
+// field took the focus (a keyboard only opens for one; a window resized
+// without one, as in Stage Manager, is the new full height). Pinch zoom
+// (scale) is not a keyboard. A hardware keyboard's shortcut bar stays below
+// KEYBOARD_MIN_PX.
+const KEYBOARD_MIN_PX = 150;
+function editingText() {
+  const node = document.activeElement;
+  return !!node && (node.isContentEditable === true || /^(INPUT|TEXTAREA|SELECT)$/.test(node.tagName || ""));
+}
+function keyboardInset() {
+  const width = window.innerWidth || 0;
+  const layout = window.innerHeight || 0;
+  const viewport = window.visualViewport;
+  const visible = viewport?.height ? viewport.height * (viewport.scale || 1) : layout;
+  if (state.viewportWidth !== width || !editingText()) {
+    state.viewportWidth = width;
+    state.viewportTall = layout;
+  } else state.viewportTall = Math.max(state.viewportTall || 0, layout);
+  return Math.max(0, state.viewportTall - visible);
+}
+function keyboardOpen() {
+  return keyboardInset() > KEYBOARD_MIN_PX;
+}
+// Phone rules for a conversation's bars (scrolling hides them, a tap toggles
+// them, typing folds them, the one-time tap hint) need a touch screen that is
+// small: phone-sized, or with an on-screen keyboard that really took the
+// space. A wide touch screen (a tablet, with a hardware keyboard or none)
+// keeps its bars in place.
+function compactChrome() {
+  return touchDevice() && (phoneLayout() || shortLayout() || keyboardOpen());
+}
+// Runs `update` inside a view transition sliding in `direction` ("push",
+// "pop", "present" or "dismiss"; style.css section 11). Without support,
+// with reduced motion or in a hidden tab it runs at once. Returns the
+// transition, or null when `update` already ran.
+let navToken = 0;
+function navTransition(direction, update) {
+  const root = document.documentElement;
+  if (typeof document.startViewTransition !== "function" || prefersReducedMotion() || document.hidden || !root?.dataset) {
+    update();
+    return null;
+  }
+  const token = ++navToken;
+  root.dataset.nav = direction;
+  const clear = () => { if (token === navToken) delete root.dataset.nav; };
+  let transition;
+  try {
+    transition = document.startViewTransition(update);
+  } catch {
+    clear();
+    update();
+    return null;
+  }
+  transition?.finished?.then?.(clear, clear);
+  return transition || null;
+}
+// Phone screens: the list or one conversation. State changes at once (chat
+// reads depend on it); only the visible switch may wait for the transition.
+function setDetailShown(shown, { direction = null, focus = false } = {}) {
+  if (!shown) rememberConversationView();
+  const changed = state.detailShown !== shown;
+  state.detailShown = shown;
+  const apply = () => {
+    if (shown) document.body.classList.add("show-detail");
+    else document.body.classList.remove("show-detail");
+    // A phone lays the conversation out only now: a scroll set while it was
+    // hidden did nothing, so a pinned one is put at its end once it has a size.
+    if (shown) {
+      const list = $("messages");
+      keepAtEnd(list);
+      if (typeof requestAnimationFrame === "function") requestAnimationFrame(() => keepAtEnd(list));
+    }
+    if (focus) {
+      if (shown) focusDetailBack();
+      else restoreSelectedCardFocus();
+    }
+  };
+  const transition = direction && changed && phoneLayout() ? navTransition(direction, apply) : (apply(), null);
+  syncEvents();
+  if (chatVisible()) tickWorking();
+  else stopWorkingClock();
+  return transition;
+}
+
+// Bottom sheet for phone dialogs; wider screens keep the centered dialog.
+// Reuse: const sheet = BottomSheet.attach(dialog, { detents: ["medium", "large"], onDismiss });
+// sheet.open({ detent: "large" }); sheet.setDetent("medium"); sheet.close().
+// The <dialog> takes class "plan-dialog sheet" (a .sheet-handle is added when
+// missing); its handle, .dialog-top and title are the drag zone. A drag down,
+// a tap outside and the caller's own "cancel" handler should all dismiss via
+// onDismiss, which may refuse (e.g. while busy): the sheet then springs back.
+function sheetRelease({ offset = 0, velocity = 0, height = 0, detent = "medium", detents = ["medium", "large"] } = {}) {
+  // offset: px dragged (down is positive); velocity: px/ms at release.
+  const size = Math.max(1, height);
+  if (offset > 0) {
+    const dismiss = offset > size * GESTURE.sheetDismissRatio || velocity > GESTURE.sheetDismissSpeed;
+    const far = offset > size * GESTURE.sheetFarRatio || velocity > GESTURE.sheetFarSpeed;
+    if (dismiss && !far && detent === "large" && detents.includes("medium")) return "medium";
+    return dismiss ? "close" : detent;
+  }
+  if (offset < 0 && detent !== "large" && detents.includes("large") &&
+      (offset < -GESTURE.sheetExpandPx || velocity < -GESTURE.sheetExpandSpeed)) return "large";
+  return detent;
+}
+class BottomSheet {
+  static attach(dialog, options = {}) {
+    if (!dialog) return null;
+    if (!dialog.bottomSheet) dialog.bottomSheet = new BottomSheet(dialog, options);
+    return dialog.bottomSheet;
+  }
+  constructor(dialog, { detents = ["medium", "large"], detent = detents[0], onDismiss = null } = {}) {
+    this.dialog = dialog;
+    this.detents = detents;
+    this.initial = detent;
+    this.onDismiss = onDismiss;
+    this.drag = null;
+    if (!dialog.querySelector?.(".sheet-handle") && typeof dialog.prepend === "function") {
+      const handle = el("div", "sheet-handle");
+      handle.setAttribute("aria-hidden", "true");
+      dialog.prepend(handle);
+    }
+    dialog.classList?.add("sheet");
+    this.setDetent(detent);
+    dialog.addEventListener("pointerdown", (event) => this.start(event));
+    dialog.addEventListener("pointermove", (event) => this.move(event));
+    dialog.addEventListener("pointerup", (event) => this.end(event));
+    dialog.addEventListener("pointercancel", (event) => this.end(event, true));
+    // A gesture whose pointerup never arrives must not block the next drag.
+    dialog.addEventListener("lostpointercapture", (event) => this.end(event, true));
+    dialog.addEventListener("click", (event) => this.outsideClick(event));
+    // Closed by code mid-drag: forget the gesture.
+    dialog.addEventListener("close", () => {
+      this.drag = null;
+      dialog.classList?.remove("is-dragging");
+    });
+  }
+  open({ detent = this.initial } = {}) {
+    this.setDetent(detent);
+    this.offset(0);
+    // A menu opened by a long press must not close on that finger's release:
+    // only a press that starts on the open sheet's backdrop dismisses it.
+    this.pressedSinceOpen = false;
+    this.pressTarget = null;
+    if (!this.dialog.open) this.dialog.showModal();
+  }
+  close() {
+    if (this.dialog.open) this.dialog.close();
+  }
+  dismiss() {
+    if (!this.dialog.open) return;
+    if (typeof this.onDismiss === "function") this.onDismiss();
+    else this.close();
+  }
+  setDetent(detent) {
+    if (!this.detents.includes(detent)) return;
+    this.detent = detent;
+    if (this.dialog.dataset) this.dialog.dataset.detent = detent;
+  }
+  offset(px) {
+    this.dialog.style?.setProperty?.("--sheet-drag", `${Math.round(px)}px`);
+  }
+  start(event) {
+    if (this.dialog.open) {
+      this.pressedSinceOpen = true;
+      this.pressTarget = event.target || null;
+    }
+    if (this.drag) this.end({ pointerId: this.drag.id }, true);
+    if (!this.dialog.open || !phoneLayout() || (event.button || 0) > 0) return;
+    const zone = event.target?.closest?.(".sheet-handle, .dialog-top, h2");
+    if (!zone || zone.parentElement !== this.dialog || event.target.closest("button, a, input, select, textarea")) return;
+    const now = Date.now();
+    const rect = this.dialog.getBoundingClientRect?.();
+    this.drag = { id: event.pointerId, y: event.clientY, offset: 0, height: rect?.height || this.dialog.offsetHeight || 0,
+      samples: [[now, event.clientY]] };
+    this.dialog.setPointerCapture?.(event.pointerId);
+    this.dialog.classList?.add("is-dragging");
+  }
+  move(event) {
+    const drag = this.drag;
+    if (!drag || event.pointerId !== drag.id) return;
+    drag.offset = event.clientY - drag.y;
+    drag.samples.push([Date.now(), event.clientY]);
+    if (drag.samples.length > 6) drag.samples.shift();
+    // Down follows the finger; up resists like a rubber band.
+    this.offset(drag.offset >= 0 ? drag.offset : -Math.min(40, Math.sqrt(-drag.offset) * 4));
+    if (event.cancelable) event.preventDefault();
+  }
+  end(event, cancelled = false) {
+    const drag = this.drag;
+    if (!drag || event?.pointerId !== drag.id) return;
+    this.drag = null;
+    this.dialog.classList?.remove("is-dragging");
+    const now = Date.now();
+    const recent = drag.samples.filter(([time]) => now - time < 120);
+    const velocity = recent.length >= 2
+      ? (recent[recent.length - 1][1] - recent[0][1]) / Math.max(1, recent[recent.length - 1][0] - recent[0][0]) : 0;
+    const outcome = cancelled ? this.detent
+      : sheetRelease({ offset: drag.offset, velocity, height: drag.height, detent: this.detent, detents: this.detents });
+    if (outcome === "close") this.dismiss();
+    else if (outcome !== this.detent) {
+      this.setDetent(outcome);
+      haptic("select");
+    }
+    // Closed: the exit transition ignores the offset. Still open: spring back.
+    this.offset(0);
+  }
+  outsideClick(event) {
+    if (event.target !== this.dialog || !this.dialog.open || !this.pressedSinceOpen) return;
+    const rect = this.dialog.getBoundingClientRect?.();
+    if (!rect || (event.clientX >= rect.left && event.clientX <= rect.right &&
+        event.clientY >= rect.top && event.clientY <= rect.bottom)) return;
+    this.dismiss();
+  }
+}
+const SHEETS = {
+  "plan-dialog": { onDismiss: () => closePlan() },
+  "close-terminal-dialog": { onDismiss: () => cancelTerminalClose() },
+  "settings-dialog": { onDismiss: () => closeSettings() },
+  "usage-dialog": { onDismiss: () => closeSheet("usage-dialog", "usage") },
+  "filter-dialog": { onDismiss: () => closeSheet("filter-dialog", "filter-open") },
+  "terminals-dialog": { onDismiss: () => closeSheet("terminals-dialog", "running-terminals") },
+  "new-session-dialog": { onDismiss: () => closeNewSession() },
+  "action-sheet": { detents: ["medium"], onDismiss: () => closeActionSheet() },
+  "session-control-dialog": { onDismiss: () => closeSessionControl() },
+  "session-label-dialog": { onDismiss: () => window.SessionholicLabels?.close?.() },
+};
+function sheet(id) {
+  return BottomSheet.attach($(id), SHEETS[id]);
+}
+// Closes a simple sheet and returns focus to the control that opened it.
+function closeSheet(id, returnFocus = null) {
+  const dialog = $(id);
+  if (!dialog?.open) return;
+  dialog.close();
+  if (returnFocus) $(returnFocus)?.focus?.({ preventScroll: true });
+}
+function openSettings() {
+  applyTheme();
+  applyTextSize();
+  window.SessionholicPush?.render?.();
+  sheet("settings-dialog").open();
+}
+// A notification tap opens its session: from the page address on a cold start, or
+// from the service worker while the board is already open. The session may arrive
+// with a later snapshot, so the request waits briefly for it.
+function requestedSessionFrom(url) {
+  try {
+    const parsed = new URL(url, globalThis.location?.origin || "http://board.invalid");
+    const key = parsed.pathname === "/" ? parsed.searchParams.get("session") : null;
+    return key && key.length <= 600 ? key : null;
+  } catch {
+    return null;
+  }
+}
+function requestSessionOpen(url) {
+  const key = requestedSessionFrom(url);
+  if (!key) return false;
+  state.openRequest = { key, until: Date.now() + 120000 };
+  openRequestedSession();
+  return true;
+}
+function openRequestedSession() {
+  const request = state.openRequest;
+  if (!request) return;
+  if (Date.now() > request.until) { state.openRequest = null; return; }
+  if (!state.authenticated || state.launchBusy || !allSessions().some((session) => session.key === request.key)) return;
+  state.openRequest = null;
+  // Over an open terminal too: the conversation shows, and back returns to the terminal.
+  if (state.terminalVisible) {
+    returnToBoard({ selectLaunchedSource: false, animate: false });
+    navigateView("detail", false, { notice: request.key });
+  }
+  const target = allSessions().find((session) => session.key === request.key);
+  if (target && groupOf(target) === "needs_input") answerOnOpen(target);
+  select(request.key);
+}
+// Opened from the 답 필요 group or its notification: the question is loaded once,
+// as "질문 불러오기" would, so the choices are there without another tap.
+function answerOnOpen(s) {
+  state.answerOnOpen = { key: s.key, until: Date.now() + 30000 };
+}
+function closeSettings() {
+  if (!$("settings-dialog").open) return;
+  $("settings-dialog").close();
+  $("settings")?.focus?.({ preventScroll: true });
+}
+
+applyTheme();
+applyTextSize();
 
 function el(tag, className, text) {
   const node = document.createElement(tag);
   if (className) node.className = className;
   if (text != null) node.textContent = text;
   return node;
+}
+// Adds or removes one class through className, so the change is the same for
+// real elements and for the test DOM (whose classList is a stub).
+function setClass(node, name, on) {
+  if (!node) return;
+  const names = String(node.className || "").split(/\s+/).filter(Boolean);
+  if (names.includes(name) === !!on) return;
+  node.className = (on ? [...names, name] : names.filter((item) => item !== name)).join(" ");
 }
 function button(text, className, action) {
   const node = el("button", className, text);
@@ -155,13 +658,19 @@ function assertAuthEpoch(epoch) {
   throw err;
 }
 function beginAuthEpoch() {
-  closeChatQueue(false);
   state.authEpoch++;
   state.pollBusy = false;
   state.terminalsRefreshing = false;
   return state.authEpoch;
 }
-async function api(path, { method = "GET", body, signal, authEpoch = state.authEpoch } = {}) {
+// After a server restart the CSRF token held here is stale (403 csrf_expired),
+// and the server refused before doing anything. Reads, and requests it
+// deduplicates by requestId, are sent once more with a fresh token. A chat send
+// never is: it waits for a new press (sendChat).
+const CSRF_RETRY = new Set(["/api/chat/state", "/api/chat/prompt", "/api/plan", "/api/launch",
+  "/api/new-session", "/api/app-server", "/api/refresh", "/api/usage/refresh",
+  "/api/push/subscribe", "/api/push/unsubscribe"]);
+async function api(path, { method = "GET", body, signal, authEpoch = state.authEpoch, csrfRetry = true } = {}) {
   assertAuthEpoch(authEpoch);
   const headers = {};
   if (body !== undefined) headers["Content-Type"] = "application/json";
@@ -182,6 +691,18 @@ async function api(path, { method = "GET", body, signal, authEpoch = state.authE
   }
   const data = await response.json().catch(() => ({}));
   assertAuthEpoch(authEpoch);
+  if (!response.ok && response.status === 403 && data.code === "csrf_expired" && csrfRetry &&
+      method !== "GET" && CSRF_RETRY.has(path)) {
+    let refreshed = false;
+    try {
+      await loadCapabilities(authEpoch, { refreshView: false });
+      refreshed = true;
+    } catch (err) {
+      if (err.unauthorized || err.staleAuth) throw err;
+    }
+    assertAuthEpoch(authEpoch);
+    if (refreshed) return api(path, { method, body, signal, authEpoch, csrfRetry: false });
+  }
   if (!response.ok) {
     const err = new Error(
       typeof data.error === "string"
@@ -197,28 +718,67 @@ async function api(path, { method = "GET", body, signal, authEpoch = state.authE
   return data;
 }
 
+function labeledSession(session) {
+  const value = window.SessionholicLabels?.decorate?.(session, state.snapshot?.sessionLabels) || session;
+  return { ...value, originalTitle: typeof value.originalTitle === "string" ? value.originalTitle : value.title,
+    title: typeof value.displayTitle === "string" && value.displayTitle ? value.displayTitle : value.title };
+}
 function allSessions() {
   const out = [];
+  // The open conversation is read again every few seconds; its own read stands until then.
+  const following = chatVisible() ? state.selected : null;
   for (const host of state.snapshot?.hosts || []) {
     for (const s of [
       ...(host.data?.claude || []),
       ...(host.data?.codex || []),
     ]) {
-      out.push({
+      // A Claude row listed without an id is told apart by its process (or folder and start).
+      const key = [host.name, s.agent, s.home || "", s.id || (s.agent === "claude"
+        ? `~${s.pid ?? ""}:${s.sessionId || ""}:${s.cwd || ""}:${s.startedAt ?? ""}` : "")].join("|");
+      // The list's own phase stands again once it changed since the conversation was read,
+      // or, for a conversation no longer open, once the host was read again after it (a quick
+      // turn may end where it began).
+      let live = state.livePhases.get(key);
+      if (live && (live.base !== s.phase || (key !== following && (host.fetchedAt ?? 0) > (live.fetchedAt ?? 0)))) {
+        state.livePhases.delete(key);
+        live = null;
+      }
+      out.push(labeledSession({
         ...s,
+        phase: s.runtimeKnown === false ? "unknown" : live && live.base === s.phase ? live.phase : s.phase,
+        listedPhase: s.phase,
         host: host.name,
         account: sessionAccountLabel({ ...s, host: host.name }),
         hostLabel: host.label,
         stale: !host.ok,
         fetchedAt: host.fetchedAt,
-        key: [host.name, s.agent, s.home || "", s.id].join("|"),
-      });
+        key,
+      }));
     }
   }
   for (const session of state.nativeSessions.values()) {
-    if (!out.some((s) => s.key === session.key)) out.push({ ...session, account: sessionAccountLabel(session) });
+    if (!out.some((s) => s.key === session.key)) out.push(labeledSession({ ...session, account: sessionAccountLabel(session) }));
   }
   return out;
+}
+// The open conversation's own read says what its session does now; the list
+// may say so only a minute later (a host without a resident collector). Its
+// card, header and counts follow the read until the list's phase changes.
+function noteLivePhase(s, data) {
+  const listed = allSessions().find((value) => value.key === s?.key);
+  if (!listed || listed.runtimeKnown === false || listed.listedPhase === undefined && listed.nativeSource || !BADGES[data?.phase] ||
+      chatKey(data.route || {}) !== chatKey(sourceOf(listed))) return;
+  if (data.phase === listed.listedPhase) state.livePhases.delete(listed.key);
+  else state.livePhases.set(listed.key, { phase: data.phase, base: listed.listedPhase, fetchedAt: listed.fetchedAt });
+  // Redrawn only where it shows (a detail not drawn yet takes it when drawn).
+  // This read is the news: the header shows it without reading the
+  // conversation again, and the list follows.
+  if (listed.phase !== data.phase && state.detailFor === listed.key) {
+    const shown = allSessions().find((value) => value.key === listed.key);
+    state.detailRevision = detailRevision(shown);
+    patchDetailMetadata(shown);
+    render();
+  }
 }
 function sourceOf(s) {
   const source = {
@@ -237,15 +797,21 @@ function accountOf(s) {
 function selectedSession() {
   return allSessions().find((s) => s.key === state.selected);
 }
-function groupOf(s) {
-  return s.phase === "needs_input"
-    ? "needs_input"
-    : s.phase === "working"
-      ? "working"
-      : "rest";
+function groupOf(s, now = state.snapshot?.serverTime || Date.now() / 1000) {
+  if (s.phase === "needs_input") return "needs_input";
+  if (s.phase === "working") return "working";
+  if (["idle", "done", "closed"].includes(s.phase) && now - (s.updatedAt || 0) <= FINISHED_SECONDS) return "finished";
+  return "rest";
 }
-function matches(s, now) {
+function matches(s, now, { phase = true, category = true, initiator = true } = {}) {
+  if (botRequestForNative(sourceOf(s))) return false;
+  if (category && sessionCategoryOf(s) !== state.sessionCategory) return false;
+  if (phase && state.phaseFilter && groupOf(s, now) !== state.phaseFilter) return false;
   for (const key of Object.keys(state.filters)) {
+    if (key === "initiator") {
+      if (initiator && state.filters.initiator && initiatorOf(s) !== state.filters.initiator) return false;
+      continue;
+    }
     if (key === "account" && state.filters.account && state.accountFilterRoutes) {
       if (!state.accountFilterRoutes.has(accountRouteKey(s))) return false;
       continue;
@@ -254,14 +820,16 @@ function matches(s, now) {
   }
   if (
     !state.showOld &&
-    groupOf(s) === "rest" &&
+    groupOf(s, now) === "rest" &&
     now - (s.updatedAt || 0) > RECENT_SECONDS
   )
     return false;
   if (!state.search) return true;
   const q = state.search.toLocaleLowerCase();
+  if (window.SessionholicGoals?.sessionMatches?.(s, q)) return true;
   return [
     s.title,
+    s.originalTitle,
     s.project,
     s.cwd,
     s.account,
@@ -275,16 +843,28 @@ function matches(s, now) {
   );
 }
 
+function renderSessionList(sessions, now) {
+  setClass($("task-list-pane"), "is-bot-category", state.sessionCategory === "bot");
+  if (state.sessionCategory === "bot") { renderSessionCategories(sessions, now); renderBotRequests(); return; }
+  // Updating list conditions must not redraw a retained conversation or reset
+  // its scroll anchor when the same source is opened again from a work card.
+  const base = sessions.filter((session) => matches(session, now, { phase: false }));
+  const shown = state.phaseFilter ? base.filter((session) => groupOf(session, now) === state.phaseFilter) : base;
+  renderCounts(base); renderSessionCategories(sessions, now);
+  renderFilters(sessions.filter((session) => sessionCategoryOf(session) === state.sessionCategory));
+  renderGroups(shown, now);
+  $("session-count").textContent = `${shown.length}개`;
+}
 function render() {
   if (!state.snapshot) return;
   const now = state.snapshot.serverTime || Date.now() / 1000;
   const sessions = allSessions();
-  const shown = sessions.filter((s) => matches(s, now));
-  renderHosts(now);
-  renderCounts(shown);
-  renderFilters(sessions);
-  renderGroups(shown, now);
-  $("session-count").textContent = `${shown.length}개`;
+  const reading = state.detailShown && sessions.find((session) => session.key === state.selected);
+  if (reading && botRequestForNative(sourceOf(reading))) { selectBotRequest(botRequestKey(botRequestForNative(sourceOf(reading)))); return; }
+  if (reading && sessionCategoryOf(reading) !== state.sessionCategory) setSessionCategory(sessionCategoryOf(reading), { renderView: false, clearSelection: false });
+  renderHosts(now); renderFreshness(now); renderAttention(sessions);
+  renderSessionList(sessions, now);
+  if (state.sessionCategory === "bot") { window.SessionholicGoals?.update?.(sessions); return; }
   const selected = sessions.find((s) => s.key === state.selected);
   if (!state.selected && !$("detail").children.length) {
     const welcome = el("div", "welcome");
@@ -299,11 +879,13 @@ function render() {
     );
     $("detail").append(welcome);
   }
+  window.SessionholicGoals?.update?.(sessions);
   if (selected) refreshDetail(selected);
   else if (state.selected) {
-    closeChatQueue(false);
     state.selected = null;
     state.detailFor = null;
+    // Nothing follows the conversation any more (polling, its live stream).
+    stopChatPolling();
     $("detail").replaceChildren(
       el(
         "div",
@@ -311,6 +893,12 @@ function render() {
         "이 작업을 목록에서 더 이상 찾을 수 없습니다. 새로고침 후 확인해 주세요.",
       ),
     );
+    // A phone showed nothing but that conversation, and its back button went
+    // with it: back to the list, saying why.
+    if (phoneLayout() && state.detailShown && !state.terminalVisible) {
+      toast("열어 둔 작업을 목록에서 더 이상 찾을 수 없어 목록으로 돌아왔습니다.");
+      backToList();
+    } else syncEvents();
   }
 }
 function renderHosts(now) {
@@ -331,37 +919,393 @@ function renderHosts(now) {
     box.append(chip);
   }
 }
-function renderCounts(shown) {
-  const box = $("counts");
-  box.replaceChildren();
-  for (const group of GROUPS.slice(0, 2)) {
-    const n = shown.filter((s) => groupOf(s) === group.key).length;
-    const pill = el("span", `count ${group.tone}${n ? "" : " zero"}`);
-    pill.append(
-      el("span", "dot"),
-      el(
-        "span",
-        null,
-        `${group.key === "needs_input" ? "답 필요" : "작업 중"} ${n}`,
-      ),
-    );
-    box.append(pill);
+// While hosts are still collecting, say how old the list on screen is; the
+// note disappears once the collection finishes.
+function renderFreshness(now) {
+  const box = $("list-freshness");
+  if (!box) return;
+  const times = (state.snapshot?.hosts || []).filter((host) => host.refreshing)
+    .map((host) => host.fetchedAt).filter((value) => Number.isFinite(value) && value > 0);
+  const oldest = times.length ? Math.min(...times) : null;
+  const text = oldest && now - oldest >= 60 ? `${ago(oldest, now)} 기준 · 갱신 중` : "";
+  if (box.textContent !== text) box.textContent = text;
+  box.hidden = !text;
+}
+// Agent usage (remaining limits) when the board host provides it; a board
+// without the endpoint simply never shows the strip.
+function usageTone(remaining) {
+  return !Number.isFinite(remaining) ? "muted" : remaining < 15 ? "red" : remaining < 40 ? "orange" : "green";
+}
+function kstShort(iso) {
+  const time = Date.parse(iso || "");
+  if (!Number.isFinite(time)) return "";
+  const date = new Date(time + 9 * 3600 * 1000);
+  const pad = (value) => String(value).padStart(2, "0");
+  return `${date.getUTCMonth() + 1}/${date.getUTCDate()} ${pad(date.getUTCHours())}:${pad(date.getUTCMinutes())}`;
+}
+function renderUsage(data) {
+  const box = $("usage");
+  if (!box) return;
+  const providers = data?.available && Array.isArray(data.providers) ? data.providers.filter((item) => item && typeof item === "object") : [];
+  if (!providers.length) {
+    box.hidden = true;
+    box.dataset.revision = "";
+    if ($("usage-dialog")?.open) closeSheet("usage-dialog");
+    return;
+  }
+  box.hidden = false;
+  const revision = JSON.stringify([providers, data.refreshing, data.fetchedAt, data.error]);
+  if (box.dataset.revision === revision) return;
+  box.dataset.revision = revision;
+  const summary = $("usage-summary");
+  const pills = providers.map((provider) => {
+    const remaining = Number.isFinite(provider.remaining) ? provider.remaining : null;
+    const pill = el("span", `usage-pill ${provider.status === "ready" ? usageTone(remaining) : "muted"}`);
+    pill.append(el("span", "usage-short", provider.short || provider.label || ""), el("strong", null, remaining === null ? "—" : `${remaining}%`));
+    return pill;
+  });
+  if (data.refreshing) pills.push(el("span", "usage-state", "조회 중"));
+  summary.replaceChildren(...pills);
+  box.setAttribute("aria-label", `남은 사용량 ${providers.map((provider) =>
+    `${provider.label || provider.short} ${Number.isFinite(provider.remaining) ? provider.remaining + "%" : "확인 불가"}`).join(", ")}. 계정별로 보기`);
+  const body = $("usage-body");
+  const sections = providers.map((provider) => {
+    const section = el("section", "usage-provider");
+    section.append(el("h3", null, provider.label || provider.short || "사용량"));
+    if (provider.note) section.append(el("p", "usage-note", provider.note));
+    for (const row of Array.isArray(provider.rows) ? provider.rows : []) {
+      const item = el("div", "usage-row");
+      const head = el("div", "usage-row-head");
+      head.append(el("strong", null, row.name || ""));
+      if (row.credits) head.append(el("span", "usage-credits", `크레딧 ${row.credits}`));
+      item.append(head);
+      if (row.note) item.append(el("p", "usage-note", row.note));
+      for (const window of Array.isArray(row.windows) ? row.windows : []) {
+        const remaining = Number.isFinite(window.remaining) ? Math.max(0, Math.min(100, window.remaining)) : null;
+        const line = el("div", "usage-window");
+        const bar = el("div", "usage-bar");
+        const fill = el("span", `usage-fill ${usageTone(remaining)}`);
+        if (fill.style) fill.style.width = `${remaining ?? 0}%`;
+        bar.append(fill);
+        const reset = kstShort(window.resetsAt);
+        line.append(el("span", "usage-window-label", window.label || ""), bar,
+          el("span", "usage-window-value", remaining === null ? "—" : `${remaining}%`),
+          el("span", "usage-window-reset", reset ? `${reset} 초기화` : ""));
+        item.append(line);
+      }
+      section.append(item);
+    }
+    return section;
+  });
+  const foot = el("div", "usage-foot");
+  const fetched = Number.isFinite(data.fetchedAt) ? clock(data.fetchedAt) : "";
+  foot.append(el("span", null, data.error ? data.error : fetched ? `마지막 조회 ${fetched} · 남은 비율` : "남은 비율"));
+  const refresh = button(data.refreshing ? "조회 중…" : "새로고침", "usage-refresh", () => loadUsage(true));
+  refresh.disabled = !!data.refreshing;
+  foot.append(refresh);
+  body.replaceChildren(...sections, foot);
+}
+function openUsage() {
+  if ($("usage")?.hidden) return;
+  sheet("usage-dialog").open();
+  // A sheet opened long after the last read asks for fresh numbers.
+  if (Date.now() - (state.usageAt || 0) > 55000) loadUsage();
+}
+async function loadUsage(force = false) {
+  if (state.usageUnsupported || !state.authenticated || networkOffline() || document.hidden) return;
+  if (state.usageBusy) return;
+  state.usageBusy = true;
+  state.usageAt = Date.now();
+  try {
+    const data = force ? await api("/api/usage/refresh", { method: "POST", body: {} }) : await api("/api/usage");
+    state.usage = data;
+    renderUsage(data);
+    // Follow a refresh the server is running, without polling forever.
+    if (data?.refreshing && (state.usageFollow = (state.usageFollow || 0) + 1) <= 15)
+      setTimeout(() => loadUsage(false), 4000);
+    else if (!data?.refreshing) state.usageFollow = 0;
+  } catch (err) {
+    if (err.status === 404) { state.usageUnsupported = true; renderUsage(null); }
+  } finally {
+    state.usageBusy = false;
   }
 }
+const BASE_TITLE = INSTANCE.title;
+function renderAttention(sessions) {
+  // The tab title and app icon say when work waits for an answer while this view is elsewhere.
+  const waiting = sessions.filter((s) => !botRequestForNative(sourceOf(s)) && groupOf(s) === "needs_input").length;
+  const title = waiting ? `(${waiting}) 답 필요 · ${INSTANCE.shortName}` : BASE_TITLE;
+  if (document.title !== title) document.title = title;
+  try {
+    if (waiting) navigator.setAppBadge?.(waiting)?.catch?.(() => {});
+    else navigator.clearAppBadge?.()?.catch?.(() => {});
+  } catch {
+    /* badges are optional */
+  }
+}
+// Status chips: "답 필요 N" and "작업 중 N" filter the list to that state;
+// tapping the active chip again shows everything. The buttons are kept and
+// only relabelled, so keyboard focus stays on a chip while counts change.
+const PHASE_LABELS = { needs_input: "답 필요", working: "작업 중" };
+function togglePhaseFilter(key) {
+  state.phaseFilter = state.phaseFilter === key ? "" : key;
+  haptic("select");
+  render();
+}
+function renderCounts(sessions) {
+  const box = $("counts");
+  const counts = GROUPS.slice(0, 2).map((group) => sessions.filter((s) => groupOf(s) === group.key).length);
+  const revision = `${counts.join(",")}|${state.phaseFilter}`;
+  if (box.dataset.revision === revision) return;
+  box.dataset.revision = revision;
+  box.chips ||= new Map();
+  const chips = GROUPS.slice(0, 2).map((group, index) => {
+    let chip = box.chips.get(group.key);
+    if (!chip) {
+      chip = button("", "count", () => togglePhaseFilter(group.key));
+      chip.dataset.phase = group.key;
+      chip.chipLabel = el("span", "count-label");
+      chip.append(el("span", "dot"), chip.chipLabel);
+      box.chips.set(group.key, chip);
+    }
+    const n = counts[index];
+    const active = state.phaseFilter === group.key;
+    chip.className = `count ${group.tone}${n ? "" : " zero"}${active ? " is-active" : ""}`;
+    chip.chipLabel.textContent = `${PHASE_LABELS[group.key]} ${n}`;
+    chip.setAttribute("aria-pressed", String(active));
+    chip.setAttribute("aria-label", `${PHASE_LABELS[group.key]} ${n}개${active ? ", 이것만 보는 중" : ""}`);
+    return chip;
+  });
+  placeChildren(box, chips);
+}
+// The filter sheet's selects; the button that opens it shows how many apply.
+const INITIATOR_LABELS = { human: "직접 시작", agent: "에이전트 시작", unknown: "출처 미확인" };
+function initiatorOf(s) { return ["human", "agent"].includes(s?.initiator) ? s.initiator : "unknown"; }
+function initiatorLabel(s) {
+  return INITIATOR_LABELS[initiatorOf(s)] + (s?.initiatorName ? ` · ${s.initiatorName}` : "");
+}
+const ONE_SHOT_NO_INPUT = "일회성 실행에는 후속 메시지를 보낼 수 없습니다. 결과는 요청한 에이전트에서 확인해 주세요.";
+const ONE_SHOT_HISTORY = "대화 기록을 저장하지 않는 일회성 실행입니다. 실행 상태를 확인하고 결과는 요청한 에이전트에서 확인해 주세요.";
+function sessionOneShot(s) { return s?.executionMode === "one-shot"; }
+const BOT_CACHE_MS = 120000;
+const BOT_STATUS = { pending: "대기", queued: "대기", waiting: "대기", running: "진행 중", working: "진행 중", completed: "완료", done: "완료", failed: "실패", cancelled: "취소", canceled: "취소", stopped: "중단", closed: "종료", active: "진행 중", needs_input: "답변 필요", error: "실패" };
+function emptyBotRequests() { return { requests: [], sources: [], loaded: false, busy: false, error: "", readAt: 0, fetchedAt: null, promise: null }; }
+function botTimestamp(value) { return typeof value === "number" ? value * 1000 : Date.parse(value) || 0; }
+function botRequestKey(request) { return JSON.stringify([request.sourceId, request.id]); }
+function botLabel(value) { return typeof value === "string" && value.trim() && !["unknown", "unconfirmed"].includes(value.trim().toLowerCase()) ? value.trim() : "미확인"; }
+function botRequestStale(request) { return !!(request.stale || state.botRequests.error || state.botRequests.sources.some((source) => source.id === request.sourceId && source.stale)); }
+function botRequestForNative(source) {
+  return state.botRequests.requests.find((request) => request.nativeRef && request.host === source.host &&
+    request.nativeRef.agent === source.agent && request.nativeRef.id === source.id && request.nativeRef.home === source.home);
+}
+function botRequestMatches(request) {
+  const query = state.search.trim().toLocaleLowerCase();
+  return !query || [request.title, request.botName, request.host, request.channelLabel, request.requesterLabel,
+    request.authorityLabel, request.scopeLabel, BOT_STATUS[request.status]].some((value) => String(value || "").toLocaleLowerCase().includes(query));
+}
+function botSnapshot(data) {
+  if (!data || !Array.isArray(data.requests) || !Array.isArray(data.sources) ||
+      data.requests.some((request) => !request || typeof request.id !== "string" || !request.id || typeof request.sourceId !== "string" || !request.sourceId) ||
+      data.sources.some((source) => !source || typeof source.id !== "string"))
+    throw new Error("봇 요청 목록 형식을 확인하지 못했습니다. 잠시 후 다시 확인해 주세요.");
+  const unique = new Map();
+  for (const request of data.requests) unique.set(botRequestKey(request), request);
+  return { requests: [...unique.values()], sources: data.sources, fetchedAt: data.fetchedAt };
+}
+async function loadBotRequests({ refresh = false } = {}) {
+  if (!state.authenticated) return;
+  const cache = state.botRequests;
+  if (cache.promise) return cache.promise;
+  if (!refresh && cache.loaded && Date.now() - cache.readAt < BOT_CACHE_MS) return;
+  if (networkOffline()) { cache.error = "오프라인입니다. 연결 후 봇 요청을 다시 확인해 주세요."; render(); return; }
+  const authEpoch = state.authEpoch;
+  cache.busy = true; cache.error = "";
+  cache.promise = (async () => {
+    try {
+      // Refresh is explicit and bounded to this bot source service. A normal
+      // category visit is one GET; render/poll never starts another request.
+      const data = refresh
+        ? await api("/api/bot-requests/refresh", { method: "POST", body: {}, authEpoch, csrfRetry: false })
+        : await api("/api/bot-requests", { authEpoch });
+      assertAuthEpoch(authEpoch);
+      if (state.botRequests !== cache) return;
+      Object.assign(cache, botSnapshot(data), { loaded: true, readAt: Date.now() });
+      const selected = selectedSession();
+      const moved = selected && botRequestForNative(sourceOf(selected));
+      if (moved) selectBotRequest(botRequestKey(moved));
+    } catch (err) {
+      if (authEpoch === state.authEpoch && state.botRequests === cache && !err.staleAuth && !err.unauthorized)
+        cache.error = err.message || "봇 요청을 확인하지 못했습니다. 다시 확인해 주세요.";
+    } finally {
+      if (authEpoch === state.authEpoch && state.botRequests === cache) {
+        cache.busy = false; cache.promise = null; render();
+      }
+    }
+  })();
+  render();
+  return cache.promise;
+}
+function renderBotRequests() {
+  const cache = state.botRequests, box = $("groups");
+  const shown = cache.requests.filter(botRequestMatches).sort((a, b) => botTimestamp(b.updatedAt) - botTimestamp(a.updatedAt));
+  const tools = el("div", "bot-list-tools");
+  const note = el("p", "muted", cache.busy ? "봇 요청을 확인하고 있습니다…" : cache.loaded ? `확인된 요청 ${cache.requests.length}개` : "봇 요청을 확인해 주세요.");
+  const refresh = button(cache.busy ? "확인 중…" : "새로고침", "secondary", () => loadBotRequests({ refresh: true }));
+  refresh.id = "bot-requests-refresh"; refresh.disabled = cache.busy || networkOffline();
+  tools.append(note, refresh);
+  const nodes = [tools];
+  if (cache.error) { const error = el("p", "bot-source-notice", cache.error + (cache.loaded ? " 마지막으로 확인한 요청을 표시합니다." : "")); error.setAttribute("role", "status"); nodes.push(error); }
+  for (const source of cache.sources.filter((source) => source.ok !== true)) {
+    const error = typeof source.error === "string" ? source.error : source.error?.message;
+    const notice = el("div", "bot-source-notice");
+    notice.append(el("div", "", `${botLabel(source.label)} · ${error || "요청 목록을 확인하지 못했습니다. 연결 상태를 확인해 주세요."}`));
+    if (source.stale) notice.append(el("div", "", "마지막으로 확인한 요청을 표시합니다."));
+    nodes.push(notice);
+  }
+  if (cache.busy && !cache.loaded) nodes.push(skeletonList("봇 요청을 확인하고 있습니다…"));
+  for (const request of shown) {
+    const key = botRequestKey(request);
+    const card = button("", "bot-request-card", () => selectBotRequest(key)); card.dataset.botRequestKey = key;
+    card.setAttribute("aria-pressed", String(state.selectedBotRequest === key));
+    const meta = el("span", "bot-request-top"); meta.append(el("strong", "bot-name", botLabel(request.botName)), el("span", "bot-status", BOT_STATUS[request.status] || "상태 미확인"));
+    if (botRequestStale(request)) meta.append(el("span", "bot-stale-tag", "이전 정보"));
+    card.append(meta, el("span", "bot-request-title", botLabel(request.title)),
+      el("span", "bot-request-context", `요청자 ${botLabel(request.requesterLabel)} · 채널 ${botLabel(request.channelLabel)}`),
+      el("span", "bot-request-boundary", `권한 ${botLabel(request.authorityLabel)}`),
+      el("span", "bot-request-boundary", `범위 ${botLabel(request.scopeLabel)}`));
+    nodes.push(card);
+  }
+  if (!shown.length && !cache.busy) nodes.push(emptyState("none", state.search ? "검색에 맞는 봇 요청이 없습니다." : cache.error || cache.sources.some((source) => !source.ok) ? "봇 요청을 확인하지 못했습니다." : "표시할 봇 요청이 없습니다.", "봇에서 접수한 요청과 권한·사용 범위를 이곳에서 확인합니다."));
+  box.replaceChildren(...nodes); box.setAttribute("aria-busy", String(cache.busy));
+  $("session-count").textContent = cache.loaded ? `${shown.length}개` : "-";
+  const selected = cache.requests.find((request) => botRequestKey(request) === state.selectedBotRequest);
+  if (state.selectedBotRequest && !selected) {
+    state.selectedBotRequest = null; $("detail").replaceChildren(); setDetailShown(false); navigateView("list", true);
+  } else if (selected) drawBotRequest(selected);
+  else if (!$("detail").children.length) $("detail").append(emptyState("none", "봇 요청을 선택하세요.", "요청자와 채널, 권한과 사용 범위를 확인할 수 있습니다."));
+}
+function selectBotRequest(key) {
+  if (!state.authenticated || state.launchBusy) return;
+  const request = state.botRequests.requests.find((row) => botRequestKey(row) === key); if (!request) return;
+  rememberConversationView(); stopChatPolling();
+  state.selected = null; state.detailFor = null; state.detailRevision = null; state.detailRun += 1;
+  state.selectedBotRequest = key;
+  window.SessionholicGoals?.openTab?.("sessions");
+  setSessionCategory("bot", { renderView: false, clearSelection: false });
+  $("detail").replaceChildren();
+  render();
+  const entering = phoneLayout() && !state.detailShown;
+  if (entering) navigateView("detail");
+  setDetailShown(true, { direction: entering ? "push" : null, focus: phoneLayout() });
+}
+function drawBotRequest(request) {
+  const pane = $("detail");
+  const stale = botRequestStale(request);
+  const revision = JSON.stringify([request, stale]);
+  if (pane.dataset.botRevision === revision && pane.querySelector?.(".bot-request-detail")) return;
+  pane.replaceChildren(); pane.dataset.key = ""; pane.dataset.botRevision = revision;
+  pane.classList.remove("is-reading", "is-typing"); state.chromeVisible = true;
+  const head = el("div", "detail-head bot-detail-head");
+  const back = button("←", "back", backToList); back.setAttribute("aria-label", "봇 요청 목록으로 돌아가기");
+  const titles = el("div", "detail-titles"); titles.append(el("h1", "detail-title", botLabel(request.title)), el("p", "detail-project", botLabel(request.botName)));
+  head.append(back, titles);
+  const detail = el("section", "bot-request-detail"); detail.setAttribute("aria-label", "봇 요청 정보");
+  if (stale) detail.append(el("p", "bot-source-notice", "이전 정보 · 마지막으로 확인한 요청입니다. 새로고침으로 최신 상태를 확인해 주세요."));
+  detail.append(el("p", "bot-request-guidance", "이 요청은 원래 봇에서 이어가세요. 아래 권한과 사용 범위가 적용됩니다."));
+  const metadata = el("dl", "bot-request-metadata");
+  for (const [label, value] of [["봇", request.botName], ["요청자", request.requesterLabel], ["채널", request.channelLabel], ["권한", request.authorityLabel], ["사용 범위", request.scopeLabel], ["기기", request.host ? hostLabel(request.host) : null], ["상태", BOT_STATUS[request.status]]]) {
+    const row = el("div"); row.append(el("dt", "", label), el("dd", "", botLabel(value))); metadata.append(row);
+  }
+  detail.append(metadata);
+  if (request.nativeRef) detail.append(el("p", "bot-native-note", "연결된 세션 기록이 있습니다. 입력과 실행 관리는 원래 봇에서 진행해 주세요."));
+  pane.append(head, detail);
+}
+const SESSION_CATEGORIES = { general: "일반 세션", agent: "에이전트 세션", bot: "봇 요청" };
+function sessionCategoryOf(session) { return botRequestForNative(sourceOf(session)) ? "bot" : initiatorOf(session) === "agent" ? "agent" : "general"; }
+function setSessionCategory(category, { renderView = true, clearSelection = true } = {}) {
+  if (!Object.hasOwn(SESSION_CATEGORIES, category) || state.launchBusy) return false;
+  const changed = state.sessionCategory !== category;
+  const selected = selectedSession();
+  if (clearSelection && ((selected && sessionCategoryOf(selected) !== category) || (state.selectedBotRequest && category !== "bot"))) {
+    rememberConversationView(); stopChatPolling();
+    state.selected = null; state.selectedBotRequest = null; state.detailFor = null; state.detailRevision = null; state.detailRun += 1;
+    $("detail").replaceChildren(); $("detail").dataset.key = ""; setDetailShown(false); navigateView("list", true);
+  }
+  state.sessionCategory = category;
+  if (changed && !state.selected && !state.selectedBotRequest) $("detail").replaceChildren();
+  const origin = state.filters.initiator;
+  if (category !== "bot" && origin && (origin === "agent" ? "agent" : "general") !== category) state.filters.initiator = "";
+  if (renderView) { render(); if (changed) $("task-list-pane").scrollTop = 0; }
+  if (category === "bot" && renderView) loadBotRequests();
+  return changed;
+}
+function renderSessionCategories(sessions, now) {
+  const counts = { general: 0, agent: 0, bot: state.botRequests.loaded ? state.botRequests.requests.filter(botRequestMatches).length : null };
+  for (const session of sessions) {
+    const category = sessionCategoryOf(session);
+    if (category !== "bot" && matches(session, now, { category: false, initiator: category === state.sessionCategory })) counts[category] += 1;
+  }
+  for (const [category, label] of Object.entries(SESSION_CATEGORIES)) {
+    const control = $(`session-category-${category}`); const selected = state.sessionCategory === category;
+    control.setAttribute("aria-selected", String(selected)); control.tabIndex = selected ? 0 : -1;
+    control.setAttribute("aria-label", counts[category] === null ? `${label}, 아직 확인하지 않음` : `${label} ${counts[category]}개`);
+    $(`session-category-${category}-count`).textContent = counts[category] === null ? "-" : String(counts[category]);
+  }
+  $("groups").setAttribute("aria-labelledby", `session-category-${state.sessionCategory}`);
+  $("session-category-note").hidden = state.sessionCategory !== "general" || state.filters.initiator === "human";
+  const others = Object.keys(SESSION_CATEGORIES).filter((category) => category !== state.sessionCategory && counts[category] > 0);
+  const other = others[0];
+  $("session-category-search").hidden = !state.search.trim() || !other;
+  $("session-category-search-action").textContent = other ? `${SESSION_CATEGORIES[other]}에 검색 결과 ${counts[other]}개 · 보기` : "";
+  $("session-category-search-action").dataset.category = other || "general";
+}
+function sessionCategoryKeydown(event) {
+  if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
+  event.preventDefault();
+  const categories = Object.keys(SESSION_CATEGORIES), index = categories.indexOf(state.sessionCategory);
+  const category = event.key === "Home" ? categories[0] : event.key === "End" ? categories.at(-1) : categories[(index + (event.key === "ArrowRight" ? 1 : -1) + categories.length) % categories.length];
+  setSessionCategory(category); $(`session-category-${category}`).focus();
+}
+function prepareSessionListFor(session) {
+  let changed = setSessionCategory(sessionCategoryOf(session), { renderView: false, clearSelection: false });
+  for (const key of Object.keys(state.filters)) {
+    const value = key === "initiator" ? initiatorOf(session) : session[key];
+    const excluded = key === "account" && state.filters.account && state.accountFilterRoutes
+      ? !state.accountFilterRoutes.has(accountRouteKey(session)) : state.filters[key] && state.filters[key] !== value;
+    if (excluded) { state.filters[key] = ""; if (key === "account") state.accountFilterRoutes = null; changed = true; }
+  }
+  if (state.phaseFilter && groupOf(session) !== state.phaseFilter) { state.phaseFilter = ""; changed = true; }
+  const now = state.snapshot?.serverTime || Date.now() / 1000;
+  if (!state.showOld && groupOf(session) === "rest" && now - (session.updatedAt || 0) > RECENT_SECONDS) {
+    state.showOld = true; $("show-old").checked = true; changed = true;
+  }
+  if (state.search && !matches(session, now)) {
+    state.search = ""; $("search").value = ""; window.SessionholicGoals?.setQuery?.(""); changed = true;
+  }
+  return changed;
+}
+const FILTER_FIELDS = ["filter-host", "filter-agent", "filter-project", "filter-account", "filter-initiator"];
 function renderFilters(sessions) {
-  const active = Object.values(state.filters).filter(Boolean).length;
-  $("filter-count").textContent = active ? `${active}개 적용` : "";
+  const active = Object.values(state.filters).filter(Boolean).length + (state.showOld ? 1 : 0);
+  $("filter-count").textContent = active ? String(active) : "";
+  const open = $("filter-open");
+  if (open) {
+    setClass(open, "is-active", active > 0);
+    open.setAttribute?.("aria-label", active ? `필터 ${active}개 적용됨` : "필터");
+  }
   const box = $("filter-fields");
-  const focused = document.activeElement?.id;
-  if (focused?.startsWith("filter-")) return;
+  // A select being used keeps its element (and the open picker).
+  if (FILTER_FIELDS.includes(document.activeElement?.id)) return;
   box.replaceChildren();
   for (const [key, label, pick] of [
     ["host", "기기", (s) => [s.host, s.hostLabel]],
     ["agent", "에이전트", (s) => [s.agent, AGENTS[s.agent]]],
     ["project", "프로젝트", (s) => [s.project, s.project]],
     ["account", "계정 설정", (s) => [s.account, s.account]],
+    ["initiator", "시작 주체", (s) => [initiatorOf(s), INITIATOR_LABELS[initiatorOf(s)]]],
   ]) {
     const options = new Map(sessions.map(pick).filter(([v]) => v));
+    if (key === "initiator") for (const [value, text] of Object.entries(INITIATOR_LABELS)) options.set(value, text);
     const field = el("label", null, label);
     const select = el("select");
     select.id = `filter-${key}`;
@@ -376,13 +1320,20 @@ function renderFilters(sessions) {
     select.addEventListener("change", () => {
       state.filters[key] = select.value;
       if (key === "account") state.accountFilterRoutes = null;
+      if (key === "initiator" && select.value) setSessionCategory(select.value === "agent" ? "agent" : "general", { renderView: false });
       render();
     });
     field.append(select);
     box.append(field);
   }
-  const n = Object.values(state.filters).filter(Boolean).length;
-  $("filter-count").textContent = n ? `${n}개 적용` : "";
+}
+function resetFilters() {
+  for (const key of Object.keys(state.filters)) state.filters[key] = "";
+  state.accountFilterRoutes = null;
+  state.showOld = false;
+  if ($("show-old")) $("show-old").checked = false;
+  renderFilters(allSessions());
+  render();
 }
 function cardLine(value) {
   return String(value || "").replace(/\s+/g, " ").trim();
@@ -433,17 +1384,17 @@ function renderGroups(shown, now) {
   const cards = new Map();
   // Reuse only what is mounted now; lock clears this DOM and its references.
   for (const section of box.children) {
-    if (section.dataset.groupKey) sections.set(section.dataset.groupKey, section);
-    for (const node of section.children)
-      if (node.dataset.sessionKey) cards.set(node.dataset.sessionKey, node);
+    if (section.dataset?.groupKey) sections.set(section.dataset.groupKey, section);
+    for (const node of section.children || [])
+      if (node.dataset?.sessionKey) cards.set(node.dataset.sessionKey, node);
   }
-  const focused = active?.dataset?.sessionKey && cards.get(active.dataset.sessionKey) === active ? active : null;
+  const focused = active?.dataset?.sessionKey && cards.get(active.dataset.sessionKey)?.card === active ? active : null;
   const folders = cardFolderHints(shown);
   const desired = [];
   const visible = new Set();
   for (const group of GROUPS) {
     const items = shown
-      .filter((s) => groupOf(s) === group.key)
+      .filter((s) => groupOf(s, now) === group.key)
       .sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
     if (!items.length) continue;
     let section = sections.get(group.key);
@@ -461,129 +1412,803 @@ function renderGroups(shown, now) {
     for (const session of items) {
       const source = chatKey(sourceOf(session));
       const previous = cards.get(session.key);
-      const node = previous?.dataset.sourceKey === source ? previous : card(session);
-      updateCard(node, session, now, folders.get(session.key));
-      children.push(node); visible.add(node);
+      const row = previous?.dataset.sourceKey === source ? previous : card(session);
+      updateCard(row.card, session, now, folders.get(session.key));
+      children.push(row); visible.add(row.card);
     }
     placeChildren(section, children);
     desired.push(section);
   }
+  let loading = false;
   if (!shown.length) {
-    const filtered = state.search || Object.values(state.filters).some(Boolean);
+    const searching = !!state.search;
+    const filtering = Object.values(state.filters).some(Boolean);
     const unconfigured = !state.snapshot?.hosts?.length;
     const offline = state.snapshot?.hosts?.length && state.snapshot.hosts.every((host) => !host.ok && !host.refreshing);
-    const empty = el("div", "empty-list");
-    empty.append(el("p", null, filtered ? "조건에 맞는 작업이 없습니다." : unconfigured
-      ? "연결할 기기가 아직 설정되지 않았습니다. 설치 안내에 따라 기기를 설정한 뒤 새로고침해 주세요." : offline
-      ? "기기에 연결되지 않아 작업을 확인하지 못했습니다. 기기 연결과 에이전트 설치 상태를 확인한 뒤 다시 확인해 주세요."
-      : state.snapshot?.hosts?.some((host) => host.refreshing)
-        ? "기기에서 작업을 확인하고 있습니다…"
-        : "표시할 최근 작업이 없습니다. 설정한 기기에서 Claude Code나 Codex로 대화를 시작한 뒤 새로고침해 주세요. 이전 대화는 필터에서 확인할 수 있습니다."));
-    if (filtered) empty.append(button("검색·필터 초기화", "secondary", () => {
+    const clearAll = () => {
       state.search = "";
+      state.phaseFilter = "";
       for (const key of Object.keys(state.filters)) state.filters[key] = "";
       state.accountFilterRoutes = null;
       $("search").value = "";
       render();
-    }));
-    else if (offline) empty.append(button("다시 확인", "secondary", manualRefresh));
+    };
+    let empty;
+    if (state.phaseFilter && !searching && !filtering) {
+      empty = emptyState("filter", state.phaseFilter === "needs_input" ? "답이 필요한 세션이 없습니다." : "작업 중인 세션이 없습니다.",
+        "다른 세션은 필터를 해제하면 보입니다.", button("필터 해제", "secondary", () => togglePhaseFilter(state.phaseFilter)));
+    } else if (searching || filtering || state.phaseFilter) {
+      empty = emptyState("search", "조건에 맞는 세션이 없습니다.",
+        `${searching ? `‘${state.search}’ 검색. ` : ""}${filtering ? "선택한 필터가 적용되어 있습니다. " : ""}${state.showOld ? "오래된 기록도 포함했습니다." : "3일 지난 대화는 제외되어 있습니다. 필터에서 오래된 기록을 포함할 수 있습니다."}`,
+        button("검색·필터 초기화", "secondary", clearAll));
+    } else if (unconfigured) {
+      empty = emptyState("setup", "연결할 기기가 아직 설정되지 않았습니다.",
+        "설치 안내에 따라 기기를 설정한 뒤 새로고침해 주세요.");
+    } else if (offline) {
+      empty = emptyState("offline", "기기에 연결되지 않아 세션을 확인하지 못했습니다.",
+        "기기 연결과 에이전트 설치 상태를 확인한 뒤 다시 확인해 주세요.", button("다시 확인", "secondary", manualRefresh));
+    } else if (state.snapshot?.hosts?.some((host) => host.refreshing)) {
+      loading = true;
+      empty = skeletonList("기기에서 세션을 확인하고 있습니다…");
+    } else {
+      empty = emptyState("none", "표시할 최근 세션이 없습니다.",
+        "설정한 기기에서 Claude Code나 Codex로 대화를 시작한 뒤 새로고침해 주세요. 3일 지난 대화는 필터에서 볼 수 있습니다.");
+    }
     desired.push(empty);
   }
+  box.setAttribute?.("aria-busy", String(loading));
   placeChildren(box, desired);
   if (focused && visible.has(focused) && document.activeElement !== focused) focused.focus({ preventScroll: true });
   if (typeof scroll === "number") pane.scrollTop = scroll;
 }
+// Empty and loading states of the list: an icon, a short title, what to do,
+// and at most one action.
+function emptyState(kind, title, body = "", action = null) {
+  const box = el("div", `empty-list empty-${kind}`);
+  const icon = el("span", "empty-icon");
+  icon.setAttribute("aria-hidden", "true");
+  box.append(icon, el("p", "empty-title", title));
+  if (body) box.append(el("p", "empty-body", body));
+  if (action) box.append(action);
+  return box;
+}
+function skeletonList(label = "작업을 확인하고 있습니다…") {
+  const wrap = el("div", "skeleton-wrap");
+  const list = el("div", "skeleton-list");
+  list.setAttribute("aria-hidden", "true");
+  for (let index = 0; index < 4; index++) {
+    const item = el("div", "skeleton-card");
+    item.append(el("span"), el("span"), el("span"));
+    list.append(item);
+  }
+  const note = el("p", "sr-only", label);
+  note.setAttribute("role", "status");
+  wrap.append(list, note);
+  return wrap;
+}
+function cardTitle(s) {
+  const rawTitle = cardLine(s.title);
+  return !rawTitle || ["(제목 없음)", "(이름 없음)"].includes(rawTitle) ? "제목 없는 작업" : rawTitle;
+}
+// A card is three short lines (title, a one-line preview, status · agent ·
+// project · time) with a disclosure chevron and an explicit device badge.
+// Account details stay in its accessible name and conversation header. The row holds the card and
+// the action a left swipe reveals.
 function card(s) {
+  const row = el("div", "card-row");
+  row.dataset.sessionKey = s.key;
+  row.dataset.sourceKey = chatKey(sourceOf(s));
+  // Touch shortcut only; the same actions open from a long press, a right
+  // click or the conversation itself, so it stays out of the focus order.
+  const action = button("", "card-swipe-action", () => runSwipeAction(row));
+  action.tabIndex = -1;
+  action.setAttribute("aria-hidden", "true");
   const node = button("", "card", () => {
-    const mounted = [...$("groups").children].some((section) => [...section.children].includes(node));
-    const current = allSessions().find((session) => session.key === node.dataset.sessionKey);
-    if (state.authenticated && mounted && current && chatKey(sourceOf(current)) === node.dataset.sourceKey) select(current.key);
+    if (state.swipeOpen === row) { closeSwipe(row); return; }
+    const mounted = [...$("groups").children].some((section) => [...(section.children || [])].includes(row));
+    const current = allSessions().find((session) => session.key === row.dataset.sessionKey);
+    if (state.authenticated && mounted && current && chatKey(sourceOf(current)) === row.dataset.sourceKey) {
+      if (groupOf(current) === "needs_input") answerOnOpen(current);
+      select(current.key);
+    }
   });
   node.dataset.sessionKey = s.key;
-  node.dataset.sourceKey = chatKey(sourceOf(s));
-  const project = el("span", "card-project");
+  node.dataset.sourceKey = row.dataset.sourceKey;
   const title = el("span", "card-title");
   const snippet = el("span", "card-snippet");
-  const folder = el("span", "card-folder");
   const meta = el("span", "card-meta");
   const badge = el("span", "badge");
   const agent = el("span", "card-agent");
-  const host = el("span", "card-host");
+  const project = el("span", "card-project");
+  const stale = el("span", "stale-tag", "이전 정보");
+  const execution = el("span", "card-execution", "일회성 실행");
   const time = el("span", "card-time");
-  meta.append(badge, agent, host, time);
-  const accountLine = el("span", "card-account-line");
-  const account = el("span", "card-account");
-  const stale = el("span", "stale-tag", "마지막 확인 기준");
-  accountLine.append(account, stale);
-  node.append(project, title, snippet, folder, meta, accountLine);
-  node.cardParts = { project, title, snippet, folder, badge, agent, host, time, accountLine, account, stale };
-  return node;
+  const provenance = el("span", "card-provenance");
+  const device = el("span", "card-device");
+  const deviceIcon = el("span", "card-device-icon");
+  deviceIcon.setAttribute("aria-hidden", "true");
+  deviceIcon.innerHTML = '<svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="2.5" y="3" width="15" height="10.5" rx="1.5"/><path d="M10 13.5V17M6.5 17h7"/></svg>';
+  const host = el("span", "card-device-label");
+  device.append(deviceIcon, host);
+  const initiator = el("span", "card-initiator");
+  provenance.append(device, initiator);
+  const goals = el("span", "card-goals");
+  // A live board terminal of this session (renderTerminalMarks keeps it current).
+  const terminal = terminalMark("card-terminal");
+  meta.append(badge, terminal, agent, execution, project, stale, time);
+  const chevron = el("span", "card-chevron");
+  chevron.setAttribute("aria-hidden", "true");
+  node.append(title, snippet, provenance, goals, meta, chevron);
+  node.cardParts = { title, snippet, badge, terminal, agent, execution, project, stale, time, initiator, host, goals };
+  node.cardRow = row;
+  row.append(action, node);
+  row.card = node;
+  row.swipeAction = action;
+  return row;
 }
 function updateCard(node, s, now, folderHint = "") {
   const p = node.cardParts;
   const write = (target, value) => { if (target.textContent !== value) target.textContent = value; };
   const project = cardProject(s);
   const rawTitle = cardLine(s.title);
-  const title = !rawTitle || ["(제목 없음)", "(이름 없음)"].includes(rawTitle) ? "제목 없는 작업" : rawTitle;
+  const title = cardTitle(s);
   const snippet = cardLine(s.snippet);
   const preview = snippet && snippet !== rawTitle && snippet !== title ? snippet : "";
   const agent = AGENTS[s.agent] || s.agent || "에이전트";
   const host = s.hostLabel || s.host || "기기 확인 필요";
   const account = cardLine(s.account);
-  const [label, tone] = BADGES[s.phase] || [s.phase || "상태 확인 필요", "gray"];
+  const [label, tone] = BADGES[s.runtimeKnown === false ? "unknown" : s.phase] || ["상태 확인 필요", "gray"];
   const time = ago(s.updatedAt, now);
   node.className = `card${state.selected === s.key ? " selected" : ""}`;
   node.setAttribute("aria-pressed", String(state.selected === s.key));
-  node.setAttribute("aria-label", ["프로젝트: " + project, "작업: " + title,
+  node.cardLabel = ["프로젝트: " + project, "작업: " + title,
     preview ? "대화 미리보기: " + preview : "", folderHint ? "작업 폴더: " + folderHint : "",
     label, agent, "기기: " + host, account ? "계정 설정: " + account : "", time,
-    s.stale ? "마지막 확인 기준" : ""].filter(Boolean).join(". "));
+    s.stale ? "마지막 확인 기준" : ""].filter(Boolean).join(". ");
+  markCardTerminal(node, s);
   node.title = `${project}\n${title}`;
-  write(p.project, project); p.project.title = project;
+  const place = folderHint ? `${project} · ${folderHint}` : project;
   write(p.title, title); p.title.title = title;
-  write(p.snippet, preview ? `대화 미리보기 · ${preview}` : ""); p.snippet.hidden = !preview; p.snippet.title = preview;
-  write(p.folder, folderHint ? `작업 폴더 · ${folderHint}` : ""); p.folder.hidden = !folderHint; p.folder.title = folderHint;
+  write(p.snippet, preview); p.snippet.hidden = !preview; p.snippet.title = preview;
   write(p.badge, label); p.badge.className = `badge ${tone}`;
   write(p.agent, agent); p.agent.className = `card-agent ${s.agent}`;
-  write(p.host, host); p.host.title = host;
+  write(p.project, place); p.project.title = place;
   write(p.time, time);
-  write(p.account, account ? `계정 설정 · ${account}` : ""); p.account.title = account; p.account.hidden = !account;
+  write(p.host, host); p.host.title = `기기: ${host}`;
+  write(p.initiator, initiatorLabel(s));
+  p.execution.hidden = !sessionOneShot(s);
+  const linkedGoals = window.SessionholicGoals?.linkedTitles?.(s) || "";
+  write(p.goals, linkedGoals);
+  p.goals.hidden = !linkedGoals;
   p.stale.hidden = !s.stale;
-  p.accountLine.hidden = !account && !s.stale;
+  p.stale.title = s.stale ? "기기에 연결되지 않아 마지막으로 확인한 정보입니다." : "";
+}
+
+// --- Gestures: long press menus and card swipes --------------------------------
+// A long press (or a right click) opens the same action sheet as the visible
+// controls; a left swipe on a card reveals its terminal action. The decisions
+// are pure functions so their timing and angles are testable (thresholds: GESTURE).
+// What a drag is once it passes the slop: "swipe" (sideways: leftward, or
+// either way on an open row), "scroll" (anything steeper, or rightward on a
+// closed row), or null while still undecided.
+function swipeIntent(dx, dy, open = false) {
+  const ax = Math.abs(dx);
+  const ay = Math.abs(dy);
+  if (Math.max(ax, ay) < GESTURE.pressSlopPx) return null;
+  if (ax < ay * GESTURE.swipeRatio) return "scroll";
+  return dx < 0 || open ? "swipe" : "scroll";
+}
+// Where a released swipe settles. offset: px from rest (left is negative);
+// velocity: px/ms (left is negative). "action" runs it (a pull past 60% of
+// the card), "open" keeps the button revealed, "close" springs back.
+function swipeRelease({ offset = 0, velocity = 0, width = 0, reveal = GESTURE.swipeRevealPx } = {}) {
+  const size = Math.max(1, width);
+  if (offset <= -size * GESTURE.swipeActionRatio) return "action";
+  if (velocity > GESTURE.swipeFlickSpeed) return "close";
+  if (offset <= -reveal * 0.5 || (velocity < -GESTURE.swipeFlickSpeed && offset < -GESTURE.pressSlopPx)) return "open";
+  return "close";
+}
+// One press at a time: fires onPress after GESTURE.longPressMs unless the
+// pointer moved past GESTURE.pressSlopPx, lifted or was cancelled (scrolling)
+// first. Mouse buttons use the context menu instead.
+function createLongPress(onPress) {
+  let press = null;
+  const tracker = {
+    start(event, target) {
+      tracker.cancel();
+      if (!target || event?.pointerType === "mouse" || event?.isPrimary === false) return;
+      press = { id: event.pointerId, x: event.clientX, y: event.clientY, target, fired: false };
+      const current = press;
+      press.timer = setTimeout(() => {
+        if (press !== current || current.fired) return;
+        current.fired = true;
+        onPress(current.target, current);
+      }, GESTURE.longPressMs);
+    },
+    move(event) {
+      if (!press || press.fired || event?.pointerId !== press.id) return;
+      if (Math.hypot((event.clientX || 0) - press.x, (event.clientY || 0) - press.y) > GESTURE.pressSlopPx) tracker.cancel();
+    },
+    // True when this press already opened its menu: its click is ignored.
+    end(event) {
+      if (!press || (event && event.pointerId !== press.id)) return false;
+      const fired = press.fired;
+      clearTimeout(press.timer);
+      press = null;
+      return fired;
+    },
+    // Android sends contextmenu for a long press; it opens the menu at once.
+    fire() {
+      if (!press || press.fired) return false;
+      clearTimeout(press.timer);
+      press.fired = true;
+      onPress(press.target, press);
+      return true;
+    },
+    cancel() {
+      if (press) clearTimeout(press.timer);
+      press = null;
+    },
+    get active() {
+      return press;
+    },
+  };
+  return tracker;
+}
+const PRESS_MENU_SKIP = "button:not(.card):not(.tool-group-toggle):not(.tool-item), input, textarea, select, summary";
+// Long press, right click and the context-menu key open `open(row, point)`;
+// the click a long press leaves behind is swallowed.
+function bindPressMenu(root, rowOf, open, { onDown = null, onMove = null, onUp = null } = {}) {
+  const press = createLongPress((row) => {
+    root.pressedAt = Date.now();
+    haptic("select");
+    open(row, null);
+  });
+  root.addEventListener("pointerdown", (event) => {
+    onDown?.(event);
+    // Cards and tool records are buttons that also take a long press (their menu).
+    if (event.target?.closest?.(PRESS_MENU_SKIP)) return;
+    press.start(event, rowOf(event.target));
+  });
+  root.addEventListener("pointermove", (event) => {
+    press.move(event);
+    if (onMove?.(event)) press.cancel();
+  });
+  root.addEventListener("pointerup", (event) => {
+    // `fired`: this press already opened its menu, so it was not a tap.
+    const fired = press.end(event);
+    if (fired) root.pressedAt = Date.now();
+    onUp?.(event, false, fired);
+  });
+  root.addEventListener("pointercancel", (event) => {
+    press.cancel();
+    onUp?.(event, true);
+  });
+  root.addEventListener("contextmenu", (event) => {
+    const row = rowOf(event.target);
+    if (!row) return;
+    if (press.active) {
+      event.preventDefault();
+      if (press.fire()) root.pressedAt = Date.now();
+      return;
+    }
+    if (Date.now() - (root.pressedAt || 0) < 1000) {
+      event.preventDefault();
+      return;
+    }
+    // A text selection keeps the browser's own menu (its copy works on it).
+    const selection = window.getSelection?.();
+    if (selection && !selection.isCollapsed && row.contains?.(selection.anchorNode)) return;
+    event.preventDefault();
+    open(row, { x: event.clientX, y: event.clientY });
+  });
+  root.addEventListener("click", (event) => {
+    // The button a swipe just revealed takes its first tap.
+    if (event.target?.closest?.(".card-swipe-action")) return;
+    if (Date.now() - (root.pressedAt || 0) > 700) return;
+    root.pressedAt = 0;
+    event.preventDefault();
+    event.stopPropagation();
+  }, true);
+  return press;
+}
+
+// Cards: swipe left for the terminal action, long press for all actions.
+function sessionForRow(row) {
+  return row ? allSessions().find((session) => session.key === row.dataset?.sessionKey) || null : null;
+}
+// The alive board terminal that belongs to a session: its attached runtime
+// (nativeSource) first, then the session it was launched from (sourceKey).
+function terminalForSession(s) {
+  if (!s) return null;
+  const key = chatKey(sourceOf(s));
+  const alive = state.terminals.filter((terminal) => terminal && terminal.alive !== false && !terminal.closed);
+  const launchedFrom = (info) => {
+    try {
+      const source = JSON.parse(info.sourceKey || "null");
+      return source && typeof source === "object" ? chatKey(source) : "";
+    } catch {
+      return "";
+    }
+  };
+  return alive.find((terminal) => {
+    const native = terminalInfo(terminal).nativeSource;
+    return native?.host && chatKey(native) === key;
+  }) || alive.find((terminal) => launchedFrom(terminalInfo(terminal)) === key) || null;
+}
+// "터미널 열림": the list chip's terminal glyph with a green dot. Hidden until the
+// session has a live board terminal (terminalForSession).
+function terminalMark(className) {
+  const mark = el("span", `terminal-mark ${className}`);
+  const icon = el("span", "terminal-mark-icon", "›_");
+  icon.setAttribute("aria-hidden", "true");
+  mark.append(icon, el("span", "terminal-mark-label", "터미널 열림"));
+  mark.hidden = true;
+  return mark;
+}
+function markCardTerminal(node, s) {
+  const mark = node?.cardParts?.terminal;
+  if (!mark) return;
+  const terminal = terminalForSession(s);
+  const open = !!terminal;
+  const label = terminalEstimated(terminal) ? "터미널 연결 추정" : "터미널 열림";
+  const text = mark.querySelector?.(".terminal-mark-label");
+  if (text) text.textContent = label;
+  if (mark.hidden !== !open) mark.hidden = !open;
+  if (typeof node.cardLabel === "string")
+    node.setAttribute("aria-label", open ? `${node.cardLabel}. ${label}` : node.cardLabel);
+}
+function terminalEstimated(terminal) {
+  if (!terminal) return false;
+  const info = terminalInfo(terminal);
+  return info.linkConfidence === "estimated" || (info.mode === "new-session" && info.nativeSource && info.linkConfidence !== "exact");
+}
+// The terminal list changed (a read, an open or a close here, or a live update):
+// mounted cards and the open conversation's header follow without a full render.
+function renderTerminalMarks() {
+  const sessions = new Map(allSessions().map((s) => [s.key, s]));
+  for (const section of $("groups")?.children || [])
+    for (const row of section.children || [])
+      if (row.card?.cardParts) markCardTerminal(row.card, sessions.get(row.dataset?.sessionKey));
+  const selected = sessions.get(state.selected);
+  if (selected) renderDetailTerminal(selected);
+}
+function renderDetailTerminal(s) {
+  if (!s || $("detail").dataset?.key !== s.key) return;
+  const box = $("detail-terminal");
+  if (!box) return;
+  const terminal = terminalForSession(s);
+  box.hidden = !terminal;
+  const mark = box.querySelector?.(".terminal-mark-label");
+  if (mark) mark.textContent = terminalEstimated(terminal) ? "터미널 연결 추정" : "터미널 열림";
+  box.title = terminalEstimated(terminal) ? "시작 시각으로 추정한 연결입니다. 터미널의 대화가 맞는지 확인해 주세요." : "";
+  $("detail-terminal-open")?.setAttribute("aria-label",
+    terminal ? `열린 터미널로 가기: ${terminalTitle(terminal, s.title || "열어 둔 터미널")}` : "열린 터미널로 가기");
+}
+// "터미널로" in the conversation header: the terminal is looked up again on the
+// tap, so one closed meanwhile is never opened (the header just hides it).
+function goToSessionTerminal(key) {
+  const s = selectedSession();
+  if (!s || s.key !== key || state.launchBusy || !state.authenticated) return;
+  const terminal = terminalForSession(s);
+  if (!terminal) {
+    renderDetailTerminal(s);
+    return;
+  }
+  openTerminal(terminal);
+}
+function openSessionTerminal(s) {
+  if (!s || state.launchBusy || !state.authenticated) return;
+  if (sessionOneShot(s)) { select(s.key); toast(ONE_SHOT_NO_INPUT); return; }
+  const terminal = terminalForSession(s);
+  if (terminal) {
+    openTerminal(terminal);
+    return;
+  }
+  // Opening a new terminal is reviewed from the conversation (plan sheet).
+  if (state.selected !== s.key) select(s.key);
+  const current = selectedSession();
+  if (current?.key === s.key) openChatTerminal(current);
+}
+function swipeActionFor(s) {
+  if (sessionOneShot(s)) return { kind: "manage", label: "세션 관리", s };
+  const terminal = terminalForSession(s);
+  if (!terminal) return { kind: "open", label: "터미널 열기", s };
+  const copy = terminalCloseCopy(terminal);
+  return { kind: "close", label: copy.action, danger: copy.danger, terminal, s };
+}
+function setSwipeOffset(row, px) {
+  row?.style?.setProperty?.("--swipe-x", `${Math.round(px)}px`);
+  if (row) row.swipeOffset = px;
+}
+function prepareSwipe(row) {
+  const action = swipeActionFor(sessionForRow(row));
+  row.pendingSwipe = action;
+  row.swipeAction.textContent = action.label;
+  row.swipeAction.className = `card-swipe-action ${action.kind === "close" ? `is-close${action.danger ? " is-danger" : ""}` : "is-open"}`;
+  setClass(row, "is-swiping", true);
+}
+function closeSwipe(row = state.swipeOpen) {
+  if (!row) return;
+  setSwipeOffset(row, 0);
+  setClass(row, "is-swiping", false);
+  setClass(row, "is-open", false);
+  if (state.swipeOpen === row) state.swipeOpen = null;
+}
+function settleSwipe(row, outcome) {
+  setClass(row, "is-swiping", false);
+  if (outcome === "open") {
+    if (state.swipeOpen && state.swipeOpen !== row) closeSwipe();
+    setSwipeOffset(row, -GESTURE.swipeRevealPx);
+    setClass(row, "is-open", true);
+    state.swipeOpen = row;
+    haptic("select");
+    return;
+  }
+  closeSwipe(row);
+  if (outcome === "action") runSwipeAction(row);
+}
+function runSwipeAction(row) {
+  const action = row.pendingSwipe || swipeActionFor(sessionForRow(row));
+  row.pendingSwipe = null;
+  closeSwipe(row);
+  if (!action?.s || !state.authenticated) return;
+  haptic("select");
+  if (action.kind === "close") closeTerminal(action.terminal.id);
+  else if (action.kind === "manage") manageSession(action.s);
+  else openSessionTerminal(action.s);
+}
+function cardActions(s) {
+  const terminal = terminalForSession(s);
+  const actions = [
+    { label: "대화 열기", run: () => select(s.key) },
+    { label: "세션 관리", run: () => manageSession(s) },
+  ];
+  if (window.SessionholicLabels?.eligible?.(s)) actions.push({ label: "제목 수정", run: () => window.SessionholicLabels.open(s, document.activeElement) });
+  if (!sessionOneShot(s)) actions.push({ label: terminal ? "터미널로 돌아가기" : "터미널 열기", run: () => openSessionTerminal(s), disabled: state.launchBusy });
+  if (terminal) {
+    const copy = terminalCloseCopy(terminal);
+    actions.push({ label: copy.action, danger: copy.danger, run: () => closeTerminal(terminal.id) });
+  }
+  return actions;
+}
+function openCardMenu(row, at = null) {
+  const s = sessionForRow(row);
+  if (!s || !state.authenticated) return;
+  closeSwipe();
+  openActionSheet({ eyebrow: cardProject(s), title: cardTitle(s), actions: cardActions(s), at, trigger: row.card });
+}
+function bindCardGestures(root) {
+  let drag = null;
+  const rowOf = (target) => {
+    const row = target?.closest?.(".card-row");
+    return row?.card ? row : null;
+  };
+  bindPressMenu(root, rowOf, openCardMenu, {
+    onDown(event) {
+      const row = rowOf(event.target);
+      if (state.swipeOpen && state.swipeOpen !== row) closeSwipe();
+      drag = null;
+      if (!row || event.pointerType === "mouse" || event.target?.closest?.(".card-swipe-action")) return;
+      drag = { row, id: event.pointerId, x: event.clientX, y: event.clientY, intent: null, offset: 0,
+        base: state.swipeOpen === row ? -GESTURE.swipeRevealPx : 0, samples: [[Date.now(), event.clientX]] };
+    },
+    // Returns true once the drag is a swipe, which ends the long press.
+    onMove(event) {
+      if (!drag || event.pointerId !== drag.id) return false;
+      const dx = event.clientX - drag.x;
+      const dy = event.clientY - drag.y;
+      if (!drag.intent) {
+        drag.intent = swipeIntent(dx, dy, drag.base !== 0);
+        if (drag.intent === "scroll") {
+          drag = null;
+          return false;
+        }
+        if (drag.intent !== "swipe") return false;
+        prepareSwipe(drag.row);
+        root.swiping = true;
+      }
+      // Never right of rest; past the card's width the pull resists.
+      const raw = Math.min(0, drag.base + dx);
+      const width = drag.row.offsetWidth || 360;
+      drag.offset = raw < -width * 0.75 ? -width * 0.75 - Math.sqrt(-raw - width * 0.75) * 4 : raw;
+      drag.samples.push([Date.now(), event.clientX]);
+      if (drag.samples.length > 6) drag.samples.shift();
+      setSwipeOffset(drag.row, drag.offset);
+      if (event.cancelable) event.preventDefault();
+      return true;
+    },
+    onUp(event, cancelled) {
+      const current = drag;
+      if (!current || event.pointerId !== current.id) return;
+      drag = null;
+      root.swiping = false;
+      if (current.intent !== "swipe") return;
+      root.pressedAt = Date.now(); // the click after a swipe never opens the card
+      root.swiping = false;
+      const now = Date.now();
+      const recent = current.samples.filter(([time]) => now - time < 120);
+      const velocity = recent.length >= 2
+        ? (recent[recent.length - 1][1] - recent[0][1]) / Math.max(1, recent[recent.length - 1][0] - recent[0][0]) : 0;
+      settleSwipe(current.row, cancelled ? "close"
+        : swipeRelease({ offset: current.offset, velocity, width: current.row.offsetWidth || 360 }));
+    },
+  });
+  // Once a drag is a swipe, the list does not also scroll under the finger.
+  root.addEventListener("touchmove", (event) => {
+    if (root.swiping && event.cancelable) event.preventDefault();
+  }, { passive: false });
+}
+
+// --- Action sheet (menus) -------------------------------------------------------
+// One sheet serves every menu: a bottom sheet on phones, a small popover at
+// the pointer for a right click on wider screens.
+function openActionSheet({ eyebrow = "", title = "", preview = "", actions = [], at = null, trigger = null } = {}) {
+  const dialog = $("action-sheet");
+  if (!dialog || !actions.length) return;
+  if (dialog.open) dialog.close();
+  $("action-eyebrow").textContent = eyebrow;
+  $("action-title").textContent = title;
+  const previewNode = $("action-preview");
+  previewNode.textContent = preview;
+  previewNode.hidden = !preview;
+  const items = actions.map((action) => {
+    const item = button(action.label, `action-item${action.danger ? " danger" : ""}`, (event) => {
+      if (item.disabled || !menuItemPressed(dialog, item, event)) return;
+      closeActionSheet({ restoreFocus: false });
+      action.run();
+    });
+    item.disabled = !!action.disabled;
+    return item;
+  });
+  $("action-list").replaceChildren(...items);
+  state.actionTrigger = trigger;
+  const popover = !!at && !phoneLayout();
+  setClass(dialog, "is-popover", popover);
+  if (dialog.style) {
+    const width = window.innerWidth || 0;
+    const height = window.innerHeight || 0;
+    dialog.style.left = popover ? `${Math.round(Math.max(8, Math.min(at.x, width - 268)))}px` : "";
+    dialog.style.top = popover ? `${Math.round(Math.max(8, Math.min(at.y, height - 96 - 46 * items.length)))}px` : "";
+  }
+  sheet("action-sheet").open();
+}
+// A pointer click runs a menu item only when its press started on that item
+// after the menu opened. The finger that opened the menu by a long press
+// lifts over it (a centered menu on wide screens sits right under it) and
+// must run nothing. A keyboard's click (Enter, Space) has no pointer: detail 0.
+function menuItemPressed(dialog, item, event) {
+  if (!event?.detail) return true;
+  const target = dialog?.bottomSheet?.pressedSinceOpen ? dialog.bottomSheet.pressTarget : null;
+  return !!target && (target === item || !!item.contains?.(target));
+}
+function closeActionSheet({ restoreFocus = true } = {}) {
+  const dialog = $("action-sheet");
+  if (dialog?.open) dialog.close();
+  const trigger = state.actionTrigger;
+  state.actionTrigger = null;
+  if (restoreFocus && trigger && trigger.isConnected !== false) trigger.focus?.({ preventScroll: true });
+}
+
+// Original execution controls are separate from closing the board's attached terminal.
+let sessionControl = null;
+function closeSessionControl(force = false) {
+  if (!force && sessionControl?.busy) return;
+  const previous = sessionControl;
+  sessionControl = null;
+  const dialog = $("session-control-dialog");
+  if (dialog?.open) dialog.close();
+  const handle = dialog?.querySelector?.(".sheet-handle");
+  dialog?.replaceChildren(...(handle ? [handle] : []));
+  if (!force) previous?.trigger?.focus?.({ preventScroll: true });
+}
+async function manageSession(s, trigger = null) {
+  if (!s || !state.authenticated || sessionControl?.busy) return;
+  const bot = botRequestForNative(sourceOf(s));
+  if (bot) { selectBotRequest(botRequestKey(bot)); return; }
+  closeSessionControl(true);
+  let dialog = $("session-control-dialog");
+  if (!dialog) {
+    dialog = el("dialog", "plan-dialog session-control-dialog"); dialog.id = "session-control-dialog";
+    dialog.setAttribute("aria-labelledby", "session-control-title");
+    dialog.addEventListener("cancel", (event) => { event.preventDefault(); closeSessionControl(); });
+    document.body.append(dialog);
+  }
+  const source = sourceOf(s);
+  if (!source.id && s.agent === "claude" && s.kind === "interactive" && /^[0-9A-Za-z-]{8,64}$/.test(s.sessionId || "")) source.id = s.sessionId;
+  const context = { source, s, trigger, authEpoch: state.authEpoch, busy: false, preview: null, used: false };
+  sessionControl = context;
+  const top = el("div", "dialog-top");
+  const title = el("h2", "", "세션 관리"); title.id = "session-control-title";
+  const close = button("닫기", "secondary", () => closeSessionControl()); close.id = "session-control-close";
+  top.append(title, close);
+  const body = el("div", "dialog-body session-control-body");
+  const name = el("h3", "", cardTitle(s));
+  body.append(name, el("p", "muted", `${s.hostLabel || s.host} · ${s.agent === "claude" ? "Claude" : "Codex"}`));
+  const status = el("p", "session-control-status", "현재 실행 상태를 확인하고 있습니다…");
+  status.id = "session-control-status"; status.setAttribute("role", "status");
+  body.append(status);
+  const actions = el("div", "session-control-actions");
+  for (const [action, label, explanation] of [
+    ["interrupt", "응답 중단", "현재 생성 중인 응답을 멈춥니다. 대화 기록은 유지됩니다."],
+    ["terminate", "실행 종료", "이 세션의 원본 실행을 끝냅니다. 대화 기록은 남습니다."],
+  ]) {
+    const row = el("div", "session-control-row");
+    const actionButton = button(label, action === "terminate" ? "secondary danger" : "secondary", () => confirmSessionAction(context, action));
+    actionButton.id = `session-control-${action}`; actionButton.disabled = true;
+    const reason = el("p", "muted", explanation); reason.id = `session-control-${action}-reason`;
+    row.append(actionButton, reason); actions.append(row);
+  }
+  const archive = button("작업 보관", "secondary", () => archiveSessionWork(context, true));
+  archive.id = "session-control-archive";
+  actions.append(archive, el("p", "muted", "이 세션의 작업 카드를 보관합니다. 실행은 계속됩니다."));
+  body.append(actions);
+  const confirmation = el("div", "session-control-confirmation"); confirmation.id = "session-control-confirmation"; confirmation.hidden = true;
+  body.append(confirmation); dialog.append(top, body);
+  sheet(dialog.id).open();
+  try {
+    const result = await api("/api/session/preview", { method: "POST", body: { source: context.source }, authEpoch: context.authEpoch });
+    if (sessionControl !== context) return;
+    context.preview = result;
+    status.textContent = "이 세션에서 사용할 동작을 선택하세요.";
+    for (const action of ["interrupt", "terminate"]) {
+      const capability = result.capabilities?.[action];
+      $(`session-control-${action}`).disabled = !capability?.supported;
+      if (!capability?.supported) $(`session-control-${action}-reason`).textContent = capability?.reason || "현재 실행에서 지원하지 않습니다.";
+      else if (capability.effect) $(`session-control-${action}-reason`).textContent = capability.effect;
+    }
+  } catch (err) {
+    if (sessionControl === context && !err.staleAuth && !err.unauthorized) status.textContent = err.message || "실행 상태를 확인하지 못했습니다.";
+  }
+}
+function confirmSessionAction(context, action) {
+  if (sessionControl !== context || context.busy || context.used || !context.preview?.capabilities?.[action]?.supported) return;
+  const confirmation = $("session-control-confirmation"); confirmation.hidden = false;
+  const label = action === "terminate" ? "실행 종료" : "응답 중단";
+  const confirm = button(label, "primary", () => executeSessionAction(context, action));
+  confirm.id = "session-control-confirm";
+  const effect = context.preview.capabilities[action].effect || (action === "terminate" ? "이 세션의 원본 실행을 끝냅니다. 대화 기록은 남습니다." : "현재 생성 중인 응답을 멈춥니다. 대화 기록은 유지됩니다.");
+  confirmation.replaceChildren(el("p", "", `${cardTitle(context.s)} · ${context.s.hostLabel || context.s.host}: ${effect}`),
+    confirm, button("취소", "secondary", () => { confirmation.hidden = true; }));
+  confirm.focus();
+}
+function sessionControlBusy(context, busy) {
+  context.busy = busy;
+  for (const item of $("session-control-dialog").querySelectorAll("button")) item.disabled = busy;
+  if (!busy) for (const action of ["interrupt", "terminate"])
+    $(`session-control-${action}`).disabled = context.used || !context.preview?.capabilities?.[action]?.supported;
+}
+async function executeSessionAction(context, action) {
+  if (sessionControl !== context || context.busy || context.used) return;
+  context.used = true;
+  sessionControlBusy(context, true);
+  $("session-control-status").textContent = "요청 결과를 확인하고 있습니다…";
+  try {
+    const result = await api("/api/session/action", { method: "POST", body: { source: context.source, action,
+      targetProof: context.preview.targetProof, requestId: requestId() }, authEpoch: context.authEpoch, csrfRetry: false });
+    if (sessionControl !== context) return;
+    $("session-control-status").textContent = result.confirmed === true
+      ? (action === "terminate" ? "이 세션의 실행 종료를 확인했습니다. 기록은 남아 있습니다." : "현재 응답이 중단된 것을 확인했습니다.")
+      : result.reason || "처리 결과를 확인하지 못했습니다. 실행 상태를 다시 확인해 주세요. 자동으로 재요청하지 않습니다.";
+    if (result.confirmed === true) {
+      await window.SessionholicGoals?.refresh?.();
+      poll(false);
+    }
+  } catch (err) {
+    if (sessionControl === context && !err.staleAuth && !err.unauthorized)
+      $("session-control-status").textContent = "처리 결과를 확인하지 못했습니다. 실행 상태를 다시 확인해 주세요. 요청을 자동으로 다시 보내지 않습니다.";
+  } finally {
+    if (sessionControl === context) {
+      $("session-control-confirmation").hidden = true;
+      sessionControlBusy(context, false);
+    }
+  }
+}
+async function archiveSessionWork(context, archived) {
+  if (sessionControl !== context || context.busy) return;
+  sessionControlBusy(context, true);
+  try {
+    await api("/api/session/archive", { method: "POST", body: { source: context.source, archived }, authEpoch: context.authEpoch });
+    if (sessionControl !== context) return;
+    $("session-control-status").textContent = archived ? "작업을 보관했습니다. 세션 실행은 계속됩니다." : "작업을 복원했습니다.";
+    const archive = $("session-control-archive");
+    const replacement = button(archived ? "보관 되돌리기" : "작업 보관", "secondary", () => archiveSessionWork(context, !archived));
+    replacement.id = archive.id; archive.replaceWith(replacement);
+    await window.SessionholicGoals?.refresh?.();
+  } catch (err) {
+    if (sessionControl === context && !err.staleAuth && !err.unauthorized) $("session-control-status").textContent = err.message;
+  } finally { if (sessionControl === context) sessionControlBusy(context, false); }
 }
 
 function focusDetailBack() {
   $("detail").querySelector(".back")?.focus({ preventScroll: true });
 }
 function restoreSelectedCardFocus() {
-  const card = [...$("groups").querySelectorAll(".card")].find((node) => node.dataset.sessionKey === state.selected);
+  const card = state.selectedBotRequest
+    ? [...$("groups").querySelectorAll(".bot-request-card")].find((node) => node.dataset.botRequestKey === state.selectedBotRequest)
+    : [...$("groups").querySelectorAll(".card")].find((node) => node.dataset.sessionKey === state.selected);
   (card || $("home")).focus({ preventScroll: true });
+}
+function rememberConversationView() {
+  const session = selectedSession();
+  const list = $("messages");
+  if (!session || !list || !list.conversationSource || !list.clientHeight || list.pendingView) return;
+  const pinned = pinnedToEnd(list);
+  let anchor = null;
+  let occurrence = 0;
+  let offset = 0;
+  for (const item of list.conversationRows || []) {
+    const box = rowBox(list, item.row);
+    if (box && box.top + box.height > list.scrollTop) {
+      anchor = item.key;
+      const rows = list.conversationRows || [];
+      occurrence = rows.slice(rows.indexOf(item) + 1).filter((row) => row.key === item.key).length;
+      offset = box.top - list.scrollTop;
+      break;
+    }
+  }
+  state.conversationViews.set(conversationIdentity(session), {
+    chromeVisible: state.chromeVisible, pinned, top: list.scrollTop, anchor, occurrence, offset,
+  });
+}
+function restoreConversationView(list) {
+  const view = list.pendingView;
+  if (!view || !list.conversationRows?.length || !list.clientHeight) return;
+  list.pendingView = null;
+  list.pinned = view.pinned;
+  const matches = list.conversationRows.filter((item) => item.key === view.anchor);
+  const item = matches[Math.max(0, matches.length - 1 - (view.occurrence || 0))];
+  const box = item && rowBox(list, item.row);
+  setMessagesScroll(list, view.pinned ? list.scrollHeight : box ? box.top - view.offset : view.top);
 }
 function select(key) {
   if (state.launchBusy) return;
-  const mobile = window.matchMedia("(max-width: 700px)").matches;
-  if (
-    window.matchMedia("(max-width: 700px)").matches &&
-    !document.body.classList.contains("show-detail")
-  )
-    navigateView("detail");
+  if (state.selected !== key) rememberConversationView();
+  const target = allSessions().find((session) => session.key === key);
+  const bot = target && botRequestForNative(sourceOf(target));
+  if (bot) { selectBotRequest(botRequestKey(bot)); return; }
+  state.selectedBotRequest = null;
+  const listChanged = target && prepareSessionListFor(target);
+  if (listChanged && state.selected === key) renderSessionList(allSessions(), state.snapshot?.serverTime || Date.now() / 1000);
+  const mobile = phoneLayout();
+  const entering = mobile && !state.detailShown;
+  if (entering) navigateView("detail");
   if (state.selected === key) {
-    document.body.classList.add("show-detail");
-    if (mobile) focusDetailBack();
+    // Moving this retained DOM through a hidden goal/session pane can reset its
+    // scrollTop. Reapply the saved view only when reopening, not on a live click.
+    if (!state.detailShown) {
+      const list = $("messages");
+      const session = selectedSession();
+      const savedView = session && state.conversationViews.get(conversationIdentity(session));
+      if (list && savedView) {
+        list.pendingView = savedView;
+        list.pinned = savedView.pinned;
+        setChromeVisible(savedView.chromeVisible);
+      }
+    }
+    setDetailShown(true, { direction: entering ? "push" : null, focus: mobile });
     return;
   }
-  closeChatQueue(false);
+  haptic("select");
   state.selected = key;
   stopChatPolling();
   state.detailFor = null;
   state.route = null;
-  document.body.classList.add("show-detail");
+  // The conversation read that render() starts checks this, so it is set
+  // first; setDetailShown then switches the screen (and syncs live updates).
+  const wasShown = state.detailShown;
+  state.detailShown = true;
   render();
-  if (mobile) focusDetailBack();
+  state.detailShown = wasShown;
+  setDetailShown(true, { direction: entering ? "push" : null, focus: mobile });
+}
+function detailRevision(s) {
+  return JSON.stringify([s.stale, s.phase, s.title, s.project, s.account, s.hostLabel, s.fetchedAt,
+    s.cwd || null, s.sessionId || null, s.runtimeKnown, s.readOnly, s.initiator, s.initiatorName, s.initiatorEvidence, s.parentSessionId,
+    s.executionMode, s.transcriptAvailability, s.historyNotice]);
 }
 function refreshDetail(s) {
-  const revision = JSON.stringify([s.stale, s.phase, s.title, s.project, s.account, s.hostLabel, s.fetchedAt,
-    s.cwd || null, s.sessionId || null]);
+  const revision = detailRevision(s);
   if (
     state.detailFor === s.key &&
     state.detailUpdatedAt === s.updatedAt &&
@@ -599,18 +2224,18 @@ function refreshDetail(s) {
   loadDetail(s, fresh);
 }
 function detailMetaChildren(s) {
-  const [label, tone] = BADGES[s.phase] || [s.phase || "상태 확인 필요", "gray"];
+  const [label, tone] = BADGES[s.runtimeKnown === false ? "unknown" : s.phase] || ["상태 확인 필요", "gray"];
   return [el("span", `badge ${tone}`, label),
     el("span", null, [AGENTS[s.agent], s.account, s.hostLabel].filter(Boolean).join(" · ")),
-    el("span", null, clock(s.updatedAt))];
+    el("span", null, initiatorLabel(s)), ...(sessionOneShot(s) ? [el("span", "detail-execution", "일회성 실행")] : []), el("span", null, clock(s.updatedAt))];
 }
 function patchDetailMetadata(s) {
   const pane = $("detail");
   if (pane.dataset.key !== s.key) return;
   const title = pane.querySelector(".detail-title");
-  const eyebrow = pane.querySelector(".detail-titles .eyebrow");
+  const eyebrow = pane.querySelector(".detail-project");
   if (title) title.textContent = s.title || "제목 없는 작업";
-  if (eyebrow) eyebrow.textContent = s.project || "RECENT CONVERSATION";
+  if (eyebrow) eyebrow.textContent = s.project || "";
   pane.querySelector(".detail-meta")?.replaceChildren(...detailMetaChildren(s));
   let note = pane.querySelector(".stale-notice");
   if (s.stale) {
@@ -622,6 +2247,7 @@ function patchDetailMetadata(s) {
   } else note?.remove();
   const route = pane.querySelector(".chat-route");
   if (route) route.textContent = `${s.hostLabel || s.host} · ${AGENTS[s.agent] || s.agent} · ${sessionAccountLabel(s)}`;
+  renderDetailTerminal(s);
 }
 async function loadDetail(s, fresh = false) {
   const run = ++state.detailRun;
@@ -632,6 +2258,13 @@ async function loadDetail(s, fresh = false) {
   const viewCurrent = () => run === state.detailRun && authEpoch === state.authEpoch &&
     state.authenticated && state.selected === s.key && conversationIdentity(selectedSession()) === identity &&
     stateEpoch === entry.stateEpoch;
+  if (claudeWithoutId(s) && !s.sessionId) {
+    // Nothing to read yet: one notice, no request that can only fail.
+    renderMessages(s, [], "", fresh);
+    conversationSyncNotice(s, "");
+    updateChatComposer(entry);
+    return;
+  }
   const cached = entry.conversation;
   const usableCache = cached && cached.authEpoch === authEpoch && cached.identity === identity;
   if (usableCache) {
@@ -660,7 +2293,10 @@ async function loadDetail(s, fresh = false) {
     if (entry.conversation !== fallbackSnapshot && chatReadSupported(entry)) return;
     const messages = data.messages || [];
     rememberConversation(s, messages, data);
-    renderMessages(s, messages, data.error || "", fresh && !usableCache);
+    if (!data.error && data.executionMode === "one-shot" && entry.error !== entry.inputError) entry.error = "";
+    // The host said its daemon is off even if the list read just before did not.
+    const shown = data.code === "app_server_off" ? { ...s, appServer: "off" } : s;
+    renderMessages(shown, messages, data.error || "", fresh && !usableCache);
     updateReadNotice(data);
     conversationSyncNotice(s, data.error ? "failed" : data.stale ? "stale" : "");
   } catch (err) {
@@ -677,17 +2313,38 @@ function drawDetail(s) {
   pane.replaceChildren();
   pane.dataset.key = s.key;
   const head = el("div", "detail-head");
-  head.append(button("←", "back", backToList));
+  const back = button("←", "back", backToList);
+  back.setAttribute("aria-label", "대화에서 돌아가기");
+  head.append(back);
   const titles = el("div", "detail-titles");
   titles.append(
-    el("p", "eyebrow", s.project || "RECENT CONVERSATION"),
     el("h1", "detail-title", s.title || "제목 없는 작업"),
+    el("span", "detail-device", s.hostLabel || s.host || "기기 미확인"),
+    el("span", "detail-project", s.project || ""),
   );
   const meta = el("div", "detail-meta");
   meta.append(...detailMetaChildren(s));
-  titles.append(meta);
+  // Shown while this session has a live board terminal (renderDetailTerminal);
+  // without one, the composer's own "터미널 열기" stays the way to open it.
+  const terminal = el("div", "detail-terminal");
+  terminal.id = "detail-terminal";
+  terminal.hidden = true;
+  const goTerminal = button("터미널로", "detail-terminal-open", () => goToSessionTerminal(s.key));
+  goTerminal.id = "detail-terminal-open";
+  const mark = terminalMark("detail-terminal-mark");
+  mark.hidden = false;
+  terminal.append(mark, goTerminal);
+  titles.append(meta, terminal);
   head.append(titles);
+  const focusToggle = button("집중 모드", "focus-toggle quiet", toggleChrome);
+  focusToggle.id = "focus-toggle";
+  // Keep the keyboard and compact header still until the click lands.
+  focusToggle.addEventListener("pointerdown", (event) => event.preventDefault());
+  focusToggle.setAttribute("aria-pressed", "false");
+  head.append(focusToggle);
+  window.SessionholicGoals?.attachSessionDetail?.(s, head);
   pane.append(head);
+  renderDetailTerminal(s);
   if (s.stale)
     pane.append(
       el(
@@ -697,22 +2354,441 @@ function drawDetail(s) {
       ),
     );
   const bar = el("div", "conversation-bar");
-  bar.append(
-    el("strong", null, "최근 대화"),
-    button("맨 아래 ↓", "", () => {
-      const list = $("messages");
-      list.scrollTop = list.scrollHeight;
-    }),
-  );
+  const conversationActions = el("div", "conversation-actions");
+  const manage = button("세션 관리", "", (event) => {
+    if (state.authenticated && state.selected === s.key) manageSession(s, event.currentTarget);
+  });
+  manage.id = "detail-manage-session";
+  if (window.SessionholicLabels?.eligible?.(s)) {
+    const editTitle = button("제목 수정", "", (event) => {
+      if (state.selected === s.key) window.SessionholicLabels.open(selectedSession() || s, event.currentTarget);
+    });
+    editTitle.id = "detail-edit-title";
+    conversationActions.append(editTitle);
+  }
+  conversationActions.append(manage, button("맨 아래 ↓", "", () => scrollMessagesToEnd()));
+  bar.append(el("strong", null, "최근 대화"), conversationActions);
   const list = el("div", "messages");
   list.id = "messages";
+  const savedView = state.conversationViews.get(conversationIdentity(s));
+  list.pendingView = savedView || null;
+  list.pinned = savedView ? savedView.pinned : true;
+  list.lastScrollTop = 0;
+  observeMessages(list);
   list.setAttribute("aria-label", "최근 대화 읽기");
   list.append(el("p", "group-empty", "대화를 불러오고 있습니다…"));
   const sync = el("p", "conversation-sync-notice");
   sync.id = "conversation-sync-notice";
   sync.hidden = true;
   sync.setAttribute("role", "status");
-  pane.append(bar, sync, list, buildChatComposer(s), buildContinuePanel(s));
+  const jump = button("↓", "jump-bottom", () => scrollMessagesToEnd());
+  jump.id = "jump-bottom";
+  jump.hidden = true;
+  jump.setAttribute("aria-label", "대화 맨 아래로");
+  list.addEventListener("scroll", () => readingScroll(list), { passive: true });
+  bindMessageGestures(list);
+  state.chromeVisible = savedView ? savedView.chromeVisible : true;
+  pane.classList?.remove("is-reading");
+  pane.classList?.remove("is-typing");
+  // Shown once, the first time scrolling hides the bars on a phone.
+  const hint = el("p", "tap-hint", "화면을 탭하면 메뉴가 나타나요");
+  hint.id = "tap-hint";
+  hint.hidden = true;
+  hint.setAttribute("role", "status");
+  const prompt = el("section", "chat-prompt");
+  prompt.id = "chat-prompt";
+  prompt.hidden = true;
+  prompt.setAttribute("aria-live", "polite");
+  pane.append(bar, sync, list, jump, hint, prompt, buildChatComposer(s), buildContinuePanel(s));
+  setChromeVisible(state.chromeVisible);
+}
+// Questions and approvals drawn by the CLI in the board's terminal, answered
+// here with the same keys a person would press. Nothing is sent until the
+// second, explicit tap, and the server rechecks the exact menu first.
+const AGENT_NAMES = { claude: "Claude", codex: "Codex" };
+const PROMPT_INLINE_OPTIONS = 4;
+function renderPrompt(s, data) {
+  const card = $("chat-prompt");
+  if (!card || !currentChat(chatEntry(s))) return;
+  const entry = chatEntry(s);
+  const prompt = data?.prompt && Array.isArray(data.prompt.options) && data.prompt.options.length ? data.prompt : null;
+  const openable = !prompt && data?.promptOpenable === true && data?.phase === "needs_input";
+  const asked = state.answerOnOpen;
+  if (asked?.key === s.key && (prompt || Date.now() > asked.until)) state.answerOnOpen = null;
+  else if (asked?.key === s.key && openable && !entry.promptBusy && !entry.promptNote && !networkOffline()) {
+    state.answerOnOpen = null;
+    Promise.resolve().then(() => promptAction(s, { action: "open" }));
+  }
+  if (!prompt && !openable) {
+    card.hidden = true;
+    card.chooseNumber = null;
+    card.dataset.fingerprint = "";
+    card.dataset.question = "";
+    entry.promptChoice = null;
+    // A note belongs to the question it was written for.
+    entry.promptNote = "";
+    return;
+  }
+  const question = prompt ? prompt.fingerprint : "open";
+  if (card.dataset.question && card.dataset.question !== question) entry.promptNote = "";
+  const revision = prompt ? `${prompt.fingerprint}|${prompt.current}|${entry.promptChoice?.number || ""}|${entry.promptBusy ? 1 : 0}|${entry.promptNote || ""}`
+    : `open|${entry.promptBusy ? 1 : 0}|${entry.promptNote || ""}`;
+  // A question that just appeared (or a different one) must not be missed:
+  // the bars come back. Re-renders of the same question leave them alone.
+  const appeared = card.hidden || card.dataset.question !== question;
+  card.hidden = false;
+  card.dataset.question = question;
+  if (appeared) revealChrome();
+  if (card.dataset.fingerprint === revision) return;
+  card.dataset.fingerprint = revision;
+  if (entry.promptChoice && entry.promptChoice.fingerprint !== prompt?.fingerprint) entry.promptChoice = null;
+  // The choice that had the keyboard focus keeps it across this redraw (or the one an arrow moved to).
+  const focusedNumber = Number(document.activeElement?.dataset?.promptNumber) || null;
+  const focusNumber = entry.promptFocus ?? focusedNumber;
+  entry.promptFocus = null;
+  const head = el("div", "chat-prompt-head");
+  head.append(el("strong", null, prompt ? `${AGENT_NAMES[prompt.agent] || "에이전트"}가 답을 기다려요` : "답이 필요한 상태입니다"));
+  const terminal = button("터미널", "chat-prompt-terminal", () => openChatTerminal(s));
+  head.append(terminal);
+  const nodes = [head];
+  if (!prompt) {
+    card.chooseNumber = null;
+    nodes.push(el("p", "chat-prompt-note", "질문 화면을 불러오면 여기서 바로 고를 수 있습니다."));
+    const open = button(entry.promptBusy ? "불러오는 중…" : "질문 불러오기", "primary", () => promptAction(s, { action: "open" }));
+    open.disabled = !!entry.promptBusy || networkOffline();
+    nodes.push(open);
+    // Why the last "질문 불러오기" did not work.
+    if (entry.promptNote) nodes.push(el("p", "chat-prompt-note", entry.promptNote));
+    card.replaceChildren(...nodes);
+    return;
+  }
+  if (prompt.question) {
+    const question = el("pre", "chat-prompt-question", prompt.question);
+    nodes.push(question);
+  }
+  const selectable = !prompt.multi && Number.isInteger(prompt.current);
+  // A hardware keyboard's 1–9 (promptKeydown): the same choice as a tap,
+  // among every option (the sheet's too); false when there is no such one.
+  card.chooseNumber = selectable ? (number) => {
+    const option = prompt.options.find((item) => item.number === number);
+    if (!option || entry.promptBusy || !currentChat(entry) || card.dataset.question !== prompt.fingerprint) return false;
+    if (entry.promptChoice?.number !== option.number) {
+      entry.promptChoice = { fingerprint: prompt.fingerprint, number: option.number };
+      haptic("select");
+      renderPrompt(s, entry.data);
+    }
+    return true;
+  } : null;
+  const options = el("div", "chat-prompt-options");
+  options.setAttribute("role", "radiogroup");
+  // A long menu keeps the card short: the first few choices (and the chosen
+  // one) inline, every choice in a sheet.
+  const many = selectable && prompt.options.length > PROMPT_INLINE_OPTIONS + 1;
+  const inline = many ? prompt.options.filter((option, index) => index < PROMPT_INLINE_OPTIONS ||
+    option.number === entry.promptChoice?.number) : prompt.options;
+  const items = new Map();
+  for (const [index, option] of inline.entries()) {
+    const chosen = entry.promptChoice?.number === option.number;
+    const item = button("", `chat-prompt-option${chosen ? " is-chosen" : ""}${option.number === prompt.current ? " is-current" : ""}`, () => {
+      if (!selectable || entry.promptBusy) return;
+      entry.promptChoice = { fingerprint: prompt.fingerprint, number: option.number };
+      haptic("select");
+      renderPrompt(s, entry.data);
+    });
+    item.setAttribute("role", "radio");
+    item.setAttribute("aria-checked", String(chosen));
+    item.disabled = !selectable || !!entry.promptBusy;
+    // One stop in the tab order; arrows move the choice, as in any radio group.
+    item.dataset.promptNumber = String(option.number);
+    item.tabIndex = (entry.promptChoice ? chosen : index === 0) ? 0 : -1;
+    item.addEventListener?.("keydown", (event) => {
+      const step = { ArrowDown: 1, ArrowRight: 1, ArrowUp: -1, ArrowLeft: -1 }[event.key];
+      if (!step || !selectable || entry.promptBusy) return;
+      event.preventDefault?.();
+      const next = inline[(index + step + inline.length) % inline.length];
+      entry.promptChoice = { fingerprint: prompt.fingerprint, number: next.number };
+      entry.promptFocus = next.number;
+      haptic("select");
+      renderPrompt(s, entry.data);
+    });
+    items.set(option.number, item);
+    item.append(el("span", "chat-prompt-number", String(option.number)), el("span", "chat-prompt-label", option.label));
+    if (option.detail) item.append(el("span", "chat-prompt-detail", option.detail));
+    options.append(item);
+  }
+  nodes.push(options);
+  if (many) {
+    const all = button(`선택지 ${prompt.options.length}개 모두 보기`, "chat-prompt-more", () => {
+      if (entry.promptBusy) return;
+      openActionSheet({ eyebrow: "선택지", title: prompt.question ? prompt.question.split("\n")[0] : "선택지를 고르세요",
+        trigger: all, actions: prompt.options.map((option) => ({
+          label: `${option.number}. ${option.label}${entry.promptChoice?.number === option.number ? " · 선택됨" : ""}`,
+          run: () => {
+            entry.promptChoice = { fingerprint: prompt.fingerprint, number: option.number };
+            haptic("select");
+            renderPrompt(s, entry.data);
+          },
+        })) });
+    });
+    all.setAttribute("aria-haspopup", "dialog");
+    all.disabled = !!entry.promptBusy;
+    nodes.push(all);
+  }
+  if (!selectable) {
+    nodes.push(el("p", "chat-prompt-note", prompt.multi ? "여러 개를 고르는 메뉴는 터미널에서 선택해 주세요."
+      : "현재 선택 위치를 확인하지 못했습니다. 터미널에서 선택해 주세요."));
+  } else {
+    const choice = prompt.options.find((option) => option.number === entry.promptChoice?.number);
+    const send = button(entry.promptBusy ? "보내는 중…" : choice ? `${choice.number}번 보내기` : "선택지를 고르세요", "primary", () => {
+      if (!choice) return;
+      promptAction(s, { action: "answer", fingerprint: prompt.fingerprint, number: choice.number });
+    });
+    send.disabled = !choice || !!entry.promptBusy || networkOffline();
+    nodes.push(send);
+  }
+  if (entry.promptNote) nodes.push(el("p", "chat-prompt-note", entry.promptNote));
+  card.replaceChildren(...nodes);
+  if (focusNumber != null) items.get(focusNumber)?.focus?.({ preventScroll: true });
+}
+async function promptAction(s, body) {
+  const entry = chatEntry(s);
+  if (entry.promptBusy || !currentChat(entry)) return;
+  entry.promptBusy = true;
+  entry.promptNote = "";
+  // A state read begun before the answer still shows the question: it is not
+  // drawn again (the read that follows the answer is).
+  entry.stateEpoch++;
+  renderPrompt(s, entry.data);
+  try {
+    const result = await api("/api/chat/prompt", { method: "POST", body: {
+      source: entry.source, requestId: requestId(), ...body } });
+    if (!currentChat(entry)) return;
+    entry.promptChoice = null;
+    if (body.action === "answer")
+      entry.promptNote = result.status === "answered" ? "" : "선택이 반영됐는지 확인하지 못했습니다. 터미널에서 확인해 주세요.";
+    if (body.action === "answer" && result.status === "answered") { toast("선택을 보냈습니다."); haptic("success"); }
+    entry.data = { ...entry.data, prompt: result.prompt || null, promptOpenable: false };
+    // "질문 불러오기" may have attached a board terminal: its marks show it now.
+    if (body.action === "open") refreshTerminals();
+  } catch (err) {
+    if (!err.unauthorized && currentChat(entry)) { entry.promptNote = err.message; haptic("error"); }
+  } finally {
+    entry.promptBusy = false;
+    entry.stateEpoch++;
+    if (currentChat(entry)) {
+      renderPrompt(s, entry.data);
+      state.chatPollCount = 0;
+      loadChatState(s, true);
+    }
+  }
+}
+// --- Conversation bars (header and composer tools, "chrome") ------------------
+// Reading and typing are different intents, so they are separate states:
+// state.chromeVisible is the reader's choice, "is-typing" the input's own
+// folded layout. Phones (coarse pointer): scrolling either way hides the bars,
+// reaching the end does not bring them back, and a tap on the conversation
+// shows or hides them; a new question, a send result or a connection problem
+// toggles them on touch devices. Mouse users restore with the focus button.
+const CHROME_TAP_IGNORE = "a, button, input, textarea, select, label, summary, [role=button], " +
+  "pre, code, .tool-group, .msg-more, .message-block-copy, .message-code-toggle, .chat-prompt, .msg-attachment, .chat-attachment, img, video";
+const TAP_HINT_MS = 2500;
+function chatTyping() {
+  return document.activeElement?.id === "chat-input";
+}
+function messagesAtEnd(list, slack = 50) {
+  return !!list && list.scrollHeight - list.scrollTop - list.clientHeight < slack;
+}
+// Whether the conversation stays at its newest message. A newly opened one does
+// (drawDetail), "맨 아래" sets it again, and only the reader's own scroll away
+// from the end clears it — not a hidden list (a phone's detail before it shows),
+// a question card, the keyboard or a growing composer, which change the list's
+// size but not the reader's place. A scroll the board has not seen yet (no
+// scroll event since its own) decides afresh by the distance.
+function pinnedToEnd(list) {
+  if (!list) return false;
+  if (list.scrollTop !== list.lastScrollTop) list.pinned = messagesAtEnd(list);
+  return list.pinned === true;
+}
+// The list's own size changed (shown, a card, the keyboard, the bars): a pinned
+// conversation is put back at its newest message.
+function keepAtEnd(list) {
+  if (list?.pendingView) { restoreConversationView(list); return; }
+  if (!list || list.isConnected === false || !list.clientHeight || !pinnedToEnd(list)) return;
+  setMessagesScroll(list, list.scrollHeight);
+  list.unread = 0;
+  renderJump();
+}
+function observeMessages(list) {
+  if (typeof ResizeObserver === "undefined") return;
+  state.messagesObserver ||= new ResizeObserver((entries) => {
+    for (const entry of entries) keepAtEnd(entry.target);
+  });
+  state.messagesObserver.disconnect();
+  state.messagesObserver.observe(list);
+}
+// The explicit choice survives keyboard, network, receipt and viewport changes.
+function setChromeVisible(visible, { stickBottom = false } = {}) {
+  state.chromeVisible = !!visible;
+  setReading(!visible, { stickBottom });
+  const toggle = $("focus-toggle");
+  if (toggle) {
+    toggle.textContent = visible ? "집중 모드" : "집중 모드 해제";
+    toggle.setAttribute("aria-pressed", String(!visible));
+    toggle.setAttribute("aria-label", visible ? "대화 집중 모드" : "집중 모드 해제");
+  }
+  rememberConversationView();
+}
+function toggleChrome() {
+  const hint = $("tap-hint");
+  if (hint && !hint.hidden) hint.hidden = true;
+  setChromeVisible(!state.chromeVisible, { stickBottom: messagesAtEnd($("messages")) });
+}
+// Attention stays beside the input. It never overrides the reader's choice.
+function revealChrome() {
+  $("chat-status")?.setAttribute?.("data-attention", "true");
+}
+// Whether a finger's down → up toggles the bars: short and still, not on a
+// control (which keeps its own tap), no text selected, no long-press menu.
+function isChromeTap(down, up, { now = Date.now(), fired = false } = {}) {
+  if (!down || !up || fired || up.pointerId !== down.id) return false;
+  const dx = (Number.isFinite(up.clientX) ? up.clientX : down.x) - down.x;
+  const dy = (Number.isFinite(up.clientY) ? up.clientY : down.y) - down.y;
+  if (Math.hypot(dx, dy) > GESTURE.tapSlopPx || now - down.at > GESTURE.tapMaxMs) return false;
+  if (down.target?.closest?.(CHROME_TAP_IGNORE)) return false;
+  const selection = window.getSelection?.();
+  return !(selection && selection.isCollapsed === false);
+}
+function showTapHint() {
+  if (state.tapHintShown || prefs.get("tapHint", false) === true) return;
+  state.tapHintShown = true;
+  prefs.set("tapHint", true);
+  const hint = $("tap-hint");
+  if (!hint) return;
+  const list = $("messages");
+  if (hint.style && Number.isFinite(list?.offsetTop)) hint.style.top = `${list.offsetTop + 12}px`;
+  hint.hidden = false;
+  clearTimeout(state.tapHintTimer);
+  state.tapHintTimer = setTimeout(() => { hint.hidden = true; }, TAP_HINT_MS);
+}
+// The board's own scroll of the conversation (new messages, layout changes):
+// the next scroll event sees no travel, so it never hides the bars.
+function setMessagesScroll(list, top) {
+  list.scrollTop = top;
+  list.lastScrollTop = list.scrollTop;
+}
+// The class mirror of state.chromeVisible (and of the input's focus):
+// "is-reading" folds the header and the composer tools.
+function setReading(reading, { stickBottom = false } = {}) {
+  const pane = $("detail");
+  if (!pane?.classList || pane.classList.contains?.("is-reading") === reading) return;
+  const list = $("messages");
+  const before = list?.getBoundingClientRect?.().top;
+  pane.classList.toggle?.("is-reading", reading);
+  if (list && typeof before === "number") {
+    if (stickBottom) list.scrollTop = list.scrollHeight;
+    else {
+      // The header folding moves the list; shift its scroll by the same amount
+      // so the line being read stays exactly where it was.
+      const shift = list.getBoundingClientRect().top - before;
+      if (shift) list.scrollTop += shift;
+    }
+    list.lastScrollTop = list.scrollTop;
+  }
+  renderJump();
+}
+// Typing on a phone folds the same chrome as reading mode (header to one
+// line, conversation bar, continue row and tool row), so the keyboard leaves
+// the transcript most of the screen. Leaving the input restores it.
+function setTyping(typing) {
+  const pane = $("detail");
+  if (!pane?.classList || !!pane.classList.contains?.("is-typing") === typing) return;
+  const list = $("messages");
+  const atBottom = messagesAtEnd(list);
+  const before = list?.getBoundingClientRect?.().top;
+  if (typing) pane.classList.add("is-typing");
+  else pane.classList.remove("is-typing");
+  if (list && atBottom) setMessagesScroll(list, list.scrollHeight);
+  else if (list && typeof before === "number") setMessagesScroll(list, list.scrollTop + list.getBoundingClientRect().top - before);
+  renderJump();
+}
+// The viewport changed (an on-screen keyboard opened or closed, a rotation, a
+// split view): only the temporary typing layout follows the available space.
+// The reader's focus choice is independent of the keyboard and viewport.
+function syncChromeMode() {
+  const compact = compactChrome();
+  setTyping(chatTyping() && compact);
+  const hint = $("tap-hint");
+  if (!touchDevice() && hint && !hint.hidden) hint.hidden = true;
+}
+function readingScroll(list) {
+  const top = list.scrollTop;
+  const previous = list.lastScrollTop ?? top;
+  list.lastScrollTop = top;
+  // Pinned to the end unless the reader moved away: a resize or the board's
+  // smooth "맨 아래" also scrolls, without unpinning.
+  const height = list.clientHeight;
+  const resized = Number.isFinite(list.pinHeight) && list.pinHeight !== height;
+  list.pinHeight = height;
+  if (messagesAtEnd(list)) list.pinned = true;
+  else if (top !== previous && !resized && Date.now() >= (list.autoScrollUntil || 0)) list.pinned = false;
+  const typing = chatTyping();
+  phoneReadingScroll(list, top - previous, typing || resized);
+  rememberConversationView();
+  renderJump();
+}
+// Phones: a deliberate scroll either way hides the bars; only a tap (or
+// the explicit restore button) shows them again, even at the end. `keep`
+// (typing or a resize) records the scroll without hiding.
+function phoneReadingScroll(list, delta, keep) {
+  if (messagesAtEnd(list, GESTURE.readingBottomPx)) list.unread = 0;
+  const height = list.clientHeight;
+  const resized = Number.isFinite(list.lastClientHeight) && list.lastClientHeight !== height;
+  list.lastClientHeight = height;
+  if (!delta) return;
+  list.lastScrollAt = Date.now();
+  // A keyboard, the bars themselves, a growing composer or the board's smooth
+  // "맨 아래" also move the list: that is not reading.
+  if (keep || resized || Date.now() < (list.autoScrollUntil || 0)) {
+    list.travel = 0;
+    return;
+  }
+  const direction = Math.sign(delta);
+  list.travel = direction === list.travelDirection ? (list.travel || 0) + Math.abs(delta) : Math.abs(delta);
+  list.travelDirection = direction;
+  if (list.travel <= GESTURE.readingHideTravelPx || !state.chromeVisible) return;
+  list.travel = 0;
+  setChromeVisible(false);
+  if (touchDevice()) showTapHint();
+}
+function scrollMessagesToEnd() {
+  const list = $("messages");
+  if (!list) return;
+  list.unread = 0;
+  list.pinned = true;
+  if (typeof list.scrollTo === "function") {
+    // The smooth scroll's own events do not hide the bars; a touch ends this.
+    list.autoScrollUntil = Date.now() + 1000;
+    list.scrollTo({ top: list.scrollHeight, behavior: prefersReducedMotion() ? "auto" : "smooth" });
+  } else setMessagesScroll(list, list.scrollHeight);
+  renderJump();
+}
+function renderJump() {
+  const list = $("messages");
+  const jump = $("jump-bottom");
+  if (!list || !jump) return;
+  const far = list.scrollHeight - list.scrollTop - list.clientHeight > GESTURE.jumpShowPx;
+  const unread = list.unread || 0;
+  jump.hidden = !far && !unread;
+  const label = unread ? `↓ 새 메시지 ${unread}` : "↓";
+  if (jump.textContent !== label) jump.textContent = label;
+  jump.classList?.toggle?.("has-unread", unread > 0);
+  jump.setAttribute("aria-label", unread ? `새 메시지 ${unread}개, 맨 아래로` : "대화 맨 아래로");
+  // Float just above the conversation's bottom edge, whatever the composer height.
+  const pane = $("detail");
+  if (jump.style && pane?.clientHeight && Number.isFinite(list.offsetTop)) {
+    const bottom = pane.clientHeight - list.offsetTop - list.clientHeight + 12;
+    if (bottom > 0) jump.style.bottom = `${bottom}px`;
+  }
 }
 
 // Drafts and attachment handles stay in memory and are keyed by the actual
@@ -730,7 +2806,8 @@ function chatReadSupported(entry, data = entry.data) {
 function rememberConversation(s, messages, data = {}) {
   if (!Array.isArray(messages) || data.error) return;
   chatEntry(s).conversation = { identity: conversationIdentity(s), authEpoch: state.authEpoch,
-    messages, fetchedAt: data.fetchedAt || Date.now() / 1000, stale: !!data.stale };
+    messages, historyNotice: data.historyNotice || null, executionMode: data.executionMode,
+    transcriptAvailability: data.transcriptAvailability, fetchedAt: data.fetchedAt || Date.now() / 1000, stale: !!data.stale };
 }
 function conversationSyncNotice(s, status) {
   if (state.selected !== s.key || $("detail").dataset.key !== s.key) return;
@@ -754,21 +2831,28 @@ function attachmentMetadata(files) {
       source: file.source === "native" ? "native" : "sessionholic" };
   });
 }
-function attachmentGroup(files, caption = `첨부 ${files.length}개`) {
+// Names a transcript gives files it cannot name; such a chip shows its kind once.
+const GENERIC_ATTACHMENT_NAMES = new Set(["이미지 첨부", "이미지", "사진", "첨부파일", "파일", "image", "file", "attachment"]);
+function attachmentGroup(files, caption = `첨부 ${files.length}개`, { showCaption = true } = {}) {
   const group = el("div", "msg-attachments");
   group.setAttribute("role", "group");
   group.setAttribute("aria-label", caption);
-  group.append(el("span", "attachment-caption", caption));
+  if (showCaption) group.append(el("span", "attachment-caption", caption));
   const chips = el("div", "attachment-chips");
   chips.setAttribute("role", "list");
   for (const file of files) {
-    const kind = file.kind === "image" ? "이미지" : "파일";
+    const image = file.kind === "image";
+    const kind = image ? "이미지" : "파일";
+    const generic = GENERIC_ATTACHMENT_NAMES.has(String(file.name || "").trim().toLowerCase());
+    const name = generic ? kind : file.name;
     const size = file.size == null ? "" : formatBytes(file.size);
-    const chip = el("span", "msg-attachment");
+    const chip = el("span", `msg-attachment ${image ? "is-image" : "is-file"}`);
     chip.setAttribute("role", "listitem");
-    chip.setAttribute("aria-label", `${kind}: ${file.name}${size ? `, ${size}` : ""}`);
-    chip.title = file.name;
-    chip.append(el("span", "attachment-kind", kind), el("span", "attachment-name", file.name));
+    chip.setAttribute("aria-label", `${kind}${generic ? "" : `: ${file.name}`}${size ? `, ${size}` : ""}`);
+    chip.title = generic ? kind : file.name;
+    const icon = el("span", "attachment-icon");
+    icon.setAttribute("aria-hidden", "true");
+    chip.append(icon, el("span", "attachment-name", name));
     if (size) chip.append(el("span", "attachment-size", size));
     chips.append(chip);
   }
@@ -782,12 +2866,14 @@ function updateChatDeliveryEvidence(entry) {
   const matchingReceipt = !pending || receipt?.requestId === pending.requestId;
   const files = attachmentMetadata(matchingReceipt && Array.isArray(receipt?.attachments)
     ? receipt.attachments : pending?.attachmentDetails);
-  const retained = pending || ["accepted", "queued", "completed", "interrupted", "unknown"].includes(receipt?.status) ||
-    receipt?.status === "failed" && receipt.confirmed === true;
+  // Once the message is in the conversation, its own chips show the files.
+  const retained = pending || !receiptSettled(entry) &&
+    (["accepted", "queued", "completed", "interrupted", "unknown"].includes(receipt?.status) ||
+    receipt?.status === "failed" && receipt.confirmed === true);
   const visible = retained && files.length > 0;
   box.hidden = !visible;
   if (!visible) { box.replaceChildren(); box.deliveryRevision = null; return false; }
-  const labels = { accepted: "전송 접수", queued: "대기열 접수", completed: "요청 완료",
+  const labels = { accepted: "전송 접수", queued: "전송 접수", completed: "응답 종료",
     interrupted: "접수 후 중단", unknown: "전송 결과 미확인", failed: "접수 후 오류" };
   const label = pending ? entry.sending ? "전송 중" : "전송 결과 미확인" : labels[receipt?.status];
   const record = receipt?.readbackConfirmed === true && !pending ? " · 세션 기록 확인" : "";
@@ -798,225 +2884,15 @@ function updateChatDeliveryEvidence(entry) {
   box.replaceChildren(attachmentGroup(files, caption));
   return true;
 }
-const CHAT_SUBMISSIONS_MAX = 20;
-const CHAT_SUBMISSIONS_BYTES = 256 * 1024;
-function queueContext(entry, s = selectedSession()) {
-  if (!s || chatKey(sourceOf(s)) !== chatKey(entry.source)) return false;
-  const identity = conversationIdentity(s);
-  if (entry.submissionIdentity !== identity || entry.submissionAuthEpoch !== state.authEpoch) {
-    entry.submissions = [];
-    entry.submissionIdentity = identity;
-    entry.submissionAuthEpoch = state.authEpoch;
-    entry.queueState = null;
-    entry.queueKeys = new Set();
-    entry.submissionsLimited = false;
-  }
-  return true;
-}
-function queueRecordKey(item) {
-  return typeof item.requestId === "string" && item.requestId ? `request:${item.requestId}`
-    : typeof item.queueId === "string" && item.queueId ? `queue:${item.queueId}` : null;
-}
-function limitSubmissions(entry) {
-  let bytes = entry.submissions.reduce((total, item) => total + item.textBytes, 0);
-  while (entry.submissions.length > CHAT_SUBMISSIONS_MAX || bytes > CHAT_SUBMISSIONS_BYTES) {
-    let index = entry.submissions.findIndex((item) => !["queued", "sending", "unknown"].includes(item.status));
-    if (index < 0) index = 0;
-    bytes -= entry.submissions[index].textBytes;
-    entry.submissions.splice(index, 1);
-    entry.submissionsLimited = true;
-  }
-}
-function queueRecords(entry) {
-  return (entry.submissions || []).filter((item) => item.wasQueued || ["unknown", "sending"].includes(item.status));
-}
-function rememberSubmission(entry, pending) {
-  if (!queueContext(entry)) return;
-  entry.submissions.push({ key: `request:${pending.requestId}`, requestId: pending.requestId, queueId: null,
-    text: pending.text, textTruncated: false, attachments: pending.attachmentDetails,
-    contentAvailable: true,
-    textBytes: new TextEncoder().encode(pending.text).length,
-    submittedAt: Date.now() / 1000, status: "sending", confirmed: false, wasQueued: false, local: true,
-    localQueuedAfterRead: false });
-  limitSubmissions(entry);
-}
-function updateSubmissionReceipt(entry, receipt, fromSnapshot = false) {
-  const item = (entry.submissions || []).find((record) => record.requestId === receipt?.requestId);
-  if (!item) return;
-  const confirmed = receipt.confirmed === true;
-  const inCurrentQueue = entry.queueState?.available === true && entry.queueKeys?.has(item.key);
-  const historicalActive = receipt.currentSnapshotConfirmed === false && ["queued", "accepted"].includes(receipt.status);
-  item.confirmed = confirmed;
-  item.status = historicalActive || receipt.status === "unknown" || !confirmed && receipt.status !== "failed" ? "unknown" : receipt.status;
-  if (inCurrentQueue && ["queued", "unknown"].includes(receipt.status)) { item.status = "queued"; item.confirmed = true; }
-  if (fromSnapshot && item.status === "queued" && !inCurrentQueue && receipt.currentSnapshotConfirmed !== true) item.status = "unknown";
-  if (confirmed && receipt.status === "queued") item.wasQueued = true;
-  if (receipt.dispatchState === "not_started") item.status = "failed";
-  if (Array.isArray(receipt.attachments)) item.attachments = attachmentMetadata(receipt.attachments);
-  if (receipt.queueId) item.queueId = receipt.queueId;
-  if (item.status === "queued") {
-    item.wasQueued = true;
-    item.localQueuedAfterRead = !fromSnapshot;
-  }
-}
-function syncQueuedMessages(entry, s, data) {
-  if (!queueContext(entry, s) || chatKey(data.route || {}) !== chatKey(entry.source)) return;
-  const supplied = Array.isArray(data.queuedMessages);
-  const queue = supplied ? data.queuedMessages : [];
-  const seen = new Set();
-  if (supplied) {
-    for (const item of entry.submissions) item.localQueuedAfterRead = false;
-    entry.queueState = data.queueState && typeof data.queueState === "object" ? { ...data.queueState } : null;
-    for (const raw of queue) {
-      if (!raw || typeof raw !== "object") continue;
-      const key = queueRecordKey(raw);
-      if (!key) continue;
-      let item = entry.submissions.find((record) => record.key === key || raw.requestId && record.requestId === raw.requestId ||
-        raw.queueId && record.queueId === raw.queueId);
-      if (!item) {
-        item = { key, requestId: typeof raw.requestId === "string" ? raw.requestId : null,
-          submittedAt: null, local: false };
-        entry.submissions.push(item);
-      }
-      seen.add(item.key);
-      Object.assign(item, { queueId: raw.queueId || null,
-        text: item.local ? item.text : typeof raw.text === "string" ? raw.text : null,
-        textTruncated: !item.local && raw.textTruncated === true,
-        contentAvailable: item.local || raw.contentAvailable !== false && typeof raw.text === "string",
-        attachments: attachmentMetadata(raw.attachments), status: "queued", confirmed: true,
-        wasQueued: true, localQueuedAfterRead: false });
-      item.textBytes = new TextEncoder().encode(item.text || "").length;
-    }
-    entry.queueKeys = seen;
-    if (entry.queueState?.available === false || entry.queueState?.complete === true && !entry.queueState.truncated) {
-      for (const item of entry.submissions) {
-        if (item.status === "queued" && !seen.has(item.key)) item.status = "unknown";
-        item.localQueuedAfterRead = false;
-      }
-    }
-  }
-  // Receipts carry exact request evidence; queue absence alone proves no turn state.
-  for (const receipt of data.receipts || []) updateSubmissionReceipt(entry, receipt, true);
-  limitSubmissions(entry);
-}
-function chatQueueCount(entry) {
-  const queue = entry.queueState;
-  const known = (entry.submissions || []).filter((item) => item.status === "queued" && item.confirmed);
-  if (queue?.available === true && Number.isInteger(queue.total) && queue.total >= 0) {
-    const added = known.filter((item) => item.localQueuedAfterRead && !entry.queueKeys?.has(item.key));
-    return queue.total + added.length;
-  }
-  return known.length;
-}
 function submissionRequestIds(entry, lastRequestId) {
-  const active = (entry.submissions || []).filter((item) => ["queued", "accepted", "unknown", "sending"].includes(item.status));
-  return [...new Set([lastRequestId, ...active.map((item) => item.requestId).reverse()])]
-    .filter((id) => typeof id === "string" && /^[A-Za-z0-9][A-Za-z0-9_.:-]{7,127}$/.test(id)).slice(0, 20);
-}
-function submissionStatus(item) {
-  const labels = { queued: "대기 중", accepted: "실행 시작", completed: "완료",
-    interrupted: "실행 중단", failed: item.confirmed ? "처리 오류" : "미접수",
-    sending: "전송 중", unknown: item.wasQueued ? "접수 후 상태 미확인" : "전송 결과 미확인" };
-  return labels[item.status] || "상태 미확인";
-}
-function closeChatQueue(restoreFocus = true) {
-  const view = state.chatQueueView;
-  state.chatQueueView = null;
-  const dialog = $("chat-queue-dialog");
-  if (dialog.open) dialog.close();
-  $("chat-queue-list").replaceChildren();
-  $("chat-queue-note").textContent = "";
-  if (restoreFocus && view?.authEpoch === state.authEpoch && currentChat(view.entry) &&
-      view.identity === conversationIdentity(selectedSession())) $("chat-queue-open").focus({ preventScroll: true });
-}
-function renderChatQueue(entry) {
-  const view = state.chatQueueView;
-  if (!view) return;
-  if (view.entry !== entry) {
-    if (!currentChat(view.entry) || view.identity !== conversationIdentity(selectedSession())) closeChatQueue(false);
-    return;
-  }
-  if (view.authEpoch !== state.authEpoch || !currentChat(entry) || view.identity !== conversationIdentity(selectedSession())) {
-    closeChatQueue(false); return;
-  }
-  const records = queueRecords(entry);
-  const list = $("chat-queue-list");
-  const desired = [];
-  for (const item of records) {
-    let shown = view.rows.get(item.key);
-    if (!shown) {
-      const row = el("article", "queued-message");
-      const meta = el("div", "queued-message-meta");
-      const status = el("strong", "queued-message-status");
-      const timestamp = el("span", "queued-message-time");
-      meta.append(status, timestamp);
-      const body = el("div", "queued-message-body");
-      const origin = el("p", "queued-message-origin");
-      const attachments = el("div", "queued-message-files");
-      const note = el("p", "queued-message-note");
-      const copy = button("본문 복사", "secondary queued-message-copy", async () => {
-        if (state.chatQueueView !== view || !currentChat(entry) || view.identity !== conversationIdentity(selectedSession())) return;
-        const latest = entry.submissions.find((record) => record.key === item.key);
-        if (latest?.contentAvailable === false || typeof latest?.text !== "string" || !latest.text) return;
-        try { await navigator.clipboard.writeText(latest.text); toast("보낸 메시지 본문을 복사했습니다."); }
-        catch { toast("클립보드에 접근할 수 없습니다. 본문을 길게 눌러 선택해 주세요."); }
-      });
-      row.append(meta, origin, body, attachments, note, copy);
-      shown = { row, status, timestamp, origin, body, attachments, note, copy, attachmentRevision: null };
-      view.rows.set(item.key, shown);
-    }
-    shown.status.textContent = submissionStatus(item);
-    shown.timestamp.textContent = item.submittedAt ? `이 탭에서 보낸 시각 · ${clock(item.submittedAt)}` : "";
-    shown.origin.textContent = item.local ? "이 탭에서 보낸 원문" : "원본 세션 대기열에서 확인한 내용";
-    const hasText = item.contentAvailable !== false && typeof item.text === "string";
-    const bodyText = hasText ? item.text || (item.attachments.length ? "첨부만 보낸 메시지" : "텍스트 본문이 없습니다.") : "메시지 내용을 확인하지 못했습니다.";
-    if (shown.body.textContent !== bodyText) shown.body.textContent = bodyText;
-    const attachmentRevision = JSON.stringify(item.attachments);
-    if (shown.attachmentRevision !== attachmentRevision) {
-      shown.attachments.replaceChildren(...(item.attachments.length ? [attachmentGroup(item.attachments, `전송에 포함한 첨부 ${item.attachments.length}개`)] : []));
-      shown.attachmentRevision = attachmentRevision;
-    }
-    shown.note.textContent = item.textTruncated ? "본문이 길어 일부만 표시합니다. 전체 내용은 원본 세션에서 확인해 주세요." : "";
-    shown.note.hidden = !item.textTruncated;
-    shown.copy.disabled = !hasText || !item.text;
-    shown.copy.hidden = shown.copy.disabled;
-    shown.copy.setAttribute("aria-label", "표시된 메시지 본문 복사");
-    desired.push(shown.row);
-  }
-  if (!desired.length) desired.push(el("p", "group-empty", "현재 표시할 메시지 내용을 확인하지 못했습니다."));
-  for (const child of [...list.children]) if (!desired.includes(child)) list.removeChild(child);
-  for (let index = 0; index < desired.length; index++)
-    if (list.children[index] !== desired[index]) list.insertBefore(desired[index], list.children[index] || null);
-  for (const [key, shown] of view.rows) if (!desired.includes(shown.row)) view.rows.delete(key);
-  const partial = entry.submissionsLimited || entry.queueState?.truncated || entry.queueState?.complete === false;
-  $("chat-queue-note").textContent = `${partial ? "표시 범위를 넘어 일부 내역은 보이지 않을 수 있습니다. " : ""}상태는 마지막 확인 기준입니다. 대기열 정보만으로 완료 여부를 알 수 없습니다.${entry.queueState?.available === false ? " 현재 대기열을 확인하지 못했습니다." : ""}${networkOffline() ? " 오프라인입니다." : ""}`;
-}
-function openChatQueue(entry) {
-  if (!currentChat(entry) || !queueContext(entry)) return;
-  if (entry.composing) { toast("한글 입력을 마친 뒤 예약 내용을 확인해 주세요."); return; }
-  state.chatQueueView = { entry, identity: conversationIdentity(selectedSession()), authEpoch: state.authEpoch, rows: new Map() };
-  renderChatQueue(entry);
-  $("chat-queue-open").focus({ preventScroll: true });
-  if (!$("chat-queue-dialog").open) $("chat-queue-dialog").showModal();
-}
-function updateChatQueue(entry) {
-  if (!queueContext(entry)) return;
-  const records = queueRecords(entry);
-  const count = chatQueueCount(entry);
-  const control = $("chat-queue-open");
-  control.hidden = !records.length && !count;
-  control.textContent = count ? `예약 ${count}개` : records.some((item) => item.status === "unknown") ? "미확인 내역"
-    : records.some((item) => item.status === "sending") ? "전송 중" : "예약 내역";
-  control.setAttribute("aria-label", `${count ? `예약 ${count}개` : "보낸 메시지 내역"} 내용 보기`);
-  control.title = "보낸 메시지와 예약 내용 보기";
-  renderChatQueue(entry);
+  return [lastRequestId].filter((id) => typeof id === "string" && /^[A-Za-z0-9][A-Za-z0-9_.:-]{7,127}$/.test(id));
 }
 function chatEntry(s) {
   const source = sourceOf(s);
   const key = chatKey(source);
   if (!state.chats.has(key)) state.chats.set(key, {
     source: Object.freeze({ ...source }), text: "", attachments: [], data: null, conversation: null,
-    pending: null, receipt: null, sending: false, uploads: 0,
+    pending: null, receipt: null, sending: false, uploads: 0, outbox: [], outboxClaims: [], uploadQueue: [], thumbs: new Map(),
     composing: false, editorEpoch: 0, stateEpoch: 0, recheckQueued: false, expanded: false, inputCollapsed: false, checking: false, error: "", notice: "", revision: 0,
   });
   return state.chats.get(key);
@@ -1029,15 +2905,48 @@ function networkOffline() {
   return state.offline || globalThis.navigator?.onLine === false;
 }
 function chatVisible() {
-  return !document.hidden && !state.terminalVisible &&
-    (!window.matchMedia?.("(max-width: 700px)").matches || document.body.classList.contains("show-detail"));
+  return !document.hidden && !state.terminalVisible && (!phoneLayout() || state.detailShown);
+}
+function chatHostOffline(entry) {
+  const session = selectedSession();
+  return state.snapshot?.hosts?.find((host) => host.name === entry.source.host)?.ok === false ||
+    capsHost(entry.source.host)?.online === false ||
+    (session && chatKey(sourceOf(session)) === chatKey(entry.source) && session.online === false);
+}
+function chatOneShot(entry) {
+  if (chatKey(entry.data?.route || {}) === chatKey(entry.source) && sessionOneShot(entry.data)) return true;
+  return allSessions().some((session) => chatKey(sourceOf(session)) === chatKey(entry.source) &&
+    (sessionOneShot(session) || entry.conversation?.identity === conversationIdentity(session) && sessionOneShot(entry.conversation)));
+}
+function conversationHistoryNotice(s, entry) {
+  const data = entry?.data && chatKey(entry.data.route || {}) === chatKey(sourceOf(s)) ? entry.data : null;
+  const cached = entry?.conversation?.identity === conversationIdentity(s) ? entry.conversation : null;
+  // The newest successful read owns this notice, including its absence. A
+  // persisted transcript can predate a run that has persistence disabled.
+  const notice = cached ? cached.historyNotice : data ? data.historyNotice : s.historyNotice;
+  if (notice?.code === "not_persisted") return typeof notice.message === "string" && notice.message.trim() ? notice.message : ONE_SHOT_HISTORY;
+  return "";
+}
+function chatRecovery(entry) {
+  if (botRequestForNative(entry.source)) return null;
+  if (chatHostOffline(entry)) return { supported: true, action: "refresh_host",
+    reason: chatOneShot(entry) ? "기기에 연결되지 않았습니다. 연결을 확인한 뒤 실행 상태를 확인해 주세요." : "기기에 연결되지 않았습니다. 연결을 확인한 뒤 같은 세션을 이어갈 수 있습니다." };
+  if (chatOneShot(entry)) return null;
+  if (chatKey(entry.data?.route || {}) !== chatKey(entry.source)) return null;
+  const recovery = entry.data?.recovery;
+  if (recovery?.supported !== true || recovery.closedByBoard === true) return null;
+  return ["resume_session", "refresh_host"].includes(recovery.action) ? recovery : null;
 }
 function chatSupported(entry) {
-  return entry.data?.capability?.supported === true &&
+  return !botRequestForNative(entry.source) && !chatOneShot(entry) && !chatHostOffline(entry) && entry.data?.capability?.supported === true &&
     chatKey(entry.data.route || {}) === chatKey(entry.source);
 }
+// The server's capability says sending needs a board terminal the user opens.
+function terminalRequired(entry) {
+  return !chatOneShot(entry) && entry.data?.capability?.action === "open_terminal" && chatKey(entry.data.route || {}) === chatKey(entry.source);
+}
 function chatAttachmentsSupported(entry) {
-  return !!entry.data && chatKey(entry.data.route || {}) === chatKey(entry.source) &&
+  return !botRequestForNative(entry.source) && !chatOneShot(entry) && !!entry.data && chatKey(entry.data.route || {}) === chatKey(entry.source) &&
     entry.data.phase !== "unavailable" && entry.data.capability?.attachments !== false;
 }
 function buildChatComposer(s) {
@@ -1058,6 +2967,23 @@ function buildChatComposer(s) {
   status.id = "chat-status";
   status.setAttribute("role", "status");
   status.setAttribute("aria-live", "polite");
+  // A Claude background session takes input only through a board terminal; the
+  // board never opens one by itself, so the user opens it here (the same plan
+  // flow as "터미널·승인") and sends after coming back.
+  const gate = el("div", "chat-terminal-gate");
+  gate.id = "chat-terminal-gate";
+  gate.hidden = true;
+  const gateText = el("span", "chat-terminal-gate-text");
+  gateText.id = "chat-terminal-gate-text";
+  const openTerminal = button("터미널 열기", "primary", () => { if (editorCurrent()) openChatTerminal(s); });
+  openTerminal.id = "chat-open-terminal";
+  gate.append(gateText, openTerminal);
+  const recovery = el("div", "chat-recovery");
+  recovery.id = "chat-recovery"; recovery.hidden = true;
+  const recoveryText = el("span", "chat-terminal-gate-text"); recoveryText.id = "chat-recovery-text";
+  const recover = button("세션 다시 열기", "primary", () => { if (editorCurrent()) return recoverChatSession(s); });
+  recover.id = "chat-recover";
+  recovery.append(recoveryText, recover);
   const evidence = el("div", "chat-delivery-evidence");
   evidence.id = "chat-delivery-evidence";
   evidence.hidden = true;
@@ -1077,8 +3003,22 @@ function buildChatComposer(s) {
     entry.inputCollapsed = false;
     entry.text = input.value;
     entry.notice = "";
+    // Editing the draft answers an input error about it.
+    if (entry.inputError && entry.error === entry.inputError) entry.error = "";
+    entry.inputError = "";
     entry.revision++;
     updateChatComposer(entry);
+  });
+  // Phones fold the bars for typing and return to the reader's choice on blur
+  // (hidden stays hidden); mouse layouts show them for the input, as before.
+  // A tablet folds them only once its on-screen keyboard takes the space
+  // (syncChromeMode on the viewport's resize); a hardware keyboard never does.
+  input.addEventListener("focus", () => {
+    setTyping(compactChrome());
+  });
+  input.addEventListener("blur", () => {
+    setTyping(false);
+    if (!state.chromeVisible) setReading(true, { stickBottom: messagesAtEnd($("messages")) });
   });
   input.addEventListener("compositionstart", () => {
     if (!editorCurrent()) return;
@@ -1088,6 +3028,7 @@ function buildChatComposer(s) {
   input.addEventListener("compositionend", () => {
     if (!editorCurrent()) return;
     entry.composing = false;
+    entry.compositionEndedAt = Date.now();
     entry.inputCollapsed = false;
     entry.text = input.value;
     entry.revision++;
@@ -1095,9 +3036,17 @@ function buildChatComposer(s) {
   });
   input.addEventListener("keydown", (event) => {
     if (!editorCurrent()) return;
+    // Esc leaves the input (a hardware keyboard's way out); an open tools menu
+    // closes first (closeChatToolsEscape), and an IME keeps its own Esc.
+    if (event.key === "Escape") {
+      if (event.isComposing || event.keyCode === 229 || entry.composing || tools.open) return;
+      event.preventDefault();
+      input.blur();
+      return;
+    }
     if (event.key !== "Enter" || !(event.ctrlKey || event.metaKey)) return;
     event.preventDefault();
-    if (event.isComposing || event.keyCode === 229 || entry.composing) return;
+    if (event.isComposing || event.keyCode === 229 || entry.composing || Date.now() - (entry.compositionEndedAt || 0) < 80) return;
     sendChat(entry);
   });
   input.addEventListener("paste", (event) => {
@@ -1141,6 +3090,15 @@ function buildChatComposer(s) {
   });
   native.id = "chat-native-open";
   native.hidden = true;
+  // The same "연결 닫기" a card offers on a swipe or long press.
+  const closeTerm = button("연결 닫기", "secondary", () => {
+    if (!editorCurrent()) return;
+    tools.open = false;
+    const terminal = terminalForSession(s);
+    if (terminal) closeTerminal(terminal.id);
+  });
+  closeTerm.id = "chat-terminal-close";
+  closeTerm.hidden = true;
   const send = button("보내기", "primary", () => {
     if (!editorCurrent()) return;
     if (entry.composing) {
@@ -1151,9 +3109,21 @@ function buildChatComposer(s) {
     sendChat(entry);
   });
   send.id = "chat-send";
+  send.setAttribute("aria-keyshortcuts", "Meta+Enter Control+Enter");
+  // Sending keeps the keyboard and the folded typing layout; a blur first
+  // would move the button away under the finger before the click lands.
+  send.addEventListener("pointerdown", (event) => {
+    if (document.activeElement === input) event.preventDefault();
+  });
   const hint = el("p", "chat-hint", "Ctrl/⌘ + Enter로 전송 · 초안과 첨부 선택은 이 탭에서만 보관됩니다.");
   hint.id = "chat-hint";
   hint.hidden = !entry.expanded;
+  // The folded composer's reminder of the send key, once a keyboard is known
+  // to be there (keyboardPresent); the expanded one says it in its hint.
+  const keyHint = el("span", "chat-key-hint", `${sendShortcutLabel()} 보내기`);
+  keyHint.id = "chat-key-hint";
+  keyHint.hidden = true;
+  keyHint.setAttribute("aria-hidden", "true");
   const expand = button(entry.expanded ? "접기" : "펼치기", "chat-toggle", () => {
     if (!editorCurrent()) return;
     const collapse = entry.expanded || input.dataset.grown === "true";
@@ -1173,20 +3143,16 @@ function buildChatComposer(s) {
   expand.addEventListener("pointerdown", (event) => event.preventDefault());
   tools.append(el("summary", null, "도구"));
   const toolsActions = el("div", "chat-tools-actions");
-  toolsActions.append(clipboard, check, native);
-  for (const action of [clipboard, check, native])
+  const manage = button("세션 관리", "secondary", (event) => { if (editorCurrent()) { tools.open = false; manageSession(s, event.currentTarget); } });
+  manage.id = "chat-manage";
+  toolsActions.append(clipboard, check, native, closeTerm, manage);
+  for (const action of [clipboard, check, native, closeTerm])
     action.addEventListener("pointerdown", (event) => event.preventDefault());
   tools.append(toolsActions);
-  const queue = button("예약 내용", "chat-queue-open", () => { if (editorCurrent()) openChatQueue(entry); });
-  queue.id = "chat-queue-open";
-  queue.hidden = true;
-  queue.setAttribute("aria-haspopup", "dialog");
-  queue.setAttribute("aria-controls", "chat-queue-dialog");
-  queue.addEventListener("pointerdown", (event) => event.preventDefault());
-  actions.append(attach, expand, terminal, queue, tools);
+  actions.append(attach, expand, terminal, keyHint, tools);
   const main = el("div", "chat-main");
   main.append(input, send);
-  box.append(heading, status, evidence, attachmentsLabel, attachments, main, files, actions, hint);
+  box.append(heading, status, recovery, gate, evidence, attachmentsLabel, attachments, main, files, actions, hint);
   queueMicrotask(() => {
     if (!editorCurrent()) return;
     updateChatComposer(entry);
@@ -1202,7 +3168,7 @@ function resizeChatInput(entry) {
   const border = (parseFloat(style?.borderTopWidth) || 1) + (parseFloat(style?.borderBottomWidth) || 1);
   const base = Math.max(44, line + padding + border);
   const viewport = window.visualViewport?.height || window.innerHeight || 800;
-  const cap = entry.inputCollapsed ? base : Math.max(base,
+  const cap = entry.inputCollapsed || sentDraftHidden(entry) ? base : Math.max(base,
     Math.min(line * (entry.expanded ? 11 : 6) + padding + border, viewport * 0.34, viewport - 200));
   const minimum = Math.min(cap, entry.expanded ? 3 * line + padding + border : base);
   const list = $("messages");
@@ -1222,13 +3188,21 @@ function resizeChatInput(entry) {
   const toggle = $("chat-expand");
   toggle.textContent = height > base + 1 || entry.expanded ? "접기" : "펼치기";
   toggle.setAttribute("aria-expanded", String(height > base + 1 || entry.expanded));
-  if (atBottom) list.scrollTop = list.scrollHeight;
+  if (atBottom) setMessagesScroll(list, list.scrollHeight);
+}
+// While a send is in flight or unconfirmed, its text already shows as the
+// bubble; the editor keeps it (a rejected send leaves it there) but hides it.
+function sentDraftHidden(entry) {
+  return !entry.composing && draftIsPending(entry);
 }
 function closeChatToolsOutside(event) {
   for (const id of ["chat-tools", "terminal-settings"]) {
     const tools = $(id);
     if (tools?.open && !tools.contains(event.target)) tools.open = false;
   }
+  // An open card swipe closes on any touch outside its row.
+  const open = state.swipeOpen;
+  if (open && !open.contains?.(event.target)) closeSwipe(open);
 }
 function closeChatToolsEscape(event) {
   if (event.key !== "Escape" || event.isComposing || event.keyCode === 229) return;
@@ -1241,6 +3215,58 @@ function closeChatToolsEscape(event) {
     event.preventDefault();
   }
 }
+// --- Hardware keyboard ----------------------------------------------------------
+// A keyboard is assumed with a mouse or trackpad as the main pointer. On a
+// touch screen it is known from a key an on-screen keyboard does not send
+// (a modifier, Esc, arrows) or from typing into the composer while no
+// on-screen keyboard takes the screen (an iPad's Magic Keyboard). Memory only.
+const HARDWARE_KEYS = new Set(["Escape", "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight",
+  "Home", "End", "PageUp", "PageDown", "Meta", "Control", "Alt"]);
+function keyboardPresent() {
+  return !touchDevice() || state.hardwareKeyboard === true;
+}
+function sendShortcutLabel() {
+  const nav = globalThis.navigator;
+  const platform = nav?.userAgentData?.platform || nav?.platform || "";
+  return /Mac|iPhone|iPad|iPod/i.test(platform) ? "⌘↩" : "Ctrl+Enter";
+}
+function noteHardwareKey(event) {
+  if (state.hardwareKeyboard || !event || event.isComposing || event.keyCode === 229) return;
+  const key = String(event.key || "");
+  const physical = event.metaKey || event.ctrlKey || event.altKey || HARDWARE_KEYS.has(key) ||
+    (key.length === 1 && chatTyping() && !phoneLayout() && !shortLayout() && !keyboardOpen());
+  if (!physical) return;
+  state.hardwareKeyboard = true;
+  const s = selectedSession();
+  if (s) updateChatComposer(chatEntry(s));
+}
+// 1–9 on a question card choose that option (only choose: sending stays the
+// card's second, explicit step). Typing in a field, a modifier, an IME, an
+// open sheet or the terminal leave the key alone.
+function promptKeydown(event) {
+  const key = String(event?.key || "");
+  if (!/^[1-9]$/.test(key) || event.metaKey || event.ctrlKey || event.altKey || event.isComposing ||
+      event.keyCode === 229 || event.defaultPrevented) return false;
+  const target = event.target;
+  if (target?.isContentEditable || target?.closest?.("input, textarea, select, [contenteditable]")) return false;
+  if (state.terminalVisible || !chatVisible() || Object.keys(SHEETS).some((id) => $(id)?.open)) return false;
+  const card = $("chat-prompt");
+  if (!card || card.hidden || typeof card.chooseNumber !== "function" || !card.chooseNumber(Number(key))) return false;
+  event.preventDefault();
+  return true;
+}
+function documentKeydown(event) {
+  if ((event.metaKey || event.ctrlKey) && String(event.key).toLowerCase() === "k" && !event.isComposing) {
+    event.preventDefault();
+    const search = window.SessionholicGoals?.searchElement?.() || $("search");
+    search?.focus();
+    search?.select?.();
+    return;
+  }
+  noteHardwareKey(event);
+  closeChatToolsEscape(event);
+  promptKeydown(event);
+}
 function chatReceiptCopy(receipt) {
   if (receipt?.dispatchState === "not_started")
     return `${receipt.reason || "메시지 전송 조건을 확인해 주세요."} 메시지는 전송되지 않았습니다. 초안과 첨부는 유지됩니다.`;
@@ -1248,75 +3274,224 @@ function chatReceiptCopy(receipt) {
     return "요청 처리 중 오류가 발생했습니다. 대화를 확인해 주세요.";
   const labels = {
     accepted: "메시지를 접수했습니다. 작업 완료는 대화에서 확인해 주세요.",
-    queued: "현재 작업 뒤에 보낼 메시지로 접수했습니다.",
-    completed: "요청한 작업이 완료됐습니다.",
+    queued: "메시지를 접수했습니다. 답변은 대화에서 확인해 주세요.",
+    completed: "응답이 끝났습니다. 목표 완료 여부는 결과와 완료 조건을 확인해 주세요.",
     interrupted: "접수했던 작업이 중단되었습니다. 대화를 확인한 뒤 새 메시지를 보내 주세요.",
     unknown: "전송 결과를 아직 확인하지 못했습니다. 중복 전송하지 않고 상태를 확인합니다.",
     failed: "메시지를 접수하지 못했습니다. 초안은 유지됩니다.",
   };
   return labels[receipt?.status] || "";
 }
+// The last receipt's message reached the conversation (its bubble went): what
+// the composer said about it being taken is no longer news.
+function receiptSettled(entry) {
+  return !entry.pending && !!entry.receipt?.requestId && entry.settledRequestId === entry.receipt.requestId;
+}
+function receiptNotice(entry) {
+  const status = entry.receipt?.status;
+  const phase = entry.data?.phase;
+  // A refusal keeps saying the draft was not sent; anything else waits while
+  // the agent asks something (the phase says so).
+  if (phase === "needs_input" && entry.receipt?.dispatchState !== "not_started" && status !== "failed") return "";
+  if (receiptSettled(entry) && ["accepted", "queued"].includes(status)) return "";
+  // Its request ended and the agent now works on a newer one (typed in the
+  // terminal, say): the phase says what is going on.
+  if (["completed", "interrupted"].includes(status) && phase === "working") return "";
+  return chatReceiptCopy(entry.receipt);
+}
 function updateChatComposer(entry) {
   if (!currentChat(entry) || $("chat-composer")?.dataset.source !== chatKey(entry.source)) return;
   const supported = chatSupported(entry);
+  const oneShot = chatOneShot(entry);
   $("chat-composer").classList.toggle?.("is-busy", entry.data?.phase === "working" || entry.sending || !!entry.uploads);
   $("chat-composer").classList.toggle?.("is-error", !!entry.error || entry.receipt?.status === "failed");
   $("chat-composer").classList.toggle?.("is-unknown", !!entry.pending && !entry.sending);
+  setClass($("chat-composer"), "is-sent-draft", sentDraftHidden(entry));
   const offline = networkOffline();
   const blocked = offline || !supported || entry.sending || !!entry.pending || !!entry.uploads;
-  $("chat-input").disabled = !supported || entry.sending || !!entry.pending;
+  // No board terminal yet (Claude background): the draft can be written now and
+  // sent once the user opened the terminal from the gate.
+  const recovery = chatRecovery(entry);
+  const gateOn = !supported && !recovery && terminalRequired(entry);
+  $("chat-recovery").hidden = !recovery;
+  $("chat-recovery-text").textContent = recovery?.reason || (recovery?.action === "resume_session" ? "대화 기록과 초안을 유지하고 같은 세션을 다시 엽니다." : "");
+  $("chat-recover").textContent = entry.recovering ? "연결 확인 중…" : recovery?.action === "refresh_host" ? "기기 연결 다시 확인" : "세션 다시 열기";
+  $("chat-recover").disabled = offline || !!entry.recovering || state.launchBusy;
+  const gateReason = entry.data?.capability?.reason || "보내려면 먼저 터미널을 여세요.";
+  $("chat-terminal-gate").hidden = !gateOn;
+  $("chat-terminal-gate-text").textContent = gateOn ? gateReason : "";
+  $("chat-open-terminal").disabled = offline || state.launchBusy;
+  // A send in flight (or unconfirmed) locks the text but not the field: a
+  // disabled field would drop the focus, and with it the keyboard and the
+  // next ⌘↩. sendChat itself refuses a second send meanwhile.
+  const input = $("chat-input");
+  input.placeholder = oneShot ? "후속 메시지 없음" : "이 세션에 보낼 메시지…";
+  input.disabled = !supported && !gateOn && recovery?.action !== "resume_session";
+  input.readOnly = !input.disabled && (entry.sending || !!entry.pending);
+  input.setAttribute("aria-disabled", String(input.disabled || input.readOnly));
   $("chat-attach").disabled = offline || !chatAttachmentsSupported(entry) || entry.sending || !!entry.pending || !!entry.uploads;
   $("chat-clipboard").disabled = $("chat-attach").disabled;
   $("chat-send").disabled = blocked || entry.composing || (!entry.text.trim() && !entry.attachments.length);
   $("chat-send").textContent = entry.sending ? "전송 중" : "보내기";
-  $("chat-send").setAttribute("aria-label", entry.data?.phase === "working" ? "작업 대기열에 메시지 보내기" : "메시지 보내기");
+  $("chat-send").setAttribute("aria-label", "메시지 보내기");
+  $("chat-key-hint").hidden = oneShot || !!entry.expanded || !keyboardPresent();
   $("chat-check").disabled = offline || entry.checking;
-  $("chat-terminal").disabled = state.launchBusy;
+  $("chat-terminal").disabled = state.launchBusy || oneShot;
+  $("chat-terminal").hidden = oneShot;
+  const continuation = $("detail").querySelector?.(".continue-disclosure");
+  if (continuation) continuation.hidden = oneShot;
   const native = terminalInfo(state.terminal).nativeSource;
   $("chat-native-open").hidden = !native || chatKey(native) === chatKey(entry.source) || !state.terminalAlive;
+  const openTerminalRow = terminalForSession(selectedSession());
+  $("chat-terminal-close").hidden = !openTerminalRow;
+  if (openTerminalRow) $("chat-terminal-close").textContent = terminalCloseCopy(openTerminalRow).action;
   const phase = entry.data?.phase;
-  const phaseCopy = phase === "working" ? "작업 중 · 보낸 메시지는 대기열에 접수됩니다." : phase === "needs_input" ? "답변·승인 필요 · 승인은 터미널에서 처리해 주세요." : entry.expanded ? "위의 실제 세션에 메시지를 전달합니다." : "";
-  const budgetNote = state.chatPollCount >= 40 ? " 자동 상태 확인을 마쳤습니다. 상태 다시 확인을 눌러 주세요." : "";
-  const unsupportedCopy = !supported && entry.attachments.length
+  const phaseCopy = phase === "working" ? "작업 중 · 지금 보내도 CLI가 이어서 반영합니다." : phase === "needs_input" ? (entry.data?.prompt ? "답변·승인 필요 · 위 카드에서 답해 주세요." : "답변·승인 필요 · 터미널에서 처리해 주세요.") : entry.expanded ? "위의 실제 세션에 메시지를 전달합니다." : "";
+  const budgetNote = state.chatPollCount >= CHAT_POLL_MAX ? " 자동 상태 확인을 잠시 멈췄습니다. 상태 다시 확인을 눌러 주세요." : "";
+  // The gate itself says what to do; the status line only adds that a refused
+  // message was not sent.
+  const unsupportedCopy = oneShot ? ONE_SHOT_NO_INPUT : (gateOn || recovery) ? (entry.receipt?.dispatchState === "not_started"
+    ? "메시지는 전송되지 않았습니다. 초안과 첨부는 유지됩니다." : "") : !supported && entry.attachments.length
     ? "첨부는 이 작업 폴더에 저장됐습니다. 첨부의 ‘경로’를 복사해 터미널에 붙여넣으세요."
     : entry.data?.capability?.reason || "직접 입력을 지원하지 않습니다. 터미널을 사용해 주세요.";
-  $("chat-status").textContent = (offline ? "오프라인입니다. 초안은 유지됩니다. 연결 후 상태를 확인하고 보내 주세요." : entry.error || entry.notice || (entry.uploads ? `첨부 ${entry.uploads}개를 올리고 있습니다…` : !entry.data ? "메시지 전송 환경을 확인하고 있습니다…" : !supported ? unsupportedCopy : chatReceiptCopy(entry.receipt) || phaseCopy)) + budgetNote;
-  updateChatQueue(entry);
+  $("chat-status").textContent = (offline ? "오프라인입니다. 초안은 유지됩니다. 연결 후 상태를 확인하고 보내 주세요." : entry.error || (oneShot ? ONE_SHOT_NO_INPUT : entry.notice || (entry.uploads ? `첨부 ${entry.uploads}개를 올리고 있습니다…` : !entry.data ? (claudeWithoutId(selectedSession()) ? CLAUDE_NO_SEND : "메시지 전송 환경을 확인하고 있습니다…") : !supported ? unsupportedCopy : receiptNotice(entry) || phaseCopy))) + budgetNote;
+  $("chat-status").setAttribute("data-attention", String(!!(offline || chatHostOffline(entry) || entry.error || entry.receipt?.status === "unknown")));
   const deliveryVisible = updateChatDeliveryEvidence(entry);
   const chips = $("chat-attachments");
-  chips.hidden = !!entry.pending && deliveryVisible;
+  // While a bubble resends its own message, another draft's files stay as they are.
+  const draftSent = draftIsPending(entry);
+  chips.hidden = draftSent && deliveryVisible;
   const attachmentsLabel = $("chat-attachments-label");
   attachmentsLabel.hidden = chips.hidden || !entry.attachments.length;
-  const selectedCaption = entry.pending
+  const selectedCaption = draftSent
     ? `전송 요청 첨부 ${entry.attachments.length}개 · 결과 미확인`
     : `전송 전 첨부 ${entry.attachments.length}개 · 업로드 완료`;
   attachmentsLabel.textContent = selectedCaption;
   chips.setAttribute("aria-label", selectedCaption);
-  chips.replaceChildren();
-  for (const file of entry.attachments) {
-    const chip = el("div", "chat-attachment");
-    chip.append(el("span", null, `${file.name || "첨부파일"} · ${formatBytes(file.size)}`));
-    const remove = button("×", "chat-attachment-remove", () => {
-      if (entry.sending || entry.pending) return;
-      entry.attachments = entry.attachments.filter((item) => item.id !== file.id);
-      entry.revision++;
-      updateChatComposer(entry);
-    });
-    remove.setAttribute("aria-label", `${file.name || "첨부파일"} 제거`);
-    remove.disabled = entry.sending || !!entry.pending;
-    chip.append(remove);
-    if (file.path) {
-      const copy = button("경로", "chat-attachment-copy", async () => {
+  renderAttachmentTiles(entry, chips);
+  resizeChatInput(entry);
+}
+// Attachment tiles: a row that scrolls sideways. Images show a local preview
+// (an object URL of the picked file, memory only, revoked once the tile is
+// gone); uploads show a progress ring.
+function attachmentThumb(entry, key, file) {
+  entry.thumbs ||= new Map();
+  if (!String(file?.type || "").startsWith("image/") || entry.thumbs.has(key)) return;
+  try {
+    const url = URL.createObjectURL?.(file);
+    if (url) entry.thumbs.set(key, url);
+  } catch {
+    /* no preview for this file */
+  }
+}
+function revokeThumb(entry, key) {
+  const url = entry.thumbs?.get(key);
+  if (!url) return;
+  entry.thumbs.delete(key);
+  try {
+    URL.revokeObjectURL?.(url);
+  } catch {
+    /* already released */
+  }
+}
+function pruneThumbs(entry) {
+  if (!entry.thumbs?.size) return;
+  const live = new Set([...entry.attachments.map((item) => item.id), ...(entry.uploadQueue || []).map((item) => item.key)]);
+  for (const key of [...entry.thumbs.keys()]) if (!live.has(key)) revokeThumb(entry, key);
+}
+function attachmentTile(entry, file, { key, uploading = null } = {}) {
+  const image = String(file.type || "").startsWith("image/") || /\.(png|jpe?g|gif|webp|heic|bmp)$/i.test(file.name || "");
+  const tile = el("div", `chat-attachment${image ? " is-image" : " is-file"}${uploading ? " is-uploading" : ""}`);
+  tile.dataset.key = key;
+  const thumb = entry.thumbs.get(key);
+  const preview = el("span", "chat-attachment-preview");
+  preview.setAttribute("aria-hidden", "true");
+  if (thumb) {
+    const img = el("img");
+    img.src = thumb;
+    img.alt = "";
+    img.decoding = "async";
+    preview.append(img);
+  } else preview.append(el("span", "chat-attachment-ext", (String(file.name || "").split(".").pop() || "").slice(0, 4).toUpperCase()));
+  tile.append(preview);
+  tile.append(el("span", "chat-attachment-name", `${file.name || "첨부파일"} · ${formatBytes(file.size)}`));
+  if (uploading) {
+    const ring = el("span", "upload-ring");
+    ring.setAttribute("role", "progressbar");
+    ring.setAttribute("aria-label", `${file.name || "첨부파일"} 올리는 중`);
+    tile.uploadRing = ring;
+    tile.append(ring);
+    setUploadProgress(tile, uploading);
+    return tile;
+  }
+  const remove = button("×", "chat-attachment-remove", () => {
+    if (entry.sending || entry.pending) return;
+    entry.attachments = entry.attachments.filter((item) => item.id !== file.id);
+    revokeThumb(entry, file.id);
+    entry.revision++;
+    updateChatComposer(entry);
+  });
+  remove.setAttribute("aria-label", `${file.name || "첨부파일"} 제거`);
+  remove.disabled = entry.sending || !!entry.pending;
+  tile.append(remove);
+  if (file.path) {
+    const copy = button("경로", "chat-attachment-copy", async () => {
       try { await navigator.clipboard.writeText(file.path); toast("실제 세션의 첨부 경로를 복사했습니다. 같은 작업의 터미널에 붙여넣을 수 있습니다."); }
       catch { toast("클립보드에 접근할 수 없습니다."); }
-      });
-      copy.setAttribute("aria-label", `${file.name || "첨부파일"} 실제 경로 복사`);
-      copy.title = "실제 첨부 경로 복사";
-      chip.append(copy);
-    }
-    chips.append(chip);
+    });
+    copy.setAttribute("aria-label", `${file.name || "첨부파일"} 실제 경로 복사`);
+    copy.title = "실제 첨부 경로 복사";
+    tile.append(copy);
   }
-  resizeChatInput(entry);
+  return tile;
+}
+function setUploadProgress(tile, item) {
+  const ring = tile?.uploadRing;
+  if (!ring) return;
+  const percent = item.state === "uploading" && Number.isFinite(item.progress) ? Math.round(item.progress * 100) : null;
+  ring.style?.setProperty?.("--progress", `${percent ?? 0}%`);
+  setClass(ring, "is-waiting", percent === null);
+  if (percent === null) ring.removeAttribute?.("aria-valuenow");
+  else ring.setAttribute("aria-valuenow", String(percent));
+}
+function renderAttachmentTiles(entry, box = $("chat-attachments")) {
+  entry.thumbs ||= new Map();
+  entry.uploadQueue ||= [];
+  pruneThumbs(entry);
+  const tiles = [
+    ...entry.attachments.map((file) => attachmentTile(entry, file, { key: file.id })),
+    ...entry.uploadQueue.map((item) => attachmentTile(entry, item.file, { key: item.key, uploading: item })),
+  ];
+  for (const item of entry.uploadQueue) item.tile = tiles.find((tile) => tile.dataset.key === item.key) || null;
+  box.replaceChildren(...tiles);
+}
+// Uploads report progress through XMLHttpRequest where it exists; fetch is
+// the fallback (same request, no progress).
+function sendUpload(file, headers, onProgress) {
+  if (typeof XMLHttpRequest !== "function") {
+    return fetch("/api/chat/upload", { method: "POST", credentials: "same-origin", cache: "no-store", body: file, headers })
+      .then(async (response) => ({ status: response.status, ok: response.ok, data: await response.json().catch(() => ({})) }));
+  }
+  return new Promise((resolve, reject) => {
+    const request = new XMLHttpRequest();
+    request.open("POST", "/api/chat/upload");
+    for (const [name, value] of Object.entries(headers)) request.setRequestHeader(name, value);
+    request.upload?.addEventListener?.("progress", (event) => {
+      if (event.lengthComputable && event.total > 0) onProgress(event.loaded / event.total);
+    });
+    request.addEventListener("load", () => {
+      let data = {};
+      try {
+        data = JSON.parse(request.responseText || "{}") || {};
+      } catch {
+        data = {};
+      }
+      resolve({ status: request.status, ok: request.status >= 200 && request.status < 300, data });
+    });
+    request.addEventListener("error", () => reject(new Error("첨부파일을 올리지 못했습니다. 연결을 확인해 주세요.")));
+    request.addEventListener("abort", () => reject(new Error("첨부파일 올리기를 멈췄습니다.")));
+    request.send(file);
+  });
 }
 function stopChatPolling() {
   clearTimeout(state.chatPollTimer);
@@ -1324,27 +3499,40 @@ function stopChatPolling() {
   state.chatPollRun++;
   state.chatPollCount = 0;
 }
+const CHAT_POLL_MAX = 240;
+function chatPollDelay(count) {
+  // Live updates announce changes; polling is then only a safety net.
+  if (eventsHealthy()) return EVENTS_SAFETY_MS.chat;
+  // Fast while a reply is likely, then slower; long turns keep being followed.
+  return count < 10 ? 3000 : count < 30 ? 5000 : count < 90 ? 10000 : 20000;
+}
 function scheduleChatPoll(s, entry) {
   if (!currentChat(entry)) return;
   clearTimeout(state.chatPollTimer);
-  const queuedWork = chatQueueCount(entry) > 0 || (entry.submissions || []).some((item) => item.wasQueued && item.status === "accepted" && item.confirmed);
-  if (networkOffline() || !currentChat(entry) || !chatVisible() || state.chatPollCount >= 40 ||
-      (!entry.pending && !queuedWork && !["working", "needs_input"].includes(entry.data?.phase))) return;
+  // A bubble still waiting for its message keeps the conversation followed, so it
+  // goes when the message (or an answer after it) shows, or when it times out.
+  if (networkOffline() || !currentChat(entry) || !chatVisible() || state.chatPollCount >= CHAT_POLL_MAX ||
+      (!entry.pending && !(entry.error && entry.error !== entry.inputError) && !entry.data?.prompt &&
+       !["working", "needs_input"].includes(entry.data?.phase) &&
+       !(entry.outbox || []).some(outboxAwaitsAgent))) return;
   const run = state.chatPollRun;
   state.chatPollTimer = setTimeout(() => {
     if (run !== state.chatPollRun || !currentChat(entry) || !chatVisible()) return;
     state.chatPollCount++;
     loadChatState(s, false);
-  }, 3000);
+  }, chatPollDelay(state.chatPollCount));
 }
-function applyChatReceipt(entry, receipt, fromSnapshot = false) {
-  updateSubmissionReceipt(entry, receipt, fromSnapshot);
+function applyChatReceipt(entry, receipt) {
   if (!receipt || (entry.pending && receipt.requestId !== entry.pending.requestId)) return;
   const fallback = entry.pending?.attachmentDetails ||
     (entry.receipt?.requestId === receipt.requestId ? entry.receipt.attachments : []);
   entry.receipt = { ...receipt, attachments: attachmentMetadata(Array.isArray(receipt.attachments) ? receipt.attachments : fallback) };
+  markOutbox(entry, receipt.requestId, entry.receipt);
   if (!entry.pending || !["accepted", "queued", "completed", "interrupted", "failed"].includes(receipt.status)) return;
-  if ((receipt.status !== "failed" || receipt.confirmed === true) && entry.revision === entry.pending.revision) {
+  // Only the draft that was sent is cleared; a resend from a bubble leaves
+  // any other draft in the editor.
+  if ((receipt.status !== "failed" || receipt.confirmed === true) && entry.revision === entry.pending.revision &&
+      draftIsPending(entry)) {
     entry.text = "";
     entry.attachments = [];
     if (currentChat(entry)) {
@@ -1357,6 +3545,8 @@ function applyChatReceipt(entry, receipt, fromSnapshot = false) {
 async function loadChatState(s, manual = false, { join = false } = {}) {
   const entry = chatEntry(s);
   if (!currentChat(entry) || !chatVisible() || networkOffline()) return;
+  // Without an id the session has no chat state; its transcript (if named) is read directly.
+  if (claudeWithoutId(s)) return { status: "skipped" };
   const identity = conversationIdentity(s);
   if (entry.checking) {
     if (join) {
@@ -1378,7 +3568,10 @@ async function loadChatState(s, manual = false, { join = false } = {}) {
   const epoch = entry.stateEpoch;
   const pollRun = state.chatPollRun;
   let readFailed = false;
-  if (manual) { state.chatPollCount = 0; entry.error = ""; }
+  // A read clears its own (and a send's) errors; an input error (a file too
+  // large, too many files, too long a message) stays until the user acts again.
+  const clearError = () => { if (entry.error !== entry.inputError) entry.error = ""; };
+  if (manual) { state.chatPollCount = 0; clearError(); }
   updateChatComposer(entry);
   try {
     const lastRequestId = entry.pending?.requestId ||
@@ -1392,13 +3585,13 @@ async function loadChatState(s, manual = false, { join = false } = {}) {
     if (epoch !== entry.stateEpoch || currentChat(entry) && conversationIdentity(selectedSession()) !== identity) return;
     entry.data = data;
     outcome = { status: "success", data };
-    entry.error = "";
-    syncQueuedMessages(entry, s, data);
+    clearError();
     for (const receipt of data.receipts || []) {
       if (receipt.requestId === entry.pending?.requestId ||
           (entry.receipt?.dispatchState !== "not_started" && receipt.requestId === entry.receipt?.requestId))
-        applyChatReceipt(entry, receipt, true);
+        applyChatReceipt(entry, receipt);
     }
+    renderPrompt(s, data);
     if (chatReadSupported(entry, data)) {
       rememberConversation(s, data.messages, data);
       if (currentChat(entry)) {
@@ -1406,6 +3599,7 @@ async function loadChatState(s, manual = false, { join = false } = {}) {
         conversationSyncNotice(s, data.stale ? "stale" : "");
       }
     }
+    noteLivePhase(s, data);
     scheduleChatPoll(s, entry);
   } catch (err) {
     readFailed = true;
@@ -1413,8 +3607,14 @@ async function loadChatState(s, manual = false, { join = false } = {}) {
     if (!err.unauthorized && !err.staleAuth && epoch === entry.stateEpoch &&
         currentChat(entry) && conversationIdentity(selectedSession()) === identity)
       conversationSyncNotice(s, "failed");
-    if (!err.unauthorized && !err.staleAuth && epoch === entry.stateEpoch) entry.error = `${err.message} 상태 다시 확인을 눌러 주세요.`;
-    if (currentChat(entry) && pollRun === state.chatPollRun) clearTimeout(state.chatPollTimer);
+    if (!err.unauthorized && !err.staleAuth && epoch === entry.stateEpoch) {
+      // A connection problem that just started shows the bars (its notice is in them).
+      if (!entry.error && currentChat(entry)) revealChrome();
+      entry.error = `${err.message} 상태 다시 확인을 눌러 주세요.`;
+    }
+    // A transient failure keeps following the session with the same backoff.
+    if (currentChat(entry) && pollRun === state.chatPollRun && !err.unauthorized && !err.staleAuth)
+      scheduleChatPoll(s, entry);
   } finally {
     entry.checking = false;
     complete(outcome);
@@ -1427,27 +3627,43 @@ async function loadChatState(s, manual = false, { join = false } = {}) {
   }
   return outcome;
 }
-async function sendChat(entry) {
+// Whether the editor still holds exactly the message in flight.
+function draftIsPending(entry) {
+  const pending = entry.pending;
+  return !!pending && entry.text === pending.text && entry.attachments.length === pending.attachments.length &&
+    entry.attachments.every((item, index) => item.id === pending.attachments[index]);
+}
+// Sends the editor's draft, or `message` ({ text, attachments }) when a
+// bubble resends what it showed; the editor is then left as it is.
+async function sendChat(entry, message = null) {
   if (networkOffline()) { updateChatComposer(entry); return; }
+  const text = message ? String(message.text || "") : entry.text;
+  const attachments = (message ? message.attachments || [] : entry.attachments).slice();
   if (!currentChat(entry) || !chatSupported(entry) || entry.composing || entry.sending || entry.pending || entry.uploads ||
-      (!entry.text.trim() && !entry.attachments.length)) return;
-  if (new TextEncoder().encode(entry.text).length > 32768 || entry.attachments.length > 8) {
-    entry.error = "메시지는 32KiB, 첨부는 8개까지 보낼 수 있습니다. 초안은 유지됩니다.";
+      (!text.trim() && !attachments.length)) return;
+  if (new TextEncoder().encode(text).length > 32768 || attachments.length > 8) {
+    entry.error = entry.inputError = "메시지는 32KiB, 첨부는 8개까지 보낼 수 있습니다. 초안은 유지됩니다.";
     updateChatComposer(entry);
     return;
   }
   // Keep the exact source and idempotency key even if selection changes during transport.
   const authEpoch = state.authEpoch;
   const pending = { requestId: requestId(), revision: entry.revision, source: entry.source,
-    text: entry.text, attachments: entry.attachments.map((item) => item.id),
-    attachmentDetails: attachmentMetadata(entry.attachments) };
-  rememberSubmission(entry, pending);
+    text, attachments: attachments.map((item) => item.id),
+    attachmentDetails: attachmentMetadata(attachments) };
   entry.pending = pending;
   entry.stateEpoch++;
   entry.sending = true;
   entry.error = "";
   entry.notice = "";
+  // The bubble shows at once, translucent, and becomes the real message
+  // when the transcript has it. A failed earlier attempt is superseded.
+  entry.outbox = (entry.outbox || []).filter((item) => item.state !== "failed");
+  entry.outbox.push({ requestId: pending.requestId, text: pending.text, attachments: pending.attachmentDetails,
+    attachmentObjects: attachments, state: "sending", status: "", reason: "", at: Date.now(),
+    ...outboxOrigin(entry.conversation?.messages) });
   updateChatComposer(entry);
+  refreshConversationView(entry, true);
   try {
     const result = await api("/api/chat/send", { method: "POST", body: {
       source: pending.source, requestId: pending.requestId, text: pending.text, attachments: pending.attachments,
@@ -1456,12 +3672,20 @@ async function sendChat(entry) {
     if (result.receipt?.requestId && result.receipt.requestId !== pending.requestId)
       throw new Error("요청 확인 번호가 일치하지 않습니다.");
     applyChatReceipt(entry, { ...result.receipt, requestId: pending.requestId, status: result.status || "unknown" });
+    if (["accepted", "queued", "completed"].includes(result.status)) haptic("success");
+    // A Claude send may have attached the session's board terminal: its marks show it now.
+    if (pending.source?.agent === "claude" && result.receipt?.terminalId) refreshTerminals();
   } catch (err) {
     if (authEpoch === state.authEpoch && !err.unauthorized && !err.staleAuth) {
+      haptic("error");
       if (err.dispatchState === "not_started") {
         applyChatReceipt(entry, { requestId: pending.requestId, status: "failed", confirmed: false,
           dispatchState: "not_started", reason: err.message });
         entry.error = `${err.message} 메시지는 전송되지 않았습니다. 초안과 첨부는 유지됩니다.`;
+        // The terminal closed since the last read: offer the button at once
+        // (the read that follows says the same).
+        if (err.code === "terminal_required" && entry.data)
+          entry.data = { ...entry.data, capability: { ...(entry.data.capability || {}), supported: false, action: "open_terminal" } };
         if (err.code === "csrf_expired") {
           try {
             // Refresh credentials once; keep the current editor mounted and
@@ -1480,23 +3704,361 @@ async function sendChat(entry) {
       } else {
         // HTTP status alone cannot establish whether the native runtime started.
         entry.receipt = { requestId: pending.requestId, status: "unknown", attachments: pending.attachmentDetails };
-        updateSubmissionReceipt(entry, entry.receipt);
         entry.error = "전송 결과를 확인하지 못했습니다. 상태 다시 확인을 눌러 주세요. 중복 전송은 잠겼습니다.";
       }
     }
   } finally {
     entry.stateEpoch++;
     entry.sending = false;
+    if (entry.receipt?.requestId === pending.requestId) markOutbox(entry, pending.requestId, entry.receipt);
+    else if (entry.pending?.requestId === pending.requestId) markOutbox(entry, pending.requestId, { status: "unknown" });
     updateChatComposer(entry);
+    refreshConversationView(entry);
+    // The result (sent, refused or unknown) is read in the composer's status.
+    if (currentChat(entry)) revealChrome();
     const s = selectedSession();
     if (currentChat(entry) && s) { state.chatPollCount = 0; loadChatState(s, true); }
   }
+}
+// --- Sent-from-here bubbles (outbox) ------------------------------------------
+// Memory only, per conversation. "sending" until the server answers; then
+// "sent" (accepted or queued), "uncertain" (no answer: the send stays locked
+// as before) or "failed" (never started: the draft is still in the editor).
+const OUTBOX_LABELS = { sending: "전송 중…", uncertain: "전송 확인 중", sent: "전송됨",
+  queued: "대기 중 · 지금 작업이 끝나면 전달됩니다", failed: "보내지 못함" };
+const OUTBOX_SETTLED_MS = 3 * 60 * 1000;
+const OUTBOX_MAX_MS = 15 * 60 * 1000;
+// A transcript may record a message a little before the browser's clock says
+// it was sent (clocks of the phone and the agent host differ slightly).
+const OUTBOX_CLOCK_SLACK_MS = 30 * 1000;
+// Settled messages remembered per conversation (the server shows 80 at most).
+const OUTBOX_CLAIM_LIMIT = 80;
+const OUTBOX_ATTACHMENT_LINE = /^첨부 파일:/;
+const OUTBOX_ATTACHMENT_ONLY = new Set(["[이미지 첨부]", "[파일 첨부]"]);
+// Claude Code records a pasted image path as "[Image #1]" in the prompt (before,
+// after or instead of the words) and may show a long paste as
+// "[Pasted text #1 +12 lines]"; the board's own words never contain them.
+const CLAUDE_INPUT_TOKEN = /\[(?:Image|Pasted text|Pasted image) #\d+(?: \+\d+ lines?)?\]/g;
+const CLAUDE_IMAGE_TOKEN = /[ \t]*\[(?:Image|Pasted image) #\d+\][ \t]*/g;
+// A sent bubble waits this long for its own message before an answer recorded
+// after it settles it while the agent still works (a message sent mid-turn is
+// recorded when the agent takes it, after the rest of the answer in progress).
+const OUTBOX_REPLY_GRACE_MS = 60 * 1000;
+function outboxText(text) {
+  return String(text || "").replace(/\s+/g, " ").trim();
+}
+// A transcript user message as a bubble compares it: the body without Claude
+// Code's input tokens and the "첨부 파일: …" lines the server appends for
+// attachments, and the possible attachment counts (native attachments and
+// those lines, which a transcript may record once or twice for the same file).
+function outboxShape(message) {
+  const lines = String(message?.text || "").replace(CLAUDE_INPUT_TOKEN, " ").split("\n");
+  let marked = 0;
+  while (lines.length) {
+    const last = lines[lines.length - 1].trim();
+    if (last && !OUTBOX_ATTACHMENT_LINE.test(last)) break;
+    lines.pop();
+    if (last) marked++;
+  }
+  const native = attachmentMetadata(message?.attachments).length;
+  const truncated = message?.truncated === true;
+  let body = outboxText(lines.join("\n"));
+  if (truncated) body = body.replace(/\s*…$/, "");
+  if ((native || marked) && OUTBOX_ATTACHMENT_ONLY.has(body)) body = "";
+  return { body, counts: new Set([native + marked, Math.max(native, marked)]), truncated };
+}
+// A transcript row's stable identifier: Codex rows from /api/chat/state name
+// their item; /api/read and Claude rows carry none.
+function outboxRowId(message) {
+  return typeof message?.itemId === "string" && message.itemId ? message.itemId : null;
+}
+// A message as every read path shows it (role, text and time), whatever
+// attachment details or identifiers that path adds.
+function outboxPrint(message) {
+  return JSON.stringify([message?.role || "", message?.text || "", message?.ts ?? null]);
+}
+// What a bubble keeps of the conversation it was sent into, so a message that
+// was already there never counts as the one it sent: the user rows' item ids
+// when that read named them, and the message count with the last message.
+function outboxOrigin(messages) {
+  const list = Array.isArray(messages) ? messages : [];
+  const named = list.some((message) => outboxRowId(message));
+  return { base: list.length, anchor: list.length ? outboxPrint(list[list.length - 1]) : null,
+    known: named ? list.filter((message) => message?.role === "user").map(outboxRowId).filter(Boolean) : null };
+}
+// Where the messages sent after this bubble start: just after the last message
+// it saw (found again even when the server's window moved), else its count.
+function outboxCut(item, messages) {
+  const base = Math.max(0, Number(item.base) || 0);
+  if (!base || !item.anchor) return base;
+  if (base <= messages.length && outboxPrint(messages[base - 1]) === item.anchor) return base;
+  for (let index = messages.length - 1; index >= 0; index--)
+    if (outboxPrint(messages[index]) === item.anchor) return index + 1;
+  return base;
+}
+// Whether a transcript user message (row: { message, index, shape, id, taken })
+// is the one this bubble sent (view: { codex, cut, known, loose } of this
+// read). A message already there at the send never is. Codex names it by
+// request id, and nothing else settles a Codex bubble; otherwise it is a
+// message after those the bubble saw, with the same body and attachment
+// count, and not recorded before the send (the clock slack only narrows it
+// further). A loose view (the Claude safety net) skips the body comparison.
+function outboxMatches(item, row, view = {}) {
+  const known = view.known || null;
+  if (row.id && known?.has(row.id)) return false;
+  const clientId = row.message?.clientId;
+  if (typeof clientId === "string" && clientId) return clientId === item.requestId;
+  if (view.codex || row.taken) return false;
+  if (!(row.id && known) && row.index < (view.cut ?? (Number(item.base) || 0))) return false;
+  if (!outboxAfterSend(item, row.message)) return false;
+  if (view.loose) return true;
+  const body = outboxText(item.text);
+  // A cut long message keeps only its beginning (and loses the attachment lines).
+  if (row.shape.truncated) return !!row.shape.body && body.startsWith(row.shape.body);
+  return row.shape.body === body && row.shape.counts.has(item.attachments?.length || 0);
+}
+// Not recorded before the send (a message without a time may be after it).
+function outboxAfterSend(item, message) {
+  const ts = Number(message?.ts);
+  return !(Number.isFinite(ts) && ts > 0 && ts * 1000 < item.at - OUTBOX_CLOCK_SLACK_MS);
+}
+// A bubble the server took (accepted, or a later turn status): not one still
+// sending, unconfirmed, refused, or queued behind the running turn.
+function outboxDelivered(item) {
+  return item.state === "sent" && item.status !== "queued";
+}
+// A bubble whose message the agent has yet to show: it keeps "작업 중" after
+// it. A refused one, or one whose request already ended, does not.
+function outboxAwaitsAgent(item) {
+  return item.state !== "failed" && !item.settledAt;
+}
+// The same on /api/chat/state and /api/read: attachment details differ between
+// them (state names the board's files), the time and text do not.
+function outboxClaimKey(row) {
+  return JSON.stringify([row.message?.ts ?? null, row.message?.text || ""]);
+}
+function outboxState(receipt) {
+  if (!receipt) return "uncertain";
+  if (receipt.dispatchState === "not_started") return "failed";
+  if (receipt.status === "failed") return receipt.confirmed === true ? "sent" : "failed";
+  if (["accepted", "queued", "completed", "interrupted"].includes(receipt.status)) return "sent";
+  return "uncertain";
+}
+function markOutbox(entry, requestId, receipt) {
+  const item = entry.outbox?.find((value) => value.requestId === requestId);
+  if (!item) return;
+  item.state = outboxState(receipt);
+  item.status = receipt?.status || "unknown";
+  item.reason = item.state === "failed" ? String(receipt?.reason || "") : "";
+  if (item.state === "failed" || ["completed", "interrupted"].includes(receipt?.status)) item.settledAt ||= Date.now();
+  // The server found the message in the conversation it read.
+  if (item.state !== "failed" && receipt?.readbackConfirmed === true) item.recorded = true;
+}
+// Drops bubbles whose message reached the transcript, settled ones the
+// transcript never showed, and anything older than OUTBOX_MAX_MS. Each
+// transcript message settles at most one bubble, in the order they were
+// sent, and stays claimed on later renders (from either read path) so it
+// never settles another. Every bubble is first matched by its own text; a
+// delivered Claude bubble left over then takes the next new user message
+// (Claude Code may record the words differently), or goes once the agent
+// answered after it (`working`: the conversation's agent still works).
+// Returns whether a bubble went.
+function settleOutbox(entry, messages, { working = false, claimed = null } = {}) {
+  if (!entry) return false;
+  const now = Date.now();
+  entry.outboxClaims = (entry.outboxClaims || []).filter((claim) => now - claim.at < OUTBOX_MAX_MS);
+  if (!entry.outbox?.length) return false;
+  const list = Array.isArray(messages) ? messages : [];
+  const rows = [];
+  list.forEach((message, index) => {
+    if (message?.role === "user") rows.push({ message, index, shape: outboxShape(message), id: outboxRowId(message), taken: false });
+  });
+  for (const claim of entry.outboxClaims) {
+    const row = rows.find((value) => !value.taken && (claim.id && value.id ? claim.id === value.id
+      : outboxClaimKey(value) === claim.key && (value.message.ts != null || value.index >= claim.base)));
+    if (row) row.taken = true;
+  }
+  const codex = entry.source?.agent === "codex";
+  const settled = new Set();
+  const views = new Map();
+  const claim = (item, row, view) => {
+    row.taken = true;
+    settled.add(item);
+    claimed?.add(row.message);
+    entry.outboxClaims.push({ id: row.id, key: outboxClaimKey(row), base: view.cut, at: now });
+  };
+  for (const item of entry.outbox) {
+    if (item.state === "failed") continue;
+    const view = { codex, cut: outboxCut(item, list), known: Array.isArray(item.known) ? new Set(item.known) : null };
+    views.set(item, view);
+    const row = rows.find((value) => outboxMatches(item, value, view));
+    if (row) claim(item, row, view);
+  }
+  for (const item of entry.outbox) {
+    if (settled.has(item) || item.state === "failed") continue;
+    const view = { ...views.get(item), loose: true };
+    if (!codex && outboxDelivered(item)) {
+      const row = rows.find((value) => outboxMatches(item, value, view));
+      if (row) { claim(item, row, view); continue; }
+    }
+    // The server read the conversation and found the message there.
+    if (item.recorded) { settled.add(item); continue; }
+    if (!codex && outboxDelivered(item)) {
+      // An answer recorded after the send itself (no clock slack: an answer the
+      // bubble's view of the conversation had not caught yet is no reply).
+      const answered = list.slice(view.cut).some((message) => {
+        const ts = Number(message?.ts);
+        return message?.role === "assistant" && !(Number.isFinite(ts) && ts > 0 && (ts + 1) * 1000 <= item.at);
+      });
+      if (answered && (!working || now - item.at > OUTBOX_REPLY_GRACE_MS)) settled.add(item);
+    }
+  }
+  if (entry.outboxClaims.length > OUTBOX_CLAIM_LIMIT)
+    entry.outboxClaims.splice(0, entry.outboxClaims.length - OUTBOX_CLAIM_LIMIT);
+  const before = entry.outbox.length;
+  entry.outbox = entry.outbox.filter((item) => {
+    const keep = !settled.has(item) &&
+      !(item.state !== "failed" && item.settledAt && now - item.settledAt > OUTBOX_SETTLED_MS) &&
+      now - item.at < OUTBOX_MAX_MS;
+    // The composer's "접수했습니다" note was about this message; the conversation
+    // now says the rest.
+    if (!keep && item.state !== "failed" && entry.receipt?.requestId === item.requestId)
+      entry.settledRequestId = item.requestId;
+    return keep;
+  });
+  return entry.outbox.length !== before;
+}
+// Resends exactly what the failed bubble showed. Another draft in the editor
+// stays there, unsent; an empty editor gets the message back so a second
+// refusal still leaves it to edit.
+function retryOutbox(entry, item) {
+  if (!currentChat(entry) || entry.sending || entry.pending || entry.uploads || entry.composing) return;
+  const message = { text: String(item.text || ""), attachments: (item.attachmentObjects || []).slice() };
+  if (!message.text.trim() && !message.attachments.length) {
+    entry.outbox = (entry.outbox || []).filter((value) => value !== item);
+    refreshConversationView(entry);
+    return;
+  }
+  if (!entry.text.trim() && !entry.attachments.length) {
+    entry.text = message.text;
+    entry.attachments = message.attachments.slice();
+    entry.revision++;
+    const input = $("chat-input");
+    if (input && $("chat-composer")?.dataset.source === chatKey(entry.source)) input.value = entry.text;
+  }
+  // sendChat replaces the failed bubble once the resend starts.
+  sendChat(entry, message);
+}
+function outboxRows(list, entry) {
+  list.outboxNodes ||= new Map();
+  const rows = [];
+  const keep = new Set();
+  for (const item of entry.outbox || []) {
+    keep.add(item.requestId);
+    let row = list.outboxNodes.get(item.requestId);
+    if (!row) {
+      row = el("article", "msg user is-outbox");
+      const bubble = el("div", "bubble");
+      if (item.text) bubble.append(el("span", "msg-body", item.text));
+      if (item.attachments?.length)
+        bubble.append(attachmentGroup(item.attachments, `첨부 ${item.attachments.length}개`, { showCaption: false }));
+      const status = el("p", "msg-delivery");
+      status.setAttribute("role", "status");
+      row.append(bubble, status);
+      row.deliveryStatus = status;
+      list.outboxNodes.set(item.requestId, row);
+    }
+    const name = item.state === "sent" && item.status === "queued" ? "queued" : item.state;
+    const className = `msg user is-outbox is-${item.state}`;
+    if (row.className !== className) row.className = className;
+    const revision = `${name}|${item.reason}`;
+    if (row.deliveryRevision !== revision) {
+      row.deliveryRevision = revision;
+      // The reason stays in the composer's status line above the kept draft.
+      row.deliveryStatus.title = item.state === "failed" ? item.reason : "";
+      if (item.state === "failed") {
+        const retry = button("다시 보내기", "msg-retry", () => retryOutbox(entry, item));
+        retry.setAttribute("aria-label", "보내지 못한 메시지 다시 보내기");
+        row.deliveryStatus.replaceChildren(el("span", "msg-delivery-text", OUTBOX_LABELS.failed), retry);
+      } else row.deliveryStatus.replaceChildren(el("span", "msg-delivery-text", OUTBOX_LABELS[name] || OUTBOX_LABELS.uncertain));
+    }
+    rows.push(row);
+  }
+  for (const key of [...list.outboxNodes.keys()]) if (!keep.has(key)) list.outboxNodes.delete(key);
+  return rows;
+}
+// "··· 작업 중 · 12분 34초" at the end of a conversation that waits on its
+// working agent (renderMessages decides), counted from an exact workingSince
+// (epoch seconds); without one (Claude) it says "··· 작업 중" alone.
+function workingRow(list) {
+  if (list.workingRow) return list.workingRow;
+  const row = el("article", "msg assistant msg-working");
+  row.setAttribute("role", "status");
+  const bubble = el("div", "bubble working-bubble");
+  const dots = el("span", "working-dots");
+  dots.setAttribute("aria-hidden", "true");
+  dots.append(el("i"), el("i"), el("i"));
+  // The ticking time is not announced every second; the status is.
+  row.workingTime = el("span", "working-time");
+  row.workingTime.setAttribute("aria-live", "off");
+  const label = el("span", "working-label", "작업 중");
+  label.append(row.workingTime);
+  bubble.append(dots, label);
+  row.append(bubble);
+  list.workingRow = row;
+  return row;
+}
+// Under an hour minutes and seconds ("12분 34초"), then hours and minutes.
+function formatElapsed(seconds) {
+  const total = Math.max(0, Math.floor(Number(seconds) || 0));
+  if (total < 60) return `${total}초`;
+  if (total < 3600) return `${Math.floor(total / 60)}분 ${total % 60}초`;
+  const minutes = Math.floor((total % 3600) / 60);
+  return `${Math.floor(total / 3600)}시간${minutes ? ` ${minutes}분` : ""}`;
+}
+function workingElapsedText(since, now = Date.now()) {
+  return Number.isFinite(since) && since > 0 ? ` · ${formatElapsed(now / 1000 - since)}` : "";
+}
+function stopWorkingClock() {
+  clearTimeout(state.workingTimer);
+  state.workingTimer = null;
+}
+// Updates the shown working time, then once a second while the conversation
+// is on screen: not on a phone's list, behind a terminal or on a hidden page
+// (visibilitychange and setDetailShown stop and restart it). Reduced motion
+// stops only the dots; the time keeps counting.
+function tickWorking() {
+  stopWorkingClock();
+  const list = $("messages");
+  const row = list?.workingRow;
+  if (!row || ![...(list.children || [])].includes(row)) return;
+  const text = workingElapsedText(list.workingSince);
+  if (row.workingTime.textContent !== text) row.workingTime.textContent = text;
+  if (!text || !chatVisible()) return;
+  state.workingTimer = setTimeout(tickWorking, 1000 - (Date.now() % 1000) + 20);
+}
+// `claude agents` can list a working interactive session without an id (and
+// then often without its transcript's session id too): the board can neither
+// send to it nor, without a session id, read it.
+const CLAUDE_UNREADABLE = "이 Claude 세션은 아직 대화 기록 ID를 알 수 없어 여기서 읽을 수 없습니다. " +
+  "잠시 뒤 다시 열거나 터미널에서 확인해 주세요.";
+const CLAUDE_NO_SEND = "이 Claude 세션은 세션 ID가 없어 여기서 보낼 수 없습니다. 터미널에서 이어가 주세요.";
+function claudeWithoutId(s) {
+  return s?.agent === "claude" && !s.nativeSource && !s.id;
+}
+// Re-renders the open conversation from what is already on screen (new
+// bubble states, the working indicator), optionally scrolling to the end.
+function refreshConversationView(entry, toEnd = false) {
+  const list = $("messages");
+  const s = selectedSession();
+  if (!s || !list || !currentChat(entry) || list.conversationSource !== chatKey(entry.source)) return;
+  renderMessages(s, null, list.conversationErrorText || "", toEnd);
 }
 async function uploadChatFiles(entry, files) {
   if (networkOffline()) { updateChatComposer(entry); return; }
   if (!currentChat(entry) || !chatAttachmentsSupported(entry) || entry.sending || entry.pending || entry.uploads || !files.length) return;
   if (entry.attachments.length + files.length > 8) {
-    entry.error = "한 메시지에는 첨부 파일을 8개까지 추가할 수 있습니다.";
+    entry.error = entry.inputError = "한 메시지에는 첨부 파일을 8개까지 추가할 수 있습니다.";
     updateChatComposer(entry);
     return;
   }
@@ -1504,45 +4066,67 @@ async function uploadChatFiles(entry, files) {
   entry.uploads = files.length;
   entry.error = "";
   entry.notice = "";
+  const queue = files.map((file, index) => ({ key: `upload-${Date.now()}-${index}`, file, state: "waiting", progress: null }));
+  for (const item of queue) attachmentThumb(entry, item.key, item.file);
+  entry.uploadQueue = queue;
+  const unqueue = (item) => {
+    entry.uploadQueue = entry.uploadQueue.filter((value) => value !== item);
+  };
   updateChatComposer(entry);
-  for (const file of files) {
-    if (authEpoch !== state.authEpoch) { entry.uploads = 0; return; }
-    if (networkOffline()) {
-      entry.notice = `아직 올리지 못한 파일 ${entry.uploads}개가 있습니다. 다시 첨부해 주세요.`;
-      entry.uploads = 0; updateChatComposer(entry); break;
-    }
-    try {
-      const limit = entry.data.maxAttachmentBytes || 20 * 1024 * 1024;
-      if (file.size > limit) throw new Error(`${file.name || "파일"}: 최대 ${formatBytes(limit)}까지 첨부할 수 있습니다.`);
-      const response = await fetch("/api/chat/upload", {
-        method: "POST", credentials: "same-origin", cache: "no-store", body: file,
-        headers: { "Content-Type": "application/octet-stream", "X-CSRF-Token": state.csrf,
-          "X-Chat-Source": encodeURIComponent(JSON.stringify(entry.source)),
-          "X-File-Name": encodeURIComponent(file.name || `clipboard-${Date.now()}.${file.type?.split("/")[1]?.replace("jpeg", "jpg") || "bin"}`) },
-      });
-      assertAuthEpoch(authEpoch);
-      if (response.status === 401) { showLogin(); return; }
-      const data = await response.json().catch(() => ({}));
-      assertAuthEpoch(authEpoch);
-      if (!response.ok || !data.attachment?.id) throw new Error(data.error || "첨부파일을 올리지 못했습니다.");
-      if (!state.authenticated || state.chats.get(chatKey(entry.source)) !== entry) return;
-      entry.attachments.push(data.attachment);
-      entry.revision++;
-    } catch (err) {
-      if (authEpoch !== state.authEpoch || err.staleAuth) { entry.uploads = 0; return; }
-      entry.error = err.message;
+  try {
+    for (const item of queue) {
+      const file = item.file;
+      if (authEpoch !== state.authEpoch) { entry.uploads = 0; return; }
       if (networkOffline()) {
         entry.notice = `아직 올리지 못한 파일 ${entry.uploads}개가 있습니다. 다시 첨부해 주세요.`;
-        entry.error = `${err.message} ${entry.notice}`;
-        break;
+        entry.uploads = 0; updateChatComposer(entry); break;
       }
-    } finally { entry.uploads = Math.max(0, entry.uploads - 1); updateChatComposer(entry); }
+      try {
+        const limit = entry.data.maxAttachmentBytes || 20 * 1024 * 1024;
+        if (file.size > limit) throw new Error(`${file.name || "파일"}: 최대 ${formatBytes(limit)}까지 첨부할 수 있습니다.`);
+        item.state = "uploading";
+        item.progress = 0;
+        setUploadProgress(item.tile, item);
+        const response = await sendUpload(file, { "Content-Type": "application/octet-stream", "X-CSRF-Token": state.csrf,
+          "X-Chat-Source": encodeURIComponent(JSON.stringify(entry.source)),
+          "X-File-Name": encodeURIComponent(file.name || `clipboard-${Date.now()}.${file.type?.split("/")[1]?.replace("jpeg", "jpg") || "bin"}`) },
+        (ratio) => {
+          item.progress = ratio;
+          setUploadProgress(item.tile, item);
+        });
+        assertAuthEpoch(authEpoch);
+        if (response.status === 401) { showLogin(); return; }
+        const data = response.data || {};
+        if (!response.ok || !data.attachment?.id) throw new Error(data.error || "첨부파일을 올리지 못했습니다.");
+        if (!state.authenticated || state.chats.get(chatKey(entry.source)) !== entry) return;
+        // The local preview now belongs to the uploaded attachment.
+        const thumb = entry.thumbs.get(item.key);
+        if (thumb) {
+          entry.thumbs.delete(item.key);
+          entry.thumbs.set(data.attachment.id, thumb);
+        }
+        unqueue(item);
+        entry.attachments.push(data.attachment);
+        entry.revision++;
+      } catch (err) {
+        if (authEpoch !== state.authEpoch || err.staleAuth) { entry.uploads = 0; return; }
+        unqueue(item);
+        entry.error = entry.inputError = err.message;
+        if (networkOffline()) {
+          entry.notice = `아직 올리지 못한 파일 ${entry.uploads}개가 있습니다. 다시 첨부해 주세요.`;
+          entry.error = entry.inputError = `${err.message} ${entry.notice}`;
+          break;
+        }
+      } finally { entry.uploads = Math.max(0, entry.uploads - 1); updateChatComposer(entry); }
+    }
+  } finally {
+    entry.uploadQueue = entry.uploadQueue.filter((item) => !queue.includes(item));
   }
   entry.uploads = 0;
   updateChatComposer(entry);
 }
 function insertChatText(entry, input, text) {
-  if (!text || !currentChat(entry) || input.disabled) return;
+  if (!text || !currentChat(entry) || input.disabled || input.readOnly) return;
   const start = input.selectionStart ?? input.value.length;
   const end = input.selectionEnd ?? start;
   input.value = input.value.slice(0, start) + text + input.value.slice(end);
@@ -1667,8 +4251,41 @@ async function readChatClipboard(entry, input, files, editorEpoch = entry.editor
     updateChatComposer(entry);
   }
 }
+async function recoverChatSession(s) {
+  if (!state.authenticated || state.selected !== s.key || state.launchBusy || networkOffline()) return;
+  const entry = chatEntry(s);
+  const recovery = chatRecovery(entry);
+  if (!recovery || entry.recovering) return;
+  if (recovery.action === "resume_session") {
+    state.route = { host: s.host, agent: s.agent, account: accountOf(s) };
+    return preparePlan({ resume: true });
+  }
+  const authEpoch = state.authEpoch;
+  entry.recovering = true;
+  entry.error = "";
+  updateChatComposer(entry);
+  try {
+    await api("/api/refresh", { method: "POST", body: { host: s.host }, authEpoch });
+    assertAuthEpoch(authEpoch);
+    await poll(false);
+    assertAuthEpoch(authEpoch);
+    if (currentChat(entry) && !chatHostOffline(entry)) {
+      state.chatPollCount = 0;
+      await loadChatState(selectedSession(), true, { join: true });
+    }
+  } catch (err) {
+    if (authEpoch === state.authEpoch && !err.unauthorized && !err.staleAuth)
+      entry.error = err.message || "기기 연결을 확인하지 못했습니다. 초안은 유지됩니다.";
+  } finally {
+    if (authEpoch === state.authEpoch) { entry.recovering = false; updateChatComposer(entry); }
+  }
+}
 function openChatTerminal(s) {
   if (state.selected !== s.key || state.launchBusy) return;
+  const bot = botRequestForNative(sourceOf(s));
+  if (bot) { selectBotRequest(botRequestKey(bot)); return; }
+  if (chatOneShot(chatEntry(s))) { toast(ONE_SHOT_NO_INPUT); return; }
+  if (chatRecovery(chatEntry(s))) return recoverChatSession(s);
   if (state.terminalAlive && chatKey(terminalInfo(state.terminal).nativeSource || {}) === chatKey(sourceOf(s))) {
     openTerminal(state.terminal);
     return;
@@ -1694,10 +4311,170 @@ function openNativeChat(terminal) {
   if (state.terminalVisible) returnToBoard({ selectLaunchedSource: false });
   select(key);
 }
+// --- Tool records: consecutive tool rows fold into one line -----------------
+// "도구 실행 7개 · 명령 4 · 파일 수정 2" opens to one line per record, and a
+// record opens once more to its full text. Groups and records are reused
+// across reads, so what is open stays open while a turn adds records.
+const TOOL_KIND_LABELS = { command: "명령", edit: "파일 수정", read: "파일 읽기", search: "검색",
+  mcp: "MCP", agent: "에이전트", other: "기타" };
+const CLAUDE_TOOL_KINDS = { Bash: "command", BashOutput: "command", KillShell: "command", KillBash: "command",
+  Edit: "edit", MultiEdit: "edit", Write: "edit", NotebookEdit: "edit", Read: "read", NotebookRead: "read",
+  Grep: "search", Glob: "search", LS: "search", WebSearch: "search", WebFetch: "search", ToolSearch: "search",
+  Task: "agent", Agent: "agent" };
+// The collector names each record's kind (toolKind); a read without it is
+// told apart by the text the collector writes ("$ …", "파일 수정 · …", "Bash · …").
+function toolKindOf(message) {
+  if (Object.prototype.hasOwnProperty.call(TOOL_KIND_LABELS, message?.toolKind)) return message.toolKind;
+  const text = String(message?.text || "");
+  if (text.startsWith("$ ")) return "command";
+  if (text.startsWith("파일 수정")) return "edit";
+  if (text.startsWith("웹 검색")) return "search";
+  const name = text.split(" · ")[0].trim();
+  if (name.startsWith("mcp__")) return "mcp";
+  return CLAUDE_TOOL_KINDS[name] || "other";
+}
+function toolItemNode(message) {
+  const node = button("", "tool-item", () => {
+    node.full = !node.full;
+    setClass(node, "is-full", node.full);
+    node.setAttribute("aria-expanded", String(node.full));
+  });
+  node.setAttribute("aria-expanded", "false");
+  node.append(el("span", "tool-item-text", String(message.text || "")));
+  return node;
+}
+function toolGroupTitle(items) {
+  return `도구 실행 ${items.length}개`;
+}
+function toolGroupKinds(items) {
+  const counts = new Map();
+  for (const item of items) counts.set(item.kind, (counts.get(item.kind) || 0) + 1);
+  const order = Object.keys(TOOL_KIND_LABELS);
+  return [...counts].sort((a, b) => b[1] - a[1] || order.indexOf(a[0]) - order.indexOf(b[0]))
+    .map(([kind, count]) => `${TOOL_KIND_LABELS[kind] || TOOL_KIND_LABELS.other} ${count}`).join(" · ");
+}
+function setToolGroupOpen(row, open) {
+  row.open = !!open;
+  setClass(row, "is-open", row.open);
+  row.toolToggle.setAttribute("aria-expanded", String(row.open));
+  row.toolList.hidden = !row.open;
+}
+function toolGroupNode() {
+  const row = el("article", "msg tool tool-group");
+  const toggle = button("", "tool-group-toggle", () => setToolGroupOpen(row, !row.open));
+  const icon = el("span", "tool-group-icon");
+  icon.setAttribute("aria-hidden", "true");
+  const chevron = el("span", "tool-group-chevron");
+  chevron.setAttribute("aria-hidden", "true");
+  row.toolTitle = el("span", "tool-group-title");
+  row.toolKinds = el("span", "tool-group-kinds");
+  toggle.append(icon, row.toolTitle, row.toolKinds, chevron);
+  row.toolToggle = toggle;
+  row.toolList = el("div", "tool-group-list");
+  row.append(toggle, row.toolList);
+  setToolGroupOpen(row, false);
+  // The long-press menu copies every record of the group.
+  row.messageItem = { key: "", message: { role: "tool", text: "", ts: null }, row, role: "tool", truncated: false,
+    group: true, items: [] };
+  const more = button("", "msg-more", () => openMessageMenu(row));
+  more.setAttribute("aria-label", "도구 실행 기록 메뉴");
+  more.setAttribute("aria-haspopup", "dialog");
+  more.title = "도구 실행 기록 메뉴";
+  row.moreButton = more;
+  row.append(more);
+  return row;
+}
+function updateToolGroup(row, items) {
+  const title = toolGroupTitle(items);
+  const kinds = toolGroupKinds(items);
+  if (row.toolTitle.textContent !== title) row.toolTitle.textContent = title;
+  if (row.toolKinds.textContent !== `· ${kinds}`) row.toolKinds.textContent = `· ${kinds}`;
+  row.toolToggle.setAttribute("aria-label", `${title}, ${kinds}`);
+  // Records already shown stay mounted, so their own open state survives.
+  const nodes = items.map((item) => item.row);
+  const box = row.toolList;
+  for (const child of [...box.children]) if (!nodes.includes(child)) box.removeChild(child);
+  nodes.forEach((node, index) => {
+    if (box.children[index] !== node) box.insertBefore(node, box.children[index] || null);
+  });
+  Object.assign(row.messageItem, { key: items[0].key, items, message: { role: "tool",
+    text: items.map((item) => item.message.text || "").join("\n"), ts: items[0].message.ts ?? null } });
+  // Every record remembers its group, for when the group's first record leaves.
+  for (const item of items) item.inGroup = row;
+}
+// The conversation's rows with each run of tool records as one group. A group
+// belongs to its first record (the same object while later records join it).
+// When the server's 80-row window moves past that record, the group of a record
+// still shown carries on, opened or not; one group is never drawn twice.
+function toolGroupRows(list, rows) {
+  const desired = [];
+  const used = new Set();
+  for (let index = 0; index < rows.length;) {
+    if (rows[index].role !== "tool") { desired.push(rows[index++].row); continue; }
+    const items = [];
+    while (index < rows.length && rows[index].role === "tool") items.push(rows[index++]);
+    if (!items[0].toolGroup || used.has(items[0].toolGroup)) {
+      const earlier = items.map((item) => item.inGroup).filter(Boolean);
+      let node = earlier.find((group) => !used.has(group));
+      if (!node) {
+        node = toolGroupNode();
+        if (earlier.some((group) => group.open)) setToolGroupOpen(node, true);
+      }
+      items[0].toolGroup = node;
+    }
+    used.add(items[0].toolGroup);
+    updateToolGroup(items[0].toolGroup, items);
+    desired.push(items[0].toolGroup);
+  }
+  return desired;
+}
+// What a user bubble shows: the board's own "첨부 파일: <경로>" lines (added
+// when it sends files) become chips named by the file, and "[이미지 첨부]"
+// alone is left out when chips say it. No attachment path is drawn.
+const ATTACHMENT_PATH_LINE = /^첨부 파일: (.+)$/;
+const IMAGE_NAME = /\.(png|jpe?g|gif|webp|heic|heif|bmp|svg)$/i;
+function userMessageParts(message) {
+  const text = String(message?.text || "");
+  const chips = attachmentMetadata(message?.attachments);
+  const lines = text.split("\n");
+  const names = [];
+  while (lines.length) {
+    const match = lines[lines.length - 1].trim().match(ATTACHMENT_PATH_LINE);
+    if (!match) break;
+    let path = match[1].trim();
+    if (path.startsWith('"')) {
+      try { path = String(JSON.parse(path)); } catch { path = path.replace(/^"|"$/g, ""); }
+    }
+    // Only the board's attachment store; a typed "첨부 파일: …" line stays text.
+    if (!path.includes(`/${INSTANCE.attachmentsDir}/`)) break;
+    names.unshift(path.slice(path.lastIndexOf("/") + 1) || "첨부파일");
+    lines.pop();
+  }
+  for (const name of names) {
+    if (chips.some((file) => file.name === name)) continue;
+    const kind = IMAGE_NAME.test(name) ? "image" : "file";
+    const chip = { id: null, name, type: "", size: null, kind, source: "sessionholic" };
+    // A transcript chip that could not name its file takes the name from the path.
+    const unnamed = chips.findIndex((file) => file.source === "native" && file.kind === kind &&
+      GENERIC_ATTACHMENT_NAMES.has(String(file.name).trim().toLowerCase()));
+    if (unnamed >= 0) chips[unnamed] = chip;
+    else chips.push(chip);
+  }
+  let body = names.length ? lines.join("\n").replace(/\s+$/, "") : text;
+  // Claude Code's "[Image #1]" stands for an image the chips already show.
+  if (chips.some((file) => file.kind === "image")) {
+    const words = body.replace(CLAUDE_IMAGE_TOKEN, " ");
+    if (words !== body) body = words.trim();
+  }
+  if (chips.length && OUTBOX_ATTACHMENT_ONLY.has(body.trim())) body = "";
+  return { body, attachments: chips };
+}
 function renderMessages(s, messages, error = "", fresh = false) {
   const list = $("messages");
   if (!list) return;
   const source = chatKey(sourceOf(s));
+  const entry = state.chats.get(source) || null;
+  const historyNotice = messages?.length ? "" : conversationHistoryNotice(s, entry);
   const previous = list.conversationSource === source ? list.conversationRows || [] : [];
   // A failed refresh never removes a conversation that was already readable.
   if (messages == null || (error && !messages.length && previous.length))
@@ -1705,93 +4482,178 @@ function renderMessages(s, messages, error = "", fresh = false) {
   const selectedText = window.getSelection?.();
   const readingSelection = selectedText && !selectedText.isCollapsed &&
     (list.contains?.(selectedText.anchorNode) || list.contains?.(selectedText.focusNode));
+  // Pinned (or within 50px of the end): stays at the newest message, also when the
+  // list was laid out at another size (hidden, a question card, the keyboard).
   const stick = !readingSelection &&
-    (fresh || list.scrollHeight - list.scrollTop - list.clientHeight < 50);
+    (list.pendingView ? list.pendingView.pinned :
+      fresh || pinnedToEnd(list) || list.scrollHeight - list.scrollTop - list.clientHeight < 50);
+  if (stick) list.pinned = true;
   const scroll = list.scrollTop;
+  const previousKeys = new Set(previous.map((item) => item.key));
   const oldWarningHeight = list.conversationError && [...list.children].includes(list.conversationError)
     ? list.conversationError.offsetHeight || 0 : 0;
+  const keys = messages.map((message) => JSON.stringify([message.role, message.text, message.ts || null,
+    attachmentMetadata(message.attachments), message.truncated === true]));
+  // The server's 80-row window drops whole rows at its start: the rows on
+  // screen are first lined up with the new ones where they overlap most, so
+  // two rows with the same key (the same first command of two Codex turns,
+  // which have no time) each keep their own row and tool group.
+  let overlap = 0;
+  let shift = 0;
+  for (let start = 0; start < previous.length && previous.length - start > overlap; start++) {
+    let length = 0;
+    while (start + length < previous.length && length < keys.length && previous[start + length].key === keys[length]) length++;
+    if (length > overlap) { overlap = length; shift = start; }
+  }
+  const lined = new Set(previous.slice(shift, shift + overlap));
   const available = new Map();
   for (const item of previous) {
+    if (lined.has(item)) continue;
     if (!available.has(item.key)) available.set(item.key, []);
     available.get(item.key).push(item);
   }
-  const rows = messages.map((message) => {
-    const attachments = attachmentMetadata(message.attachments);
-    const key = JSON.stringify([message.role, message.text, message.ts || null, attachments]);
-    const retained = available.get(key)?.shift();
+  const rows = messages.map((message, index) => {
+    const key = keys[index];
+    const retained = index < overlap ? previous[shift + index] : available.get(key)?.shift();
     if (retained) return retained;
     const role = ["user", "assistant", "tool", "system"].includes(message.role) ? message.role : "system";
+    // A tool record is one line of its group (toolGroupNode), not a row of its own.
+    if (role === "tool") return { key, message, row: toolItemNode(message), role, truncated: false, kind: toolKindOf(message) };
     const row = el("article", `msg ${role}`);
-    if (role === "tool") {
-      const more = el("details");
-      more.append(el("summary", null, "도구 실행 기록"), el("div", "bubble", message.text));
+    if (role !== "system") {
+      const label = el("div", "msg-label");
+      label.append(el("strong", null, role === "user" ? "나" : AGENTS[s.agent] || "에이전트"));
+      if (message.ts) label.append(el("span", null, clock(message.ts)));
+      row.append(label);
+      row.msgLabel = label;
+    }
+    const bubble = el("div", "bubble");
+    if (role === "assistant" && typeof MessageFormat !== "undefined") {
+      MessageFormat.render(bubble, message.text || "", {
+        onCopy: (text) => copyText(text, "코드를 복사했습니다."),
+      });
+    } else if (role === "user") {
+      // The board's own "첨부 파일: <경로>" lines become chips, never paths.
+      const shown = userMessageParts(message);
+      if (shown.attachments.length) {
+        if (shown.body) bubble.append(el("span", "msg-body", shown.body));
+        bubble.append(attachmentGroup(shown.attachments, `첨부 ${shown.attachments.length}개`, { showCaption: false }));
+      } else bubble.textContent = shown.body;
+    } else bubble.textContent = message.text || "";
+    row.append(bubble);
+    // The server keeps at most 4,000 characters per message; say so instead of
+    // letting a partial copy pass for the whole answer.
+    const truncated = message.truncated === true;
+    if (truncated) {
+      const total = Number.isInteger(message.fullLength) ? ` · 전체 ${message.fullLength.toLocaleString()}자` : "";
+      row.append(el("p", "msg-truncated", `긴 메시지라 앞부분만 표시합니다${total}. 전체 내용은 터미널에서 확인해 주세요.`));
+    }
+    // Copy, code copy, selection and the terminal live in a menu: long press
+    // on touch, right click or this button (shown on hover) with a mouse.
+    const item = { key, message, row, role, truncated };
+    row.messageItem = item;
+    if (role !== "system") {
+      const more = button("", "msg-more", () => openMessageMenu(row));
+      more.setAttribute("aria-label", "메시지 메뉴");
+      more.setAttribute("aria-haspopup", "dialog");
+      more.title = "메시지 메뉴";
+      row.moreButton = more;
       row.append(more);
-    } else {
-      if (role !== "system") {
-        const label = el("div", "msg-label");
-        label.append(el("strong", null, role === "user" ? "나" : AGENTS[s.agent] || "에이전트"));
-        if (message.ts) label.append(el("span", null, clock(message.ts)));
-        row.append(label);
-      }
-      const bubble = el("div", "bubble");
-      if (role === "assistant" && typeof MessageFormat !== "undefined") {
-        MessageFormat.render(bubble, message.text || "", {
-          onCopy: async (text, kind) => {
-            try {
-              await navigator.clipboard.writeText(text);
-              toast(kind === "code" ? "코드를 복사했습니다." : "인용문을 복사했습니다.");
-            } catch { toast("클립보드에 접근할 수 없습니다. 본문을 길게 눌러 선택해 주세요."); }
-          },
-        });
-      } else {
-        const text = message.text || "";
-        if (role === "user" && attachments.length) {
-          if (text) bubble.append(el("span", "msg-body", text));
-          bubble.append(attachmentGroup(attachments));
-        } else bubble.textContent = text;
-      }
-      row.append(bubble);
     }
-    const copy = button("복사", "msg-copy", async () => {
-      const text = role === "assistant" && typeof MessageFormat !== "undefined"
-        ? MessageFormat.plainText(message.text || "") : message.text || "";
-      try { await navigator.clipboard.writeText(text); toast("메시지 본문을 복사했습니다."); }
-      catch { toast("클립보드에 접근할 수 없습니다. 본문을 길게 눌러 선택해 주세요."); }
-    });
-    copy.setAttribute("aria-label", "메시지 본문 복사");
-    if (role === "user" && attachments.length && !message.text) {
-      copy.disabled = true;
-      copy.hidden = true;
-      copy.setAttribute("aria-label", "복사할 텍스트 본문이 없습니다");
-    }
-    row.append(copy);
-    return { key, message, row };
+    return item;
   });
-  const desired = rows.map((item) => item.row);
+  groupMessageRows(rows);
+  const desired = toolGroupRows(list, rows);
+  // This board's own sends that the transcript does not show yet, then the
+  // working indicator, always after the transcript.
+  let tail = [];
+  let working = false;
+  // Transcript messages that settled one of this board's bubbles in this render.
+  const claimed = new Set();
+  if (entry) {
+    const live = entry.data && chatKey(entry.data.route || {}) === source ? entry.data : null;
+    // A Claude row without an id is never read; its listed phase still says it works.
+    const phaseWorking = live ? live.phase === "working" : claudeWithoutId(s) && s.phase === "working";
+    // The composer's receipt note follows a bubble that went (renderMessages
+    // also runs for /api/read, which no composer update follows).
+    if (settleOutbox(entry, messages, { working: phaseWorking, claimed })) updateChatComposer(entry);
+    tail = outboxRows(list, entry);
+    // The phase stays "working" while a background agent still runs tools after
+    // its answer, so the row shows only while the conversation waits on the
+    // agent: it ends with a message of the user's (one sent from here and not
+    // refused or ended included), with tool records, or nothing has been read yet.
+    const lastRole = (entry.outbox || []).some(outboxAwaitsAgent) ? "user" : rows.at(-1)?.role;
+    working = !historyNotice && phaseWorking && (!lastRole || lastRole === "user" || lastRole === "tool");
+    // Only an exact start (Codex's running turn) is counted; Claude's newest
+    // prompt time is an approximation and shows no time.
+    list.workingSince = live && live.workingSinceApprox !== true ? live.workingSince ?? null : null;
+    if (working) tail.push(workingRow(list));
+  }
   if (error) {
-    if (!list.conversationError || list.conversationErrorText !== error || list.conversationSource !== source) {
-      const warning = el("div", "conversation-read-error");
+    // A Codex account without its app-server daemon: listed from its state DB, readable
+    // once the daemon runs. "앱 서버 켜기" starts it on that host.
+    const serverOff = s.agent === "codex" && s.appServer === "off";
+    const errorKey = error + (serverOff ? "\0off" : "");
+    if (!list.conversationError || list.conversationErrorText !== errorKey || list.conversationSource !== source) {
+      const warning = el("div", `conversation-read-error${serverOff ? " app-server-off" : ""}`);
       warning.setAttribute("role", "status");
-      warning.append(el("p", "detail-error", error), button("대화 다시 불러오기", "secondary", () => {
-        const current = selectedSession();
-        if (current?.key === s.key) loadDetail(current, !list.conversationRows?.length);
-      }));
+      warning.append(el("p", "detail-error", error));
+      if (serverOff) {
+        warning.append(el("p", "detail-note", "켜면 이 계정의 Codex 앱 서버가 이 기기에서 계속 실행되고, 이 계정의 다음 Codex 세션도 같은 앱 서버를 씁니다."),
+          button("앱 서버 켜기", "primary app-server-start", (event) => startAppServer(s, event?.currentTarget)));
+      } else {
+        warning.append(button("대화 다시 불러오기", "secondary", () => {
+          const current = selectedSession();
+          if (current?.key === s.key) loadDetail(current, !list.conversationRows?.length);
+        }));
+      }
       list.conversationError = warning;
-      list.conversationErrorText = error;
+      list.conversationErrorText = errorKey;
     }
     desired.unshift(list.conversationError);
   } else {
     list.conversationError = null;
     list.conversationErrorText = "";
-    if (!rows.length) {
+    if (historyNotice) {
+      const note = list.conversationHistoryNotice ||= el("section", "conversation-history-notice");
+      note.setAttribute("role", "status");
+      if (note.dataset.notice !== historyNotice) {
+        note.replaceChildren(el("strong", "", "일회성 실행 · 기록 저장 안 함"), el("p", "", historyNotice));
+        note.dataset.notice = historyNotice;
+      }
+      desired.unshift(note);
+    } else if (claudeWithoutId(s) && !s.sessionId) {
+      // One explanation instead of a read error here and another in the composer.
+      list.conversationUnreadable ||= el("p", "group-empty conversation-unreadable", CLAUDE_UNREADABLE);
+      desired.unshift(list.conversationUnreadable);
+    } else if (!rows.length && !tail.length) {
       list.conversationEmpty ||= el("p", "group-empty", "저장된 대화를 아직 찾지 못했습니다.");
       desired.push(list.conversationEmpty);
+    }
+  }
+  desired.push(...tail);
+  // While reading back, the first row on screen that stays keeps its place:
+  // rows dropped above it (the server's 80-row window moving during a turn) or
+  // a grown tool group no longer push the text being read up.
+  const keep = new Set(desired);
+  let anchor = null;
+  let anchorOffset = 0;
+  if (!stick) {
+    for (const child of [...list.children]) {
+      if (!keep.has(child)) continue;
+      const box = rowBox(list, child);
+      if (!box) break;
+      if (box.top + box.height > list.scrollTop) {
+        anchor = child;
+        anchorOffset = box.top - list.scrollTop;
+        break;
+      }
     }
   }
   // Keep unchanged text nodes mounted: mobile selections and expanded tool
   // records survive reads, including new messages appended during a turn.
   for (const child of [...list.children]) {
-    if (!desired.includes(child)) list.removeChild(child);
+    if (!keep.has(child)) list.removeChild(child);
   }
   for (let index = 0; index < desired.length; index++) {
     if (list.children[index] !== desired[index])
@@ -1800,9 +4662,165 @@ function renderMessages(s, messages, error = "", fresh = false) {
   list.conversationSource = source;
   list.conversationRows = rows;
   const warningHeight = error ? list.conversationError.offsetHeight || 0 : 0;
-  list.scrollTop = stick ? list.scrollHeight : scroll + warningHeight - oldWarningHeight;
+  const anchorBox = anchor && !stick ? rowBox(list, anchor) : null;
+  if (stick) setMessagesScroll(list, list.scrollHeight);
+  else if (anchorBox) setMessagesScroll(list, anchorBox.top - anchorOffset);
+  else setMessagesScroll(list, scroll + warningHeight - oldWarningHeight);
+  if (working) tickWorking();
+  else stopWorkingClock();
+  // While reading back, count what arrived below instead of jumping to it. A
+  // row that only got its time (Codex's final answer takes its turn's end) is
+  // not new, nor this board's own message that took the place of its bubble.
+  if (!stick && previous.length) {
+    const before = new Set(previous);
+    const loose = (item) => JSON.stringify([item.message.role, item.message.text, attachmentMetadata(item.message.attachments)]);
+    const gone = new Map();
+    for (const item of previous) {
+      if (rows.includes(item)) continue;
+      gone.set(loose(item), (gone.get(loose(item)) || 0) + 1);
+    }
+    let added = 0;
+    for (const item of rows) {
+      if (before.has(item) || previousKeys.has(item.key)) continue;
+      const replaced = gone.get(loose(item)) || 0;
+      if (replaced) { gone.set(loose(item), replaced - 1); continue; }
+      if (item.message.role !== "tool" && !claimed.has(item.message)) added++;
+    }
+    if (added) list.unread = (list.unread || 0) + added;
+  } else if (stick) list.unread = 0;
+  restoreConversationView(list);
+  if (list.pendingView && typeof requestAnimationFrame === "function") requestAnimationFrame(() => restoreConversationView(list));
+  renderJump();
 }
 
+// A row's top and height in the conversation's own scrolled content, or null
+// without layout. .messages is not positioned, so a row's offsetTop counts from
+// an ancestor above it; the distance between the two boxes on screen (plus the
+// list's scroll) does not. Without boxes (tests), offsetTop.
+function rowBox(list, row) {
+  const outer = list.getBoundingClientRect?.();
+  const inner = row.getBoundingClientRect?.();
+  if (Number.isFinite(outer?.top) && Number.isFinite(inner?.top) && Number.isFinite(inner?.height))
+    return { top: inner.top - outer.top - (list.clientTop || 0) + list.scrollTop, height: inner.height };
+  if (!Number.isFinite(row.offsetTop) || !Number.isFinite(row.offsetHeight)) return null;
+  return { top: row.offsetTop, height: row.offsetHeight };
+}
+
+// Consecutive messages of one speaker form a group: only the first keeps the
+// name and time, and the gap between them narrows (style.css: .is-cont).
+// Rows are reused across reads, so this runs on every render.
+const GROUP_GAP_SECONDS = 300;
+function sameSpeaker(a, b) {
+  if (!a || !b || a.role !== b.role || !["user", "assistant"].includes(a.role)) return false;
+  const first = a.message?.ts;
+  const next = b.message?.ts;
+  // A timed row after untimed ones (Codex's final answer after its progress
+  // notes, which have no time of their own) shows its name and time again.
+  if (!Number.isFinite(first) && Number.isFinite(next)) return false;
+  return !(Number.isFinite(first) && Number.isFinite(next) && next - first > GROUP_GAP_SECONDS);
+}
+function groupMessageRows(rows) {
+  rows.forEach((item, index) => {
+    const continued = sameSpeaker(rows[index - 1], item);
+    setClass(item.row, "is-cont", continued);
+    setClass(item.row, "has-next", sameSpeaker(item, rows[index + 1]));
+    if (item.row.msgLabel) item.row.msgLabel.hidden = continued;
+  });
+}
+async function copyText(text, done) {
+  try {
+    await navigator.clipboard.writeText(text);
+    toast(done);
+  } catch {
+    toast("클립보드에 접근할 수 없습니다. 메뉴의 ‘텍스트 선택’으로 골라 복사해 주세요.");
+  }
+}
+function messagePlainText(item) {
+  const text = item?.message?.text || "";
+  if (item?.role === "user") return userMessageParts(item.message).body;
+  return item?.role === "assistant" && typeof MessageFormat !== "undefined" ? MessageFormat.plainText(text) : text;
+}
+function messageActions(s, item) {
+  const actions = [];
+  const text = messagePlainText(item);
+  if (item.group && text.trim()) {
+    actions.push({ label: `도구 기록 ${item.items.length}개 모두 복사`, run: () => copyText(text, "도구 실행 기록을 복사했습니다.") });
+  } else if (text.trim()) {
+    actions.push({ label: item.truncated ? "표시된 부분 복사" : "복사", run: () => copyText(text, item.truncated
+      ? "표시된 부분만 복사했습니다. 전체 내용은 터미널에서 확인해 주세요." : "메시지 본문을 복사했습니다.") });
+  }
+  const code = item.role === "assistant" && typeof MessageFormat?.codeBlocks === "function"
+    ? MessageFormat.codeBlocks(item.message.text || "") : [];
+  if (code.length) {
+    actions.push({ label: code.length > 1 ? `코드 ${code.length}개 모두 복사` : "코드 복사",
+      run: () => copyText(code.join("\n"), "코드를 복사했습니다.") });
+  }
+  if (text.trim() && !item.group) actions.push({ label: "텍스트 선택", run: () => selectMessageText(item.row) });
+  if (chatEntry(s).data && !state.launchBusy && (!s.nativeSource || terminalForSession(s)))
+    actions.push({ label: "터미널에서 보기", run: () => openChatTerminal(s) });
+  return actions;
+}
+function openMessageMenu(row, at = null) {
+  const item = row?.messageItem;
+  const s = selectedSession();
+  if (!item || !s || chatKey(sourceOf(s)) !== $("messages")?.conversationSource) return;
+  const speaker = item.role === "user" ? "내 메시지" : item.group ? toolGroupTitle(item.items)
+    : item.role === "tool" ? "도구 실행 기록" : `${AGENTS[s.agent] || "에이전트"}의 답변`;
+  const preview = messagePlainText(item).replace(/\s+/g, " ").trim().slice(0, 140);
+  openActionSheet({ eyebrow: item.message.ts ? clock(item.message.ts) : "", title: speaker, preview,
+    actions: messageActions(s, item), at, trigger: row.moreButton || null });
+}
+// "텍스트 선택": the bubble becomes selectable (touch turns selection off so a
+// long press opens the menu) and its text is selected for the handles.
+function selectMessageText(row) {
+  const bubble = row?.querySelector?.(".bubble");
+  if (!bubble) return;
+  setClass(row, "is-selecting", true);
+  try {
+    const range = document.createRange();
+    range.selectNodeContents(bubble);
+    const selection = window.getSelection();
+    selection.removeAllRanges();
+    selection.addRange(range);
+  } catch {
+    /* the bubble stays selectable by hand */
+  }
+}
+// Long press opens a message's menu; on phones a tap on the conversation shows
+// or hides its bars. Both share the list's one set of pointer listeners.
+function bindMessageGestures(list) {
+  const rowOf = (target) => {
+    const row = target?.closest?.(".msg");
+    return row?.messageItem ? row : null;
+  };
+  let tap = null;
+  bindPressMenu(list, rowOf, openMessageMenu, {
+    onDown(event) {
+      // A selection made from the menu ends when another message is touched.
+      const row = rowOf(event.target);
+      for (const item of list.conversationRows || [])
+        if (item.row !== row && String(item.row.className || "").includes("is-selecting")) setClass(item.row, "is-selecting", false);
+      // A finger on the list ends the board's own smooth scroll.
+      list.autoScrollUntil = 0;
+      // A touch that stops a moving list only stops it.
+      const settled = Date.now() - (list.lastScrollAt || 0) >= GESTURE.scrollSettleMs;
+      tap = touchDevice() && event.pointerType !== "mouse" && event.isPrimary !== false && settled
+        ? { id: event.pointerId, x: event.clientX, y: event.clientY, at: Date.now(), target: event.target } : null;
+    },
+    onMove(event) {
+      if (tap && event.pointerId === tap.id &&
+          Math.hypot((event.clientX || 0) - tap.x, (event.clientY || 0) - tap.y) > GESTURE.tapSlopPx) tap = null;
+      return false;
+    },
+    onUp(event, cancelled, fired) {
+      const down = tap;
+      tap = null;
+      // While typing, the input's folded layout stays; a scroll ends in pointercancel.
+      if (cancelled || chatTyping() || !isChromeTap(down, event, { fired })) return;
+      toggleChrome();
+    },
+  });
+}
 function updateReadNotice(data) {
   const pane = $("detail");
   let note = pane.querySelector(".stale-notice");
@@ -1814,27 +4832,30 @@ function updateReadNotice(data) {
   note.textContent = `기기에 연결되지 않아 ${data.fetchedAt ? `${ago(data.fetchedAt)} 저장한` : "저장된"} 대화를 표시합니다. 실행 상태는 연결 후 확인해 주세요.`;
 }
 
-function navigateView(view, replace = false) {
+function navigateView(view, replace = false, extra = {}) {
   const current = window.history.state;
-  if (!replace && current?.sessionholic && current.view === view) return;
+  if (!replace && current?.[INSTANCE.historyKey] && current.view === view) return;
+  // `notice` belongs to the one entry a notification opened.
+  const { notice, ...kept } = current || {};
   window.history[replace ? "replaceState" : "pushState"](
-    { sessionholic: true, view },
+    { ...kept, ...extra, [INSTANCE.historyKey]: true, view },
     "",
   );
 }
 function backToList() {
-  closeChatQueue(false);
+  rememberConversationView();
+  if (!state.selectedBotRequest && window.SessionholicGoals?.backFromSession?.()) return;
   stopChatPolling();
   if (
-    window.history.state?.sessionholic &&
+    window.history.state?.[INSTANCE.historyKey] &&
     window.history.state.view === "detail"
   )
     window.history.back();
-  else { document.body.classList.remove("show-detail"); restoreSelectedCardFocus(); }
+  else setDetailShown(false, { direction: "pop", focus: true });
 }
 function backFromTerminal() {
   if (
-    window.history.state?.sessionholic &&
+    window.history.state?.[INSTANCE.historyKey] &&
     window.history.state.view === "terminal"
   )
     window.history.back();
@@ -1892,6 +4913,7 @@ function formatBytes(bytes) {
 }
 function buildContinuePanel(s) {
   const disclosure = el("details", "continue-disclosure");
+  disclosure.hidden = sessionOneShot(s);
   disclosure.append(el("summary", null, "다른 기기·계정에서 이어가기"));
   const panel = el("section", "continue-panel");
   panel.setAttribute("aria-label", "이어서 사용할 환경 선택");
@@ -2109,14 +5131,18 @@ function updateContinue(s) {
               : "작업 맥락을 전달할 수 있는지 먼저 확인합니다.";
 }
 
-async function preparePlan() {
+async function preparePlan({ resume = false } = {}) {
   const s = selectedSession();
   if (!s || !state.route) return;
+  if (chatOneShot(chatEntry(s))) { toast(ONE_SHOT_NO_INPUT); return; }
+  const bot = botRequestForNative(sourceOf(s));
+  if (bot) { selectBotRequest(botRequestKey(bot)); return; }
   if (state.launchBusy || $("plan-dialog").open) {
     $(state.launchBusy ? "plan-dialog" : "plan-cancel").focus();
     return;
   }
-  const target = { ...state.route };
+  if (resume && chatRecovery(chatEntry(s))?.action !== "resume_session") return;
+  const target = resume ? { host: s.host, agent: s.agent, account: accountOf(s) } : { ...state.route };
   const run = ++state.planRun;
   state.plan = null;
   $("plan-title").textContent = "이어서 할 준비를 확인합니다";
@@ -2128,15 +5154,18 @@ async function preparePlan() {
   $("plan-launch").textContent = "터미널 열기 ↗";
   $("plan-close").disabled = false;
   $("plan-cancel").disabled = false;
-  $("plan-dialog").showModal();
+  sheet("plan-dialog").open();
   try {
     const plan = await api("/api/plan", {
       method: "POST",
-      body: { source: sourceOf(s), target },
+      body: { source: sourceOf(s), target, ...(resume ? { resume: true } : {}) },
     });
     if (run !== state.planRun || !$("plan-dialog").open) return;
     state.plan = plan;
     renderPlan(s, plan, target);
+    // Returning to the same session's own terminal needs no second confirmation.
+    if (plan.allowed && ["attach", "reconnect"].includes(plan.mode) && !(plan.warnings || []).length)
+      await launchPlan();
   } catch (err) {
     if (!err.unauthorized && !err.staleAuth && run === state.planRun && $("plan-dialog").open) {
       $("plan-title").textContent = "준비를 완료하지 못했습니다";
@@ -2152,7 +5181,9 @@ function progress(text) {
 }
 function renderPlan(s, plan, target) {
   $("plan-title").textContent = plan.allowed
-    ? plan.mode === "transfer"
+    ? plan.mode === "resume"
+      ? "같은 세션을 다시 열까요?"
+      : plan.mode === "transfer"
       ? "새 작업 폴더로 옮길까요?"
       : plan.mode === "reconnect"
       ? "열어 둔 터미널로 돌아갑니다"
@@ -2268,7 +5299,9 @@ function renderPlan(s, plan, target) {
     );
   $("plan-launch").disabled = !plan.allowed;
   $("plan-launch").textContent =
-    plan.mode === "transfer"
+    plan.mode === "resume"
+      ? "세션 다시 열기"
+      : plan.mode === "transfer"
       ? `${transfer.requiresInterrupt ? "중단하고 " : ""}${transfer.targetHostLabel || hostLabel(target.host)}로 넘기기`
       : plan.mode === "reconnect"
       ? "열어 둔 터미널로 ↗"
@@ -2312,8 +5345,12 @@ async function launchPlan() {
       throw new Error("터미널 연결 정보를 받지 못했습니다.");
     $("plan-dialog").close();
     state.plan = null;
+    // Its card and conversation header show "터미널 열림" at once.
+    rememberTerminal(result.terminal);
     await openTerminal(result.terminal);
     assertAuthEpoch(authEpoch);
+    if (result.goalLinkWarning) notice(result.goalLinkWarning);
+    window.SessionholicGoals?.refresh?.();
     if (plan.mode === "transfer" || result.mode === "transfer")
       toast(
         `실제 실행 위치가 ${plan.transfer?.targetHostLabel || hostLabel(plan.target?.host || "")}로 바뀌었습니다. 새 작업 폴더에서 이어가세요.`,
@@ -2364,10 +5401,61 @@ function terminalStatus(text, connected = false) {
   for (const node of $("terminal-keys").querySelectorAll("button"))
     node.disabled = !connected || !!state.draftPaste;
   $("draft-paste").disabled = !connected || !!state.draftPaste;
+  $("draft-type").disabled = !connected || !!state.draftPaste;
   $("terminal-reconnect").hidden = connected || !state.terminalAlive;
 }
 function terminalInfo(terminal) {
   return { ...terminal?.metadata, ...terminal };
+}
+// A terminal is named after the session it runs once the board knows it (its
+// nativeSource): that session's board title, a 제목 수정 alias included. A
+// "새 세션" terminal that names no session keeps its launcher label with the
+// time it opened, so several of them stay apart.
+function terminalTitle(terminal, fallback = "열어 둔 터미널") {
+  const info = terminalInfo(terminal);
+  if (info.nativeSource?.host) {
+    const key = chatKey(info.nativeSource);
+    const session = allSessions().find((s) => chatKey(sourceOf(s)) === key);
+    if (session?.title) return terminalEstimated(terminal) ? `${session.title} · 연결 추정` : session.title;
+  }
+  const title = info.title || fallback;
+  if (info.mode === "new-session" && !info.nativeSource) {
+    // What the launcher ended up running, read from its host (launcher_programs).
+    const folder = String(info.programCwd || "").split("/").filter(Boolean).pop();
+    if (info.program === "claude-agents") return `Claude 에이전트 목록${folder ? ` · ${folder}` : ""}`;
+    const started = Number.isInteger(info.createdAt) ? ` · ${clock(info.createdAt)} 시작` : "";
+    if (AGENTS[info.program]) return `${AGENTS[info.program]}${started}`;
+    return `${title}${started}`;
+  }
+  return title;
+}
+// A Claude connection to an existing session: the board opens these to send or answer
+// and closes them after ten unused minutes. A Codex connection the user opened stays listed.
+function connectionTerminal(terminal) {
+  const info = terminalInfo(terminal);
+  return info.mode === "attach" && (!info.launchMode || info.launchMode === "attach") && info.agent === "claude";
+}
+// Two 새 세션 terminals on one host showing the same Claude agent view (same folder):
+// every later one repeats the first. {terminal id: the first terminal}.
+function duplicateTerminals(terminals) {
+  const first = new Map(), repeats = new Map();
+  const ordered = [...terminals].sort((a, b) => (terminalInfo(a).createdAt || 0) - (terminalInfo(b).createdAt || 0));
+  for (const terminal of ordered) {
+    const info = terminalInfo(terminal);
+    if (info.mode !== "new-session" || info.program !== "claude-agents") continue;
+    const key = [info.host, info.program, info.programCwd || ""].join("|");
+    if (first.has(key)) repeats.set(terminal.id, first.get(key));
+    else first.set(key, terminal);
+  }
+  return repeats;
+}
+// Session titles arrive with each snapshot: open terminals follow them. An open
+// sheet is not rebuilt under a finger reaching for 연결 닫기; it renames on reopen.
+function renameTerminals() {
+  if (!$("terminals-dialog")?.open) renderTerminals();
+  if (state.terminal && state.terminalVisible)
+    $("terminal-title").textContent = terminalTitle(state.terminal, "진행 중인 작업");
+  renderTerminalReturn();
 }
 function terminalCloseCopy(terminal) {
   const mode = terminal?.mode || terminal?.metadata?.mode;
@@ -2377,6 +5465,13 @@ function terminalCloseCopy(terminal) {
     context: "기존 작업에 연결했습니다. 보드로 돌아가거나 브라우저를 닫아도 작업은 유지됩니다.",
     ended: "이 보드의 연결이 종료되었습니다. 기존 작업 상태는 실행 기기에서 확인하세요.",
     done: "연결을 닫았습니다. 기존 작업에 중단 명령을 보내지 않았습니다.",
+  };
+  if (mode === "new-session") return {
+    action: "실행 종료", title: "이 터미널의 실행을 종료할까요?", danger: true,
+    description: "이 보드에서 연 새 세션을 종료합니다. 진행 중인 응답이 중단될 수 있고, 대화 기록은 남습니다.",
+    context: "보드에서 새로 연 세션입니다. 보드로 돌아가거나 브라우저를 닫아도 실행은 유지됩니다.",
+    ended: "새 세션의 실행이 종료되었습니다. 대화 기록은 보드의 작업 목록에서 확인하세요.",
+    done: "새 세션의 실행을 종료했습니다. 대화 기록은 보드의 작업 목록에서 확인하세요.",
   };
   if (mode === "handoff" || mode === "transfer") return {
     action: "실행 종료", title: "이 터미널의 실행을 종료할까요?", danger: true,
@@ -2477,11 +5572,43 @@ function prepareDraftPaste(event) {
   event.preventDefault();
 }
 function bindDraftInput(node) {
-  node.addEventListener("input", inputDraft);
+  node.addEventListener("input", (event) => {
+    inputDraft(event);
+    resizeDraft();
+  });
+  node.addEventListener("keydown", draftKeydown);
   node.addEventListener("compositionstart", startDraftComposition);
   node.addEventListener("compositionend", endDraftComposition);
 }
+// Korean needs monospace fallbacks that keep two-cell glyphs aligned. Only
+// fonts already on the device are named; no web font is bundled.
+const TERMINAL_FONT = 'ui-monospace, SFMono-Regular, Menlo, Consolas, D2Coding, "D2Coding ligature", ' +
+  '"Nanum Gothic Coding", NanumGothicCoding, "Noto Sans Mono CJK KR", "Source Han Mono K", "Sarasa Mono K", monospace';
+function clampFontSize(size) {
+  return Math.max(GESTURE.pinchMinFont, Math.min(GESTURE.pinchMaxFont, Math.round(Number(size) || 14)));
+}
+// A−/A+ and the pinch share one range and one stored preference.
+function setTerminalFontSize(size, { persist = true } = {}) {
+  const next = clampFontSize(size);
+  const changed = next !== state.fontSize;
+  state.fontSize = next;
+  if (persist) prefs.set("fontSize", next);
+  if (changed && state.term) {
+    state.term.options.fontSize = next;
+    fitTerminal();
+  }
+  return changed;
+}
+function pinchFontSize(startSize, startDistance, distance) {
+  if (!(startDistance > 0) || !(distance > 0)) return clampFontSize(startSize);
+  return clampFontSize(startSize * (distance / startDistance));
+}
+function touchDistance(touches) {
+  const [a, b] = [touches[0], touches[1]];
+  return a && b ? Math.hypot(a.clientX - b.clientX, a.clientY - b.clientY) : 0;
+}
 function fitTerminal() {
+  measureTerminalTools();
   if (!state.term || !state.terminalVisible || !state.fit) return;
   try {
     state.fit.fit();
@@ -2508,10 +5635,85 @@ function fitTerminal() {
     }
   }, 180);
 }
+function showTerminalScreen(visible) {
+  $("app").hidden = visible;
+  $("terminal-screen").hidden = !visible;
+}
+// Keeps the toast above the key bar (style.css, section 8).
+function measureTerminalTools() {
+  const tools = $("terminal-tools");
+  if (tools?.offsetHeight) document.documentElement.style?.setProperty?.("--terminal-tools-h", `${tools.offsetHeight}px`);
+}
+// The terminal library (xterm + fit addon, ~490KB) loads on the first
+// terminal open, once; a failed load can be retried by opening again.
+function assetVersions() {
+  if (state.assetVersions) return state.assetVersions;
+  let versions = {};
+  try {
+    const meta = document.querySelector?.('meta[name="sessionholic-assets"]');
+    const parsed = JSON.parse(meta?.getAttribute?.("content") || "{}");
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) versions = parsed;
+  } catch {
+    versions = {};
+  }
+  state.assetVersions = versions;
+  return versions;
+}
+function assetUrl(path) {
+  const version = assetVersions()[path];
+  return typeof version === "string" && /^[0-9a-f]{8}$/.test(version) ? `${path}?v=${version}` : path;
+}
+let xtermLoading = null;
+// The stylesheet and both scripts are all required. Each one that loaded is
+// remembered, so opening again retries only the ones that failed.
+const xtermLoaded = new Set();
+function xtermReady() {
+  return !!(window.Terminal && window.FitAddon) && xtermLoaded.has("/vendor/xterm.css");
+}
+function loadXterm() {
+  if (xtermReady()) return Promise.resolve();
+  if (xtermLoading) return xtermLoading;
+  const head = document.head;
+  if (typeof head?.appendChild !== "function")
+    return Promise.reject(new Error("터미널 화면 파일을 불러올 수 없습니다."));
+  const add = (path, tag, attributes, loaded = () => true) => new Promise((resolve, reject) => {
+    const node = document.createElement(tag);
+    Object.assign(node, attributes);
+    node.onload = () => {
+      if (loaded()) xtermLoaded.add(path);
+      resolve();
+    };
+    node.onerror = () => {
+      node.remove?.();
+      reject(new Error("터미널 화면 파일을 받지 못했습니다."));
+    };
+    head.appendChild(node);
+  });
+  const assets = [
+    ["/vendor/xterm.css", "link", { rel: "stylesheet", href: assetUrl("/vendor/xterm.css") }],
+    // Inserted scripts with async=false still run in insertion order.
+    ["/vendor/xterm.js", "script", { src: assetUrl("/vendor/xterm.js"), async: false }, () => !!window.Terminal],
+    ["/vendor/addon-fit.js", "script", { src: assetUrl("/vendor/addon-fit.js"), async: false }, () => !!window.FitAddon],
+  ];
+  xtermLoading = Promise.all(assets.filter(([path]) => !xtermLoaded.has(path)).map((asset) => add(...asset))).then(() => {
+    if (!window.Terminal || !window.FitAddon) {
+      xtermLoaded.delete("/vendor/xterm.js");
+      xtermLoaded.delete("/vendor/addon-fit.js");
+      throw new Error("터미널 화면 파일이 올바르지 않습니다.");
+    }
+    if (!xtermReady()) throw new Error("터미널 화면 파일을 받지 못했습니다.");
+  }).catch((err) => {
+    xtermLoading = null;
+    throw err;
+  });
+  return xtermLoading;
+}
 async function openTerminal(terminal, { recordHistory = true } = {}) {
-  closeChatQueue(false);
   stopChatPolling();
   if (recordHistory) navigateView("terminal");
+  const presenting = !state.terminalVisible;
+  const openRun = ++state.terminalOpenRun;
+  const current = () => openRun === state.terminalOpenRun && state.terminal?.id === terminal.id && state.terminalVisible;
   const changing = state.terminal?.id !== terminal.id;
   saveDraft();
   if (state.composing) {
@@ -2527,15 +5729,19 @@ async function openTerminal(terminal, { recordHistory = true } = {}) {
     bindDraftInput(next);
   }
   stopTerminalReader();
+  if (changing) resetTerminalScroll();
   state.inputEpoch++;
   state.inputQueue = Promise.resolve();
   state.inputFailed = false;
+  clearTerminalMenu();
   state.terminal = terminal;
   state.terminalAlive = terminal.alive !== false && !terminal.closed;
   state.terminalVisible = true;
-  $("app").hidden = true;
-  $("terminal-screen").hidden = false;
-  $("terminal-title").textContent = terminal.title || "진행 중인 작업";
+  renderConnectivity();
+  const shown = presenting ? navTransition("present", () => showTerminalScreen(true)) : (showTerminalScreen(true), null);
+  updateThemeColor();
+  closeEvents();
+  $("terminal-title").textContent = terminalTitle(terminal, "진행 중인 작업");
   $("terminal-route").textContent = targetLabel(terminalInfo(terminal));
   const nativeHost = terminalInfo(terminal).nativeSource?.host || terminalInfo(terminal).host;
   $("terminal-back").setAttribute("aria-label", `${hostLabel(nativeHost)}의 작업을 보드에서 보기`);
@@ -2548,19 +5754,34 @@ async function openTerminal(terminal, { recordHistory = true } = {}) {
   $("terminal-draft").value = state.drafts.get(draftKey(terminal)) || "";
   state.composing = false;
   state.draftRevision++;
-  $("draft-note").textContent = "미전송 초안은 잠시 보관됩니다. 새로고침하거나 브라우저를 닫으면 사라집니다.";
+  $("draft-note").textContent = "";
   terminalError();
   renderTerminalReturn();
   if (!state.terminalAlive) {
     terminalStatus(copy.ended);
     return;
   }
-  if (!window.Terminal || !window.FitAddon) {
-    terminalStatus("터미널 화면을 불러오지 못했습니다.");
-    terminalError(
-      "터미널 파일이 준비되지 않았습니다. 보드로 돌아가 새로고침해 주세요.",
-    );
-    return;
+  if (!xtermReady()) {
+    const viewport = $("terminal-viewport");
+    viewport.classList?.add("is-loading");
+    terminalStatus("터미널 화면을 불러오고 있습니다…");
+    try {
+      await loadXterm();
+    } catch {
+      if (current()) {
+        terminalStatus("터미널 화면을 불러오지 못했습니다.");
+        terminalError("터미널 화면 파일을 받지 못했습니다. 연결을 확인한 뒤 보드로 돌아가 다시 열어 주세요.");
+      }
+      return;
+    } finally {
+      viewport.classList?.remove("is-loading");
+    }
+    if (!current()) return;
+  }
+  // xterm measures its cells on open, so the screen must be visible first.
+  if (shown?.updateCallbackDone) {
+    await shown.updateCallbackDone.catch(() => {});
+    if (!current()) return;
   }
   if (changing || !state.term) {
     state.term?.dispose();
@@ -2569,7 +5790,7 @@ async function openTerminal(terminal, { recordHistory = true } = {}) {
     state.lastSize = "";
     $("terminal-viewport").replaceChildren();
     state.term = new Terminal({
-      fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
+      fontFamily: TERMINAL_FONT,
       fontSize: state.fontSize,
       lineHeight: 1.2,
       cursorBlink: true,
@@ -2587,8 +5808,20 @@ async function openTerminal(terminal, { recordHistory = true } = {}) {
     state.fit = new FitAddon.FitAddon();
     state.term.loadAddon(state.fit);
     state.term.open($("terminal-viewport"));
+    configureTerminalKeyboard();
+    // An app that asked for the mouse gets the wheel from xterm itself (tmux
+    // forwards it); otherwise the wheel scrolls tmux history instead of
+    // reaching the CLI as arrow keys.
+    state.term.attachCustomWheelEventHandler?.((event) => {
+      if ((state.term?.modes?.mouseTrackingMode || "none") !== "none") return true;
+      queueTerminalScroll(event.deltaY / terminalLineHeight());
+      return false;
+    });
     state.term.onData((text) => {
-      if (state.connected) sendInput(text).catch(() => {});
+      if (!state.connected) return;
+      state.terminalScrollLines = 0;
+      renderTerminalScroll();
+      sendInput(text).catch(() => {});
     });
     state.term.onBinary((data) => {
       if (state.connected)
@@ -2602,6 +5835,7 @@ async function openTerminal(terminal, { recordHistory = true } = {}) {
   terminalStatus("터미널에 연결하고 있습니다…");
   startTerminalReader();
 }
+const TERMINAL_RETRIES = 6;
 async function startTerminalReader() {
   if (networkOffline()) return;
   if (!state.terminal || !state.terminalVisible || document.hidden) return;
@@ -2625,11 +5859,18 @@ async function startTerminalReader() {
     !document.hidden
   ) {
     try {
+      // A silently dropped connection (Wi-Fi to LTE) must not hold the long poll forever.
+      const signal = globalThis.AbortSignal?.any && AbortSignal.timeout
+        ? AbortSignal.any([controller.signal, AbortSignal.timeout(35000)]) : controller.signal;
       const result = await api(
         `/api/terminal/${encodeURIComponent(id)}/events?after=${state.terminalAfter}&wait=20${state.terminalEpoch ? `&epoch=${encodeURIComponent(state.terminalEpoch)}` : ""}`,
-        { signal: controller.signal },
+        { signal },
       );
       if (run !== state.terminalRun) return;
+      // A malformed reply counts as a failed read, so it can never spin this loop.
+      if (!result || !Number.isFinite(Number(result.after)))
+        throw new Error("터미널 응답 형식이 올바르지 않습니다.");
+      state.terminalRetry = 0;
       const screen = state.term;
       const commitCursor = () => {
         if (state.terminal?.id !== id || state.term !== screen) return;
@@ -2656,6 +5897,7 @@ async function startTerminalReader() {
       } else commitCursor();
       if (run !== state.terminalRun) return;
       state.terminalAlive = result.alive !== false;
+      updateTerminalMenu();
       if (!state.terminalAlive) {
         state.terminal.alive = false;
         $("terminal-close").disabled = true;
@@ -2675,12 +5917,22 @@ async function startTerminalReader() {
         err.unauthorized || err.staleAuth
       )
         return;
+      // Reading output is cursor based and safe to repeat; queued input is
+      // still invalidated so an uncertain keystroke is never sent twice.
       state.inputEpoch++;
-      terminalStatus("연결을 확인할 수 없습니다.");
-      terminalError(
-        "새 입력은 보내지 않습니다. 실행 상태를 확인하려면 다시 연결해 주세요.",
-      );
-      return;
+      const attempt = (state.terminalRetry || 0) + 1;
+      state.terminalRetry = attempt;
+      if (attempt > TERMINAL_RETRIES || networkOffline()) {
+        state.terminalRetry = 0;
+        terminalStatus("연결을 확인할 수 없습니다.");
+        terminalError(
+          "새 입력은 보내지 않습니다. 실행 상태를 확인하려면 다시 연결해 주세요.",
+        );
+        return;
+      }
+      terminalStatus(`연결이 끊겨 다시 연결하는 중… (${attempt}/${TERMINAL_RETRIES})`);
+      await new Promise((resolve) => setTimeout(resolve, Math.min(15000, 1000 * 2 ** (attempt - 1))));
+      if (run !== state.terminalRun || networkOffline()) return;
     }
   }
 }
@@ -2718,15 +5970,19 @@ function sendInput(text) {
   state.inputQueue = send.catch(() => {});
   return send;
 }
-function returnToBoard({ selectLaunchedSource = true } = {}) {
+function returnToBoard({ selectLaunchedSource = true, animate = true } = {}) {
   saveDraft();
   stopTerminalReader();
   state.inputEpoch++;
+  state.terminalOpenRun++;
   state.terminalVisible = false;
-  $("terminal-screen").hidden = true;
-  $("app").hidden = false;
+  renderConnectivity();
+  if (animate) navTransition("dismiss", () => showTerminalScreen(false));
+  else showTerminalScreen(false);
+  updateThemeColor();
   renderTerminalReturn();
   schedule();
+  syncEvents();
   const info = terminalInfo(state.terminal);
   if (selectLaunchedSource && state.authenticated && info.nativeSource &&
       ["handoff", "transfer"].includes(info.launchMode || info.mode)) {
@@ -2743,10 +5999,217 @@ function renderTerminalReturn() {
   const info = terminalInfo(state.terminal);
   const host = capsHost(info.host)?.label || info.host;
   $("terminal-return-label").textContent = exists
-    ? [host, state.terminal.title || "열어 둔 터미널"].filter(Boolean).join(" · ")
+    ? [terminalTitle(state.terminal), host].filter(Boolean).join(" · ")
     : "";
+  $("return-terminal").setAttribute?.("aria-label", exists ? `열린 터미널로 돌아가기: ${$("terminal-return-label").textContent}` : "열린 터미널로 돌아가기");
 }
-async function pasteDraft() {
+function touchDevice() {
+  return !!window.matchMedia?.("(pointer: coarse)").matches;
+}
+function directTerminalInput() {
+  return typeof state.directTerminalInput === "boolean" ? state.directTerminalInput : !touchDevice();
+}
+function configureTerminalKeyboard() {
+  // Mobile IMEs and dictation rewrite whole words inside xterm's hidden field,
+  // which reaches the CLI as repeated text. Touch devices type in the input bar.
+  const field = state.term?.textarea;
+  if (!field?.setAttribute) return;
+  if (directTerminalInput()) field.removeAttribute("inputmode");
+  else field.setAttribute("inputmode", "none");
+}
+function terminalLineHeight() {
+  return Math.max(8, (state.fontSize || 14) * 1.2);
+}
+function renderTerminalScroll() {
+  const scrolled = state.terminalScrollLines > 0;
+  $("terminal-bottom")?.classList?.toggle?.("is-active", scrolled);
+  $("terminal-screen")?.classList?.toggle?.("is-scrolled", scrolled);
+  const live = $("terminal-live");
+  if (!live) return;
+  live.hidden = !scrolled;
+  if (scrolled) {
+    measureTerminalTools();
+    live.textContent = `실시간으로 ↓ · ${state.terminalScrollLines}줄 위`;
+    const tools = $("terminal-tools") || document.querySelector?.(".terminal-tools");
+    if (live.style && tools?.offsetHeight) live.style.bottom = `${tools.offsetHeight + 12}px`;
+  }
+}
+function queueTerminalScroll(lines) {
+  if (!state.connected || !state.terminal || !Number.isFinite(lines) || !lines) return;
+  state.terminalScrollPending += lines;
+  if (state.terminalScrollTimer || state.terminalScrollInFlight) return;
+  state.terminalScrollTimer = setTimeout(flushTerminalScroll, 60);
+}
+async function flushTerminalScroll() {
+  state.terminalScrollTimer = null;
+  const whole = Math.trunc(state.terminalScrollPending);
+  if (!whole || !state.terminal) return;
+  state.terminalScrollPending -= whole;
+  // Up reveals older output. Below the live screen there is nothing in tmux
+  // history, but an app that owns its screen (alternate screen) scrolls itself.
+  let lines = Math.max(-200, Math.min(200, whole));
+  if (lines > 0 && state.terminalScrollMode === "history") lines = Math.min(lines, state.terminalScrollLines);
+  if (!lines) return;
+  const estimate = Math.max(0, state.terminalScrollLines - lines);
+  // A reply or a later swipe belongs to the terminal the swipe was made on; a request
+  // still on its way for an earlier terminal never holds up the next one's.
+  const target = state.terminal.id, generation = state.terminalScrollGeneration;
+  const mine = () => generation === state.terminalScrollGeneration && state.terminal?.id === target;
+  state.terminalScrollInFlight = true;
+  try {
+    const result = await api(`/api/terminal/${encodeURIComponent(target)}/scroll`,
+      { method: "POST", body: { lines } });
+    if (!mine()) return;
+    if (result?.mode === "app") {
+      state.terminalScrollMode = "app";
+      state.terminalScrollLines = 0;
+    } else {
+      state.terminalScrollMode = "history";
+      state.terminalScrollLines = Number.isInteger(result?.position) ? result.position : estimate;
+    }
+  } catch {
+    if (!mine()) return;
+    state.terminalScrollLines = 0;
+    stopTerminalMomentum();
+  } finally {
+    if (generation === state.terminalScrollGeneration) state.terminalScrollInFlight = false;
+    if (mine()) {
+      renderTerminalScroll();
+      // Swipes that arrived during the request are sent next, never dropped or doubled.
+      if (Math.trunc(state.terminalScrollPending) && !state.terminalScrollTimer)
+        state.terminalScrollTimer = setTimeout(flushTerminalScroll, 30);
+    }
+  }
+}
+async function terminalScrollEnd() {
+  stopTerminalMomentum();
+  state.terminalScrollPending = 0;
+  state.terminalScrollLines = 0;
+  renderTerminalScroll();
+  state.term?.scrollToBottom();
+  if (!state.connected || !state.terminal) return;
+  try {
+    await api(`/api/terminal/${encodeURIComponent(state.terminal.id)}/scroll-end`, { method: "POST", body: {} });
+  } catch {
+    /* typing also returns to the live screen */
+  }
+}
+// Another terminal: swipes waiting for it, its reply and its position do not carry over.
+function resetTerminalScroll() {
+  state.terminalScrollGeneration++;
+  state.terminalScrollInFlight = false;
+  clearTimeout(state.terminalScrollTimer);
+  state.terminalScrollTimer = null;
+  stopTerminalMomentum();
+  state.terminalScrollPending = 0;
+  state.terminalScrollLines = 0;
+  state.terminalScrollMode = null;
+  renderTerminalScroll();
+}
+function stopTerminalMomentum() {
+  if (state.terminalMomentum) globalThis.cancelAnimationFrame?.(state.terminalMomentum);
+  state.terminalMomentum = null;
+}
+// A flick keeps scrolling and slows down, like any native list.
+function startTerminalMomentum(velocity) {
+  stopTerminalMomentum();
+  let speed = velocity;
+  let last = Date.now();
+  const started = last;
+  const step = () => {
+    const now = Date.now();
+    const elapsed = Math.max(1, now - last);
+    last = now;
+    queueTerminalScroll((-speed * elapsed) / terminalLineHeight());
+    speed *= Math.pow(GESTURE.momentumDecay, elapsed / 16);
+    if (Math.abs(speed) < GESTURE.momentumStopSpeed || now - started > GESTURE.momentumMaxMs || !state.connected) {
+      state.terminalMomentum = null;
+      return;
+    }
+    state.terminalMomentum = requestAnimationFrame(step);
+  };
+  state.terminalMomentum = requestAnimationFrame(step);
+}
+function bindTerminalTouchScroll(node) {
+  let lastY = null;
+  let samples = [];
+  // Two fingers change the text size instead of scrolling; saved on release.
+  let pinch = null;
+  const endPinch = () => {
+    if (pinch?.changed) {
+      prefs.set("fontSize", state.fontSize);
+      toast(`터미널 글자 크기 ${state.fontSize}`);
+    }
+    pinch = null;
+  };
+  // Capture phase: xterm's own layers must not swallow the gesture first.
+  node.addEventListener("touchstart", (event) => {
+    stopTerminalMomentum();
+    if (event.touches.length === 2) {
+      pinch = { size: state.fontSize, distance: touchDistance(event.touches), changed: false };
+      lastY = null;
+      samples = [];
+      return;
+    }
+    // A new single touch starts a new gesture (also after a cancelled pinch).
+    if (event.touches.length === 1) endPinch();
+    if (pinch) return;
+    lastY = event.touches.length === 1 ? event.touches[0].clientY : null;
+    samples = lastY === null ? [] : [[Date.now(), lastY]];
+  }, { passive: true, capture: true });
+  node.addEventListener("touchmove", (event) => {
+    if (pinch) {
+      if (event.touches.length === 2 &&
+          setTerminalFontSize(pinchFontSize(pinch.size, pinch.distance, touchDistance(event.touches)), { persist: false }))
+        pinch.changed = true;
+      if (event.cancelable) event.preventDefault();
+      return;
+    }
+    if (lastY === null || event.touches.length !== 1) return;
+    const y = event.touches[0].clientY;
+    // Dragging down reveals older lines, as in any scrolling list.
+    queueTerminalScroll((lastY - y) / terminalLineHeight());
+    lastY = y;
+    samples.push([Date.now(), y]);
+    if (samples.length > 6) samples.shift();
+    if (event.cancelable) event.preventDefault();
+  }, { passive: false, capture: true });
+  node.addEventListener("touchend", (event) => {
+    if (pinch) {
+      // The finger left behind does not start a scroll.
+      if ((event?.touches?.length || 0) < 2) endPinch();
+      lastY = null;
+      samples = [];
+      return;
+    }
+    const recent = samples.filter(([time]) => Date.now() - time < 100);
+    if (recent.length >= 2) {
+      const [t0, y0] = recent[0];
+      const [t1, y1] = recent[recent.length - 1];
+      const velocity = (y1 - y0) / Math.max(1, t1 - t0);
+      if (Math.abs(velocity) > GESTURE.momentumMinSpeed) startTerminalMomentum(velocity);
+    }
+    lastY = null;
+    samples = [];
+  }, { passive: true, capture: true });
+}
+function resizeDraft() {
+  const input = $("terminal-draft");
+  if (!input?.style) return;
+  const before = input.style.height;
+  input.style.height = "auto";
+  const line = parseFloat(window.getComputedStyle?.(input)?.lineHeight) || 22;
+  input.style.height = `${Math.min(input.scrollHeight, line * 4 + 20)}px`;
+  // A taller or shorter input bar changes the terminal's rows; refit so no line is hidden.
+  if (input.style.height !== before) requestAnimationFrame(fitTerminal);
+}
+function draftKeydown(event) {
+  // Enter sends like a chat box; Shift+Enter keeps a newline in the draft.
+  if (event.key !== "Enter" || event.shiftKey || event.isComposing || event.keyCode === 229) return;
+  event.preventDefault();
+  pasteDraft(true);
+}
+async function pasteDraft(submit = false) {
   if (state.draftPaste) return;
   if (!state.connected || !state.terminal) {
     $("draft-note").textContent = "터미널에 다시 연결한 뒤 붙여넣어 주세요.";
@@ -2794,17 +6257,28 @@ async function pasteDraft() {
     const normalized = text.replace(/\r\n?/g, "\n");
     await sendInput(bracketed ? `\x1b[200~${normalized}\x1b[201~` : normalized);
     if (pending.cancelled || state.terminal?.id !== pending.id || state.inputEpoch !== pending.epoch) return;
+    if (submit) {
+      // A separate Enter after the TUI has handled the paste, as a person would type it.
+      await new Promise((resolve) => setTimeout(resolve, 120));
+      if (pending.cancelled || state.terminal?.id !== pending.id || state.inputEpoch !== pending.epoch) return;
+      await sendInput("\r");
+    }
     if (state.draftRevision === revision && $("terminal-draft").value === text) {
       $("terminal-draft").value = "";
       state.drafts.delete(pending.key);
+      resizeDraft();
     }
-    $("draft-note").textContent =
-      "붙여넣었습니다. 내용을 확인한 뒤 Enter를 눌러 실행하세요.";
+    $("draft-note").textContent = submit ? "" : "입력했습니다. 확인한 뒤 Enter를 눌러 실행하세요.";
+    if (submit) haptic("success");
+    state.terminalScrollLines = 0;
+    renderTerminalScroll();
     state.term.scrollToBottom();
   } catch {
-    if (state.terminal?.id === pending.id)
+    if (state.terminal?.id === pending.id) {
       $("draft-note").textContent =
         "전달 여부를 확인하지 못해 초안을 남겼습니다. 터미널을 확인한 뒤 다시 시도하세요.";
+      haptic("error");
+    }
   } finally {
     clearTimeout(pending.compositionTimer);
     if (state.draftPaste === pending) {
@@ -2823,6 +6297,9 @@ async function refreshTerminals(authEpoch = state.authEpoch) {
     assertAuthEpoch(authEpoch);
     state.terminals = result.terminals || [];
     state.terminalsError = "";
+    // The version the server read before this list; a newer announcement reads again.
+    state.terminalsVersion = Number.isInteger(result.version) ? result.version : null;
+    state.terminalsReadAt = Date.now();
     updateInputCleanupNotice(result.inputCleanupPending === true);
     const current = state.terminals.find((t) => t.id === state.terminal?.id);
     if (current) {
@@ -2852,29 +6329,84 @@ async function refreshTerminals(authEpoch = state.authEpoch) {
     if (authEpoch === state.authEpoch) {
       state.terminalsRefreshing = false;
       $("running-refresh").disabled = false;
+      // A change announced during this read: read once more if still behind.
+      if (state.terminalsPending) {
+        state.terminalsPending = false;
+        if (terminalsBehind()) terminalsAnnounced(state.eventsTerminalsVersion);
+      }
     }
   }
+}
+// Live updates announce the terminal list's version ("terminals"): creates,
+// closes, attaches and detaches on any device, and terminals that ended on
+// their own. A burst is read together after TERMINALS_EVENT_BATCH_MS.
+const TERMINALS_EVENT_BATCH_MS = 300;
+function terminalsBehind() {
+  return Number.isInteger(state.eventsTerminalsVersion) &&
+    !(Number.isInteger(state.terminalsVersion) && state.eventsTerminalsVersion <= state.terminalsVersion);
+}
+// hello: a stream's first message. On the first connection nothing was read
+// yet and the read after login shows the list, so only a reconnect reads.
+function terminalsAnnounced(version, { hello = false } = {}) {
+  if (!Number.isInteger(version)) return;
+  state.eventsTerminalsVersion = Math.max(version, state.eventsTerminalsVersion ?? version);
+  if (Number.isInteger(state.terminalsVersion) && version <= state.terminalsVersion) return;
+  if (hello && !Number.isInteger(state.terminalsVersion) && !state.terminalsReadAt && !state.terminalsError) return;
+  if (state.terminalsEventTimer) return;
+  const authEpoch = state.authEpoch;
+  state.terminalsEventTimer = setTimeout(() => {
+    state.terminalsEventTimer = null;
+    if (authEpoch === state.authEpoch) readAnnouncedTerminals();
+  }, TERMINALS_EVENT_BATCH_MS);
+}
+function readAnnouncedTerminals() {
+  if (!state.authenticated || !terminalsBehind()) return;
+  if (state.terminalsRefreshing) state.terminalsPending = true;
+  else refreshTerminals();
+}
+// An open or a close made here shows at once; the list read that follows confirms it.
+function rememberTerminal(terminal, changes = {}) {
+  if (!terminal?.id) return;
+  const index = state.terminals.findIndex((item) => item.id === terminal.id);
+  const row = { ...(index < 0 ? {} : state.terminals[index]), ...terminal, ...changes };
+  state.terminals = index < 0 ? [...state.terminals, row] : state.terminals.map((item, i) => (i === index ? row : item));
+  renderTerminals();
 }
 function renderTerminals() {
   const list = $("running-list");
   const focused = document.activeElement?.dataset;
-  const restoreFocus = focused?.terminalId ? { id: focused.terminalId, action: focused.action } : null;
+  const restoreFocus = focused?.terminalId ? { id: focused.terminalId, action: focused.action }
+    : focused?.action === "connections" ? { action: "connections" } : null;
   list.replaceChildren();
   const alive = state.terminals.filter((t) => t.alive !== false && !t.closed);
-  $("running-terminals").hidden = !alive.length && !state.terminalsError;
+  const direct = alive.filter((terminal) => !connectionTerminal(terminal));
+  const connections = alive.filter(connectionTerminal);
+  const repeats = duplicateTerminals(direct);
+  // A chip in the list's top row; the rows themselves live in a sheet.
+  const chip = $("running-terminals");
+  chip.hidden = !alive.length && !state.terminalsError;
+  setClass(chip, "has-error", !!state.terminalsError);
+  chip.setAttribute?.("aria-label", `열린 터미널 ${direct.length}개${connections.length ? `, 세션 연결 ${connections.length}개` : ""}${state.terminalsError ? ", 목록 확인 필요" : ""}`);
+  if (chip.hidden && $("terminals-dialog")?.open) closeSheet("terminals-dialog");
   $("running-error").textContent = state.terminalsError;
   $("running-error").hidden = !state.terminalsError;
   $("running-refresh").hidden = !state.terminalsError;
-  $("running-count").textContent = alive.length;
-  for (const terminal of alive) {
-    const node = button("", "running-terminal", () => openTerminal(terminal));
+  $("running-count").textContent = direct.length || connections.length;
+  const row = (terminal) => {
+    const node = button("", "running-terminal", () => {
+      closeSheet("terminals-dialog");
+      openTerminal(terminal);
+    });
     node.dataset.terminalId = terminal.id;
     node.dataset.action = "open";
     const labels = el("span", "running-terminal-copy");
+    const repeated = repeats.get(terminal.id);
     labels.append(
-      el("strong", "running-terminal-title", terminal.title || "열어 둔 터미널"),
+      el("strong", "running-terminal-title", terminalTitle(terminal)),
       el("span", "running-terminal-meta", targetLabel(terminalInfo(terminal))),
     );
+    if (repeated) labels.append(el("span", "running-terminal-duplicate",
+      `같은 화면이 이미 열려 있어요(${clock(terminalInfo(repeated).createdAt)} 시작). 이 터미널은 닫아도 세션은 계속 돌아가요.`));
     const arrow = el("span", null, "↗");
     arrow.setAttribute("aria-hidden", "true");
     node.append(
@@ -2882,17 +6414,212 @@ function renderTerminals() {
       labels,
       arrow,
     );
-    const row = el("div", "running-terminal-row");
+    const item = el("div", `running-terminal-row${repeated ? " duplicate" : ""}`);
     const copy = terminalCloseCopy(terminal);
     const close = button(copy.action, `running-terminal-close${copy.danger ? " danger-quiet" : ""}`, () => closeTerminal(terminal.id));
     close.dataset.terminalId = terminal.id;
     close.dataset.action = "close";
-    close.setAttribute("aria-label", `${terminal.title || "터미널"} ${copy.action}`);
-    row.append(node, close);
-    list.append(row);
+    close.setAttribute("aria-label", `${terminalTitle(terminal, "터미널")} ${copy.action}`);
+    item.append(node, close);
+    list.append(item);
     if (restoreFocus?.id === terminal.id)
       (restoreFocus.action === "close" ? close : node).focus();
+  };
+  direct.forEach(row);
+  if (connections.length) {
+    // Connections the board opened to send or answer: folded, since they close by themselves.
+    const toggle = button(`Claude 세션 연결 ${connections.length}개 · 10분 쓰지 않으면 보드가 닫아요`, "running-connections",
+      () => { state.showConnections = !state.showConnections; renderTerminals(); });
+    toggle.setAttribute("aria-expanded", String(!!state.showConnections));
+    toggle.dataset.action = "connections";
+    list.append(toggle);
+    if (restoreFocus?.action === "connections") toggle.focus();
+    if (state.showConnections) connections.forEach(row);
   }
+  // Cards and the open conversation offer "연결 닫기" for these terminals, and
+  // show "터미널 열림" while one is live.
+  renderTerminalMarks();
+  const selected = selectedSession();
+  if (selected) updateChatComposer(chatEntry(selected));
+}
+
+// "앱 서버 켜기": start one Codex account's daemon on its host, then read the list and
+// this conversation again. Nothing is sent to the agent.
+async function startAppServer(s, trigger) {
+  if (state.appServerBusy) return;
+  state.appServerBusy = true;
+  const authEpoch = state.authEpoch;
+  if (trigger) {
+    trigger.disabled = true;
+    trigger.textContent = "앱 서버를 켜는 중…";
+  }
+  try {
+    await api("/api/app-server", { method: "POST", body: { host: s.host, home: s.home || ".codex" }, authEpoch });
+    assertAuthEpoch(authEpoch);
+    toast("앱 서버를 켰습니다. 대화를 다시 읽습니다.");
+    await poll(true);
+    const current = selectedSession();
+    if (current?.key === s.key) await loadDetail(current, true);
+  } catch (err) {
+    if (!err.unauthorized && !err.staleAuth && authEpoch === state.authEpoch)
+      toast(err.message || "앱 서버를 켜지 못했습니다.");
+  } finally {
+    state.appServerBusy = false;
+    if (trigger && trigger.isConnected !== false) {
+      trigger.disabled = false;
+      trigger.textContent = "앱 서버 켜기";
+    }
+  }
+}
+
+// "새 세션": a host's own launcher (settings `launcher`), opened in a board
+// terminal. The launcher, not the board, chooses the project, agent and account.
+function newSessionHosts() {
+  return (state.capabilities?.hosts || []).filter((host) => host.newSession);
+}
+function renderNewSession() {
+  const chip = $("new-session");
+  if (!chip) return;
+  chip.hidden = !newSessionHosts().some((host) => host.newSession.available);
+  if (chip.hidden && $("new-session-dialog")?.open) closeNewSession();
+}
+function newSessionHostMeta(host) {
+  const status = host.newSession;
+  if (host.online === false) return "기기에 연결할 수 없습니다.";
+  if (!status.available) return status.reason || "이 기기에서는 열 수 없습니다.";
+  return `${status.label || "새 세션"} 실행`;
+}
+function renderNewSessionHosts() {
+  const list = $("new-session-hosts");
+  list.replaceChildren();
+  for (const host of newSessionHosts()) {
+    const ready = host.newSession.available && host.online !== false;
+    const node = button("", "new-session-host", () => startNewSession(host.name));
+    node.dataset.host = host.name;
+    node.disabled = !ready || !!state.newSessionBusy;
+    const copy = el("span", "new-session-host-copy");
+    copy.append(
+      el("strong", "new-session-host-title", host.label || host.name),
+      el("span", "new-session-host-meta",
+        state.newSessionBusy === host.name ? "터미널을 여는 중…" : newSessionHostMeta(host)),
+    );
+    const arrow = el("span", null, "↗");
+    arrow.setAttribute("aria-hidden", "true");
+    node.append(copy, arrow);
+    list.append(node);
+    // Already open here: going back to one is usually what was meant, and avoids a repeat.
+    for (const terminal of state.terminals.filter((t) => t.alive !== false && !t.closed && !connectionTerminal(t)
+        && terminalInfo(t).mode === "new-session" && terminalInfo(t).host === host.name)) {
+      const open = button("", "new-session-open", () => {
+        closeSheet("new-session-dialog");
+        openTerminal(terminal);
+      });
+      open.dataset.terminalId = terminal.id;
+      open.append(el("span", "new-session-open-label", "열린 화면으로"), el("strong", null, terminalTitle(terminal)));
+      list.append(open);
+    }
+  }
+}
+function openNewSession() {
+  // One request id per host while this sheet is open: a retry after a lost
+  // reply returns the same terminal instead of opening a second one.
+  state.newSessionRequests = new Map();
+  $("new-session-error").textContent = "";
+  $("new-session-error").hidden = true;
+  renderNewSessionHosts();
+  sheet("new-session-dialog").open();
+}
+function closeNewSession() {
+  closeSheet("new-session-dialog", "new-session");
+}
+async function startNewSession(hostName) {
+  if (state.newSessionBusy) return;
+  const authEpoch = state.authEpoch;
+  state.newSessionRequests ||= new Map();
+  if (!state.newSessionRequests.has(hostName)) state.newSessionRequests.set(hostName, requestId());
+  state.newSessionBusy = hostName;
+  $("new-session-error").hidden = true;
+  renderNewSessionHosts();
+  try {
+    const result = await api("/api/new-session", {
+      method: "POST",
+      body: { host: hostName, requestId: state.newSessionRequests.get(hostName) }, authEpoch,
+    });
+    assertAuthEpoch(authEpoch);
+    if (!result.terminal?.id) throw new Error("터미널 연결 정보를 받지 못했습니다.");
+    state.newSessionBusy = null;
+    closeSheet("new-session-dialog");
+    rememberTerminal(result.terminal);
+    await openTerminal(result.terminal);
+    refreshTerminals(authEpoch);
+  } catch (err) {
+    if (authEpoch === state.authEpoch && !err.unauthorized && !err.staleAuth) {
+      $("new-session-error").textContent = err.message || "새 세션을 열지 못했습니다.";
+      $("new-session-error").hidden = false;
+    }
+  } finally {
+    state.newSessionBusy = null;
+    if ($("new-session-dialog").open) renderNewSessionHosts();
+  }
+}
+
+// A numbered menu a launcher prints and waits on: rows such as "  1. label"
+// (and "  q. 취소"), then a short prompt such as "선택:" on the cursor's line.
+// A refused answer and its hint may sit between the rows and the new prompt.
+const MENU_ROW = /^\s{0,8}([0-9]{1,2}|[A-Za-z])\.\s+(\S.*)$/;
+function terminalMenu(lines, cursorLine = lines.length - 1) {
+  const prompt = /^(\S[^:：]{0,30})[:：]$/.exec(String(lines[cursorLine] || "").trim());
+  if (!prompt) return null;
+  let index = cursorLine - 1;
+  for (let skipped = 0; index >= 0 && skipped < 6 && !MENU_ROW.test(lines[index] || ""); skipped++) index--;
+  const options = [];
+  for (; index >= 0 && MENU_ROW.test(lines[index] || ""); index--) {
+    const [, key, label] = MENU_ROW.exec(lines[index]);
+    options.unshift({ key, label: label.trim() });
+  }
+  if (!options.some((option) => /^\d+$/.test(option.key)) ||
+      new Set(options.map((option) => option.key.toLowerCase())).size !== options.length)
+    return null;
+  const title = String(lines[index] || "").trim();
+  return { title: title.length <= 80 ? title : "", prompt: prompt[1], options };
+}
+// Only "새 세션" terminals: the agent CLIs that follow in the same terminal
+// draw their own lists, which are never turned into buttons.
+function updateTerminalMenu() {
+  const box = $("terminal-menu");
+  if (!box) return;
+  let menu = null;
+  const buffer = state.term?.buffer?.active;
+  if (buffer && terminalInfo(state.terminal).mode === "new-session" && state.terminalAlive !== false) {
+    const cursor = buffer.baseY + buffer.cursorY;
+    const lines = [];
+    for (let y = Math.max(0, cursor - 40); y <= cursor; y++)
+      lines.push(buffer.getLine(y)?.translateToString(true) || "");
+    menu = terminalMenu(lines);
+  }
+  const signature = menu ? JSON.stringify(menu) : "";
+  if (signature === state.terminalMenuSignature) return;
+  state.terminalMenuSignature = signature;
+  box.hidden = !menu;
+  $("terminal-menu-options").replaceChildren();
+  if (!menu) return;
+  $("terminal-menu-title").textContent = menu.title || menu.prompt;
+  box.setAttribute("aria-label", menu.title || "선택 메뉴");
+  for (const option of menu.options) {
+    const cancel = /^q$/i.test(option.key);
+    $("terminal-menu-options").append(button(cancel ? option.label : `${option.key}. ${option.label}`,
+      `terminal-menu-option${cancel ? " cancel" : ""}`, () => chooseTerminalMenu(option.key)));
+  }
+}
+function clearTerminalMenu() {
+  state.terminalMenuSignature = "";
+  if ($("terminal-menu")) $("terminal-menu").hidden = true;
+  $("terminal-menu-options")?.replaceChildren();
+}
+function chooseTerminalMenu(key) {
+  // Hidden at once; the launcher's echo and next menu (if any) follow as output.
+  clearTerminalMenu();
+  sendInput(`${key}\r`).catch(() => {});
 }
 
 function closeTerminal(id) {
@@ -2905,7 +6632,7 @@ function closeTerminal(id) {
     (state.terminal?.id === id ? state.terminal : null);
   if (!terminal) return;
   const copy = terminalCloseCopy(terminal);
-  state.closingTerminal = { ...terminal, id, title: terminal.title || "열어 둔 터미널", copy, trigger: document.activeElement };
+  state.closingTerminal = { ...terminal, id, title: terminalTitle(terminal), copy, trigger: document.activeElement };
   $("close-terminal-title").textContent = copy.title;
   $("close-terminal-description").textContent = copy.description;
   $("close-terminal-name").textContent = state.closingTerminal.title;
@@ -2918,7 +6645,7 @@ function closeTerminal(id) {
   $("close-terminal-confirm").textContent = copy.action;
   $("close-terminal-confirm").className = `primary${copy.danger ? " danger" : ""}`;
   $("close-terminal-confirm").disabled = false;
-  $("close-terminal-dialog").showModal();
+  sheet("close-terminal-dialog").open();
   $("close-terminal-cancel").focus();
 }
 function cancelTerminalClose() {
@@ -2929,6 +6656,9 @@ function cancelTerminalClose() {
   if (trigger?.isConnected !== false) trigger?.focus();
 }
 function finishTerminalClose(closing) {
+  // Cards and the conversation header drop "터미널 열림" at once.
+  if (state.terminals.some((item) => item.id === closing.id && item.alive !== false && !item.closed))
+    rememberTerminal({ id: closing.id }, { alive: false, closed: true });
   if (state.terminal?.id === closing.id) {
     const wasVisible = state.terminalVisible;
     saveDraft();
@@ -2943,14 +6673,16 @@ function finishTerminalClose(closing) {
     state.term = null;
     state.fit = null;
     $("terminal-viewport").replaceChildren();
-    $("terminal-screen").hidden = true;
-    $("app").hidden = false;
+    showTerminalScreen(false);
+    updateThemeColor();
     renderTerminalReturn();
     if (wasVisible) {
       navigateView("list", true);
-      backToList();
+      stopChatPolling();
+      setDetailShown(false, { focus: true });
     }
     schedule();
+    syncEvents();
   }
   state.closingTerminal = null;
   $("close-terminal-dialog").close();
@@ -2991,17 +6723,156 @@ async function confirmTerminalClose() {
   }
 }
 
+// Live updates: one EventSource for the board, subscribed to the open
+// conversation (its source in the query) and to snapshot changes. While it
+// is connected the polling below only runs as a slow safety net; a server
+// without /api/events, or 3 errors within 30s, falls back to normal polling
+// for a while. Events only say what changed; data is still read online.
+const EVENTS_SAFETY_MS = { snapshot: 60000, chat: 30000 };
+const EVENTS_RETRY_MS = 5 * 60 * 1000;
+function eventsHealthy() {
+  return !!state.events?.healthy;
+}
+function closeEvents() {
+  const events = state.events;
+  if (!events) return;
+  state.events = null;
+  try {
+    events.source.close();
+  } catch {
+    /* already closed */
+  }
+  // Polling returns to its normal pace until a new stream is healthy.
+  if (events.healthy) rescheduleAfterEvents();
+}
+function rescheduleAfterEvents() {
+  if (state.pollTimer) schedule();
+  const s = selectedSession();
+  if (s && state.chatPollTimer) scheduleChatPoll(s, chatEntry(s));
+}
+function fallbackEvents() {
+  state.eventsRetryAt = Date.now() + EVENTS_RETRY_MS;
+  closeEvents();
+}
+function syncEvents() {
+  const Source = globalThis.EventSource;
+  if (typeof Source !== "function" || !state.authenticated || document.hidden || networkOffline() ||
+      state.terminalVisible || Date.now() < state.eventsRetryAt) {
+    closeEvents();
+    return;
+  }
+  const s = selectedSession();
+  const chat = s && chatVisible() && !claudeWithoutId(s) ? sourceOf(s) : null;
+  const key = chat ? chatKey(chat) : "";
+  if (state.events?.key === key) return;
+  closeEvents();
+  const params = new URLSearchParams();
+  for (const name of ["host", "agent", "home", "id"]) if (chat?.[name]) params.set(name, chat[name]);
+  const query = params.toString();
+  let source;
+  try {
+    source = new Source(`/api/events${query ? `?${query}` : ""}`);
+  } catch {
+    fallbackEvents();
+    return;
+  }
+  const events = { source, key, healthy: false, everOpen: false, errors: [], digest: null, authEpoch: state.authEpoch };
+  state.events = events;
+  const current = () => state.events === events && events.authEpoch === state.authEpoch;
+  const parse = (event) => {
+    try {
+      return JSON.parse(event?.data || "{}") || {};
+    } catch {
+      return {};
+    }
+  };
+  const healthy = () => {
+    if (events.healthy) return;
+    events.healthy = events.everOpen = true;
+    rescheduleAfterEvents();
+  };
+  source.addEventListener("open", () => { if (current()) healthy(); });
+  source.addEventListener("hello", (event) => {
+    if (!current()) return;
+    healthy();
+    const hello = parse(event);
+    // A restarted server counts versions from 0 again: forget the old numbers first.
+    serverBooted(hello.bootId);
+    snapshotAnnounced(hello.snapshotVersion, { immediate: true });
+    terminalsAnnounced(hello.terminalsVersion, { hello: true });
+  });
+  source.addEventListener("snapshot", (event) => {
+    if (current()) snapshotAnnounced(parse(event).version);
+  });
+  source.addEventListener("terminals", (event) => {
+    if (current()) terminalsAnnounced(parse(event).version);
+  });
+  source.addEventListener("chat", (event) => {
+    if (!current()) return;
+    const digest = parse(event).digest;
+    if (typeof digest === "string" && digest && digest === events.digest) return;
+    events.digest = typeof digest === "string" ? digest : null;
+    const selected = selectedSession();
+    if (!selected || !events.key || chatKey(sourceOf(selected)) !== events.key || !chatVisible()) return;
+    const entry = chatEntry(selected);
+    if (entry.checking) entry.recheckQueued = true;
+    else loadChatState(selected, false);
+  });
+  source.addEventListener("error", () => {
+    if (!current()) return;
+    const now = Date.now();
+    events.errors = events.errors.filter((time) => now - time < 30000).concat(now);
+    const wasHealthy = events.healthy;
+    events.healthy = false;
+    // CLOSED: the browser will not retry (404, 503, a closed server).
+    if (source.readyState === 2 || events.errors.length >= 3) fallbackEvents();
+    // CONNECTING: the browser reconnects by itself. Either way, the polling
+    // timers set for a healthy stream go back to their normal pace now.
+    if (wasHealthy) rescheduleAfterEvents();
+  });
+}
+// A resident collector can announce many versions in a burst: they are read
+// together, at most once per SNAPSHOT_EVENT_BATCH_MS, and only the snapshot
+// (host and account settings come from the regular reads).
+const SNAPSHOT_EVENT_BATCH_MS = 300;
+function snapshotBehind() {
+  return Number.isInteger(state.eventsSnapshotVersion) &&
+    !(Number.isInteger(state.snapshotVersion) && state.eventsSnapshotVersion <= state.snapshotVersion);
+}
+function readAnnouncedSnapshot() {
+  if (!state.authenticated || !snapshotBehind()) return;
+  if (state.pollBusy) state.snapshotPending = true;
+  else poll(false, { capabilities: false });
+}
+// immediate: the stream's one "hello" after connecting is read at once.
+function snapshotAnnounced(version, { immediate = false } = {}) {
+  if (!Number.isInteger(version)) return;
+  state.eventsSnapshotVersion = Math.max(version, state.eventsSnapshotVersion ?? version);
+  if (Number.isInteger(state.snapshotVersion) && version <= state.snapshotVersion) return;
+  if (state.snapshotEventTimer) return;
+  if (immediate) {
+    readAnnouncedSnapshot();
+    return;
+  }
+  const authEpoch = state.authEpoch;
+  state.snapshotEventTimer = setTimeout(() => {
+    state.snapshotEventTimer = null;
+    if (authEpoch === state.authEpoch) readAnnouncedSnapshot();
+  }, SNAPSHOT_EVENT_BATCH_MS);
+}
 function schedule() {
   clearTimeout(state.pollTimer);
+  state.pollTimer = null;
   if (!state.authenticated || networkOffline() || state.terminalVisible || document.hidden) return;
   // Reading a collection already in flight does not start another host request.
   const collecting =
     state.snapshot?.hosts?.some((host) => host.refreshing) &&
     Date.now() < state.refreshDeadline;
-  state.pollTimer = setTimeout(
-    () => poll(!collecting),
-    collecting ? 2000 : POLL_MS,
-  );
+  // After a failed read, retry sooner with backoff instead of waiting a full minute.
+  const retry = state.pollFailures ? Math.min(POLL_MS, 5000 * 2 ** (state.pollFailures - 1)) : POLL_MS;
+  // Live snapshot events replace the 2s collection loop while connected.
+  const delay = eventsHealthy() && !state.pollFailures ? EVENTS_SAFETY_MS.snapshot : collecting ? 2000 : retry;
+  state.pollTimer = setTimeout(() => poll(!collecting), delay);
 }
 async function loadCapabilities(authEpoch = state.authEpoch, { refreshView = true } = {}) {
   const accountFilter = state.filters.account;
@@ -3011,7 +6882,9 @@ async function loadCapabilities(authEpoch = state.authEpoch, { refreshView = tru
   assertAuthEpoch(authEpoch);
   state.capabilities = capabilities;
   state.csrf = state.capabilities.csrfToken || "";
+  renderNewSession();
   $("logout").hidden = state.capabilities.authMode === "tailscale";
+  if ($("settings-lock")) $("settings-lock").hidden = $("logout").hidden;
   if (accountFilter && state.filters.account === accountFilter && previousRoutes?.size) {
     const labels = new Set(allSessions().filter((s) => previousRoutes.has(accountRouteKey(s))).map((s) => s.account));
     if (labels.size === 1) state.filters.account = [...labels][0];
@@ -3022,7 +6895,30 @@ async function loadCapabilities(authEpoch = state.authEpoch, { refreshView = tru
   const s = selectedSession();
   if (s && $("route-host")) populateRoute(s);
 }
-async function poll(refresh = false) {
+// What /api/capabilities depends on: the server process (bootId; a restarted
+// server has a new CSRF token), each host's reachability (a host that recovers
+// is read again) and the Codex accounts it lists. A resident collector's new
+// snapshot (another fetchedAt) alone never changes it.
+function capabilitiesRevision(snapshot) {
+  return JSON.stringify([snapshot?.bootId ?? null, (snapshot?.hosts || []).map((host) => [host.name, !!host.ok,
+    [...new Set((host.data?.codex || []).map((s) => s.home || ".codex"))].sort()])]);
+}
+// Snapshot versions count within one server process. Another bootId (a
+// restart) forgets the numbers of the previous one, so its first versions are read.
+function serverBooted(bootId) {
+  if (typeof bootId !== "string" || !bootId || bootId === state.serverBoot) return;
+  if (state.serverBoot !== null) {
+    state.snapshotVersion = null;
+    state.eventsSnapshotVersion = null;
+    // The terminal list is read again on the new process's first announcement.
+    state.terminalsVersion = null;
+    state.eventsTerminalsVersion = null;
+  }
+  state.serverBoot = bootId;
+}
+// capabilities: false (a read announced by a snapshot event) reads the
+// snapshot only; the next regular read catches the capabilities up.
+async function poll(refresh = false, { capabilities = true } = {}) {
   if (networkOffline() || state.loginBusy || state.pollBusy || document.hidden || state.terminalVisible) return;
   const authEpoch = state.authEpoch;
   state.pollBusy = true;
@@ -3032,25 +6928,51 @@ async function poll(refresh = false) {
     const snapshot = await api(`/api/snapshot${refresh ? "?refresh=1" : ""}`, { authEpoch });
     assertAuthEpoch(authEpoch);
     state.snapshot = snapshot;
+    serverBooted(snapshot?.bootId);
+    if (Number.isInteger(snapshot?.version)) state.snapshotVersion = snapshot.version;
+    const firstAuthentication = !state.authenticated;
     state.authenticated = true;
+    // One non-blocking metadata read separates known bot sessions immediately.
+    // An ordinary poll never retries this initial read, even after failure.
+    if (firstAuthentication) loadBotRequests();
     $("login").hidden = true;
     $("app").hidden = false;
     notice();
     render();
-    const revision = JSON.stringify(
-      state.snapshot.hosts.map((host) => [host.name, host.ok, host.fetchedAt]),
-    );
-    if (!state.capabilities || state.capabilitiesRevision !== revision) {
+    renameTerminals();
+    openRequestedSession();
+    const revision = capabilitiesRevision(state.snapshot);
+    const boot = typeof snapshot?.bootId === "string" ? snapshot.bootId : null;
+    // Another server process: its CSRF token is read at once, even on a read an
+    // event announced (capabilities: false), before any request needs it.
+    const restarted = boot !== null && boot !== state.capabilitiesBoot;
+    if (!state.capabilities || restarted || (capabilities && state.capabilitiesRevision !== revision)) {
       await loadCapabilities(authEpoch);
       assertAuthEpoch(authEpoch);
       state.capabilitiesRevision = revision;
+      state.capabilitiesBoot = boot;
     }
+    state.pollFailures = 0;
+    renderConnectivity();
+    if (refresh) window.SessionholicGoals?.refresh?.();
+    if (Date.now() - (state.usageAt || 0) > 55000) loadUsage();
+    // Safety net for missed (or unavailable) terminal announcements: a regular
+    // read also reads a terminal list older than a minute. The first list is
+    // read by login and startup themselves; when that read failed, this tries again.
+    if (capabilities && (state.terminalsReadAt ? Date.now() - state.terminalsReadAt >= POLL_MS : !!state.terminalsError))
+      refreshTerminals(authEpoch);
     schedule();
+    syncEvents();
   } catch (err) {
     if (!err.unauthorized && !err.staleAuth) {
-      notice(
-        "보드 연결을 확인하지 못했습니다. 마지막으로 읽은 내용을 표시합니다. 새로고침을 눌러 다시 확인하세요.",
-      );
+      // A transient failure (server restart, network blip) must not stop the
+      // list for good; from the second failure in a row the top shows it.
+      state.pollFailures = (state.pollFailures || 0) + 1;
+      renderConnectivity();
+      if (authEpoch === state.authEpoch) {
+        state.pollBusy = false;
+        schedule();
+      }
       if (!state.snapshot) {
         $("login").hidden = false;
         $("login-error").textContent =
@@ -3058,10 +6980,19 @@ async function poll(refresh = false) {
       }
     }
   } finally {
-    if (authEpoch === state.authEpoch) state.pollBusy = false;
+    if (authEpoch === state.authEpoch) {
+      state.pollBusy = false;
+      // A version announced during this read: read once more if still behind
+      // (batched like any other announcement).
+      if (state.snapshotPending) {
+        state.snapshotPending = false;
+        if (snapshotBehind()) snapshotAnnounced(state.eventsSnapshotVersion);
+      }
+    }
   }
 }
 async function manualRefresh() {
+  if (state.sessionCategory === "bot" && !$("session-layout").hidden) return loadBotRequests({ refresh: true });
   if (state.pollBusy || state.launchBusy) return;
   const authEpoch = state.authEpoch;
   $("refresh").disabled = true;
@@ -3082,9 +7013,123 @@ async function manualRefresh() {
     if (authEpoch === state.authEpoch) $("refresh").disabled = false;
   }
 }
+// Phones (iOS large title): "작업" scrolls with the list. Once it has passed
+// under the bar, the bar turns translucent (blurred) and shows the small
+// centered title; scrolling back to the top restores the large title.
+function setListCollapsed(collapsed) {
+  const body = document.body;
+  if (state.listCollapsed === collapsed && body?.classList?.contains?.("list-collapsed") === collapsed) return;
+  state.listCollapsed = collapsed;
+  if (!body?.classList) return;
+  if (collapsed) body.classList.add("list-collapsed");
+  else body.classList.remove("list-collapsed");
+}
+function listScroll(pane) {
+  setListCollapsed(phoneLayout() && (pane?.scrollTop || 0) > GESTURE.largeTitleCollapsePx);
+  if (state.swipeOpen) closeSwipe();
+}
+function scrollListToTop() {
+  const pane = $("task-list-pane");
+  if (typeof pane?.scrollTo === "function") pane.scrollTo({ top: 0, behavior: prefersReducedMotion() ? "auto" : "smooth" });
+  else if (pane) pane.scrollTop = 0;
+}
+// Pull to refresh: the installed app has no browser gesture (overscroll is off),
+// so a downward pull from the top of the list or conversation reloads both.
+function scrollParent(node) {
+  for (let item = node; item && item !== document.body; item = item.parentElement) {
+    const overflow = window.getComputedStyle?.(item)?.overflowY || "";
+    if (/(auto|scroll)/.test(overflow) && item.scrollHeight > item.clientHeight) return item;
+  }
+  return null;
+}
+function pullDistance(pulled) {
+  // Elastic: the indicator follows the finger less and less, like a rubber band.
+  return GESTURE.pullMaxPx * (1 - Math.exp(-Math.max(0, pulled) / GESTURE.pullResistPx));
+}
+function showPull(distance, label = "당겨서 새로고침", ready = false) {
+  const indicator = $("pull-refresh");
+  if (!indicator?.style) return;
+  indicator.style.transform = `translate(-50%, ${Math.round(distance - 48)}px)`;
+  indicator.style.opacity = distance > 4 ? "1" : "0";
+  indicator.classList?.toggle?.("is-ready", ready);
+  const icon = indicator.querySelector?.(".pull-refresh-icon");
+  if (icon?.style && !indicator.classList?.contains?.("is-loading"))
+    icon.style.transform = `rotate(${Math.round(Math.min(1, distance / GESTURE.pullTriggerPx) * 180)}deg)`;
+  $("pull-refresh-label").textContent = label;
+}
+async function pullRefresh() {
+  if (state.pullRefreshing) return;
+  state.pullRefreshing = true;
+  showPull(GESTURE.pullTriggerPx, "새로고침 중…", true);
+  $("pull-refresh")?.classList?.add("is-loading");
+  let label = "업데이트됨";
+  try {
+    await manualRefresh();
+    const selected = selectedSession();
+    if (selected && chatVisible()) await loadChatState(selected, true);
+    if (networkOffline()) label = "오프라인입니다";
+  } catch {
+    label = "새로고침하지 못했습니다";
+  } finally {
+    $("pull-refresh")?.classList?.remove("is-loading");
+    showPull(GESTURE.pullTriggerPx, label, false);
+    $("pull-refresh")?.classList?.add("is-done");
+    // A short confirmation, then the indicator slides away.
+    await new Promise((resolve) => setTimeout(resolve, 700));
+    $("pull-refresh")?.classList?.remove("is-done");
+    state.pullRefreshing = false;
+    showPull(0);
+  }
+}
+function bindPullToRefresh(root) {
+  let start = null, startX = 0, distance = 0;
+  root.addEventListener("touchstart", (event) => {
+    start = null;
+    distance = 0;
+    if (event.touches.length !== 1 || state.terminalVisible || state.pullRefreshing) return;
+    if (event.target?.closest?.("textarea, input, select, dialog[open]")) return;
+    // In a conversation the message list decides, wherever the finger starts.
+    const scroller = event.target?.closest?.("#detail") ? $("messages") : scrollParent(event.target);
+    if (scroller && scroller.scrollTop > 0) return;
+    start = event.touches[0].clientY;
+    startX = event.touches[0].clientX;
+  }, { passive: true });
+  root.addEventListener("touchmove", (event) => {
+    if (start === null || event.touches.length !== 1) return;
+    const pulled = event.touches[0].clientY - start;
+    // The pull starts only on a clearly downward drag: a sideways one (a
+    // card swipe) is never a pull, and a small wobble waits for direction.
+    if (distance === 0) {
+      const sideways = Math.abs((event.touches[0].clientX || 0) - startX);
+      if (sideways > GESTURE.pressSlopPx && sideways >= Math.abs(pulled)) {
+        start = null;
+        showPull(0);
+        return;
+      }
+      if (pulled > 0 && pulled < GESTURE.pressSlopPx && sideways > pulled) return;
+    }
+    if (pulled <= 0) { distance = 0; showPull(0); return; }
+    const wasReady = distance >= GESTURE.pullTriggerPx;
+    distance = pullDistance(pulled);
+    const ready = distance >= GESTURE.pullTriggerPx;
+    // A light tick when release would refresh (devices without vibration ignore it).
+    if (ready && !wasReady) haptic("select");
+    showPull(distance, ready ? "놓으면 새로고침" : "당겨서 새로고침", ready);
+    if (event.cancelable) event.preventDefault();
+  }, { passive: false });
+  const finish = () => {
+    if (start !== null && distance >= GESTURE.pullTriggerPx) pullRefresh();
+    else if (!state.pullRefreshing) showPull(0);
+    start = null;
+    distance = 0;
+  };
+  root.addEventListener("touchend", finish, { passive: true });
+  root.addEventListener("touchcancel", () => { start = null; distance = 0; if (!state.pullRefreshing) showPull(0); }, { passive: true });
+}
 function showLogin() {
-  closeChatQueue(false);
   beginAuthEpoch();
+  window.SessionholicLabels?.locked?.();
+  closeSessionControl(true);
   state.loginBusy = false;
   state.launchBusy = false;
   state.terminalCloseBusy = false;
@@ -3092,21 +7137,45 @@ function showLogin() {
   $("running-refresh").disabled = false;
   $("login-submit").disabled = false;
   clearTimeout(state.pollTimer);
+  clearTimeout(state.snapshotEventTimer);
+  state.snapshotEventTimer = null;
+  clearTimeout(state.terminalsEventTimer);
+  state.terminalsEventTimer = null;
+  state.terminalsVersion = null;
+  state.eventsTerminalsVersion = null;
+  state.terminalsPending = false;
+  state.terminalsReadAt = 0;
   stopTerminalReader();
   stopChatPolling();
+  // Object URLs of picked images are released with their drafts.
+  for (const entry of state.chats.values()) for (const key of [...(entry.thumbs?.keys() || [])]) revokeThumb(entry, key);
   state.chats.clear();
+  state.conversationViews.clear();
+  window.SessionholicGoals?.locked?.();
+  state.phaseFilter = "";
+  state.sessionCategory = "general"; state.filters.initiator = "";
+  state.selectedBotRequest = null; state.botRequests = emptyBotRequests();
+  renderSessionCategories([], Date.now() / 1000);
+  state.swipeOpen = null;
+  state.pollFailures = 0;
   state.nativeSessions.clear();
+  state.livePhases.clear();
   state.accountFilterRoutes = null;
   state.inputEpoch++;
   state.authenticated = false;
   state.csrf = "";
   state.capabilities = null;
   state.capabilitiesRevision = null;
+  state.capabilitiesBoot = null;
   state.refreshDeadline = 0;
   state.snapshot = null;
+  state.snapshotVersion = null;
+  state.eventsSnapshotVersion = null;
+  state.serverBoot = null;
+  state.snapshotPending = false;
   state.selected = null;
   navigateView("list", true);
-  document.body.classList.remove("show-detail");
+  setDetailShown(false);
   state.detailFor = null;
   state.detailRun++;
   state.planRun++;
@@ -3130,6 +7199,10 @@ function showLogin() {
   $("app").hidden = true;
   $("login").hidden = false;
   if ($("plan-dialog").open) $("plan-dialog").close();
+  if ($("settings-dialog").open) $("settings-dialog").close();
+  for (const id of ["usage-dialog", "filter-dialog", "terminals-dialog", "new-session-dialog", "action-sheet"]) if ($(id)?.open) $(id).close();
+  renderConnectivity();
+  updateThemeColor();
   $("login-token").focus();
 }
 async function lock() {
@@ -3154,9 +7227,26 @@ function updateViewport() {
     window.visualViewport?.height || window.innerHeight,
   );
   document.documentElement.style.setProperty("--app-height", `${height}px`);
+  syncChromeMode();
   const selected = selectedSession();
   if (selected) resizeChatInput(chatEntry(selected));
   fitTerminal();
+}
+// "오프라인 · 다시 연결 중" at the top while the browser is offline or the
+// board failed to answer twice in a row; it goes away by itself once a read
+// succeeds. The terminal shows its own connection state instead.
+function renderConnectivity() {
+  const box = $("offline-banner");
+  if (!box) return;
+  const offline = networkOffline();
+  const failing = !offline && (state.pollFailures || 0) >= 2;
+  const text = !state.authenticated && !state.snapshot ? ""
+    : offline ? "오프라인 · 다시 연결 중" : failing ? "연결 끊김 · 다시 연결 중" : "";
+  // A connection problem that just started shows a conversation's bars.
+  if (text && !$("offline-text").textContent) revealChrome();
+  if ($("offline-text").textContent !== text) $("offline-text").textContent = text;
+  box.dataset.kind = offline ? "offline" : failing ? "retrying" : "";
+  box.hidden = !text || state.terminalVisible;
 }
 function showOfflineStart() {
   if (state.snapshot || state.terminalVisible) return;
@@ -3167,15 +7257,17 @@ function showOfflineStart() {
 }
 function recoverConnection() {
   state.offline = false;
+  renderConnectivity();
   if (networkOffline()) return;
   if (!state.loginBusy) $("login-submit").disabled = false;
   if (document.hidden || state.loginBusy) return;
   if (!state.snapshot) $("login-error").textContent = "";
   if (state.terminalVisible) {
-    terminalStatus("네트워크 연결이 돌아왔습니다. 다시 연결을 눌러 주세요.");
+    terminalStatus("네트워크 연결이 돌아왔습니다. 다시 연결하고 있습니다…");
+    state.terminalRetry = 0;
+    startTerminalReader();
     return;
   }
-  notice("연결이 돌아왔습니다. 작업 상태를 확인하고 있습니다…");
   const initialAuthentication = !state.authenticated;
   const authEpoch = state.authEpoch;
   poll(false).then(() => {
@@ -3194,10 +7286,27 @@ function warnDraftUnload(event) {
 
 window.addEventListener("DOMContentLoaded", () => {
   navigateView("list", true);
+  window.SessionholicLabels?.init?.({ api, sourceOf, getAuthEpoch: () => state.authEpoch,
+    canEdit: (session) => state.authenticated && !botRequestForNative(sourceOf(session)),
+    openDialog: (dialog) => sheet(dialog.id).open(), toast,
+    onChanged: () => {
+      const selected = selectedSession();
+      if (selected && state.detailFor === selected.key) {
+        state.detailRevision = detailRevision(selected);
+        patchDetailMetadata(selected);
+      }
+      render();
+    } });
+  window.SessionholicPush?.init?.({ api, toast });
+  window.SessionholicGoals?.init?.({ api, sessions: allSessions, openSession: select,
+    startWork: openNewSession, manageSession,
+    hideSession: () => setDetailShown(false), getSheet: sheet,
+    onChanged: render,
+    onSearch: (query) => { state.search = query.trim(); $("search").value = query; render(); } });
   document.addEventListener("pointerdown", closeChatToolsOutside);
-  document.addEventListener("keydown", closeChatToolsEscape);
+  document.addEventListener("keydown", documentKeydown);
   window.addEventListener("popstate", (event) => {
-    const view = event.state?.sessionholic ? event.state.view : "list";
+    const view = event.state?.[INSTANCE.historyKey] ? event.state.view : "list";
     if (!state.authenticated) {
       navigateView("list", true);
       return;
@@ -3207,20 +7316,76 @@ window.addEventListener("DOMContentLoaded", () => {
         openTerminal(state.terminal, { recordHistory: false });
       return;
     }
-    if (state.terminalVisible) returnToBoard();
-    document.body.classList.toggle(
-      "show-detail",
-      view === "detail" && !!state.selected,
-    );
-    if (view === "detail") focusDetailBack();
-    else restoreSelectedCardFocus();
+    // A browser that already animated its own back swipe gets no second slide.
+    const animate = !event.hasUAVisualTransition;
+    const fromTerminal = state.terminalVisible;
+    // Forward again to a notification's conversation shows it, not the terminal's launch.
+    if (fromTerminal) returnToBoard({ animate, selectLaunchedSource: !event.state?.notice });
+    if (window.SessionholicGoals?.handleHistory?.(event)) return;
+    const detail = view === "detail" && !!(state.selected || state.selectedBotRequest);
     stopChatPolling();
+    setDetailShown(detail, { direction: animate && !fromTerminal ? (detail ? "push" : "pop") : null, focus: true });
     const selected = selectedSession();
     if (selected && chatVisible()) loadChatState(selected, true);
   });
+  $("settings").addEventListener("click", openSettings);
+  $("settings-close").addEventListener("click", closeSettings);
+  $("settings-done").addEventListener("click", closeSettings);
+  $("settings-dialog").addEventListener("cancel", (event) => {
+    event.preventDefault();
+    closeSettings();
+  });
+  for (const value of THEMES)
+    $(`theme-${value}`).addEventListener("change", (event) => {
+      if (event?.target?.checked !== false) setTheme(value);
+    });
+  for (const value of TEXT_SIZES)
+    $(`text-size-${value}`).addEventListener("change", (event) => {
+      if (event?.target?.checked !== false) setTextSize(value);
+    });
+  $("settings-lock").addEventListener("click", () => {
+    closeSettings();
+    lock();
+  });
+  applyTheme();
+  applyTextSize();
+  // List chips and their sheets.
+  $("usage").addEventListener("click", openUsage);
+  $("usage-close").addEventListener("click", () => closeSheet("usage-dialog", "usage"));
+  $("filter-open").addEventListener("click", () => sheet("filter-dialog").open());
+  $("filter-close").addEventListener("click", () => closeSheet("filter-dialog", "filter-open"));
+  $("filter-done").addEventListener("click", () => closeSheet("filter-dialog", "filter-open"));
+  $("filter-reset").addEventListener("click", resetFilters);
+  for (const category of Object.keys(SESSION_CATEGORIES))
+    $(`session-category-${category}`).addEventListener("click", () => setSessionCategory(category));
+  $("session-categories").addEventListener("keydown", sessionCategoryKeydown);
+  $("session-category-search-action").addEventListener("click", (event) => setSessionCategory(event.currentTarget.dataset.category));
+  $("running-terminals").addEventListener("click", () => {
+    renderTerminals();
+    sheet("terminals-dialog").open();
+  });
+  $("terminals-close").addEventListener("click", () => closeSheet("terminals-dialog", "running-terminals"));
+  $("new-session").addEventListener("click", () => openNewSession());
+  $("new-session-close").addEventListener("click", () => closeNewSession());
+  $("action-close").addEventListener("click", () => closeActionSheet());
+  for (const [id, close] of [["usage-dialog", () => closeSheet("usage-dialog", "usage")],
+    ["filter-dialog", () => closeSheet("filter-dialog", "filter-open")],
+    ["terminals-dialog", () => closeSheet("terminals-dialog", "running-terminals")],
+    ["new-session-dialog", () => closeNewSession()],
+    ["action-sheet", () => closeActionSheet()]])
+    $(id).addEventListener("cancel", (event) => {
+      event.preventDefault();
+      close();
+    });
+  $("nav-title").addEventListener("click", scrollListToTop);
+  $("connection-notice").addEventListener("click", () => {
+    // Floating on phones; a tap acknowledges it.
+    if (phoneLayout()) notice();
+  });
+  bindCardGestures($("groups"));
   try {
-    for (const key of ["sessionholic:selected", "sessionholic:filters", "sessionholic:showOld"])
-      localStorage.removeItem(key);
+    for (const key of ["selected", "filters", "showOld"])
+      localStorage.removeItem(INSTANCE.storagePrefix + key);
   } catch {
     /* remove legacy session metadata where available */
   }
@@ -3263,24 +7428,21 @@ window.addEventListener("DOMContentLoaded", () => {
   });
   $("search").addEventListener("input", (event) => {
     state.search = event.target.value.trim();
+    window.SessionholicGoals?.setQuery?.(state.search);
     render();
   });
   $("show-old").addEventListener("change", (event) => {
     state.showOld = event.target.checked;
     render();
   });
-  $("home").addEventListener("click", backToList);
+  $("home").addEventListener("click", () => {
+    rememberConversationView();
+    if (window.SessionholicGoals) window.SessionholicGoals.openTab("sessions", { clearSelection: true });
+    else backToList();
+  });
   $("refresh").addEventListener("click", manualRefresh);
   $("running-refresh").addEventListener("click", () => refreshTerminals());
   $("logout").addEventListener("click", lock);
-  $("chat-queue-close").addEventListener("click", () => closeChatQueue());
-  $("chat-queue-dismiss").addEventListener("click", () => closeChatQueue());
-  $("chat-queue-dialog").addEventListener("cancel", (event) => { event.preventDefault(); closeChatQueue(); });
-  $("chat-queue-dialog").addEventListener("click", (event) => {
-    if (event.target !== $("chat-queue-dialog")) return;
-    const rect = event.target.getBoundingClientRect?.();
-    if (rect && (event.clientX < rect.left || event.clientX > rect.right || event.clientY < rect.top || event.clientY > rect.bottom)) closeChatQueue();
-  });
   $("plan-close").addEventListener("click", closePlan);
   $("plan-cancel").addEventListener("click", closePlan);
   $("plan-launch").addEventListener("click", launchPlan);
@@ -3306,9 +7468,11 @@ window.addEventListener("DOMContentLoaded", () => {
     state.lastSize = "";
     startTerminalReader();
   });
-  $("terminal-bottom").addEventListener("click", () =>
-    state.term?.scrollToBottom(),
-  );
+  $("terminal-bottom").addEventListener("click", terminalScrollEnd);
+  $("terminal-live").addEventListener("click", terminalScrollEnd);
+  bindPullToRefresh($("app"));
+  $("task-list-pane").addEventListener("scroll", (event) => listScroll(event.currentTarget || $("task-list-pane")), { passive: true });
+  bindTerminalTouchScroll($("terminal-viewport"));
   $("terminal-copy").addEventListener("click", async () => {
     const text = state.term?.getSelection();
     if (!text) {
@@ -3325,42 +7489,46 @@ window.addEventListener("DOMContentLoaded", () => {
   const keys = {
     escape: "\x1b",
     tab: "\t",
+    backtab: "\x1b[Z",
     up: "\x1b[A",
     down: "\x1b[B",
     left: "\x1b[D",
     right: "\x1b[C",
     interrupt: "\x03",
+    "ctrl-j": "\n",
+    "ctrl-u": "\x15",
+    "ctrl-x": "\x18",
+    "ctrl-l": "\x0c",
     enter: "\r",
   };
   for (const node of $("terminal-keys").querySelectorAll("button")) {
     node.addEventListener("pointerdown", (event) => event.preventDefault());
     node.addEventListener("click", () => {
       if (state.composing || state.draftPaste) return;
+      state.terminalScrollLines = 0;
+      renderTerminalScroll();
       sendInput(keys[node.dataset.key]).catch(() => {});
     });
   }
   $("draft-paste").addEventListener("pointerdown", prepareDraftPaste);
-  $("draft-paste").addEventListener("click", pasteDraft);
+  $("draft-paste").addEventListener("click", () => pasteDraft(true));
+  $("draft-type").addEventListener("pointerdown", prepareDraftPaste);
+  $("draft-type").addEventListener("click", () => pasteDraft(false));
   bindDraftInput($("terminal-draft"));
-  $("draft-panel").addEventListener("toggle", () =>
-    requestAnimationFrame(fitTerminal),
-  );
   for (const [id, delta] of [
     ["terminal-font-down", -1],
     ["terminal-font-up", 1],
   ])
-    $(id).addEventListener("click", () => {
-      state.fontSize = Math.max(10, Math.min(24, state.fontSize + delta));
-      prefs.set("fontSize", state.fontSize);
-      if (state.term) {
-        state.term.options.fontSize = state.fontSize;
-        fitTerminal();
-      }
-    });
+    $(id).addEventListener("click", () => setTerminalFontSize(state.fontSize + delta));
   document.addEventListener("visibilitychange", () => {
     clearTimeout(state.pollTimer);
     stopChatPolling();
+    // The working time stops counting while the page is hidden and catches up when shown.
+    if (document.hidden) stopWorkingClock();
+    else tickWorking();
     if (document.hidden) {
+      // Live updates stop with the page; a visible page reconnects after its read.
+      closeEvents();
       if (state.terminalVisible) {
         saveDraft();
         stopTerminalReader();
@@ -3377,6 +7545,7 @@ window.addEventListener("DOMContentLoaded", () => {
   });
   window.addEventListener("offline", () => {
     state.offline = true;
+    closeEvents();
     showOfflineStart();
     stopChatPolling();
     const selected = selectedSession();
@@ -3390,12 +7559,16 @@ window.addEventListener("DOMContentLoaded", () => {
       );
     } else {
       clearTimeout(state.pollTimer);
-      notice(
-        "오프라인입니다. 작업 상태를 확인하려면 연결 후 새로고침해 주세요.",
-      );
     }
+    renderConnectivity();
   });
   window.addEventListener("online", recoverConnection);
+  $("terminal-direct-input").checked = directTerminalInput();
+  $("terminal-direct-input").addEventListener("change", (event) => {
+    state.directTerminalInput = event.target.checked;
+    prefs.set("directTerminalInput", state.directTerminalInput);
+    configureTerminalKeyboard();
+  });
   $("terminal-accessibility").checked = state.screenReaderMode;
   $("terminal-accessibility").addEventListener("change", (event) => {
     state.screenReaderMode = event.target.checked;
@@ -3404,10 +7577,19 @@ window.addEventListener("DOMContentLoaded", () => {
   });
   window.addEventListener("resize", updateViewport);
   window.addEventListener("beforeunload", warnDraftUnload);
+  // Dialog sheets: drag handle, detents and outside taps (BottomSheet).
+  for (const id of Object.keys(SHEETS)) sheet(id);
   window.visualViewport?.addEventListener("resize", updateViewport);
   updateViewport();
-  if ("serviceWorker" in navigator)
+  if ("serviceWorker" in navigator) {
     navigator.serviceWorker.register("/sw.js").catch(() => {});
+    navigator.serviceWorker.addEventListener?.("message", (event) => {
+      if (event.data?.type === "open-session") requestSessionOpen(event.data.url);
+    });
+  }
+  // Opened from a notification: remember the session, then drop it from the address.
+  if (globalThis.location?.search && requestSessionOpen(globalThis.location.href))
+    window.history.replaceState(window.history.state, "", "/");
   if (networkOffline()) {
     showOfflineStart();
   } else {

@@ -6,21 +6,27 @@
       name="viewport"
       content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content"
     />
-    <meta name="color-scheme" content="light" />
-    <meta name="theme-color" content="#f2f2f7" />
+    <meta name="color-scheme" content="light dark" />
+    <meta name="theme-color" content="#f2f2f7" media="(prefers-color-scheme: light)" />
+    <meta name="theme-color" content="#000000" media="(prefers-color-scheme: dark)" />
     <meta name="apple-mobile-web-app-capable" content="yes" />
     <meta name="apple-mobile-web-app-title" content="세션홀릭" />
     <title>세션홀릭 - 에이전트 세션 매니저</title>
     <meta name="application-name" content="Sessionholic" />
     <meta name="description" content="Claude Code·Codex의 세션과 대화를 한곳에서 확인하고 이어가는 에이전트 세션 매니저" />
+    <!-- Filled by the server with {"/path": "<sha8>"} for versioned static URLs. -->
+    <meta name="sessionholic-assets" content="{}" />
+    <meta name="sessionholic-instance" content="{}" />
     <link rel="manifest" href="/manifest.webmanifest" />
     <link rel="icon" href="/icon.svg" type="image/svg+xml" />
     <link rel="apple-touch-icon" href="/icon-192.png" />
-    <link rel="stylesheet" href="/vendor/xterm.css" />
+    <!-- Applies the stored theme and text size before the first paint. -->
+    <script src="/theme-init.js"></script>
     <link rel="stylesheet" href="/style.css" />
-    <script src="/vendor/xterm.js" defer></script>
-    <script src="/vendor/addon-fit.js" defer></script>
+    <!-- The terminal library (vendor/xterm.*, addon-fit) loads on first terminal open. -->
     <script src="/message-format.js" defer></script>
+    <script src="/session_labels.js" defer></script>
+    <script src="/push.js" defer></script>
     <script src="/app.js" defer></script>
   </head>
   <body>
@@ -48,14 +54,19 @@
       </form>
     </div>
     <div id="app" class="app" hidden>
+      <div id="pull-refresh" class="pull-refresh" aria-hidden="true">
+        <span class="pull-refresh-icon">↓</span><span id="pull-refresh-label">당겨서 새로고침</span>
+      </div>
       <header class="top">
         <button
           id="home"
           class="wordmark home-button"
-          aria-label="작업 목록으로"
+          aria-label="세션 목록으로"
         >
-          <span class="brand-icon" aria-hidden="true">↗</span> 세션홀릭
+          <span class="brand-icon" aria-hidden="true">↗</span><span class="home-label">세션홀릭</span>
         </button>
+        <!-- Phones: the small title that replaces the large one once it scrolls away. -->
+        <button id="nav-title" class="nav-title" type="button" aria-label="세션 목록 맨 위로">세션</button>
         <div id="hosts" class="hosts" aria-label="기기 연결 상태"></div>
         <button
           id="refresh"
@@ -64,7 +75,43 @@
           title="작업 새로고침"
           aria-label="작업 새로고침"
         >
-          ↻
+          <svg aria-hidden="true" viewBox="0 0 22 22" width="22" height="22">
+            <path
+              d="M17.6 8.2A7 7 0 1 0 18 13"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="1.8"
+              stroke-linecap="round"
+            />
+            <path
+              d="M18.2 3.6v4.8h-4.8"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="1.8"
+              stroke-linecap="round"
+              stroke-linejoin="round"
+            />
+          </svg>
+        </button>
+        <button
+          id="settings"
+          class="icon-button"
+          type="button"
+          title="화면 설정"
+          aria-label="화면 설정"
+          aria-haspopup="dialog"
+        >
+          <svg aria-hidden="true" viewBox="0 0 22 22" width="22" height="22">
+            <path
+              d="M3.5 6.5h9M16.5 6.5h2M3.5 15.5h2M9.5 15.5h9"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="1.8"
+              stroke-linecap="round"
+            />
+            <circle cx="14.5" cy="6.5" r="2.2" fill="none" stroke="currentColor" stroke-width="1.8" />
+            <circle cx="7.5" cy="15.5" r="2.2" fill="none" stroke="currentColor" stroke-width="1.8" />
+          </svg>
         </button>
         <button id="logout" class="quiet" type="button">잠그기</button>
       </header>
@@ -74,18 +121,44 @@
         role="status"
         hidden
       ></div>
-      <div id="terminal-return" class="terminal-return" hidden>
-        <span class="terminal-return-icon" aria-hidden="true">›_</span
-        ><span id="terminal-return-label"></span
-        ><button id="return-terminal" type="button">터미널로 돌아가기</button>
-      </div>
-      <div class="layout">
-        <aside id="task-list-pane" class="list-pane" aria-label="작업 목록">
+      <div id="session-layout" class="layout">
+        <aside id="task-list-pane" class="list-pane" aria-label="세션 목록">
           <div class="list-heading">
-            <h1>작업</h1>
+            <h1>세션</h1>
             <span id="session-count" class="session-count"></span>
           </div>
-          <div id="counts" class="counts" aria-live="polite"></div>
+          <div id="session-categories" class="session-categories" role="tablist" aria-label="세션 분류">
+            <button id="session-category-general" type="button" role="tab" aria-selected="true" aria-controls="groups"><span>일반 세션</span><span id="session-category-general-count" class="session-category-count">0</span></button>
+            <button id="session-category-agent" type="button" role="tab" aria-selected="false" aria-controls="groups" tabindex="-1"><span>에이전트 세션</span><span id="session-category-agent-count" class="session-category-count">0</span></button>
+            <button id="session-category-bot" type="button" role="tab" aria-selected="false" aria-controls="groups" tabindex="-1"><span>봇 요청</span><span id="session-category-bot-count" class="session-category-count">-</span></button>
+          </div>
+          <p id="session-category-note" class="session-category-note">출처 미확인 세션 포함</p>
+          <p id="list-freshness" class="list-freshness" role="status" hidden></p>
+          <div class="list-chips">
+            <div id="counts" class="counts" role="group" aria-label="상태로 거르기"></div>
+            <button
+              id="new-session"
+              class="list-chip new-session-chip"
+              type="button"
+              aria-haspopup="dialog"
+              hidden
+            ><span class="new-session-chip-icon" aria-hidden="true">+</span><span>새 세션</span></button>
+            <button
+              id="running-terminals"
+              class="list-chip terminals-chip"
+              type="button"
+              aria-haspopup="dialog"
+              hidden
+            ><span class="terminals-chip-icon" aria-hidden="true">›_</span><span class="terminals-chip-label">터미널</span
+            ><span id="running-count" class="terminals-chip-count"></span></button>
+            <button
+              id="usage"
+              class="list-chip usage-chip"
+              type="button"
+              aria-haspopup="dialog"
+              hidden
+            ><span id="usage-summary" class="usage-summary"></span></button>
+          </div>
           <div class="filters">
             <label class="search-wrap"
               ><svg
@@ -111,48 +184,59 @@
               ><input
                 id="search"
                 type="search"
-                placeholder="작업·프로젝트·폴더·계정 검색"
-                aria-label="작업·프로젝트·작업 폴더 검색"
+                placeholder="세션·프로젝트 검색"
+                aria-label="세션·프로젝트·기기 검색"
                 autocomplete="off"
             /></label>
-            <details class="filter-details">
-              <summary>필터 <span id="filter-count"></span></summary>
-              <div id="filter-fields" class="filter-fields"></div>
-              <label class="toggle"
-                ><input id="show-old" type="checkbox" /> 3일 지난 대화도
-                보기</label
-              >
-            </details>
-          </div>
-          <details id="running-terminals" class="running-terminals" open hidden>
-            <summary>
-              열린 터미널 <span id="running-count"></span>
-            </summary>
-            <div id="running-list"></div>
-          </details>
-          <div class="running-status">
-            <p id="running-error" class="running-error" role="status" hidden></p>
             <button
-              id="running-refresh"
-              class="running-refresh"
+              id="filter-open"
+              class="filter-button"
               type="button"
-              aria-label="열린 터미널 목록 다시 확인"
-              hidden
-            >다시 확인</button>
+              aria-haspopup="dialog"
+              aria-label="필터"
+              title="필터"
+            >
+              <svg aria-hidden="true" viewBox="0 0 20 20" width="20" height="20">
+                <path
+                  d="M3.5 5.5h13M6 10h8M8.5 14.5h3"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="1.8"
+                  stroke-linecap="round"
+                />
+              </svg>
+              <span id="filter-count" class="filter-count"></span>
+            </button>
           </div>
-          <div id="groups" class="groups">
-            <p class="empty-list">작업을 확인하고 있습니다…</p>
+          <div id="session-category-search" class="session-category-search" hidden><button id="session-category-search-action" type="button"></button></div>
+          <div id="groups" class="groups" role="tabpanel" aria-labelledby="session-category-general" aria-busy="true">
+            <div class="skeleton-list" aria-hidden="true">
+              <div class="skeleton-card"><span></span><span></span><span></span></div>
+              <div class="skeleton-card"><span></span><span></span><span></span></div>
+              <div class="skeleton-card"><span></span><span></span><span></span></div>
+              <div class="skeleton-card"><span></span><span></span><span></span></div>
+            </div>
+            <p class="sr-only" role="status">세션을 확인하고 있습니다…</p>
           </div>
           <p class="list-footnote">메시지는 여기서, 자세한 작업은 터미널에서.</p>
+          <!-- Floats at the bottom of the list while a board terminal stays open. -->
+          <div id="terminal-return" class="terminal-return" hidden>
+            <span class="terminal-return-icon" aria-hidden="true">›_</span
+            ><span id="terminal-return-label" class="terminal-return-label"></span
+            ><button id="return-terminal" type="button">돌아가기</button>
+          </div>
         </aside>
-        <main id="detail" class="detail-pane" aria-label="작업 상세">
+        <main id="detail" class="detail-pane" aria-label="세션 대화">
           <div class="welcome">
             <span class="welcome-mark">↗</span>
             <h2>맥락부터 확인하세요.</h2>
-            <p>작업을 고르면 최근 대화를 볼 수 있습니다.<br />이어서 사용할 에이전트와 계정도 여기서 선택하세요.</p>
+            <p>세션을 고르면 최근 대화를 볼 수 있습니다.<br />이어서 사용할 에이전트와 계정도 여기서 선택하세요.</p>
           </div>
         </main>
       </div>
+    </div>
+    <div id="offline-banner" class="offline-banner" role="status" hidden>
+      <span class="offline-dot" aria-hidden="true"></span><span id="offline-text"></span>
     </div>
     <section
       id="terminal-screen"
@@ -206,8 +290,12 @@
           >A+</button>
           </div>
           <label class="terminal-accessibility-label">
-            <input id="terminal-accessibility" type="checkbox" />
-            스크린리더 지원
+            <span>터미널 화면에서 바로 키보드 입력</span>
+            <input id="terminal-direct-input" class="switch" type="checkbox" role="switch" />
+          </label>
+          <label class="terminal-accessibility-label">
+            <span>스크린리더 지원</span>
+            <input id="terminal-accessibility" class="switch" type="checkbox" role="switch" />
           </label>
           </div>
         </details>
@@ -215,7 +303,12 @@
       <p id="terminal-context" class="terminal-context"></p>
       <div id="terminal-error" class="terminal-error" role="alert" hidden></div>
       <div id="terminal-viewport" class="terminal-viewport" role="region" aria-label="터미널 출력과 입력"></div>
-      <div class="terminal-tools">
+      <button id="terminal-live" class="terminal-live" type="button" hidden>실시간으로 ↓</button>
+      <div id="terminal-tools" class="terminal-tools">
+        <div id="terminal-menu" class="terminal-menu" role="group" hidden>
+          <p id="terminal-menu-title" class="terminal-menu-title"></p>
+          <div id="terminal-menu-options" class="terminal-menu-options"></div>
+        </div>
         <div
           id="terminal-keys"
           class="terminal-keys"
@@ -224,43 +317,38 @@
         >
           <button type="button" data-key="escape">Esc</button
           ><button type="button" data-key="tab">Tab</button
-          ><button type="button" data-key="up" aria-label="위 방향키">↑</button
-          ><button type="button" data-key="down" aria-label="아래 방향키">
-            ↓</button
-          ><button type="button" data-key="left" aria-label="왼쪽 방향키">
-            ←</button
-          ><button type="button" data-key="right" aria-label="오른쪽 방향키">
-            →</button
+          ><button type="button" data-key="backtab" aria-label="Shift+Tab">⇧Tab</button
           ><button type="button" data-key="interrupt" aria-label="Ctrl+C 중단">^C</button
-          ><button type="button" data-key="enter" class="enter-key">
-            Enter
-          </button>
+          ><button type="button" data-key="ctrl-j" aria-label="Ctrl+J 줄바꿈">^J</button
+          ><button type="button" data-key="ctrl-u" aria-label="Ctrl+U 줄 지우기">^U</button
+          ><button type="button" data-key="ctrl-x" aria-label="Ctrl+X">^X</button
+          ><button type="button" data-key="ctrl-l" aria-label="Ctrl+L 화면 다시 그리기">^L</button
+          ><button type="button" data-key="up" class="arrow-key" aria-label="위 방향키">↑</button
+          ><button type="button" data-key="left" class="arrow-key" aria-label="왼쪽 방향키">←</button
+          ><button type="button" data-key="down" class="arrow-key" aria-label="아래 방향키">↓</button
+          ><button type="button" data-key="right" class="arrow-key" aria-label="오른쪽 방향키">→</button
+          ><button type="button" data-key="enter" class="enter-key">Enter</button>
         </div>
-        <details id="draft-panel" class="draft-panel">
-          <summary>
-            긴 글·한글 입력 <span>초안을 쓰고 터미널에 붙여넣기</span>
-          </summary>
-          <div class="draft-body">
-            <label for="terminal-draft" class="sr-only"
-              >터미널에 붙여넣을 초안</label
-            ><textarea
+        <div id="draft-panel" class="draft-panel">
+          <label for="terminal-draft" class="sr-only">터미널에 보낼 입력</label>
+          <div class="draft-row">
+            <textarea
               id="terminal-draft"
-              rows="3"
+              rows="1"
               maxlength="32000"
-              placeholder="붙여넣은 뒤 Enter를 따로 눌러야 실행됩니다."
+              placeholder="입력 후 보내기 · 한글·음성 입력 가능"
               autocapitalize="off"
               spellcheck="false"
-            ></textarea>
-            <div class="draft-actions">
-              <span id="draft-note" role="status"
-                >초안은 이 화면에만 임시로 보관됩니다.</span
-              ><button id="draft-paste" type="button">터미널에 붙여넣기</button>
-            </div>
+            ></textarea
+            ><button id="draft-type" class="draft-type" type="button" aria-label="Enter 없이 입력만">입력</button
+            ><button id="draft-paste" class="draft-send" type="button" aria-label="입력하고 Enter">보내기</button>
           </div>
-        </details>
+          <p id="draft-note" class="draft-note" role="status"></p>
+        </div>
       </div>
     </section>
-    <dialog id="plan-dialog" class="plan-dialog" aria-labelledby="plan-title">
+    <dialog id="plan-dialog" class="plan-dialog sheet" aria-labelledby="plan-title">
+      <div class="sheet-handle" aria-hidden="true"></div>
       <div class="dialog-top">
         <p class="eyebrow">이어서 하기</p>
         <button
@@ -287,10 +375,11 @@
     </dialog>
     <dialog
       id="close-terminal-dialog"
-      class="plan-dialog close-dialog"
+      class="plan-dialog close-dialog sheet"
       aria-labelledby="close-terminal-title"
       aria-describedby="close-terminal-description"
     >
+      <div class="sheet-handle" aria-hidden="true"></div>
       <div class="dialog-top">
         <p class="eyebrow">열린 터미널</p>
         <button
@@ -322,21 +411,136 @@
         </button>
       </div>
     </dialog>
-    <dialog id="chat-queue-dialog" class="plan-dialog chat-queue-dialog" aria-labelledby="chat-queue-title" aria-describedby="chat-queue-description">
+    <dialog id="settings-dialog" class="plan-dialog sheet" aria-labelledby="settings-title">
+      <div class="sheet-handle" aria-hidden="true"></div>
       <div class="dialog-top">
-        <p class="eyebrow">보낸 메시지</p>
-        <button id="chat-queue-close" class="icon-button" type="button" aria-label="예약 내용 닫기" autofocus>×</button>
+        <p class="eyebrow">설정</p>
+        <button
+          id="settings-close"
+          class="icon-button"
+          type="button"
+          aria-label="설정 닫기"
+        >×</button>
       </div>
-      <h2 id="chat-queue-title">예약 내용</h2>
+      <h2 id="settings-title">화면</h2>
       <div class="dialog-body">
-        <p id="chat-queue-description" class="plan-preserve">본문과 첨부, 마지막으로 확인한 상태를 볼 수 있습니다.</p>
-        <div id="chat-queue-list" class="chat-queue-list"></div>
-        <p id="chat-queue-note" class="queued-message-note"></p>
+        <p id="theme-label" class="theme-label">화면 모드</p>
+        <div class="theme-picker" role="radiogroup" aria-labelledby="theme-label">
+          <label class="theme-option"
+            ><input id="theme-auto" type="radio" name="theme" value="auto" />자동</label
+          ><label class="theme-option"
+            ><input id="theme-light" type="radio" name="theme" value="light" />라이트</label
+          ><label class="theme-option"
+            ><input id="theme-dark" type="radio" name="theme" value="dark" />다크</label
+          >
+        </div>
+        <p class="plan-preserve">
+          자동은 기기의 화면 모드를 따릅니다. 터미널은 항상 어두운 화면으로
+          보입니다.
+        </p>
+        <p id="text-size-label" class="theme-label settings-section">글자 크기</p>
+        <div class="theme-picker" role="radiogroup" aria-labelledby="text-size-label">
+          <label class="theme-option text-size-option"
+            ><input id="text-size-small" type="radio" name="text-size" value="small" /><span class="text-size-sample small" aria-hidden="true">가</span>작게</label
+          ><label class="theme-option text-size-option"
+            ><input id="text-size-default" type="radio" name="text-size" value="default" /><span class="text-size-sample" aria-hidden="true">가</span>기본</label
+          ><label class="theme-option text-size-option"
+            ><input id="text-size-large" type="radio" name="text-size" value="large" /><span class="text-size-sample large" aria-hidden="true">가</span>크게</label
+          >
+        </div>
+        <p class="plan-preserve">
+          보드의 글자 크기입니다. 터미널 글자 크기는 터미널 설정에서 따로
+          바꿉니다. 이 선택들은 이 브라우저에만 저장됩니다.
+        </p>
+        <p id="push-label" class="theme-label settings-section">알림</p>
+        <p id="push-status" class="plan-preserve" role="status" aria-live="polite"></p>
+        <div class="push-actions">
+          <button id="push-toggle" class="push-button" type="button" aria-describedby="push-status" hidden>알림 켜기</button>
+          <button id="push-test" class="push-button" type="button" hidden>테스트 알림</button>
+        </div>
+        <button id="settings-lock" class="settings-lock" type="button">보드 잠그기</button>
       </div>
       <div class="dialog-actions">
-        <button id="chat-queue-dismiss" class="secondary" type="button">닫기</button>
+        <button id="settings-done" class="primary" type="button">완료</button>
       </div>
     </dialog>
+    <dialog id="usage-dialog" class="plan-dialog sheet" aria-labelledby="usage-title">
+      <div class="sheet-handle" aria-hidden="true"></div>
+      <div class="dialog-top">
+        <p class="eyebrow">에이전트</p>
+        <button id="usage-close" class="icon-button" type="button" aria-label="사용량 닫기">×</button>
+      </div>
+      <h2 id="usage-title">남은 사용량</h2>
+      <div class="dialog-body">
+        <div id="usage-body" class="usage-body"></div>
+      </div>
+    </dialog>
+    <dialog id="filter-dialog" class="plan-dialog sheet" aria-labelledby="filter-title">
+      <div class="sheet-handle" aria-hidden="true"></div>
+      <div class="dialog-top">
+        <p class="eyebrow">세션 목록</p>
+        <button id="filter-close" class="icon-button" type="button" aria-label="필터 닫기">×</button>
+      </div>
+      <h2 id="filter-title">필터</h2>
+      <div class="dialog-body">
+        <div id="filter-fields" class="filter-fields"></div>
+        <label class="toggle"
+          ><span>3일 지난 대화도 보기</span
+          ><input id="show-old" class="switch" type="checkbox" role="switch"
+        /></label>
+      </div>
+      <div class="dialog-actions">
+        <button id="filter-reset" class="secondary" type="button">초기화</button
+        ><button id="filter-done" class="primary" type="button">완료</button>
+      </div>
+    </dialog>
+    <dialog id="terminals-dialog" class="plan-dialog sheet" aria-labelledby="terminals-title">
+      <div class="sheet-handle" aria-hidden="true"></div>
+      <div class="dialog-top">
+        <p class="eyebrow">이 보드에서 연 터미널</p>
+        <button id="terminals-close" class="icon-button" type="button" aria-label="열린 터미널 목록 닫기">×</button>
+      </div>
+      <h2 id="terminals-title">열린 터미널</h2>
+      <div class="dialog-body">
+        <div class="running-status">
+          <p id="running-error" class="running-error" role="status" hidden></p>
+          <button
+            id="running-refresh"
+            class="running-refresh"
+            type="button"
+            aria-label="열린 터미널 목록 다시 확인"
+            hidden
+          >다시 확인</button>
+        </div>
+        <div id="running-list" class="running-list"></div>
+      </div>
+    </dialog>
+    <dialog id="new-session-dialog" class="plan-dialog sheet" aria-labelledby="new-session-title">
+      <div class="sheet-handle" aria-hidden="true"></div>
+      <div class="dialog-top">
+        <p class="eyebrow">새 세션</p>
+        <button id="new-session-close" class="icon-button" type="button" aria-label="새 세션 닫기">×</button>
+      </div>
+      <h2 id="new-session-title">어느 기기에서 열까요?</h2>
+      <div class="dialog-body">
+        <p class="new-session-note">기기의 실행 명령을 터미널로 엽니다. 프로젝트·에이전트·계정은 터미널 메뉴에서 고릅니다.</p>
+        <div id="new-session-hosts" class="new-session-hosts"></div>
+        <p id="new-session-error" class="error" role="alert" hidden></p>
+      </div>
+    </dialog>
+    <dialog id="action-sheet" class="plan-dialog sheet action-sheet" aria-labelledby="action-title">
+      <div class="sheet-handle" aria-hidden="true"></div>
+      <div class="dialog-top">
+        <p id="action-eyebrow" class="eyebrow"></p>
+        <button id="action-close" class="icon-button" type="button" aria-label="메뉴 닫기">×</button>
+      </div>
+      <h2 id="action-title" class="action-title"></h2>
+      <div class="dialog-body">
+        <p id="action-preview" class="action-preview" hidden></p>
+        <div id="action-list" class="action-list" role="group" aria-labelledby="action-title"></div>
+      </div>
+    </dialog>
+    <div id="goal-undo" class="goal-undo" role="status" hidden><span id="goal-undo-label"></span><button id="goal-undo-action" type="button">실행 취소</button><button id="goal-undo-close" type="button" aria-label="실행 취소 안내 닫기">닫기</button></div>
     <div id="toast" class="toast" role="status" hidden></div>
   </body>
 </html>

@@ -47,6 +47,7 @@ function client(
     json: async () => ({ ok: true }),
   }),
   timers = { setTimeout, clearTimeout },
+  { instanceMeta } = {},
 ) {
   const nodes = new Map();
   const frames = [];
@@ -76,6 +77,11 @@ function client(
       return nodes.get(id);
     },
   };
+  // The server fills <meta name="sessionholic-instance">; app.js reads it once at load.
+  if (instanceMeta !== undefined) {
+    document.querySelector = (selector) => (selector === 'meta[name="sessionholic-instance"]'
+      ? { getAttribute: (name) => (name === 'content' ? instanceMeta : null) } : null);
+  }
   const context = vm.createContext({
     console,
     document,
@@ -120,7 +126,7 @@ function client(
   vm.runInContext(messageSource, context);
   vm.runInContext(source, context);
   const api = vm.runInContext(
-    "({state,api,sourceOf,accountOf,sendInput,pasteDraft,prepareDraftPaste,startDraftComposition,endDraftComposition,inputDraft,stopTerminalReader,startTerminalReader,closePlan,navigateView,backToList,backFromTerminal,closeTerminal,cancelTerminalClose,confirmTerminalClose,populateAccount,populateRoute,updateContinue,renderPlan,launchPlan,openTerminal,saveDraft,draftKey,refreshTerminals,renderTerminals,renderTerminalReturn,renderFilters,terminalCloseCopy,warnDraftUnload,preparePlan,renderGroups,renderMessages,loadDetail,chatKey,chatEntry,currentChat,chatSupported,chatAttachmentsSupported,buildChatComposer,sendChat,loadChatState,applyChatReceipt,uploadChatFiles,pasteChat,scheduleChatPoll,stopChatPolling,openNativeChat,allSessions,buildContinuePanel,chatReceiptCopy,returnToBoard,readChatClipboard,accountDisplay,sessionAccountLabel,closeChatToolsOutside,closeChatToolsEscape,drawDetail,refreshDetail,loadCapabilities,matches,recoverConnection,networkOffline,poll,select,focusDetailBack,restoreSelectedCardFocus,showLogin,lock,beginAuthEpoch,resizeChatInput,updateViewport,openChatQueue,closeChatQueue,chatQueueCount})",
+    "({state,api,sourceOf,accountOf,sendInput,pasteDraft,prepareDraftPaste,startDraftComposition,endDraftComposition,inputDraft,stopTerminalReader,startTerminalReader,closePlan,navigateView,backToList,backFromTerminal,closeTerminal,cancelTerminalClose,confirmTerminalClose,populateAccount,populateRoute,updateContinue,renderPlan,launchPlan,openTerminal,saveDraft,draftKey,refreshTerminals,renderTerminals,renderTerminalReturn,renderFilters,terminalCloseCopy,warnDraftUnload,preparePlan,renderGroups,renderMessages,loadDetail,chatKey,chatEntry,currentChat,chatSupported,chatRecovery,recoverChatSession,openChatTerminal,chatAttachmentsSupported,buildChatComposer,sendChat,loadChatState,applyChatReceipt,uploadChatFiles,pasteChat,scheduleChatPoll,stopChatPolling,openNativeChat,allSessions,buildContinuePanel,chatReceiptCopy,returnToBoard,readChatClipboard,accountDisplay,sessionAccountLabel,closeChatToolsOutside,closeChatToolsEscape,drawDetail,refreshDetail,loadCapabilities,matches,recoverConnection,networkOffline,poll,select,focusDetailBack,restoreSelectedCardFocus,showLogin,lock,beginAuthEpoch,resizeChatInput,updateViewport,draftKeydown,configureTerminalKeyboard,queueTerminalScroll,flushTerminalScroll,terminalScrollEnd,resetTerminalScroll,renderAttention,chatPollDelay,pullRefresh,readingScroll,renderJump,pullDistance,listScroll,setReading,renderPrompt,promptAction,renderUsage,loadUsage,applyTheme,setTheme,updateThemeColor,haptic,navTransition,setDetailShown,chatVisible,sheetRelease,BottomSheet,sheet,openSettings,closeSettings,setTyping,pinchFontSize,setTerminalFontSize,loadXterm,assetUrl,syncEvents,closeEvents,eventsHealthy,renderFreshness,schedule,touchDevice,togglePhaseFilter,renderCounts,createLongPress,swipeIntent,swipeRelease,groupMessageRows,setTextSize,applyTextSize,renderConnectivity,terminalForSession,swipeActionFor,openMessageMenu,openCardMenu,messageActions,outboxShape,outboxMatches,outboxOrigin,settleOutbox,retryOutbox,renderAttachmentTiles,attachmentThumb,sendUpload,openActionSheet,closeActionSheet,setListCollapsed,closeSwipe,settleSwipe,prepareSwipe,runSwipeAction,GESTURE,setChromeVisible,toggleChrome,revealChrome,isChromeTap,snapshotAnnounced,updateChatComposer,capabilitiesRevision,toolKindOf,userMessageParts,formatElapsed,tickWorking,renderTerminalMarks,renderDetailTerminal,terminalsAnnounced,goToSessionTerminal,rememberTerminal,terminalMenu,updateTerminalMenu,chooseTerminalMenu,clearTerminalMenu,renderNewSession,openNewSession,startNewSession,startAppServer,rememberConversationView,restoreConversationView,conversationIdentity,initiatorOf,initiatorLabel,documentKeydown,sessionCategoryOf,setSessionCategory,renderSessionCategories,prepareSessionListFor,sessionCategoryKeydown,render,resetFilters,terminalTitle,renameTerminals,requestedSessionFrom,requestSessionOpen,openRequestedSession,answerOnOpen})",
     context,
   );
   api.state.csrf = "csrf-test";
@@ -1065,8 +1071,9 @@ test("empty lists distinguish filtered results, offline hosts, and pending colle
   c.state.search = "없는 작업";
   c.state.filters.host = "homeserver";
   c.renderGroups([], Date.now());
-  assert.match(textOf(c.get("groups")), /조건에 맞는 작업/);
-  c.get("groups").children[0].children[1].events.click();
+  assert.match(textOf(c.get("groups")), /조건에 맞는 세션/);
+  assert.match(textOf(c.get("groups")), /‘없는 작업’ 검색.*필터.*3일 지난 대화/s);
+  byClass(c.get("groups"), "secondary")[0].events.click();
   assert.equal(c.state.search, "");
   assert.equal(c.state.filters.host, "");
   assert.equal(c.get("search").value, "");
@@ -1220,15 +1227,21 @@ test('Claude terminal fallback permits same-session attachment paths but blocks 
   assert.equal(c.chatAttachmentsSupported(entry), false);
 });
 
-test('selected native polling has a fixed request budget and stops while hidden or in terminal', () => {
+test('selected native polling backs off during long turns, stays bounded and stops while hidden or in terminal', () => {
   const timers = [];
   const c = client(undefined, { setTimeout: (callback, delay) => { timers.push({ callback, delay }); return timers.length; }, clearTimeout() {} });
   const { s, entry } = selectChat(c);
   entry.data.phase = 'working';
   c.scheduleChatPoll(s, entry);
   assert.equal(timers.at(-1).delay, 3000);
+  // A turn longer than two minutes is still followed, just less often.
+  for (const [count, delay] of [[10, 5000], [30, 10000], [90, 20000], [239, 20000]]) {
+    c.state.chatPollCount = count;
+    c.scheduleChatPoll(s, entry);
+    assert.equal(timers.at(-1).delay, delay);
+  }
   const count = timers.length;
-  c.state.chatPollCount = 40;
+  c.state.chatPollCount = 240;
   c.scheduleChatPoll(s, entry);
   assert.equal(timers.length, count);
   c.state.chatPollCount = 0;
@@ -1250,7 +1263,7 @@ test('accepted native receipts are read back until completion and interrupted pe
   assert.equal(requests[0].requestId, 'accepted-request-id');
   assert.equal(entry.receipt.status, 'completed');
   entry.text = '중단된 요청';
-  entry.pending = { requestId: 'interrupted-request-id', revision: entry.revision };
+  entry.pending = { requestId: 'interrupted-request-id', revision: entry.revision, text: entry.text, attachments: [] };
   c.applyChatReceipt(entry, { requestId: 'interrupted-request-id', status: 'interrupted' });
   assert.equal(entry.pending, null);
   assert.equal(entry.text, '');
@@ -1318,7 +1331,7 @@ test('a confirmed native turn failure clears its submitted draft while an unacce
   const { entry } = selectChat(c);
   entry.text = '이미 접수된 요청';
   entry.attachments = [{ id: 'attached-file' }];
-  entry.pending = { requestId: 'confirmed-failed-id', revision: entry.revision };
+  entry.pending = { requestId: 'confirmed-failed-id', revision: entry.revision, text: entry.text, attachments: ['attached-file'] };
   c.applyChatReceipt(entry, { requestId: 'confirmed-failed-id', status: 'failed', confirmed: true });
   assert.equal(entry.text, '');
   assert.equal(entry.attachments.length, 0);
@@ -1326,7 +1339,7 @@ test('a confirmed native turn failure clears its submitted draft while an unacce
   assert.match(c.chatReceiptCopy(entry.receipt), /처리 중 오류/);
   assert.doesNotMatch(c.chatReceiptCopy(entry.receipt), /접수하지 못/);
   entry.text = '미접수 요청';
-  entry.pending = { requestId: 'unaccepted-failed-id', revision: entry.revision };
+  entry.pending = { requestId: 'unaccepted-failed-id', revision: entry.revision, text: entry.text, attachments: [] };
   c.applyChatReceipt(entry, { requestId: 'unaccepted-failed-id', status: 'failed', confirmed: false });
   assert.equal(entry.text, '미접수 요청');
   assert.equal(entry.pending, null);
@@ -1376,6 +1389,9 @@ test('switching away and back resets chat IME ownership and ignores the detached
   newInput.events.keydown({ key: 'Enter', ctrlKey: true, isComposing: false, preventDefault() {} });
   assert.equal(requests.filter((r) => r.url === '/api/chat/send').length, 0);
   newInput.events.compositionend();
+  newInput.events.keydown({ key: 'Enter', metaKey: true, isComposing: false, preventDefault() {} });
+  assert.equal(requests.filter((r) => r.url === '/api/chat/send').length, 0, 'the IME commit Enter never sends');
+  entry.compositionEndedAt -= 100;
   newInput.events.keydown({ key: 'Enter', metaKey: true, isComposing: false, preventDefault() {} });
   await new Promise((resolve) => setImmediate(resolve));
   const sends = requests.filter((r) => r.url === '/api/chat/send');
@@ -1693,11 +1709,12 @@ function wireTree(c, root, parent = null) {
 
 test('same-session metadata changes preserve the active chat DOM, Korean composition, draft and transcript position', async () => {
   let message = '기존 대화';
+  let phase = 'idle';
   const requests = [];
   const c = client(async (url, options) => {
     requests.push(url);
     return { ok: true, status: 200, json: async () => url === '/api/chat/state'
-      ? { capability: { supported: true }, phase: 'idle', route: JSON.parse(options.body).source }
+      ? { capability: { supported: true }, phase, route: JSON.parse(options.body).source }
       : { messages: [{ role: 'assistant', text: message }] } };
   }, noChatTimers);
   const { s, entry } = selectChat(c);
@@ -1712,8 +1729,8 @@ test('same-session metadata changes preserve the active chat DOM, Korean composi
   c.context.document.activeElement = input;
   const messages = c.get('messages');
   messages.scrollHeight = 500; messages.clientHeight = 120; messages.scrollTop = 35;
-  message = '갱신된 대화';
-  const updated = { ...s, title: '갱신된 제목', project: '새 프로젝트', phase: 'working',
+  message = '갱신된 대화'; phase = 'working';
+  const updated ={ ...s, title: '갱신된 제목', project: '새 프로젝트', phase: 'working',
     account: '실험 환경 · 새 표시', stale: true, hostLabel: 'Workstation', updatedAt: s.updatedAt + 1 };
   c.state.snapshot.hosts[0].data.codex[0] = updated;
   c.refreshDetail(updated);
@@ -1725,7 +1742,7 @@ test('same-session metadata changes preserve the active chat DOM, Korean composi
   assert.equal(entry.composing, true);
   assert.equal(entry.text, '한글 입력 중인 초안');
   assert.equal(c.get('detail').querySelector('.detail-title').textContent, '갱신된 제목');
-  assert.equal(c.get('detail').querySelector('.eyebrow').textContent, '새 프로젝트');
+  assert.equal(c.get('detail').querySelector('.detail-project').textContent, '새 프로젝트');
   assert.match(textOf(c.get('detail').querySelector('.detail-meta')), /작업 중.*실험 환경/);
   assert.match(c.get('detail').querySelector('.stale-notice').textContent, /Workstation/);
   assert.equal(messages.scrollTop, 35);
@@ -1754,8 +1771,10 @@ test('capability refresh immediately updates account labels while preserving exa
   assert.deepEqual(Array.from(c.allSessions(), (row) => row.account), [personal.label, standard.label, personal.label]);
   assert.equal(c.state.filters.account, 'sample');
   assert.equal(c.state.accountFilterRoutes.size, 2);
-  assert.match(textOf(c.get('groups')), /실험 환경 · sample/);
-  assert.match(textOf(c.get('groups')), /공용 환경 · sample/);
+  // Cards show three short lines; the account stays in each card's accessible name.
+  const cardNames = () => byClass(c.get('groups'), 'card').map((card) => card.attributes['aria-label']).join(' ');
+  assert.match(cardNames(), /실험 환경 · sample/);
+  assert.match(cardNames(), /공용 환경 · sample/);
   assert.doesNotMatch(textOf(c.get('groups')), /원래 필터와 무관한 작업/);
   assert.equal(c.get('session-count').textContent, '2개');
   profiles = [personal, { ...standard, label: personal.label }, other];
@@ -1798,19 +1817,20 @@ test('unchanged and appended conversations retain selected nodes and expanded to
   const messages = [{ role: 'tool', text: '도구 본문' }, { role: 'assistant', text: '답변 본문', ts: 123 }];
   c.renderMessages(s, messages);
   const list = c.get('messages'); const tool = list.children[0]; const answer = list.children[1];
-  tool.children[0].open = true;
+  tool.toolToggle.events.click();
   list.contains = (node) => node === answer;
   c.context.window.getSelection = () => ({ isCollapsed: false, anchorNode: answer, focusNode: answer });
   list.scrollHeight = 500; list.clientHeight = 100; list.scrollTop = 395;
   c.renderMessages(s, messages);
   c.renderMessages(s, [...messages, { role: 'user', text: '새 답변' }]);
   assert.equal(list.children[0], tool); assert.equal(list.children[1], answer);
-  assert.equal(tool.children[0].open, true); assert.equal(list.scrollTop, 395);
+  assert.equal(tool.open, true); assert.equal(tool.toolList.hidden, false); assert.equal(list.scrollTop, 395);
   let copied;
   c.context.navigator = { clipboard: { writeText: async (text) => { copied = text; } } };
-  await answer.children.at(-1).events.click();
+  assert.equal(answer.moreButton.attributes['aria-label'], '메시지 메뉴');
+  assert.equal(byClass(answer, 'msg-copy').length, 0, 'no per-message copy button');
+  await menuAction(c, answer, '복사');
   assert.equal(copied, '답변 본문');
-  assert.equal(answer.children.at(-1).attributes['aria-label'], '메시지 본문 복사');
 });
 
 test('assistant replies render Markdown and copy readable body or exact code while user input stays literal', async () => {
@@ -1826,15 +1846,33 @@ test('assistant replies render Markdown and copy readable body or exact code whi
   assert.equal(flatten(user).some((n) => n.tagName === 'BLOCKQUOTE'), false);
   let copied;
   c.context.navigator = { clipboard: { writeText: async (text) => { copied = text; } } };
-  await answer.children.at(-1).events.click();
+  await menuAction(c, answer, '복사');
   assert.equal(copied, '요청\n\n첫 줄\n\n둘째 줄\n\nif a > b:\n    print("확인")\n');
-  rendered.find((n) => n.attributes['aria-label'] === '인용문 본문 복사').events.click();
-  assert.equal(copied, '첫 줄\n\n둘째 줄\n');
+  // Quotes copy with the message; only code keeps its own small icon.
+  assert.equal(rendered.some((n) => n.attributes['aria-label'] === '인용문 본문 복사'), false);
   rendered.find((n) => n.attributes['aria-label'] === '코드 블록 복사').events.click();
+  await settle();
   assert.equal(copied, 'if a > b:\n    print("확인")\n');
-  await user.children.at(-1).events.click();
+  copied = '';
+  await menuAction(c, answer, '코드 복사');
+  assert.equal(copied, 'if a > b:\n    print("확인")\n');
+  await menuAction(c, user, '복사');
   assert.equal(copied, raw);
+  assert.equal(menuLabels(c, user).includes('코드 복사'), false, 'user text is never parsed for code');
 });
+
+// Opens a message's menu with its button and runs one action by label.
+function menuLabels(c, row) {
+  row.moreButton.events.click();
+  return c.get('action-list').children.map((item) => item.textContent);
+}
+async function menuAction(c, row, label) {
+  row.moreButton.events.click();
+  const item = c.get('action-list').children.find((child) => child.textContent === label);
+  assert.ok(item, `menu item ${label}`);
+  item.events.click();
+  await settle();
+}
 
 test('a delayed previous-session state success or failure cannot cancel the current polling timer', async () => {
   for (const failed of [false, true]) {
@@ -1888,7 +1926,7 @@ test('offline drafts remain editable but send, uploads, clipboard reads and term
   assert.equal(c.get('chat-send').disabled, true); assert.match(c.get('chat-status').textContent, /오프라인.*초안/);
 });
 
-test('online recovery reads one selected state and snapshot without resending unknown work or reconnecting terminal input', async () => {
+test('online recovery reads one selected state and snapshot without resending unknown work or terminal input', async () => {
   const requests = [];
   let snapshot;
   const c = client(async (url, options) => {
@@ -1898,8 +1936,8 @@ test('online recovery reads one selected state and snapshot without resending un
   }, noChatTimers);
   const { s, entry } = selectChat(c); snapshot = c.state.snapshot;
   c.state.detailFor = s.key; c.state.detailUpdatedAt = s.updatedAt;
-  c.state.detailRevision = JSON.stringify([false, undefined, undefined, undefined, '현재 계정 설정', 'Workstation', undefined, null, null]);
-  c.state.capabilities = {}; c.state.capabilitiesRevision = JSON.stringify([['workstation', true, undefined]]);
+  c.state.detailRevision = vm.runInContext('detailRevision', c.context)(c.allSessions().find((item) => item.key === s.key));
+  c.state.capabilities = {}; c.state.capabilitiesRevision = c.capabilitiesRevision(c.state.snapshot);
   entry.pending = { requestId: 'unknown-request', revision: entry.revision }; entry.text = '전송 결과 모르는 초안';
   c.state.offline = true; c.context.navigator = { onLine: true };
   c.recoverConnection(); await new Promise((resolve) => setImmediate(resolve));
@@ -1909,9 +1947,107 @@ test('online recovery reads one selected state and snapshot without resending un
   assert.equal(JSON.parse(requests.find((r) => r.url === '/api/chat/state').options.body).requestId, 'unknown-request');
   assert.equal(entry.pending.requestId, 'unknown-request');
   c.state.terminalVisible = true; c.state.terminal = { id: 'visible-terminal' }; c.state.offline = true;
-  const before = requests.length; c.recoverConnection();
-  assert.equal(requests.length, before); assert.equal(c.state.connected, false);
+  const before = requests.length; c.recoverConnection(); await new Promise((resolve) => setImmediate(resolve));
+  // Output is re-read from its cursor; input is never replayed and stays locked until a valid read.
+  const after = requests.slice(before);
+  assert.ok(after.length >= 1);
+  assert.ok(after.every((r) => /\/api\/terminal\/visible-terminal\/events\?/.test(r.url) && (r.options?.method || 'GET') === 'GET'));
+  assert.equal(c.state.connected, false);
   assert.match(c.get('terminal-status').textContent, /다시 연결/);
+});
+
+test('the open conversation\'s own phase shows on its header, card and counts until the list\'s phase changes', async () => {
+  const requests = [];
+  const c = client(async (url, options) => {
+    requests.push(url);
+    return { ok: true, status: 200, json: async () => ({ route: JSON.parse(options.body).source, capability: { supported: true },
+      phase: 'idle', receipts: [], messages: [] }) };
+  }, noChatTimers);
+  const { s } = selectChat(c);
+  Object.assign(s, { phase: 'working', title: '목록이 늦은 작업', updatedAt: Date.now() / 1000 });
+  c.state.snapshot.hosts[0].data.codex[0] = s;
+  c.refreshDetail(c.allSessions()[0]);
+  wireTree(c, c.get('detail'));
+  assert.match(textOf(c.get('detail').querySelector('.detail-meta')), /작업 중/, 'the list says working');
+  await settle();
+  // The conversation's read (newer than the list) says the turn ended.
+  assert.equal(c.allSessions()[0].phase, 'idle');
+  assert.match(textOf(c.get('detail').querySelector('.detail-meta')), /열림/);
+  assert.equal(requests.filter((url) => url === '/api/chat/state').length, 1, 'shown without reading the conversation again');
+  // The list catches up, then moves on: its own phase stands again.
+  c.state.snapshot.hosts[0].data.codex[0] = { ...s, phase: 'idle' };
+  assert.equal(c.allSessions()[0].phase, 'idle');
+  assert.equal(c.state.livePhases.size, 0);
+  c.state.snapshot.hosts[0].data.codex[0] = { ...s, phase: 'needs_input' };
+  assert.equal(c.allSessions()[0].phase, 'needs_input');
+  // A quick turn may end where it began (a new question). While the conversation is open its
+  // next read decides, even if a list read finishes first (it may have begun before that read).
+  const host = c.state.snapshot.hosts[0];
+  host.fetchedAt = 1000;
+  c.state.livePhases.set(c.allSessions()[0].key, { phase: 'working', base: 'needs_input', fetchedAt: 1000 });
+  assert.equal(c.allSessions()[0].phase, 'working', 'the read stands while the list is no newer');
+  host.fetchedAt = 1060;
+  assert.equal(c.allSessions()[0].phase, 'working', 'the open conversation is read again soon');
+  // Left: no read follows, so the next list read stands though its phase looks unchanged.
+  c.state.selected = null;
+  assert.equal(c.allSessions()[0].phase, 'needs_input');
+  assert.equal(c.state.livePhases.size, 0);
+});
+
+test('a terminal list whose first read failed is read again by the next regular read', async () => {
+  const requests = []; let fail = true; let snapshot;
+  const c = client(async (url) => {
+    requests.push(url);
+    if (url === '/api/terminals') {
+      if (fail) return { ok: false, status: 502, json: async () => ({ error: '일시적인 오류' }) };
+      return { ok: true, status: 200, json: async () => ({ terminals: [], version: 3 }) };
+    }
+    return { ok: true, status: 200, json: async () => url === '/api/snapshot' ? snapshot : {} };
+  }, noChatTimers);
+  selectChat(c);
+  snapshot = c.state.snapshot;
+  c.state.capabilities = {}; c.state.capabilitiesRevision = c.capabilitiesRevision(snapshot);
+  await c.refreshTerminals();
+  assert.ok(c.state.terminalsError);
+  assert.equal(c.state.terminalsReadAt, 0);
+  fail = false;
+  await c.poll(); await settle();
+  assert.equal(requests.filter((url) => url === '/api/terminals').length, 2);
+  assert.equal(c.state.terminalsError, '');
+  assert.ok(c.state.terminalsReadAt > 0);
+  await c.poll(); await settle();
+  assert.equal(requests.filter((url) => url === '/api/terminals').length, 2, 'then once a minute as before');
+});
+
+test('a conversation that left the list stops being followed, and a phone goes back to the list instead of a screen without a way back', async () => {
+  const requests = [];
+  let snapshot;
+  const c = client(async (url, options) => {
+    requests.push(url);
+    return { ok: true, status: 200, json: async () => url === '/api/snapshot' ? snapshot : {} };
+  }, noChatTimers);
+  c.context.window.matchMedia = (query) => ({ matches: query === '(max-width: 700px)' });
+  const { s } = selectChat(c);
+  c.state.detailShown = true;
+  c.state.capabilities = {};
+  snapshot = { hosts: [{ name: 'workstation', label: 'Workstation', ok: true, data: { codex: [] } }] };
+  c.state.capabilitiesRevision = c.capabilitiesRevision(snapshot);
+  const run = c.state.chatPollRun;
+  await c.poll();
+  assert.equal(c.state.selected, null);
+  assert.ok(c.state.chatPollRun > run, 'its polling stopped');
+  assert.equal(c.state.detailShown, false, 'the phone shows the list again');
+  assert.match(c.get('toast').textContent, /더 이상 찾을 수 없어 목록으로/);
+  // A wide screen keeps the list beside it and says so in the detail pane.
+  const d = client(async (url) => ({ ok: true, status: 200, json: async () => url === '/api/snapshot' ? snapshot : {} }), noChatTimers);
+  selectChat(d);
+  d.state.detailShown = true;
+  d.state.capabilities = {};
+  d.state.capabilitiesRevision = d.capabilitiesRevision(snapshot);
+  await d.poll();
+  assert.equal(d.state.selected, null);
+  assert.match(textOf(d.get('detail')), /더 이상 찾을 수 없습니다/);
+  assert.ok(s);
 });
 
 test('a state read begun before sending cannot roll back new chat state and schedules one reconciliation read', async () => {
@@ -1995,8 +2131,8 @@ test('offline visibility and return-online events restart only bounded reads and
   await new Promise((resolve) => setImmediate(resolve));
   const { s, entry } = selectChat(c);
   c.state.detailFor = s.key; c.state.detailUpdatedAt = s.updatedAt;
-  c.state.detailRevision = JSON.stringify([false, undefined, undefined, undefined, '현재 계정 설정', 'Workstation', undefined, null, null]);
-  c.state.capabilities = {}; c.state.capabilitiesRevision = JSON.stringify([['workstation', true, undefined]]);
+  c.state.detailRevision = vm.runInContext('detailRevision', c.context)(c.allSessions().find((item) => item.key === s.key));
+  c.state.capabilities = {}; c.state.capabilitiesRevision = c.capabilitiesRevision(c.state.snapshot);
   entry.text = '미전송 초안';
   c.windowEvents.offline(); assert.equal(c.state.offline, true);
   c.context.document.hidden = true; c.documentEvents.visibilitychange();
@@ -2005,7 +2141,8 @@ test('offline visibility and return-online events restart only bounded reads and
   assert.equal(requests.length, 0);
   c.context.navigator.onLine = true; c.windowEvents.online();
   await new Promise((resolve) => setImmediate(resolve));
-  assert.deepEqual(requests, ['/api/snapshot', '/api/chat/state']);
+  // The usage strip is another bounded read alongside the list.
+  assert.deepEqual(requests.filter((url) => url !== '/api/usage'), ['/api/snapshot', '/api/chat/state']);
   assert.equal(entry.text, '미전송 초안'); assert.equal(entry.pending, null);
 });
 
@@ -2070,7 +2207,8 @@ test('first-run, empty-session and unavailable-host views give the installer a c
   assert.match(textOf(c.get('groups')), /Claude Code나 Codex로 대화를 시작.*새로고침/);
   c.state.snapshot.hosts[0].ok = false; c.renderGroups([], Date.now() / 1000);
   assert.match(textOf(c.get('groups')), /기기 연결과 에이전트 설치 상태.*다시 확인/);
-  assert.equal(c.get('groups').children[0].children[1].textContent, '다시 확인');
+  assert.equal(byClass(c.get('groups'), 'secondary')[0].textContent, '다시 확인');
+  assert.equal(byClass(c.get('groups'), 'empty-title').length, 1, 'one short title per empty state');
 });
 
 test('service worker evicts only its own old shells and offline reads use the current Sessionholic cache', async () => {
@@ -2082,7 +2220,7 @@ test('service worker evicts only its own old shells and offline reads use the cu
     self, URL, Set, Response,
     fetch: async () => { throw new Error('offline'); },
     caches: {
-      keys: async () => ['another-app-shell', 'sessionholic-shell-v0', 'sessionholic-shell-v1', 'sessionholic-shell-v2', 'sessionholic-shell-v4', 'sessionholic-shell-v5', 'sessionholic-shell-v6', 'sessionholic-shell-v7', 'sessionholic-shell-v8'],
+      keys: async () => ['another-app-shell', 'sessionholic-shell-v0', 'sessionholic-shell-v1', 'sessionholic-shell-v2', 'sessionholic-shell-v4', 'sessionholic-shell-v5', 'sessionholic-shell-v6', 'sessionholic-shell-v7', 'sessionholic-shell-v8', 'sessionholic-shell-v9', 'sessionholic-shell-v10', 'sessionholic-shell-v11', 'sessionholic-shell-v12'],
       delete: async (key) => { deleted.push(key); },
       open: async (key) => { opened.push(key); return { match: async () => currentShell }; },
       match: async () => { throw new Error('Global cross-application cache lookup is forbidden'); },
@@ -2090,11 +2228,11 @@ test('service worker evicts only its own old shells and offline reads use the cu
   });
   let activated;
   listeners.activate({ waitUntil: (promise) => { activated = promise; } }); await activated;
-  assert.deepEqual(deleted, ['sessionholic-shell-v0', 'sessionholic-shell-v1', 'sessionholic-shell-v2', 'sessionholic-shell-v4', 'sessionholic-shell-v5', 'sessionholic-shell-v6', 'sessionholic-shell-v7']);
+  assert.deepEqual(deleted, ['sessionholic-shell-v0', 'sessionholic-shell-v1', 'sessionholic-shell-v2', 'sessionholic-shell-v4', 'sessionholic-shell-v5', 'sessionholic-shell-v6', 'sessionholic-shell-v7', 'sessionholic-shell-v8', 'sessionholic-shell-v9', 'sessionholic-shell-v10', 'sessionholic-shell-v11', 'sessionholic-shell-v12']);
   listeners.fetch({ request: { method: 'GET', url: 'https://app.example/' },
     respondWith: (promise) => { response = promise; }, waitUntil() {} });
   assert.equal(await response, currentShell);
-  assert.deepEqual(opened, ['sessionholic-shell-v8']);
+  assert.deepEqual(opened, ['sessionholic-shell-v14']);
 });
 
 test('an offline first launch restores authentication and already-open terminal rows without reopening their sessions', async () => {
@@ -2105,7 +2243,7 @@ test('an offline first launch restores authentication and already-open terminal 
       ? { hosts: [], serverTime: Date.now() / 1000 }
       : url === '/api/terminals' ? { terminals: [{ id: 'existing-terminal', alive: true,
         host: 'workstation', agent: 'codex', title: '이미 열린 작업' }] }
-      : { hosts: [], csrfToken: 'test-csrf', authMode: 'token' } };
+      : url === '/api/bot-requests' ? { requests: [], sources: [] } : { hosts: [], csrfToken: 'test-csrf', authMode: 'token' } };
   }, noChatTimers);
   c.context.navigator = { onLine: false };
   c.get('app').hidden = true; c.get('login').hidden = true;
@@ -2118,13 +2256,13 @@ test('an offline first launch restores authentication and already-open terminal 
   assert.equal(requests.length, 0);
   c.context.navigator.onLine = true; c.windowEvents.online();
   await new Promise((resolve) => setImmediate(resolve));
-  assert.deepEqual(requests, ['/api/snapshot', '/api/capabilities', '/api/terminals']);
+  assert.deepEqual(requests.filter((url) => url !== '/api/usage'), ['/api/snapshot', '/api/bot-requests', '/api/capabilities', '/api/terminals']);
   assert.match(textOf(c.get('running-list')), /이미 열린 작업/);
   assert.equal(c.state.terminal, null); assert.equal(c.state.terminalVisible, false);
   assert.equal(c.get('app').hidden, false); assert.equal(c.get('login').hidden, true);
   assert.equal(c.get('login-submit').disabled, false);
   c.windowEvents.online(); await new Promise((resolve) => setImmediate(resolve));
-  assert.deepEqual(requests, ['/api/snapshot', '/api/capabilities', '/api/terminals', '/api/snapshot']);
+  assert.deepEqual(requests.filter((url) => url !== '/api/usage'), ['/api/snapshot', '/api/bot-requests', '/api/capabilities', '/api/terminals', '/api/snapshot']);
 });
 
 test('returning to a first-launch tab after online recovery while hidden reads login state without transmitting a token', async () => {
@@ -2210,6 +2348,14 @@ test('a delayed response body is also discarded when locking advances the authen
   assert.equal(c.state.authenticated, false); assert.equal(c.state.csrf, '');
 });
 
+test('an expired login closes every open sheet, the new-session one too, so the login form is reachable', () => {
+  const c = client(undefined, noChatTimers);
+  const sheets = ['plan-dialog', 'settings-dialog', 'usage-dialog', 'filter-dialog', 'terminals-dialog', 'new-session-dialog', 'action-sheet'];
+  for (const id of sheets) c.get(id).open = true;
+  c.showLogin();
+  assert.deepEqual(sheets.filter((id) => c.get(id).open), []);
+});
+
 test('late API and binary-upload 401 responses cannot lock a newly logged-in session or erase its new draft', async () => {
   for (const kind of ['api', 'upload']) {
     let releaseOld;
@@ -2270,7 +2416,7 @@ test('only explicit not_started send errors unlock the draft and attachments, pr
     assert.match(c.get('chat-status').textContent, /첨부를 다시 확인.*전송되지 않았습니다.*초안과 첨부는 유지/);
     assert.equal(requests.filter((r) => r.url === '/api/chat/send').length, 1);
     assert.equal(requests.filter((r) => r.url === '/api/chat/state').some((r) => r.body.requestId), false);
-    c.get('chat-attachments').children[0].children[1].events.click();
+    byClass(c.get('chat-attachments'), 'chat-attachment-remove')[0].events.click();
     assert.equal(entry.attachments.length, 0); assert.equal(entry.text, '거절된 초안');
   }
 });
@@ -2287,7 +2433,8 @@ test('HTTP status without a not_started guarantee remains unknown and never auto
     const { entry } = selectChat(c); entry.text = '전송 결과를 모르는 초안';
     await c.sendChat(entry); await new Promise((resolve) => setImmediate(resolve)); await c.sendChat(entry);
     assert.equal(sends, 1); assert.equal(!!entry.pending, true); assert.equal(entry.receipt.status, 'unknown');
-    assert.equal(c.get('chat-input').disabled, true); assert.equal(entry.text, '전송 결과를 모르는 초안');
+    assert.equal(c.get('chat-input').readOnly, true); assert.equal(c.get('chat-input').disabled, false);
+    assert.equal(c.get('chat-input').attributes['aria-disabled'], 'true'); assert.equal(entry.text, '전송 결과를 모르는 초안');
   }
 });
 
@@ -2512,7 +2659,7 @@ test('programmatic clipboard insertion grows the editor and accepted delivery sh
   Object.defineProperty(input, 'scrollHeight', { get: () => 20 + 22 * input.value.split('\n').length });
   await c.readChatClipboard(entry, input, c.get('chat-files'), entry.editorEpoch);
   assert.equal(input.style.height, '88px');
-  entry.pending = { requestId: 'grow-draft-request', revision: entry.revision };
+  entry.pending = { requestId: 'grow-draft-request', revision: entry.revision, text: entry.text, attachments: [] };
   c.applyChatReceipt(entry, { requestId: 'grow-draft-request', status: 'accepted' });
   assert.equal(input.value, '');
   assert.equal(input.style.height, '44px');
@@ -2555,14 +2702,19 @@ test('user history displays durable attachment names, image kinds and attachment
   const rows = c.get('messages').children;
   const group = byClass(rows[0], 'msg-attachments')[0];
   assert.equal(group.attributes['aria-label'], '첨부 2개');
-  assert.equal(byClass(group, 'msg-attachment').length, 2);
-  assert.match(textOf(group), /이미지.*화면.png.*파일.*<img onerror=alert\(1\)>.txt/);
+  const chips = byClass(group, 'msg-attachment');
+  assert.equal(chips.length, 2);
+  assert.deepEqual(chips.map((chip) => chip.attributes['aria-label']), ['이미지: 화면.png, 2KB', '파일: <img onerror=alert(1)>.txt, 12B']);
+  assert.match(textOf(group), /화면.png.*<img onerror=alert\(1\)>.txt/);
   assert.equal(byClass(group, 'attachment-name')[1].textContent, '<img onerror=alert(1)>.txt');
-  await byClass(rows[0], 'msg-copy')[0].events.click();
+  await menuAction(c, rows[0], '복사');
   assert.equal(copied, messages[0].text);
-  assert.match(textOf(rows[1]), /첨부 1개.*이미지.*이미지 첨부/);
+  // A transcript that cannot name the file shows its kind once, not "이미지 이미지 첨부".
+  assert.equal(byClass(rows[1], 'attachment-name')[0].textContent, '이미지');
+  assert.doesNotMatch(textOf(rows[1]), /이미지\s+이미지/);
+  assert.equal(byClass(rows[1], 'msg-attachment')[0].attributes['aria-label'], '이미지');
   assert.equal(byClass(rows[1], 'attachment-size').length, 0);
-  assert.equal(byClass(rows[1], 'msg-copy')[0].hidden, true);
+  assert.equal(menuLabels(c, rows[1]).includes('복사'), false, 'nothing to copy from an attachment-only message');
   assert.equal(byClass(rows[2], 'msg-attachments').length, 0);
 });
 
@@ -2575,13 +2727,13 @@ test('attachment metadata refresh replaces only changed message rows and preserv
   list.scrollHeight = 500; list.clientHeight = 100; list.scrollTop = 70;
   c.renderMessages(s, messages);
   const [tool, user] = list.children;
-  tool.children[0].open = true;
+  tool.toolToggle.events.click();
   c.renderMessages(s, JSON.parse(JSON.stringify(messages)));
   assert.equal(list.children[0], tool); assert.equal(list.children[1], user);
   const renamed = structuredClone(messages);
   renamed[1].attachments[0].name = '서버에서 복원된 이름.txt';
   c.renderMessages(s, renamed);
-  assert.equal(list.children[0], tool); assert.equal(tool.children[0].open, true);
+  assert.equal(list.children[0], tool); assert.equal(tool.open, true);
   assert.notEqual(list.children[1], user);
   assert.match(textOf(list.children[1]), /서버에서 복원된 이름.txt/);
   assert.equal(list.scrollTop, 70);
@@ -2638,7 +2790,7 @@ test('queued attachment delivery keeps server metadata evidence after clearing t
   assert.equal(Object.hasOwn(outbound.body, 'attachmentDetails'), false);
   const evidence = c.get('chat-delivery-evidence');
   assert.equal(evidence.hidden, false);
-  assert.match(textOf(evidence), /대기열 접수.*세션 기록 확인.*전송에 포함한 첨부 1개.*authoritative.png/);
+  assert.match(textOf(evidence), /전송 접수.*세션 기록 확인.*전송에 포함한 첨부 1개.*authoritative.png/);
   assert.doesNotMatch(textOf(evidence), /local.png|not-for-evidence|모델.*읽|동기화 완료/);
   assert.equal(c.get('chat-attachments-label').hidden, true);
   const retained = evidence.children[0];
@@ -2646,7 +2798,7 @@ test('queued attachment delivery keeps server metadata evidence after clearing t
   assert.equal(evidence.children[0], retained);
   receipt = { ...receipt, status: 'completed' };
   await c.loadChatState(selected.s, true);
-  assert.match(textOf(evidence), /요청 완료.*authoritative.png/);
+  assert.match(textOf(evidence), /응답 종료.*authoritative.png/);
   assert.doesNotMatch(textOf(evidence), /모델.*읽|동기화 완료/);
 });
 
@@ -2939,221 +3091,6 @@ function queueItem(requestId, text, attachments = [], extra = {}) {
     attachments, status: 'queued', confirmed: true, ...extra };
 }
 
-test('queued send snapshots keep multiple original bodies visible after draft clearing, and readonly dialog refresh preserves new Korean input', async () => {
-  const requests = []; const queued = []; const stored = []; let copied;
-  const c = client(async (url, options) => {
-    const body = JSON.parse(options.body); requests.push({ url, body });
-    if (url === '/api/chat/send') {
-      queued.push(queueItem(body.requestId, body.text + '\n첨부 파일: [native-added-path]', body.attachments.map((id) => ({ id, name: '사진.png', type: 'image/png', kind: 'image', size: 3, source: 'sessionholic' }))));
-      return { ok: true, status: 200, json: async () => ({ status: 'queued', receipt: { requestId: body.requestId,
-        queueId: queued.at(-1).queueId, confirmed: true, currentSnapshotConfirmed: true } }) };
-    }
-    return { ok: true, status: 200, json: async () => queueStateReply(body.source, queued,
-      queued.map((item) => ({ requestId: item.requestId, status: 'queued', confirmed: true, currentSnapshotConfirmed: true }))) };
-  }, noChatTimers);
-  c.context.navigator = { clipboard: { writeText: async (text) => { copied = text; } } };
-  c.context.localStorage.setItem = (...args) => stored.push(args);
-  const { s, entry } = selectChat(c); entry.data.phase = 'working';
-  c.buildChatComposer(s);
-  const original = '첫 요청 **원문**\n> 인용 기호도 원문입니다.';
-  entry.text = original; entry.attachments = [{ id: 'photo-id', name: '사진.png', type: 'image/png', size: 3 }];
-  await c.sendChat(entry); await new Promise((resolve) => setImmediate(resolve));
-  assert.equal(entry.text, ''); assert.equal(entry.pending, null);
-  c.get('chat-input').value = '두 번째 요청 전체 본문'; c.get('chat-input').events.input();
-  await c.sendChat(entry); await new Promise((resolve) => setImmediate(resolve));
-  assert.equal(c.chatQueueCount(entry), 2); assert.equal(c.get('chat-queue-open').textContent, '예약 2개');
-  const beforeOpen = requests.length;
-  c.get('chat-queue-open').events.click();
-  assert.equal(c.get('chat-queue-dialog').open, true); assert.equal(requests.length, beforeOpen);
-  const list = c.get('chat-queue-list'); const firstRow = list.children[0];
-  assert.equal(byClass(firstRow, 'queued-message-body')[0].textContent, original);
-  assert.match(textOf(firstRow), /이 탭에서 보낸 원문.*사진.png/s);
-  assert.doesNotMatch(textOf(firstRow), /native-added-path/);
-  await byClass(firstRow, 'queued-message-copy')[0].events.click(); assert.equal(copied, original);
-  assert.equal(byClass(firstRow, 'queued-message-copy')[0].attributes['aria-label'], '표시된 메시지 본문 복사');
-  c.closeChatQueue();
-  const input = c.get('chat-input'); input.value = '보낸 후 새 한글 초안'; input.events.compositionstart(); input.events.input();
-  c.get('chat-queue-open').events.click();
-  assert.equal(c.get('chat-queue-dialog').open, false); assert.equal(entry.composing, true);
-  input.events.compositionend(); c.openChatQueue(entry);
-  const bodyNode = byClass(c.get('chat-queue-list').children[0], 'queued-message-body')[0];
-  c.get('chat-queue-list').scrollTop = 45;
-  await c.loadChatState(s, true);
-  assert.equal(byClass(c.get('chat-queue-list').children[0], 'queued-message-body')[0], bodyNode);
-  assert.equal(c.get('chat-queue-list').scrollTop, 45);
-  assert.equal(c.get('chat-input'), input); assert.equal(entry.text, '보낸 후 새 한글 초안');
-  assert.equal(requests.filter((request) => request.url === '/api/chat/send').length, 2);
-  assert.equal(requests.filter((request) => request.url === '/api/chat/state').length, 3);
-  assert.deepEqual(stored, []);
-});
-
-test('an uncertain send exposes its original content for review but is never counted as a reservation or retransmitted', async () => {
-  let sends = 0; let copied;
-  const c = client(async (url, options) => {
-    const body = JSON.parse(options.body);
-    if (url === '/api/chat/send') { sends++; throw new Error('lost response'); }
-    return { ok: true, status: 200, json: async () => queueStateReply(body.source, [],
-      [{ requestId: body.requestId, status: 'unknown', confirmed: false, currentSnapshotConfirmed: false }]) };
-  }, noChatTimers);
-  const { entry } = selectChat(c); c.buildChatComposer(c.state.snapshot.hosts[0].data.codex[0]);
-  c.context.navigator = { clipboard: { writeText: async (text) => { copied = text; } } };
-  entry.text = '전송 결과를 모르는 원문\n둘째 줄';
-  await c.sendChat(entry); await new Promise((resolve) => setImmediate(resolve));
-  assert.ok(entry.pending); assert.equal(c.chatQueueCount(entry), 0);
-  assert.equal(c.get('chat-queue-open').textContent, '미확인 내역');
-  c.openChatQueue(entry); const row = c.get('chat-queue-list').children[0];
-  assert.match(textOf(row), /전송 결과 미확인/);
-  assert.equal(byClass(row, 'queued-message-body')[0].textContent, entry.pending.text);
-  await byClass(row, 'queued-message-copy')[0].events.click(); assert.equal(copied, entry.pending.text);
-  await c.sendChat(entry); assert.equal(sends, 1);
-});
-
-test('a fresh page restores native queue contents, generic attachments and missing-content warnings without adding an API call', async () => {
-  const calls = [];
-  const native = [queueItem('native.request:001', '<script>literal</script>\nfull native request', [], { textTruncated: true }),
-    queueItem(null, '', [{ id: null, name: '이미지', kind: 'image', type: 'image/*', size: null, source: 'native' }], { queueId: 'native-queue-two' }),
-    queueItem(null, '', [], { queueId: 'native-queue-three', contentAvailable: false })];
-  const c = client(async (url, options) => { calls.push(url); return { ok: true, status: 200,
-    json: async () => queueStateReply(JSON.parse(options.body).source, native) }; }, noChatTimers);
-  const { s, entry } = selectChat(c); c.buildChatComposer(s);
-  await c.loadChatState(s, true); c.openChatQueue(entry);
-  assert.deepEqual(calls, ['/api/chat/state']); assert.equal(c.chatQueueCount(entry), 3);
-  const rows = c.get('chat-queue-list').children;
-  assert.equal(byClass(rows[0], 'queued-message-body')[0].textContent, '<script>literal</script>\nfull native request');
-  assert.match(textOf(rows[0]), /원본 세션 대기열에서 확인한 내용.*일부만 표시/s);
-  assert.equal(byClass(rows[0], 'queued-message-time')[0].textContent, '');
-  assert.match(textOf(rows[1]), /첨부만 보낸 메시지.*이미지/);
-  assert.equal(byClass(rows[1], 'queued-message-copy')[0].hidden, true);
-  assert.match(textOf(rows[2]), /메시지 내용을 확인하지 못했습니다/);
-  assert.equal(byClass(rows[2], 'queued-message-copy')[0].hidden, true);
-});
-
-test('queueId aliases prevent duplicate reservations when a native row lacks its client request ID', async () => {
-  let queued; let requestId;
-  const c = client(async (url, options) => {
-    const body = JSON.parse(options.body);
-    if (url === '/api/chat/send') {
-      requestId = body.requestId; queued = queueItem(null, body.text, [], { queueId: 'shared-queue-id' });
-      return { ok: true, status: 200, json: async () => ({ status: 'queued', receipt: { requestId,
-        queueId: 'shared-queue-id', confirmed: true, currentSnapshotConfirmed: true } }) };
-    }
-    return { ok: true, status: 200, json: async () => queueStateReply(body.source, [queued],
-      [{ requestId, status: 'queued', confirmed: true, currentSnapshotConfirmed: false }]) };
-  }, noChatTimers);
-  const { s, entry } = selectChat(c); c.buildChatComposer(s); entry.text = 'only one request';
-  await c.sendChat(entry); await new Promise((resolve) => setImmediate(resolve));
-  assert.equal(entry.submissions.length, 1); assert.equal(c.chatQueueCount(entry), 1);
-  c.openChatQueue(entry); assert.equal(c.get('chat-queue-list').children.length, 1);
-  assert.match(textOf(c.get('chat-queue-list')), /대기 중.*only one request/);
-});
-
-test('queue absence and historical queued receipts remain uncertain, while exact fresh receipts alone advance execution and completion', async () => {
-  let phase = 'queued';
-  const c = client(async (url, options) => {
-    const body = JSON.parse(options.body);
-    const item = queueItem('known-request-001', '내용이 남아야 하는 예약');
-    return { ok: true, status: 200, json: async () => queueStateReply(body.source, phase === 'queued' ? [item] : [],
-      phase === 'queued' ? [] : [{ requestId: item.requestId, status: phase === 'historical' ? 'queued' : phase,
-        confirmed: true, currentSnapshotConfirmed: phase !== 'historical' }]) };
-  }, noChatTimers);
-  const { s, entry } = selectChat(c); c.buildChatComposer(s);
-  await c.loadChatState(s, true); c.openChatQueue(entry);
-  phase = 'historical'; await c.loadChatState(s, true);
-  assert.equal(c.chatQueueCount(entry), 0);
-  assert.match(textOf(c.get('chat-queue-list')), /접수 후 상태 미확인.*내용이 남아야/);
-  assert.doesNotMatch(textOf(c.get('chat-queue-list')), /완료|실행 시작/);
-  phase = 'accepted'; await c.loadChatState(s, true); assert.match(textOf(c.get('chat-queue-list')), /실행 시작/);
-  phase = 'completed'; await c.loadChatState(s, true); assert.match(textOf(c.get('chat-queue-list')), /완료.*내용이 남아야/);
-});
-
-test('partial queue totals never double-count a local queued message outside the returned window and unavailable snapshots stay uncertain', async () => {
-  let receipt; let available = true;
-  const c = client(async (url, options) => {
-    const body = JSON.parse(options.body);
-    if (url === '/api/chat/send') {
-      receipt = { requestId: body.requestId, status: 'queued', confirmed: true, currentSnapshotConfirmed: true };
-      return { ok: true, status: 200, json: async () => ({ status: 'queued', receipt }) };
-    }
-    return { ok: true, status: 200, json: async () => queueStateReply(body.source, [],
-      [{ ...receipt, currentSnapshotConfirmed: available }], { available, complete: false, truncated: true, total: available ? 60 : null }) };
-  }, noChatTimers);
-  const { s, entry } = selectChat(c); c.buildChatComposer(s); entry.text = 'window 밖 새 예약';
-  await c.sendChat(entry); await new Promise((resolve) => setImmediate(resolve));
-  assert.equal(c.chatQueueCount(entry), 60);
-  c.openChatQueue(entry); assert.match(c.get('chat-queue-note').textContent, /일부 내역/);
-  available = false; await c.loadChatState(s, true);
-  assert.equal(c.chatQueueCount(entry), 0);
-  assert.match(textOf(c.get('chat-queue-list')), /접수 후 상태 미확인/);
-  assert.match(c.get('chat-queue-note').textContent, /대기열을 확인하지 못했습니다/);
-});
-
-test('submission memory and batched receipt requests are bounded, native IDs remain valid and completed records stop requesting readback', async () => {
-  const bodies = []; let complete = false;
-  const items = Array.from({ length: 25 }, (_, index) => queueItem('native.request:' + String(index).padStart(3, '0'), '한'.repeat(32768)));
-  const c = client(async (url, options) => {
-    const body = JSON.parse(options.body); bodies.push(body);
-    return { ok: true, status: 200, json: async () => queueStateReply(body.source, complete ? [] : items,
-      complete ? (body.requestIds || []).map((requestId) => ({ requestId, status: 'completed', confirmed: true, currentSnapshotConfirmed: true })) : [],
-      { total: complete ? 0 : 25 }) };
-  }, noChatTimers);
-  const { s, entry } = selectChat(c); c.buildChatComposer(s);
-  await c.loadChatState(s, true);
-  assert.ok(entry.submissions.length <= 20);
-  assert.ok(entry.submissions.reduce((bytes, item) => bytes + Buffer.byteLength(item.text || ''), 0) <= 256 * 1024);
-  c.openChatQueue(entry); assert.match(c.get('chat-queue-note').textContent, /일부 내역/);
-  entry.pending = { requestId: 'last-pending-001', revision: entry.revision };
-  await c.loadChatState(s, true);
-  const selected = bodies.at(-1);
-  assert.ok(new Set([selected.requestId, ...selected.requestIds]).size <= 20);
-  assert.ok(selected.requestIds.includes('last-pending-001'));
-  assert.ok(selected.requestIds.some((id) => id.includes('.request:')));
-  entry.pending = null; entry.receipt = null;
-  complete = true; await c.loadChatState(s, true); await c.loadChatState(s, true);
-  assert.equal(bodies.at(-1).requestIds, undefined); assert.equal(bodies.at(-1).requestId, undefined);
-});
-
-test('queue details purge on auth, session and cwd boundaries; close and Escape return focus to the shortcut without editing drafts', async () => {
-  for (const boundary of ['auth', 'session', 'cwd', 'removed']) {
-    const c = client(async (url, options) => ({ ok: true, status: 200,
-      json: async () => queueStateReply(JSON.parse(options.body).source, [queueItem('private-request-001', 'private queue body')]) }), noChatTimers);
-    const { s, entry } = selectChat(c); s.cwd = '/example/original'; c.buildChatComposer(s);
-    await c.loadChatState(s, true); entry.text = '새 초안'; c.openChatQueue(entry);
-    assert.match(textOf(c.get('chat-queue-list')), /private queue body/);
-    if (boundary === 'auth') c.showLogin();
-    if (boundary === 'session') { const other = selectChat(c, { id: 'different-session' }); c.buildChatComposer(other.s); c.get('chat-input').events.input(); }
-    if (boundary === 'cwd') { s.cwd = '/example/changed'; c.get('chat-input').events.input(); }
-    if (boundary === 'removed') { c.state.snapshot.hosts[0].data.codex = []; vm.runInContext('render()', c.context); }
-    assert.equal(c.get('chat-queue-dialog').open, false, boundary);
-    assert.equal(c.get('chat-queue-list').children.length, 0, boundary);
-  }
-  const c = client(undefined, noChatTimers); c.context.navigator = { onLine: false }; c.windowEvents.DOMContentLoaded();
-  const { s, entry } = selectChat(c); c.buildChatComposer(s); entry.text = '닫기 후 남을 초안';
-  c.openChatQueue(entry); c.get('chat-queue-dismiss').events.click();
-  assert.equal(c.get('chat-queue-dialog').open, false); assert.equal(entry.text, '닫기 후 남을 초안');
-  assert.ok(c.get('chat-queue-open').focusCount > 0);
-  c.openChatQueue(entry); let prevented = false;
-  c.get('chat-queue-dialog').events.cancel({ preventDefault() { prevented = true; } });
-  assert.equal(prevented, true); assert.equal(c.get('chat-queue-dialog').open, false);
-  assert.equal(c.get('chat-input').focusCount, undefined);
-});
-
-test('confirmed queued work keeps the existing bounded poll alive while idle, but unknown-only work and offline or hidden views do not', async () => {
-  const timers = []; let mode = 'queued';
-  const c = client(async (url, options) => ({ ok: true, status: 200, json: async () => ({
-    ...queueStateReply(JSON.parse(options.body).source, mode === 'queued' ? [queueItem('poll-request-001', '대기 중 본문')] : [],
-      mode === 'queued' ? [] : [{ requestId: 'poll-request-001', status: 'unknown', confirmed: true, currentSnapshotConfirmed: false }]), phase: 'idle',
-  }) }), { setTimeout: (callback, delay) => { timers.push({ callback, delay }); return timers.length; }, clearTimeout() {} });
-  const { s, entry } = selectChat(c); c.buildChatComposer(s);
-  await c.loadChatState(s, true);
-  assert.equal(timers.at(-1).delay, 3000);
-  let count = timers.length;
-  c.state.chatPollCount = 40; c.scheduleChatPoll(s, entry); assert.equal(timers.length, count);
-  c.state.chatPollCount = 0; c.context.document.hidden = true; c.scheduleChatPoll(s, entry); assert.equal(timers.length, count);
-  c.context.document.hidden = false; c.state.offline = true; c.scheduleChatPoll(s, entry); assert.equal(timers.length, count);
-  c.state.offline = false; mode = 'unknown'; await c.loadChatState(s, false);
-  assert.equal(c.chatQueueCount(entry), 0); assert.equal(timers.length, count);
-});
-
 function recentSession(id, fields = {}) {
   const s = { host: 'workstation', hostLabel: 'Workstation', agent: 'codex', home: '.codex-example', id,
     title: '검토할 작업', project: 'Sample project', account: 'Sample profile', phase: 'idle', updatedAt: 1000, ...fields };
@@ -3174,16 +3111,26 @@ test('recent cards give project and full task separate priority while retaining 
   c.renderGroups([s], 1100);
   const card = byClass(c.get('groups'), 'card')[0];
   assert.equal(card.tagName, 'BUTTON'); assert.equal(card.type, 'button');
-  assert.equal(card.children[0].className, 'card-project'); assert.equal(card.children[1].className, 'card-title');
-  assert.equal(byClass(card, 'card-project')[0].textContent, project.trim());
-  assert.equal(byClass(card, 'card-project')[0].title, project.trim());
+  // Three short lines: title, preview, then status · agent · project · time.
+  assert.deepEqual(card.children.map((child) => child.className), ['card-title', 'card-snippet', 'card-provenance', 'card-goals', 'card-meta', 'card-chevron']);
   assert.equal(byClass(card, 'card-title')[0].textContent, title.trim());
   assert.equal(byClass(card, 'card-snippet')[0].hidden, true);
+  const meta = byClass(card, 'card-meta')[0];
+  assert.deepEqual(meta.children.map((child) => child.className.split(' ')[0]), ['badge', 'terminal-mark', 'card-agent', 'card-execution', 'card-project', 'stale-tag', 'card-time']);
+  assert.equal(byClass(card, 'card-execution')[0].hidden, true, '일반 대화에는 일회성 실행 표식을 표시하지 않는다');
+  assert.equal(byClass(card, 'card-terminal')[0].hidden, true, '"터미널 열림" only with a live board terminal');
+  assert.match(byClass(card, 'card-project')[0].textContent, new RegExp('^' + project.trim()));
+  assert.equal(byClass(card, 'stale-tag')[0].hidden, false);
   assert.match(card.attributes['aria-label'], /프로젝트:.*작업:.*작업 중.*Codex.*기기: Workstation.*계정 설정: Sample profile.*마지막 확인 기준/s);
   assert.equal(card.attributes['aria-pressed'], 'true');
   assert.equal(byClass(card, 'agent').length, 0);
   assert.equal(byClass(card, 'card-agent')[0].textContent, 'Codex');
-  assert.equal(byClass(card, 'card-account')[0].textContent, '계정 설정 · Sample profile');
+  // Device gets an independent readable badge; the initiator stays separate.
+  assert.equal(byClass(card, 'card-device-label')[0].textContent, 'Workstation');
+  assert.equal(byClass(card, 'card-device-icon')[0].attributes['aria-hidden'], 'true');
+  assert.equal(byClass(card, 'card-initiator')[0].textContent, '출처 미확인');
+  assert.match(textOf(card), /Workstation.*출처 미확인/);
+  assert.doesNotMatch(textOf(card), /Sample profile/);
   assert.equal(calls, 0); assert.equal(c.state.chats.size, 0);
   assert.equal(s.title, title); assert.equal(s.cwd, '/Users/example/work/service');
 });
@@ -3199,14 +3146,15 @@ test('recent cards expose only disambiguating folder suffixes, handle home and m
   ];
   c.renderGroups(rows, 1100);
   const cards = byClass(c.get('groups'), 'card');
-  assert.equal(byClass(cards[0], 'card-folder')[0].textContent, '작업 폴더 · team-a / repo / src');
-  assert.equal(byClass(cards[1], 'card-folder')[0].textContent, '작업 폴더 · team-b / repo / src');
+  // The folder suffix follows the project in the meta line only when it disambiguates.
+  assert.equal(byClass(cards[0], 'card-project')[0].textContent, 'Shared project · team-a / repo / src');
+  assert.equal(byClass(cards[1], 'card-project')[0].textContent, 'Shared project · team-b / repo / src');
+  assert.match(cards[0].attributes['aria-label'], /작업 폴더: team-a \/ repo \/ src/);
   for (const card of cards) {
     assert.doesNotMatch(textOf(card) + card.attributes['aria-label'], /source|other|\/Users|\/home/);
   }
-  assert.equal(byClass(cards[2], 'card-folder')[0].hidden, true);
+  assert.equal(byClass(cards[2], 'card-project')[0].textContent, 'Sessionholic');
   assert.equal(byClass(cards[3], 'card-project')[0].textContent, '홈 폴더');
-  assert.equal(byClass(cards[3], 'card-folder')[0].hidden, true);
   assert.equal(byClass(cards[4], 'card-project')[0].textContent, '프로젝트 확인 필요');
   assert.equal(byClass(cards[4], 'card-title')[0].textContent, '제목 없는 작업');
   c.state.search = 'work/team-b/repo/src';
@@ -3231,7 +3179,7 @@ test('recent card updates retain mounted buttons, selection, keyboard focus and 
   c.context.document.createElement = (tag) => {
     const made = create(tag); const insert = made.insertBefore;
     made.insertBefore = function (child, before) {
-      if (child === selected) { c.context.document.activeElement = c.context.document.body; pane.scrollTop = 0; }
+      if (child === selected.cardRow) { c.context.document.activeElement = c.context.document.body; pane.scrollTop = 0; }
       return insert.call(this, child, before);
     };
     return made;
@@ -3273,9 +3221,4524 @@ test('changing list filters removes hidden cards without changing the selected s
   const second = recentSession('preview-b', { project: 'Second project' });
   c.state.selected = first.key; c.renderGroups([first, second], 1100);
   const original = byClass(c.get('groups'), 'card')[0];
-  assert.equal(byClass(original, 'card-snippet')[0].textContent, '대화 미리보기 · 이전에 확인한 대화의 본문');
+  assert.equal(byClass(original, 'card-snippet')[0].textContent, '이전에 확인한 대화의 본문');
+  assert.match(original.attributes['aria-label'], /대화 미리보기: 이전에 확인한 대화의 본문/);
   c.state.filters.project = 'Second project'; c.renderGroups([second], 1100);
   assert.equal(byClass(c.get('groups'), 'card').length, 1);
   assert.equal(c.state.selected, first.key);
   assert.equal(byClass(c.get('groups'), 'card')[0].dataset.sessionKey, second.key);
+});
+
+test('terminal keys sit in two rows with an inverted-T arrow cluster and the requested control keys', () => {
+  const html = fs.readFileSync(path.join(__dirname, '../web/index.html'), 'utf8');
+  const css = fs.readFileSync(path.join(__dirname, '../web/style.css'), 'utf8');
+  for (const key of ['escape', 'tab', 'backtab', 'interrupt', 'ctrl-j', 'ctrl-u', 'ctrl-x', 'ctrl-l', 'up', 'left', 'down', 'right', 'enter'])
+    assert.match(html, new RegExp(`data-key="${key}"`));
+  assert.match(css, /"k1 k2 k3 k4 \.\s+up\s+\.\s+enter"/);
+  assert.match(css, /"k5 k6 k7 k8 left down right enter"/);
+  for (const [key, bytes] of [['backtab', '\\x1b[Z'], ['"ctrl-j"', '\\n'], ['"ctrl-u"', '\\x15'], ['"ctrl-x"', '\\x18'], ['"ctrl-l"', '\\x0c']])
+    assert.ok(source.includes(`${key}: "${bytes}"`), key);
+});
+
+test('the input bar sends a paste then a separate Enter, while input-only never adds Enter', async () => {
+  const calls = [];
+  const c = client(async (url, opts) => {
+    calls.push(JSON.parse(opts.body).text);
+    return { ok: true, status: 200, json: async () => ({ ok: true }) };
+  });
+  c.state.connected = true;
+  c.state.terminal = { id: 'term-1' };
+  c.state.term = { modes: { bracketedPasteMode: true }, scrollToBottom() {} };
+  c.get('terminal-draft').value = '테스트 돌려줘';
+  await c.pasteDraft(true);
+  assert.deepEqual(calls, ['\x1b[200~테스트 돌려줘\x1b[201~', '\r']);
+  assert.equal(c.get('terminal-draft').value, '');
+  calls.length = 0;
+  c.get('terminal-draft').value = '1';
+  await c.pasteDraft(false);
+  assert.deepEqual(calls, ['\x1b[200~1\x1b[201~']);
+  assert.match(c.get('draft-note').textContent, /Enter/);
+});
+
+test('Enter in the input bar sends; Shift+Enter and IME composition keep editing', async () => {
+  const calls = [];
+  const c = client(async (url, opts) => {
+    calls.push(JSON.parse(opts.body).text);
+    return { ok: true, status: 200, json: async () => ({ ok: true }) };
+  });
+  c.state.connected = true;
+  c.state.terminal = { id: 'term-1' };
+  c.state.term = { modes: { bracketedPasteMode: true }, scrollToBottom() {} };
+  c.get('terminal-draft').value = '계속해';
+  let prevented = 0;
+  const key = (extra) => ({ key: 'Enter', preventDefault() { prevented++; }, ...extra });
+  c.draftKeydown(key({ shiftKey: true }));
+  c.draftKeydown(key({ isComposing: true }));
+  c.draftKeydown(key({ keyCode: 229 }));
+  assert.equal(prevented, 0);
+  c.draftKeydown(key({}));
+  assert.equal(prevented, 1);
+  await new Promise((resolve) => setTimeout(resolve, 250));
+  assert.deepEqual(calls, ['\x1b[200~계속해\x1b[201~', '\r']);
+});
+
+test('touch devices keep the xterm keyboard closed unless direct terminal input is chosen', () => {
+  const c = client();
+  c.context.window.matchMedia = (query) => ({ matches: query === '(pointer: coarse)' });
+  const field = node(); field.removeAttribute = function (name) { delete this.attributes[name]; };
+  c.state.term = { textarea: field };
+  c.configureTerminalKeyboard();
+  assert.equal(field.attributes.inputmode, 'none');
+  c.state.directTerminalInput = true;
+  c.configureTerminalKeyboard();
+  assert.equal(field.attributes.inputmode, undefined);
+  c.context.window.matchMedia = () => ({ matches: false });
+  c.state.directTerminalInput = null;
+  c.configureTerminalKeyboard();
+  assert.equal(field.attributes.inputmode, undefined);
+});
+
+test('a swipe made on one terminal never scrolls or marks the next one', async () => {
+  const calls = [];
+  const timers = [];
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  const c = client(async (url, opts) => {
+    calls.push([url, JSON.parse(opts.body)]);
+    await gate;
+    return { ok: true, status: 200, json: async () => ({ mode: 'history', position: 7 }) };
+  }, { setTimeout: (callback) => { timers.push(callback); return timers.length; }, clearTimeout() {} });
+  c.state.connected = true;
+  c.state.terminal = { id: 'term-1' };
+  c.state.terminalScrollPending = -3;
+  const flight = c.flushTerminalScroll();
+  c.queueTerminalScroll(-2);
+  // Another terminal opens while the reply for the first is on its way.
+  c.state.terminal = { id: 'term-2' };
+  c.resetTerminalScroll();
+  release();
+  await flight;
+  assert.deepEqual(calls, [['/api/terminal/term-1/scroll', { lines: -3 }]]);
+  assert.equal(c.state.terminalScrollLines, 0, "the first terminal's position is not the second's");
+  assert.equal(c.state.terminalScrollPending, 0, 'a swipe left over is not sent to the second');
+  assert.equal(timers.length, 0);
+  // The first terminal's request does not hold up the second's swipes, even while it is on its way.
+  let releaseFirst;
+  const slow = new Promise((resolve) => { releaseFirst = resolve; });
+  const d = client(async (url) => {
+    calls.push([url]);
+    if (url.includes('term-1')) await slow;
+    return { ok: true, status: 200, json: async () => ({ mode: 'history', position: 4 }) };
+  }, { setTimeout: (callback) => { timers.push(callback); return timers.length; }, clearTimeout() {} });
+  d.state.connected = true;
+  d.state.terminal = { id: 'term-1' };
+  d.state.terminalScrollPending = -3;
+  const first = d.flushTerminalScroll();
+  d.state.terminal = { id: 'term-2' };
+  d.resetTerminalScroll();
+  d.queueTerminalScroll(-4);
+  assert.equal(timers.length, 1, 'the second terminal schedules its own swipe');
+  await timers.pop()();
+  assert.deepEqual(calls.at(-1), ['/api/terminal/term-2/scroll']);
+  assert.equal(d.state.terminalScrollLines, 4);
+  releaseFirst();
+  await first;
+  assert.equal(d.state.terminalScrollLines, 4, "the first terminal's late reply changes nothing");
+  assert.equal(d.state.terminalScrollInFlight, false);
+});
+
+test('terminal swipes coalesce into tmux history scrolls that never pass below the live screen', async () => {
+  const calls = [];
+  const timers = [];
+  const c = client(async (url, opts) => {
+    calls.push([url, JSON.parse(opts.body)]);
+    return { ok: true, status: 200, json: async () => ({ ok: true }) };
+  }, { setTimeout: (callback) => { timers.push(callback); return timers.length; }, clearTimeout() {} });
+  c.state.connected = true;
+  c.state.terminal = { id: 'term-1' };
+  c.queueTerminalScroll(-2.5); c.queueTerminalScroll(-1);
+  assert.equal(timers.length, 1);
+  await c.flushTerminalScroll();
+  assert.deepEqual(calls.at(-1), ['/api/terminal/term-1/scroll', { lines: -3 }]);
+  assert.equal(c.state.terminalScrollLines, 3);
+  c.state.terminalScrollPending = 0;
+  c.queueTerminalScroll(10);
+  await c.flushTerminalScroll();
+  assert.deepEqual(calls.at(-1), ['/api/terminal/term-1/scroll', { lines: 3 }]);
+  assert.equal(c.state.terminalScrollLines, 0);
+  const count = calls.length;
+  c.state.terminalScrollPending = 0;
+  c.queueTerminalScroll(5);
+  await c.flushTerminalScroll();
+  assert.equal(calls.length, count);
+  c.state.terminalScrollLines = 4;
+  await c.terminalScrollEnd();
+  assert.deepEqual(calls.at(-1), ['/api/terminal/term-1/scroll-end', {}]);
+  assert.equal(c.state.terminalScrollLines, 0);
+});
+
+test('waiting answers are counted in the tab title for every visible session', () => {
+  const c = client();
+  c.renderAttention([{ phase: 'needs_input' }, { phase: 'needs_input' }, { phase: 'working' }]);
+  assert.equal(c.context.document.title, '(2) 답 필요 · 세션홀릭');
+  c.renderAttention([{ phase: 'working' }]);
+  assert.equal(c.context.document.title, '세션홀릭 - 에이전트 세션 매니저');
+});
+
+test('a message cut at the server limit says so and copies as a visible part only', () => {
+  const c = client(undefined, noChatTimers);
+  const { s } = selectChat(c);
+  c.renderMessages(s, [{ role: 'assistant', text: '앞부분 …', ts: 1, truncated: true, fullLength: 12000 },
+    { role: 'assistant', text: '짧은 답변', ts: 2 }]);
+  const text = textOf(c.get('messages'));
+  assert.match(text, /긴 메시지라 앞부분만 표시합니다 · 전체 12,000자/);
+  assert.equal((text.match(/앞부분만 표시/g) || []).length, 1);
+  const [cut, whole] = c.get('messages').children;
+  assert.equal(menuLabels(c, cut)[0], '표시된 부분 복사');
+  assert.equal(menuLabels(c, whole)[0], '복사');
+});
+
+test('pull to refresh reloads the board once and never overlaps a running refresh', async () => {
+  const requests = [];
+  let release;
+  const c = client(async (url) => {
+    requests.push(url);
+    if (url === '/api/refresh') await new Promise((resolve) => { release = resolve; });
+    return { ok: true, status: 200, json: async () => ({ ok: true, hosts: [], terminals: [] }) };
+  }, { setTimeout: (callback, delay) => (delay === 700 ? setImmediate(callback) : 1), clearTimeout() {} });
+  c.state.authenticated = true;
+  const first = c.pullRefresh();
+  const second = c.pullRefresh();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(requests.filter((url) => url === '/api/refresh').length, 1);
+  assert.equal(c.state.pullRefreshing, true);
+  release();
+  await new Promise((resolve) => setImmediate(resolve));
+  // A short confirmation is shown before the indicator slides away.
+  assert.match(c.get('pull-refresh-label').textContent, /업데이트됨|오프라인/);
+  await Promise.all([first, second]);
+  assert.equal(c.state.pullRefreshing, false);
+  assert.equal(requests[0], '/api/refresh');
+});
+
+function classes() {
+  const set = new Set();
+  return { set, add: (name) => set.add(name), remove: (name) => set.delete(name), contains: (name) => set.has(name),
+    toggle: (name, force) => { const on = force ?? !set.has(name); on ? set.add(name) : set.delete(name); return on; } };
+}
+
+test('reading mode folds after deliberate scrolling and stays folded at the newest message', () => {
+  const c = client(undefined, noChatTimers);
+  const pane = c.get('detail'); pane.classList = classes();
+  const list = c.get('messages'); Object.assign(list, { scrollHeight: 3000, clientHeight: 600, scrollTop: 2400 });
+  c.get('jump-bottom');
+  c.readingScroll(list);
+  list.scrollTop = 2390; c.readingScroll(list);
+  assert.equal(pane.classList.contains('is-reading'), false, 'a 10px wobble keeps the chrome');
+  list.scrollTop = 2350; c.readingScroll(list);
+  assert.equal(pane.classList.contains('is-reading'), true, 'a 50px upward read folds it');
+  assert.equal(c.get('jump-bottom').hidden, true, 'the jump appears only once the end is out of reach');
+  list.scrollTop = 1500; c.readingScroll(list);
+  assert.equal(c.get('jump-bottom').hidden, false);
+  list.scrollTop = 2300; c.readingScroll(list);
+  assert.equal(pane.classList.contains('is-reading'), true, 'reading downward keeps the space');
+  list.scrollTop = 2395; c.readingScroll(list);
+  assert.equal(pane.classList.contains('is-reading'), true, 'the newest message preserves the focus choice');
+  c.toggleChrome();
+  assert.equal(pane.classList.contains('is-reading'), false, 'explicit restore shows the tools');
+  assert.equal(c.get('jump-bottom').hidden, true);
+});
+
+test('messages arriving while reading back are counted on the jump button and cleared at the bottom', () => {
+  const c = client(undefined, noChatTimers);
+  const { s } = selectChat(c);
+  const list = c.get('messages'); const jump = c.get('jump-bottom'); jump.classList = classes();
+  c.renderMessages(s, [{ role: 'assistant', text: '첫 답', ts: 1 }], '', true);
+  Object.assign(list, { scrollHeight: 3000, clientHeight: 600, scrollTop: 100 });
+  c.renderMessages(s, [{ role: 'assistant', text: '첫 답', ts: 1 }, { role: 'user', text: '질문', ts: 2 },
+    { role: 'tool', text: '$ ls', ts: 3 }, { role: 'assistant', text: '둘째 답', ts: 4 }]);
+  assert.equal(list.unread, 2, 'tool rows are not counted');
+  assert.match(jump.textContent, /새 메시지 2/);
+  assert.equal(jump.classList.contains('has-unread'), true);
+  list.scrollTop = 2400; c.readingScroll(list);
+  assert.equal(list.unread, 0);
+  assert.equal(jump.textContent, '↓');
+});
+
+test('the new-message count skips a row that only got its time and this board\'s own message that replaced its bubble', () => {
+  const c = client(undefined, noChatTimers);
+  const { s, entry } = selectChat(c, { agent: 'claude', home: '.claude', id: 'claude-session' });
+  const list = c.get('messages');
+  const now = Date.now(); const ts = Math.floor(now / 1000);
+  const shown = [{ role: 'user', text: '요청', ts: ts - 60 }, { role: 'assistant', text: '중간 보고' }];
+  c.renderMessages(s, shown, '', true);
+  Object.assign(list, { scrollHeight: 3000, clientHeight: 600, scrollTop: 100 });
+  const untimed = { role: 'assistant', text: '최종 답' };
+  c.renderMessages(s, [...shown, untimed]);
+  assert.equal(list.unread, 1);
+  // The turn ended: the same answer now carries the turn's end time.
+  c.renderMessages(s, [...shown, { ...untimed, ts: ts - 1 }]);
+  assert.equal(list.unread, 1, 'the same answer, counted once');
+  // A message sent from here reaches the transcript while the reader is above.
+  const seen = [...shown, { ...untimed, ts: ts - 1 }];
+  entry.outbox = [{ requestId: 'req-own-0001', text: '내 질문', attachments: [], state: 'sent', status: 'accepted', reason: '',
+    at: now, ...c.outboxOrigin(seen) }];
+  c.renderMessages(s, [...seen, { role: 'user', text: '내 질문', ts: ts + 1 }]);
+  assert.equal(entry.outbox.length, 0);
+  assert.equal(list.unread, 1, 'its own message is no news');
+  c.renderMessages(s, [...seen, { role: 'user', text: '내 질문', ts: ts + 1 }, { role: 'assistant', text: '답', ts: ts + 5 }]);
+  assert.equal(list.unread, 2, 'the answer to it is');
+});
+
+test('two turns that start with the same command keep their own tool groups when the window drops the first', () => {
+  const c = client(undefined, noChatTimers); const { s } = selectChat(c);
+  const list = c.get('messages');
+  // Codex tool records carry no time: both turns' first records have the same key.
+  const turn = (n) => [{ role: 'user', text: `요청 ${n}`, ts: 1000 + n * 100 },
+    { role: 'tool', text: '$ npm test', toolKind: 'command' }, { role: 'tool', text: `파일 수정 · ${n}.py`, toolKind: 'edit' },
+    { role: 'assistant', text: `답 ${n}`, ts: 1050 + n * 100 }];
+  const groups = () => list.children.filter((row) => /tool-group/.test(row.className));
+  c.renderMessages(s, [...turn(1), ...turn(2), ...turn(3)]);
+  const [first, second, third] = groups();
+  first.toolToggle.events.click();
+  third.toolToggle.events.click();
+  assert.deepEqual(groups().map((group) => group.open), [true, false, true]);
+  c.renderMessages(s, [...turn(2), ...turn(3)]);
+  assert.deepEqual(groups(), [second, third], 'each turn keeps its own group');
+  assert.deepEqual(groups().map((group) => group.open), [false, true]);
+  assert.deepEqual(second.toolList.children.map((item) => textOf(item).trim()), ['$ npm test', '파일 수정 · 2.py']);
+});
+
+test('pull distance is elastic and the large title collapses into the bar on phones only', () => {
+  const c = client(undefined, noChatTimers);
+  assert.equal(c.pullDistance(0), 0);
+  assert.ok(c.pullDistance(80) < 80 && c.pullDistance(300) < 110 && c.pullDistance(300) > c.pullDistance(150));
+  c.context.document.body.classList = classes();
+  c.context.window.matchMedia = (query) => ({ matches: query === '(max-width: 700px)' });
+  const pane = { scrollTop: 0 };
+  const collapsed = () => c.context.document.body.classList.contains('list-collapsed');
+  for (const top of [10, 30]) { pane.scrollTop = top; c.listScroll(pane); }
+  assert.equal(collapsed(), false, 'the large title is still visible');
+  pane.scrollTop = 80; c.listScroll(pane);
+  assert.equal(collapsed(), true, 'past the title the bar shows the small title');
+  pane.scrollTop = 500; c.listScroll(pane);
+  assert.equal(collapsed(), true, 'the bar never slides away while reading down');
+  pane.scrollTop = 0; c.listScroll(pane);
+  assert.equal(collapsed(), false);
+  c.context.window.matchMedia = () => ({ matches: false });
+  pane.scrollTop = 800; c.listScroll(pane);
+  assert.equal(collapsed(), false, 'wide screens keep their plain bar');
+  const html = indexPage();
+  assert.match(html, /id="nav-title"[^>]*aria-label="세션 목록 맨 위로"[^>]*>세션</);
+  assert.match(styleSheet(), /body\.list-collapsed \.top \{[^}]*backdrop-filter: saturate\(180%\) blur\(20px\)/);
+});
+
+test('an app that owns its screen scrolls in both directions, while tmux history stops at the live screen', async () => {
+  const calls = [];
+  let mode = 'app';
+  const c = client(async (url, opts) => {
+    calls.push(JSON.parse(opts.body).lines);
+    return { ok: true, status: 200, json: async () => (mode === 'app' ? { ok: true, mode: 'app', position: null }
+      : { ok: true, mode: 'history', position: 7 }) };
+  }, { setTimeout: () => 1, clearTimeout() {} });
+  c.state.connected = true; c.state.terminal = { id: 'term-1' };
+  c.state.terminalScrollPending = 6; await c.flushTerminalScroll();
+  assert.deepEqual(calls, [6], 'app mode can scroll down from the live screen');
+  assert.equal(c.state.terminalScrollLines, 0);
+  mode = 'history'; c.state.terminalScrollMode = null;
+  c.state.terminalScrollPending = -9; await c.flushTerminalScroll();
+  assert.equal(c.state.terminalScrollLines, 7, 'the server position is shown');
+  assert.equal(c.get('terminal-live').hidden, false);
+  assert.match(c.get('terminal-live').textContent, /7줄 위/);
+  c.state.terminalScrollPending = 20; await c.flushTerminalScroll();
+  assert.equal(calls.at(-1), 7, 'history never scrolls below the live screen');
+});
+
+function findClass(root, name, out = []) {
+  if (typeof root?.className === 'string' && root.className.split(' ').includes(name)) out.push(root);
+  for (const child of root?.children || []) findClass(child, name, out);
+  return out;
+}
+
+test('a question card keeps the keyboard on the chosen option, and arrows move the choice as in a radio group', () => {
+  const c = client(undefined, noChatTimers);
+  const { s, entry } = selectChat(c);
+  c.drawDetail(s);
+  const prompt = { agent: 'claude', fingerprint: 'e'.repeat(64), current: 1, multi: false, terminalId: 'a'.repeat(32),
+    question: 'Do you want to proceed?', options: [{ number: 1, label: 'Yes', detail: '' },
+      { number: 2, label: 'Yes, always', detail: '' }, { number: 3, label: 'No', detail: '' }] };
+  entry.data = { ...entry.data, prompt, phase: 'needs_input' };
+  c.renderPrompt(s, entry.data);
+  const options = () => findClass(c.get('chat-prompt'), 'chat-prompt-option');
+  assert.deepEqual(options().map((item) => item.tabIndex), [0, -1, -1], 'one stop in the tab order');
+  c.context.document.activeElement = options()[0];
+  options()[0].events.click();
+  assert.equal(options()[0].focusCount, 1, 'the redrawn choice takes the focus back');
+  c.context.document.activeElement = options()[0];
+  options()[0].events.keydown({ key: 'ArrowUp', preventDefault() {} });
+  assert.equal(entry.promptChoice.number, 3, 'up from the first wraps to the last');
+  assert.equal(options()[2].focusCount, 1);
+  assert.deepEqual(options().map((item) => item.tabIndex), [-1, -1, 0]);
+  c.context.document.activeElement = null;
+});
+
+test('a question card selects first and sends only on the second tap, with the exact menu fingerprint', async () => {
+  const requests = [];
+  const c = client(async (url, opts) => {
+    requests.push([url, JSON.parse(opts.body)]);
+    return { ok: true, status: 200, json: async () => (url === '/api/chat/prompt' ? { status: 'answered', prompt: null } : { messages: [] }) };
+  }, noChatTimers);
+  const { s, entry } = selectChat(c);
+  c.drawDetail(s);
+  const prompt = { agent: 'claude', fingerprint: 'f'.repeat(64), current: 1, multi: false, terminalId: 'a'.repeat(32),
+    question: 'Bash command\n  rm -rf build\nDo you want to proceed?',
+    options: [{ number: 1, label: 'Yes', detail: '' }, { number: 2, label: "Yes, and don't ask again", detail: '' },
+      { number: 3, label: 'No, and tell Claude what to do differently (esc)', detail: '' }] };
+  entry.data = { ...entry.data, prompt, phase: 'needs_input' };
+  c.renderPrompt(s, entry.data);
+  const card = c.get('chat-prompt');
+  assert.equal(card.hidden, false);
+  assert.match(textOf(card), /Claude가 답을 기다려요/);
+  assert.match(textOf(card), /rm -rf build/);
+  const options = findClass(card, 'chat-prompt-option');
+  assert.equal(options.length, 3);
+  options[2].events.click();
+  assert.equal(requests.length, 0, 'choosing alone sends nothing');
+  assert.equal(entry.promptChoice.number, 3);
+  const again = c.get('chat-prompt');
+  const send = findClass(again, 'primary')[0];
+  assert.match(send.textContent, /3번 보내기/);
+  // A poll with the same menu keeps the selection instead of resetting it.
+  c.renderPrompt(s, entry.data);
+  assert.equal(entry.promptChoice.number, 3);
+  await send.events.click();
+  await new Promise((resolve) => setImmediate(resolve));
+  const [url, body] = requests[0];
+  assert.equal(url, '/api/chat/prompt');
+  assert.deepEqual({ action: body.action, fingerprint: body.fingerprint, number: body.number },
+    { action: 'answer', fingerprint: prompt.fingerprint, number: 3 });
+  assert.equal(entry.promptChoice, null);
+});
+
+test('menus the web cannot drive stay readable with disabled options, and a waiting session can load its question', async () => {
+  const requests = [];
+  const c = client(async (url, opts) => {
+    requests.push([url, JSON.parse(opts.body)]);
+    return { ok: true, status: 200, json: async () => ({ prompt: null, messages: [] }) };
+  }, noChatTimers);
+  const { s, entry } = selectChat(c);
+  c.drawDetail(s);
+  entry.data = { ...entry.data, phase: 'needs_input', prompt: { agent: 'codex', fingerprint: 'e'.repeat(64), current: 1, multi: true,
+    question: '고를 항목', options: [{ number: 1, label: '[ ] A', detail: '' }, { number: 2, label: '[ ] B', detail: '' }] } };
+  c.renderPrompt(s, entry.data);
+  assert.ok(findClass(c.get('chat-prompt'), 'chat-prompt-option').every((option) => option.disabled));
+  assert.match(textOf(c.get('chat-prompt')), /터미널에서 선택/);
+  entry.data = { ...entry.data, prompt: null, promptOpenable: true };
+  c.renderPrompt(s, entry.data);
+  const open = findClass(c.get('chat-prompt'), 'primary')[0];
+  assert.match(open.textContent, /질문 불러오기/);
+  await open.events.click();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(requests[0][1].action, 'open');
+  entry.data = { ...entry.data, promptOpenable: false, phase: 'working' };
+  c.renderPrompt(s, entry.data);
+  assert.equal(c.get('chat-prompt').hidden, true);
+});
+
+test('a 답 필요 session opened from its card or notification loads its question once, without another tap', async () => {
+  const requests = [];
+  const c = client(async (url, opts) => {
+    requests.push([url, JSON.parse(opts.body || '{}')]);
+    return { ok: true, status: 200, json: async () => ({ prompt: null, messages: [] }) };
+  }, noChatTimers);
+  const { s, entry } = selectChat(c);
+  c.drawDetail(s);
+  const opens = () => requests.filter(([url, body]) => url === '/api/chat/prompt' && body.action === 'open').length;
+  // Opened another way: the card waits for "질문 불러오기".
+  entry.data = { ...entry.data, phase: 'needs_input', prompt: null, promptOpenable: true };
+  c.renderPrompt(s, entry.data);
+  await settle();
+  assert.equal(opens(), 0);
+  c.answerOnOpen(s);
+  c.renderPrompt(s, { ...entry.data });
+  await settle();
+  assert.equal(opens(), 1);
+  assert.equal(c.state.answerOnOpen, null);
+  c.renderPrompt(s, { ...entry.data });
+  await settle();
+  assert.equal(opens(), 1, 'later renders never load it again by themselves');
+  // A request that waited too long, or one for a question already shown, does nothing.
+  c.answerOnOpen(s);
+  c.state.answerOnOpen.until = Date.now() - 1;
+  c.renderPrompt(s, { ...entry.data });
+  await settle();
+  assert.equal(opens(), 1);
+  assert.equal(c.state.answerOnOpen, null);
+});
+
+test('a failed "질문 불러오기" says why on its card, and the note never follows to the next question', async () => {
+  const c = client(async (url, opts) => {
+    if (url === '/api/chat/prompt') return { ok: false, status: 409, json: async () => ({ error: '질문 화면을 불러오지 못했습니다.' }) };
+    return { ok: true, status: 200, json: async () => ({ route: JSON.parse(opts.body).source, capability: { supported: true },
+      phase: 'needs_input', prompt: null, promptOpenable: true, messages: [] }) };
+  }, noChatTimers);
+  const { s, entry } = selectChat(c);
+  c.drawDetail(s);
+  entry.data = { ...entry.data, phase: 'needs_input', prompt: null, promptOpenable: true };
+  c.renderPrompt(s, entry.data);
+  await findClass(c.get('chat-prompt'), 'primary')[0].events.click();
+  await settle();
+  assert.match(textOf(c.get('chat-prompt')), /질문 화면을 불러오지 못했습니다/);
+  // The question shows up later (the terminal was opened by hand): a fresh card.
+  entry.data = { ...entry.data, prompt: { agent: 'codex', fingerprint: 'd'.repeat(64), current: 1, multi: false, question: '계속할까요?',
+    options: [{ number: 1, label: 'Yes', detail: '' }, { number: 2, label: 'No', detail: '' }] } };
+  c.renderPrompt(s, entry.data);
+  assert.match(textOf(c.get('chat-prompt')), /계속할까요/);
+  assert.doesNotMatch(textOf(c.get('chat-prompt')), /불러오지 못했습니다/);
+});
+
+test('a state read begun before an answer does not bring the answered question back', async () => {
+  const releases = [];
+  const prompt = { agent: 'codex', fingerprint: 'c'.repeat(64), current: 1, multi: false, question: '계속할까요?',
+    options: [{ number: 1, label: 'Yes', detail: '' }, { number: 2, label: 'No', detail: '' }] };
+  const c = client(async (url, opts) => {
+    if (url === '/api/chat/prompt') return { ok: true, status: 200, json: async () => ({ status: 'answered', prompt: null }) };
+    const route = JSON.parse(opts.body).source;
+    // The first read saw the question; any later one does not (both wait to be released).
+    const answer = releases.length ? { route, capability: { supported: true }, phase: 'working', prompt: null, messages: [] }
+      : { route, capability: { supported: true }, phase: 'needs_input', prompt, messages: [] };
+    return await new Promise((resolve) => releases.push(() => resolve({ ok: true, status: 200, json: async () => answer })));
+  }, noChatTimers);
+  const { s, entry } = selectChat(c);
+  c.drawDetail(s);
+  entry.data = { ...entry.data, phase: 'needs_input', prompt };
+  c.renderPrompt(s, entry.data);
+  const stale = c.loadChatState(s, false);
+  await settle();
+  findClass(c.get('chat-prompt'), 'chat-prompt-option')[0].events.click();
+  await findClass(c.get('chat-prompt'), 'primary')[0].events.click();
+  await settle();
+  assert.equal(c.get('chat-prompt').hidden, true, 'answered');
+  releases[0]();
+  await stale; await settle();
+  assert.equal(c.get('chat-prompt').hidden, true, 'the read from before the answer is not drawn');
+  assert.equal(releases.length, 2, 'a read after the answer follows');
+  releases[1](); await settle();
+  assert.equal(c.get('chat-prompt').hidden, true);
+});
+
+test('an input error (a file too large) stays until the user acts again; a state read does not wipe it', async () => {
+  const c = client(async (url, opts) => ({ ok: true, status: 200, json: async () => ({ route: JSON.parse(opts.body).source,
+    capability: { supported: true }, phase: 'working', receipts: [], messages: [] }) }), noChatTimers);
+  const { s, entry } = selectChat(c);
+  wireTree(c, c.buildChatComposer(s)); await settle();
+  entry.data = { ...entry.data, phase: 'working', maxAttachmentBytes: 10 };
+  await c.uploadChatFiles(entry, [{ name: 'big.png', size: 100, type: 'image/png' }]);
+  const status = () => c.get('chat-status').textContent;
+  assert.match(status(), /big\.png.*최대/);
+  await c.loadChatState(s, false);
+  assert.match(status(), /big\.png.*최대/, 'an automatic read keeps it');
+  await c.loadChatState(s, true);
+  assert.match(status(), /big\.png.*최대/, 'so does a detail refresh');
+  const input = c.get('chat-input'); input.value = '다른 파일로 보낼게요'; input.events.input();
+  assert.doesNotMatch(status(), /최대/, 'editing the draft answers it');
+  // A read's own error still goes with the next successful read.
+  entry.error = '상태를 확인하지 못했습니다. 상태 다시 확인을 눌러 주세요.';
+  await c.loadChatState(s, false);
+  assert.doesNotMatch(status(), /확인하지 못했습니다/);
+});
+
+test('the usage strip shows remaining limits per provider and hides on boards without the endpoint', async () => {
+  const c = client(undefined, noChatTimers);
+  const box = c.get('usage');
+  c.renderUsage({ available: true, refreshing: false, fetchedAt: 1791600000, providers: [
+    { id: 'codex', short: 'CX', label: 'Codex', remaining: 45, status: 'ready', rows: [
+      { name: '업무', credits: '1,250', windows: [{ label: '5시간', remaining: null, resetsAt: null },
+        { label: '주간', remaining: 68, resetsAt: '2026-10-14T13:00:00Z' }] }] },
+    { id: 'claude', short: 'CC', label: 'Claude', remaining: 10, status: 'ready', rows: [
+      { name: 'Claude Code', windows: [{ label: '5시간', remaining: 86, resetsAt: '2026-10-10T06:29:59Z' }] }] }] });
+  assert.equal(box.hidden, false);
+  const summary = textOf(c.get('usage-summary'));
+  assert.match(summary, /CX\s*45%/); assert.match(summary, /CC\s*10%/);
+  const body = textOf(c.get('usage-body'));
+  assert.match(body, /크레딧 1,250/); assert.match(body, /68%/); assert.match(body, /10\/14 22:00 초기화/);
+  assert.match(body, /—/);
+  c.renderUsage({ available: false });
+  assert.equal(box.hidden, true);
+  const missing = client(async () => ({ ok: false, status: 404, json: async () => ({ error: '없는 경로입니다.' }) }), noChatTimers);
+  missing.state.authenticated = true;
+  await missing.loadUsage();
+  assert.equal(missing.state.usageUnsupported, true);
+  assert.equal(missing.get('usage').hidden, true);
+});
+
+// --- UI foundation: theme, motion, sheets, typing, terminal, assets, live updates ---
+const settle = async (rounds = 3) => { for (let i = 0; i < rounds; i++) await new Promise((resolve) => setImmediate(resolve)); };
+const styleSheet = () => fs.readFileSync(path.join(__dirname, '../web/style.css'), 'utf8');
+const indexPage = () => fs.readFileSync(path.join(__dirname, '../web/index.html'), 'utf8');
+function cssBlock(css, selector) {
+  const start = css.indexOf(`${selector} {`);
+  assert.notEqual(start, -1, selector);
+  const end = css.indexOf('}', start);
+  const tokens = {};
+  for (const line of css.slice(css.indexOf('{', start) + 1, end).split(';')) {
+    const match = /^\s*(--[\w-]+|color-scheme)\s*:\s*([\s\S]+?)\s*$/.exec(line);
+    if (match) tokens[match[1]] = match[2].replace(/\s+/g, ' ');
+  }
+  return tokens;
+}
+
+test('every board color is a token, and dark values exist for the device setting and for a forced dark board', () => {
+  const css = styleSheet().replace(/\/\*[\s\S]*?\*\//g, '');
+  const tokenBlock = /^(:root(\[data-theme="(light|dark)"\]|:not\(\[data-theme="light"\]\))?)$/;
+  const literals = [];
+  const stack = [];
+  let buffer = '';
+  for (const char of css) {
+    if (char === '{') { stack.push(buffer.trim()); buffer = ''; continue; }
+    if (char === '}') {
+      const selector = stack.pop();
+      if (selector && !tokenBlock.test(selector))
+        for (const declaration of buffer.split(';')) {
+          const value = declaration.split(':').slice(1).join(':');
+          if (/#[0-9a-fA-F]{3,8}\b|rgba?\(|hsla?\(|\bwhite\b|\bblack\b/.test(value)) literals.push(`${selector} -> ${declaration.trim()}`);
+        }
+      buffer = '';
+      continue;
+    }
+    buffer += char;
+  }
+  assert.deepEqual(literals, [], 'colors outside the token blocks');
+  assert.match(css, /@media \(prefers-color-scheme: dark\) \{\s*:root:not\(\[data-theme="light"\]\) \{/);
+  const light = cssBlock(css, ':root');
+  const system = cssBlock(css, ':root:not([data-theme="light"])');
+  const forced = cssBlock(css, ':root[data-theme="dark"]');
+  assert.deepEqual(system, forced, 'both dark blocks carry the same values');
+  assert.equal(forced['color-scheme'], 'dark');
+  for (const name of ['--bg', '--surface', '--label', '--label-3', '--accent', '--accent-fill', '--bubble', '--codex', '--toast-bg', '--backdrop', '--chevron-select'])
+    assert.ok(forced[name] && forced[name] !== light[name], `${name} has its own dark value`);
+  for (const name of Object.keys(forced)) if (name !== 'color-scheme') assert.ok(name in light, `${name} has a light value`);
+  assert.equal(light['color-scheme'], 'light dark');
+  assert.match(css, /:root\[data-theme="light"\] \{\s*color-scheme: light;/);
+  const html = indexPage();
+  assert.match(html, /name="color-scheme" content="light dark"/);
+  assert.match(html, /name="theme-color" content="#f2f2f7" media="\(prefers-color-scheme: light\)"/);
+  assert.match(html, /name="theme-color" content="#000000" media="\(prefers-color-scheme: dark\)"/);
+});
+
+test('the theme follows the device by default, forced themes set data-theme, only the choice is stored, and the terminal darkens the browser bar', () => {
+  const c = client(undefined, noChatTimers);
+  const root = c.context.document.documentElement;
+  root.attributes = {};
+  root.setAttribute = (name, value) => { root.attributes[name] = String(value); };
+  root.removeAttribute = (name) => { delete root.attributes[name]; };
+  const meta = (content) => ({ attributes: { content }, dataset: {}, getAttribute(name) { return this.attributes[name]; },
+    setAttribute(name, value) { this.attributes[name] = value; } });
+  const metas = [meta('#f2f2f7'), meta('#000000')];
+  c.context.document.querySelectorAll = (selector) => (selector === 'meta[name="theme-color"]' ? metas : []);
+  const writes = [];
+  c.context.localStorage = { getItem: () => null, setItem: (key, value) => writes.push([key, value]) };
+  c.applyTheme('auto');
+  assert.equal(root.attributes['data-theme'], undefined);
+  assert.deepEqual(metas.map((item) => item.attributes.content), ['#f2f2f7', '#000000']);
+  c.setTheme('dark');
+  assert.equal(root.attributes['data-theme'], 'dark');
+  assert.deepEqual(metas.map((item) => item.attributes.content), ['#000000', '#000000']);
+  assert.equal(c.get('theme-dark').checked, true); assert.equal(c.get('theme-auto').checked, false);
+  c.setTheme('dark');
+  c.setTheme('sepia');
+  assert.equal(c.state.theme, 'auto'); assert.equal(root.attributes['data-theme'], undefined);
+  assert.deepEqual(metas.map((item) => item.attributes.content), ['#f2f2f7', '#000000'], 'auto restores the media colors');
+  assert.deepEqual(writes, [['sessionholic:ui:theme', '"dark"'], ['sessionholic:ui:theme', '"auto"']]);
+  c.setTheme('light');
+  c.state.terminalVisible = true; c.updateThemeColor();
+  assert.deepEqual(metas.map((item) => item.attributes.content), ['#1c1c1e', '#1c1c1e']);
+  c.state.terminalVisible = false; c.updateThemeColor();
+  assert.deepEqual(metas.map((item) => item.attributes.content), ['#f2f2f7', '#f2f2f7']);
+});
+
+test('the settings sheet opens from the top bar with the current theme and returns focus when closed', () => {
+  const c = client(undefined, noChatTimers);
+  c.context.navigator = { onLine: false };
+  c.windowEvents.DOMContentLoaded();
+  c.state.theme = 'dark';
+  c.get('settings').events.click();
+  assert.equal(c.get('settings-dialog').open, true);
+  assert.equal(c.get('theme-dark').checked, true);
+  c.get('theme-light').events.change({ target: { checked: true } });
+  assert.equal(c.state.theme, 'light');
+  c.get('settings-done').events.click();
+  assert.equal(c.get('settings-dialog').open, false);
+  assert.equal(c.get('settings').focusCount, 1);
+  let prevented = 0;
+  c.get('settings').events.click();
+  c.get('settings-dialog').events.cancel({ preventDefault() { prevented++; } });
+  assert.equal(prevented, 1); assert.equal(c.get('settings-dialog').open, false);
+});
+
+test('haptics use vibration only where available and map selection, success and errors', async () => {
+  const c = client(undefined, noChatTimers);
+  assert.equal(c.haptic('select'), false, 'no navigator: silent');
+  const calls = [];
+  c.context.navigator = { vibrate: (pattern) => { calls.push(pattern); return true; } };
+  c.haptic('select'); c.haptic('success'); c.haptic('error'); c.haptic('unknown');
+  assert.equal(JSON.stringify(calls), JSON.stringify([8, [12, 60, 18], [30, 50, 30, 50, 30]]));
+  c.context.navigator = { vibrate: () => { throw new Error('blocked'); } };
+  assert.equal(c.haptic('select'), false);
+  let fail = false;
+  const d = client(async (url, options) => {
+    if (url === '/api/chat/send' && fail) throw new Error('lost');
+    return { ok: true, status: 200, json: async () => (url === '/api/chat/send' ? { status: 'accepted', receipt: {} }
+      : { route: JSON.parse(options.body).source, capability: { supported: true }, phase: 'idle' }) };
+  }, noChatTimers);
+  const { entry } = selectChat(d);
+  const pulses = [];
+  d.context.navigator = { vibrate: (pattern) => { pulses.push(pattern); return true; } };
+  entry.text = '보낼 메시지';
+  await d.sendChat(entry);
+  assert.equal(JSON.stringify(pulses), '[[12,60,18]]', 'an accepted send ticks success');
+  fail = true; entry.pending = null; entry.text = '다시 보낼 메시지';
+  await d.sendChat(entry);
+  assert.equal(JSON.stringify(pulses.at(-1)), '[30,50,30,50,30]', 'an uncertain send buzzes an error');
+});
+
+test('screen changes run at once without view transitions or with reduced motion, and slide in the given direction otherwise', async () => {
+  const c = client(undefined, noChatTimers);
+  const root = c.context.document.documentElement;
+  root.dataset = {};
+  let ran = 0;
+  assert.equal(c.navTransition('push', () => ran++), null);
+  assert.equal(ran, 1, 'no support: the update runs immediately');
+  const seen = [];
+  let finish;
+  c.context.document.startViewTransition = (update) => {
+    seen.push(root.dataset.nav);
+    Promise.resolve().then(update);
+    return { finished: new Promise((resolve) => { finish = resolve; }), updateCallbackDone: Promise.resolve() };
+  };
+  assert.ok(c.navTransition('pop', () => ran++));
+  assert.deepEqual(seen, ['pop']); assert.equal(root.dataset.nav, 'pop');
+  await settle();
+  assert.equal(ran, 2);
+  finish(); await settle();
+  assert.equal(root.dataset.nav, undefined, 'the direction is cleared when the slide ends');
+  c.context.window.matchMedia = (query) => ({ matches: query === '(prefers-reduced-motion: reduce)' });
+  c.navTransition('push', () => ran++);
+  assert.equal(ran, 3); assert.deepEqual(seen, ['pop'], 'reduced motion never starts a transition');
+  c.context.window.matchMedia = () => ({ matches: false });
+  c.context.document.startViewTransition = () => { throw new Error('busy'); };
+  c.navTransition('push', () => ran++);
+  assert.equal(ran, 4); assert.equal(root.dataset.nav, undefined, 'a refused transition still updates');
+});
+
+test('Android back keeps one history step per phone screen while list and conversation slide', async () => {
+  const c = client(undefined, noChatTimers);
+  c.context.navigator = { onLine: false };
+  c.windowEvents.DOMContentLoaded();
+  const { s } = selectChat(c);
+  const root = c.context.document.documentElement;
+  root.dataset = {};
+  const body = classes();
+  c.context.document.body.classList = body;
+  c.context.window.matchMedia = (query) => ({ matches: query === '(max-width: 700px)' });
+  const slides = [];
+  c.context.document.startViewTransition = (update) => { slides.push(root.dataset.nav); update(); return { finished: Promise.resolve() }; };
+  c.select(s.key);
+  assert.equal(c.context.window.history.state.view, 'detail');
+  assert.deepEqual(slides, ['push']); assert.equal(body.contains('show-detail'), true); assert.equal(c.chatVisible(), true);
+  c.backToList();
+  assert.equal(c.context.window.history.backCount, 1, 'back uses the browser history');
+  c.context.window.history.state = { sessionholic: true, view: 'list' };
+  c.windowEvents.popstate({ state: { sessionholic: true, view: 'list' } });
+  assert.deepEqual(slides, ['push', 'pop']);
+  assert.equal(body.contains('show-detail'), false); assert.equal(c.chatVisible(), false);
+  c.windowEvents.popstate({ state: { sessionholic: true, view: 'detail' }, hasUAVisualTransition: true });
+  assert.deepEqual(slides, ['push', 'pop'], 'a browser-animated swipe gets no second slide');
+  assert.equal(body.contains('show-detail'), true);
+  await settle();
+});
+
+test('bottom sheets follow the finger, dismiss on a long or fast pull, step between heights and spring back when dismissal is refused', () => {
+  const c = client(undefined, noChatTimers);
+  const release = (fields) => c.sheetRelease({ height: 600, detent: 'medium', ...fields });
+  assert.equal(release({ offset: 30, velocity: 0.1 }), 'medium');
+  assert.equal(release({ offset: 200, velocity: 0.1 }), 'close');
+  assert.equal(release({ offset: 60, velocity: 0.9 }), 'close');
+  assert.equal(release({ offset: 260, velocity: 0.2, height: 800, detent: 'large' }), 'medium');
+  assert.equal(release({ offset: 500, velocity: 0.2, height: 800, detent: 'large' }), 'close');
+  assert.equal(release({ offset: -60, velocity: -0.1 }), 'large');
+  assert.equal(release({ offset: -20, velocity: -0.1 }), 'medium');
+  assert.equal(release({ offset: -60, detents: ['medium'] }), 'medium');
+  let now = 1000;
+  c.context.Date = { now: () => now };
+  c.context.window.matchMedia = (query) => ({ matches: query === '(max-width: 700px)' });
+  const dialog = node();
+  dialog.open = false;
+  dialog.classList = classes();
+  dialog.style = { props: {}, setProperty(name, value) { this.props[name] = value; } };
+  dialog.getBoundingClientRect = () => ({ top: 300, bottom: 900, left: 0, right: 412, height: 600 });
+  const handle = node();
+  handle.parentElement = dialog;
+  handle.closest = (selector) => (selector.includes('button') ? null : handle);
+  let dismissed = 0, allow = true;
+  const sheet = c.BottomSheet.attach(dialog, { onDismiss: () => { dismissed++; if (allow) dialog.close(); } });
+  assert.equal(c.BottomSheet.attach(dialog), sheet, 'one controller per dialog');
+  sheet.open();
+  assert.equal(dialog.open, true); assert.equal(dialog.dataset.detent, 'medium');
+  const pointer = (type, y, extra = {}) => dialog.events[type]({ pointerId: 1, clientY: y, clientX: 200, button: 0, target: handle,
+    cancelable: true, preventDefault() {}, ...extra });
+  pointer('pointerdown', 320); now = 1100; pointer('pointermove', 360);
+  assert.equal(dialog.style.props['--sheet-drag'], '40px'); assert.equal(dialog.classList.contains('is-dragging'), true);
+  now = 1300; pointer('pointerup', 360);
+  assert.equal(dismissed, 0, 'a short slow pull stays'); assert.equal(dialog.style.props['--sheet-drag'], '0px');
+  assert.equal(dialog.classList.contains('is-dragging'), false);
+  pointer('pointerdown', 320); now = 1400; pointer('pointermove', 600); now = 1700; pointer('pointerup', 600);
+  assert.equal(dismissed, 1); assert.equal(dialog.open, false);
+  sheet.open(); allow = false;
+  pointer('pointerdown', 320); now = 1800; pointer('pointermove', 620); now = 2100; pointer('pointerup', 620);
+  assert.equal(dismissed, 2); assert.equal(dialog.open, true, 'a refused dismissal keeps the sheet');
+  assert.equal(dialog.style.props['--sheet-drag'], '0px', 'and springs back');
+  pointer('pointerdown', 320); now = 2200; pointer('pointermove', 250);
+  assert.equal(dialog.style.props['--sheet-drag'], '-33px', 'pulling up resists');
+  now = 2400; pointer('pointerup', 250);
+  assert.equal(dialog.dataset.detent, 'large');
+  const button = node(); button.closest = () => button;
+  pointer('pointerdown', 320, { target: button }); now = 2500; pointer('pointermove', 700);
+  assert.equal(dialog.style.props['--sheet-drag'], '0px', 'header buttons keep their taps');
+  c.context.window.matchMedia = () => ({ matches: false });
+  pointer('pointerdown', 320); pointer('pointermove', 700);
+  assert.equal(dialog.style.props['--sheet-drag'], '0px', 'wide screens keep the centered dialog');
+  dialog.events.click({ target: dialog, clientX: 200, clientY: 100 });
+  assert.equal(dismissed, 3, 'a tap outside dismisses');
+  dialog.events.click({ target: dialog, clientX: 200, clientY: 500 });
+  assert.equal(dismissed, 3, 'a tap inside does not');
+});
+
+test('typing on a phone folds the conversation chrome, sending keeps the keyboard, and blur restores the layout', () => {
+  const c = client(undefined, noChatTimers);
+  const { s } = selectChat(c);
+  c.drawDetail(s);
+  const pane = c.get('detail');
+  pane.classList = classes();
+  const list = c.get('messages');
+  Object.assign(list, { scrollHeight: 2000, clientHeight: 300, scrollTop: 1700 });
+  const input = c.get('chat-input');
+  c.context.window.matchMedia = (query) => ({ matches: query === '(pointer: coarse)' || query === '(max-width: 700px)' });
+  input.events.focus();
+  assert.equal(pane.classList.contains('is-typing'), true);
+  assert.equal(list.scrollTop, 2000, 'the newest message stays in view');
+  input.events.blur();
+  assert.equal(pane.classList.contains('is-typing'), false);
+  c.context.window.matchMedia = () => ({ matches: false });
+  input.events.focus();
+  assert.equal(pane.classList.contains('is-typing'), false, 'a mouse and keyboard keep the full layout');
+  const send = c.get('chat-send');
+  let prevented = 0;
+  c.context.document.activeElement = input;
+  send.events.pointerdown({ preventDefault() { prevented++; } });
+  c.context.document.activeElement = null;
+  send.events.pointerdown({ preventDefault() { prevented++; } });
+  assert.equal(prevented, 1, 'focus is kept only while typing');
+  const css = styleSheet();
+  for (const part of ['.conversation-bar', '.continue-disclosure', '.chat-toolbar', '.detail-meta'])
+    assert.match(css, new RegExp(`\\.detail-pane\\.is-typing ${part.replace('.', '\\.')}`));
+});
+
+test('terminal text size pinches within the A−/A+ range, stores once on release, and keys are taller', () => {
+  const c = client(undefined, noChatTimers);
+  assert.equal(c.pinchFontSize(14, 100, 200), 24);
+  assert.equal(c.pinchFontSize(14, 100, 50), 10);
+  assert.equal(c.pinchFontSize(14, 100, 120), 17);
+  assert.equal(c.pinchFontSize(14, 0, 100), 14);
+  const writes = [];
+  c.context.navigator = { onLine: false };
+  c.context.localStorage = { getItem: () => null, removeItem() {}, setItem: (key, value) => writes.push([key, value]) };
+  c.windowEvents.DOMContentLoaded();
+  const term = { options: { fontSize: 14 } };
+  c.state.term = term; c.state.fontSize = 14;
+  c.state.connected = true; c.state.terminal = { id: 'term-1' };
+  const viewport = c.get('terminal-viewport');
+  const fingers = (distance) => [{ clientX: 0, clientY: 100 }, { clientX: distance, clientY: 100 }];
+  viewport.events.touchstart({ touches: fingers(100) });
+  viewport.events.touchmove({ touches: fingers(130), cancelable: true, preventDefault() {} });
+  assert.equal(c.state.fontSize, 18); assert.equal(term.options.fontSize, 18);
+  viewport.events.touchmove({ touches: fingers(400), cancelable: true, preventDefault() {} });
+  assert.equal(c.state.fontSize, 24);
+  assert.deepEqual(writes, [], 'nothing is stored mid-gesture');
+  viewport.events.touchend({ touches: [{ clientX: 0, clientY: 100 }] });
+  assert.deepEqual(writes, [['sessionholic:ui:fontSize', '24']]);
+  assert.match(c.get('toast').textContent, /글자 크기 24/);
+  viewport.events.touchmove({ touches: [{ clientX: 0, clientY: 300 }], cancelable: true, preventDefault() {} });
+  assert.equal(c.state.terminalScrollPending, 0, 'the finger left behind does not scroll');
+  c.get('terminal-font-up').events.click();
+  assert.equal(c.state.fontSize, 24);
+  c.get('terminal-font-down').events.click();
+  assert.equal(c.state.fontSize, 23); assert.equal(term.options.fontSize, 23);
+  const css = styleSheet();
+  assert.match(css, /\.terminal-keys \{[^}]*grid-template-rows: repeat\(2, 42px\)/);
+  assert.match(css, /\.terminal-screen:not\(\[hidden\]\) ~ \.toast \{\s*bottom: calc\(var\(--terminal-tools-h/);
+  assert.match(source, /D2Coding/); assert.match(source, /"Noto Sans Mono CJK KR"/);
+});
+
+test('the terminal library loads once on first open with versioned URLs, and a failed load is reported and can be retried', async () => {
+  const html = indexPage();
+  assert.doesNotMatch(html, /<(script|link)\b[^>]*(xterm|addon-fit)/, 'no terminal files on the board page');
+  assert.match(html, /<meta name="sessionholic-assets" content="\{\}"/);
+  const c = client(undefined, noChatTimers);
+  const appended = [];
+  c.context.document.head = { appendChild(item) { appended.push(item); } };
+  c.context.document.querySelector = (selector) => (selector === 'meta[name="sessionholic-assets"]'
+    ? { getAttribute: () => JSON.stringify({ '/vendor/xterm.js': 'abcdef12', '/vendor/addon-fit.js': '1234abcd', '/vendor/xterm.css': 'bad' }) } : null);
+  const first = c.loadXterm();
+  assert.equal(c.loadXterm(), first, 'one promise while loading');
+  assert.deepEqual(appended.map((item) => item.href || item.src), ['/vendor/xterm.css', '/vendor/xterm.js?v=abcdef12', '/vendor/addon-fit.js?v=1234abcd']);
+  assert.equal(appended[1].async, false); assert.equal(appended[2].async, false);
+  c.context.window.Terminal = function Terminal() {};
+  c.context.window.FitAddon = { FitAddon: function FitAddon() {} };
+  for (const item of appended) item.onload();
+  await first;
+  await c.loadXterm();
+  assert.equal(appended.length, 3, 'loaded once');
+  const d = client(undefined, noChatTimers);
+  const added = [];
+  d.context.document.head = { appendChild(item) { added.push(item); } };
+  const failed = d.loadXterm();
+  added[1].onerror();
+  await assert.rejects(failed);
+  d.loadXterm();
+  assert.equal(added.length, 6, 'opening again retries');
+  const e = client(undefined, noChatTimers);
+  e.context.document.head = { appendChild(item) { queueMicrotask(() => item.onerror()); } };
+  const viewport = e.get('terminal-viewport');
+  const loading = [];
+  viewport.classList = { add: (name) => loading.push(`+${name}`), remove: (name) => loading.push(`-${name}`) };
+  await e.openTerminal({ id: 'term-1', mode: 'attach' });
+  assert.deepEqual(loading, ['+is-loading', '-is-loading']);
+  assert.match(e.get('terminal-status').textContent, /불러오지 못했습니다/);
+  assert.match(e.get('terminal-error').textContent, /다시 열어/);
+});
+
+test('service worker serves versioned assets cache-first by full URL, drops older versions, keeps the page network-first and never caches APIs', async () => {
+  const listeners = {};
+  const store = new Map();
+  const cache = {
+    match: async (request) => store.get(typeof request === 'string' ? request : request.url),
+    put: async (request, response) => { store.set(typeof request === 'string' ? request : request.url, response); },
+    keys: async () => [...store.keys()].map((url) => ({ url })),
+    delete: async (request) => store.delete(request.url),
+  };
+  const fetched = [];
+  let online = true;
+  // Like the server: immutable only when the requested version is the current file.
+  const current = { '/app.js': 'aaaaaaaa' };
+  vm.runInNewContext(fs.readFileSync(path.join(__dirname, '../web/sw.js'), 'utf8'), {
+    self: { location: { origin: 'https://app.example' }, addEventListener: (type, handler) => { listeners[type] = handler; } },
+    URL, Set, Response,
+    fetch: async (request) => {
+      const url = typeof request === 'string' ? request : request.url;
+      fetched.push(url);
+      if (!online) throw new Error('offline');
+      const parsed = new URL(url, 'https://app.example');
+      const fresh = parsed.searchParams.get('v') === current[parsed.pathname];
+      return new Response(`body ${url}`, { headers: { 'Cache-Control': fresh ? 'public, max-age=31536000, immutable' : 'no-cache' } });
+    },
+    caches: { open: async () => cache, keys: async () => [] },
+  });
+  const run = async (route) => {
+    let response;
+    const waits = [];
+    listeners.fetch({ request: { method: 'GET', url: `https://app.example${route}` }, respondWith: (promise) => { response = promise; },
+      waitUntil: (promise) => waits.push(promise) });
+    if (!response) return null;
+    const result = await response;
+    await Promise.all(waits);
+    return result;
+  };
+  assert.match(await (await run('/app.js?v=aaaaaaaa')).text(), /aaaaaaaa/);
+  await run('/app.js?v=aaaaaaaa');
+  assert.equal(fetched.length, 1, 'a cached version is served without the network');
+  current['/app.js'] = 'bbbbbbbb';
+  await run('/app.js?v=bbbbbbbb');
+  assert.equal(fetched.length, 2);
+  assert.deepEqual([...store.keys()], ['https://app.example/app.js?v=bbbbbbbb'], 'older versions of the path are dropped');
+  online = false;
+  assert.match(await (await run('/app.js?v=bbbbbbbb')).text(), /bbbbbbbb/, 'versioned assets work offline');
+  online = true;
+  for (const route of ['/api/snapshot', '/api/events?host=a', '/api/chat/state', '/app.js?v=private', '/app.js?v=aaaaaaaa&x=1', '/?token=x', '/login'])
+    assert.equal(await run(route), null, route);
+  await run('/');
+  assert.ok(store.has('https://app.example/'));
+  online = false;
+  assert.match(await (await run('/')).text(), /body https:\/\/app\.example\//, 'the page falls back to its cached copy offline');
+  assert.equal((await run('/style.css')).status, 503, 'an uncached unversioned asset reports offline');
+  assert.ok(![...store.keys()].some((url) => url.includes('/api/')));
+});
+
+function serviceWorkerHarness(page = '') {
+  const listeners = {};
+  const store = new Map();
+  const key = (request) => new URL(typeof request === 'string' ? request : request.url, 'https://app.example').href;
+  // A Cache without add(): storing goes through fetch, a header check, then put.
+  const cache = {
+    match: async (request) => store.get(key(request)),
+    put: async (request, response) => { store.set(key(request), response); },
+    keys: async () => [...store.keys()].map((url) => ({ url })),
+    delete: async (request) => store.delete(key(request)),
+  };
+  const fetched = [];
+  const current = {};
+  vm.runInNewContext(fs.readFileSync(path.join(__dirname, '../web/sw.js'), 'utf8'), {
+    self: { location: { origin: 'https://app.example' }, addEventListener: (type, handler) => { listeners[type] = handler; },
+      skipWaiting() {} },
+    URL, Set, Response,
+    fetch: async (request) => {
+      const url = typeof request === 'string' ? request : request.url;
+      fetched.push(url);
+      const parsed = new URL(url, 'https://app.example');
+      if (parsed.pathname === '/') return new Response(page, { headers: { 'Cache-Control': 'no-cache' } });
+      const version = parsed.searchParams.get('v');
+      const fresh = version === current[parsed.pathname];
+      return new Response(`${parsed.pathname}@${current[parsed.pathname]}`,
+        { headers: { 'Cache-Control': fresh ? 'public, max-age=31536000, immutable' : 'no-cache' } });
+    },
+    caches: { open: async () => cache, keys: async () => [] },
+  });
+  const run = async (route) => {
+    let response;
+    const waits = [];
+    listeners.fetch({ request: { method: 'GET', url: `https://app.example${route}` }, respondWith: (promise) => { response = promise; },
+      waitUntil: (promise) => waits.push(promise) });
+    if (!response) return null;
+    const result = await response;
+    await Promise.all(waits);
+    return result;
+  };
+  return { listeners, store, fetched, current, run };
+}
+
+test('service worker keeps only responses the server marked immutable, so a mismatched version is never pinned to that URL', async () => {
+  const sw = serviceWorkerHarness();
+  sw.current['/app.js'] = 'aaaaaaaa';
+  await sw.run('/app.js?v=aaaaaaaa');
+  assert.deepEqual([...sw.store.keys()], ['https://app.example/app.js?v=aaaaaaaa']);
+  // A page that asks for v=bbbbbbbb before the server has it (or after a
+  // rollback) gets the current file with no-cache: shown, but not stored.
+  assert.equal(await (await sw.run('/app.js?v=bbbbbbbb')).text(), '/app.js@aaaaaaaa');
+  assert.deepEqual([...sw.store.keys()], ['https://app.example/app.js?v=aaaaaaaa'], 'not kept, and the valid version stays');
+  const before = sw.fetched.length;
+  await sw.run('/app.js?v=bbbbbbbb');
+  assert.equal(sw.fetched.length, before + 1, 'asked again rather than served from the cache');
+  // Once the server has that version it is immutable and cached for good.
+  sw.current['/app.js'] = 'bbbbbbbb';
+  assert.equal(await (await sw.run('/app.js?v=bbbbbbbb')).text(), '/app.js@bbbbbbbb');
+  assert.deepEqual([...sw.store.keys()], ['https://app.example/app.js?v=bbbbbbbb']);
+  const cached = sw.fetched.length;
+  assert.equal(await (await sw.run('/app.js?v=bbbbbbbb')).text(), '/app.js@bbbbbbbb');
+  assert.equal(sw.fetched.length, cached, 'served from the cache');
+  assert.match(fs.readFileSync(path.join(__dirname, '../web/sw.js'), 'utf8'), /const CACHE = "sessionholic-shell-v14";/,
+    'a new cache name drops entries stored by the older rule');
+});
+
+test('service worker precache stores only immutable versioned assets and skips the terminal library', async () => {
+  const versions = { '/app.js': 'aaaaaaaa', '/style.css': 'cccccccc', '/theme-init.js': 'eeeeeeee', '/vendor/xterm.js': 'dddddddd',
+    '/session_labels.js': 'abababab', '/api/snapshot': 'ffffffff' };
+  const page = `<meta name="sessionholic-assets" content="${JSON.stringify(versions).replace(/"/g, '&quot;')}">`;
+  const sw = serviceWorkerHarness(page);
+  // The server already serves a different app.js than the page names.
+  Object.assign(sw.current, { '/app.js': '99999999', '/style.css': 'cccccccc', '/theme-init.js': 'eeeeeeee', '/vendor/xterm.js': 'dddddddd', '/session_labels.js': 'abababab' });
+  let installed;
+  sw.listeners.install({ waitUntil: (promise) => { installed = promise; } });
+  await installed;
+  assert.deepEqual([...sw.store.keys()].sort(), ['https://app.example/', 'https://app.example/session_labels.js?v=abababab', 'https://app.example/style.css?v=cccccccc',
+    'https://app.example/theme-init.js?v=eeeeeeee']);
+  assert.ok(sw.fetched.includes('/app.js?v=aaaaaaaa'), 'fetched, then refused by its header');
+  assert.ok(!sw.fetched.some((url) => url.includes('xterm') || url.includes('/api/')));
+});
+
+test('a list still being collected says how old it is, outside the cards, and the note clears when collection ends', () => {
+  const c = client(undefined, noChatTimers);
+  const now = 1800000000;
+  c.state.snapshot = { serverTime: now, hosts: [{ name: 'a', refreshing: true, fetchedAt: now - 300 },
+    { name: 'b', refreshing: false, fetchedAt: now - 3000 }] };
+  c.renderFreshness(now);
+  assert.equal(c.get('list-freshness').textContent, '5분 전 기준 · 갱신 중');
+  assert.equal(c.get('list-freshness').hidden, false);
+  c.state.snapshot.hosts[0].fetchedAt = now - 20;
+  c.renderFreshness(now);
+  assert.equal(c.get('list-freshness').hidden, true, 'a fresh list needs no note');
+  c.state.snapshot.hosts[0] = { name: 'a', refreshing: false, fetchedAt: now - 300 };
+  c.renderFreshness(now);
+  assert.equal(c.get('list-freshness').hidden, true); assert.equal(c.get('list-freshness').textContent, '');
+  assert.match(indexPage(), /id="list-freshness"[\s\S]*id="groups"/);
+});
+
+function fakeEventSource() {
+  const sources = [];
+  class FakeEventSource {
+    constructor(url) { this.url = url; this.readyState = 0; this.listeners = {}; this.closed = false; sources.push(this); }
+    addEventListener(type, callback) { this.listeners[type] = callback; }
+    emit(type, data) { this.listeners[type]?.({ data: data === undefined ? undefined : JSON.stringify(data) }); }
+    close() { this.closed = true; this.readyState = 2; }
+  }
+  return { FakeEventSource, sources };
+}
+
+test('live updates follow the open conversation, reread only on newer events, slow polling to a safety net and fall back after errors', async () => {
+  const requests = [];
+  const timers = [];
+  let c;
+  c = client(async (url, options) => {
+    requests.push(url);
+    return { ok: true, status: 200, json: async () => (url.startsWith('/api/snapshot') ? { hosts: c.state.snapshot.hosts, version: 7 }
+      : { route: JSON.parse(options.body).source, capability: { supported: true }, phase: 'working', messages: [] }) };
+  }, { setTimeout: (callback, ms) => {
+    // Announced snapshots are read after a 300ms batch; run that one at once.
+    if (ms === 300) { setImmediate(callback); return 'batch'; }
+    timers.push(ms); return timers.length;
+  }, clearTimeout() {} });
+  const { FakeEventSource, sources } = fakeEventSource();
+  c.context.EventSource = FakeEventSource;
+  const { s } = selectChat(c);
+  c.state.detailShown = true;
+  c.state.capabilities = {};
+  c.state.capabilitiesRevision = c.capabilitiesRevision(c.state.snapshot);
+  c.state.usageAt = Date.now();
+  c.state.detailFor = s.key; c.state.detailUpdatedAt = s.updatedAt;
+  c.state.detailRevision = vm.runInContext('detailRevision', c.context)(c.allSessions().find((item) => item.key === s.key));
+  c.syncEvents();
+  assert.equal(sources.length, 1);
+  assert.equal(sources[0].url, '/api/events?host=workstation&agent=codex&home=.codex-example&id=native-session');
+  c.syncEvents();
+  assert.equal(sources.length, 1, 'the same conversation keeps its stream');
+  assert.equal(c.chatPollDelay(0), 3000);
+  c.state.snapshot.hosts[0].refreshing = true;
+  c.state.refreshDeadline = Date.now() + 60000;
+  sources[0].emit('hello', { snapshotVersion: 3 });
+  await settle();
+  assert.equal(c.eventsHealthy(), true);
+  assert.equal(requests.filter((url) => url === '/api/snapshot').length, 1, 'the first announced version is read once');
+  assert.equal(c.state.snapshotVersion, 7);
+  assert.equal(c.chatPollDelay(0), 30000, 'conversation polling becomes a 30s safety net');
+  timers.length = 0; c.schedule();
+  assert.deepEqual(timers, [60000], 'snapshot polling becomes a 60s safety net even while collecting');
+  requests.length = 0;
+  sources[0].emit('snapshot', { version: 7 });
+  await settle();
+  assert.deepEqual(requests, [], 'a version already shown reads nothing');
+  sources[0].emit('snapshot', { version: 8 });
+  await settle();
+  assert.deepEqual(requests, ['/api/snapshot']);
+  requests.length = 0;
+  sources[0].emit('chat', { digest: 'd1' });
+  await settle();
+  assert.deepEqual(requests, ['/api/chat/state']);
+  sources[0].emit('chat', { digest: 'd1' });
+  await settle();
+  assert.deepEqual(requests, ['/api/chat/state'], 'an unchanged digest reads nothing');
+  c.state.detailShown = false;
+  c.context.window.matchMedia = (query) => ({ matches: query === '(max-width: 700px)' });
+  c.syncEvents();
+  assert.equal(sources[0].closed, true);
+  assert.equal(sources[1].url, '/api/events', 'the list alone subscribes to snapshots only');
+  c.context.window.matchMedia = () => ({ matches: false });
+  c.context.document.hidden = true; c.syncEvents();
+  assert.equal(sources[1].closed, true); assert.equal(c.state.events, null, 'a hidden page closes the stream');
+  c.context.document.hidden = false; c.syncEvents();
+  assert.equal(sources.length, 3);
+  sources[2].emit('open');
+  assert.equal(c.eventsHealthy(), true);
+  for (let index = 0; index < 3; index++) sources[2].emit('error');
+  assert.equal(sources[2].closed, true, 'three errors within 30 seconds fall back');
+  assert.equal(c.eventsHealthy(), false);
+  assert.equal(c.chatPollDelay(0), 3000, 'polling returns to its normal backoff');
+  timers.length = 0; c.schedule();
+  assert.deepEqual(timers, [2000], 'and to the 2s collection loop');
+  c.syncEvents();
+  assert.equal(sources.length, 3, 'no reconnect right after a fallback');
+  c.state.eventsRetryAt = 0;
+  c.syncEvents();
+  sources[3].emit('open');
+  timers.length = 0; c.schedule();
+  assert.deepEqual(timers, [60000]);
+  timers.length = 0;
+  sources[3].readyState = 2;
+  sources[3].emit('error');
+  assert.equal(c.state.events, null, 'a healthy stream closed for good falls back');
+  assert.deepEqual(timers, [2000, 3000], 'and both safety timers (60s list, 30s conversation) return to the normal pace at once');
+  const d = client(undefined, noChatTimers);
+  const second = fakeEventSource();
+  d.context.EventSource = second.FakeEventSource;
+  selectChat(d);
+  d.syncEvents();
+  second.sources[0].readyState = 2;
+  second.sources[0].emit('error');
+  assert.equal(d.state.events, null, 'a server without /api/events (closed before opening) falls back at once');
+  const e = client(undefined, noChatTimers);
+  selectChat(e);
+  e.syncEvents();
+  assert.equal(e.state.events, null, 'no EventSource: the existing polling stays');
+});
+
+// --- UI round 2: list header, sending, gestures, attachments, states, text size ---
+
+test('status chips filter the list to answers or running work, keep both counts, and clear on a second tap', () => {
+  const c = client(undefined, noChatTimers);
+  const rows = [recentSession('wait-a', { phase: 'needs_input', updatedAt: 1090 }), recentSession('wait-b', { phase: 'needs_input', updatedAt: 1080 }),
+    recentSession('run', { phase: 'working', updatedAt: 1070 }), recentSession('idle', { updatedAt: 1060 })];
+  setRecentSnapshot(c, rows);
+  vm.runInContext('render()', c.context);
+  const chips = c.get('counts').children;
+  assert.deepEqual(chips.map((chip) => chip.tagName), ['BUTTON', 'BUTTON']);
+  assert.deepEqual(chips.map((chip) => chip.chipLabel.textContent), ['답 필요 2', '작업 중 1']);
+  assert.deepEqual(chips.map((chip) => chip.attributes['aria-pressed']), ['false', 'false']);
+  assert.equal(byClass(c.get('groups'), 'card').length, 4);
+  chips[0].events.click();
+  assert.equal(c.state.phaseFilter, 'needs_input');
+  assert.deepEqual(byClass(c.get('groups'), 'card').map((card) => card.dataset.sessionKey), [rows[0].key, rows[1].key]);
+  const after = c.get('counts').children;
+  assert.equal(after[0], chips[0], 'the chip keeps its element (and keyboard focus)');
+  assert.equal(after[0].attributes['aria-pressed'], 'true');
+  assert.match(after[0].className, /is-active/);
+  assert.equal(after[1].chipLabel.textContent, '작업 중 1', 'the other chip keeps its count');
+  assert.equal(c.get('session-count').textContent, '2개');
+  assert.equal(c.context.document.title, '(2) 답 필요 · 세션홀릭', 'the tab title still counts every waiting session');
+  after[1].events.click();
+  assert.equal(c.state.phaseFilter, 'working');
+  assert.deepEqual(byClass(c.get('groups'), 'card').map((card) => card.dataset.sessionKey), [rows[2].key]);
+  after[1].events.click();
+  assert.equal(c.state.phaseFilter, '');
+  assert.equal(byClass(c.get('groups'), 'card').length, 4);
+  assert.equal(c.matches(rows[3], 1100), true);
+  // A filter that leaves nothing explains itself and clears with one tap.
+  c.state.snapshot.hosts[0].data.codex = rows.filter((s) => s.phase !== 'working');
+  after[1].events.click();
+  assert.match(textOf(c.get('groups')), /작업 중인 세션이 없습니다/);
+  byClass(c.get('groups'), 'secondary')[0].events.click();
+  assert.equal(c.state.phaseFilter, '');
+  assert.equal(byClass(c.get('groups'), 'card').length, 3);
+});
+
+test('the usage line is one chip that opens a sheet of per-account bars, and open terminals live in their own sheet', () => {
+  const c = client(undefined, noChatTimers);
+  c.context.navigator = { onLine: false };
+  c.windowEvents.DOMContentLoaded();
+  c.renderUsage({ available: true, providers: [{ short: 'CX', label: 'Codex', remaining: 45, status: 'ready', rows: [
+    { name: '개인', windows: [{ label: '주간', remaining: 45 }] }] }] });
+  assert.equal(c.get('usage').hidden, false);
+  assert.match(c.get('usage').attributes['aria-label'], /남은 사용량 Codex 45%.*계정별로 보기/);
+  c.get('usage').events.click();
+  assert.equal(c.get('usage-dialog').open, true);
+  assert.match(textOf(c.get('usage-body')), /개인.*주간.*45%/);
+  c.get('usage-close').events.click();
+  assert.equal(c.get('usage-dialog').open, false);
+  assert.equal(c.get('usage').focusCount, 1, 'focus returns to the chip');
+  c.state.terminals = [{ id: 'one', alive: true, title: '열어 둔 작업', host: 'workstation', agent: 'claude', mode: 'attach' }];
+  c.renderTerminals();
+  assert.equal(c.get('running-terminals').hidden, false);
+  assert.equal(c.get('running-count').textContent, 1);
+  c.get('running-terminals').events.click();
+  assert.equal(c.get('terminals-dialog').open, true);
+  // A connection to an existing session is folded under one row until asked for.
+  assert.doesNotMatch(textOf(c.get('running-list')), /열어 둔 작업/);
+  byClass(c.get('running-list'), 'running-connections')[0].events.click();
+  assert.match(textOf(c.get('running-list')), /열어 둔 작업/);
+  c.state.terminals = [];
+  c.renderTerminals();
+  assert.equal(c.get('running-terminals').hidden, true);
+  assert.equal(c.get('terminals-dialog').open, false, 'an emptied list closes its sheet');
+  // The filter sheet holds the selects and the old-conversations switch; its button counts what applies.
+  c.state.filters.agent = 'codex'; c.state.showOld = true;
+  c.renderFilters([]);
+  assert.equal(c.get('filter-count').textContent, '2');
+  assert.equal(c.get('filter-open').attributes['aria-label'], '필터 2개 적용됨');
+  c.get('filter-reset').events.click();
+  assert.equal(c.state.filters.agent, ''); assert.equal(c.state.showOld, false);
+  assert.equal(c.get('filter-count').textContent, '');
+  const html = indexPage();
+  for (const id of ['usage-dialog', 'filter-dialog', 'terminals-dialog', 'action-sheet'])
+    assert.match(html, new RegExp(`<dialog id="${id}" class="plan-dialog sheet`));
+  assert.match(html, /id="terminal-return"[\s\S]*<\/aside>/, 'the terminal bar floats inside the list');
+});
+
+test('after an answer a still-working session shows no "작업 중" until a message is sent, which brings it back right after the bubble', async () => {
+  let release; let stage = 'answered'; const sends = [];
+  const now = Math.floor(Date.now() / 1000);
+  const c = client(async (url, options) => {
+    const body = JSON.parse(options.body);
+    if (url === '/api/chat/send') {
+      sends.push(body);
+      return await new Promise((resolve) => { release = () => resolve({ ok: true, status: 200, json: async () => ({ status: 'accepted', receipt: {} }) }); });
+    }
+    const messages = [{ role: 'user', text: '정리해 주세요', ts: now - 120, itemId: 'item-user-0', clientId: null },
+      { role: 'assistant', text: '정리했습니다', ts: now - 60, itemId: 'item-answer-0', clientId: null }];
+    if (stage !== 'answered') messages.push({ role: 'user', text: '이것도 해 주세요', ts: now, itemId: 'item-user-1', clientId: sends[0].requestId });
+    if (stage === 'done') messages.push({ role: 'assistant', text: '그것도 했습니다', ts: now + 5, itemId: 'item-answer-1', clientId: null });
+    return { ok: true, status: 200, json: async () => ({ route: body.source, capability: { supported: true }, phase: 'working',
+      workingSince: now - 30, receipts: body.requestId ? [{ requestId: body.requestId, status: 'accepted' }] : [], messages }) };
+  }, noChatTimers);
+  const { s, entry } = selectChat(c);
+  wireTree(c, c.buildChatComposer(s)); await settle();
+  await c.loadChatState(s, true);
+  const list = c.get('messages');
+  const working = () => list.children.filter((row) => /msg-working/.test(row.className));
+  assert.equal(entry.data.phase, 'working');
+  assert.equal(working().length, 0, 'the answer is the newest row');
+  c.get('chat-input').value = entry.text = '이것도 해 주세요';
+  const pending = c.sendChat(entry);
+  const bubble = list.children.find((row) => /is-outbox/.test(row.className));
+  assert.match(bubble.className, /is-sending/);
+  assert.equal(list.children.at(-2), bubble);
+  assert.match(list.children.at(-1).className, /msg-working/, 'right after the bubble sent from here');
+  assert.match(list.children.at(-1).workingTime.textContent, /^ · 3[0-2]초$/, 'Codex counts its exact turn start');
+  await settle();
+  stage = 'delivered';
+  release(); await pending; await settle();
+  assert.equal(list.children.some((row) => /is-outbox/.test(row.className)), false);
+  assert.equal(list.children.at(-2).messageItem.message.text, '이것도 해 주세요');
+  assert.match(list.children.at(-1).className, /msg-working/, 'the transcript\'s own user row still waits');
+  stage = 'done';
+  await c.loadChatState(s, true);
+  assert.equal(working().length, 0);
+});
+
+test('sending shows the bubble at once, keeps but hides the draft, and gives way to the transcript row', async () => {
+  let release; let delivered = false; const sends = [];
+  const now = Math.floor(Date.now() / 1000);
+  const c = client(async (url, options) => {
+    const body = JSON.parse(options.body);
+    if (url === '/api/chat/send') {
+      sends.push(body);
+      return await new Promise((resolve) => { release = () => resolve({ ok: true, status: 200, json: async () => ({ status: 'accepted', receipt: {} }) }); });
+    }
+    // A Codex state read names each item and the request a board message came from.
+    return { ok: true, status: 200, json: async () => ({ route: body.source, capability: { supported: true }, phase: 'working',
+      receipts: body.requestId ? [{ requestId: body.requestId, status: 'accepted' }] : [],
+      messages: [{ role: 'assistant', text: '이전 답변', ts: now - 60, itemId: 'item-answer-0', clientId: null },
+        ...(delivered ? [{ role: 'user', text: '테스트를 다시 돌려 주세요', ts: now, itemId: 'item-user-1', clientId: sends[0].requestId }] : [])] }) };
+  }, noChatTimers);
+  const { s, entry } = selectChat(c);
+  wireTree(c, c.buildChatComposer(s)); await settle();
+  await c.loadChatState(s, true);
+  const list = c.get('messages');
+  const input = c.get('chat-input'); input.value = entry.text = '테스트를 다시 돌려 주세요';
+  const pending = c.sendChat(entry);
+  // Before any answer: a translucent "전송 중" bubble after the transcript, before the working row.
+  const outbox = () => list.children.filter((row) => /is-outbox/.test(row.className));
+  assert.equal(outbox().length, 1);
+  assert.match(outbox()[0].className, /is-outbox is-sending/);
+  assert.match(textOf(outbox()[0]), /테스트를 다시 돌려 주세요.*전송 중/);
+  assert.match(list.children.at(-1).className, /msg-working/);
+  assert.match(c.get('chat-composer').className, /is-sent-draft/, 'the kept draft is drawn empty');
+  assert.equal(entry.text, '테스트를 다시 돌려 주세요', 'and is not cleared before the server accepts it');
+  await settle();
+  assert.equal(sends.length, 1);
+  delivered = true;
+  release(); await pending; await settle();
+  assert.equal(entry.text, ''); assert.equal(input.value, '');
+  assert.equal(entry.outbox.length, 0, 'the transcript has the message now');
+  assert.equal(outbox().length, 0);
+  assert.equal(list.children.filter((row) => row.messageItem?.message.text === '테스트를 다시 돌려 주세요').length, 1);
+  assert.doesNotMatch(c.get('chat-composer').className, /is-sent-draft/);
+  // Accepted but not yet in the transcript (a queued turn): the bubble stays, labelled.
+  const d = client(async (url, options) => {
+    const body = JSON.parse(options.body);
+    if (url === '/api/chat/send') return { ok: true, status: 200, json: async () => ({ status: 'queued', receipt: {} }) };
+    return { ok: true, status: 200, json: async () => ({ route: body.source, capability: { supported: true }, phase: 'working', receipts: [], messages: [] }) };
+  }, noChatTimers);
+  const queued = selectChat(d);
+  wireTree(d, d.buildChatComposer(queued.s)); await settle();
+  d.renderMessages(queued.s, []);
+  queued.entry.text = '끝나면 이어서 해 주세요';
+  await d.sendChat(queued.entry); await settle();
+  const bubble = d.get('messages').children.find((row) => /is-outbox/.test(row.className));
+  assert.match(bubble.className, /is-sent/);
+  assert.match(textOf(bubble), /대기 중/);
+});
+
+test('a refused send becomes "보내지 못함 · 다시 보내기", shows the kept draft again and resends only when asked', async () => {
+  const sends = [];
+  const c = client(async (url, options) => {
+    const body = JSON.parse(options.body);
+    if (url === '/api/chat/send') {
+      sends.push(body.requestId);
+      if (sends.length === 1) return { ok: false, status: 409, json: async () => ({
+        error: '현재 실행 중인 작업은 새 입력을 받을 수 없습니다.', dispatchState: 'not_started' }) };
+      return { ok: true, status: 200, json: async () => ({ status: 'queued', receipt: {} }) };
+    }
+    return { ok: true, status: 200, json: async () => ({ route: body.source, capability: { supported: true }, phase: 'working',
+      receipts: [], messages: [{ role: 'assistant', text: '진행 중' }] }) };
+  }, noChatTimers);
+  const { s, entry } = selectChat(c);
+  wireTree(c, c.buildChatComposer(s)); await settle();
+  c.renderMessages(s, [{ role: 'assistant', text: '진행 중' }]);
+  const input = c.get('chat-input'); input.value = entry.text = '끝나면 요약해 주세요';
+  await c.sendChat(entry); await settle();
+  const failed = c.get('messages').children.find((row) => /is-outbox/.test(row.className));
+  assert.match(failed.className, /is-failed/);
+  assert.match(textOf(failed), /끝나면 요약해 주세요.*보내지 못함/);
+  assert.equal(failed.deliveryStatus.title, '현재 실행 중인 작업은 새 입력을 받을 수 없습니다.');
+  const retry = byClass(failed, 'msg-retry')[0];
+  assert.equal(retry.textContent, '다시 보내기');
+  assert.equal(entry.text, '끝나면 요약해 주세요'); assert.equal(input.value, '끝나면 요약해 주세요');
+  assert.doesNotMatch(c.get('chat-composer').className, /is-sent-draft/, 'the kept draft shows again');
+  assert.match(c.get('chat-status').textContent, /새 입력을 받을 수 없습니다.*전송되지 않았습니다/);
+  assert.equal(sends.length, 1, 'nothing is resent by itself');
+  retry.events.click(); await settle();
+  assert.equal(sends.length, 2);
+  assert.notEqual(sends[1], sends[0], 'an explicit resend is a new request');
+  assert.deepEqual(Array.from(entry.outbox, (item) => [item.state, item.status]), [['sent', 'queued']]);
+  assert.equal(entry.text, '');
+  // A runtime refusal reported in a 200 receipt (NOT_STEERABLE) is a failed bubble too.
+  const d = client(async (url, options) => {
+    const body = JSON.parse(options.body);
+    if (url === '/api/chat/send') return { ok: true, status: 200, json: async () => ({ status: 'failed',
+      receipt: { confirmed: false, reason: '현재 실행 중인 작업(/review·/compact 등)은 새 입력을 받을 수 없습니다. 끝난 뒤 다시 보내 주세요.' } }) };
+    return { ok: true, status: 200, json: async () => ({ route: body.source, capability: { supported: true }, phase: 'working', receipts: [], messages: [] }) };
+  }, noChatTimers);
+  const second = selectChat(d);
+  wireTree(d, d.buildChatComposer(second.s)); await settle();
+  d.renderMessages(second.s, []);
+  second.entry.text = '리뷰가 끝나면 알려 주세요';
+  await d.sendChat(second.entry); await settle();
+  assert.match(d.get('messages').children.find((row) => /is-outbox/.test(row.className)).className, /is-failed/);
+  assert.equal(second.entry.text, '리뷰가 끝나면 알려 주세요');
+  assert.equal(second.entry.pending, null);
+});
+
+test('resending a refused bubble sends that message and its files only, and leaves a different draft in the editor', async () => {
+  const sends = [];
+  const c = client(async (url, options) => {
+    const body = JSON.parse(options.body);
+    if (url === '/api/chat/send') {
+      sends.push(body);
+      if (sends.length === 1) return { ok: false, status: 409, json: async () => ({
+        error: '현재 실행 중인 작업은 새 입력을 받을 수 없습니다.', dispatchState: 'not_started' }) };
+      return { ok: true, status: 200, json: async () => ({ status: 'accepted', receipt: {} }) };
+    }
+    return { ok: true, status: 200, json: async () => ({ route: body.source, capability: { supported: true }, phase: 'working',
+      receipts: [], messages: [{ role: 'assistant', text: '진행 중' }] }) };
+  }, noChatTimers);
+  const { s, entry } = selectChat(c);
+  wireTree(c, c.buildChatComposer(s)); await settle();
+  c.renderMessages(s, [{ role: 'assistant', text: '진행 중' }]);
+  const input = c.get('chat-input');
+  input.value = entry.text = '메시지 A';
+  entry.attachments = [{ id: 'file-a', name: 'a.png', type: 'image/png', size: 10 }];
+  await c.sendChat(entry); await settle();
+  const failed = c.get('messages').children.find((row) => /is-outbox/.test(row.className));
+  assert.match(failed.className, /is-failed/);
+  // The user drops A's file, writes B, then taps A's "다시 보내기".
+  entry.attachments = []; entry.revision++;
+  input.value = '초안 B'; input.events.input();
+  byClass(failed, 'msg-retry')[0].events.click(); await settle();
+  assert.equal(sends.length, 2);
+  assert.equal(sends[1].text, '메시지 A', 'the bubble\'s own text');
+  assert.deepEqual(sends[1].attachments, ['file-a'], 'and its own files');
+  assert.notEqual(sends[1].requestId, sends[0].requestId, 'a refused request gets a new id');
+  assert.deepEqual(Array.from(entry.outbox, (item) => [item.text, item.state]), [['메시지 A', 'sent']]);
+  assert.equal(entry.text, '초안 B', 'the other draft is kept'); assert.equal(input.value, '초안 B');
+  assert.equal(entry.attachments.length, 0);
+  assert.equal(entry.pending, null);
+  assert.ok(!sends.some((body) => body.text === '초안 B'), 'and is never sent by itself');
+  // With the editor emptied instead, the message comes back to it and leaves once accepted.
+  const emptied = [];
+  const d = client(async (url, options) => {
+    const body = JSON.parse(options.body);
+    if (url === '/api/chat/send') {
+      emptied.push(body);
+      if (emptied.length === 1) return { ok: false, status: 409, json: async () => ({ error: '거절', dispatchState: 'not_started' }) };
+      return { ok: true, status: 200, json: async () => ({ status: 'accepted', receipt: {} }) };
+    }
+    return { ok: true, status: 200, json: async () => ({ route: body.source, capability: { supported: true }, phase: 'idle', receipts: [], messages: [] }) };
+  }, noChatTimers);
+  const second = selectChat(d);
+  wireTree(d, d.buildChatComposer(second.s)); await settle();
+  d.renderMessages(second.s, []);
+  const editor = d.get('chat-input');
+  editor.value = second.entry.text = '메시지 C';
+  await d.sendChat(second.entry); await settle();
+  editor.value = ''; editor.events.input();
+  byClass(d.get('messages').children.find((row) => /is-failed/.test(row.className)), 'msg-retry')[0].events.click();
+  assert.equal(second.entry.text, '메시지 C', 'back in the editor while it is sent');
+  await settle();
+  assert.equal(emptied[1].text, '메시지 C');
+  assert.equal(second.entry.text, ''); assert.equal(editor.value, '');
+});
+
+test('one transcript message settles one bubble, matched by its whole text and attachment count, never by an earlier message', () => {
+  const c = client(undefined, noChatTimers);
+  // Claude rows carry no identifiers, so a Claude bubble is matched by its text.
+  const { s, entry } = selectChat(c, { agent: 'claude', home: '.claude', id: 'claude-session' });
+  wireTree(c, c.buildChatComposer(s));
+  const now = Date.now(); const ts = Math.floor(now / 1000);
+  const bubble = (requestId, text, extra = {}) => ({ requestId, text, attachments: [], state: 'sent', status: 'accepted', reason: '',
+    at: now, base: 0, ...extra });
+  const pending = () => entry.outbox.map((item) => item.requestId);
+  // The same text sent twice, both accepted; the transcript shows one so far.
+  entry.outbox = [bubble('req-first-0001', '다시 확인해 주세요', { at: now - 2000 }),
+    bubble('req-second-0002', '다시 확인해 주세요', { at: now - 1000 })];
+  const earlier = { role: 'user', text: '다시 확인해 주세요', ts: ts - 600 };
+  const first = { role: 'user', text: '다시 확인해 주세요\n', ts };
+  c.renderMessages(s, [earlier, first]);
+  assert.deepEqual(pending(), ['req-second-0002']);
+  assert.equal(c.get('messages').children.filter((row) => /is-outbox/.test(row.className)).length, 1, 'one bubble left on screen');
+  c.renderMessages(s, [earlier, first]);
+  assert.deepEqual(pending(), ['req-second-0002'], 'a message that settled a bubble never settles another on a later render');
+  c.renderMessages(s, [earlier, first, { role: 'user', text: '  다시   확인해 주세요 ', ts: ts + 1 }]);
+  assert.deepEqual(pending(), []);
+  // Neither a longer message containing the text, another attachment count,
+  // nor the same message from before the send settles a bubble by its text.
+  // (An unconfirmed bubble: a delivered Claude bubble would take the next new
+  // message through the safety net, tested on its own below.)
+  entry.outbox = [bubble('req-third-0003', '확인', { state: 'uncertain', status: 'unknown',
+    attachments: [{ id: 'f', name: 'a.png', type: 'image/png', kind: 'image' }] })];
+  const others = [{ role: 'user', text: '확인', ts: ts - 120, attachments: [{ kind: 'image' }] },
+    { role: 'user', text: '다시 확인할까요', ts: ts + 2, attachments: [{ kind: 'image' }] },
+    { role: 'user', text: '확인', ts: ts + 2 }];
+  c.settleOutbox(entry, others);
+  assert.deepEqual(pending(), ['req-third-0003']);
+  // A Claude message carries its file as a "첨부 파일:" line the server appended.
+  c.settleOutbox(entry, [...others, { role: 'user', text: '확인\n첨부 파일: /work/a.png', ts: ts + 3 }]);
+  assert.deepEqual(pending(), []);
+  // A Codex message with only an image reads "[이미지 첨부]".
+  entry.outbox = [bubble('req-image-0004', '', { attachments: [{ id: 'g', name: 'b.png', type: 'image/png', kind: 'image' }] })];
+  c.settleOutbox(entry, [{ role: 'user', text: '[이미지 첨부]', ts: ts + 4, attachments: [{ kind: 'image' }] }]);
+  assert.deepEqual(pending(), []);
+  // Without times, only messages after those on screen at the send count.
+  entry.outbox = [bubble('req-untimed-0005', '계속', { base: 2 })];
+  const untimed = [{ role: 'user', text: '계속' }, { role: 'assistant', text: '네' }];
+  c.settleOutbox(entry, untimed);
+  assert.deepEqual(pending(), ['req-untimed-0005']);
+  c.settleOutbox(entry, [...untimed, { role: 'user', text: '계속' }]);
+  assert.deepEqual(pending(), []);
+  // A Codex row names its request: another request's row never settles it, its
+  // own does even when it joined a turn that started before the send.
+  const d = client(undefined, noChatTimers);
+  const codex = selectChat(d).entry;
+  codex.outbox = [bubble('req-codex-0006', '계속 진행')];
+  d.settleOutbox(codex, [{ role: 'user', text: '계속 진행', ts: ts + 5, itemId: 'item-9', clientId: 'req-other-0099' }]);
+  assert.deepEqual(codex.outbox.map((item) => item.requestId), ['req-codex-0006']);
+  d.settleOutbox(codex, [{ role: 'user', text: '계속 진행', ts: ts - 300, itemId: 'item-6', clientId: 'req-codex-0006' }]);
+  assert.deepEqual(codex.outbox.map((item) => item.requestId), []);
+  // A cut long message is compared by its beginning.
+  const long = '가'.repeat(5000);
+  entry.outbox = [bubble('req-long-0007', long)];
+  c.settleOutbox(entry, [{ role: 'user', text: long.slice(0, 4000) + ' …', truncated: true, fullLength: 5000, ts: ts + 6 }]);
+  assert.deepEqual(pending(), []);
+});
+
+test('the same text sent 10 seconds earlier never settles the new bubble, also after switching away and back', async () => {
+  const now = Math.floor(Date.now() / 1000);
+  const sends = []; let delivered = false;
+  const earlier = [{ role: 'user', text: '계속 진행해 주세요', ts: now - 10 }, { role: 'assistant', text: '진행했습니다', ts: now - 5 }];
+  const c = client(async (url, options) => {
+    const body = JSON.parse(options.body);
+    if (url === '/api/chat/send') { sends.push(body); return { ok: true, status: 200, json: async () => ({ status: 'accepted', receipt: {} }) }; }
+    return { ok: true, status: 200, json: async () => ({ route: body.source, capability: { supported: true }, phase: 'working', receipts: [],
+      messages: [...earlier, ...(delivered ? [{ role: 'user', text: '계속 진행해 주세요', ts: now }] : [])] }) };
+  }, noChatTimers);
+  const claude = { agent: 'claude', home: '.claude', id: 'claude-session' };
+  const { s, entry } = selectChat(c, claude);
+  wireTree(c, c.buildChatComposer(s)); await settle();
+  await c.loadChatState(s, true);
+  entry.text = '계속 진행해 주세요';
+  await c.sendChat(entry); await settle();
+  assert.equal(sends.length, 1);
+  const bubbles = () => c.get('messages').children.filter((row) => /is-outbox/.test(row.className)).length;
+  assert.equal(entry.outbox.length, 1, 'the message already there is not the one just sent');
+  assert.equal(bubbles(), 1);
+  await c.loadChatState(s, true); await settle();
+  assert.equal(entry.outbox.length, 1, 'nor on the next read');
+  // Another conversation and back: the bubble still knows what it was sent after.
+  const other = selectChat(c, { ...claude, id: 'claude-other' });
+  c.renderMessages(other.s, []);
+  assert.equal(bubbles(), 0);
+  assert.equal(selectChat(c, claude).entry, entry);
+  await c.loadChatState(s, true); await settle();
+  assert.equal(entry.outbox.length, 1);
+  assert.equal(bubbles(), 1);
+  delivered = true;
+  await c.loadChatState(s, true); await settle();
+  assert.equal(entry.outbox.length, 0, 'its own message settles it');
+  assert.equal(bubbles(), 0);
+  assert.equal(c.get('messages').children.filter((row) => row.messageItem?.message.text === '계속 진행해 주세요').length, 2);
+});
+
+test('a Codex bubble settles only by its request id, and /api/read rows without ids never settle a second bubble of the same text', async () => {
+  const now = Math.floor(Date.now() / 1000);
+  const sends = []; const reads = [];
+  let stateFails = false;
+  const answer = { role: 'assistant', text: '확인했습니다', ts: now - 30 };
+  let stateRows = [{ ...answer, itemId: 'item-answer', clientId: null }];
+  let readRows = [answer];
+  const c = client(async (url, options) => {
+    if (url.startsWith('/api/read')) { reads.push(url); return { ok: true, status: 200, json: async () => ({ messages: readRows }) }; }
+    const body = JSON.parse(options.body);
+    if (url === '/api/chat/send') { sends.push(body); return { ok: true, status: 200, json: async () => ({ status: 'accepted', receipt: {} }) }; }
+    if (stateFails) return { ok: false, status: 502, json: async () => ({ error: '상태를 확인하지 못했습니다.' }) };
+    return { ok: true, status: 200, json: async () => ({ route: body.source, capability: { supported: true }, phase: 'working',
+      receipts: [], messages: stateRows }) };
+  }, noChatTimers);
+  const { s, entry } = selectChat(c);
+  c.state.detailShown = true;
+  wireTree(c, c.buildChatComposer(s)); await settle();
+  await c.loadChatState(s, true);
+  for (let i = 0; i < 2; i++) {
+    entry.text = '다시 확인해 주세요';
+    await c.sendChat(entry); await settle();
+  }
+  const [first, second] = sends.map((body) => body.requestId);
+  assert.equal(sends.length, 2); assert.notEqual(first, second);
+  const pending = () => Array.from(entry.outbox, (item) => item.requestId);
+  const bubbles = () => c.get('messages').children.filter((row) => /is-outbox/.test(row.className)).length;
+  assert.deepEqual(pending(), [first, second]);
+  // The state read shows the first send, named by its request id.
+  const own = (requestId, itemId) => ({ role: 'user', text: '다시 확인해 주세요', ts: now, itemId, clientId: requestId });
+  stateRows = [...stateRows, own(first, 'item-1')];
+  await c.loadChatState(s, true); await settle();
+  assert.deepEqual(pending(), [second]);
+  // The state read fails; /api/read shows the same message without any id.
+  stateFails = true;
+  readRows = [answer, { role: 'user', text: '다시 확인해 주세요', ts: now }];
+  await c.loadDetail(s); await settle();
+  assert.equal(reads.length, 1, 'the conversation came from /api/read');
+  assert.deepEqual(pending(), [second], 'a message settled by its id is not taken again by its text');
+  assert.equal(bubbles(), 1);
+  // Even the second message, as /api/read shows it, cannot say which request it was.
+  readRows = [...readRows, { role: 'user', text: '다시 확인해 주세요', ts: now }];
+  await c.loadDetail(s); await settle();
+  assert.equal(reads.length, 2);
+  assert.deepEqual(pending(), [second]);
+  // Back on the state read, its own row settles it.
+  stateFails = false;
+  stateRows = [...stateRows, own(second, 'item-2')];
+  await c.loadChatState(s, true); await settle();
+  assert.deepEqual(pending(), []);
+  assert.equal(bubbles(), 0);
+});
+
+test('one new message settles one bubble with or without row ids, after the last message the bubble saw', () => {
+  const now = Date.now(); const ts = Math.floor(now / 1000);
+  const c = client(undefined, noChatTimers);
+  const bubble = (requestId, text, seen, extra = {}) => ({ requestId, text, attachments: [], state: 'sent', status: 'accepted', reason: '',
+    at: now, ...c.outboxOrigin(seen), ...extra });
+  // Rows named by item id (a Codex state read).
+  const codex = selectChat(c).entry;
+  const named = [{ role: 'user', text: '계속', ts: ts - 10, itemId: 'item-old', clientId: null },
+    { role: 'assistant', text: '네', ts: ts - 5, itemId: 'item-answer', clientId: null }];
+  codex.outbox = [bubble('req-codex-a001', '계속', named), bubble('req-codex-b002', '계속', named)];
+  assert.deepEqual(codex.outbox[0].known, ['item-old']);
+  const codexPending = () => codex.outbox.map((item) => item.requestId);
+  // Neither the message already there nor one typed in the terminal (no request id) settles a Codex bubble.
+  const typed = { role: 'user', text: '계속', ts, itemId: 'item-typed', clientId: null };
+  c.settleOutbox(codex, [...named, typed]);
+  assert.deepEqual(codexPending(), ['req-codex-a001', 'req-codex-b002']);
+  const a = { role: 'user', text: '계속', ts, itemId: 'item-a', clientId: 'req-codex-a001' };
+  c.settleOutbox(codex, [...named, typed, a]);
+  assert.deepEqual(codexPending(), ['req-codex-b002'], 'one new row, one bubble');
+  c.settleOutbox(codex, [...named, typed, a]);
+  assert.deepEqual(codexPending(), ['req-codex-b002'], 'and not another on the next read');
+  // A row named at the send never counts as new, whatever it claims.
+  c.settleOutbox(codex, [{ ...named[0], clientId: 'req-codex-b002' }, named[1]]);
+  assert.deepEqual(codexPending(), ['req-codex-b002']);
+  // Rows without ids (a Claude read): only what follows the last message the bubble saw.
+  const claude = selectChat(c, { agent: 'claude', home: '.claude', id: 'claude-session' }).entry;
+  const shown = [{ role: 'user', text: '계속', ts: ts - 10 }, { role: 'assistant', text: '네', ts: ts - 5 }];
+  claude.outbox = [bubble('req-claude-a001', '계속', shown), bubble('req-claude-b002', '계속', shown)];
+  assert.equal(claude.outbox[0].known, null);
+  const claudePending = () => claude.outbox.map((item) => item.requestId);
+  c.settleOutbox(claude, shown);
+  assert.deepEqual(claudePending(), ['req-claude-a001', 'req-claude-b002']);
+  const next = { role: 'user', text: '계속', ts };
+  c.settleOutbox(claude, [...shown, next]);
+  assert.deepEqual(claudePending(), ['req-claude-b002'], 'one new row, one bubble');
+  c.settleOutbox(claude, [...shown, next]);
+  assert.deepEqual(claudePending(), ['req-claude-b002']);
+  // The server's window moved on (the oldest message dropped): the bubbles' last message is found again.
+  c.settleOutbox(claude, [shown[1], next]);
+  assert.deepEqual(claudePending(), ['req-claude-b002']);
+  c.settleOutbox(claude, [shown[1], next, { role: 'user', text: '계속', ts: ts + 1 }]);
+  assert.deepEqual(claudePending(), []);
+  // A Claude message names its file in a "첨부 파일:" line; the same one from before the send does not count.
+  const withFile = [{ role: 'user', text: '확인\n첨부 파일: /work/a.png', ts: ts - 10 }];
+  claude.outbox = [bubble('req-claude-c003', '확인', withFile, { attachments: [{ id: 'f', name: 'a.png', type: 'image/png', kind: 'image' }] })];
+  c.settleOutbox(claude, withFile);
+  assert.deepEqual(claudePending(), ['req-claude-c003']);
+  c.settleOutbox(claude, [...withFile, { role: 'user', text: '확인\n첨부 파일: /work/a.png', ts: ts + 2 }]);
+  assert.deepEqual(claudePending(), []);
+  // What settled stays remembered per conversation only up to a limit.
+  claude.outboxClaims = Array.from({ length: 200 }, (_, index) => ({ id: null, key: `old-${index}`, base: 0, at: now }));
+  claude.outbox = [bubble('req-claude-d004', '끝', [])];
+  c.settleOutbox(claude, [{ role: 'user', text: '끝', ts: ts + 3 }]);
+  assert.deepEqual(claudePending(), []);
+  assert.equal(claude.outboxClaims.length, 80);
+  assert.equal(claude.outboxClaims.at(-1).key, JSON.stringify([ts + 3, '끝']));
+});
+
+test('a Claude image message recorded as "[Image #1]본문" settles its bubble, so neither "작업 중" nor the receipt note stays', async () => {
+  const now = Math.floor(Date.now() / 1000);
+  const sends = []; let stage = 'before';
+  const native = { id: null, name: '이미지', type: 'image/*', size: null, kind: 'image', source: 'native' };
+  const c = client(async (url, options) => {
+    const body = JSON.parse(options.body);
+    if (url === '/api/chat/send') {
+      sends.push(body);
+      return { ok: true, status: 200, json: async () => ({ status: 'accepted', receipt: { confirmed: true, acknowledged: true,
+        attachments: [{ id: 'file-a', name: 'shot.png', type: 'image/png', size: 10, kind: 'image', source: 'sessionholic' }] } }) };
+    }
+    const messages = [{ role: 'assistant', text: '이전 답변', ts: now - 60 }];
+    // Claude Code turned the pasted "첨부 파일: <경로>" line into an image and "[Image #1]".
+    if (stage !== 'before') messages.push({ role: 'user', text: '[Image #1]코덱스로 이어서 하려는데 여기서 막힘', ts: now + 1, attachments: [native] });
+    if (stage === 'answered') messages.push({ role: 'assistant', text: '확인했습니다', ts: now + 5 }, { role: 'assistant', text: '이어서 정리했습니다', ts: now + 9 });
+    return { ok: true, status: 200, json: async () => ({ route: body.source, capability: { supported: true }, phase: 'working',
+      receipts: body.requestId ? [{ requestId: body.requestId, status: 'accepted', confirmed: true, acknowledged: true }] : [], messages }) };
+  }, noChatTimers);
+  const { s, entry } = selectChat(c, { agent: 'claude', home: '.claude', id: 'claude-session' });
+  wireTree(c, c.buildChatComposer(s)); await settle();
+  await c.loadChatState(s, true);
+  const list = c.get('messages');
+  const bubbles = () => list.children.filter((row) => /is-outbox/.test(row.className));
+  const working = () => list.children.some((row) => /msg-working/.test(row.className));
+  entry.text = '코덱스로 이어서 하려는데 여기서 막힘';
+  entry.attachments = [{ id: 'file-a', name: 'shot.png', type: 'image/png', size: 10 }];
+  await c.sendChat(entry); await settle();
+  assert.equal(sends.length, 1);
+  assert.equal(bubbles().length, 1, 'not in the transcript yet');
+  assert.match(c.get('chat-status').textContent, /메시지를 접수했습니다/);
+  assert.equal(c.get('chat-delivery-evidence').hidden, false);
+  assert.equal(working(), true, 'the conversation waits on the agent');
+  stage = 'answered';
+  await c.loadChatState(s, true); await settle();
+  assert.equal(bubbles().length, 0, 'its own message, as Claude Code recorded it, settled the bubble');
+  assert.equal(entry.outbox.length, 0);
+  assert.equal(working(), false, 'the agent answered: the newest row is its answer');
+  assert.doesNotMatch(c.get('chat-status').textContent, /접수했습니다/, 'the receipt note went with the bubble');
+  assert.equal(c.get('chat-delivery-evidence').hidden, true, 'the message\'s own chips show its file now');
+  const own = list.children.find((row) => row.messageItem?.message.text.startsWith('[Image #1]'));
+  assert.ok(own, 'the transcript row is drawn once');
+  assert.doesNotMatch(textOf(own), /\[Image #1\]/, 'the image token is not drawn next to the image chip');
+  assert.match(textOf(own), /코덱스로 이어서 하려는데 여기서 막힘/);
+  assert.equal(c.messageActions(s, own.messageItem)[0].label, '복사');
+  // The token sits before, after or instead of the words; spaces around it vary.
+  for (const text of ['[Image #1] 확인', '확인 [Image #1]', '확인\n[Image #1]', '[Image #1]확인\n첨부 파일: [Image #2]']) {
+    const shape = c.outboxShape({ role: 'user', text, attachments: [native] });
+    assert.equal(shape.body, '확인', text);
+    assert.ok(shape.counts.has(1), text);
+  }
+  assert.equal(c.outboxShape({ role: 'user', text: '[Image #1]', attachments: [native] }).body, '');
+  assert.equal(c.outboxShape({ role: 'user', text: '[Pasted text #1 +12 lines]' }).body, '');
+});
+
+test('a delivered Claude bubble the transcript words differently takes the next new user message, or goes after an answer to it', () => {
+  const c = client(undefined, noChatTimers);
+  const now = Date.now(); const ts = Math.floor(now / 1000);
+  const { entry } = selectChat(c, { agent: 'claude', home: '.claude', id: 'claude-session' });
+  const seen = [{ role: 'user', text: '처음 요청', ts: ts - 100 }, { role: 'assistant', text: '네', ts: ts - 90 }];
+  const bubble = (requestId, text, extra = {}) => ({ requestId, text, attachments: [], state: 'sent', status: 'accepted', reason: '',
+    at: now, ...c.outboxOrigin(seen), ...extra });
+  const pending = () => entry.outbox.map((item) => item.requestId);
+  // Every bubble is matched by its own text first: a reworded message never takes a later bubble's row.
+  entry.outbox = [bubble('req-a-0001', '긴 붙여넣기'), bubble('req-b-0002', '짧은 확인')];
+  const shortRow = { role: 'user', text: '짧은 확인', ts: ts + 1 };
+  c.settleOutbox(entry, [...seen, shortRow]);
+  assert.deepEqual(pending(), ['req-a-0001'], 'B by its own text; nothing new is left for A');
+  c.settleOutbox(entry, [...seen, shortRow, { role: 'user', text: '[Pasted text #1 +12 lines]', ts: ts + 2 }]);
+  assert.deepEqual(pending(), [], 'A takes the next new message, one for one');
+  // Not a message from before the send, and never for a bubble the server has not taken.
+  entry.outbox = [bubble('req-c-0003', '확인', { state: 'uncertain', status: 'unknown' }), bubble('req-d-0004', '확인', { status: 'queued' }),
+    bubble('req-e-0005', '확인', { state: 'failed', status: 'failed' })];
+  c.settleOutbox(entry, [...seen, { role: 'user', text: '다른 말', ts: ts + 3 }]);
+  assert.deepEqual(pending(), ['req-c-0003', 'req-d-0004', 'req-e-0005']);
+  entry.outbox = [bubble('req-f-0006', '확인')];
+  c.settleOutbox(entry, [...seen, { role: 'user', text: '예전 말', ts: ts - 120 }]);
+  assert.deepEqual(pending(), ['req-f-0006']);
+  // A Codex bubble still settles only by its request id.
+  const codex = selectChat(c).entry;
+  codex.outbox = [bubble('req-codex-0007', '계속')];
+  c.settleOutbox(codex, [...seen, { role: 'user', text: '터미널에서 입력', ts: ts + 4, itemId: 'item-typed', clientId: null },
+    { role: 'assistant', text: '답', ts: ts + 5, itemId: 'item-answer', clientId: null }]);
+  assert.deepEqual(codex.outbox.map((item) => item.requestId), ['req-codex-0007']);
+  // No message of its own (yet), but the agent answered after it.
+  entry.outbox = [bubble('req-g-0008', '이미지 확인')];
+  const answered = [...seen, { role: 'assistant', text: '확인했습니다', ts: ts + 6 }];
+  c.settleOutbox(entry, answered, { working: true });
+  assert.deepEqual(pending(), ['req-g-0008'], 'while the agent works, its own message gets a minute to show');
+  entry.outbox[0].at = now - 61 * 1000;
+  c.settleOutbox(entry, answered, { working: true });
+  assert.deepEqual(pending(), []);
+  entry.outbox = [bubble('req-h-0009', '이미지 확인')];
+  c.settleOutbox(entry, [...seen, { role: 'assistant', text: '보내기 직전 답', ts: ts - 1 }]);
+  assert.deepEqual(pending(), ['req-h-0009'], 'an answer recorded before the send is no reply to it');
+  c.settleOutbox(entry, [...seen, { role: 'assistant', text: '답', ts: ts + 7 }]);
+  assert.deepEqual(pending(), [], 'an agent that answered after it and stopped');
+  // The server read the conversation and found the message: that settles it too,
+  // for Claude and for Codex, and the composer's receipt note goes with it.
+  for (const target of [entry, codex]) {
+    target.outbox = [bubble('req-i-0010', '어떤 말')];
+    target.pending = null;
+    c.applyChatReceipt(target, { requestId: 'req-i-0010', status: 'accepted', readbackConfirmed: false });
+    c.settleOutbox(target, seen, { working: true });
+    assert.equal(target.outbox.length, 1, 'taken, not yet found');
+    c.applyChatReceipt(target, { requestId: 'req-i-0010', status: 'accepted', readbackConfirmed: true });
+    c.settleOutbox(target, seen, { working: true });
+    assert.equal(target.outbox.length, 0);
+    assert.equal(target.settledRequestId, 'req-i-0010');
+  }
+});
+
+test('the composer note: a question waiting beats the receipt note, and an ended request yields to a newer running turn', () => {
+  const c = client(undefined, noChatTimers);
+  const { s, entry } = selectChat(c);
+  wireTree(c, c.buildChatComposer(s));
+  const status = () => c.get('chat-status').textContent;
+  entry.receipt = { requestId: 'req-done-0001', status: 'completed' };
+  c.updateChatComposer(entry);
+  assert.match(status(), /응답이 끝났습니다.*목표 완료/);
+  // A new turn (typed in the terminal) runs now: the old "completed" is no news.
+  entry.data = { ...entry.data, phase: 'working' };
+  c.updateChatComposer(entry);
+  assert.match(status(), /^작업 중/);
+  entry.receipt = { requestId: 'req-stop-0002', status: 'interrupted' };
+  c.updateChatComposer(entry);
+  assert.match(status(), /^작업 중/);
+  // The agent asks something: that comes before "접수했습니다".
+  entry.receipt = { requestId: 'req-wait-0003', status: 'accepted' };
+  entry.data = { ...entry.data, phase: 'needs_input' };
+  c.updateChatComposer(entry);
+  assert.match(status(), /답변·승인 필요/);
+  entry.data = { ...entry.data, phase: 'working' };
+  c.updateChatComposer(entry);
+  assert.match(status(), /메시지를 접수했습니다/, 'until its bubble settles');
+  entry.settledRequestId = 'req-wait-0003';
+  c.updateChatComposer(entry);
+  assert.match(status(), /^작업 중/);
+  // A refused send keeps saying its draft was not sent, question or not.
+  entry.receipt = { requestId: 'req-refused-0004', status: 'failed', confirmed: false, dispatchState: 'not_started',
+    reason: '메뉴가 떠 있어 보내지 않았습니다.' };
+  entry.data = { ...entry.data, phase: 'needs_input' };
+  c.updateChatComposer(entry);
+  assert.match(status(), /메뉴가 떠 있어 보내지 않았습니다.*초안과 첨부는 유지/);
+});
+
+test('"작업 중" waits only on bubbles still on their way, and a waiting bubble keeps the conversation followed', () => {
+  const timers = [];
+  const c = client(undefined, { setTimeout: (callback, delay) => { timers.push({ callback, delay }); return timers.length; }, clearTimeout() {} });
+  const { s, entry } = selectChat(c, { agent: 'claude', home: '.claude', id: 'claude-session' });
+  wireTree(c, c.buildChatComposer(s));
+  const now = Date.now(); const ts = Math.floor(now / 1000);
+  const shown = [{ role: 'user', text: '요청', ts: ts - 60 }, { role: 'assistant', text: '답변', ts: ts - 30 }];
+  const item = (extra) => ({ requestId: 'req-wait-0001', text: '보낸 말', attachments: [], reason: '', at: now, ...c.outboxOrigin(shown), ...extra });
+  const list = c.get('messages');
+  const working = () => list.children.some((row) => /msg-working/.test(row.className));
+  const bubbles = () => list.children.filter((row) => /is-outbox/.test(row.className)).length;
+  entry.data.phase = 'working';
+  entry.outbox = [item({ state: 'failed', status: 'failed', reason: '거절', settledAt: now })];
+  c.renderMessages(s, shown);
+  assert.equal(bubbles(), 1, 'a refused bubble stays to be resent');
+  assert.equal(working(), false, 'but nothing waits on it');
+  entry.outbox = [item({ state: 'uncertain', status: 'unknown' })];
+  c.renderMessages(s, shown);
+  assert.equal(working(), true, 'a message on its way');
+  // A Codex request that already ended (the transcript never showed it) waits on nothing.
+  const codex = selectChat(c);
+  wireTree(c, c.buildChatComposer(codex.s));
+  codex.entry.data.phase = 'working';
+  codex.entry.outbox = [item({ state: 'sent', status: 'completed', settledAt: now })];
+  c.renderMessages(codex.s, shown);
+  assert.equal(working(), false);
+  // An idle conversation is still read while a bubble waits for its message.
+  const claude = selectChat(c, { agent: 'claude', home: '.claude', id: 'claude-session' });
+  claude.entry.data.phase = 'idle';
+  claude.entry.outbox = [item({ state: 'sent', status: 'accepted' })];
+  const count = timers.length;
+  c.scheduleChatPoll(claude.s, claude.entry);
+  assert.equal(timers.length, count + 1);
+  claude.entry.outbox = [item({ state: 'failed', status: 'failed', settledAt: now })];
+  c.scheduleChatPoll(claude.s, claude.entry);
+  assert.equal(timers.length, count + 1, 'not for a refused one');
+});
+
+test('a failed xterm stylesheet fails the terminal load, and opening again retries only that file', async () => {
+  const c = client(undefined, noChatTimers);
+  const appended = []; const removed = [];
+  c.context.document.head = { appendChild(item) { item.remove = () => removed.push(item); appended.push(item); } };
+  c.context.document.querySelector = (selector) => (selector === 'meta[name="sessionholic-assets"]'
+    ? { getAttribute: () => JSON.stringify({ '/vendor/xterm.js': 'abcdef12', '/vendor/addon-fit.js': '1234abcd', '/vendor/xterm.css': '0badc0de' }) } : null);
+  const first = c.loadXterm();
+  c.context.window.Terminal = function Terminal() {};
+  c.context.window.FitAddon = { FitAddon: function FitAddon() {} };
+  appended[1].onload(); appended[2].onload();
+  appended[0].onerror();
+  await assert.rejects(first, /받지 못했습니다/);
+  assert.deepEqual(removed, [appended[0]], 'the failed stylesheet is not left in the page');
+  const second = c.loadXterm();
+  assert.deepEqual(appended.slice(3).map((item) => item.href || item.src), ['/vendor/xterm.css?v=0badc0de'], 'only the stylesheet again');
+  appended[3].onload();
+  await second;
+  await c.loadXterm();
+  assert.equal(appended.length, 4, 'nothing more once all three loaded');
+  // Scripts that ran without defining the terminal are asked again too.
+  const e = client(undefined, noChatTimers);
+  const tried = [];
+  e.context.document.head = { appendChild(item) { tried.push(item); } };
+  const broken = e.loadXterm();
+  for (const item of tried) item.onload();
+  await assert.rejects(broken, /올바르지 않습니다/);
+  e.loadXterm();
+  assert.deepEqual(tried.slice(3).map((item) => item.src), ['/vendor/xterm.js', '/vendor/addon-fit.js']);
+  // Opening a terminal whose scripts are present but whose stylesheet fails
+  // reports it instead of drawing an unstyled terminal.
+  const d = client(undefined, noChatTimers);
+  d.context.window.Terminal = function Terminal() {};
+  d.context.window.FitAddon = { FitAddon: function FitAddon() {} };
+  d.context.document.head = { appendChild(item) { queueMicrotask(() => (item.tagName === 'LINK' ? item.onerror() : item.onload())); } };
+  await d.openTerminal({ id: 'term-1', mode: 'attach' });
+  assert.match(d.get('terminal-status').textContent, /불러오지 못했습니다/);
+  assert.match(d.get('terminal-error').textContent, /다시 열어/);
+});
+
+test('a long press opens its menu after 450ms, while a drag, an early release or a mouse never does', () => {
+  const timers = [];
+  const c = client(undefined, { setTimeout: (callback, delay) => { timers.push({ callback, delay }); return timers.length; },
+    clearTimeout(id) { if (timers[id - 1]) timers[id - 1].cleared = true; } });
+  assert.equal(c.GESTURE.longPressMs, 450); assert.equal(c.GESTURE.pressSlopPx, 10);
+  const fired = [];
+  const press = c.createLongPress((target) => fired.push(target));
+  const down = (extra = {}) => ({ pointerId: 1, pointerType: 'touch', clientX: 100, clientY: 200, ...extra });
+  press.start(down(), 'row-a');
+  assert.equal(timers.at(-1).delay, 450);
+  press.move({ pointerId: 1, clientX: 106, clientY: 205 });
+  timers.at(-1).callback();
+  assert.deepEqual(fired, ['row-a'], 'a small wobble still counts as a press');
+  assert.equal(press.end({ pointerId: 1 }), true, 'the click after a fired press is swallowed');
+  press.start(down(), 'row-b');
+  press.move({ pointerId: 1, clientX: 100, clientY: 212 });
+  assert.equal(timers.at(-1).cleared, true, 'moving past the slop (a scroll) cancels');
+  timers.at(-1).callback();
+  press.start(down(), 'row-c');
+  assert.equal(press.end({ pointerId: 1 }), false, 'a release before 450ms is an ordinary tap');
+  timers.at(-1).callback();
+  assert.deepEqual(fired, ['row-a']);
+  press.start(down({ pointerType: 'mouse' }), 'row-d');
+  assert.equal(press.active, null, 'a mouse uses the right-click menu instead');
+  press.start(down(), 'row-e');
+  assert.equal(press.fire(), true, "Android's contextmenu opens it at once");
+  assert.equal(press.fire(), false);
+  assert.deepEqual(fired, ['row-a', 'row-e']);
+  // Wired to a conversation: the long press opens the message menu and its click is ignored.
+  const { s } = selectChat(c);
+  c.renderMessages(s, [{ role: 'assistant', text: '길게 눌러 볼 답변' }]);
+  const list = c.get('messages');
+  const row = list.children[0];
+  vm.runInContext('bindMessageGestures', c.context)(list);
+  const target = { closest: (selector) => (selector === '.msg' ? row : null) };
+  list.events.pointerdown({ ...down(), target });
+  timers.at(-1).callback();
+  assert.equal(c.get('action-sheet').open, true);
+  assert.deepEqual(c.get('action-list').children.map((item) => item.textContent), ['복사', '텍스트 선택', '터미널에서 보기']);
+  list.events.pointerup({ pointerId: 1 });
+  let stopped = 0;
+  list.events.click({ preventDefault() { stopped++; }, stopPropagation() { stopped++; } });
+  assert.equal(stopped, 2);
+  let prevented = 0;
+  list.events.contextmenu({ target, clientX: 10, clientY: 10, preventDefault() { prevented++; } });
+  assert.equal(prevented, 1, 'the native long-press menu stays closed');
+  // A right click (no press in progress) opens the same menu at the pointer.
+  c.closeActionSheet();
+  c.context.Date = { now: () => 1e13 };
+  list.events.contextmenu({ target, clientX: 10, clientY: 10, preventDefault() { prevented++; } });
+  assert.equal(prevented, 2); assert.equal(c.get('action-sheet').open, true);
+});
+
+test('a card swipe needs a sideways drag within about 30 degrees and settles open, back or into its action', () => {
+  const c = client(undefined, noChatTimers);
+  assert.equal(c.swipeIntent(-6, 2), null, 'inside the slop nothing is decided');
+  assert.equal(c.swipeIntent(-30, 5), 'swipe');
+  assert.equal(c.swipeIntent(-17, 10), 'swipe', 'up to about 30 degrees');
+  assert.equal(c.swipeIntent(-16, 10), 'scroll', 'steeper drags scroll the list');
+  assert.equal(c.swipeIntent(2, 40), 'scroll');
+  assert.equal(c.swipeIntent(30, 2), 'scroll', 'a rightward drag on a closed card is left to the browser');
+  assert.equal(c.swipeIntent(30, 2, true), 'swipe', 'but closes an open card');
+  const release = (fields) => c.swipeRelease({ width: 380, ...fields });
+  assert.equal(release({ offset: -20, velocity: 0 }), 'close');
+  assert.equal(release({ offset: -60, velocity: 0 }), 'open');
+  assert.equal(release({ offset: -30, velocity: -0.8 }), 'open', 'a quick flick opens');
+  assert.equal(release({ offset: -230, velocity: 0 }), 'action', 'past 60% of the card runs the action');
+  assert.equal(release({ offset: -80, velocity: 0.6 }), 'close', 'flicking back closes');
+});
+
+test('a swipe offers 터미널 열기, or 연결 닫기 when the session has a board terminal, and the same actions open from a long press', () => {
+  const c = client(undefined, noChatTimers);
+  const s = recentSession('swipe-me');
+  setRecentSnapshot(c, [s]); c.renderGroups([s], 1100);
+  const row = byClass(c.get('groups'), 'card-row')[0];
+  assert.equal(row.card, byClass(c.get('groups'), 'card')[0]);
+  assert.equal(row.swipeAction.attributes['aria-hidden'], 'true', 'the swipe button stays out of the focus order');
+  assert.equal(c.swipeActionFor(s).label, '터미널 열기');
+  c.state.terminals = [{ id: 'attached', alive: true, mode: 'attach',
+    metadata: { nativeSource: { host: s.host, agent: s.agent, home: s.home, id: s.id }, mode: 'attach' } }];
+  assert.equal(c.terminalForSession(s).id, 'attached');
+  assert.equal(c.swipeActionFor(s).label, '연결 닫기');
+  c.state.terminals = [{ id: 'gone', alive: false, sourceKey: JSON.stringify({ agent: s.agent, home: s.home, host: s.host, id: s.id }) },
+    { id: 'launched', alive: true, mode: 'handoff', sourceKey: JSON.stringify({ agent: s.agent, home: s.home, host: s.host, id: s.id }) }];
+  assert.equal(c.terminalForSession(s).id, 'launched', 'a terminal launched from the session counts; a closed one does not');
+  assert.equal(c.swipeActionFor(s).label, '실행 종료');
+  // Touch drag on the list: the card follows the finger and stays open past half the button.
+  const groups = c.get('groups');
+  vm.runInContext('bindCardGestures', c.context)(groups);
+  const target = { closest: (selector) => (selector === '.card-row' ? row : null) };
+  let prevented = 0;
+  groups.events.pointerdown({ target, pointerId: 3, pointerType: 'touch', clientX: 300, clientY: 100 });
+  groups.events.pointermove({ target, pointerId: 3, clientX: 280, clientY: 103, cancelable: true, preventDefault() {} });
+  groups.events.touchmove({ cancelable: true, preventDefault() { prevented++; } });
+  groups.events.pointermove({ target, pointerId: 3, clientX: 200, clientY: 106, cancelable: true, preventDefault() {} });
+  assert.equal(row.swipeOffset, -100);
+  assert.equal(prevented, 1, 'a swiping finger does not also scroll the list');
+  assert.equal(row.swipeAction.textContent, '실행 종료');
+  groups.events.pointerup({ pointerId: 3 });
+  assert.equal(c.state.swipeOpen, row); assert.equal(row.swipeOffset, -c.GESTURE.swipeRevealPx);
+  assert.match(row.className, /is-open/);
+  // The revealed button takes its first tap right after the swipe.
+  let swallowed = 0;
+  groups.events.click({ target: { closest: (selector) => (selector === '.card-swipe-action' ? row.swipeAction : null) },
+    preventDefault() { swallowed++; }, stopPropagation() { swallowed++; } });
+  assert.equal(swallowed, 0);
+  row.swipeAction.events.click();
+  assert.equal(c.get('close-terminal-dialog').open, true, 'its action runs (closing asks first)');
+  assert.equal(c.state.swipeOpen, null);
+  c.cancelTerminalClose();
+  c.prepareSwipe(row); c.settleSwipe(row, 'open');
+  // Tapping the open card closes it instead of opening the conversation.
+  c.context.Date = { now: () => 1e13 };
+  row.card.events.click();
+  assert.equal(c.state.swipeOpen, null); assert.equal(c.state.selected, null);
+  // The action asks for confirmation (the existing close sheet); nothing closes directly.
+  c.prepareSwipe(row); c.settleSwipe(row, 'action');
+  assert.equal(c.get('close-terminal-dialog').open, true);
+  assert.equal(c.get('close-terminal-confirm').textContent, '실행 종료');
+  c.cancelTerminalClose();
+  c.openCardMenu(row);
+  assert.deepEqual(c.get('action-list').children.map((item) => item.textContent), ['대화 열기', '세션 관리', '터미널로 돌아가기', '실행 종료']);
+  // A vertical drag is a scroll: no swipe, no menu.
+  groups.events.pointerdown({ target, pointerId: 4, pointerType: 'touch', clientX: 300, clientY: 100 });
+  groups.events.pointermove({ target, pointerId: 4, clientX: 296, clientY: 130, cancelable: true, preventDefault() {} });
+  groups.events.pointerup({ pointerId: 4 });
+  assert.equal(c.state.swipeOpen, null);
+});
+
+test('consecutive messages from one speaker group under one name and time, with tighter spacing, and regroup on new rows', () => {
+  const c = client(undefined, noChatTimers); const { s } = selectChat(c);
+  const messages = [{ role: 'assistant', text: '첫 답변', ts: 1000 }, { role: 'assistant', text: '이어지는 답변', ts: 1060 },
+    { role: 'user', text: '질문', ts: 1100 }, { role: 'user', text: '추가 질문', ts: 1110 },
+    { role: 'tool', text: '도구 기록' }, { role: 'assistant', text: '도구 뒤 답변', ts: 1200 },
+    { role: 'assistant', text: '한참 뒤 답변', ts: 1900 }];
+  c.renderMessages(s, messages);
+  const flags = () => c.get('messages').children.map((row) =>
+    [/is-cont/.test(row.className), /has-next/.test(row.className), row.msgLabel ? row.msgLabel.hidden : null]);
+  assert.deepEqual(flags(), [[false, true, false], [true, false, true], [false, true, false], [true, false, true],
+    [false, false, null], [false, false, false], [false, false, false]]);
+  const last = c.get('messages').children[6];
+  c.renderMessages(s, [...messages, { role: 'assistant', text: '바로 이어진 답변', ts: 1930 }]);
+  assert.equal(c.get('messages').children[6], last, 'the row is reused');
+  assert.deepEqual(flags().slice(6), [[false, true, false], [true, false, true]]);
+  assert.match(styleSheet(), /\.msg\.is-cont \{\s*margin-top: -10px;/);
+});
+
+test('a working agent shows "··· 작업 중" after the newest message, still under reduced motion, and it leaves when the turn ends', () => {
+  const c = client(undefined, noChatTimers); const { s, entry } = selectChat(c);
+  entry.data.phase = 'working';
+  c.renderMessages(s, [{ role: 'user', text: '시작해 주세요' }]);
+  const list = c.get('messages');
+  assert.match(list.children.at(-1).className, /msg-working/);
+  assert.match(textOf(list.children.at(-1)), /작업 중/);
+  assert.equal(list.children.at(-1).attributes.role, 'status');
+  c.renderMessages(s, [{ role: 'user', text: '시작해 주세요' }, { role: 'tool', text: '$ npm test' }]);
+  assert.match(list.children.at(-1).className, /msg-working/, 'it stays last as tool records arrive');
+  entry.data.phase = 'idle';
+  c.renderMessages(s, [{ role: 'user', text: '시작해 주세요' }, { role: 'assistant', text: '끝났습니다' }]);
+  assert.equal(list.children.some((row) => /msg-working/.test(row.className)), false);
+  assert.match(styleSheet(), /@media \(prefers-reduced-motion: reduce\) \{[^@]*\.working-dots i \{\s*animation: none;/);
+});
+
+test('"작업 중" shows only while the conversation waits on the agent: after a user message or tool records, never after an answer or a system line', () => {
+  const armed = [];
+  const c = client(undefined, { setTimeout: (callback, ms) => { armed.push({ callback, ms }); return armed.length; },
+    clearTimeout: (id) => { if (armed[id - 1]) armed[id - 1].cleared = true; } });
+  const ticking = () => armed.filter((timer) => timer.callback === c.context.tickWorking && !timer.cleared);
+  const { s, entry } = selectChat(c);
+  entry.data.phase = 'working';
+  entry.data.workingSince = Math.floor(Date.now() / 1000) - 90;
+  const list = c.get('messages');
+  const working = () => list.children.filter((row) => /msg-working/.test(row.className));
+  const ask = { role: 'user', text: '테스트를 고쳐 주세요' };
+  const tool = (n) => ({ role: 'tool', text: `$ npm test -- --shard=${n}` });
+  const answer = { role: 'assistant', text: '고쳤습니다. 테스트가 모두 통과합니다.' };
+  c.renderMessages(s, [ask]);
+  assert.equal(working().length, 1); assert.equal(list.children.at(-1), working()[0], 'a user message waits for its first answer');
+  assert.equal(ticking().length, 1);
+  c.renderMessages(s, [ask, tool(1), tool(2)]);
+  const group = list.children.find((row) => /tool-group/.test(row.className));
+  assert.ok(group); assert.equal(list.children.at(-1), working()[0], 'tool records mean something runs now');
+  group.toolToggle.events.click();
+  // The agent's answer is on screen: background tools may still run, but the row leaves and its clock stops.
+  c.renderMessages(s, [ask, tool(1), tool(2), answer]);
+  assert.equal(working().length, 0);
+  assert.equal(ticking().length, 0, 'no clock for a row that is not shown');
+  assert.equal(list.children.at(-1).messageItem.message.text, answer.text);
+  c.renderMessages(s, [ask, tool(1), tool(2), answer, { role: 'system', text: '세션을 다시 시작했습니다.' }]);
+  assert.equal(working().length, 0, 'a system line ends nothing on screen either');
+  // More tool records after the answer: the same row returns and counts again.
+  const row = list.workingRow;
+  c.renderMessages(s, [ask, tool(1), tool(2), answer, tool(3)]);
+  assert.equal(list.children.at(-1), row); assert.equal(ticking().length, 1);
+  assert.match(row.workingTime.textContent, /^ · 1분 3[01]초$/);
+  assert.equal(group.open, true, 'an opened tool group stays open while the row comes and goes');
+  // Phase "working" alone, with nothing read yet (a Claude row without an id): the row stays.
+  c.renderMessages(s, []);
+  assert.equal(list.children.at(-1), row);
+  assert.doesNotMatch(textOf(list), /저장된 대화를 아직/);
+});
+
+test('Claude\'s approximate start shows "··· 작업 중" without a time or a ticking clock; the status line carries no time', () => {
+  const armed = [];
+  const c = client(undefined, { setTimeout: (callback, ms) => { armed.push({ callback, ms }); return armed.length; },
+    clearTimeout: (id) => { if (armed[id - 1]) armed[id - 1].cleared = true; } });
+  const ticking = () => armed.filter((timer) => timer.callback === c.context.tickWorking && !timer.cleared);
+  const { s, entry } = selectChat(c, { agent: 'claude', home: '.claude', id: 'claude-session' });
+  entry.data.phase = 'working';
+  // The server's newest-prompt time for Claude: a guess, never shown.
+  entry.data.workingSince = Math.floor(Date.now() / 1000) - 754;
+  entry.data.workingSinceApprox = true;
+  c.renderMessages(s, [{ role: 'user', text: '시작해 주세요' }]);
+  const list = c.get('messages'); const row = list.children.at(-1);
+  assert.match(row.className, /msg-working/);
+  assert.equal(textOf(row).trim(), '작업 중');
+  assert.equal(row.workingTime.textContent, '');
+  assert.ok(!row.title, 'no note about an approximate time either');
+  assert.equal(ticking().length, 0, 'nothing to count');
+  c.tickWorking();
+  assert.equal(ticking().length, 0);
+  // An answer on screen ends it here as well, though the session is still working.
+  c.renderMessages(s, [{ role: 'user', text: '시작해 주세요' }, { role: 'assistant', text: '끝났습니다' }]);
+  assert.equal(list.children.includes(row), false);
+  vm.runInContext('updateChatComposer([...state.chats.values()][0])', c.context);
+  assert.equal(c.get('chat-status').textContent, '작업 중 · 지금 보내도 CLI가 이어서 반영합니다.', 'the session state stays in the status line');
+});
+
+test('picked images preview from memory with an upload ring, move to the uploaded file, and are released when removed', async () => {
+  const created = []; const revoked = [];
+  const c = client(undefined, noChatTimers);
+  c.context.URL = class extends URL {};
+  c.context.URL.createObjectURL = (file) => { created.push(file.name); return `blob:preview-${created.length}`; };
+  c.context.URL.revokeObjectURL = (url) => revoked.push(url);
+  const sent = [];
+  c.context.XMLHttpRequest = class {
+    constructor() { this.headers = {}; this.listeners = {}; this.upload = { addEventListener: (type, callback) => { this.onProgress = callback; } }; sent.push(this); }
+    open(method, url) { this.method = method; this.url = url; }
+    setRequestHeader(name, value) { this.headers[name] = value; }
+    addEventListener(type, callback) { this.listeners[type] = callback; }
+    send(body) { this.body = body; }
+  };
+  const { s, entry } = selectChat(c);
+  wireTree(c, c.buildChatComposer(s)); await settle();
+  const photo = { name: '화면.png', size: 2048, type: 'image/png' };
+  const pending = c.uploadChatFiles(entry, [photo]);
+  await settle();
+  const request = sent[0];
+  assert.equal(request.method, 'POST'); assert.equal(request.url, '/api/chat/upload'); assert.equal(request.body, photo);
+  assert.equal(request.headers['X-CSRF-Token'], 'csrf-test');
+  assert.equal(JSON.parse(decodeURIComponent(request.headers['X-Chat-Source'])).home, '.codex-example');
+  assert.equal(decodeURIComponent(request.headers['X-File-Name']), '화면.png');
+  const tile = byClass(c.get('chat-attachments'), 'chat-attachment')[0];
+  assert.match(tile.className, /is-image is-uploading/);
+  assert.equal(byClass(tile, 'chat-attachment-preview')[0].children[0].src, 'blob:preview-1');
+  const ring = byClass(tile, 'upload-ring')[0];
+  assert.equal(ring.attributes.role, 'progressbar');
+  request.onProgress({ lengthComputable: true, loaded: 512, total: 2048 });
+  assert.equal(ring.attributes['aria-valuenow'], '25');
+  request.status = 200;
+  request.responseText = JSON.stringify({ attachment: { id: 'up-1', name: '화면.png', size: 2048, type: 'image/png' } });
+  request.listeners.load();
+  await pending; await settle();
+  assert.deepEqual(Array.from(entry.attachments, (item) => item.id), ['up-1']);
+  const done = byClass(c.get('chat-attachments'), 'chat-attachment')[0];
+  assert.doesNotMatch(done.className, /is-uploading/);
+  assert.equal(byClass(done, 'chat-attachment-preview')[0].children[0].src, 'blob:preview-1', 'the preview follows the upload');
+  assert.deepEqual(revoked, []);
+  byClass(done, 'chat-attachment-remove')[0].events.click();
+  assert.deepEqual(revoked, ['blob:preview-1'], 'released with its tile');
+  // A failed upload releases its preview too, and locking releases whatever is left.
+  const again = c.uploadChatFiles(entry, [{ name: '두번째.png', size: 10, type: 'image/png' }]);
+  await settle();
+  sent[1].listeners.error();
+  await again; await settle();
+  assert.deepEqual(revoked, ['blob:preview-1', 'blob:preview-2']);
+  assert.match(entry.error, /첨부파일을 올리지 못했습니다/);
+  c.attachmentThumb(entry, 'left-over', { name: 'x.png', type: 'image/png' });
+  c.showLogin();
+  assert.deepEqual(revoked, ['blob:preview-1', 'blob:preview-2', 'blob:preview-3']);
+});
+
+test('the board text size is its own stored choice scaling the rem type scale, apart from the terminal size', () => {
+  const c = client(undefined, noChatTimers);
+  const root = c.context.document.documentElement;
+  root.attributes = {};
+  root.setAttribute = (name, value) => { root.attributes[name] = String(value); };
+  root.removeAttribute = (name) => { delete root.attributes[name]; };
+  const writes = [];
+  c.context.localStorage = { getItem: () => null, setItem: (key, value) => writes.push([key, value]) };
+  c.setTextSize('large');
+  assert.equal(root.attributes['data-text-size'], 'large');
+  assert.equal(c.get('text-size-large').checked, true); assert.equal(c.get('text-size-default').checked, false);
+  c.setTextSize('large');
+  c.setTextSize('huge');
+  assert.equal(c.state.textSize, 'default'); assert.equal(root.attributes['data-text-size'], undefined);
+  assert.deepEqual(writes, [['sessionholic:ui:textSize', '"large"'], ['sessionholic:ui:textSize', '"default"']]);
+  assert.equal(c.state.fontSize, 14, 'the terminal text size is untouched');
+  c.context.navigator = { onLine: false };
+  c.windowEvents.DOMContentLoaded();
+  c.get('text-size-small').events.change({ target: { checked: true } });
+  assert.equal(root.attributes['data-text-size'], 'small');
+  const css = styleSheet();
+  assert.match(css, /:root\[data-text-size="large"\] \{\s*font-size: 112\.5%;/);
+  assert.match(css, /:root\[data-text-size="small"\] \{\s*font-size: 93\.75%;/);
+  const tokens = cssBlock(css.replace(/\/\*[\s\S]*?\*\//g, ''), ':root');
+  for (const name of ['--fs-head', '--fs-body', '--fs-sub', '--fs-cap']) assert.match(tokens[name], /^[\d.]+rem$/, name);
+  for (const name of ['--fs-large', '--fs-title']) assert.match(tokens[name], /^clamp\([\d.]+rem, .*\)$/, name);
+  assert.doesNotMatch(css, /content:\s*['"][⌄⌃]['"]/, 'chevrons are drawn, not glyphs');
+  assert.match(indexPage(), /id="refresh"[\s\S]{0,200}<svg/, 'the refresh icon is drawn too');
+  assert.match(css, /input\.switch \{[^}]*appearance: none;/);
+  for (const id of ['show-old', 'terminal-direct-input', 'terminal-accessibility'])
+    assert.match(indexPage(), new RegExp(`id="${id}" class="switch" type="checkbox" role="switch"`), id);
+});
+
+test('theme-init applies a forced theme and text size before paint, keeps meta originals for auto, and survives blocked storage', () => {
+  const source = fs.readFileSync(path.join(__dirname, '../web/theme-init.js'), 'utf8');
+  const run = (stored, { throws = false } = {}) => {
+    const attributes = {};
+    const meta = (content) => ({ attributes: { content }, getAttribute(name) { return this.attributes[name] ?? null; },
+      setAttribute(name, value) { this.attributes[name] = String(value); } });
+    const metas = [meta('#f2f2f7'), meta('#000000')];
+    const document = { documentElement: { setAttribute(name, value) { attributes[name] = String(value); } },
+      querySelectorAll: (selector) => (selector === 'meta[name="theme-color"]' ? metas : []) };
+    const localStorage = { getItem(key) { if (throws) throw new Error('blocked'); return stored[key] ?? null; } };
+    vm.runInNewContext(source, { window: { localStorage }, document, JSON });
+    return { attributes, metas };
+  };
+  const dark = run({ 'sessionholic:ui:theme': '"dark"', 'sessionholic:ui:textSize': '"large"' });
+  assert.deepEqual(dark.attributes, { 'data-theme': 'dark', 'data-text-size': 'large' });
+  assert.deepEqual(dark.metas.map((item) => [item.attributes.content, item.attributes['data-original']]),
+    [['#000000', '#f2f2f7'], ['#000000', '#000000']]);
+  assert.deepEqual(run({ 'sessionholic:ui:theme': '"light"' }).metas.map((item) => item.attributes.content), ['#f2f2f7', '#f2f2f7']);
+  const auto = run({ 'sessionholic:ui:theme': '"auto"', 'sessionholic:ui:textSize': '"default"' });
+  assert.deepEqual(auto.attributes, {});
+  assert.equal(auto.metas[0].attributes['data-original'], undefined);
+  assert.deepEqual(run({ 'sessionholic:ui:theme': '{not json' }).attributes, {});
+  assert.deepEqual(run({}, { throws: true }).attributes, {}, 'blocked storage keeps the device defaults');
+  const html = indexPage();
+  const init = html.indexOf('<script src="/theme-init.js"></script>');
+  assert.ok(init > 0, 'loaded without defer');
+  assert.ok(init < html.indexOf('<link rel="stylesheet" href="/style.css"'), 'before the stylesheet');
+  assert.ok(html.lastIndexOf('name="theme-color"', init) > 0, 'after the theme-color metas it updates');
+  assert.match(fs.readFileSync(path.join(__dirname, '../web/sw.js'), 'utf8'), /"\/theme-init\.js",/);
+  assert.ok(JSON.parse(fs.readFileSync(path.join(__dirname, '../scripts/public-files.json'), 'utf8')).includes('web/theme-init.js'));
+  // app.js keeps the original colors theme-init recorded, so "auto" restores them.
+  const c = client(undefined, noChatTimers);
+  const metas = dark.metas.map((item) => ({ ...item, dataset: { original: item.attributes['data-original'] },
+    getAttribute(name) { return this.attributes[name]; }, setAttribute(name, value) { this.attributes[name] = value; } }));
+  c.context.document.querySelectorAll = (selector) => (selector === 'meta[name="theme-color"]' ? metas : []);
+  c.applyTheme('auto');
+  assert.deepEqual(metas.map((item) => item.attributes.content), ['#f2f2f7', '#000000']);
+});
+
+test('the top shows "오프라인 · 다시 연결 중" while offline or after two failed reads in a row, and clears after a good read', async () => {
+  let fail = false;
+  const c = client(async (url) => {
+    if (fail) throw new Error('down');
+    return { ok: true, status: 200, json: async () => (url.startsWith('/api/snapshot') ? { hosts: [], serverTime: 1 } : { hosts: [], terminals: [] }) };
+  }, noChatTimers);
+  c.context.navigator = { onLine: true };
+  c.windowEvents.DOMContentLoaded(); await settle(10);
+  assert.equal(c.state.authenticated, true);
+  assert.equal(c.get('offline-banner').hidden, true);
+  c.windowEvents.offline();
+  assert.equal(c.get('offline-banner').hidden, false);
+  assert.equal(c.get('offline-text').textContent, '오프라인 · 다시 연결 중');
+  assert.equal(c.get('offline-banner').dataset.kind, 'offline');
+  assert.equal(c.get('connection-notice').hidden, true, 'one indicator for one state');
+  c.context.navigator.onLine = true; c.windowEvents.online(); await settle(10);
+  assert.equal(c.get('offline-banner').hidden, true);
+  fail = true;
+  await c.poll(false);
+  assert.equal(c.get('offline-banner').hidden, true, 'a single failed read retries quietly');
+  await c.poll(false);
+  assert.equal(c.get('offline-banner').hidden, false);
+  assert.equal(c.get('offline-text').textContent, '연결 끊김 · 다시 연결 중');
+  c.state.terminalVisible = true; c.renderConnectivity();
+  assert.equal(c.get('offline-banner').hidden, true, 'the terminal shows its own connection state');
+  c.state.terminalVisible = false;
+  fail = false; await c.poll(false);
+  assert.equal(c.get('offline-banner').hidden, true);
+  assert.match(indexPage(), /<div id="offline-banner" class="offline-banner" role="status" hidden>/);
+});
+
+test('the first paint shows skeleton cards, a collection in progress keeps them, and the list replaces them', () => {
+  const html = indexPage();
+  assert.match(html, /<div id="groups" class="groups"[^>]*aria-busy="true">\s*<div class="skeleton-list" aria-hidden="true">/);
+  assert.match(html, /<p class="sr-only" role="status">세션을 확인하고 있습니다…<\/p>/);
+  const c = client(undefined, noChatTimers);
+  c.state.snapshot = { hosts: [{ name: 'workstation', ok: true, refreshing: true }] };
+  c.renderGroups([], 1100);
+  assert.equal(byClass(c.get('groups'), 'skeleton-card').length, 4);
+  assert.equal(c.get('groups').attributes['aria-busy'], 'true');
+  const s = recentSession('ready'); setRecentSnapshot(c, [s]);
+  c.renderGroups([s], 1100);
+  assert.equal(byClass(c.get('groups'), 'skeleton-card').length, 0);
+  assert.equal(c.get('groups').attributes['aria-busy'], 'false');
+  assert.match(styleSheet(), /@media \(prefers-reduced-motion: reduce\) \{[^@]*\.skeleton-card span \{\s*animation: none;/);
+});
+
+test('a long question menu keeps its first choices inline and lists every choice in a sheet that only selects', async () => {
+  const requests = [];
+  const c = client(async (url, opts) => { requests.push(url); return { ok: true, status: 200, json: async () => ({ messages: [] }) }; }, noChatTimers);
+  const { s, entry } = selectChat(c);
+  c.drawDetail(s);
+  const prompt = { agent: 'codex', fingerprint: 'e'.repeat(64), current: 1, multi: false, question: '어느 브랜치에 반영할까요?\n자세한 설명',
+    options: Array.from({ length: 7 }, (_, index) => ({ number: index + 1, label: `브랜치 ${index + 1}`, detail: '' })) };
+  entry.data = { ...entry.data, prompt, phase: 'needs_input' };
+  c.renderPrompt(s, entry.data);
+  const card = c.get('chat-prompt');
+  assert.equal(findClass(card, 'chat-prompt-option').length, 4);
+  const more = findClass(card, 'chat-prompt-more')[0];
+  assert.equal(more.textContent, '선택지 7개 모두 보기');
+  more.events.click();
+  assert.equal(c.get('action-sheet').open, true);
+  assert.equal(c.get('action-title').textContent, '어느 브랜치에 반영할까요?');
+  const items = c.get('action-list').children;
+  assert.equal(items.length, 7);
+  items[5].events.click();
+  assert.equal(c.get('action-sheet').open, false);
+  assert.equal(entry.promptChoice.number, 6);
+  assert.equal(requests.length, 0, 'choosing in the sheet sends nothing');
+  const inline = findClass(c.get('chat-prompt'), 'chat-prompt-option');
+  assert.deepEqual(inline.map((item) => item.attributes['aria-checked']), ['false', 'false', 'false', 'false', 'true'],
+    'the chosen choice joins the inline list');
+  assert.match(findClass(c.get('chat-prompt'), 'primary')[0].textContent, /6번 보내기/);
+  // Short menus are unchanged: every choice inline, no sheet.
+  entry.data = { ...entry.data, prompt: { ...prompt, fingerprint: 'd'.repeat(64), options: prompt.options.slice(0, 5) } };
+  c.renderPrompt(s, entry.data);
+  assert.equal(findClass(c.get('chat-prompt'), 'chat-prompt-option').length, 5);
+  assert.equal(findClass(c.get('chat-prompt'), 'chat-prompt-more').length, 0);
+});
+
+// --- Phone conversation bars, explicit terminals, gesture thresholds, batched snapshot events ---
+
+// A phone conversation (coarse pointer, phone width) with a scrolled transcript and a
+// controllable clock. `wide`: a tablet instead (coarse pointer, wide screen).
+function phoneConversation({ coarse = true, wide = false, timers = noChatTimers, fetchImpl } = {}) {
+  const c = client(fetchImpl, timers);
+  const { s, entry } = selectChat(c);
+  c.drawDetail(s);
+  const pane = c.get('detail'); pane.classList = classes();
+  const list = c.get('messages');
+  // As after the first render (renderMessages keeps the position it set).
+  Object.assign(list, { scrollHeight: 3000, clientHeight: 600, scrollTop: 2400, offsetTop: 80, lastScrollTop: 2400 });
+  c.context.window.matchMedia = (query) => ({ matches: coarse &&
+    (query === '(pointer: coarse)' || (!wide && query === '(max-width: 700px)')) });
+  c.state.detailShown = true; // a phone shows the conversation screen
+  const clock = { now: 1e13 };
+  c.context.Date = class extends Date { static now() { return clock.now; } };
+  const plain = { closest: () => null };
+  const pointer = (type, { id = 1, x = 200, y = 400, target = plain, pointerType = 'touch' } = {}) =>
+    list.events[type]({ pointerId: id, pointerType, isPrimary: true, clientX: x, clientY: y, target, cancelable: true, preventDefault() {} });
+  // `after` ms since the last scroll: down, `ms` later up `dx` px away.
+  const tap = (options = {}, { ms = 80, dx = 0, after = 200 } = {}) => {
+    clock.now += after;
+    pointer('pointerdown', options);
+    clock.now += ms;
+    if (dx) pointer('pointermove', { ...options, x: (options.x ?? 200) + dx });
+    pointer('pointerup', { ...options, x: (options.x ?? 200) + dx });
+    clock.now += 400;
+  };
+  const scrollTo = (top) => { list.scrollTop = top; list.events.scroll(); clock.now += 16; };
+  return { c, s, entry, pane, list, clock, pointer, tap, scrollTo, reading: () => pane.classList.contains('is-reading') };
+}
+
+test('gesture thresholds live in one frozen object with the values the board used before', () => {
+  const c = client(undefined, noChatTimers);
+  assert.equal(Object.isFrozen(c.GESTURE), true);
+  const expected = { longPressMs: 450, pressSlopPx: 10, tapSlopPx: 10, tapMaxMs: 300, swipeRatio: 1.7, swipeRevealPx: 96,
+    swipeActionRatio: 0.6, swipeFlickSpeed: 0.4, pullTriggerPx: 64, pullMaxPx: 110, pullResistPx: 160, readingHideTravelPx: 32,
+    readingBottomPx: 24, jumpShowPx: 160, largeTitleCollapsePx: 36, pinchMinFont: 10, pinchMaxFont: 24, momentumMinSpeed: 0.35,
+    momentumDecay: 0.94, momentumStopSpeed: 0.03, momentumMaxMs: 1600, sheetDismissRatio: 0.25, sheetDismissSpeed: 0.5,
+    sheetFarRatio: 0.5, sheetFarSpeed: 1.4, sheetExpandPx: 48, sheetExpandSpeed: 0.5 };
+  for (const [key, value] of Object.entries(expected)) assert.equal(c.GESTURE[key], value, key);
+  // The decisions read them: the pull is elastic up to pullMaxPx, the swipe angle and slop are unchanged.
+  assert.ok(c.pullDistance(10000) <= c.GESTURE.pullMaxPx);
+  assert.equal(c.swipeIntent(-9, 0), null);
+  assert.equal(c.swipeIntent(-17, 10), 'swipe');
+  assert.equal(c.swipeIntent(-16, 10), 'scroll');
+  assert.equal(c.pinchFontSize(14, 100, 1000), c.GESTURE.pinchMaxFont);
+  // No stray copies of the old constants remain in the app.
+  assert.doesNotMatch(source, /\b(LONG_PRESS_MS|PRESS_SLOP|SWIPE_RATIO|SWIPE_REVEAL|PULL_TRIGGER|FONT_MIN|FONT_MAX|LARGE_TITLE_COLLAPSE)\b/);
+});
+
+test('on a phone a tap on the conversation shows or hides its bars; scrolling hides them and the end does not bring them back', () => {
+  const { c, pane, list, tap, scrollTo, reading } = phoneConversation();
+  assert.equal(c.state.chromeVisible, true, 'a conversation opens with its bars');
+  scrollTo(2390);
+  assert.equal(reading(), false, 'a 10px wobble keeps them');
+  scrollTo(2420); scrollTo(2440);
+  assert.equal(reading(), true, 'a 40px downward scroll hides them (the same 32px as upward)');
+  assert.equal(c.state.chromeVisible, false);
+  scrollTo(2400);
+  assert.equal(reading(), true, 'reaching the end keeps them hidden');
+  assert.equal(list.unread || 0, 0, 'the end still clears the new-message count');
+  tap();
+  assert.equal(reading(), false, 'a tap shows them');
+  assert.equal(c.state.chromeVisible, true);
+  tap();
+  assert.equal(reading(), true, 'another tap hides them');
+  tap();
+  scrollTo(2350);
+  assert.equal(reading(), true, 'scrolling up hides them again');
+  assert.equal(pane.classList.contains('is-typing'), false);
+});
+
+test('a drag, a slow press, a long press, a control, a selection or a touch that stops the list never toggles the bars', () => {
+  const callbacks = [];
+  const timers = { setTimeout: (callback, ms) => { callbacks.push({ callback, ms }); return callbacks.length; },
+    clearTimeout(id) { if (callbacks[id - 1]) callbacks[id - 1].cleared = true; } };
+  const { c, list, clock, pointer, tap, reading } = phoneConversation({ timers });
+  tap({}, { dx: 11 });
+  assert.equal(reading(), false, 'moving past tapSlopPx is a drag');
+  tap({}, { dx: 9 });
+  assert.equal(reading(), true, 'within tapSlopPx it is a tap');
+  tap({}, { ms: 301 });
+  assert.equal(reading(), true, 'held past tapMaxMs it is not a tap');
+  pointer('pointerdown'); clock.now += 60; pointer('pointercancel'); clock.now += 400;
+  assert.equal(reading(), true, 'a scroll ends in pointercancel, not a tap');
+  // Long press wins: its menu opens and the release is not a tap.
+  const row = { className: 'msg', messageItem: { role: 'assistant', message: { text: '답' } } };
+  const onRow = { closest: (selector) => (selector === '.msg' ? row : null) };
+  pointer('pointerdown', { target: onRow });
+  const press = callbacks.find((item) => item.ms === c.GESTURE.longPressMs && !item.cleared);
+  assert.ok(press, 'a long press is armed');
+  clock.now += 100; press.callback();
+  pointer('pointerup', { target: onRow }); clock.now += 400;
+  assert.equal(reading(), true, 'the long press opened the menu instead');
+  // Controls keep their own tap.
+  for (const selector of ['button', 'a', '.msg-more', '.message-block-copy', '.chat-prompt', '.msg-attachment', 'summary']) {
+    const control = { closest: (query) => (query.split(/,\s*/).includes(selector) ? {} : null) };
+    tap({ target: control });
+    assert.equal(reading(), true, selector);
+  }
+  c.context.window.getSelection = () => ({ isCollapsed: false });
+  tap();
+  assert.equal(reading(), true, 'a text selection is kept');
+  c.context.window.getSelection = () => ({ isCollapsed: true });
+  // A touch right after the list moved only stops its momentum.
+  list.scrollTop = 2200; list.events.scroll();
+  tap({}, { after: 50 });
+  assert.equal(reading(), true);
+  tap({}, { after: 200 });
+  assert.equal(reading(), false, 'once the list settled a tap works again');
+  // Mouse layouts keep their own rules: no tap toggle there.
+  c.context.window.matchMedia = () => ({ matches: false });
+  tap({ pointerType: 'mouse' });
+  assert.equal(reading(), false);
+  assert.equal(c.isChromeTap(null, {}), false);
+});
+
+test('the board\'s own scrolling, layout changes and typing never hide the bars on a phone', () => {
+  const { c, s, list, clock, scrollTo, reading } = phoneConversation();
+  // New messages at the end keep the reader at the end without hiding anything.
+  c.renderMessages(s, [{ role: 'assistant', text: '첫 답', ts: 1 }], '', true);
+  list.scrollHeight = 3400;
+  c.renderMessages(s, [{ role: 'assistant', text: '첫 답', ts: 1 }, { role: 'assistant', text: '새 답', ts: 2 }]);
+  assert.equal(list.scrollTop, 3400);
+  list.events.scroll();
+  assert.equal(reading(), false, 'a stick-to-end jump is not reading');
+  // A keyboard or the bars resizing the list moves it too.
+  list.clientHeight = 300; list.scrollTop = 3000; list.events.scroll();
+  assert.equal(reading(), false, 'a resize is not reading');
+  list.clientHeight = 600;
+  // The smooth "맨 아래" scroll is the board's, until a finger touches the list.
+  list.scrollTo = () => {};
+  list.scrollTop = 1000; list.lastScrollTop = 1000; list.events.scroll(); list.lastClientHeight = 600;
+  c.get('jump-bottom').events.click();
+  for (const top of [1400, 1900, 2400]) scrollTo(top);
+  assert.equal(reading(), false, 'the jump to the end does not hide the bars');
+  clock.now += 2000;
+  scrollTo(2350); scrollTo(2300);
+  assert.equal(reading(), true, 'the reader\'s own scroll still does');
+  // Typing: the input's folded layout; leaving it restores the reader's choice.
+  const input = c.get('chat-input');
+  const pane = c.get('detail');
+  c.context.document.activeElement = input;
+  input.events.focus();
+  assert.equal(pane.classList.contains('is-typing'), true);
+  assert.equal(reading(), true, 'typing preserves the focus choice');
+  assert.equal(c.state.chromeVisible, false, 'the reader\'s choice is kept for later');
+  scrollTo(1500);
+  c.revealChrome();
+  assert.equal(c.state.chromeVisible, false);
+  assert.equal(reading(), true, 'attention never unfolds the tools under the keyboard');
+  c.setChromeVisible(false);
+  c.context.document.activeElement = null;
+  input.events.blur();
+  assert.equal(pane.classList.contains('is-typing'), false);
+  assert.equal(reading(), true, 'hidden before typing: hidden again after');
+  c.setChromeVisible(true);
+  c.context.document.activeElement = input; input.events.focus();
+  c.context.document.activeElement = null; input.events.blur();
+  assert.equal(reading(), false, 'shown before typing: shown again after');
+});
+
+test('questions and failures remain visible without overriding focus mode', async () => {
+  const { c, s, entry, tap, reading } = phoneConversation({ fetchImpl: async (url) => {
+    if (url === '/api/chat/send') return { ok: false, status: 409, json: async () => ({ error: '지금은 보낼 수 없습니다.', dispatchState: 'not_started' }) };
+    if (url === '/api/chat/state') return { ok: false, status: 503, json: async () => ({ error: '연결 실패' }) };
+    return { ok: true, status: 200, json: async () => ({}) };
+  } });
+  c.setChromeVisible(false);
+  assert.equal(reading(), true);
+  const prompt = { agent: 'codex', fingerprint: 'a'.repeat(64), current: 1, multi: false, question: '진행할까요?',
+    options: [{ number: 1, label: 'Yes', detail: '' }, { number: 2, label: 'No', detail: '' }] };
+  entry.data = { ...entry.data, prompt, phase: 'needs_input' };
+  c.renderPrompt(s, entry.data);
+  assert.equal(reading(), true, 'a question preserves focus mode');
+  assert.equal(c.get('chat-prompt').hidden, false, 'the approval card stays visible');
+  c.setChromeVisible(false);
+  c.renderPrompt(s, entry.data);
+  c.renderPrompt(s, { ...entry.data, prompt: { ...prompt, current: 2 } });
+  assert.equal(reading(), true, 'the same question re-rendered by polling leaves the bars hidden');
+  c.renderPrompt(s, { ...entry.data, prompt: { ...prompt, fingerprint: 'b'.repeat(64) } });
+  assert.equal(reading(), true, 'a different question preserves the choice');
+  c.setChromeVisible(false);
+  c.renderPrompt(s, { ...entry.data, prompt: null, promptOpenable: false });
+  c.renderPrompt(s, { ...entry.data, prompt: { ...prompt, fingerprint: 'b'.repeat(64) } });
+  assert.equal(reading(), true, 'a returning question keeps focus mode');
+  // A send that was refused: the result is in the composer, so the bars come back.
+  entry.data = { capability: { supported: true }, phase: 'idle', route: c.sourceOf(s) };
+  c.setChromeVisible(false);
+  assert.equal(reading(), true);
+  entry.text = '안녕하세요';
+  await c.sendChat(entry);
+  assert.equal(reading(), true, 'a send result stays near the composer');
+  assert.equal(entry.text, '안녕하세요', 'the refused draft is kept');
+  await settle();
+  // A failing conversation read (connection problem) shows them once.
+  c.setChromeVisible(false);
+  entry.error = '';
+  await c.loadChatState(s, false);
+  assert.equal(reading(), true);
+  c.setChromeVisible(false);
+  await c.loadChatState(s, false);
+  assert.equal(reading(), true, 'the same ongoing problem does not keep unfolding them');
+  // The board's offline notice.
+  c.context.navigator = { onLine: false };
+  c.get('offline-text').textContent = '';
+  c.renderConnectivity();
+  assert.equal(c.get('offline-text').textContent, '오프라인 · 다시 연결 중');
+  assert.equal(reading(), true, 'going offline keeps the tools folded');
+});
+
+test('a new conversation shows tools, and revisiting preserves focus mode and the one-time hint', () => {
+  const writes = [];
+  const { c, list, scrollTo, reading } = phoneConversation();
+  c.context.localStorage = { getItem: () => null, setItem: (key, value) => writes.push([key, value]) };
+  const hint = c.get('tap-hint');
+  assert.equal(hint.hidden, true);
+  scrollTo(2350);
+  assert.equal(reading(), true);
+  assert.equal(hint.hidden, false, 'the first hide shows the hint');
+  assert.equal(hint.textContent, '화면을 탭하면 메뉴가 나타나요');
+  assert.equal(hint.style.top, '92px', 'just below the folded header');
+  assert.deepEqual(writes, [['sessionholic:ui:tapHint', 'true']], 'remembered as a UI preference only');
+  c.toggleChrome();
+  assert.equal(hint.hidden, true, 'a tap clears it');
+  scrollTo(2300); scrollTo(2250);
+  assert.equal(reading(), true);
+  assert.equal(hint.hidden, true, 'shown once');
+  assert.equal(writes.length, 1);
+  // A board that saw it before (another page load) never shows it.
+  const other = phoneConversation();
+  other.c.context.localStorage = { getItem: (key) => (key === 'sessionholic:ui:tapHint' ? 'true' : null), setItem() { throw new Error('no write'); } };
+  other.scrollTo(2350);
+  assert.equal(other.reading(), true);
+  assert.equal(other.c.get('tap-hint').hidden, true);
+  // Leaving and entering the same conversation preserves the choice.
+  c.setDetailShown(false);
+  c.setDetailShown(true);
+  assert.equal(c.state.chromeVisible, false);
+  assert.equal(reading(), true);
+  // Reduced motion: the bars switch without transitions; the gate folds with them.
+  const css = styleSheet();
+  assert.match(css, /\.jump-bottom, \.tap-hint, \.detail-head, \.conversation-bar,\s*\.detail-pane\.is-reading \.detail-head \{ transition: none; animation: none; \}/);
+  assert.match(css, /\.detail-pane\.is-reading \.chat-terminal-gate/);
+  // The jump button and the new-message badge stay usable while hidden.
+  assert.doesNotMatch(css, /\.detail-pane\.is-reading \.jump-bottom/);
+  assert.equal(list.unread || 0, 0);
+});
+
+test('a Claude conversation without a board terminal offers "터미널 열기" and never opens one by itself', async () => {
+  const requests = [];
+  const c = client(async (url, options) => {
+    requests.push({ url, body: options?.body ? JSON.parse(options.body) : null });
+    return { ok: true, status: 200, json: async () => ({ allowed: true, id: 'plan-1', mode: 'attach' }) };
+  }, noChatTimers);
+  const { s, entry } = selectChat(c, { agent: 'claude', home: '' });
+  c.drawDetail(s);
+  await settle();
+  requests.length = 0;
+  entry.data = { route: c.sourceOf(s), phase: 'idle', capability: { supported: false, attachments: true,
+    reason: '보내려면 먼저 터미널을 여세요.', action: 'open_terminal' } };
+  entry.text = '먼저 써 둔 초안';
+  c.updateChatComposer(entry);
+  assert.equal(c.get('chat-terminal-gate').hidden, false);
+  assert.equal(c.get('chat-terminal-gate-text').textContent, '보내려면 먼저 터미널을 여세요.');
+  assert.equal(c.get('chat-open-terminal').textContent, '터미널 열기');
+  assert.equal(c.get('chat-status').textContent, '', 'the gate says it; the status line stays for errors');
+  assert.equal(c.get('chat-input').disabled, false, 'a draft can be written before opening the terminal');
+  assert.equal(c.get('chat-send').disabled, true, 'but not sent');
+  await c.sendChat(entry);
+  assert.deepEqual(requests, [], 'nothing is sent and no terminal is opened in the background');
+  c.get('chat-open-terminal').events.click();
+  await settle();
+  assert.equal(requests[0].url, '/api/plan', 'the button reuses the reviewed plan sheet');
+  assert.deepEqual(requests[0].body.target, { host: 'workstation', agent: 'claude', account: 'claude:default' });
+  // Returning to the same session's own terminal (attach) opens it right after the plan,
+  // as "터미널·승인" always did: only because the user pressed the button.
+  assert.deepEqual(requests.map((request) => request.url).slice(0, 2), ['/api/plan', '/api/launch']);
+  // With the terminal open the composer sends as before.
+  entry.data = { ...entry.data, capability: { supported: true, attachments: true, reason: null } };
+  c.updateChatComposer(entry);
+  assert.equal(c.get('chat-terminal-gate').hidden, true);
+  assert.equal(c.get('chat-send').disabled, false);
+  // An interactive session (no attach possible) gets no button.
+  entry.data = { ...entry.data, capability: { supported: false, attachments: true, reason: '보드 밖 터미널' } };
+  c.updateChatComposer(entry);
+  assert.equal(c.get('chat-terminal-gate').hidden, true);
+  assert.equal(c.get('chat-input').disabled, true);
+  assert.equal(c.get('chat-status').textContent, '보드 밖 터미널');
+});
+
+test('a send refused because the terminal closed keeps the draft and offers the button', async () => {
+  let reads = 0;
+  let c;
+  c = client(async (url, options) => {
+    if (url === '/api/chat/send')
+      return { ok: false, status: 409, json: async () => ({ error: '보내려면 먼저 터미널을 여세요.', dispatchState: 'not_started', code: 'terminal_required' }) };
+    if (url === '/api/chat/state' && ++reads === 1) return { ok: false, status: 503, json: async () => ({ error: '연결 실패' }) };
+    return { ok: true, status: 200, json: async () => ({ route: JSON.parse(options.body).source, phase: 'idle', messages: [],
+      capability: { supported: false, attachments: true, reason: '보내려면 먼저 터미널을 여세요.', action: 'open_terminal' } }) };
+  }, noChatTimers);
+  const { s, entry } = selectChat(c, { agent: 'claude', home: '' });
+  c.drawDetail(s);
+  await settle();
+  reads = 0;
+  entry.data = { route: c.sourceOf(s), phase: 'idle', capability: { supported: true, attachments: true } };
+  entry.text = '보낼 내용';
+  await c.sendChat(entry);
+  await settle();
+  assert.equal(entry.text, '보낼 내용', 'nothing was sent: the draft stays');
+  assert.equal(entry.receipt.dispatchState, 'not_started');
+  // Even when the next read fails, the refusal's code already offers the button.
+  assert.equal(entry.data.capability.action, 'open_terminal');
+  c.updateChatComposer(entry);
+  assert.equal(c.get('chat-terminal-gate').hidden, false);
+  // The next good read says the same, and the status line adds that nothing was sent.
+  entry.error = '';
+  await c.loadChatState(s, false);
+  assert.equal(c.get('chat-terminal-gate').hidden, false);
+  assert.equal(c.get('chat-status').textContent, '메시지는 전송되지 않았습니다. 초안과 첨부는 유지됩니다.');
+});
+
+test('snapshot events are read together after 300ms and never reload capabilities', async () => {
+  const requests = [];
+  const pending = [];
+  let version = 7;
+  const c = client(async (url) => {
+    requests.push(url);
+    return { ok: true, status: 200, json: async () => (url.startsWith('/api/snapshot')
+      ? { hosts: [{ name: 'workstation', ok: true, fetchedAt: 1000 + requests.length, data: {} }], version }
+      : url === '/api/capabilities' ? { hosts: [], csrfToken: 'csrf-test' } : {}) };
+  }, { setTimeout: (callback, ms) => { if (ms === 300) pending.push(callback); return pending.length; }, clearTimeout() {} });
+  c.state.authenticated = true;
+  c.state.snapshot = { hosts: [{ name: 'workstation', ok: true, fetchedAt: 1, data: {} }] };
+  c.state.snapshotVersion = 6;
+  c.state.capabilities = { hosts: [] };
+  c.state.capabilitiesRevision = 'old';
+  c.state.usageAt = Date.now();
+  for (const announced of [7, 8, 9]) c.snapshotAnnounced(announced);
+  assert.equal(pending.length, 1, 'a burst arms one read');
+  assert.deepEqual(requests, [], 'nothing is read before the batch window ends');
+  version = 9;
+  pending.shift()();
+  await settle();
+  assert.deepEqual(requests, ['/api/snapshot'], 'one snapshot read, no /api/capabilities even though the hosts changed');
+  assert.equal(c.state.snapshotVersion, 9);
+  c.snapshotAnnounced(9);
+  assert.equal(pending.length, 0, 'a version already shown reads nothing');
+  // An announcement during a read is batched again once that read ends.
+  c.state.pollBusy = true;
+  c.snapshotAnnounced(10);
+  pending.shift()();
+  assert.equal(c.state.snapshotPending, true);
+  c.state.pollBusy = false;
+  requests.length = 0;
+  await c.poll(false, { capabilities: false });
+  assert.deepEqual(requests, ['/api/snapshot']);
+  assert.equal(pending.length, 1, 'still behind (version 9 < 10): one more batched read');
+  version = 10;
+  pending.shift()();
+  await settle();
+  assert.equal(c.state.snapshotVersion, 10);
+  assert.equal(requests.filter((url) => url === '/api/capabilities').length, 0);
+  // A regular read still catches capabilities up.
+  requests.length = 0;
+  await c.poll(false);
+  assert.deepEqual(requests.slice(0, 2), ['/api/snapshot', '/api/capabilities']);
+});
+
+test('the 60s safety poll reads /api/capabilities only when a host recovers or its accounts change, never for a new fetchedAt', async () => {
+  const requests = [];
+  const hosts = [{ name: 'workstation', ok: true, fetchedAt: 1, data: { codex: [{ id: 'a', home: '.codex' }] } }];
+  const c = client(async (url) => {
+    requests.push(url);
+    return { ok: true, status: 200, json: async () => (url.startsWith('/api/snapshot')
+      ? { hosts: JSON.parse(JSON.stringify(hosts)) } : url === '/api/capabilities' ? { hosts: [], csrfToken: 'csrf-test' } : {}) };
+  }, noChatTimers);
+  c.state.usageAt = Date.now();
+  const reads = async () => { requests.length = 0; await c.poll(false); return requests.filter((url) => url === '/api/capabilities').length; };
+  assert.equal(await reads(), 1, 'the first read loads capabilities');
+  hosts[0].fetchedAt = 2;
+  assert.equal(await reads(), 0, 'a watch snapshot (new fetchedAt) is not an account change');
+  hosts[0].ok = false;
+  assert.equal(await reads(), 1);
+  hosts[0].ok = true; hosts[0].fetchedAt = 3;
+  assert.equal(await reads(), 1, 'a host recovering from a failure is read again');
+  hosts[0].data.codex.push({ id: 'b', home: '.codex-work' });
+  assert.equal(await reads(), 1, 'a new Codex account home is read again');
+  hosts[0].data.codex.push({ id: 'c', home: '.codex-work' });
+  assert.equal(await reads(), 0);
+});
+
+test('consecutive tool records fold into one "도구 실행 N개" line that opens to one line per record and once more to the full text', async () => {
+  const c = client(undefined, noChatTimers); const { s } = selectChat(c);
+  const list = c.get('messages');
+  const turn = [{ role: 'user', text: '고쳐 주세요', ts: 1000 },
+    { role: 'tool', text: '$ npm test', toolKind: 'command' }, { role: 'tool', text: '파일 수정 · a.py', toolKind: 'edit' },
+    { role: 'tool', text: '$ git status\n두 번째 줄', toolKind: 'command' }];
+  c.renderMessages(s, turn);
+  assert.equal(list.children.length, 2, 'three records are one line');
+  const group = list.children[1];
+  assert.match(group.className, /msg tool tool-group/);
+  assert.equal(group.toolTitle.textContent, '도구 실행 3개');
+  assert.equal(group.toolKinds.textContent, '· 명령 2 · 파일 수정 1');
+  assert.equal(group.toolToggle.tagName, 'BUTTON', 'a control, so a tap on it never toggles the bars');
+  assert.equal(group.toolToggle.attributes['aria-expanded'], 'false'); assert.equal(group.toolList.hidden, true);
+  group.toolToggle.events.click();
+  assert.equal(group.toolToggle.attributes['aria-expanded'], 'true'); assert.equal(group.toolList.hidden, false);
+  assert.deepEqual(group.toolList.children.map((item) => textOf(item).trim()), ['$ npm test', '파일 수정 · a.py', '$ git status\n두 번째 줄']);
+  const record = group.toolList.children[2];
+  assert.equal(record.attributes['aria-expanded'], 'false');
+  record.events.click();
+  assert.match(record.className, /is-full/); assert.equal(record.attributes['aria-expanded'], 'true');
+  // The running turn adds a record: the same group counts it, still open, the record still full.
+  list.scrollHeight = 900; list.clientHeight = 200; list.scrollTop = 100;
+  const more = [...turn, { role: 'tool', text: 'Grep · TODO' }];
+  c.renderMessages(s, more);
+  assert.equal(list.children[1], group); assert.equal(group.toolTitle.textContent, '도구 실행 4개');
+  assert.equal(group.toolKinds.textContent, '· 명령 2 · 파일 수정 1 · 검색 1');
+  assert.equal(group.open, true); assert.equal(group.toolList.children[2], record); assert.match(record.className, /is-full/);
+  assert.equal(list.unread || 0, 0, 'a new tool record raises no "새 메시지" badge');
+  // An answer ends the group; tools after it start another one.
+  c.renderMessages(s, [...more, { role: 'assistant', text: '테스트를 고쳤습니다.', ts: 1500 }, { role: 'tool', text: '$ ls' }]);
+  assert.equal(list.children.length, 4); assert.equal(list.children[1], group);
+  assert.notEqual(list.children[3], group); assert.equal(list.children[3].toolTitle.textContent, '도구 실행 1개');
+  assert.equal(list.children[3].open, false); assert.equal(list.unread, 1, 'only the answer counts');
+  // The long-press menu copies the whole group.
+  let copied; c.context.navigator = { clipboard: { writeText: async (text) => { copied = text; } } };
+  const labels = menuLabels(c, group);
+  assert.equal(labels.includes('텍스트 선택'), false);
+  await menuAction(c, group, '도구 기록 4개 모두 복사');
+  assert.equal(copied, '$ npm test\n파일 수정 · a.py\n$ git status\n두 번째 줄\nGrep · TODO');
+  assert.match(styleSheet(), /\.tool-item\.is-full \.tool-item-text \{[^}]*white-space: pre-wrap;/);
+});
+
+test('a tool record without toolKind is classified from the collector text', () => {
+  const c = client(undefined, noChatTimers);
+  const kinds = ['$ npm test', '파일 수정 · a.py', '웹 검색 · 날씨', 'Bash · 목록', 'Edit · a.py', 'Write · b', 'Read · c',
+    'Glob · *.js', 'WebFetch · https://e.com', 'mcp__slack__send', 'Task · 조사', 'slack send', 'TodoWrite']
+    .map((text) => c.toolKindOf({ role: 'tool', text }));
+  assert.deepEqual(kinds, ['command', 'edit', 'search', 'command', 'edit', 'edit', 'read', 'search', 'search', 'mcp',
+    'agent', 'other', 'other']);
+  assert.equal(c.toolKindOf({ text: '$ ls', toolKind: 'mcp' }), 'mcp', 'the collector kind wins');
+  assert.equal(c.toolKindOf({ text: '$ ls', toolKind: 'nonsense' }), 'command');
+});
+
+test('B2: reading back, the row on screen keeps its place when rows above it leave the 80-row window', () => {
+  const c = client(undefined, noChatTimers); const { s } = selectChat(c);
+  const list = c.get('messages');
+  const rows = (from, to) => Array.from({ length: to - from }, (_, i) =>
+    ({ role: 'assistant', text: `답변 ${from + i}`, ts: 1000 + (from + i) * 600 }));
+  c.renderMessages(s, rows(0, 10));
+  const layout = (node) => Object.defineProperties(node, {
+    offsetTop: { configurable: true, get: () => list.children.indexOf(node) * 100 },
+    offsetHeight: { configurable: true, get: () => 100 } });
+  list.children.forEach(layout);
+  Object.assign(list, { scrollHeight: 1000, clientHeight: 300, scrollTop: 450 });
+  const reading = list.children[4];
+  // Two rows leave at the top and two arrive below while the reader is at "답변 4".
+  c.renderMessages(s, rows(2, 12));
+  assert.equal(list.children[2], reading);
+  assert.equal(list.scrollTop, 250, 'the row the reader was on stays 50px above the top edge');
+  assert.equal(list.unread, 2);
+  // Without layout (or once the row itself left), the old position is kept.
+  const plain = client(undefined, noChatTimers); const other = selectChat(plain);
+  plain.renderMessages(other.s, rows(0, 3));
+  Object.assign(plain.get('messages'), { scrollHeight: 900, clientHeight: 200, scrollTop: 45 });
+  plain.renderMessages(other.s, rows(1, 4));
+  assert.equal(plain.get('messages').scrollTop, 45);
+});
+
+test('B4: the board\'s own attachment path lines become file chips and "[이미지 첨부]" alone is not shown', async () => {
+  const c = client(undefined, noChatTimers); const { s } = selectChat(c);
+  const codexLine = '첨부 파일: "/w/project/.sessionholic-attachments/0a1b/보고서.pdf"';
+  const claudeLine = '첨부 파일: /w/project/.sessionholic-attachments/0c2d/화면.png';
+  c.renderMessages(s, [
+    { role: 'user', text: '검토해 주세요\n' + codexLine + '\n' + claudeLine, ts: 1 },
+    { role: 'user', text: '[이미지 첨부]', ts: 2, attachments: [{ id: null, name: '이미지', kind: 'image', source: 'native' }] },
+    { role: 'user', text: '첨부 파일: 메모로 남긴 줄', ts: 3 },
+    { role: 'user', text: codexLine, ts: 4, attachments: [{ id: 'f', name: '보고서.pdf', kind: 'file', source: 'sessionholic' }] }]);
+  const rows = c.get('messages').children;
+  assert.doesNotMatch(textOf(rows[0]), /sessionholic-attachments|첨부 파일:/);
+  assert.match(textOf(rows[0]), /검토해 주세요/);
+  assert.deepEqual(byClass(rows[0], 'attachment-name').map((node) => node.textContent), ['보고서.pdf', '화면.png']);
+  assert.match(byClass(rows[0], 'msg-attachment')[1].className, /is-image/);
+  assert.doesNotMatch(textOf(rows[1]), /\[이미지 첨부\]/);
+  assert.equal(byClass(rows[1], 'msg-attachment').length, 1);
+  assert.match(textOf(rows[2]), /첨부 파일: 메모로 남긴 줄/, 'a typed line is not an attachment');
+  assert.deepEqual(byClass(rows[3], 'attachment-name').map((node) => node.textContent), ['보고서.pdf'], 'one chip per file');
+  assert.equal(byClass(rows[3], 'msg-body').length, 0);
+  let copied; c.context.navigator = { clipboard: { writeText: async (text) => { copied = text; } } };
+  await menuAction(c, rows[0], '복사'); assert.equal(copied, '검토해 주세요');
+  assert.equal(menuLabels(c, rows[3]).includes('복사'), false);
+  // A transcript image chip without a name takes the name from its path line.
+  assert.deepEqual(c.userMessageParts({ text: claudeLine, attachments: [{ name: '이미지', kind: 'image', source: 'native' }] })
+    .attachments.map((file) => file.name), ['화면.png']);
+});
+
+test('B5: a timed final answer after untimed progress notes shows its own name and time', () => {
+  const c = client(undefined, noChatTimers); const { s } = selectChat(c);
+  c.renderMessages(s, [{ role: 'user', text: '질문', ts: 1000 }, { role: 'assistant', text: '살펴볼게요', ts: null },
+    { role: 'assistant', text: '조금 더', ts: null }, { role: 'assistant', text: '최종 답', ts: 2500 }]);
+  const rows = c.get('messages').children;
+  assert.deepEqual(rows.map((row) => row.msgLabel?.hidden ?? null), [false, false, true, false]);
+  assert.equal(rows[1].msgLabel.children.length, 1, 'no time on a progress note');
+  assert.equal(rows[3].msgLabel.children.length, 2, 'the final answer shows when the turn completed');
+});
+
+test('B8: Claude summary and interruption notes render as system lines, not "나" bubbles', () => {
+  const c = client(undefined, noChatTimers); const { s } = selectChat(c, { agent: 'claude', home: '', id: 'claude-row' });
+  c.renderMessages(s, [{ role: 'system', text: '이전 대화 요약으로 이어짐', ts: 1 }, { role: 'system', text: '사용자가 중단함', ts: 2 }]);
+  const rows = c.get('messages').children;
+  assert.deepEqual(rows.map((row) => row.className), ['msg system', 'msg system']);
+  assert.equal(rows.some((row) => row.msgLabel), false);
+});
+
+test('the working row counts "작업 중 · 12분 34초" from workingSince once a second, and stops while the page is hidden', () => {
+  const armed = [];
+  const c = client(undefined, { setTimeout: (callback, ms) => { armed.push({ callback, ms }); return armed.length; },
+    clearTimeout: (id) => { if (armed[id - 1]) armed[id - 1].cleared = true; } });
+  const clock = armed.filter.bind(armed);
+  const ticking = () => clock((timer) => timer.callback === c.context.tickWorking && !timer.cleared);
+  // The page's own visibility handler (registered at start; offline, so nothing is fetched).
+  c.context.navigator = { onLine: false }; c.windowEvents.DOMContentLoaded();
+  const { s, entry } = selectChat(c);
+  const now = Date.now();
+  entry.data.phase = 'working';
+  entry.data.workingSince = Math.floor(now / 1000) - 754;
+  c.renderMessages(s, [{ role: 'user', text: '시작해 주세요' }]);
+  const list = c.get('messages'); const row = list.children.at(-1);
+  assert.match(row.className, /msg-working/);
+  assert.match(row.workingTime.textContent, /^ · 12분 3[45]초$/);
+  assert.match(textOf(row), /작업 중/);
+  assert.equal(row.workingTime.attributes['aria-live'], 'off', 'the second count is not announced');
+  assert.equal(ticking().length, 1); assert.ok(ticking()[0].ms > 0 && ticking()[0].ms <= 1020);
+  // Repeated renders keep one timer.
+  c.renderMessages(s, [{ role: 'user', text: '시작해 주세요' }]);
+  assert.equal(ticking().length, 1);
+  c.context.document.hidden = true; c.documentEvents.visibilitychange();
+  assert.equal(ticking().length, 0, 'no ticking while hidden');
+  c.context.document.hidden = false; c.tickWorking();
+  assert.equal(ticking().length, 1);
+  assert.deepEqual([0, 59, 60, 754, 3599, 3600, 3900, 7200].map(c.formatElapsed),
+    ['0초', '59초', '1분 0초', '12분 34초', '59분 59초', '1시간', '1시간 5분', '2시간']);
+  // An approximate start (Claude) and no workingSince both leave the label alone.
+  entry.data.workingSinceApprox = true; c.renderMessages(s, [{ role: 'user', text: '시작해 주세요' }]);
+  assert.equal(row.workingTime.textContent, ''); assert.equal(ticking().length, 0);
+  assert.match(textOf(row), /작업 중/);
+  entry.data.workingSinceApprox = false; c.renderMessages(s, [{ role: 'user', text: '시작해 주세요' }]);
+  assert.match(row.workingTime.textContent, /^ · 12분 3[4-6]초$/); assert.equal(ticking().length, 1);
+  entry.data.workingSince = null; c.renderMessages(s, [{ role: 'user', text: '시작해 주세요' }]);
+  assert.equal(row.workingTime.textContent, ''); assert.equal(ticking().length, 0);
+  entry.data.phase = 'idle'; entry.data.workingSince = Math.floor(now / 1000) - 10;
+  c.renderMessages(s, [{ role: 'user', text: '시작해 주세요' }, { role: 'assistant', text: '끝' }]);
+  assert.equal(list.children.includes(row), false); assert.equal(ticking().length, 0);
+  assert.match(styleSheet(), /@media \(prefers-reduced-motion: reduce\) \{[^@]*\.working-dots i \{\s*animation: none;/);
+});
+
+test('B10: a Claude row listed without an id gets its own key, one notice and no request that can only fail', async () => {
+  const requests = [];
+  const c = client(async (url) => { requests.push(url); return { ok: true, status: 200, json: async () => ({ messages: [] }) }; }, noChatTimers);
+  const { FakeEventSource, sources } = fakeEventSource();
+  c.context.EventSource = FakeEventSource;
+  const rows = [{ agent: 'claude', id: '', sessionId: '', pid: 11, cwd: '/w', phase: 'working', title: 'A', kind: 'interactive' },
+    { agent: 'claude', id: '', sessionId: '', pid: 12, cwd: '/w', phase: 'idle', title: 'B', kind: 'interactive' }];
+  c.state.snapshot = { hosts: [{ name: 'workstation', label: 'Workstation', ok: true, data: { claude: rows } }] };
+  c.state.authenticated = true;
+  const sessions = c.allSessions();
+  assert.equal(new Set(sessions.map((session) => session.key)).size, 2, 'two rows without ids never share a key');
+  const s = sessions[0];
+  c.state.selected = s.key;
+  c.get('chat-composer').dataset.source = c.chatKey(c.sourceOf(s));
+  await c.loadDetail(s, true);
+  await c.loadChatState(s, true);
+  c.syncEvents();
+  assert.deepEqual(requests, [], 'neither /api/chat/state nor /api/read');
+  assert.deepEqual(sources.map((source) => source.url), ['/api/events'], 'the list stream only, no conversation subscription');
+  const list = c.get('messages');
+  assert.match(textOf(list), /대화 기록 ID를 알 수 없어 여기서 읽을 수 없습니다/);
+  assert.doesNotMatch(textOf(list), /저장된 대화를 아직|올바르지 않습니다/);
+  assert.match(list.children.at(-1).className, /msg-working/, 'the listed phase still shows it works');
+  assert.match(c.get('chat-status').textContent, /세션 ID가 없어 여기서 보낼 수 없습니다/);
+  // With a session id the transcript is read directly, still without chat state.
+  const named = { ...s, sessionId: 'session-1234', key: 'workstation|claude||~named' };
+  rows.push({ ...rows[0], sessionId: 'session-1234', pid: 13 });
+  const withSession = c.allSessions().find((session) => session.sessionId === 'session-1234');
+  c.state.selected = withSession.key;
+  await c.loadDetail(withSession, true);
+  assert.deepEqual(requests.map((url) => url.split('?')[0]), ['/api/read']);
+  assert.match(requests[0], /id=session-1234/);
+  assert.ok(named);
+});
+
+test('a long press on a tool group line (a button) opens the group menu and its tap then does not toggle the group', () => {
+  const timers = [];
+  const c = client(undefined, { setTimeout: (callback, delay) => { timers.push({ callback, delay }); return timers.length; },
+    clearTimeout(id) { if (timers[id - 1]) timers[id - 1].cleared = true; } });
+  const { s } = selectChat(c);
+  c.renderMessages(s, [{ role: 'tool', text: '$ ls', toolKind: 'command' }, { role: 'tool', text: 'Read · a.py' }]);
+  const list = c.get('messages');
+  const group = list.children[0];
+  vm.runInContext('bindMessageGestures', c.context)(list);
+  // The toggle matches a bare "button" but not the long-press skip list.
+  const skip = vm.runInContext('PRESS_MENU_SKIP', c.context);
+  assert.match(skip, /button:not\(\.card\):not\(\.tool-group-toggle\):not\(\.tool-item\)/);
+  const onToggle = { closest: (selector) => (selector === '.msg' ? group : selector === skip ? null : null) };
+  list.events.pointerdown({ pointerId: 1, pointerType: 'touch', clientX: 50, clientY: 50, target: onToggle });
+  timers.filter((timer) => timer.delay === c.GESTURE.longPressMs && !timer.cleared).at(-1).callback();
+  assert.equal(c.get('action-sheet').open, true);
+  assert.equal(c.get('action-list').children[0].textContent, '도구 기록 2개 모두 복사');
+  list.events.pointerup({ pointerId: 1 });
+  let stopped = 0;
+  list.events.click({ preventDefault() { stopped++; }, stopPropagation() { stopped++; } });
+  assert.equal(stopped, 2, 'the click the long press leaves behind is swallowed');
+  // Any other button (code copy, message menu) still keeps its own tap only.
+  const onCopy = { closest: (selector) => (selector === '.msg' ? group : selector === skip ? {} : null) };
+  c.closeActionSheet();
+  const before = timers.length;
+  list.events.pointerdown({ pointerId: 2, pointerType: 'touch', clientX: 50, clientY: 50, target: onCopy });
+  assert.equal(timers.slice(before).some((timer) => timer.delay === c.GESTURE.longPressMs), false);
+});
+
+test('the installation meta names preferences, titles, history and attachment folders', () => {
+  const names = JSON.stringify({ title: '데모 보드', shortName: '데모', storagePrefix: 'db:', historyKey: 'demoBoard',
+    attachmentsDir: '.demo-board-attachments' });
+  const reads = []; const removed = []; const writes = [];
+  const c = client(undefined, noChatTimers, { instanceMeta: names });
+  c.context.navigator = { onLine: false };
+  c.context.localStorage = {
+    getItem: (key) => { reads.push(key); return null; },
+    removeItem: (key) => removed.push(key),
+    setItem: (key, value) => writes.push([key, value]),
+  };
+  vm.runInContext('prefs.get("fontSize", 14)', c.context);
+  c.windowEvents.DOMContentLoaded();
+  c.get('terminal-accessibility').events.change({ target: { checked: true } });
+  assert.deepEqual(reads, ['db:ui:fontSize']);
+  assert.deepEqual(removed, ['db:selected', 'db:filters', 'db:showOld'], 'legacy cleanup follows the prefix');
+  assert.deepEqual(writes, [['db:ui:screenReaderMode', 'true']]);
+  c.renderAttention([{ phase: 'needs_input' }, { phase: 'working' }]);
+  assert.equal(c.context.document.title, '(1) 답 필요 · 데모');
+  c.renderAttention([]);
+  assert.equal(c.context.document.title, '데모 보드');
+  c.navigateView('detail');
+  assert.deepEqual(Object.keys(c.context.window.history.state).sort(), ['demoBoard', 'view']);
+  c.backToList();
+  assert.equal(c.context.window.history.backCount, 1);
+  c.context.window.history.state = { sessionholic: true, view: 'detail' };
+  c.windowEvents.popstate({ state: { sessionholic: true, view: 'detail' } });
+  c.backToList();
+  assert.equal(c.context.window.history.backCount, 1, "another installation's history entry is not ours");
+  const own = c.userMessageParts({ text: '첨부 파일: /w/p/.demo-board-attachments/0a/화면.png', attachments: [] });
+  assert.deepEqual(own.attachments.map((file) => [file.name, file.source]), [['화면.png', 'sessionholic']]);
+  const other = c.userMessageParts({ text: '첨부 파일: /w/p/.sessionholic-attachments/0a/화면.png', attachments: [] });
+  assert.deepEqual(other.attachments, [], 'another folder name stays text');
+});
+
+test('a missing, broken or invalid installation meta keeps the public names', () => {
+  const cases = [undefined, '{not json', '[]', 'null',
+    JSON.stringify({ storagePrefix: 'has space', historyKey: '1bad', title: '', attachmentsDir: '../x', shortName: 7 })];
+  for (const instanceMeta of cases) {
+    const writes = [];
+    const c = client(undefined, noChatTimers, { instanceMeta });
+    c.context.localStorage = { getItem: () => null, setItem: (key, value) => writes.push([key, value]) };
+    vm.runInContext('prefs.set("fontSize", 15)', c.context);
+    assert.deepEqual(writes.at(-1), ['sessionholic:ui:fontSize', '15'], String(instanceMeta));
+    c.renderAttention([{ phase: 'needs_input' }]);
+    assert.equal(c.context.document.title, '(1) 답 필요 · 세션홀릭');
+    c.renderAttention([]);
+    assert.equal(c.context.document.title, '세션홀릭 - 에이전트 세션 매니저');
+    c.navigateView('detail');
+    assert.deepEqual(Object.keys(c.context.window.history.state).sort(), ['sessionholic', 'view']);
+  }
+  // One valid key is used even when another is not.
+  const c = client(undefined, noChatTimers, { instanceMeta: JSON.stringify({ storagePrefix: 'db:', historyKey: '1bad' }) });
+  const writes = [];
+  c.context.localStorage = { getItem: () => null, setItem: (key, value) => writes.push([key, value]) };
+  vm.runInContext('prefs.set("fontSize", 15)', c.context);
+  assert.deepEqual(writes, [['db:ui:fontSize', '15']]);
+  c.navigateView('detail');
+  assert.deepEqual(Object.keys(c.context.window.history.state).sort(), ['sessionholic', 'view']);
+});
+
+test('theme-init reads the preference prefix from the installation meta above it', () => {
+  const source = fs.readFileSync(path.join(__dirname, '../web/theme-init.js'), 'utf8');
+  const run = (content, stored) => {
+    const attributes = {};
+    const document = { documentElement: { setAttribute(name, value) { attributes[name] = String(value); } },
+      querySelectorAll: () => [],
+      querySelector: (selector) => (selector === 'meta[name="sessionholic-instance"]' && content !== undefined
+        ? { getAttribute: (name) => (name === 'content' ? content : null) } : null) };
+    const localStorage = { getItem: (key) => stored[key] ?? null };
+    vm.runInNewContext(source, { window: { localStorage }, document, JSON });
+    return attributes;
+  };
+  const stored = { 'db:ui:theme': '"dark"', 'db:ui:textSize': '"large"', 'sessionholic:ui:theme': '"light"' };
+  assert.deepEqual(run(JSON.stringify({ storagePrefix: 'db:' }), stored), { 'data-theme': 'dark', 'data-text-size': 'large' });
+  for (const content of [undefined, '{broken', JSON.stringify({ storagePrefix: 'bad prefix' }), '{}']) {
+    assert.deepEqual(run(content, stored), { 'data-theme': 'light' }, String(content));
+  }
+  const html = indexPage();
+  assert.ok(html.indexOf('name="sessionholic-instance"') > 0);
+  assert.ok(html.indexOf('name="sessionholic-instance"') < html.indexOf('<script src="/theme-init.js"></script>'),
+    'the meta is parsed before theme-init runs');
+});
+
+test('H3: a restarted server (another bootId) has its CSRF token read again, even on a read an event announced', async () => {
+  const requests = [];
+  let boot = 'boot-a'; let version = 5; let csrf = 'csrf-a';
+  const c = client(async (url) => {
+    requests.push(url);
+    return { ok: true, status: 200, json: async () => (url.startsWith('/api/snapshot')
+      ? { hosts: [{ name: 'workstation', ok: true, fetchedAt: 1, data: {} }], version, bootId: boot }
+      : url === '/api/capabilities' ? { hosts: [], csrfToken: csrf } : {}) };
+  }, noChatTimers);
+  c.state.usageAt = Date.now();
+  await c.poll(false);
+  assert.equal(c.state.csrf, 'csrf-a');
+  assert.equal(requests.filter((url) => url === '/api/capabilities').length, 1);
+  // The same process: an announced read and a regular read read only the snapshot.
+  requests.length = 0; version = 6;
+  await c.poll(false, { capabilities: false });
+  await c.poll(false);
+  assert.deepEqual(requests, ['/api/snapshot', '/api/snapshot']);
+  // The server restarts: its versions count from 0 again and its token is new.
+  boot = 'boot-b'; version = 0; csrf = 'csrf-b';
+  requests.length = 0;
+  await c.poll(false, { capabilities: false });
+  assert.deepEqual(requests, ['/api/snapshot', '/api/capabilities']);
+  assert.equal(c.state.csrf, 'csrf-b');
+  assert.equal(c.state.snapshotVersion, 0, 'the new process\'s first version is taken');
+  requests.length = 0; version = 1;
+  await c.poll(false);
+  assert.deepEqual(requests, ['/api/snapshot'], 'read once per restart');
+});
+
+test('H3: after a restart the reconnected stream\'s hello (another bootId) reads the new versions and token at once', async () => {
+  const requests = [];
+  let boot = 'boot-a'; let version = 40; let csrf = 'csrf-a';
+  const c = client(async (url) => {
+    requests.push(url);
+    return { ok: true, status: 200, json: async () => (url.startsWith('/api/snapshot')
+      ? { hosts: [{ name: 'workstation', ok: true, fetchedAt: 1, data: {} }], version, bootId: boot }
+      : url === '/api/capabilities' ? { hosts: [], csrfToken: csrf } : { requests: [], sources: [] }) };
+  }, { setTimeout: (callback, ms) => { if (ms === 300) setImmediate(callback); return 1; }, clearTimeout() {} });
+  const { FakeEventSource, sources } = fakeEventSource();
+  c.context.EventSource = FakeEventSource;
+  c.state.usageAt = Date.now();
+  await c.poll(false);
+  assert.equal(sources.length, 1);
+  sources[0].emit('hello', { snapshotVersion: 40, bootId: 'boot-a' });
+  await settle();
+  assert.deepEqual(requests, ['/api/snapshot', '/api/bot-requests', '/api/capabilities'], 'initial bot metadata is read once; the same process adds no reads');
+  // The server restarts with version 2; the browser reconnects the same stream.
+  boot = 'boot-b'; version = 2; csrf = 'csrf-b';
+  requests.length = 0;
+  sources[0].emit('hello', { snapshotVersion: 2, bootId: 'boot-b' });
+  await settle();
+  assert.deepEqual(requests, ['/api/snapshot', '/api/capabilities']);
+  assert.equal(c.state.csrf, 'csrf-b');
+  assert.equal(c.state.snapshotVersion, 2);
+  // Later versions of the new process are read (below the old process's 40).
+  requests.length = 0; version = 3;
+  sources[0].emit('snapshot', { version: 3 });
+  await settle();
+  assert.deepEqual(requests, ['/api/snapshot']);
+  assert.equal(c.state.snapshotVersion, 3);
+});
+
+test('H3: a stale CSRF token is refreshed once and a read or a deduplicated request sent again; never a chat send', async () => {
+  const refused = { ok: false, status: 403, json: async () => ({ error: '보안 연결을 갱신한 뒤 다시 시도해 주세요.',
+    code: 'csrf_expired' }) };
+  const setup = ({ fresh = true, capabilities = 'ok' } = {}) => {
+    const requests = [];
+    const c = client(async (url, options) => {
+      requests.push([url, options?.headers?.['X-CSRF-Token']]);
+      if (url === '/api/capabilities') {
+        if (capabilities === 'network') throw new Error('network unavailable');
+        return { ok: true, status: 200, json: async () => ({ hosts: [], csrfToken: 'fresh-csrf' }) };
+      }
+      if (!fresh || options.headers['X-CSRF-Token'] !== 'fresh-csrf') return refused;
+      return { ok: true, status: 200, json: async () => ({ ok: true }) };
+    }, noChatTimers);
+    c.state.authenticated = true;
+    return { c, requests };
+  };
+  const retried = [['/api/chat/state', { source: {} }], ['/api/chat/prompt', { requestId: 'request-0001' }],
+    ['/api/plan', { source: {} }], ['/api/launch', { planId: 'plan', requestId: 'request-0002' }], ['/api/refresh', {}],
+    ['/api/usage/refresh', {}]];
+  for (const [path, body] of retried) {
+    const { c, requests } = setup();
+    assert.deepEqual(await c.api(path, { method: 'POST', body }), { ok: true }, path);
+    assert.deepEqual(requests, [[path, 'csrf-test'], ['/api/capabilities', undefined], [path, 'fresh-csrf']], path);
+    assert.equal(c.state.csrf, 'fresh-csrf');
+  }
+  // Only once: a second refusal is the caller's error.
+  {
+    const { c, requests } = setup({ fresh: false });
+    await assert.rejects(c.api('/api/chat/state', { method: 'POST', body: {} }), (err) => err.code === 'csrf_expired');
+    assert.deepEqual(requests.map(([url]) => url), ['/api/chat/state', '/api/capabilities', '/api/chat/state']);
+  }
+  // A failed refresh reports the refusal, without another attempt.
+  {
+    const { c, requests } = setup({ capabilities: 'network' });
+    await assert.rejects(c.api('/api/refresh', { method: 'POST', body: {} }), (err) => err.code === 'csrf_expired');
+    assert.deepEqual(requests.map(([url]) => url), ['/api/refresh', '/api/capabilities']);
+  }
+  // A chat send and a terminal input are never sent again, nor is the token read here.
+  for (const path of ['/api/chat/send', `/api/terminal/${'a'.repeat(32)}/input`]) {
+    const { c, requests } = setup();
+    await assert.rejects(c.api(path, { method: 'POST', body: { requestId: 'request-0003' } }),
+      (err) => err.code === 'csrf_expired', path);
+    assert.deepEqual(requests.map(([url]) => url), [path], path);
+  }
+});
+
+test('M5: an opened tool group stays open when the 80-row window moves past its first record', () => {
+  const c = client(undefined, noChatTimers); const { s } = selectChat(c);
+  const list = c.get('messages');
+  const tool = (n) => ({ role: 'tool', text: `$ step ${n}`, toolKind: 'command' });
+  c.renderMessages(s, [{ role: 'user', text: '시작', ts: 1000 }, tool(1), tool(2), tool(3)]);
+  const group = list.children[1];
+  group.toolToggle.events.click();
+  assert.equal(group.open, true);
+  // The question and the group's first two records leave the window; a record arrives.
+  c.renderMessages(s, [tool(3), tool(4)]);
+  assert.deepEqual(list.children, [group], 'the same group carries on');
+  assert.equal(group.open, true); assert.equal(group.toolList.hidden, false);
+  assert.equal(group.toolTitle.textContent, '도구 실행 2개');
+  c.renderMessages(s, [tool(4), { role: 'assistant', text: '끝', ts: 2000 }]);
+  assert.equal(list.children[0], group); assert.equal(group.open, true);
+  // A group never opened stays closed when its first record leaves.
+  const d = client(undefined, noChatTimers); const other = selectChat(d);
+  d.renderMessages(other.s, [tool(1), tool(2)]);
+  const closed = d.get('messages').children[0];
+  d.renderMessages(other.s, [tool(2)]);
+  assert.equal(d.get('messages').children[0], closed); assert.equal(closed.open, false);
+  // A group split in two by a new row is drawn once; the second part opens like it.
+  const e = client(undefined, noChatTimers); const third = selectChat(e);
+  e.renderMessages(third.s, [tool(1), tool(2), tool(3)]);
+  const whole = e.get('messages').children[0];
+  whole.toolToggle.events.click();
+  e.renderMessages(third.s, [tool(1), { role: 'assistant', text: '중간 답', ts: 3000 }, tool(3)]);
+  const rows = e.get('messages').children;
+  assert.equal(rows.length, 3); assert.equal(rows[0], whole); assert.notEqual(rows[2], whole);
+  assert.equal(rows[2].open, true); assert.equal(rows[2].toolTitle.textContent, '도구 실행 1개');
+});
+
+test('reading back, the row kept in place is measured in the list\'s own coordinates, not by an ancestor\'s offsetTop', () => {
+  const c = client(undefined, noChatTimers); const { s } = selectChat(c);
+  const list = c.get('messages');
+  const rows = (from, to) => Array.from({ length: to - from }, (_, i) =>
+    ({ role: 'assistant', text: `답변 ${from + i}`, ts: 1000 + (from + i) * 600 }));
+  c.renderMessages(s, rows(0, 10));
+  // Like a browser: .messages is 200px below the page top and not positioned, so a
+  // row's offsetTop counts from the page and moves with the list's scroll; removing
+  // rows above the one on screen lowers scrollTop by itself (scroll anchoring).
+  const LIST_TOP = 200;
+  const top = (node) => list.children.indexOf(node) * 100;
+  const screen = (node) => LIST_TOP + top(node) - list.scrollTop;
+  const layout = (node) => Object.defineProperties(node, {
+    offsetTop: { configurable: true, get: () => screen(node) },
+    offsetHeight: { configurable: true, get: () => 100 },
+    getBoundingClientRect: { configurable: true, value: () => ({ top: screen(node), height: 100 }) } });
+  list.children.forEach(layout);
+  list.getBoundingClientRect = () => ({ top: LIST_TOP, height: 300 });
+  const remove = list.removeChild.bind(list);
+  list.removeChild = (child) => {
+    const above = top(child) + 100 <= list.scrollTop;
+    remove(child);
+    if (above) list.scrollTop -= 100;
+    return child;
+  };
+  Object.assign(list, { scrollHeight: 1000, clientHeight: 300, scrollTop: 450 });
+  const reading = list.children[4];
+  // Two rows leave at the top and two arrive below while the reader is at "답변 4".
+  c.renderMessages(s, rows(2, 12));
+  assert.equal(list.children[2], reading);
+  assert.equal(list.scrollTop, 250, 'the row the reader was on stays 50px above the top edge');
+});
+
+test('the working time does not tick on a phone\'s list or behind a terminal, and counts again when the conversation shows', () => {
+  const armed = [];
+  const c = client(undefined, { setTimeout: (callback, ms) => { armed.push({ callback, ms }); return armed.length; },
+    clearTimeout: (id) => { if (armed[id - 1]) armed[id - 1].cleared = true; } });
+  const ticking = () => armed.filter((timer) => timer.callback === c.context.tickWorking && !timer.cleared);
+  c.context.window.matchMedia = () => ({ matches: true });
+  const { s, entry } = selectChat(c);
+  c.state.detailShown = true;
+  entry.data.phase = 'working';
+  entry.data.workingSince = Math.floor(Date.now() / 1000) - 30;
+  c.renderMessages(s, [{ role: 'user', text: '시작해 주세요' }]);
+  assert.equal(ticking().length, 1);
+  c.setDetailShown(false);
+  assert.equal(ticking().length, 0, 'the list is on screen');
+  c.tickWorking();
+  assert.equal(ticking().length, 0);
+  c.setDetailShown(true);
+  assert.equal(ticking().length, 1, 'the conversation shows again');
+  c.state.terminalVisible = true;
+  ticking()[0].callback();
+  assert.equal(ticking().length, 0, 'a terminal covers the conversation');
+});
+
+// --- Tablets (wide touch screens) and hardware keyboards ---
+
+test('a menu item runs only for a press that started on it after the menu opened, so a long press lifting over it runs nothing', () => {
+  const timers = [];
+  const c = client(undefined, { setTimeout: (callback, delay) => { timers.push({ callback, delay }); return timers.length; },
+    clearTimeout(id) { if (timers[id - 1]) timers[id - 1].cleared = true; } });
+  c.context.window.matchMedia = (query) => ({ matches: query === '(pointer: coarse)' }); // a tablet: the centered menu
+  const { s } = selectChat(c);
+  c.renderMessages(s, [{ role: 'assistant', text: '길게 눌러 볼 답변' }]);
+  const list = c.get('messages');
+  const row = list.children[0];
+  vm.runInContext('bindMessageGestures', c.context)(list);
+  const dialog = c.get('action-sheet');
+  const target = { closest: (selector) => (selector === '.msg' ? row : null) };
+  const longPress = (id) => {
+    list.events.pointerdown({ pointerId: id, pointerType: 'touch', isPrimary: true, clientX: 300, clientY: 600, target });
+    timers.filter((timer) => timer.delay === c.GESTURE.longPressMs && !timer.cleared).at(-1).callback();
+    assert.equal(dialog.open, true, 'the long press opened the menu');
+    return c.get('action-list').children.find((item) => item.textContent === '텍스트 선택');
+  };
+  let item = longPress(1);
+  // The finger lifts where the menu now is: its click lands on an item.
+  list.events.pointerup({ pointerId: 1, clientX: 300, clientY: 600 });
+  item.events.click({ detail: 1, target: item });
+  assert.equal(dialog.open, true, 'the opening finger runs nothing and the menu stays');
+  // A press on the backdrop (not on the item) does not arm the item either.
+  dialog.events.pointerdown({ pointerId: 2, pointerType: 'touch', target: dialog, clientX: 10, clientY: 10 });
+  item.events.click({ detail: 1, target: item });
+  assert.equal(dialog.open, true);
+  // A tap that starts on the item runs it.
+  dialog.events.pointerdown({ pointerId: 3, pointerType: 'touch', target: item, clientX: 300, clientY: 640 });
+  item.events.click({ detail: 1, target: item });
+  assert.equal(dialog.open, false, 'a deliberate tap on the item runs it');
+  // The next menu forgets that press.
+  item = longPress(4);
+  item.events.click({ detail: 1, target: item });
+  assert.equal(dialog.open, true);
+  // Keyboard (Enter/Space) and assistive clicks have no pointer: detail 0.
+  item.events.click({ detail: 0, target: item });
+  assert.equal(dialog.open, false, 'the keyboard still runs items');
+});
+
+test('sending locks the draft read-only instead of disabling the field, so the focus and the next ⌘↩ stay', async () => {
+  let release = null;
+  const sends = [];
+  const c = client(async (url, options) => {
+    const body = JSON.parse(options.body);
+    if (url === '/api/chat/send') {
+      sends.push(body);
+      await new Promise((resolve) => { release = resolve; });
+      return { ok: true, status: 200, json: async () => ({ status: 'accepted' }) };
+    }
+    return { ok: true, status: 200, json: async () => ({ route: body.source, capability: { supported: true, attachments: true }, phase: 'idle' }) };
+  }, noChatTimers);
+  const { s, entry } = selectChat(c);
+  entry.data.capability.attachments = true;
+  wireTree(c, c.buildChatComposer(s));
+  await settle();
+  const input = c.get('chat-input');
+  c.context.document.activeElement = input;
+  const key = { key: 'Enter', metaKey: true, isComposing: false, preventDefault() {} };
+  input.value = '첫 메시지'; input.events.input();
+  input.events.keydown(key);
+  assert.equal(entry.sending, true);
+  assert.equal(input.disabled, false, 'a disabled field would drop the focus (and the keyboard)');
+  assert.equal(input.readOnly, true, 'the text being sent cannot change');
+  assert.equal(input.attributes['aria-disabled'], 'true');
+  input.events.keydown(key);
+  input.events.paste({ clipboardData: { files: [{ name: 'a.png', size: 1, type: 'image/png' }], items: [], getData: () => '끼어든 글' },
+    preventDefault() {} });
+  assert.equal(entry.text, '첫 메시지', 'a paste cannot slip into the locked draft');
+  await settle();
+  assert.equal(sends.length, 1, 'a second ⌘↩ meanwhile sends nothing');
+  release(); await settle();
+  assert.equal(entry.pending, null);
+  assert.equal(input.readOnly, false);
+  assert.equal(input.attributes['aria-disabled'], 'false');
+  assert.equal(input.value, '', 'the sent draft is cleared');
+  // The next message goes out with the same key, without touching the field again.
+  input.value = '두 번째 메시지'; input.events.input();
+  input.events.keydown(key);
+  await settle();
+  assert.equal(sends.length, 2);
+  assert.equal(sends[1].text, '두 번째 메시지');
+  release(); await settle();
+  // A session that cannot take input at all is still disabled.
+  entry.data = { ...entry.data, capability: { supported: false, reason: '보드 밖 터미널' } };
+  c.updateChatComposer(entry);
+  assert.equal(input.disabled, true);
+  assert.equal(input.readOnly, false);
+  assert.match(styleSheet(), /\.chat-input:disabled,\n\.chat-input\[readonly\] \{/);
+});
+
+test('a tablet supports focus scrolling and taps, preserving the choice across keyboards and rotation', () => {
+  const { c, pane, tap, scrollTo, reading } = phoneConversation({ wide: true });
+  const typing = () => pane.classList.contains('is-typing');
+  scrollTo(2350); scrollTo(2300); scrollTo(2200);
+  assert.equal(reading(), true, 'tablet scrolling folds the tools');
+  scrollTo(2300); scrollTo(2400);
+  assert.equal(reading(), true, 'the bottom keeps focus mode');
+  assert.equal(c.get('tap-hint').hidden, false, 'tablet receives the tap hint');
+  tap();
+  assert.equal(reading(), false, 'a safe tablet tap restores the tools');
+  assert.equal(c.state.chromeVisible, true);
+  // A hardware keyboard: nothing takes the screen (a shortcut bar stays below 150px).
+  const input = c.get('chat-input');
+  Object.assign(c.context.window, { innerWidth: 834, innerHeight: 1194, visualViewport: { height: 1194, scale: 1 } });
+  c.context.document.activeElement = input;
+  input.events.focus();
+  assert.equal(typing(), false, 'the tools stay while typing on a hardware keyboard');
+  c.context.window.visualViewport.height = 1194 - 55;
+  c.updateViewport();
+  assert.equal(typing(), false, 'a shortcut bar is not an on-screen keyboard');
+  // Safari: the on-screen keyboard shrinks the visual viewport after the focus.
+  c.context.window.visualViewport.height = 1194 - 360;
+  c.updateViewport();
+  assert.equal(typing(), true, 'an on-screen keyboard that took the space folds them as on a phone');
+  c.context.window.visualViewport = { height: 1194 / 2, scale: 2 };
+  c.updateViewport();
+  assert.equal(typing(), false, 'pinch zoom is not a keyboard');
+  // Chromium (resizes-content): the window shrinks too; the tallest one at this width counts.
+  Object.assign(c.context.window, { innerHeight: 834, visualViewport: { height: 834, scale: 1 } });
+  c.updateViewport();
+  assert.equal(typing(), true);
+  Object.assign(c.context.window, { innerHeight: 1194, visualViewport: { height: 1194, scale: 1 } });
+  c.updateViewport();
+  assert.equal(typing(), false, 'the keyboard went down while the input kept the focus');
+  c.context.document.activeElement = null; input.events.blur();
+  assert.equal(reading(), false);
+  // Stage Manager: the window itself gets shorter while no text field has the focus.
+  Object.assign(c.context.window, { innerHeight: 700, visualViewport: { height: 700, scale: 1 } });
+  c.updateViewport();
+  c.context.document.activeElement = input; input.events.focus();
+  assert.equal(typing(), false, 'a shorter window is not a keyboard');
+  c.context.document.activeElement = null; input.events.blur();
+  // A phone that hid them becomes a wide screen (rotation, split view): they come back.
+  const phone = phoneConversation();
+  phone.scrollTo(2350);
+  assert.equal(phone.reading(), true);
+  assert.equal(phone.c.get('tap-hint').hidden, false);
+  phone.c.context.window.matchMedia = (query) => ({ matches: query === '(pointer: coarse)' });
+  phone.c.updateViewport();
+  assert.equal(phone.reading(), true);
+  assert.equal(phone.c.state.chromeVisible, false);
+  // A phone held sideways (short) keeps the phone rules.
+  const sideways = phoneConversation({ wide: true });
+  sideways.c.context.window.matchMedia = (query) => ({ matches: query === '(pointer: coarse)' || query === '(max-height: 520px)' });
+  sideways.scrollTo(2350);
+  assert.equal(sideways.reading(), true);
+  sideways.tap();
+  assert.equal(sideways.reading(), false);
+  const sidewaysInput = sideways.c.get('chat-input');
+  sideways.c.context.document.activeElement = sidewaysInput; sidewaysInput.events.focus();
+  assert.equal(sideways.pane.classList.contains('is-typing'), true);
+});
+
+test('wide touch screens read like a phone: 16px text, one reading column for bubbles, question card and composer, and a narrower list', () => {
+  const css = styleSheet();
+  const wide = css.match(/@media \(pointer: coarse\) and \(min-width: 701px\) and \(min-height: 521px\) \{([\s\S]*?)\n\}/);
+  assert.ok(wide, 'a block for wide touch screens (phones held sideways excluded)');
+  assert.match(wide[1], /--fs-body: 1rem;/);
+  assert.match(wide[1], /--fs-sub: 0\.875rem;/);
+  // 42.5rem = 680px at 16px; a bubble's text is 680 - 28px padding = 652px, about 40 Hangul characters.
+  assert.match(wide[1], /--detail-pad: max\(16px, calc\(\(100% - 42\.5rem\) \/ 2\)\);/);
+  assert.match(wide[1], /\.chat-prompt \{\s*margin-inline: var\(--detail-pad\);/, 'the question card sits in the same column');
+  const list = css.match(/@media \(pointer: coarse\) and \(min-width: 701px\) and \(max-width: 1023px\) and \(min-height: 521px\) \{([\s\S]*?)\n\}/);
+  assert.ok(list);
+  assert.match(list[1], /\.layout \{\s*grid-template-columns: clamp\(256px, 33vw, 300px\) minmax\(0, 1fr\);/);
+  // Same specificity as the rules they refine, so they must come later.
+  for (const earlier of ['@media (max-width: 900px)', '.chat-prompt {', '.layout {'])
+    assert.ok(css.indexOf(wide[0]) > css.indexOf(earlier), earlier);
+  assert.ok(css.indexOf(list[0]) > css.indexOf('@media (max-width: 900px)'));
+  // Phones keep their own values.
+  const phone = cssBlock(css, '@media (max-width: 700px)');
+  assert.equal(phone['--fs-body'], '1rem'); assert.equal(phone['--detail-pad'], '16px');
+});
+
+test('a hardware keyboard: the folded composer shows the send key once one is known, Esc leaves the input, and 1-9 choose on a question card', async () => {
+  const requests = [];
+  const c = client(async (url) => { requests.push(url); return { ok: true, status: 200, json: async () => ({}) }; }, noChatTimers);
+  c.context.window.matchMedia = (query) => ({ matches: query === '(pointer: coarse)' }); // a tablet
+  c.context.navigator = { onLine: true, platform: 'MacIntel' }; // iPadOS Safari says Mac
+  Object.assign(c.context.window, { innerWidth: 834, innerHeight: 1194, visualViewport: { height: 1194 - 360, scale: 1 } });
+  const { s, entry } = selectChat(c);
+  c.drawDetail(s);
+  await settle();
+  const hint = c.get('chat-key-hint');
+  assert.equal(hint.textContent, '⌘↩ 보내기');
+  assert.equal(c.get('chat-send').attributes['aria-keyshortcuts'], 'Meta+Enter Control+Enter');
+  c.updateChatComposer(entry);
+  assert.equal(hint.hidden, true, 'a touch screen alone may have no keyboard');
+  const plain = { closest: () => null };
+  const field = { closest: (query) => (/textarea/.test(query) ? {} : null) };
+  const press = (extra) => c.context.documentKeydown?.({ target: plain, preventDefault() {}, ...extra });
+  const input = c.get('chat-input');
+  c.context.document.activeElement = input;
+  press({ key: 'a', target: field });
+  assert.equal(hint.hidden, true, 'typing on an on-screen keyboard that took the screen says nothing');
+  press({ key: 'Unidentified', keyCode: 229, isComposing: true, target: field });
+  assert.equal(hint.hidden, true);
+  c.context.window.visualViewport.height = 1194 - 55;
+  press({ key: 'a', target: field });
+  assert.equal(hint.hidden, false, 'typing while nothing took the screen: a hardware keyboard');
+  entry.expanded = true; c.updateChatComposer(entry);
+  assert.equal(hint.hidden, true, 'the expanded composer says it in its own hint');
+  entry.expanded = false; c.updateChatComposer(entry);
+  assert.equal(hint.hidden, false);
+  // Esc leaves the input; an IME or an open tools menu keep it.
+  let blurred = 0; input.blur = () => { blurred++; };
+  let prevented = 0;
+  const escape = (extra = {}) => input.events.keydown({ key: 'Escape', preventDefault() { prevented++; }, ...extra });
+  escape({ isComposing: true }); escape({ keyCode: 229 });
+  c.get('chat-tools').open = true; escape(); c.get('chat-tools').open = false;
+  assert.equal(blurred, 0);
+  escape();
+  assert.equal(blurred, 1); assert.equal(prevented, 1);
+  // A question card: 1-9 choose (any option, the sheet's too); sending stays the second step.
+  c.context.document.activeElement = null;
+  const prompt = { agent: 'claude', fingerprint: 'f'.repeat(64), current: 1, multi: false, question: '계속할까요?',
+    options: Array.from({ length: 7 }, (_, index) => ({ number: index + 1, label: `선택 ${index + 1}`, detail: '' })) };
+  entry.data = { ...entry.data, prompt, phase: 'needs_input' };
+  c.renderPrompt(s, entry.data);
+  press({ key: '2', target: field });
+  assert.equal(entry.promptChoice ?? null, null, 'a digit typed into a field is text');
+  press({ key: '2', metaKey: true }); press({ key: '2', isComposing: true }); press({ key: '0' });
+  assert.equal(entry.promptChoice ?? null, null);
+  press({ key: '2' });
+  assert.equal(entry.promptChoice.number, 2);
+  assert.match(findClass(c.get('chat-prompt'), 'primary')[0].textContent, /2번 보내기/);
+  press({ key: '6' });
+  assert.equal(entry.promptChoice.number, 6, 'beyond the inline four');
+  press({ key: '9' });
+  assert.equal(entry.promptChoice.number, 6, 'no such option');
+  c.get('action-sheet').open = true; press({ key: '1' }); c.get('action-sheet').open = false;
+  c.state.terminalVisible = true; press({ key: '1' }); c.state.terminalVisible = false;
+  entry.promptBusy = true; press({ key: '1' }); entry.promptBusy = false;
+  assert.equal(entry.promptChoice.number, 6, 'an open sheet, the terminal or a busy card leave the key alone');
+  assert.equal(requests.filter((url) => url === '/api/chat/prompt').length, 0, 'a key never sends');
+  c.renderPrompt(s, { ...entry.data, prompt: { ...prompt, fingerprint: 'g'.repeat(64), multi: true } });
+  press({ key: '3' });
+  assert.notEqual(entry.promptChoice?.number, 3, 'a multi-select menu is answered in the terminal');
+  // A phone: a modifier is evidence, typing is not; a mouse layout always has a keyboard.
+  const phone = client(undefined, noChatTimers);
+  phone.context.window.matchMedia = (query) => ({ matches: query === '(pointer: coarse)' || query === '(max-width: 700px)' });
+  const onPhone = selectChat(phone);
+  phone.state.detailShown = true;
+  phone.drawDetail(onPhone.s); await settle();
+  phone.context.document.activeElement = phone.get('chat-input');
+  phone.context.documentKeydown?.({ key: 'a', target: field, preventDefault() {} });
+  phone.updateChatComposer(onPhone.entry);
+  assert.equal(phone.get('chat-key-hint').hidden, true);
+  phone.context.documentKeydown?.({ key: 'Meta', metaKey: true, target: field, preventDefault() {} });
+  assert.equal(phone.get('chat-key-hint').hidden, false);
+  const desk = client(undefined, noChatTimers);
+  desk.context.navigator = { onLine: true, platform: 'Win32' };
+  const onDesk = selectChat(desk);
+  desk.drawDetail(onDesk.s); await settle();
+  desk.updateChatComposer(onDesk.entry);
+  assert.equal(desk.get('chat-key-hint').hidden, false, 'a mouse layout has a keyboard');
+  assert.equal(desk.get('chat-key-hint').textContent, 'Ctrl+Enter 보내기');
+});
+
+// --- Open board terminals shown on cards and in the conversation header ------
+
+function attachedTo(s, fields = {}) {
+  return { id: 'attached', alive: true, title: '보드 터미널', mode: 'attach',
+    metadata: { nativeSource: { host: s.host, agent: s.agent, home: s.home, id: s.id }, mode: 'attach' }, ...fields };
+}
+function cardOf(c, s) {
+  return byClass(c.get('groups'), 'card').find((card) => card.dataset.sessionKey === s.key);
+}
+
+test('the session list groups what needs an answer, what runs, what stopped in the last three hours and the rest', () => {
+  const c = client(undefined, noChatTimers);
+  const now = 2_000_000;
+  const sessions = [
+    recentSession('old-question', { phase: 'needs_input', updatedAt: now - 10 * 86400 }),
+    recentSession('running', { phase: 'working', updatedAt: now - 60 }),
+    recentSession('just-done', { phase: 'done', updatedAt: now - 3600 }),
+    recentSession('just-idle', { phase: 'idle', updatedAt: now - 3 * 3600 }),
+    recentSession('earlier', { phase: 'idle', updatedAt: now - 3 * 3600 - 1 }),
+    recentSession('unknown', { phase: 'unknown', updatedAt: now - 60 }),
+    recentSession('ancient', { phase: 'closed', updatedAt: now - 5 * 86400 }),
+  ];
+  c.state.snapshot = { serverTime: now, hosts: [{ name: 'workstation', label: 'Workstation', ok: true, data: { codex: sessions, claude: [] } }] };
+  c.state.authenticated = true;
+  const shown = c.allSessions().filter((s) => c.matches(s, now));
+  c.renderGroups(shown, now);
+  const sections = c.get('groups').children.filter((node) => node.dataset?.groupKey);
+  assert.deepEqual(sections.map((section) => section.cardHeading.textContent), ['답 필요', '작업 중', '최근 끝남', '이전']);
+  const ids = (section) => section.children.filter((node) => node.dataset?.sessionKey).map((node) => node.dataset.sessionKey.split('|').pop());
+  assert.deepEqual(sections.map(ids), [['old-question'], ['running'], ['just-done', 'just-idle'], ['unknown', 'earlier']]);
+  assert.equal(sections[2].cardHeading.className, 'group-head green');
+  assert.ok(!shown.some((s) => s.id === 'ancient'), 'only the 이전 group drops sessions older than three days');
+});
+
+// The board's own clock format; ICU data differs between Node versions (오후 / PM),
+// so names are checked against the same formatter rather than a fixed spelling.
+const seoulClock = (ts) => new Date(ts * 1000).toLocaleString('ko-KR', {
+  timeZone: 'Asia/Seoul', month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+const escapeRegExp = (text) => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+test('a 새 세션 terminal is named by what it runs, and a second view of the same Claude agents folder is marked as a repeat', () => {
+  const c = client(undefined, noChatTimers);
+  const launcher = (id, createdAt, program, programCwd, host = 'laptop') => ({ id, alive: true, title: 'zz', mode: 'new-session',
+    host, createdAt, metadata: { mode: 'new-session', host, createdAt, program, programCwd } });
+  c.state.terminals = [
+    launcher('later', 1791792862, 'claude-agents', '/Users/example/project-a'),
+    launcher('first', 1791785812, 'claude-agents', '/Users/example/project-a'),
+    launcher('other-folder', 1791790000, 'claude-agents', '/Users/example/project-b'),
+    launcher('codex', 1791791000, 'codex', null),
+    launcher('mini', 1791791500, 'claude-agents', '/Users/example/project-a', 'mini'),
+    { id: 'link', alive: true, title: '세션 연결', mode: 'attach', agent: 'claude', metadata: { mode: 'attach', agent: 'claude' } },
+  ];
+  c.renderTerminals();
+  const rows = byClass(c.get('running-list'), 'running-terminal-row');
+  assert.deepEqual(rows.map((row) => byClass(row, 'running-terminal-title')[0].textContent),
+    ['Claude 에이전트 목록 · project-a', 'Claude 에이전트 목록 · project-a', 'Claude 에이전트 목록 · project-b',
+      `Codex · ${seoulClock(1791791000)} 시작`, 'Claude 에이전트 목록 · project-a']);
+  const repeated = rows.filter((row) => row.className.includes('duplicate')).map((row) => row.children[0].dataset.terminalId);
+  assert.deepEqual(repeated, ['later'], 'only the later view of one host and folder repeats the first');
+  assert.match(textOf(rows[0]), new RegExp(escapeRegExp(`같은 화면이 이미 열려 있어요(${seoulClock(1791785812)} 시작)`)));
+  assert.equal(c.get('running-count').textContent, 5, 'the chip counts terminals the user opened');
+  assert.match(c.get('running-terminals').attributes['aria-label'], /열린 터미널 5개, 세션 연결 1개/);
+  assert.equal(byClass(c.get('running-list'), 'running-connections')[0].attributes['aria-expanded'], 'false');
+});
+
+test('the folded session connections row keeps the keyboard focus as it opens', () => {
+  const c = client(undefined, noChatTimers);
+  c.state.terminals = [{ id: 'link', alive: true, title: '세션 연결', mode: 'attach', agent: 'claude', metadata: { mode: 'attach', agent: 'claude' } }];
+  c.renderTerminals();
+  const first = byClass(c.get('running-list'), 'running-connections')[0];
+  c.context.document.activeElement = first;
+  first.events.click();
+  const reopened = byClass(c.get('running-list'), 'running-connections')[0];
+  assert.equal(reopened.attributes['aria-expanded'], 'true');
+  assert.equal(reopened.focusCount, 1, 'the redrawn row takes the focus back');
+  assert.equal(byClass(c.get('running-list'), 'running-terminal-row').length, 1, 'opening it shows the connection');
+  c.context.document.activeElement = null;
+});
+
+test('a notification link opens its session once it is listed, and an old request expires', async () => {
+  const c = client(async () => ({ ok: true, status: 200, json: async () => ({ terminals: [] }) }), noChatTimers);
+  assert.equal(c.requestedSessionFrom('/?session=workstation%7Ccodex%7C.codex-example%7Cnote'), 'workstation|codex|.codex-example|note');
+  assert.equal(c.requestedSessionFrom('/other?session=x'), null);
+  assert.equal(c.requestedSessionFrom('/?view=list'), null);
+  const s = recentSession('notified');
+  c.state.authenticated = true;
+  setRecentSnapshot(c, []);
+  assert.equal(c.requestSessionOpen('/?session=' + encodeURIComponent(s.key)), true);
+  assert.equal(c.state.selected, null, 'nothing opens before the session is listed');
+  setRecentSnapshot(c, [s]);
+  c.openRequestedSession();
+  assert.equal(c.state.selected, s.key);
+  assert.equal(c.state.openRequest, null);
+  c.requestSessionOpen('/?session=' + encodeURIComponent('workstation|codex|.codex-example|missing'));
+  c.state.openRequest.until = Date.now() - 1;
+  c.openRequestedSession();
+  assert.equal(c.state.openRequest, null, 'a request older than its wait is dropped');
+  assert.equal(c.state.selected, s.key);
+  // Opened while a terminal fills the screen: the terminal steps aside for the conversation.
+  const other = recentSession('notified-over-terminal');
+  setRecentSnapshot(c, [s, other]);
+  c.state.terminal = attachedTo(s);
+  c.state.terminalVisible = true;
+  c.context.window.history.state = { [c.context.INSTANCE?.historyKey || 'sessionholic'] : true, view: 'terminal' };
+  const pushed = [];
+  const push = c.context.window.history.pushState;
+  c.context.window.history.pushState = function (value) { pushed.push(value.view); return push.call(this, value); };
+  c.requestSessionOpen('/?session=' + encodeURIComponent(other.key));
+  c.openRequestedSession();
+  assert.equal(c.state.terminalVisible, false);
+  assert.equal(c.state.selected, other.key);
+  // A conversation entry over the terminal's: back returns to the terminal.
+  assert.deepEqual(pushed, ['detail']);
+  assert.equal(c.context.window.history.state.view, 'detail');
+  assert.equal(c.context.window.history.state.notice, other.key);
+  // Any later entry leaves the notice behind.
+  c.navigateView('terminal');
+  assert.equal(c.context.window.history.state.notice, undefined);
+});
+
+test('forward again to a conversation a notification opened shows it, not the handoff the terminal launched', () => {
+  const c = client(async () => ({ ok: true, status: 200, json: async () => ({ terminals: [] }) }), noChatTimers);
+  c.context.navigator = { onLine: false };
+  c.windowEvents.DOMContentLoaded();
+  const s = recentSession('notified-forward');
+  c.state.authenticated = true;
+  setRecentSnapshot(c, [s]);
+  c.select(s.key);
+  const destination = { host: s.host, agent: 'codex', id: 'handoff-destination', home: '.codex-example', cwd: '/fixture' };
+  c.state.terminal = { id: 'h'.repeat(32), alive: true, mode: 'handoff', launchMode: 'handoff', nativeSource: destination,
+    metadata: { mode: 'handoff', launchMode: 'handoff', nativeSource: destination } };
+  c.state.terminalVisible = true;
+  c.windowEvents.popstate({ state: { sessionholic: true, view: 'detail', notice: s.key } });
+  assert.equal(c.state.terminalVisible, false);
+  assert.equal(c.state.selected, s.key, 'the notified conversation stays chosen');
+});
+
+test('an open terminal is named after the session it runs and follows a renamed session; a new-session terminal without one shows when it opened', async () => {
+  const c = client(async () => ({ ok: true, status: 200, json: async () => ({ terminals: [] }) }), noChatTimers);
+  const s = recentSession('named-terminal');
+  setRecentSnapshot(c, [s]);
+  const attached = attachedTo(s);
+  const launcher = (id, createdAt) => ({ id, alive: true, title: 'zz', mode: 'new-session', createdAt,
+    metadata: { mode: 'new-session', createdAt } });
+  c.state.terminals = [attached, launcher('first', 1791792862), launcher('second', 1791785812)];
+  c.state.showConnections = true;
+  c.renderTerminals();
+  const titles = () => byClass(c.get('running-list'), 'running-terminal-title').map((node) => node.textContent);
+  // A Codex connection the user opened is listed with the other terminals (only Claude ones fold).
+  assert.deepEqual(titles(), ['검토할 작업', `zz · ${seoulClock(1791792862)} 시작`, `zz · ${seoulClock(1791785812)} 시작`]);
+  // A newer snapshot with the session renamed renames its terminal.
+  // An open sheet is not rebuilt under the finger; it renames once it is not open.
+  setRecentSnapshot(c, [{ ...s, title: '바뀐 작업 이름' }]);
+  c.get('terminals-dialog').open = true;
+  c.renameTerminals();
+  assert.equal(titles()[0], '검토할 작업');
+  c.get('terminals-dialog').open = false;
+  c.renameTerminals();
+  assert.equal(titles()[0], '바뀐 작업 이름');
+  // A link estimated from start times says so.
+  assert.equal(c.terminalTitle({ ...attached, metadata: { ...attached.metadata, linkConfidence: 'estimated' } }),
+    '바뀐 작업 이름 · 연결 추정');
+  // A session no longer listed leaves the title the terminal was opened with.
+  setRecentSnapshot(c, []);
+  assert.equal(c.terminalTitle(attached), '보드 터미널');
+});
+
+test('a card shows 터미널 열림 while its session has a live board terminal, by the same rule as the swipe, and follows each list read', async () => {
+  let rows = [];
+  const requests = [];
+  const c = client(async (url) => {
+    requests.push(url);
+    return { ok: true, status: 200, json: async () => ({ terminals: JSON.parse(JSON.stringify(rows)), version: 4 }) };
+  }, noChatTimers);
+  const s = recentSession('with-terminal');
+  const other = recentSession('launched-here');
+  setRecentSnapshot(c, [s, other]);
+  c.renderGroups([s, other], 1100);
+  const mark = (session) => byClass(cardOf(c, session), 'card-terminal')[0];
+  assert.equal(mark(s).hidden, true);
+  assert.doesNotMatch(cardOf(c, s).attributes['aria-label'], /터미널 열림/);
+  rows = [attachedTo(s)];
+  await c.refreshTerminals();
+  assert.deepEqual(requests, ['/api/terminals']);
+  assert.equal(c.state.terminalsVersion, 4);
+  assert.equal(mark(s).hidden, false, 'the mounted card shows it without a full render');
+  assert.match(textOf(mark(s)), /터미널 열림/);
+  assert.match(cardOf(c, s).attributes['aria-label'], /\. 터미널 열림$/);
+  assert.equal(mark(other).hidden, true);
+  assert.equal(c.swipeActionFor(s).kind, 'close', 'the swipe offers 연결 닫기 for the same terminal');
+  // A closed terminal no longer counts; one launched from a session (sourceKey) does.
+  rows = [attachedTo(s, { alive: false, closed: true }),
+    { id: 'launched', alive: true, mode: 'handoff', sourceKey: JSON.stringify({ agent: other.agent, home: other.home, host: other.host, id: other.id }) }];
+  await c.refreshTerminals();
+  assert.equal(mark(s).hidden, true);
+  assert.equal(mark(other).hidden, false);
+  assert.equal(c.swipeActionFor(other).kind, 'close');
+  // A full render keeps the marks.
+  c.renderGroups([s, other], 1100);
+  assert.equal(mark(s).hidden, true);
+  assert.equal(mark(other).hidden, false);
+});
+
+test('the conversation header shows 터미널 열림 and 터미널로 only with a live board terminal, and the button goes to that terminal', async () => {
+  const c = client(async () => ({ ok: true, status: 200, json: async () => ({ terminals: [] }) }), noChatTimers);
+  const s = recentSession('detail-terminal');
+  setRecentSnapshot(c, [s]);
+  c.state.selected = s.key;
+  c.drawDetail(s);
+  const box = c.get('detail-terminal');
+  assert.equal(box.hidden, true, 'no board terminal: nothing in the header (the composer keeps its own 터미널 열기)');
+  c.state.terminals = [attachedTo(s)];
+  c.renderTerminals();
+  assert.equal(box.hidden, false);
+  assert.match(textOf(box), /터미널 열림/);
+  const go = c.get('detail-terminal-open');
+  assert.equal(go.textContent, '터미널로');
+  // The terminal is named after the session it runs, not the title it was opened with.
+  assert.match(go.attributes['aria-label'], /열린 터미널로 가기: 검토할 작업/);
+  // A new header drawn while the terminal is live shows it at once.
+  c.drawDetail(s);
+  assert.equal(c.get('detail-terminal').hidden, false);
+  const opened = [];
+  c.context.openTerminal = (terminal) => { opened.push(terminal.id); };
+  c.get('detail-terminal-open').events.click();
+  assert.deepEqual(opened, ['attached']);
+  // Closed meanwhile (another device): the tap opens nothing and the header hides it.
+  c.state.terminals = [attachedTo(s, { alive: false, closed: true })];
+  c.get('detail-terminal-open').events.click();
+  assert.deepEqual(opened, ['attached']);
+  assert.equal(c.get('detail-terminal').hidden, true);
+  // The header of another session is never changed by this session's terminal.
+  const other = recentSession('other-detail');
+  setRecentSnapshot(c, [s, other]);
+  c.state.selected = other.key;
+  c.drawDetail(other);
+  c.state.terminals = [attachedTo(s)];
+  c.renderTerminals();
+  assert.equal(c.get('detail-terminal').hidden, true);
+});
+
+test('terminal events reread the list once per 300ms burst, only when newer, not on a first hello, and again after a read in flight', async () => {
+  const requests = [];
+  const batches = [];
+  let version = 5;
+  let hold = null;
+  const c = client(async (url) => {
+    requests.push(url);
+    if (hold) await hold;
+    const answered = version;
+    return { ok: true, status: 200, json: async () => ({ terminals: [], version: answered }) };
+  }, { setTimeout: (callback, ms) => { if (ms === 300) batches.push(callback); return batches.length; }, clearTimeout() {} });
+  c.state.authenticated = true;
+  // The first connection: login and startup read the list themselves.
+  c.terminalsAnnounced(3, { hello: true });
+  assert.equal(batches.length, 0);
+  await c.refreshTerminals();
+  assert.equal(c.state.terminalsVersion, 5);
+  requests.length = 0;
+  c.terminalsAnnounced(5);
+  assert.equal(batches.length, 0, 'a version already read reads nothing');
+  for (const announced of [6, 7, 8]) c.terminalsAnnounced(announced);
+  assert.equal(batches.length, 1, 'a burst arms one read');
+  assert.deepEqual(requests, [], 'nothing is read before the batch window ends');
+  version = 8;
+  batches.shift()();
+  await settle();
+  assert.deepEqual(requests, ['/api/terminals']);
+  assert.equal(c.state.terminalsVersion, 8);
+  // Announced while a read is in flight: that read may predate it, so one more follows.
+  requests.length = 0;
+  let release;
+  hold = new Promise((resolve) => { release = resolve; });
+  version = 9;
+  const reading = c.refreshTerminals();
+  c.terminalsAnnounced(10);
+  batches.shift()();
+  assert.equal(c.state.terminalsPending, true);
+  assert.deepEqual(requests, ['/api/terminals'], 'never two reads at once');
+  hold = null;
+  release();
+  await reading;
+  assert.equal(batches.length, 1, 'still behind (9 < 10): one more batched read');
+  version = 10;
+  batches.shift()();
+  await settle();
+  assert.deepEqual(requests, ['/api/terminals', '/api/terminals']);
+  assert.equal(c.state.terminalsVersion, 10);
+  // A reconnect's hello reads only a newer list.
+  c.terminalsAnnounced(10, { hello: true });
+  assert.equal(batches.length, 0);
+  c.terminalsAnnounced(12, { hello: true });
+  assert.equal(batches.length, 1);
+  // A batch from before a login change reads nothing.
+  c.state.authEpoch++;
+  requests.length = 0;
+  batches.shift()();
+  await settle();
+  assert.deepEqual(requests, []);
+});
+
+test('the live stream announces terminals, a restarted server is read on its hello, and the regular poll is the safety net', async () => {
+  const requests = [];
+  const batches = [];
+  let c;
+  c = client(async (url) => {
+    requests.push(url);
+    return { ok: true, status: 200, json: async () => (url === '/api/terminals' ? { terminals: [], version: 2 }
+      : url.startsWith('/api/snapshot') ? { hosts: c.state.snapshot.hosts, bootId: 'boot-a' } : {}) };
+  }, { setTimeout: (callback, ms) => { if (ms === 300) batches.push(callback); return 0; }, clearTimeout() {} });
+  const { FakeEventSource, sources } = fakeEventSource();
+  c.context.EventSource = FakeEventSource;
+  selectChat(c);
+  c.state.capabilities = {};
+  c.state.capabilitiesRevision = c.capabilitiesRevision(c.state.snapshot);
+  c.state.capabilitiesBoot = 'boot-a';
+  c.state.usageAt = Date.now();
+  c.state.serverBoot = 'boot-a';
+  await c.refreshTerminals();
+  c.syncEvents();
+  sources[0].emit('hello', { snapshotVersion: 1, bootId: 'boot-a', terminalsVersion: 2 });
+  assert.equal(batches.length, 0, 'the list read already shows version 2');
+  sources[0].emit('terminals', { version: 3 });
+  assert.equal(batches.length, 1);
+  await settle();
+  requests.length = 0;
+  batches.shift()();
+  await settle();
+  assert.deepEqual(requests.filter((url) => url === '/api/terminals'), ['/api/terminals']);
+  // Another server process counts from 0 again: its hello is read even at a lower number.
+  sources[0].emit('hello', { snapshotVersion: 0, bootId: 'boot-b', terminalsVersion: 0 });
+  assert.equal(c.state.terminalsVersion, null);
+  assert.equal(batches.length, 1);
+  await settle(6);
+  // Without live updates, a regular read rereads a list older than a minute.
+  c.closeEvents();
+  c.state.serverBoot = 'boot-a';
+  batches.length = 0;
+  requests.length = 0;
+  c.state.terminalsReadAt = Date.now();
+  await c.poll(false);
+  assert.deepEqual(requests.filter((url) => url === '/api/terminals'), [], 'a fresh list is not read again');
+  c.state.terminalsReadAt = Date.now() - 61000;
+  requests.length = 0;
+  await c.poll(false);
+  await settle();
+  assert.deepEqual(requests.filter((url) => url === '/api/terminals'), ['/api/terminals']);
+  requests.length = 0;
+  c.state.terminalsReadAt = Date.now() - 61000;
+  await c.poll(false, { capabilities: false });
+  assert.deepEqual(requests.filter((url) => url === '/api/terminals'), [], 'an announced snapshot read stays a snapshot read');
+});
+
+test('a terminal opened or closed here shows on its card and header at once, before the list is read again', async () => {
+  const s = recentSession('opened-here');
+  const opened = attachedTo(s, { id: 'b'.repeat(32) });
+  const requests = [];
+  const c = client(async (url) => {
+    requests.push(url);
+    if (url === '/api/terminals') return await new Promise(() => {});
+    if (url === '/api/launch') return { ok: true, status: 200, json: async () => ({ terminal: opened, mode: 'attach' }) };
+    return { ok: true, status: 200, json: async () => ({ ok: true }) };
+  }, noChatTimers);
+  setRecentSnapshot(c, [s]);
+  c.state.selected = s.key;
+  c.renderGroups([s], 1100);
+  c.drawDetail(s);
+  c.context.openTerminal = async () => {};
+  c.state.plan = { id: 'plan-1', allowed: true, mode: 'attach' };
+  await c.launchPlan();
+  assert.ok(requests.includes('/api/terminals'), 'the list is read again (still in flight here)');
+  assert.equal(byClass(cardOf(c, s), 'card-terminal')[0].hidden, false);
+  assert.equal(c.get('detail-terminal').hidden, false);
+  c.closeTerminal(opened.id);
+  c.confirmTerminalClose();
+  await settle();
+  assert.equal(byClass(cardOf(c, s), 'card-terminal')[0].hidden, true, 'the close answer alone hides it');
+  assert.equal(c.get('detail-terminal').hidden, true);
+  assert.equal(c.state.terminals.find((item) => item.id === opened.id).closed, true);
+});
+
+// "새 세션": a host's own launcher in a terminal; its numbered menu becomes buttons.
+const LAUNCHER_MENU = ['', '프로젝트 선택', '  1. Alpha project', '  2. Personal', '  q. 취소', '선택:'];
+
+test('a launcher menu is read from the rows above the prompt on the cursor line', () => {
+  const c = client();
+  const menu = c.terminalMenu(LAUNCHER_MENU);
+  assert.equal(menu.title, '프로젝트 선택');
+  assert.equal(menu.prompt, '선택');
+  assert.deepEqual(JSON.parse(JSON.stringify(menu.options)),
+    [{ key: '1', label: 'Alpha project' }, { key: '2', label: 'Personal' }, { key: 'q', label: '취소' }]);
+  // A refused answer and its hint between the rows and the prompt asked again.
+  const retried = c.terminalMenu([...LAUNCHER_MENU.slice(0, -1), '선택: x', '번호를 직접 선택하세요.', '선택:']);
+  assert.equal(retried.options.length, 3);
+  // Not a menu: an answer already typed, no numbered row, a drawn list, a distant prompt.
+  assert.equal(c.terminalMenu([...LAUNCHER_MENU.slice(0, -1), '선택: 1']), null);
+  assert.equal(c.terminalMenu(['계정', '  a. 하나', '  b. 둘', '선택:']), null);
+  assert.equal(c.terminalMenu(['│ 1. Yes      │', '│ 2. No       │', '╰─────────────╯', '› ']), null);
+  assert.equal(c.terminalMenu([...LAUNCHER_MENU.slice(0, -1), ...Array(7).fill('출력'), '선택:']), null);
+  assert.equal(c.terminalMenu(['  1. 하나', '  1. 둘', '선택:']), null);
+});
+
+function menuScreen(c, lines, mode = 'new-session') {
+  c.state.terminal = { id: 'c'.repeat(32), mode };
+  c.state.terminalAlive = true;
+  c.state.term = { buffer: { active: { baseY: 0, cursorY: lines.length - 1,
+    getLine: (y) => ({ translateToString: () => lines[y] }) } } };
+}
+
+test('only a new-session terminal turns a launcher menu into buttons that type the key and Enter', () => {
+  const c = client();
+  const sent = [];
+  c.context.sendInput = (text) => { sent.push(text); return Promise.resolve(); };
+  menuScreen(c, LAUNCHER_MENU, 'attach');
+  c.updateTerminalMenu();
+  assert.equal(c.get('terminal-menu').hidden, true, 'an attached agent CLI never gets menu buttons');
+  menuScreen(c, LAUNCHER_MENU);
+  c.updateTerminalMenu();
+  assert.equal(c.get('terminal-menu').hidden, false);
+  assert.equal(c.get('terminal-menu-title').textContent, '프로젝트 선택');
+  const options = c.get('terminal-menu-options').children;
+  assert.deepEqual(options.map((node) => node.textContent), ['1. Alpha project', '2. Personal', '취소']);
+  assert.match(options[2].className, /cancel/);
+  options[1].events.click();
+  assert.deepEqual(sent, ['2\r']);
+  assert.equal(c.get('terminal-menu').hidden, true, 'hidden until the launcher answers');
+  // The echoed answer is not a menu; the next menu appears with the next output.
+  menuScreen(c, [...LAUNCHER_MENU.slice(0, -1), '선택: 2']);
+  c.updateTerminalMenu();
+  assert.equal(c.get('terminal-menu').hidden, true);
+  menuScreen(c, [...LAUNCHER_MENU.slice(0, -1), '선택: 2', '', '에이전트 선택', '  1. Codex', '  2. Claude Code', '  q. 취소', '선택:']);
+  c.updateTerminalMenu();
+  assert.equal(c.get('terminal-menu-title').textContent, '에이전트 선택');
+  c.state.terminalAlive = false;
+  c.updateTerminalMenu();
+  assert.equal(c.get('terminal-menu').hidden, true, 'an ended terminal shows no menu');
+});
+
+const NEW_SESSION_HOSTS = [
+  { name: 'mini', label: 'Mini', online: true, newSession: { available: true, label: 'launcher' } },
+  { name: 'air', label: 'Air', online: true, newSession: { available: false, label: null, reason: '이 기기에는 새 세션 실행 명령이 설정되지 않았습니다.' } },
+  { name: 'old', label: 'Old', online: false, newSession: { available: true, label: 'launcher' } },
+];
+
+test('the new session chip shows only when a host can open one; the sheet says why others cannot', () => {
+  const c = client();
+  c.state.capabilities = { hosts: NEW_SESSION_HOSTS.slice(1, 2) };
+  c.renderNewSession();
+  assert.equal(c.get('new-session').hidden, true);
+  c.state.capabilities = { hosts: NEW_SESSION_HOSTS };
+  c.renderNewSession();
+  assert.equal(c.get('new-session').hidden, false);
+  c.openNewSession();
+  const rows = c.get('new-session-hosts').children;
+  assert.deepEqual(rows.map((row) => row.disabled), [false, true, true]);
+  assert.match(textOf(rows[0]), /launcher 실행/);
+  assert.match(textOf(rows[1]), /설정되지 않았습니다/);
+  assert.match(textOf(rows[2]), /연결할 수 없습니다/);
+  assert.equal(c.get('new-session-dialog').open, true);
+});
+
+test('opening a new session posts once per host and request, then opens its terminal', async () => {
+  const calls = [];
+  let fail = true;
+  const terminal = { id: 'd'.repeat(32), title: 'launcher', host: 'mini', mode: 'new-session', alive: true };
+  const c = client(async (url, options) => {
+    calls.push({ url, body: options?.body ? JSON.parse(options.body) : null });
+    if (url === '/api/new-session') {
+      if (fail) { fail = false; return { ok: false, status: 409, json: async () => ({ error: '기기 응답 시간이 초과됐습니다.' }) }; }
+      return { ok: true, status: 200, json: async () => ({ terminal, mode: 'new-session' }) };
+    }
+    return { ok: true, status: 200, json: async () => ({ terminals: [terminal] }) };
+  });
+  const opened = [];
+  c.context.openTerminal = async (value) => { opened.push(value.id); };
+  c.state.capabilities = { hosts: NEW_SESSION_HOSTS };
+  c.openNewSession();
+  await c.startNewSession('mini');
+  assert.equal(c.get('new-session-error').hidden, false);
+  assert.match(c.get('new-session-error').textContent, /시간이 초과/);
+  assert.equal(c.get('new-session-dialog').open, true, 'the sheet stays for a retry');
+  await c.startNewSession('mini');
+  const posts = calls.filter((call) => call.url === '/api/new-session');
+  assert.equal(posts.length, 2);
+  assert.equal(posts[0].body.host, 'mini');
+  assert.equal(posts[0].body.requestId, posts[1].body.requestId, 'a retry reuses the request id');
+  assert.deepEqual(opened, [terminal.id]);
+  assert.equal(c.get('new-session-dialog').open, false);
+  assert.ok(c.state.terminals.some((item) => item.id === terminal.id));
+  assert.equal(c.terminalCloseCopy(terminal).action, '실행 종료');
+  assert.equal(c.terminalCloseCopy(terminal).danger, true);
+});
+
+// The conversation keeps its newest message in view (pinnedToEnd, keepAtEnd).
+function scrollingList(c, { scrollHeight, clientHeight }) {
+  const list = c.get('messages');
+  let top = 0;
+  Object.defineProperty(list, 'scrollTop', { configurable: true, get: () => top,
+    // A browser ignores a scroll on a list without a box and clamps one past the end.
+    set: (value) => { if (list.clientHeight) top = Math.max(0, Math.min(value, list.scrollHeight - list.clientHeight)); } });
+  Object.assign(list, { scrollHeight, clientHeight });
+  return list;
+}
+function resizeObservers(c) {
+  const observers = [];
+  c.context.ResizeObserver = class {
+    constructor(callback) { this.callback = callback; this.targets = []; observers.push(this); }
+    observe(target) { this.targets.push(target); }
+    disconnect() { this.targets = []; }
+  };
+  return () => { for (const observer of observers) observer.callback(observer.targets.map((target) => ({ target }))); };
+}
+const LONG_CONVERSATION = Array.from({ length: 30 }, (_, i) => ({ role: i % 2 ? 'assistant' : 'user', text: `메시지 ${i}`, ts: i + 1 }));
+function openLong(c, id) {
+  const s = recentSession(id);
+  setRecentSnapshot(c, [s]);
+  c.state.selected = s.key;
+  c.drawDetail(s);
+  return s;
+}
+
+test('a conversation drawn while its pane is still hidden opens at its newest message once laid out', () => {
+  const c = client(undefined, noChatTimers);
+  const resize = resizeObservers(c);
+  const s = openLong(c, 'hidden-open');
+  const list = scrollingList(c, { scrollHeight: 3000, clientHeight: 0 });
+  // A phone draws the cached copy before it shows the conversation pane.
+  c.renderMessages(s, LONG_CONVERSATION, '', true);
+  assert.equal(list.scrollTop, 0, 'a hidden list cannot scroll');
+  list.clientHeight = 600;
+  resize();
+  assert.equal(list.scrollTop, 2400);
+  list.scrollHeight = 3200;
+  c.renderMessages(s, [...LONG_CONVERSATION, { role: 'assistant', text: '새 답', ts: 99 }]);
+  assert.equal(list.scrollTop, 2600, 'the read that follows stays at the end');
+  assert.equal(c.get('jump-bottom').hidden, true);
+  // Without a resize callback, showing the pane puts it at the end as well.
+  const other = client(undefined, noChatTimers);
+  const t = openLong(other, 'hidden-open-2');
+  const plain = scrollingList(other, { scrollHeight: 3000, clientHeight: 0 });
+  other.renderMessages(t, LONG_CONVERSATION, '', true);
+  plain.clientHeight = 600;
+  other.setDetailShown(true);
+  assert.equal(plain.scrollTop, 2400);
+});
+
+test('a question card, the keyboard or the bars shrinking the list keep a pinned conversation at its end', () => {
+  const c = client(undefined, noChatTimers);
+  const resize = resizeObservers(c);
+  const s = openLong(c, 'pinned-shrink');
+  const list = scrollingList(c, { scrollHeight: 3000, clientHeight: 600 });
+  c.renderMessages(s, LONG_CONVERSATION, '', true);
+  assert.equal(list.scrollTop, 2400);
+  list.clientHeight = 350;
+  resize();
+  assert.equal(list.scrollTop, 2650);
+  // A read that comes before the resize callback still sticks, though 300px from the end.
+  list.clientHeight = 300;
+  c.renderMessages(s, [...LONG_CONVERSATION, { role: 'assistant', text: '질문입니다', ts: 99 }]);
+  assert.equal(list.scrollTop, 2700);
+  assert.equal(list.unread, 0);
+});
+
+test('a reader who scrolled up keeps the place through resizes and new messages until 맨 아래', () => {
+  const c = client(undefined, noChatTimers);
+  const resize = resizeObservers(c);
+  const s = openLong(c, 'reading-back');
+  const list = scrollingList(c, { scrollHeight: 3000, clientHeight: 600 });
+  c.renderMessages(s, LONG_CONVERSATION, '', true);
+  list.scrollTop = 1200;
+  c.readingScroll(list);
+  assert.equal(list.pinned, false);
+  list.clientHeight = 500;
+  resize();
+  assert.equal(list.scrollTop, 1200);
+  c.renderMessages(s, [...LONG_CONVERSATION, { role: 'assistant', text: '새 답', ts: 99 }]);
+  assert.equal(list.scrollTop, 1200);
+  assert.equal(list.unread, 1);
+  c.get('jump-bottom').events.click();
+  assert.equal(list.scrollTop, 2500);
+  assert.equal(list.pinned, true);
+  list.clientHeight = 450;
+  resize();
+  assert.equal(list.scrollTop, 2550);
+});
+
+test('a new-session terminal belongs to the session the server linked it to, and only then', () => {
+  const c = client(async () => ({ ok: true, status: 200, json: async () => ({ ok: true }) }), noChatTimers);
+  const s = recentSession('launched-here', { home: '.codex', id: '019a0000-0000-7000-8000-000000000004' });
+  const terminal = { id: 'e'.repeat(32), alive: true, title: 'zz', mode: 'new-session', host: 'workstation',
+    metadata: { mode: 'new-session', host: 'workstation', title: 'zz', createdAt: 1000 } };
+  c.state.terminals = [terminal];
+  assert.equal(c.terminalForSession(s), null, 'no session is guessed in the browser');
+  c.state.terminals = [{ ...terminal, nativeSource: { host: s.host, agent: 'codex', id: s.id, home: '.codex', cwd: '/work' },
+    metadata: { ...terminal.metadata, nativeSource: { host: s.host, agent: 'codex', id: s.id, home: '.codex', cwd: '/work' } } }];
+  assert.equal(c.terminalForSession(s)?.id, terminal.id);
+});
+
+// A Codex account without its app-server: listed from its state DB; "앱 서버 켜기" starts it.
+test('a conversation of an account whose app-server is off offers to start it, then reads again', async () => {
+  const calls = [];
+  const c = client(async (url, options) => {
+    calls.push({ url, body: options?.body ? JSON.parse(options.body) : null });
+    if (url === '/api/app-server') return { ok: true, status: 200, json: async () => ({ ok: true, started: true }) };
+    return { ok: true, status: 200, json: async () => ({ ok: true }) };
+  }, noChatTimers);
+  const s = recentSession('off-thread', { home: '.codex', appServer: 'off', phase: 'closed' });
+  setRecentSnapshot(c, [s]);
+  c.state.selected = s.key;
+  c.renderGroups([s], 1100);
+  c.drawDetail(s);
+  const reloaded = [];
+  c.context.poll = async (refresh) => { reloaded.push(['poll', refresh]); };
+  c.context.loadDetail = async (current, fresh) => { reloaded.push(['detail', current.key, fresh]); };
+  c.renderMessages(s, [], '이 계정의 Codex 앱 서버가 꺼져 있어 대화를 읽지 못했습니다.');
+  const box = byClass(c.get('messages'), 'conversation-read-error')[0];
+  assert.match(box.className, /app-server-off/);
+  const start = byClass(box, 'app-server-start')[0];
+  assert.equal(start.textContent, '앱 서버 켜기');
+  assert.equal(byClass(box, 'secondary').length, 0, 'no plain retry: reading cannot work before the start');
+  await start.events.click({ currentTarget: start });
+  const posts = calls.filter((call) => call.url === '/api/app-server');
+  assert.deepEqual(posts.map((call) => call.body), [{ host: 'workstation', home: '.codex' }]);
+  assert.deepEqual(reloaded, [['poll', true], ['detail', s.key, true]]);
+  assert.equal(start.disabled, false);
+  // An ordinary read failure keeps its retry button.
+  const other = recentSession('other-thread');
+  c.renderMessages(other, [], '대화를 읽지 못했습니다.');
+  const plain = byClass(c.get('messages'), 'conversation-read-error')[0];
+  assert.equal(byClass(plain, 'app-server-start').length, 0);
+  assert.equal(byClass(plain, 'secondary')[0].textContent, '대화 다시 불러오기');
+});
+
+
+test('focus view restores the message anchor per conversation without storing conversation text', () => {
+  const c = client(undefined, noChatTimers);
+  const { s } = selectChat(c);
+  const list = c.get('messages');
+  Object.assign(list, { scrollHeight: 3000, clientHeight: 600, scrollTop: 400, lastScrollTop: 400, pinned: false });
+  c.renderMessages(s, [{ role: 'assistant', text: '검증용 대화', ts: 1 }]);
+  const item = list.conversationRows[0]; Object.assign(item.row, { offsetTop: 350, offsetHeight: 150 });
+  c.state.chromeVisible = false;
+  c.rememberConversationView();
+  const saved = c.state.conversationViews.get(c.conversationIdentity(s));
+  assert.equal(saved.top, 400); assert.equal(saved.chromeVisible, false); assert.equal(saved.pinned, false);
+  assert.equal(saved.anchor, item.key);
+  assert.equal(c.state.conversationViews.has(c.conversationIdentity({ ...s, home: '.codex-other' })), false);
+  Object.assign(item.row, { offsetTop: 550 });
+  list.pendingView = saved; list.scrollTop = 0;
+  c.restoreConversationView(list);
+  assert.equal(list.scrollTop, 600, 'the same message keeps its visual offset after layout changes');
+  assert.equal(list.pinned, false);
+  c.showLogin();
+  assert.equal(c.state.conversationViews.size, 0, 'locking clears private view metadata');
+});
+
+test('focus restoration waits for a hidden pane to acquire its real size', () => {
+  const c = client(undefined, noChatTimers); const { s } = selectChat(c);
+  const list = c.get('messages');
+  c.renderMessages(s, [{ role: 'assistant', text: '기존 답', ts: 1 }]);
+  list.pendingView = { top: 225, pinned: false, anchor: null, offset: 0, chromeVisible: false };
+  list.clientHeight = 0; c.restoreConversationView(list);
+  assert.ok(list.pendingView);
+  list.clientHeight = 600; c.restoreConversationView(list);
+  assert.equal(list.scrollTop, 225); assert.equal(list.pendingView, null);
+});
+
+test('reopening the same retained conversation restores its scroll after a hidden parent reset', () => {
+  const c = client(undefined, noChatTimers); const { s } = selectChat(c);
+  const list = c.get('messages');
+  c.renderMessages(s, [{ role: 'assistant', text: '다시 읽을 대화', ts: 1 }]);
+  Object.assign(list, { scrollHeight: 3000, clientHeight: 600, scrollTop: 720, lastScrollTop: 720, pinned: false });
+  c.state.chromeVisible = false;
+  c.rememberConversationView();
+  c.state.detailShown = false;
+  list.scrollTop = 0; // Browsers reset this when the retained node moves to a hidden pane.
+  c.select(s.key);
+  assert.equal(list.scrollTop, 720);
+  assert.equal(c.state.chromeVisible, false);
+  list.scrollTop = 840;
+  c.select(s.key);
+  assert.equal(list.scrollTop, 840, 'selecting an already visible conversation does not replay an older view');
+});
+
+test('session origin filters never equate execution surface with its initiator', () => {
+  const c = client(undefined, noChatTimers); c.state.showOld = true;
+  for (const row of [{ source: 'cli' }, { kind: 'background' }, { source: 'exec' }]) {
+    assert.equal(c.initiatorOf(row), 'unknown');
+    c.state.filters.initiator = 'human'; assert.equal(c.matches(row, 100), false);
+    c.state.filters.initiator = 'unknown'; assert.equal(c.matches(row, 100), true);
+  }
+  c.state.filters.initiator = 'agent'; c.state.sessionCategory = 'agent';
+  assert.equal(c.matches({ initiator: 'agent', initiatorName: 'Planner' }, 100), true);
+  assert.equal(c.initiatorLabel({ initiator: 'agent', initiatorName: 'Planner' }), '에이전트 시작 · Planner');
+});
+
+test('Ctrl or Command K focuses the visible unified search without submitting a draft', () => {
+  const c = client(undefined, noChatTimers); let prevented = 0;
+  c.documentKeydown({ key: 'k', metaKey: true, preventDefault() { prevented++; } });
+  assert.equal(c.get('search').focusCount, 1); assert.equal(prevented, 1);
+  c.documentKeydown({ key: 'k', metaKey: true, isComposing: true, preventDefault() { prevented++; } });
+  assert.equal(prevented, 1);
+});
+
+
+test('Windows 저장 기록의 실행 미확인은 기기 연결·과거 live phase와 별개로 표시한다', () => {
+  const c = client(undefined, noChatTimers);
+  const row = recentSession('windows-record', { host: 'windows-pc', phase: 'unknown', runtimeKnown: false, readOnly: true });
+  c.state.authenticated = true;
+  c.state.snapshot = { serverTime: 1100, hosts: [{ name: 'windows-pc', label: '작업실 PC', ok: true, fetchedAt: 1099, data: { codex: [row] } }] };
+  c.state.livePhases.set(row.key, { base: 'unknown', phase: 'working' });
+  const record = c.allSessions()[0];
+  assert.equal(record.phase, 'unknown'); assert.equal(record.stale, false); assert.equal(record.hostLabel, '작업실 PC');
+  c.renderGroups([record], 1100);
+  let card = byClass(c.get('groups'), 'card')[0];
+  assert.equal(byClass(card, 'badge')[0].textContent, '실행 확인 전');
+  assert.equal(byClass(card, 'card-device-label')[0].textContent, '작업실 PC');
+  assert.equal(byClass(card, 'stale-tag')[0].hidden, true, '실행 미확인을 오프라인으로 표시하지 않는다');
+  const detailMeta = vm.runInContext('detailMetaChildren', c.context)(record);
+  assert.equal(detailMeta[0].textContent, '실행 확인 전');
+  vm.runInContext('noteLivePhase', c.context)(record, { route: c.sourceOf(record), phase: 'idle' });
+  assert.equal(c.allSessions()[0].phase, 'unknown', '저장된 대화의 phase는 실행 상태의 증거가 아니다');
+  c.state.snapshot.hosts[0].ok = false;
+  c.renderGroups(c.allSessions(), 1100); card = byClass(c.get('groups'), 'card')[0];
+  assert.equal(byClass(card, 'badge')[0].textContent, '실행 확인 전');
+  assert.equal(byClass(card, 'stale-tag')[0].hidden, false, '기기 연결이 끊긴 경우에는 별도 이전 정보 표시를 붙인다');
+});
+
+
+test('세션 분류는 명시 agent만 분리하고 일반 세션에 human과 미확인 실행을 중복 없이 남긴다', () => {
+  const c = client(undefined, noChatTimers);
+  const rows = [recentSession('human', { initiator: 'human' }), recentSession('agent', { initiator: 'agent' }),
+    ...['cli', 'background', 'exec'].map((kind) => recentSession(kind, { source: kind, kind, parentSessionId: 'agent', agentName: 'worker' }))];
+  setRecentSnapshot(c, rows);
+  const general = rows.filter(s => c.matches(s, 1100));
+  assert.deepEqual(general.map(s => s.id), ['human', 'cli', 'background', 'exec']);
+  c.state.sessionCategory = 'agent';
+  const agents = rows.filter(s => c.matches(s, 1100)); assert.deepEqual(agents.map(s => s.id), ['agent']);
+  assert.equal(new Set([...general, ...agents].map(s => s.key)).size, rows.length);
+  c.renderSessionCategories(rows, 1100);
+  assert.equal(c.get('session-category-general-count').textContent, '4');
+  assert.equal(c.get('session-category-agent-count').textContent, '1');
+  assert.equal(c.get('session-category-agent').attributes['aria-selected'], 'true');
+  assert.equal(c.get('groups').attributes['aria-labelledby'], 'session-category-agent');
+});
+
+test('검색은 선택 분류에서 동작하고 다른 분류의 일치 결과로 조건을 유지해 이동한다', () => {
+  const c = client(undefined, noChatTimers);
+  const rows = [recentSession('human', { initiator: 'human', title: '일반 문서 검토' }),
+    recentSession('agent', { initiator: 'agent', title: '검색 회귀 확인', phase: 'working' }),
+    recentSession('other-device', { initiator: 'agent', host: 'other', title: '검색 회귀 확인', phase: 'working' })];
+  setRecentSnapshot(c, rows.slice(0, 2));
+  c.state.snapshot.hosts.push({ name: 'other', label: '다른 기기', ok: true, data: { codex: [rows[2]] } });
+  c.state.search = '검색 회귀'; c.state.filters.host = 'workstation'; c.state.phaseFilter = 'working';
+  c.render();
+  assert.equal(byClass(c.get('groups'), 'card').length, 0);
+  assert.equal(c.get('session-category-search').hidden, false);
+  assert.match(c.get('session-category-search-action').textContent, /에이전트 세션.*1개/);
+  c.setSessionCategory(c.get('session-category-search-action').dataset.category);
+  assert.equal(c.state.search, '검색 회귀'); assert.equal(c.state.filters.host, 'workstation'); assert.equal(c.state.phaseFilter, 'working');
+  assert.equal(byClass(c.get('groups'), 'card').length, 1); assert.equal(c.get('session-category-search').hidden, true);
+});
+
+test('시작 주체 필터와 분류를 동기화하고 초기화는 현재 분류를 유지한다', () => {
+  const c = client(undefined, noChatTimers);
+  const rows = [recentSession('human', { initiator: 'human' }), recentSession('agent', { initiator: 'agent' }), recentSession('unknown')];
+  setRecentSnapshot(c, rows); c.renderFilters(rows);
+  let control = c.get('filter-initiator'); control.value = 'agent'; control.events.change();
+  assert.equal(c.state.sessionCategory, 'agent'); assert.equal(c.state.filters.initiator, 'agent');
+  assert.equal(byClass(c.get('groups'), 'card').length, 1);
+  c.resetFilters(); assert.equal(c.state.sessionCategory, 'agent'); assert.equal(c.state.filters.initiator, '');
+  control = c.get('filter-initiator'); control.value = 'unknown'; control.events.change();
+  assert.equal(c.state.sessionCategory, 'general'); assert.equal(byClass(c.get('groups'), 'card').length, 1);
+  control = c.get('filter-initiator'); control.value = 'human'; control.events.change();
+  assert.equal(c.get('session-category-note').hidden, true, '직접 시작만 보는 중에는 미확인 포함 안내를 숨긴다');
+  c.setSessionCategory('agent'); assert.equal(c.state.filters.initiator, '', '분류와 충돌하는 시작 주체 조건만 해제한다');
+  c.sessionCategoryKeydown({ key: 'Home', preventDefault() {} });
+  assert.equal(c.state.sessionCategory, 'general'); assert.equal(c.get('session-category-general').tabIndex, 0);
+  assert.ok(c.get('session-category-general').focusCount > 0);
+  c.sessionCategoryKeydown({ key: 'ArrowRight', preventDefault() {} });
+  assert.equal(c.state.sessionCategory, 'agent'); assert.equal(c.get('session-category-agent').attributes['aria-selected'], 'true');
+});
+
+test('작업에서 대화를 직접 열면 대상 분류와 목록 조건을 맞추고 분류 전환은 초안과 보기 기록을 보존한다', () => {
+  const c = client(undefined, noChatTimers); c.context.navigator = { onLine: false };
+  const human = recentSession('human', { initiator: 'human' }), agent = recentSession('agent', { initiator: 'agent', phase: 'working' });
+  setRecentSnapshot(c, [human, agent]);
+  c.select(human.key); const draft = c.chatEntry(human); draft.text = '보내지 않은 초안';
+  const view = { top: 125, anchor: 'saved-row', pinned: false, chromeVisible: false };
+  c.state.conversationViews.set(c.conversationIdentity(human), view);
+  c.state.filters.host = 'other'; c.state.filters.initiator = 'human'; c.state.search = '다른 대화'; c.state.phaseFilter = 'needs_input';
+  c.select(agent.key);
+  assert.equal(c.state.sessionCategory, 'agent'); assert.equal(c.state.selected, agent.key);
+  assert.equal(c.state.filters.host, ''); assert.equal(c.state.filters.initiator, ''); assert.equal(c.state.search, ''); assert.equal(c.state.phaseFilter, '');
+  assert.equal(c.matches(c.allSessions().find(s => s.key === agent.key), 1100), true);
+  c.chatEntry(agent).text = '워커 초안'; c.setSessionCategory('general');
+  assert.equal(c.state.selected, null); assert.equal(c.state.detailShown, false);
+  assert.equal(byClass(c.get('detail'), 'detail-head').length, 0, '다른 분류의 열린 대화를 남기지 않는다');
+  assert.equal(c.chatEntry(agent).text, '워커 초안'); assert.equal(draft.text, '보내지 않은 초안');
+  assert.equal(c.state.conversationViews.get(c.conversationIdentity(human)), view);
+  c.select(human.key); assert.equal(c.state.sessionCategory, 'general'); assert.equal(c.chatEntry(human).text, '보내지 않은 초안');
+});
+
+test('잠금은 분류 선택과 시작 주체 조건을 일반 세션으로 초기화한다', () => {
+  const c = client(undefined, noChatTimers);
+  c.state.sessionCategory = 'agent'; c.state.filters.initiator = 'agent'; c.showLogin();
+  assert.equal(c.state.sessionCategory, 'general'); assert.equal(c.state.filters.initiator, '');
+  assert.equal(c.get('session-category-general').attributes['aria-selected'], 'true');
+  assert.equal(c.get('session-category-agent-count').textContent, '0');
+});
+
+
+test('closed-session recovery stays explicit, keeps its draft, and plans the same source exactly once', async () => {
+  const calls = []; let resolvePlan;
+  const c = client(async (url, options) => {
+    calls.push({ url, body: JSON.parse(options.body) });
+    return new Promise((resolve) => { resolvePlan = resolve; });
+  }, noChatTimers);
+  const { s, entry } = selectChat(c);
+  s.nativeSource = true; s.phase = 'closed'; entry.text = '이어갈 초안';
+  entry.data = { route: c.sourceOf(s), phase: 'closed', capability: { supported: false, action: 'resume_session' },
+    recovery: { supported: true, action: 'resume_session', closedByBoard: false } };
+  c.buildChatComposer(s); c.updateChatComposer(entry);
+  assert.equal(c.get('chat-recovery').hidden, false);
+  assert.equal(c.get('chat-recover').textContent, '세션 다시 열기');
+  assert.equal(c.get('chat-input').disabled, false); assert.equal(c.get('chat-send').disabled, true);
+  assert.equal(calls.length, 0, 'reading a closed session never starts a terminal or model turn');
+  c.state.route = { host: 'other-device', agent: 'claude', account: 'other-account' };
+  const pending = c.get('chat-recover').events.click();
+  await c.get('chat-recover').events.click();
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].url, '/api/plan');
+  assert.deepEqual(calls[0].body, { source: { host: s.host, agent: s.agent, home: s.home, id: s.id },
+    target: { host: s.host, agent: s.agent, account: 'codex:' + s.home }, resume: true });
+  resolvePlan({ ok: true, status: 200, json: async () => ({ allowed: true, mode: 'resume', id: 'resume-plan', warnings: [] }) });
+  await pending;
+  assert.equal(calls.length, 1, 'launch still requires the user confirmation');
+  assert.equal(c.get('plan-launch').textContent, '세션 다시 열기');
+  assert.equal(entry.text, '이어갈 초안');
+});
+
+test('board-terminated or mismatched-route recovery cannot open a session', async () => {
+  const calls = []; const c = client(async (url) => { calls.push(url); throw new Error('unexpected request'); }, noChatTimers);
+  const { s, entry } = selectChat(c);
+  c.buildChatComposer(s);
+  entry.data = { route: c.sourceOf(s), phase: 'closed', capability: { supported: false, reason: '웹보드에서 종료한 세션입니다.' },
+    recovery: { supported: true, action: 'resume_session', closedByBoard: true } };
+  c.updateChatComposer(entry); await c.recoverChatSession(s);
+  assert.equal(c.get('chat-recovery').hidden, true); assert.equal(c.get('chat-input').disabled, true);
+  assert.match(c.get('chat-status').textContent, /웹보드에서 종료/);
+  entry.data.recovery.closedByBoard = false; entry.data.route = { ...entry.data.route, home: '.codex-other' };
+  c.updateChatComposer(entry); await c.recoverChatSession(s);
+  assert.equal(c.get('chat-recovery').hidden, true); assert.equal(calls.length, 0);
+});
+
+test('offline recovery rechecks only its host once and never resumes from a cached capability', async () => {
+  const calls = []; let resolveRefresh;
+  const c = client(async (url, options) => {
+    calls.push({ url, body: JSON.parse(options.body) });
+    return new Promise((resolve) => { resolveRefresh = resolve; });
+  }, noChatTimers);
+  const { s, entry } = selectChat(c);
+  c.state.snapshot.hosts[0].ok = false;
+  entry.data.recovery = { supported: true, action: 'resume_session' };
+  entry.text = '연결 후 보낼 초안';
+  vm.runInContext('poll = async () => {}', c.context);
+  c.buildChatComposer(s); c.updateChatComposer(entry);
+  assert.equal(c.get('chat-recover').textContent, '기기 연결 다시 확인');
+  assert.equal(c.chatSupported(entry), false); assert.equal(c.get('chat-send').disabled, true);
+  const pending = c.get('chat-recover').events.click(); await c.get('chat-recover').events.click();
+  assert.deepEqual(calls, [{ url: '/api/refresh', body: { host: s.host } }]);
+  resolveRefresh({ ok: true, status: 200, json: async () => ({ ok: true }) }); await pending;
+  assert.equal(entry.text, '연결 후 보낼 초안'); assert.equal(calls.length, 1);
+  c.state.offline = true; await c.recoverChatSession(s); assert.equal(calls.length, 1);
+});
+
+test('external sessions expose management beside the conversation and Windows input follows server capability', () => {
+  const c = client(undefined, noChatTimers); const { s, entry } = selectChat(c);
+  s.source = 'vscode'; s.readOnly = true; s.runtimeKnown = false;
+  c.drawDetail(s); c.updateChatComposer(entry);
+  assert.equal(c.get('detail-manage-session').textContent, '세션 관리');
+  vm.runInContext('manageSession = (s) => { globalThis.managedSource = sourceOf(s); }', c.context);
+  c.get('detail-manage-session').events.click({ currentTarget: c.get('detail-manage-session') });
+  assert.deepEqual({ ...c.context.managedSource }, { host: s.host, agent: s.agent, home: s.home, id: s.id });
+  assert.equal(c.get('chat-input').disabled, false, 'snapshot read-only does not override live canSend');
+  entry.data.capability.supported = false; c.updateChatComposer(entry);
+  assert.equal(c.get('chat-input').disabled, true);
+});
+
+const ONE_SHOT_HISTORY = '대화 기록을 저장하지 않는 일회성 실행입니다. 실행 상태를 확인하고 결과는 요청한 에이전트에서 확인해 주세요.';
+const ONE_SHOT_INPUT = '일회성 실행에는 후속 메시지를 보낼 수 없습니다. 결과는 요청한 에이전트에서 확인해 주세요.';
+function selectWindowsOneShot(c) {
+  const s = recentSession('claude-oneshot-4102', { host: 'windows-pc', hostLabel: 'Windows PC', agent: 'claude', home: '',
+    executionMode: 'one-shot', transcriptAvailability: 'disabled', initiator: 'agent', initiatorName: 'Codex', phase: 'working' });
+  c.state.snapshot = { serverTime: 1100, hosts: [{ name: s.host, label: s.hostLabel, ok: true, data: { claude: [s] } }] };
+  c.state.selected = s.key; c.state.authenticated = true;
+  const entry = c.chatEntry(s);
+  entry.data = { route: c.sourceOf(s), executionMode: s.executionMode, transcriptAvailability: s.transcriptAvailability,
+    capability: { supported: false, reason: ONE_SHOT_INPUT }, phase: 'working', messages: [],
+    historyNotice: { code: 'not_persisted', message: ONE_SHOT_HISTORY } };
+  c.get('chat-composer').dataset.source = c.chatKey(entry.source);
+  return { s, entry };
+}
+function assertOneShotHistory(c) {
+  const messages = c.get('messages'), notices = byClass(messages, 'conversation-history-notice');
+  assert.equal(notices.length, 1);
+  assert.match(textOf(notices[0]), /일회성 실행 · 기록 저장 안 함/);
+  assert.ok(textOf(notices[0]).includes(ONE_SHOT_HISTORY));
+  for (const className of ['conversation-read-error', 'group-empty', 'msg-working'])
+    assert.equal(byClass(messages, className).length, 0, className);
+}
+
+test('Windows 일회성 Claude는 에이전트 분류·기기·호출자를 유지하고 정상 chat/state에서 기록 미저장 안내를 표시한다', async () => {
+  const calls = []; let stateData;
+  const c = client(async (url, options) => {
+    calls.push({ url, body: JSON.parse(options.body) });
+    assert.equal(url, '/api/chat/state');
+    return { ok: true, status: 200, json: async () => stateData };
+  }, noChatTimers);
+  const { s, entry } = selectWindowsOneShot(c);
+  stateData = entry.data; entry.data = null;
+  assert.equal(c.sessionCategoryOf(s), 'agent');
+  c.renderSessionCategories([s], 1100); c.renderGroups([s], 1100);
+  assert.equal(c.get('session-category-agent-count').textContent, '1');
+  assert.equal(c.get('session-category-general-count').textContent, '0');
+  const card = byClass(c.get('groups'), 'card')[0];
+  assert.match(textOf(card), /Windows PC/); assert.match(textOf(card), /Codex/);
+  assert.equal(byClass(card, 'card-execution')[0].hidden, false);
+  c.drawDetail(s); await c.loadDetail(s, true);
+  assertOneShotHistory(c);
+  assert.match(textOf(c.get('detail')), /일회성 실행/);
+  assert.match(textOf(c.get('detail')), /에이전트 시작 · Codex/);
+  assert.equal(c.get('chat-status').textContent, ONE_SHOT_INPUT);
+  assert.equal(c.get('chat-input').disabled, true);
+  assert.deepEqual(calls, [{ url: '/api/chat/state', body: { source: { host: 'windows-pc', agent: 'claude', id: s.id } } }]);
+  assert.equal(entry.source.id, 'claude-oneshot-4102');
+  assert.equal(entry.data.route.id, entry.source.id);
+});
+
+test('일회성 Claude의 /api/read fallback도 정상 미저장 안내를 표시하고 일반 세션으로 바꾸면 안내를 제거한다', async () => {
+  const calls = []; let readData;
+  const c = client(async (url) => {
+    calls.push(url);
+    return url === '/api/chat/state'
+      ? { ok: false, status: 404, json: async () => ({ error: '채팅 상태 경로 없음' }) }
+      : { ok: true, status: 200, json: async () => readData };
+  }, noChatTimers);
+  const selected = selectWindowsOneShot(c);
+  readData = { ...selected.entry.data, historyNotice: { code: 'not_persisted', message: ONE_SHOT_HISTORY + ' 수집기 확인 안내입니다.' } };
+  selected.entry.data = null;
+  c.drawDetail(selected.s); await c.loadDetail(selected.s, true);
+  assert.deepEqual(calls.map((url) => url.split('?')[0]), ['/api/chat/state', '/api/read']);
+  const query = new URL(calls[1], 'https://fixture.invalid').searchParams;
+  assert.equal(query.get('host'), 'windows-pc'); assert.equal(query.get('agent'), 'claude');
+  assert.equal(query.get('id'), 'claude-oneshot-4102');
+  assertOneShotHistory(c);
+  assert.match(textOf(c.get('messages')), /수집기 확인 안내입니다/);
+  assert.equal(selected.entry.error, '', '읽기 성공 뒤 chat/state fallback 오류를 입력 안내에 남기지 않는다');
+  const messages = c.get('messages');
+  const ordinary = selectChat(c, { agent: 'claude', home: '', id: 'ordinary-claude-session' });
+  c.renderMessages(ordinary.s, [{ role: 'assistant', text: '일반 세션의 저장된 대화' }]);
+  assert.equal(c.get('messages'), messages, '같은 목록 DOM에서 이전 안내가 제거된다');
+  assert.equal(byClass(messages, 'conversation-history-notice').length, 0);
+  assert.match(textOf(messages), /일반 세션의 저장된 대화/);
+  assert.doesNotMatch(textOf(messages), /기록 저장 안 함|결과는 요청한 에이전트/);
+  assert.equal(calls.length, 2);
+});
+
+test('일회성 Claude는 남은 전송·터미널 capability도 거부하고 세션 관리의 원본 식별자는 유지한다', async () => {
+  const calls = [];
+  const c = client(async (url) => { calls.push(url); throw new Error('일회성 실행은 입력·터미널 요청을 보내지 않는다'); }, noChatTimers);
+  const { s, entry } = selectWindowsOneShot(c);
+  entry.data.capability = { supported: true, attachments: true, action: 'open_terminal' };
+  entry.text = '보내지 않을 초안';
+  c.drawDetail(s); c.updateChatComposer(entry);
+  const { terminalRequired } = vm.runInContext('({ terminalRequired })', c.context);
+  assert.equal(c.chatSupported(entry), false); assert.equal(c.chatAttachmentsSupported(entry), false);
+  assert.equal(terminalRequired(entry), false);
+  assert.equal(c.get('chat-input').disabled, true); assert.equal(c.get('chat-send').disabled, true);
+  assert.equal(c.get('chat-attach').disabled, true); assert.equal(c.get('chat-terminal-gate').hidden, true);
+  assert.equal(c.get('chat-terminal').disabled, true);
+  assert.equal(c.get('chat-status').textContent, ONE_SHOT_INPUT);
+  await c.sendChat(entry); c.openChatTerminal(s);
+  c.state.route = { host: s.host, agent: s.agent, account: 'claude:default' };
+  await c.preparePlan();
+  assert.equal(calls.length, 0); assert.equal(entry.text, '보내지 않을 초안');
+  assert.equal(c.get('plan-dialog').open, undefined);
+  const manage = c.get('detail-manage-session');
+  assert.equal(manage.textContent, '세션 관리'); assert.equal(manage.disabled, false);
+  vm.runInContext('manageSession = (s) => { globalThis.managedSource = sourceOf(s); }', c.context);
+  manage.events.click({ currentTarget: manage });
+  assert.deepEqual({ ...c.context.managedSource }, { host: 'windows-pc', agent: 'claude', id: s.id });
+});
+
+test('저장된 일회성 대화는 이전 미저장 안내보다 우선하며 disabled 메타데이터만으로 안내를 만들지 않는다', async () => {
+  for (const fallback of [false, true]) {
+    let saved;
+    const c = client(async (url) => {
+      if (fallback && url === '/api/chat/state') return { ok: false, status: 404, json: async () => ({ error: '상태 경로 없음' }) };
+      return { ok: true, status: 200, json: async () => saved };
+    }, noChatTimers);
+    const { s, entry } = selectWindowsOneShot(c);
+    s.historyNotice = { code: 'not_persisted', message: ONE_SHOT_HISTORY };
+    c.drawDetail(s);
+    entry.conversation = { identity: c.conversationIdentity(s), authEpoch: c.state.authEpoch,
+      messages: [], historyNotice: s.historyNotice, executionMode: 'one-shot', transcriptAvailability: 'disabled' };
+    c.renderMessages(s, []); assertOneShotHistory(c);
+    saved = { route: c.sourceOf(s), phase: 'idle', executionMode: 'one-shot', transcriptAvailability: 'disabled',
+      messages: [{ role: 'assistant', text: '이전에 저장된 실제 대화입니다.' }], capability: { supported: false, reason: ONE_SHOT_INPUT } };
+    await c.loadDetail(s, true);
+    assert.match(textOf(c.get('messages')), /이전에 저장된 실제 대화/);
+    assert.equal(byClass(c.get('messages'), 'conversation-history-notice').length, 0, `저장 본문 우선, fallback=${fallback}`);
+    assert.equal(entry.conversation.historyNotice, null);
+    assert.equal(entry.error, '', '일회성 기록 읽기가 성공하면 실패한 상태 경로의 오류를 지운다');
+    c.renderMessages(s, []);
+    assert.equal(byClass(c.get('messages'), 'conversation-history-notice').length, 0, '새 읽기의 명시 안내 부재가 이전 snapshot·cache 안내를 무효화한다');
+    assert.equal(c.chatSupported(entry), false, '본문 유무와 일회성 입력 제한은 별개다');
+  }
+});
+
+test('보드 표시명은 목록·검색에 반영되고 원본 제목·세션 경로는 보존한다', () => {
+  const c = client(undefined, noChatTimers), now = Math.floor(Date.now() / 1000);
+  const original = { id: 'label-native-id', agent: 'codex', home: '.codex-fixture', name: 'native-runtime-name',
+    cwd: '/fixture/original', title: '원본 찾기', originalTitle: '원본 찾기', displayTitle: '보드 별칭 찾기',
+    titleAlias: '보드 별칭 찾기', phase: 'working', updatedAt: now, initiator: 'agent' };
+  c.state.snapshot = { sessionLabels: { ok: true, revision: 4 }, hosts: [{ name: 'local', label: '합성 PC', ok: true, data: { codex: [original] } }] };
+  c.state.sessionCategory = 'agent';
+  const row = c.allSessions()[0];
+  assert.equal(row.title, '보드 별칭 찾기');
+  assert.equal(row.originalTitle, '원본 찾기');
+  for (const field of ['id', 'name', 'cwd', 'home']) assert.equal(row[field], original[field]);
+  assert.equal(original.title, '원본 찾기', 'snapshot native title remains untouched');
+  for (const query of ['보드 별칭', '원본 찾기']) { c.state.search = query; assert.equal(c.matches(row, now), true); }
+  let decorated;
+  c.context.window.SessionholicLabels = { decorate: (value, metadata) => {
+    decorated = { value, metadata }; return { ...value, displayTitle: '저장 직후 제목' };
+  } };
+  assert.equal(c.allSessions()[0].title, '저장 직후 제목');
+  assert.equal(decorated.value.host, 'local', 'identity is complete before applying the saved alias');
+  assert.equal(decorated.metadata.revision, 4);
+  const html = fs.readFileSync(path.join(__dirname, '../web/index.html'), 'utf8');
+  assert.ok(html.indexOf('src="/session_labels.js"') < html.indexOf('src="/app.js"'), 'module loads before app initialization');
 });

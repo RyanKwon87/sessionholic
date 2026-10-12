@@ -46,6 +46,9 @@ class SetupTest(unittest.TestCase):
             self.assertEqual(value["Label"], cli.LABEL)
             self.assertIn(str(self.home / ".config/sessionholic/hosts.json"), value["ProgramArguments"])
             self.assertEqual(value["Umask"], 0o077)
+            # Interactive scheduling; low-priority I/O would slow conversation reads again.
+            self.assertEqual(value["ProcessType"], "Interactive")
+            self.assertNotIn("LowPriorityIO", value)
             self.assertEqual(output.stat().st_mode & 0o777, 0o600)
             with self.assertRaises(ValueError):
                 cli.service_file(home=self.home)

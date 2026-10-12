@@ -4,8 +4,14 @@ import json
 import os
 from pathlib import Path
 import secrets
+import subprocess
 import time
 import uuid
+
+APP_SERVER_START_SECONDS = 60
+APP_SERVER_WAIT_SECONDS = 10
+APP_SERVER_FAILED = ('이 기기에서 대상 Codex 계정의 앱 서버를 시작하지 못했습니다. '
+                     '그 계정으로 Codex를 한 번 실행한 뒤 다시 시도해 주세요.')
 
 
 def _save(path, value):
@@ -33,6 +39,51 @@ def _resume(spec, identity, socket, receipt_path):
                      'unix://' + str(socket), '--cd', spec['cwd']]}
 
 
+def app_server_running(profile, home=None):
+    """Whether this Codex home's app-server control socket is there and safe to use."""
+    from transfer_native import _socket_path
+    try:
+        _socket_path({'home': profile['home']}, home)
+        return True
+    except ValueError:
+        return False
+
+
+def ensure_app_server(spec, profile, home=None):
+    """A Codex target's app-server, started the way the account's own CLI starts it.
+
+    The first input goes through this socket, and a home unused for a while has no daemon.
+    `codex app-server daemon start` starts one (and does nothing when one runs) with this
+    launch's own variables, so the daemon stays inside the terminal's environment boundary.
+    Nothing is sent to a model here. Returns True when this call started it."""
+    if profile.get('agent') != 'codex' or app_server_running(profile, home):
+        return False
+    import launch
+    argv, env = spec.get('argv') or [], spec.get('env') or {}
+    expected = (launch._home(home) / profile['home']).resolve()
+    if (not argv or not os.path.isabs(argv[0]) or not os.access(argv[0], os.X_OK)
+            or not env.get('CODEX_HOME') or Path(env['CODEX_HOME']).resolve() != expected):
+        raise ValueError(APP_SERVER_FAILED)
+    # Later sessions of this account (from the user's own launcher too) join this daemon and
+    # run their tools in its variables: a plain launch environment also keeps the user's SSH
+    # agent, as their terminal does; one with isolation variables (personal Git·SSH) never.
+    import settings
+    if 'SSH_AUTH_SOCK' in os.environ and settings.ENV_KEYS.isdisjoint(env):
+        env = {**env, 'SSH_AUTH_SOCK': os.environ['SSH_AUTH_SOCK']}
+    try:
+        result = subprocess.run([argv[0], 'app-server', 'daemon', 'start'], env=env, cwd=str(expected),
+                                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                timeout=APP_SERVER_START_SECONDS)
+    except (OSError, subprocess.TimeoutExpired):
+        result = None
+    deadline = time.monotonic() + APP_SERVER_WAIT_SECONDS
+    while not app_server_running(profile, home):
+        if result is None or result.returncode != 0 or time.monotonic() >= deadline:
+            raise ValueError(APP_SERVER_FAILED)
+        time.sleep(0.2)
+    return True
+
+
 def mark_attached(spec, terminal_id):
     if spec.get('nativeReceiptPath'):
         path = Path(spec['nativeReceiptPath'])
@@ -57,6 +108,7 @@ def bind(spec, profile, host, *, home=None, receipt_path=None):
     from native_chat import _client, NativeRejected
     from collector import RpcError
     selector = {**identity, 'id': str(uuid.uuid4())}
+    ensure_app_server(spec, profile, home)
     socket = _socket_path(selector, home)
     receipt_path = Path(receipt_path or (spec['handoffPath'] + '.native.json'))
     prompt = spec['argv'][-1]
@@ -84,16 +136,12 @@ def bind(spec, profile, host, *, home=None, receipt_path=None):
         # Empty threads cannot yet be resumed by these CLI versions. Materialize
         # the already-authorized handoff prompt natively before attaching the TUI.
         try:
-            queued = client.call('thread/queue/add', {'threadId': identity['id'],
-                'clientUserMessageId': request_id, 'input': [{'type': 'text', 'text': prompt}]}).get('queuedSubmission', {})
-            if queued.get('clientUserMessageId') != request_id or not queued.get('id'):
+            # turn/start submits the prompt directly; there is no board-side queue.
+            started = client.call('turn/start', {'threadId': identity['id'],
+                'clientUserMessageId': request_id, 'input': [{'type': 'text', 'text': prompt}]}).get('turn', {})
+            if not started.get('id'):
                 raise ValueError('첫 메시지 접수 결과를 확인하지 못했습니다.')
-            record.update(delivery='queued', queueId=queued['id']); _save(receipt_path, record)
-            try:
-                client.call('thread/queue/start', {'threadId': identity['id'], 'queuedSubmissionId': queued['id']})
-            except NativeRejected:
-                # Automatic dispatch can already have started this exact queue item.
-                pass
+            record.update(delivery='accepted', turnId=started['id']); _save(receipt_path, record)
             # Wait for a resumable history without resubmitting the prompt.
             # Empty-thread reads can briefly reject before the first user item.
             deadline = time.monotonic() + 2

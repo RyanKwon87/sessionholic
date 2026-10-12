@@ -31,6 +31,17 @@ class SettingsTest(unittest.TestCase):
         self.path.write_text(json.dumps({'version': 1, **fields}))
         return settings.load(self.home)
 
+    def test_a_config_others_can_change_is_refused(self):
+        # It names programs the board runs (usage.python): only its owner may change it.
+        self.config()
+        for mode in (0o664, 0o646, 0o666):
+            self.path.chmod(mode)
+            with self.assertRaisesRegex(ValueError, "다른 사용자가 수정할 수 있습니다"):
+                settings.load(self.home)
+        for mode in (0o600, 0o400, 0o644):
+            self.path.chmod(mode)
+            self.assertEqual(settings.load(self.home)['version'], 1)
+
     def test_empty_home_has_no_phantom_profiles_and_ignores_legacy_files(self):
         legacy = self.home / '.config/agent-router'
         legacy.mkdir()
@@ -94,7 +105,12 @@ class SettingsTest(unittest.TestCase):
         self.assertEqual(settings.variables('team', self.home)['GH_CONFIG_DIR'], str(self.home / 'fixture-private-gh'))
 
     def test_malformed_settings_fail_closed_without_echoing_values(self):
-        bad = [{'version': True}, {'version': 2}, {'version': 1, 'unexpected': 'SENTINEL'},
+        bad = [{'version': True}, {'version': 3}, {'version': 1, 'unexpected': 'SENTINEL'},
+               # Version 2 fields are refused in a version 1 file.
+               {'version': 1, 'boundary': {'agents': ['codex']}},
+               {'version': 1, 'profiles': [{'agent': 'codex', 'home': '.codex', 'placeholder': True}]},
+               {'version': 1, 'projects': [{'id': 'p', 'label': 'P', 'root': 'Private', 'match': 'component'}]},
+               {'version': 1, 'environments': {'team': {'boundaryGroup': 'default'}}},
                {'version': 1, 'profiles': [{'agent': 'codex', 'home': '../other'}]},
                {'version': 1, 'profiles': [{'agent': 'claude', 'home': '.claude-other'}]},
                {'version': 1, 'profiles': [{'agent': 'codex', 'home': '.codex', 'environment': 'missing'}]},
@@ -107,6 +123,26 @@ class SettingsTest(unittest.TestCase):
             with self.subTest(value=value), self.assertRaises(ValueError) as error:
                 settings.load(self.home)
             self.assertNotIn('SENTINEL', str(error.exception))
+
+    def test_launch_enabled_rule_and_exact_profile_override_preserve_environment(self):
+        config = self.config(version=2, environments={'personal': {}}, profileRules=[
+            {'agent': 'codex', 'homePrefix': '.codex-personal', 'environment': 'personal', 'launchEnabled': False}],
+            profiles=[{'agent': 'codex', 'home': '.codex-personal-active', 'launchEnabled': True}])
+        self.assertEqual(settings.resolve_profile('codex', '.codex-personal-old', config=config),
+                         {'environment': 'personal', 'launchEnabled': False})
+        self.assertEqual(settings.resolve_profile('codex', '.codex-personal-active', config=config),
+                         {'environment': 'personal', 'launchEnabled': True})
+        self.assertEqual(settings.resolve_profile('codex', '.codex-personalish', config=config),
+                         {'environment': 'default', 'launchEnabled': True})
+
+    def test_launch_enabled_requires_boolean_in_version_two(self):
+        for value in ('false', 0, None, []):
+            for fields in ({'profiles': [{'agent': 'codex', 'home': '.codex', 'launchEnabled': value}]},
+                           {'profileRules': [{'agent': 'codex', 'homePrefix': '.codex', 'launchEnabled': value}]}):
+                with self.subTest(value=value, fields=fields), self.assertRaises(ValueError):
+                    self.config(version=2, **fields)
+        with self.assertRaises(ValueError):
+            self.config(profiles=[{'agent': 'codex', 'home': '.codex', 'launchEnabled': False}])
 
     def test_config_ancestor_link_and_oversized_file_are_rejected(self):
         self.path.write_text(' ' * 65537)

@@ -5,6 +5,7 @@ from discover_profiles().  Neither object is a client-supplied command.  ``env``
 in the result is a complete environment, not an overlay for an inherited one.
 """
 
+import errno
 import json
 import os
 from pathlib import Path
@@ -12,10 +13,14 @@ import re
 import shlex
 import shutil
 import stat
+import sqlite3
 import subprocess
+import time
 import uuid
 
+import instance
 import settings
+import agent_router
 
 
 HOME_KEY = re.compile(r"(?:\.codex(?:-[A-Za-z0-9_-]{1,40})?|\.codex-router/[0-9a-f]{16})\Z")
@@ -55,34 +60,137 @@ def _home(home=None):
     return Path(home if home is not None else Path.home()).expanduser().absolute()
 
 
+def saved_codex_thread(source, home=None):
+    """Read only exact native identity metadata; never scan transcripts or credentials."""
+    import collector
+    root = _home(home)
+    key = source.get("home")
+    if not isinstance(key, str) or not HOME_KEY.fullmatch(key):
+        raise ValueError("원본 Codex 계정 경로가 올바르지 않습니다.")
+    try:
+        sid = str(uuid.UUID(str(source.get("id"))))
+    except (ValueError, AttributeError):
+        raise ValueError("Codex 세션 UUID가 올바르지 않습니다.") from None
+    account = root / key
+    if not account.is_dir() or account.resolve() != account.absolute() or account.stat().st_uid != os.getuid():
+        raise ValueError("원본 계정 디렉터리를 확인하지 못했습니다.")
+    database = collector.state_db(account)
+    if database is None or database.parent != account or database.stat().st_uid != os.getuid():
+        raise ValueError("원본 계정의 저장된 세션을 확인하지 못했습니다.")
+    connection = collector._open_read_only(sqlite3, database, immutable=collector._wal_without_index(database))
+    deadline = time.monotonic() + 1
+    connection.set_progress_handler(lambda: int(time.monotonic() >= deadline), 1000)
+    try:
+        rows = connection.execute("SELECT id,cwd,archived FROM threads WHERE id=? LIMIT 2", (sid,)).fetchall()
+    finally:
+        connection.close()
+    if (len(rows) != 1 or not isinstance(rows[0][1], str) or not Path(rows[0][1]).is_absolute()
+            or rows[0][2] not in (0, 1)):
+        raise ValueError("원본 계정에서 정확한 세션을 확인하지 못했습니다.")
+    cwd = source.get("cwd")
+    if not isinstance(cwd, str) or not Path(cwd).is_absolute() or Path(cwd).resolve() != Path(rows[0][1]).resolve():
+        raise ValueError("저장된 세션과 원본 작업 경로가 다릅니다.")
+    return {"id": sid, "home": key, "cwd": rows[0][1], "archived": bool(rows[0][2])}
+
+
+def resume_preview(source, home=None):
+    """Validate an explicit same-session recovery without starting a native process."""
+    from session_control import SessionControl
+    from transfer_native import _identity
+    identity = _identity(source)
+    result = {"source": {**identity, "cwd": source.get("cwd")}, "mode": "resume",
+              "allowed": False, "blockedByBoard": False, "reason": None}
+    if identity["agent"] != "codex":
+        return {**result, "reason": "저장된 Codex 세션만 같은 ID로 재개할 수 있습니다."}
+    try:
+        if source.get("blockedByBoard") is True or SessionControl(home).close_provenance(identity)["blockedByBoard"]:
+            return {**result, "blockedByBoard": True, "reason": "웹보드에서 종료한 세션입니다. 자동으로 다시 시작하지 않습니다."}
+        record = saved_codex_thread(source, home)
+        if record["archived"]:
+            return {**result, "reason": "보관된 원본 세션은 자동으로 보관 해제하거나 재개하지 않습니다."}
+        if not Path(record["cwd"]).is_dir():
+            return {**result, "reason": "원본 작업 경로가 이 기기에 없습니다."}
+        profile = next((row for row in discover_profiles(home) if row["id"] == "codex:" + identity["home"]), None)
+        if not profile or not profile.get("available"):
+            return {**result, "reason": (profile or {}).get("reason") or "원본 계정을 사용할 수 없습니다."}
+        runtime = _resume_runtime(identity, record, home)
+        return {**result, **runtime}
+    except (OSError, ValueError, sqlite3.Error):
+        return {**result, "reason": "원본 계정과 저장된 세션을 확인하지 못했습니다."}
+
+
+def _resume_runtime(identity, record, home):
+    """Use current native metadata when connected; list-row phase may be stale."""
+    import collector
+    import transfer_native as native
+    unknown = {"allowed": True, "runtimeKnown": False, "remoteAvailable": False, "reason": None}
+    path = _home(home) / identity["home"] / SOCKET_REL
+    if not path.exists() and not path.is_symlink():
+        return unknown
+    # Validate ownership and socket type before treating a stale endpoint as offline.
+    native._socket_path(identity, home)
+    try:
+        with native._client(identity, home, time.monotonic() + 3) as client:
+            reply = client.call("thread/read", {"threadId": identity["id"], "includeTurns": False})
+        thread = reply.get("thread") if isinstance(reply, dict) else None
+        if (not isinstance(thread, dict) or thread.get("id") != identity["id"]
+                or not isinstance(thread.get("cwd"), str) or not Path(thread["cwd"]).is_absolute()
+                or Path(thread["cwd"]).resolve() != Path(record["cwd"]).resolve()):
+            raise ValueError("원본 runtime 세션과 저장된 작업 경로가 다릅니다.")
+        status = thread.get("status")
+        ready = (isinstance(status, dict) and status.get("type") in ("idle", "notLoaded")
+                 and not status.get("activeFlags"))
+        return {"allowed": ready, "runtimeKnown": True, "remoteAvailable": True,
+                "reason": None if ready else "원본 세션이 실행 중이거나 안전한 재개 상태를 확인하지 못했습니다."}
+    except OSError as error:
+        if error.errno in (errno.ECONNREFUSED, errno.ENOENT, errno.ECONNRESET):
+            return unknown
+        raise
+    except (collector.RpcError, TimeoutError):
+        return {**unknown, "allowed": False, "reason": "원본 runtime 상태를 확인하지 못했습니다. 다시 확인해 주세요."}
+
+
+def _tool_directories(home):
+    return ["/opt/homebrew/bin", str(home / ".local/bin"), "/usr/local/bin", "/usr/bin", "/bin"]
+
+
 def _binary(agent, home):
-    search = os.pathsep.join(("/opt/homebrew/bin", str(home / ".local/bin"),
-                              "/usr/local/bin", "/usr/bin", "/bin", os.environ.get("PATH", "")))
+    search = os.pathsep.join(_tool_directories(home) + [os.environ.get("PATH", "")])
     return shutil.which(agent, path=search)
 
 
 def profile_metadata(agent, key, home=None):
-    """Host-local display settings, never a verified authentication identity."""
+    """Host-local display settings, never a verified authentication identity.
+
+    The label comes from the profile row, else a matching profile rule; the group's
+    `scope` and `description` (optional) replace the group name and the generic text.
+    """
     if (agent not in ("codex", "claude") or not isinstance(key, str)
             or (agent == "codex" and not HOME_KEY.fullmatch(key))
             or (agent == "claude" and key != ".claude")):
         raise ValueError("프로필 설정 경로가 올바르지 않습니다.")
     config = settings.load(home)
-    configured = settings.profile(agent, key, home, config)
-    group = configured.get("environment", "default")
-    scope_label = config["environments"][group]["label"]
+    configured = settings.resolve_profile(agent, key, home, config)
+    group = configured["environment"]
+    environment = config["environments"][group]
+    scope_label = environment["label"]
     label = configured.get("label") or ("기본 Claude" if agent == "claude" else "기본 Codex" if key == ".codex" else key)
-    return {"label": scope_label + " · " + label, "scope": group, "environment": group,
-            "scopeLabel": scope_label, "scopeDescription": "이 호스트에 명시된 실행 환경을 사용합니다.",
+    return {"label": configured.get("title") or scope_label + " · " + label,
+            "scope": environment.get("scope", group), "environment": group, "scopeLabel": scope_label,
+            "scopeDescription": environment.get("description", "이 호스트에 명시된 실행 환경을 사용합니다."),
             "accountKey": key, "accountLabel": label, "identityVerified": False,
+            "launchEnabled": configured["launchEnabled"],
             "identityReason": "설정 디렉터리의 표시 이름입니다. 실제 로그인 신원과 유효성은 확인하지 않았습니다."}
 
 
 def _profile(agent, key, home, binary):
     path = home / key
+    metadata = profile_metadata(agent, key, home)
     available = True
     reason = "저장된 로그인 파일만 확인했습니다. 로그인 유효성은 실행 시 확인합니다."
-    if not binary:
+    if not metadata["launchEnabled"]:
+        available, reason = False, "이 계정은 기록 조회만 허용되며 새 실행은 중지되어 있습니다."
+    elif not binary:
         available, reason = False, "이 호스트에 native CLI가 없습니다."
     elif not path.is_dir():
         available, reason = False, "이 호스트에 계정 디렉터리가 없습니다."
@@ -93,20 +201,51 @@ def _profile(agent, key, home, binary):
     elif agent == "claude":
         reason = "기기 기본 Claude 설정입니다. 로그인 유효성은 실행 시 확인합니다."
     identifier = "claude:default" if agent == "claude" else "codex:" + key
-    return {**profile_metadata(agent, key, home), "id": identifier, "agent": agent, "home": key,
+    return {**metadata, "id": identifier, "agent": agent, "home": key,
             "available": available, "reason": reason}
 
 
 def discover_profiles(home=None):
-    """Discover existing supported directories without reading credentials."""
+    """Discover existing supported directories without reading credentials.
+
+    `profiles[].placeholder` rows are listed even when missing (available=False), and
+    `codexHomes.requireMarker` keeps only folders holding auth.json, config.toml or a socket.
+    A disabled or suspended profile stays visible but cannot execute through the board.
+    """
     home = _home(home)
-    settings.load(home)  # Invalid explicit settings fail closed.
+    config = settings.load(home)  # Invalid explicit settings fail closed.
+    marker = config["codexHomes"]["requireMarker"]
     candidates = [home / ".codex"] + sorted(home.glob(".codex-*")) + sorted((home / ".codex-router").glob("*"))
     keys = [str(p.relative_to(home)) for p in candidates if p.is_dir()
-            and HOME_KEY.fullmatch(str(p.relative_to(home)))]
+            and HOME_KEY.fullmatch(str(p.relative_to(home)))
+            and (not marker or any((p / name).exists() for name in ("auth.json", "config.toml", SOCKET_REL)))]
+    placeholders = [(row["agent"], row["home"]) for row in config["profiles"] if row.get("placeholder")]
+    keys += [key for agent, key in placeholders if agent == "codex"]
+    hidden = set(config["codexHomes"].get("hide", []))
+    keys = [key for key in keys if key not in hidden]
     profiles = [_profile("codex", key, home, _binary("codex", home)) for key in sorted(set(keys))]
-    if (home / ".claude").is_dir():
+    if (home / ".claude").is_dir() or ("claude", ".claude") in placeholders:
         profiles.append(_profile("claude", ".claude", home, _binary("claude", home)))
+    router = agent_router.from_settings(config)
+    suspended = set(router.suspended()) if router is not None else set()
+    unreadable = router is not None and router.policy_failed()
+    if suspended or unreadable:
+        labels = router.labels()
+        for profile in profiles:
+            if profile["agent"] != "codex":
+                continue
+            key = profile["home"]
+            account = (router.home_label(key, home / key, labels)[1]
+                       if key.startswith(".codex-router/") else
+                       key[len(".codex-personal-"):] if key.startswith(".codex-personal-") else
+                       key[len(".codex-"):] if key.startswith(".codex-") else None)
+            if unreadable and account is not None:
+                # Fail closed: which accounts are suspended is unknown while the policy is unreadable.
+                profile.update(available=False, launchEnabled=False,
+                               reason="계정 실행 정책을 읽지 못해 이 계정의 실행을 멈췄습니다. 정책 파일을 확인해 주세요. 이전 기록은 계속 볼 수 있습니다.")
+            elif account in suspended:
+                profile.update(available=False, launchEnabled=False,
+                               reason="이 계정은 실행 정책에서 중지되어 있습니다. 이전 기록은 계속 볼 수 있습니다.")
     return profiles
 
 
@@ -117,7 +256,11 @@ def _environment(home, agent, key, environment):
             "USER", "LOGNAME", "SHELL")
     env = {name: os.environ[name] for name in keep if name in os.environ}
     env["HOME"] = str(home)
-    env.setdefault("PATH", "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin")
+    # `_binary` finds the CLI in these directories, and an npm CLI there is a
+    # `#!/usr/bin/env node` script: from a non-login SSH PATH its interpreter
+    # would be missing. Missing directories go first, inherited order is kept.
+    inherited = [entry for entry in env.get("PATH", "").split(os.pathsep) if entry]
+    env["PATH"] = os.pathsep.join([entry for entry in _tool_directories(home) if entry not in inherited] + inherited)
     env.setdefault("TERM", "xterm-256color")
     if agent == "codex":
         env["CODEX_HOME"] = str(home / key)
@@ -125,11 +268,69 @@ def _environment(home, agent, key, environment):
     return env
 
 
+def start_app_server(key, home=None):
+    """Start one Codex home's app-server (`codex app-server daemon start`) with that account's
+    launch variables, as a handoff to it would. Nothing is sent to a model. Later Codex
+    sessions of that account join this daemon, so its variables are theirs too."""
+    home = _home(home)
+    if not isinstance(key, str) or not HOME_KEY.fullmatch(key):
+        raise ValueError("Codex 계정 경로가 올바르지 않습니다.")
+    profile = next((p for p in discover_profiles(home) if p["id"] == "codex:" + key), None)
+    if profile is None or not profile["available"]:
+        raise ValueError((profile or {}).get("reason") or "이 기기의 Codex 계정을 사용할 수 없습니다.")
+    binary = _binary("codex", home)
+    if not binary:
+        raise ValueError("이 호스트에 native CLI가 없습니다.")
+    from managed_launch import ensure_app_server
+    env = _environment(home, "codex", key, profile.get("environment", "default"))
+    return {"started": ensure_app_server({"argv": [binary], "env": env}, profile, home)}
+
+
+def new_session(home=None):
+    """This host's launcher (`launcher` in the host settings) as a terminal launch.
+
+    The board only opens it in a terminal; the launcher chooses the project, agent and
+    account and owns their checks. Its variables are the usual terminal ones (plus the
+    user's SSH agent socket, as in their own terminal), never board or credential overrides.
+    """
+    home = _home(home)
+    launcher = settings.load(home).get("launcher")
+    if not launcher:
+        raise ValueError("이 기기에는 새 세션 실행 명령이 설정되지 않았습니다.")
+    program = launcher["command"][0]
+    if not os.path.isfile(program) or not os.access(program, os.X_OK):
+        raise ValueError("새 세션 실행 명령을 이 기기에서 찾지 못했습니다.")
+    cwd = Path(launcher.get("cwd") or home)
+    if not cwd.is_dir():
+        raise ValueError("새 세션을 시작할 폴더가 이 기기에 없습니다.")
+    keep = ("PATH", "TERM", "COLORTERM", "TMPDIR", "LANG", "LC_ALL", "LC_CTYPE",
+            "USER", "LOGNAME", "SHELL", "SSH_AUTH_SOCK")
+    env = {name: os.environ[name] for name in keep if name in os.environ}
+    env["HOME"] = str(home)
+    env.setdefault("PATH", "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin")
+    env.setdefault("TERM", "xterm-256color")
+    env.setdefault("LANG", "en_US.UTF-8")
+    return {"argv": list(launcher["command"]), "cwd": str(cwd), "env": env, "label": launcher["label"]}
+
+
+def new_session_status(home=None):
+    """Whether "새 세션" can open here, with the launcher's label or the reason it cannot."""
+    try:
+        spec = new_session(home)
+    except ValueError as exc:
+        return {"available": False, "label": None, "reason": str(exc)}
+    return {"available": True, "label": spec["label"], "reason": None}
+
+
 def source_environment(source, home=None):
-    """Resolve explicit host-local boundary; imported work retains its origin group."""
+    """Resolve explicit host-local boundary; imported work retains its origin group.
+
+    With `boundary.priority`, a signal for that group (the source home, a path component or
+    root project) decides first, also inside an imported workspace, whose record is then not
+    read. Otherwise an imported workspace follows its private transfer record only.
+    """
     if not isinstance(source, dict):
         raise ValueError("원본 세션 정보가 올바르지 않습니다.")
-    key = str(source.get("home") or "")
     raw_cwd = source.get("cwd")
     if not isinstance(raw_cwd, str) or not raw_cwd or any(ord(char) < 32 for char in raw_cwd):
         raise ValueError("원본 작업 경로가 올바르지 않습니다.")
@@ -138,16 +339,23 @@ def source_environment(source, home=None):
         raise ValueError("원본 작업 경로가 올바르지 않습니다.")
     resolved_cwd = cwd.resolve()
     home = _home(home)
-    workspaces = (home / ".local/share/sessionholic/workspaces").resolve()
+    config = settings.load(home)
+    priority = settings.priority_environment({**source, "cwd": str(resolved_cwd)}, home, config)
+    if priority is not None:
+        return priority
+    workspaces = instance.remote_path("workspacesDir", home).resolve()
     try:
         parts = resolved_cwd.relative_to(workspaces).parts
     except ValueError:
-        return settings.source_environment({**source, "cwd": str(resolved_cwd)}, home)
+        return settings.source_environment({**source, "cwd": str(resolved_cwd)}, home, config)
     if len(parts) < 2 or not re.fullmatch(r"[a-f0-9]{32}", parts[0]):
-        return settings.source_environment({**source, "cwd": str(resolved_cwd)}, home)
-    path = home / ".local/state/sessionholic-transfers" / parts[0] / "transfer.json"
+        return settings.source_environment({**source, "cwd": str(resolved_cwd)}, home, config)
+    path = instance.remote_path("transfersDir", home) / parts[0] / "transfer.json"
     try:
-        path = settings.safe_path(path, private=True, home=home)
+        try:
+            path = settings.safe_path(path, private=True, home=home)
+        except ValueError:
+            raise ValueError("이전 기록의 위치·소유자·비공개 권한을 확인해 주세요.") from None
         parent = path.parent.stat()
         if parent.st_uid != os.getuid() or parent.st_mode & 0o022:
             raise ValueError("이전 기록 경로의 소유자와 권한을 확인해 주세요.")
@@ -160,11 +368,24 @@ def source_environment(source, home=None):
             if len(text) > 1024 * 1024:
                 raise ValueError("이전 기록이 허용 크기를 넘었습니다.")
             metadata = json.loads(text)
-        if not isinstance(metadata, dict) or not isinstance(metadata.get("sourceEnvironment"), str) or not settings.GROUP.fullmatch(metadata["sourceEnvironment"]):
+        if not isinstance(metadata, dict):
             raise ValueError("이전 기록에서 원본 실행 환경를 확인하지 못했습니다.")
-        return metadata["sourceEnvironment"]
+        return recorded_environment(metadata, config)
     except (OSError, RuntimeError, UnicodeError):
         raise ValueError("이전 기록에서 원본 실행 환경를 안전하게 확인하지 못했습니다.") from None
+
+
+def recorded_environment(metadata, config):
+    """A transfer record's origin group: `sourceEnvironment`, else an older record's boolean
+    `sourcePersonal` through `legacy.sourcePersonal`. Anything else is refused."""
+    if "sourceEnvironment" in metadata:
+        value = metadata["sourceEnvironment"]
+        if not isinstance(value, str) or not settings.GROUP.fullmatch(value):
+            raise ValueError("이전 기록에서 원본 실행 환경를 확인하지 못했습니다.")
+        return value
+    if "sourcePersonal" in metadata:
+        return settings.legacy_environment(metadata["sourcePersonal"], config)
+    raise ValueError("이전 기록에서 원본 실행 환경를 확인하지 못했습니다.")
 
 
 def _git_metadata(cwd, env):
@@ -217,7 +438,8 @@ def _handoff_text(source, target, messages, git, transfer=None):
                   "원본 응답을 멈춘 뒤 작업 파일의 사본과 최근 대화를 이 기기로 전달했습니다. "
                   "원본 클라이언트와 대화 기록은 보존하며, 이 실행은 새 native 세션입니다. "
                   "transfer 기록의 원본·목적 작업 경로와 Git 상태를 확인하세요. "
-                  "첨부 파일은 attachmentsPathMap의 from→to를 적용하고, .sessionholic-attachments 상대 경로는 목적 작업 폴더에서 읽으세요.\n\n") + header
+                  "첨부 파일은 attachmentsPathMap의 from→to를 적용하고, " + instance.current()["remote"]["attachmentsDir"]
+                  + " 상대 경로는 목적 작업 폴더에서 읽으세요.\n\n") + header
     rows = messages if isinstance(messages, list) else []
     record["omittedMessages"] = max(0, len(rows) - MAX_MESSAGES)
     record["truncated"] = len(rows) > MAX_MESSAGES
@@ -322,10 +544,12 @@ def build_transferred_launch(source, targetProfile, messages, state_dir, cwd,
             raise ValueError("원본 Codex 세션 UUID가 올바르지 않습니다.") from None
     elif not isinstance(source.get("id"), str) or not CLAUDE_ID.fullmatch(source["id"]):
         raise ValueError("원본 Claude 세션 ID가 올바르지 않습니다.")
-    environment = metadata.get("sourceEnvironment")
-    if not isinstance(environment, str) or not settings.GROUP.fullmatch(environment):
-        raise ValueError("원본 실행 환경을 확인하지 못했습니다.")
-    if environment != known[target["id"]].get("environment", "default"):
+    config = settings.load(home)
+    try:
+        environment = recorded_environment(metadata, config)
+    except ValueError:
+        raise ValueError("원본 실행 환경을 확인하지 못했습니다.") from None
+    if settings.crosses_boundary(agent, environment, known[target["id"]].get("environment", "default"), config):
         raise ValueError("원본과 대상의 실행 환경 경계가 다릅니다.")
     if not isinstance(messages, list) or not any(isinstance(row, dict) and isinstance(row.get("text"), str)
                                                and row["text"].strip() for row in messages):
@@ -419,7 +643,10 @@ def build_launch(source, targetProfile, messages, state_dir, *, home=None):
     if source_agent == "codex" and (not isinstance(source_home, str) or not HOME_KEY.fullmatch(source_home)):
         raise ValueError("원본 Codex 계정 경로가 올바르지 않습니다.")
     same_route = source_agent == agent and source_home == key
-    if not same_route and environment != known[target["id"]].get("environment", "default"):
+    if source.get("resume") is True and not same_route:
+        raise ValueError("세션 재개는 원본 도구와 계정에서만 가능합니다.")
+    if not same_route and settings.crosses_boundary(agent, environment, known[target["id"]].get("environment", "default"),
+                                                    settings.load(home)):
         raise ValueError("원본과 대상의 실행 환경 경계가 다릅니다.")
     env = _environment(home, agent, key, environment)
     binary = _binary(agent, home)
@@ -433,6 +660,14 @@ def build_launch(source, targetProfile, messages, state_dir, *, home=None):
                 session_id = str(uuid.UUID(str(source.get("id"))))
             except (ValueError, AttributeError):
                 raise ValueError("Codex 세션 UUID가 올바르지 않습니다.")
+            recovering = source.get("resume") is True
+            if recovering:
+                recovery = resume_preview(source, home)
+                if not recovery["allowed"]:
+                    raise ValueError(recovery["reason"])
+                result["mode"] = "resume"
+                result["nativeSource"] = {"agent": "codex", "id": session_id, "home": key,
+                                          "host": source_host, "cwd": str(cwd)}
             path = home / key / SOCKET_REL
             try:
                 resolved = path.resolve(strict=True)
@@ -445,10 +680,13 @@ def build_launch(source, targetProfile, messages, state_dir, *, home=None):
                         and stat.S_ISSOCK(socket_stat.st_mode))
             except (OSError, RuntimeError):
                 safe = False
-            if not safe:
-                raise ValueError("원본 계정의 로컬 Codex daemon socket을 찾지 못했습니다.")
-            result["argv"] = [binary, "resume", session_id, "--remote", "unix://" + str(path),
-                              "--cd", str(cwd)]
+            if not safe or (recovering and not recovery.get("remoteAvailable")):
+                if not recovering or (not safe and (path.exists() or path.is_symlink())):
+                    raise ValueError("원본 계정의 로컬 Codex daemon socket을 찾지 못했습니다.")
+                result["argv"] = [binary, "resume", session_id, "--cd", str(cwd)]
+            else:
+                result["argv"] = [binary, "resume", session_id, "--remote", "unix://" + str(path),
+                                  "--cd", str(cwd)]
         else:
             if source.get("kind") != "background":
                 raise ValueError("Claude background 세션만 exact attach를 지원합니다. interactive 세션은 기존 터미널에서 열어야 합니다.")

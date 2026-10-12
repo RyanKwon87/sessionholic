@@ -18,6 +18,19 @@ OTHER = {'id': 'codex:.codex-alt', 'agent': 'codex', 'home': '.codex-alt', 'labe
 REF = {'host': 'local', 'agent': 'codex', 'home': '.codex', 'id': SOURCE['id']}
 
 
+def setUpModule():
+    # A board under test never reads this user's bot sources (nor, through them, a bot ledger).
+    import pathlib
+    import shutil
+    import tempfile
+    from unittest import mock
+    folder = tempfile.mkdtemp(prefix="sh-config-")
+    patcher = mock.patch.object(server, "CONFIG_DIR", pathlib.Path(folder))
+    patcher.start()
+    unittest.addModuleCleanup(patcher.stop)
+    unittest.addModuleCleanup(shutil.rmtree, folder, True)
+
+
 class FakeTerminals:
     max_terminals = 4
     def __init__(self):
@@ -240,6 +253,15 @@ class SecurityTest(unittest.TestCase):
         self.assertNotIn('inputCleanupPending', json.loads(body))
         path = '/api/terminal/' + 'b'*32 + '/input'
         self.assertEqual(self.request('POST', path, payload, self.auth())[0].status, 200)
+
+    def test_terminal_list_carries_the_version_its_events_announce(self):
+        res, body = self.request('GET', '/api/terminals', headers=self.auth())
+        self.assertEqual(res.status, 200)
+        self.assertEqual(json.loads(body)['version'], 0)
+        # What a TerminalManager reports (create, close, attach, detach) is a new version.
+        self.httpd.events.terminals_changed()
+        res, body = self.request('GET', '/api/terminals', headers=self.auth())
+        self.assertEqual(json.loads(body)['version'], 1)
 
     def test_close_succeeds_and_reports_failed_receipt_cleanup_for_refresh_retry(self):
         self.terms.records = [{'id': 'a'*32, 'alive': True, 'closed': False}]

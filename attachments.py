@@ -5,6 +5,7 @@ Only native directory handles are used beneath the managed attachment directory.
 """
 import base64
 import binascii
+import fcntl
 import hashlib
 import json
 import mimetypes
@@ -14,7 +15,11 @@ import re
 import stat
 import uuid
 
-DIRECTORY = '.sessionholic-attachments'
+import instance
+
+# The board's attachment folder name inside each work folder (instance `remote.attachmentsDir`).
+DIRECTORY = instance.current()['remote']['attachmentsDir']
+_EXCLUDE_LINE = DIRECTORY + '/'
 MAX_FILE_BYTES = 20 * 1024 * 1024
 MAX_FILES = 20000
 MAX_WORKSPACE_BYTES = 128 * 1024 * 1024
@@ -76,6 +81,91 @@ def _open_root(cwd, create=False):
         os.close(parent)
 
 
+def _small_text(path, limit=4096):
+    fd = os.open(str(path), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(fd, 'rb') as source:
+        info = os.fstat(source.fileno())
+        if not stat.S_ISREG(info.st_mode) or info.st_size > limit:
+            raise OSError('unexpected Git metadata file')
+        return source.read(limit).decode('utf-8')
+
+
+def _git_dir(cwd):
+    """Find the repository directory holding info/exclude, without running Git.
+
+    A `.git` file (linked worktree or submodule) names its Git directory; a
+    worktree's `commondir` then points at the shared one Git reads excludes from.
+    """
+    for directory in (cwd,) + tuple(cwd.parents):
+        marker = directory / '.git'
+        try:
+            info = os.lstat(marker)
+        except FileNotFoundError:
+            continue
+        if stat.S_ISDIR(info.st_mode):
+            return marker
+        if not stat.S_ISREG(info.st_mode):
+            return None
+        text = _small_text(marker)
+        if not text.startswith('gitdir: '):
+            return None
+        git_dir = Path(os.path.normpath(directory / text[len('gitdir: '):].strip()))
+        if os.path.lexists(git_dir / 'commondir'):
+            git_dir = Path(os.path.normpath(git_dir / _small_text(git_dir / 'commondir').strip()))
+        return git_dir
+    return None
+
+
+def exclude_from_git(cwd):
+    """Best effort: add the managed directory to the enclosing repository's info/exclude.
+
+    Agents commonly run `git add -A`; uploads must not reach a remote. Nothing is
+    written through links or into directories owned by another user, and any
+    failure is ignored so that it never blocks an upload. The host settings'
+    `attachments.gitExclude: false` turns this off: nothing is written.
+    """
+    try:
+        import settings
+        if not settings.load()["attachments"]["gitExclude"]:
+            return False
+        git_dir = _git_dir(Path(cwd))
+        if git_dir is None:
+            return False
+        git_fd = os.open(str(git_dir), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            if os.fstat(git_fd).st_uid != os.getuid():
+                return False
+            try:
+                os.mkdir('info', 0o755, dir_fd=git_fd)
+            except FileExistsError:
+                pass
+            info_fd = os.open('info', os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=git_fd)
+            try:
+                if os.fstat(info_fd).st_uid != os.getuid():
+                    return False
+                fd = os.open('exclude', os.O_RDWR | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW | os.O_NONBLOCK,
+                             0o644, dir_fd=info_fd)
+                with os.fdopen(fd, 'r+b') as exclude:
+                    info = os.fstat(exclude.fileno())
+                    if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_size > 1024 * 1024:
+                        return False
+                    # Concurrent uploads must not append the same line twice.
+                    fcntl.flock(exclude.fileno(), fcntl.LOCK_EX)
+                    exclude.seek(0)
+                    text = exclude.read(1024 * 1024)
+                    if {line.strip() for line in text.split(b'\n')} & {_EXCLUDE_LINE.encode(), DIRECTORY.encode()}:
+                        return True
+                    exclude.write((b'\n' if text and not text.endswith(b'\n') else b'') + _EXCLUDE_LINE.encode() + b'\n')
+                    exclude.flush()
+                    return True
+            finally:
+                os.close(info_fd)
+        finally:
+            os.close(git_fd)
+    except Exception:  # Never let ignore bookkeeping block an upload.
+        return False
+
+
 def _read(fd, name, limit):
     try:
         opened = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=fd)
@@ -128,6 +218,7 @@ def store(cwd, name, data, expected_sha256=None):
     if expected_sha256 is not None and (not isinstance(expected_sha256, str) or not _SHA.fullmatch(expected_sha256) or digest != expected_sha256):
         _fail('첨부 파일 SHA-256 검증에 실패했습니다.')
     cwd, root_fd = _open_root(cwd, True)
+    exclude_from_git(cwd)
     identifier = uuid.uuid4().hex
     folder_fd = None
     created = False

@@ -160,7 +160,9 @@ def service_file(port=8790, tailscale_user_file=None, home=None):
             search.append(str(Path(binary).parent))
     search.extend(["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin"])
     search = list(dict.fromkeys(search))
-    payload = {"Label": LABEL, "ProgramArguments": args,
+    # Interactive keeps launchd from throttling the board like a background job;
+    # a board read on a Background service was several times slower.
+    payload = {"Label": LABEL, "ProgramArguments": args, "ProcessType": "Interactive",
                "WorkingDirectory": str(ROOT), "RunAtLoad": True, "KeepAlive": True,
                "ThrottleInterval": 15, "Umask": 0o077,
                "EnvironmentVariables": {"PATH": os.pathsep.join(search)},

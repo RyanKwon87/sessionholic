@@ -18,28 +18,30 @@ import uuid
 
 import attachments
 import collector
+import instance
 import launch
 import transfer_native as native
 
 REQUEST_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{7,127}\Z")
-MAX_QUEUED_MESSAGES = 50
-MAX_QUEUE_TEXT = 32768
-MAX_QUEUE_TEXT_TOTAL = 256 * 1024
+KNOWN_TURN_STATUS = ("inProgress", "completed", "interrupted", "failed")
+NOT_STEERABLE = "현재 실행 중인 작업(/review·/compact 등)은 새 입력을 받을 수 없습니다. 끝난 뒤 다시 보내 주세요."
 FALLBACK = "승인·질문 응답과 지원되지 않는 입력은 원본 native 터미널에서 처리하세요."
 
 
 class NativeRejected(collector.RpcError):
     def __init__(self, error):
         message = str(error.get("message") or "").lower()
+        data = json.dumps(error.get("data"), default=str) if error.get("data") is not None else ""
         self.code = error.get("code") if isinstance(error.get("code"), int) else None
-        self.category = ("attachment" if "attachment" in message else
+        self.category = ("notSteerable" if "activeTurnNotSteerable" in data or "not steerable" in message else
+                         "attachment" if "attachment" in message else
                          "inputTooLarge" if "input" in message and "large" in message else
                          "nativeRejected")
         super().__init__("Native 요청을 완료하지 못했습니다.")
 
 
 class ChatAppServer(native._DeadlineAppServer):
-    """Enable queue API, retain only safe notification/request metadata."""
+    """Experimental thread fields, retain only safe notification/request metadata."""
     def __init__(self, path, deadline):
         self.native_requests = []
         super().__init__(path, deadline)
@@ -80,9 +82,11 @@ def _thread(client, identity):
     turns, status = thread.get("turns"), thread.get("status")
     if not isinstance(turns, list) or not isinstance(status, dict):
         raise ValueError("원본 Codex 상태 형식이 올바르지 않습니다.")
-    if any(not isinstance(t, dict) or t.get("status") not in
-           ("inProgress", "completed", "interrupted", "failed") for t in turns):
+    if any(not isinstance(t, dict) or not isinstance(t.get("status"), str) for t in turns):
         raise ValueError("원본 Codex turn 상태를 확인하지 못했습니다.")
+    # A status added by a newer CLI must not hide the conversation; it only
+    # disables direct input until the board recognizes the state.
+    thread["unknownTurnStatus"] = any(t["status"] not in KNOWN_TURN_STATUS for t in turns)
     return thread
 
 
@@ -95,6 +99,8 @@ def _state(thread):
     kind = status.get("type")
     phase = ("needs_input" if flags else "working") if kind == "active" else (
         "idle" if kind == "idle" and not active else "closed" if kind == "notLoaded" and not active else "unknown")
+    if thread.get("unknownTurnStatus") and phase == "idle":
+        phase = "unknown"
     return {"phase": phase, "activeTurnId": active[0].get("id") if len(active) == 1 else None,
             "activeFlags": flags, "turns": [{"id": t.get("id"), "status": t.get("status")}
                                               for t in thread["turns"][-80:]],
@@ -109,11 +115,10 @@ def _remote(value):
     return value == "vendorRemote"
 
 
-def _capabilities(thread, queue_available):
+def _capabilities(thread):
     state = _state(thread)
     can = (thread.get("canAcceptDirectInput") is True and not _remote(thread.get("source"))
            and not _remote(thread.get("threadSource")) and state["phase"] in ("idle", "working", "needs_input"))
-    can = can and queue_available
     if can:
         reason = None
     elif _remote(thread.get("source")) or _remote(thread.get("threadSource")):
@@ -122,55 +127,32 @@ def _capabilities(thread, queue_available):
         reason = "닫힌 세션입니다. 실제 터미널을 먼저 열면 같은 세션에 메시지를 보낼 수 있습니다."
     elif thread.get("canAcceptDirectInput") is not True:
         reason = "이 세션은 직접 입력을 지원하지 않습니다. 원본 터미널을 사용하세요."
-    elif not queue_available:
-        reason = "이 기기의 Native 대기열 기능을 확인하지 못했습니다. 원본 터미널을 사용하세요."
+    elif thread.get("unknownTurnStatus"):
+        reason = "이 Codex 버전의 새 실행 상태를 아직 확인하지 못해 입력을 잠갔습니다. 대화는 계속 볼 수 있습니다."
     else:
         reason = "현재 세션 상태를 확인하지 못했습니다. 상태를 다시 확인하세요."
-    return {"canRead": True, "canSend": can, "canAttachImages": can, "canQueue": can,
-            "canSteer": can and state["phase"] == "working" and bool(state["activeTurnId"]),
+    return {"canRead": True, "canSend": can, "canAttachImages": can,
             "canAnswerApprovals": False, "canAnswerQuestions": False,
             "reason": reason, "fallback": FALLBACK}
 
 
-def _queue(client, identity):
-    out, cursor = [], None
-    for _ in range(4):
-        params = {"threadId": identity["id"], "limit": 200}
-        if cursor:
-            params["cursor"] = cursor
-        result = client.call("thread/queue/list", params)
-        data = result.get("data") if isinstance(result, dict) else None
-        if not isinstance(data, list) or any(not isinstance(q, dict) for q in data):
-            raise ValueError("원본 대기열을 확인하지 못했습니다.")
-        out.extend(data)
-        cursor = result.get("nextCursor")
-        if not cursor:
-            return out
-    raise ValueError("원본 대기열이 너무 커 전송 여부를 확인하지 못했습니다.")
-
-
-def _receipt(identity, request_id, thread, queue):
+def _receipt(identity, request_id, thread):
     for turn in reversed(thread["turns"]):
         for item in turn.get("items") or []:
             if isinstance(item, dict) and item.get("type") == "userMessage" and item.get("clientId") == request_id:
                 delivery = turn.get("status")
-                delivery = "accepted" if delivery == "inProgress" else delivery
+                delivery = delivery if delivery in ("completed", "interrupted", "failed") else "accepted"
                 return {"source": identity, "requestId": request_id, "delivery": delivery,
                         "confirmed": True, "readbackConfirmed": True, "turnId": turn.get("id"),
-                        "queueId": None, "canRetry": False}
-    for item in queue:
-        if item.get("clientUserMessageId") == request_id:
-            return {"source": identity, "requestId": request_id, "delivery": "queued",
-                    "confirmed": True, "readbackConfirmed": True, "turnId": None,
-                    "queueId": item.get("id"), "canRetry": False}
+                        "canRetry": False}
     return {"source": identity, "requestId": request_id, "delivery": "unknown", "confirmed": False,
-            "readbackConfirmed": False, "turnId": None, "queueId": None, "canRetry": False,
+            "readbackConfirmed": False, "turnId": None, "canRetry": False,
             "reason": "Native 수신 여부를 확인하지 못했습니다. 같은 입력을 자동으로 다시 보내지 않습니다."}
 
 
-def _read_receipt(identity, request_id, thread, queue, home):
+def _read_receipt(identity, request_id, thread, home):
     """Reuse the exact snapshot; this path never submits or retries input."""
-    receipt = _receipt(identity, request_id, thread, queue)
+    receipt = _receipt(identity, request_id, thread)
     current = receipt["confirmed"]
     if not receipt["confirmed"]:
         with _Ledger(identity, request_id, home) as ledger:
@@ -200,80 +182,28 @@ def _request_ids(args):
     return ids
 
 
-def _queued_messages(identity, queue, home, available, thread=None):
-    """Use only Native's existing input snapshot, never load attachment bodies."""
-    if not available:
-        return [], {"available": False, "complete": False, "total": None, "truncated": False,
-                    "reason": "예약 대기열을 확인하지 못했습니다. 원본 터미널에서 확인해 주세요."}
-    # Native may advance between thread/read and queue/list. A confirmed user
-    # item takes precedence, just as it does in the independent receipt path.
-    queued_ids = {q.get("clientUserMessageId") for q in queue if isinstance(q.get("clientUserMessageId"), str)}
-    observed = {item.get("clientId") for turn in (thread or {}).get("turns", [])
-                for item in turn.get("items") or [] if isinstance(item, dict)
-                and item.get("type") == "userMessage" and isinstance(item.get("clientId"), str)
-                and item["clientId"] in queued_ids}
-    queue = [q for q in queue if not isinstance(q.get("clientUserMessageId"), str)
-             or q["clientUserMessageId"] not in observed]
-    out, remaining, incomplete = [], MAX_QUEUE_TEXT_TOTAL, False
-    for submission in queue[:MAX_QUEUED_MESSAGES]:
-        identifier = submission.get("id")
-        if not isinstance(identifier, str) or not identifier or len(identifier) > 256:
-            incomplete = True
-            continue
-        client_id = submission.get("clientUserMessageId")
-        if not isinstance(client_id, str) or not client_id or len(client_id) > 128:
-            client_id = None
-        inputs = submission.get("input")
-        content_available = isinstance(inputs, list)
-        # Construct at most the display budget rather than joining unbounded text.
-        parts, used, used_bytes, truncated = [], 0, 0, False
-        for block in inputs if content_available else []:
-            if not isinstance(block, dict) or block.get("type") != "text" or not isinstance(block.get("text"), str):
-                continue
-            if parts:
-                if used < MAX_QUEUE_TEXT and used_bytes < remaining:
-                    parts.append("\n"); used += 1; used_bytes += 1
-                else:
-                    truncated = True
-            value = block["text"]
-            encoded = value[:MAX_QUEUE_TEXT - used].encode()
-            shown = encoded[:remaining - used_bytes].decode('utf-8', errors='ignore')
-            parts.append(shown); used += len(shown); used_bytes += len(shown.encode())
-            truncated = truncated or len(shown) < len(value)
-        text = "".join(parts)
-        remaining -= used_bytes
-        generic = collector.native_attachments(inputs)
-        manifest = _history_attachments(identity, client_id, home, inputs) if client_id and content_available else []
-        images = [item for item in generic if item["kind"] == "image"]
-        extra_images = max(0, len(images) - sum(item["kind"] == "image" for item in manifest))
-        attached = manifest + images[:extra_images] + [item for item in generic if item["kind"] != "image"]
-        row = {"queueId": identifier, "requestId": client_id, "text": text, "textTruncated": truncated,
-               "contentAvailable": content_available, "attachments": attached, "status": "queued",
-               "confirmed": True, "readbackConfirmed": True, "currentSnapshotConfirmed": True, "acknowledged": False}
-        out.append(row)
-        incomplete = incomplete or truncated or not content_available
-    limited = len(queue) > MAX_QUEUED_MESSAGES or incomplete
-    return out, {"available": True, "complete": not limited, "total": len(queue), "truncated": limited,
-                 "reason": "예약 내용을 일부만 표시합니다. 원본 터미널에서 전체 목록을 확인해 주세요." if limited else None}
-
-
 def _messages(thread, identity=None, home=None):
     out = []
     # Only the retained history window may read attachment metadata from disk.
     for turn in reversed(thread["turns"]):
-        for item in reversed(turn.get("items") or []):
-            if not isinstance(item, dict):
-                continue
-            rows = collector.codex_messages([{**turn, "items": [item]}])
+        # Rows of a whole turn at once: which answer is final (and so carries the turn's
+        # completion time) depends on the turn's other items.
+        for item, rows in reversed(collector.codex_turn_rows(turn)):
             manifest = _history_attachments(identity, item.get("clientId"), home, item.get("content")) if rows and identity and item.get("type") == "userMessage" else []
             group = []
+            # As collector.codex_messages marks them: which answer is the turn's final one.
+            marks = {}
+            if collector.evidence_id(item.get("id")):
+                marks["messageId"] = item["id"]
+            if item.get("phase") in ("commentary", "final_answer"):
+                marks["phase"] = item["phase"]
             for row in rows:
                 if manifest:
                     generic = row.get("attachments", [])
                     images = [a for a in generic if a["kind"] == "image"]
                     extra_images = max(0, len(images) - sum(a["kind"] == "image" for a in manifest))
                     row["attachments"] = manifest + images[:extra_images] + [a for a in generic if a["kind"] != "image"]
-                group.append({**row, "turnId": turn.get("id"), "turnStatus": turn.get("status"),
+                group.append({**row, **marks, "turnId": turn.get("id"), "turnStatus": turn.get("status"),
                             "itemId": item.get("id"), "clientId": item.get("clientId")})
             out[0:0] = group
             if len(out) >= collector.MESSAGE_LIMIT:
@@ -378,11 +308,16 @@ def _proven_manifest(manifest, evidence, content):
     return out
 
 
+def ledger_root(home=None):
+    """This host's chat ledger folder (instance `remote.chatLedgerDir` under its home)."""
+    return instance.remote_path("chatLedgerDir", launch._home(home))
+
+
 def _history_attachments(identity, request_id, home, content=None):
     """Atomic ledger read only; absent or unsafe history never writes or locks."""
     if not isinstance(request_id, str) or not REQUEST_ID.fullmatch(request_id):
         return []
-    root = launch._home(home) / ".sessionholic"
+    root = ledger_root(home)
     folder = root / "chat-receipts"
     try:
         for path in (root, folder):
@@ -406,7 +341,7 @@ def _history_attachments(identity, request_id, home, content=None):
 class _Ledger:
     """Deduplication and bounded attachment metadata, never message/file contents."""
     def __init__(self, identity, request_id, home):
-        root = launch._home(home) / ".sessionholic"
+        root = ledger_root(home)
         _private_dir(root)
         folder = root / "chat-receipts"
         _private_dir(folder)
@@ -443,7 +378,7 @@ class _Ledger:
         os.replace(str(temporary), str(self.path))
 
 
-def _send(client, identity, args, thread, queue, home):
+def _send(client, identity, args, thread, home):
     request_id = _request(args.get("requestId"))
     snapshot_cwd = (args.get("source") or {}).get("cwd")
     if snapshot_cwd is not None and snapshot_cwd != thread.get("cwd"):
@@ -473,15 +408,14 @@ def _send(client, identity, args, thread, queue, home):
             evidence.append({"id": item["id"], "kind": manifest[-1]["kind"], "sha256": marker,
                              "occurrence": sum(_input_marker(block) == marker for block in raw_inputs)})
     inputs = _inputs(raw_inputs)
-    mode = args.get("mode", "queue")
-    if mode not in ("queue", "steer"):
-        raise ValueError("메시지 전송 모드가 올바르지 않습니다.")
-    digest = hashlib.sha256(json.dumps([inputs, mode, args.get("expectedTurnId")], sort_keys=True).encode()).hexdigest()
+    digest = hashlib.sha256(json.dumps([inputs], sort_keys=True).encode()).hexdigest()
+    # Records written before direct sending hashed the old queue mode as well.
+    legacy = hashlib.sha256(json.dumps([inputs, "queue", None], sort_keys=True).encode()).hexdigest()
     with _Ledger(identity, request_id, home) as ledger:
         prior = ledger.read()
-        if prior and prior.get("digest") != digest:
+        if prior and prior.get("digest") not in (digest, legacy):
             raise ValueError("이미 사용한 요청 ID에 다른 메시지를 보낼 수 없습니다.")
-        before = _receipt(identity, request_id, thread, queue)
+        before = _receipt(identity, request_id, thread)
         recorded = _manifest(prior.get("attachments")) if prior else ([] if before["confirmed"] else manifest)
         if recorded:
             before["attachments"] = recorded
@@ -491,52 +425,40 @@ def _send(client, identity, args, thread, queue, home):
             # An unknown result remains read-only even when native history lags.
             saved = prior.get("receipt") or {}
             return saved if saved.get("confirmed") or saved.get("delivery") == "rejected" else before
-        capabilities, state = _capabilities(thread, True), _state(thread)
+        capabilities = _capabilities(thread)
         if not capabilities["canSend"]:
             return {**before, "delivery": "rejected", "reason": capabilities["reason"], "fallback": FALLBACK}
-        if mode == "steer" and (not capabilities["canSteer"] or
-                                args.get("expectedTurnId") != state["activeTurnId"]):
-            return {**before, "delivery": "rejected", "reason": "정확한 실행 중 turn을 확인해야 방향을 수정할 수 있습니다."}
         ledger.save({"digest": digest, "receipt": before, "attachments": manifest, "attachmentEvidence": evidence})
-        acknowledged, queue_id, turn_id = False, None, None
+        acknowledged, turn_id = False, None
         try:
-            if mode == "steer":
-                result = client.call("turn/steer", {"threadId": identity["id"], "input": inputs,
-                                     "clientUserMessageId": request_id, "expectedTurnId": state["activeTurnId"]})
-                acknowledged, turn_id = True, result.get("turnId") or state["activeTurnId"]
-            else:
-                result = client.call("thread/queue/add", {"threadId": identity["id"], "input": inputs,
-                                                         "clientUserMessageId": request_id})
-                item = result.get("queuedSubmission") or {}
-                if item.get("clientUserMessageId") != request_id or not isinstance(item.get("id"), str):
-                    raise ValueError("메시지 대기열 수신을 확인하지 못했습니다.")
-                acknowledged, queue_id = True, item["id"]
-                if state["phase"] == "idle":
-                    try:
-                        started = client.call("thread/queue/start", {"threadId": identity["id"],
-                                                                     "queuedSubmissionId": queue_id})
-                        turn_id = (started.get("turn") or {}).get("id")
-                    except collector.RpcError:
-                        # Queue auto-dispatch or concurrent active turn. No steer or retry.
-                        pass
+            # turn/start begins a turn when idle and joins the active turn otherwise;
+            # the native CLI decides when the model reads it. No board-side queue.
+            result = client.call("turn/start", {"threadId": identity["id"], "input": inputs,
+                                                "clientUserMessageId": request_id})
+            acknowledged, turn_id = True, (result.get("turn") or {}).get("id")
             after = _thread(client, identity)
-            receipt = _receipt(identity, request_id, after, _queue(client, identity))
+            receipt = _receipt(identity, request_id, after)
             receipt.update(_state(after))
         except (OSError, ValueError, TimeoutError, collector.RpcError) as error:
-            receipt = before
+            receipt = dict(before)
             if isinstance(error, NativeRejected):
                 receipt.update({"nativeErrorCode": error.code, "nativeErrorCategory": error.category})
-                if not acknowledged and error.code in (-32600, -32602) and error.category in ("attachment", "inputTooLarge"):
+                if not acknowledged and error.category == "notSteerable":
+                    receipt.update({"delivery": "rejected", "reason": NOT_STEERABLE})
+                elif not acknowledged and error.code in (-32600, -32602) and error.category in ("attachment", "inputTooLarge"):
                     receipt.update({"delivery": "rejected", "reason": "Native에서 첨부 또는 메시지 입력을 거절했습니다."})
         receipt["acknowledged"] = acknowledged
         if acknowledged and not receipt["confirmed"]:
-            receipt.update({"delivery": "accepted" if turn_id else "queued", "confirmed": True,
-                            "turnId": turn_id, "queueId": queue_id,
+            receipt.update({"delivery": "accepted", "confirmed": True, "turnId": turn_id,
                             "reason": "Native 수신 응답을 받았습니다. 대화 기록 반영은 아직 확인되지 않았습니다."})
         receipt["fallback"] = FALLBACK
         if manifest:
             receipt["attachments"] = manifest
-        ledger.save({"digest": digest, "receipt": receipt, "attachments": manifest, "attachmentEvidence": evidence})
+        try:
+            ledger.save({"digest": digest, "receipt": receipt, "attachments": manifest, "attachmentEvidence": evidence})
+        except (OSError, ValueError):
+            # Input already crossed the native boundary; never report it as a pre-send failure.
+            receipt["ledgerPending"] = True
         return receipt
 
 
@@ -563,9 +485,9 @@ def _claude(identity, action, home, deadline, args):
     result = {"source": identity, "phase": collector.claude_phase(row.get("state"), row.get("status")),
               "kind": row.get("kind"), "cwd": row.get("cwd"), "requiresNativeTerminal": True,
               "capabilities": {"canRead": True, "canSend": False, "canAttachImages": False,
-                               "canQueue": False, "canSteer": False, "canAnswerApprovals": False,
-                               "canAnswerQuestions": False, "fallback": FALLBACK,
-                               "reason": "현재 Claude CLI에는 검증된 기존 세션 직접 입력 계약이 없습니다."}}
+                               "canAnswerApprovals": False, "canAnswerQuestions": False, "fallback": FALLBACK,
+                               # The board delivers Claude input through its own attached terminal.
+                               "reason": "Claude 입력은 보드가 연결한 터미널로 전달합니다."}}
     if action == "read":
         sid = row.get("sessionId")
         if not isinstance(sid, str) or not collector.SESSION_ID.fullmatch(sid):
@@ -574,15 +496,15 @@ def _claude(identity, action, home, deadline, args):
         paths = [p for p in root.glob("*/" + sid + ".jsonl") if p.is_file() and not p.is_symlink()]
         if len(paths) != 1:
             raise ValueError("정확한 원본 Claude 대화 기록을 확인하지 못했습니다.")
-        result["messages"] = collector.claude_messages(collector.tail_entries(paths[0], 2 * 1024 * 1024))
-    if action == "read":
-        result["queuedMessages"], result["queueState"] = _queued_messages(identity, [], home, False)
-        result["queueState"]["reason"] = result["capabilities"]["reason"]
-        result["receipts"] = [{"requestId": identifier, "delivery": "rejected", "confirmed": False,
-                               "readbackConfirmed": False, "canRetry": False,
-                               "reason": result["capabilities"]["reason"], "fallback": FALLBACK}
-                              for identifier in _request_ids(args)]
-    elif action in ("send", "receipt"):
+        entries = list(collector.tail_entries(paths[0], 2 * 1024 * 1024))
+        result["messages"] = collector.claude_messages(entries)
+        if result["phase"] == "working":
+            # Claude Code records no turn start: "작업 중" counts from the newest user prompt
+            # in the transcript, an approximation the board labels as such (workingSinceApprox).
+            since = collector.claude_prompt_at(entries)
+            if since:
+                result.update(workingSince=since, workingSinceApprox=True)
+    if action in ("send", "receipt"):
         result.update({"requestId": _request(args.get("requestId")), "delivery": "rejected",
                        "confirmed": False, "readbackConfirmed": False, "canRetry": False,
                        "reason": result["capabilities"]["reason"], "fallback": FALLBACK})
@@ -600,26 +522,20 @@ def handle(args, *, home=None, timeout=10):
         return _claude(identity, action, home, deadline, args)
     with _client(identity, home, deadline) as client:
         thread = _thread(client, identity)
-        queue_available, queue = True, []
-        try:
-            queue = _queue(client, identity)
-        except (ValueError, collector.RpcError):
-            queue_available = False
         result = {"source": identity, "cwd": thread.get("cwd"), **_state(thread),
-                  "capabilities": _capabilities(thread, queue_available)}
+                  "capabilities": _capabilities(thread)}
         if action == "read":
             result["messages"] = _messages(thread, identity, home)
-            result["queue"] = [{"id": q.get("id"), "clientId": q.get("clientUserMessageId")} for q in queue]
-            result["queuedMessages"], result["queueState"] = _queued_messages(identity, queue, home, queue_available, thread)
+            # "작업 중" counts from the running turn's own start (Turn.startedAt, epoch seconds).
+            active = [t for t in thread["turns"] if t.get("status") == "inProgress"]
+            since = collector.to_epoch(active[-1].get("startedAt")) if active else None
+            if since:
+                result["workingSince"] = since
             if request_ids:
-                result["receipts"] = [_read_receipt(identity, identifier, thread, queue, home) for identifier in request_ids]
+                result["receipts"] = [_read_receipt(identity, identifier, thread, home) for identifier in request_ids]
         elif action == "receipt":
             request_id = _request(args.get("requestId"))
-            result.update(_read_receipt(identity, request_id, thread, queue, home))
+            result.update(_read_receipt(identity, request_id, thread, home))
         elif action == "send":
-            if not queue_available:
-                return {**result, "requestId": _request(args.get("requestId")), "delivery": "rejected",
-                        "confirmed": False, "readbackConfirmed": False, "canRetry": False,
-                        "reason": result["capabilities"]["reason"], "fallback": FALLBACK}
-            result.update(_send(client, identity, args, thread, queue, home))
+            result.update(_send(client, identity, args, thread, home))
         return result

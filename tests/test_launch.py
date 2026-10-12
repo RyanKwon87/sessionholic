@@ -1,7 +1,9 @@
+from contextlib import closing
 import json
 import os
 from pathlib import Path
 import socket
+import sqlite3
 import stat
 import subprocess
 import sys
@@ -92,6 +94,52 @@ class LaunchTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "로그인 파일"):
             self.build(target)
 
+    def test_disabled_launch_profile_is_visible_and_cannot_be_reenabled_by_client(self):
+        path = self.home / '.config/sessionholic/config.json'
+        data = json.loads(path.read_text())
+        data['version'] = 2
+        data['profiles'].append({'agent': 'codex', 'home': '.codex-beta', 'launchEnabled': False})
+        path.write_text(json.dumps(data))
+        row = next(profile for profile in launch.discover_profiles(self.home) if profile['home'] == '.codex-beta')
+        self.assertFalse(row['launchEnabled'])
+        self.assertFalse(row['available'])
+        self.assertIn('기록 조회', row['reason'])
+        target = dict(row, available=True, launchEnabled=True, host='local')
+        with self.assertRaisesRegex(ValueError, '새 실행은 중지'):
+            self.build(target)
+        with self.assertRaisesRegex(ValueError, '새 실행은 중지'):
+            launch.start_app_server('.codex-beta', self.home)
+
+    def test_suspended_policy_blocks_launch_without_hiding_history_profiles(self):
+        path = self.home / '.config/sessionholic/config.json'
+        data = json.loads(path.read_text())
+        data['version'] = 2
+        data['agentRouter'] = {'accountPolicy': '~/policy.json'}
+        path.write_text(json.dumps(data))
+        (self.home / 'policy.json').write_text(json.dumps({
+            'accounts': {'beta': 'DO-NOT-EXPOSE'}, 'suspended_accounts': ['beta']}))
+        self.profile('codex', '.codex-personal-beta')
+        self.profile('codex', '.codex-personal-betax')
+        profiles = {row['home']: row for row in launch.discover_profiles(self.home)}
+        for key in ('.codex-beta', '.codex-personal-beta'):
+            self.assertFalse(profiles[key]['available'])
+            self.assertFalse(profiles[key]['launchEnabled'])
+            self.assertIn('실행 정책에서 중지', profiles[key]['reason'])
+        self.assertTrue(profiles['.codex-personal-betax']['available'])
+        self.assertNotIn('DO-NOT-EXPOSE', json.dumps(profiles))
+        # A policy that cannot be read suspends nothing by name, so every named account stops.
+        for broken in ('{"accounts": ', '[1, 2]', None):
+            with self.subTest(policy=broken):
+                if broken is None:
+                    (self.home / 'policy.json').unlink()
+                else:
+                    (self.home / 'policy.json').write_text(broken)
+                profiles = {row['home']: row for row in launch.discover_profiles(self.home)}
+                for key in ('.codex-beta', '.codex-personal-beta', '.codex-personal-betax'):
+                    self.assertFalse(profiles[key]['launchEnabled'])
+                    self.assertIn('정책을 읽지 못해', profiles[key]['reason'])
+                self.assertTrue(profiles['.codex']['launchEnabled'], 'the default home names no account')
+
     def test_profile_scope_describes_environment_not_login_identity(self):
         for key in (".codex-isolated", ".codex-isolated-beta", ".codex-default",
                     ".codex-isolatedish", ".codex-router/0123456789abcdef"):
@@ -167,6 +215,156 @@ class LaunchTest(unittest.TestCase):
         self.daemon(".codex")
         with self.assertRaisesRegex(ValueError, "UUID"):
             self.build(target, dict(self.source, id="--last"))
+
+    def saved_thread(self, key='.codex', archived=0):
+        database = self.home / key / 'state_5.sqlite'
+        with closing(sqlite3.connect(database)) as connection, connection:
+            connection.execute('CREATE TABLE threads (id TEXT,cwd TEXT,archived INTEGER)')
+            connection.execute('INSERT INTO threads VALUES (?,?,?)', (self.source['id'], str(self.cwd), archived))
+        return database
+
+    def test_offline_closed_codex_resumes_same_id_home_without_prompt(self):
+        self.saved_thread()
+        source = {**self.source, 'phase': 'closed', 'appServer': 'off', 'resume': True}
+        with patch.object(subprocess, 'run') as run:
+            preview = launch.resume_preview(source, self.home)
+            result = self.build(self.profile('codex', '.codex'), source, [])
+        self.assertTrue(preview['allowed'])
+        self.assertFalse(preview['blockedByBoard'])
+        self.assertEqual(result['mode'], 'resume')
+        self.assertEqual(result['argv'], ['/native/codex', 'resume', self.source['id'], '--cd', str(self.cwd)])
+        self.assertEqual(result['env']['CODEX_HOME'], str(self.home / '.codex'))
+        self.assertEqual(result['nativeSource']['id'], self.source['id'])
+        self.assertFalse(self.state.exists())
+        run.assert_not_called()
+
+    def test_closed_resume_keeps_private_profile_environment_and_live_socket(self):
+        profile = self.profile('codex', '.codex-isolated')
+        self.saved_thread('.codex-isolated')
+        path = self.daemon('.codex-isolated')
+        source = {**self.source, 'home': '.codex-isolated', 'phase': 'closed', 'resume': True}
+        with patch.object(launch, '_resume_runtime', return_value={
+                'allowed': True, 'runtimeKnown': True, 'remoteAvailable': True, 'reason': None}):
+            result = self.build(profile, source, [])
+        self.assertEqual(result['mode'], 'resume')
+        self.assertIn('unix://' + str(path), result['argv'])
+        self.assertEqual(result['env']['CODEX_HOME'], str(self.home / '.codex-isolated'))
+        self.assertIn('GH_CONFIG_DIR', result['env'])
+
+    def test_closed_resume_rejects_archive_wrong_account_cwd_and_board_close(self):
+        database = self.saved_thread()
+        source = {**self.source, 'phase': 'closed', 'resume': True}
+        for altered in ({'cwd': str(self.home)}, {'home': '.codex-beta'}, {'blockedByBoard': True}):
+            with self.subTest(altered=altered):
+                self.assertFalse(launch.resume_preview({**source, **altered}, self.home)['allowed'])
+        with self.assertRaisesRegex(ValueError, '원본 도구와 계정'):
+            self.build(self.profile('codex', '.codex-beta'), source)
+        with closing(sqlite3.connect(database)) as connection, connection:
+            connection.execute('UPDATE threads SET archived=1')
+        self.assertFalse(launch.resume_preview(source, self.home)['allowed'])
+        with self.assertRaisesRegex(ValueError, '보관'):
+            self.build(self.profile('codex', '.codex'), source)
+
+    def test_remote_resume_preview_rpc_and_attach_revalidate_same_source(self):
+        import transfer_worker
+        source = {**self.source, 'phase': 'closed', 'resume': True}
+        self.saved_thread()
+        with patch.object(Path, 'home', return_value=self.home), patch.object(os, 'chdir'), patch.object(os, 'execve') as execute:
+            result = transfer_worker.rpc({'op': 'resume_preview', 'args': {'source': source}})
+            self.assertTrue(result['allowed'])
+            transfer_worker.attach(source)
+        self.assertEqual(execute.call_args.args[1], ['/native/codex', 'resume', self.source['id'], '--cd', str(self.cwd)])
+
+    def test_remote_attach_from_non_login_ssh_path_keeps_tool_directories(self):
+        import transfer_worker
+        source = {**self.source, 'phase': 'closed', 'resume': True}
+        self.saved_thread()
+        with patch.object(Path, 'home', return_value=self.home), patch.object(os, 'chdir'), \
+                patch.object(os, 'execve') as execute, patch.dict(os.environ, {'PATH': '/usr/bin:/bin:/usr/sbin:/sbin'}):
+            transfer_worker.attach(source)
+        self.assertEqual(execute.call_args.args[2]['PATH'].split(os.pathsep),
+                         ['/opt/homebrew/bin', str(self.home / '.local/bin'), '/usr/local/bin',
+                          '/usr/bin', '/bin', '/usr/sbin', '/sbin'])
+
+    def test_npm_cli_interpreter_resolves_from_non_login_ssh_path(self):
+        # npm installs codex as `#!/usr/bin/env node`; with only the SSH PATH the
+        # resumed CLI exited 127 before the terminal was attached.
+        tools = self.home / '.local/bin'
+        tools.mkdir(parents=True)
+        interpreter, cli = tools / 'fixture-node', tools / 'codex'
+        interpreter.write_text('#!/bin/sh\nexec /bin/sh "$@"\n')
+        cli.write_text('#!/usr/bin/env fixture-node\necho started\n')
+        for path in (interpreter, cli):
+            path.chmod(0o755)
+        minimal = '/usr/bin:/bin:/usr/sbin:/sbin'
+        with patch.dict(os.environ, {'PATH': minimal}, clear=True):
+            env = launch._environment(self.home, 'codex', '.codex', 'default')
+        done = subprocess.run([str(cli)], env=env, capture_output=True, text=True, timeout=10)
+        self.assertEqual((done.returncode, done.stdout), (0, 'started\n'))
+        before = subprocess.run([str(cli)], env={**env, 'PATH': minimal}, capture_output=True, timeout=10)
+        self.assertEqual(before.returncode, 127)
+        # A PATH the host already set up keeps its order; only missing directories are added.
+        with patch.dict(os.environ, {'PATH': '/opt/homebrew/opt/node@24/bin:/usr/bin:/opt/homebrew/bin'}, clear=True):
+            env = launch._environment(self.home, 'codex', '.codex', 'default')
+        self.assertEqual(env['PATH'].split(os.pathsep),
+                         [str(tools), '/usr/local/bin', '/bin', '/opt/homebrew/opt/node@24/bin', '/usr/bin', '/opt/homebrew/bin'])
+
+    def test_resume_uses_fresh_native_status_instead_of_stale_list_phase(self):
+        import transfer_native
+        self.saved_thread()
+        self.daemon('.codex')
+        for status, allowed in [('notLoaded', True), ('idle', True), ('active', False), ('unknown', False)]:
+            with self.subTest(status=status), patch.object(transfer_native, '_client') as client:
+                rpc = client.return_value.__enter__.return_value
+                rpc.call.return_value = {'thread': {'id': self.source['id'], 'cwd': str(self.cwd),
+                                                    'status': {'type': status, 'activeFlags': []}}}
+                preview = launch.resume_preview(self.source, self.home)
+                self.assertIs(preview['allowed'], allowed)
+                self.assertTrue(preview['runtimeKnown'])
+                rpc.call.assert_called_once_with('thread/read', {'threadId': self.source['id'], 'includeTurns': False})
+
+    def test_resume_rechecks_durable_board_termination_marker_at_execution(self):
+        import session_control
+        import transfer_native
+        self.saved_thread()
+        source = {**self.source, 'phase': 'closed', 'resume': True}
+        self.assertTrue(launch.resume_preview(source, self.home)['allowed'])
+        api = session_control.SessionControl(self.home)
+        api.directory.mkdir(mode=0o700, parents=True)
+        identity = transfer_native._identity(source)
+        session_control._save(api.directory / ('closed-' + session_control._digest(identity) + '.json'),
+                              {'source': identity, 'status': 'unconfirmed'})
+        preview = launch.resume_preview(source, self.home)
+        self.assertFalse(preview['allowed'])
+        self.assertTrue(preview['blockedByBoard'])
+        with self.assertRaisesRegex(ValueError, '웹보드에서 종료'):
+            self.build(self.profile('codex', '.codex'), source, [])
+
+    def test_stale_safe_socket_uses_same_id_local_resume_and_unsafe_socket_is_rejected(self):
+        self.saved_thread()
+        path = self.daemon('.codex')
+        source = {**self.source, 'resume': True}
+        preview = launch.resume_preview(source, self.home)
+        self.assertTrue(preview['allowed'])
+        self.assertFalse(preview['remoteAvailable'])
+        result = self.build(self.profile('codex', '.codex'), source, [])
+        self.assertNotIn('--remote', result['argv'])
+        self.assertEqual(result['argv'][2], source['id'])
+        path.unlink()
+        path.symlink_to(self.home / 'missing')
+        self.assertFalse(launch.resume_preview(source, self.home)['allowed'])
+
+    def test_resume_rejects_native_wrong_cwd_and_timeout_without_fallback(self):
+        import transfer_native
+        self.saved_thread()
+        self.daemon('.codex')
+        with patch.object(transfer_native, '_client') as client:
+            rpc = client.return_value.__enter__.return_value
+            rpc.call.return_value = {'thread': {'id': self.source['id'], 'cwd': str(self.home),
+                                                'status': {'type': 'notLoaded'}}}
+            self.assertFalse(launch.resume_preview(self.source, self.home)['allowed'])
+            rpc.call.side_effect = TimeoutError()
+            self.assertFalse(launch.resume_preview(self.source, self.home)['allowed'])
 
     def test_claude_background_attach_never_uses_resume_or_session_name(self):
         source = dict(self.source, agent="claude", home=".claude", kind="background",
@@ -280,7 +478,7 @@ class LaunchTest(unittest.TestCase):
                    "sk-ant-api03-" + "b" * 48, "ghp_" + "c" * 40,
                    "github_pat_" + "d" * 50, "AKIA" + "A" * 16,
                    "Bearer " + "e" * 30, "aws_secret_access_key=" + "f" * 40,
-                   "-----BEGIN OPENSSH PRIVATE KEY-----\nfixture-body\n-----END OPENSSH PRIVATE KEY-----"]
+                   "-----BEGIN OPENSSH " + "PRIVATE KEY-----\nfixture-body\n-----END OPENSSH PRIVATE KEY-----"]
         messages = [{"role": "user", "text": "확인할 원문: " + "\n".join(secrets)}]
         result = self.build(self.profile("claude", ".claude"), messages=messages)
         text = Path(result["handoffPath"]).read_text()

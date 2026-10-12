@@ -1,7 +1,9 @@
 """Loopback browser QA: native chat RPC is synthetic; attachments use the real store.
 
 No credentials, model process, native daemon or SSH is opened. The terminal is
-an ordinary local echo PTY. Never use this fixture as a production server.
+an ordinary local echo PTY, or with --menu-demo a small numbered menu that reads
+arrow keys and Enter like the agent TUIs' approval menus. Never use this fixture
+as a production server.
 """
 import argparse
 import base64
@@ -19,6 +21,71 @@ import launch
 import server
 from terminal import TerminalManager
 
+# Drawn like an approval menu ("❯ 1. Yes"), answered with ESC [ A / ESC [ B and Enter.
+# After a choice it shows the result and an input line, then asks the next question.
+MENU_DEMO = r'''
+import os, sys, termios, time, tty
+fd = sys.stdin.fileno()
+saved = termios.tcgetattr(fd)
+options = ['Yes', 'No']
+
+def draw(round_number, current):
+    rows = ['\x1b[2J\x1b[H', ' 검증 질문 #%d' % round_number, '', ' 계속 진행할까요?', '']
+    for index, label in enumerate(options):
+        rows.append((' ❯ ' if index == current else '   ') + '%d. %s' % (index + 1, label))
+    rows += ['', ' ↑/↓ 이동 · Enter 선택']
+    sys.stdout.write('\n'.join(rows))
+    sys.stdout.flush()
+
+try:
+    tty.setcbreak(fd)
+    round_number, current, pending = 1, 0, b''
+    draw(round_number, current)
+    while True:
+        data = os.read(fd, 64)
+        if not data:
+            break
+        pending += data
+        while pending:
+            if pending[:3] in (b'\x1b[A', b'\x1bOA'):
+                current, pending = max(current - 1, 0), pending[3:]
+            elif pending[:3] in (b'\x1b[B', b'\x1bOB'):
+                current, pending = min(current + 1, len(options) - 1), pending[3:]
+            elif pending[:1] in (b'\r', b'\n'):
+                pending = b''
+                sys.stdout.write('\x1b[2J\x1b[H 선택 결과: %d. %s (질문 #%d)\n\n> '
+                                 % (current + 1, options[current], round_number))
+                sys.stdout.flush()
+                time.sleep(4)
+                termios.tcflush(fd, termios.TCIFLUSH)
+                round_number, current = round_number + 1, 0
+                break
+            elif pending[:1] == b'\x1b' and len(pending) < 3:
+                break  # wait for the rest of the arrow sequence
+            else:
+                pending = pending[1:]
+        draw(round_number, current)
+finally:
+    termios.tcsetattr(fd, termios.TCSADRAIN, saved)
+'''
+
+
+def working_turn(now):
+    """A long running turn: a question, runs of tool records and a progress note."""
+    tools = [('$ npm test -- --watch=false', 'command'), ('Read · web/app.js', 'read'),
+             ('$ rg -n "renderMessages" web tests', 'command'), ('파일 수정 · web/app.js', 'edit'),
+             ('$ npm test -- --watch=false', 'command'), ('웹 검색 · scroll anchoring overflow-anchor', 'search'),
+             ('github get_issue', 'mcp')]
+    later = [('파일 수정 · web/app.js, web/style.css, tests/test_frontend.cjs', 'edit'),
+             ('$ node tests/test_frontend.cjs && node tests/test_message_format.cjs && '
+              'python3 -m unittest discover -s tests 2>&1 | tail -20', 'command')]
+    rows = [{'role': 'user', 'text': '테스트가 실패하는 원인을 찾아서 고쳐 줘.', 'ts': now - 754}]
+    rows += [{'role': 'tool', 'text': text, 'ts': None, 'toolKind': kind} for text, kind in tools]
+    rows.append({'role': 'assistant', 'text': '원인을 찾았습니다. 스크롤 위치를 숫자로만 되돌리고 있었어요. 고친 뒤 다시 확인합니다.',
+                 'ts': None})
+    rows += [{'role': 'tool', 'text': text, 'ts': None, 'toolKind': kind} for text, kind in later]
+    return rows
+
 
 class FakeNative:
     def __init__(self, rows):
@@ -29,7 +96,7 @@ class FakeNative:
                               'kind': 'image', 'source': 'native'}]},
             {'role': 'tool', 'text': '검증용 파일 읽기\n선택한 텍스트와 펼친 기록은 상태 갱신 중에도 유지됩니다.', 'ts': time.time() - 15},
             {'role': 'assistant', 'text': (
-                '**검증 화면**입니다. 실제 모델 호출 없이 접수와 대기열을 확인할 수 있습니다.\n\n'
+                '**검증 화면**입니다. 실제 모델 호출 없이 메시지 접수 상태를 확인할 수 있습니다.\n\n'
                 '아래 문구를 복사해 보세요.\n\n'
                 '> 미리보기 화면의 안내 문구를 쉽게 바꿔주세요.\n>\n'
                 '> 제목은 **작업 미리보기**로 바꾸고, 휴대폰에서도 잘 읽히게 해주세요.\n\n'
@@ -39,28 +106,77 @@ class FakeNative:
                 '- [프로젝트 문서](https://example.com/docs)를 참고하세요.'
             ), 'ts': time.time() - 10},
         ] for row in rows}
+        now = time.time()
+        # A working session shows a long turn: many tool records (folded into one line on the
+        # board) and "작업 중 · 12분 34초" counted from workingSince.
+        self.since = {}
+        for row in rows:
+            if row['phase'] == 'working':
+                self.messages[row['id']] += working_turn(now)
+                self.since[row['id']] = int(now) - 754
         self.receipts = {}
-        self.queued = {row['id']: [] for row in rows}
+        self.pending = {row['id']: 0 for row in rows}
+        self.running = {row['id']: 'running-' + row['id'] for row in rows if row['phase'] == 'working'}
         self.lock = threading.RLock()
+
+    def add_tool_records(self, seconds):
+        """--live-tools: a working session gets one more tool record every `seconds`."""
+        count = 0
+        while count < 60:
+            time.sleep(seconds)
+            with self.lock:
+                for identifier, row in self.rows.items():
+                    if row['phase'] == 'working':
+                        count += 1
+                        self.messages[identifier].append({'role': 'tool', 'text': f'$ npm test -- --shard={count}',
+                                                          'ts': None, 'toolKind': 'command'})
+
+    def claude_paste(self, identifier, text):
+        """--claude-paste-demo: what the board pasted, recorded the way Claude Code records
+        it: each image path becomes "[Image #N]" before the words (its "첨부 파일:" line goes)
+        and an image block; other files keep their line. Two answers follow while the
+        session stays "working", like a background agent that keeps running tools."""
+        lines = text.split('\n')
+        images, files = 0, []
+        while lines and lines[-1].startswith('첨부 파일: '):
+            path = lines.pop()[len('첨부 파일: '):]
+            if path.lower().endswith(('.png', '.jpg', '.jpeg', '.gif', '.webp')):
+                images += 1
+            else:
+                files.insert(0, '첨부 파일: ' + path)
+        words = '\n'.join(lines + files)
+        row = {'role': 'user', 'text': ''.join('[Image #%d]' % (index + 1) for index in range(images)) + words,
+               'ts': time.time()}
+        if images:
+            row['attachments'] = [{'id': None, 'name': '이미지', 'type': 'image/*', 'size': None,
+                                   'kind': 'image', 'source': 'native'}] * images
+        with self.lock:
+            self.messages[identifier].append(row)
+        for delay, answer in ((3, '보내 주신 내용을 확인했습니다.'), (6, '이어서 정리했습니다. 도구 실행은 계속됩니다.')):
+            timer = threading.Timer(delay, self.answer, args=(identifier, answer))
+            timer.daemon = True
+            timer.start()
+
+    def answer(self, identifier, text):
+        with self.lock:
+            self.messages[identifier].append({'role': 'assistant', 'text': text, 'ts': time.time()})
 
     def finish(self, identifier, request_id, text):
         with self.lock:
-            queued = next((item for item in self.queued[identifier] if item['requestId'] == request_id), None)
-            if queued:
-                self.queued[identifier].remove(queued)
-                self.messages[identifier].append({'role': 'user', 'text': queued['text'], 'ts': time.time(),
-                                                 'clientId': request_id, 'turnId': request_id, 'turnStatus': 'completed',
-                                                 'attachments': queued['attachments']})
-            for message in self.messages[identifier]:
-                if message.get('clientId') == request_id:
-                    message['turnStatus'] = 'completed'
             self.messages[identifier].append({'role': 'assistant', 'text': '검증 응답: ' + text, 'ts': time.time()})
-            self.rows[identifier]['phase'] = 'working' if self.queued[identifier] else 'idle'
-            self.receipts[request_id]['delivery'] = 'completed'
-            self.receipts[request_id]['readbackConfirmed'] = True
-            self.receipts[request_id]['currentSnapshotConfirmed'] = True
-            self.receipts[request_id]['turnId'] = request_id
-            self.receipts[request_id]['queueId'] = None
+            self.pending[identifier] -= 1
+            if self.pending[identifier]:
+                return
+            # The running turn ends only after every input it absorbed was answered.
+            turn_id = self.running.pop(identifier, None)
+            self.rows[identifier]['phase'] = 'idle'
+            self.since.pop(identifier, None)
+            for message in self.messages[identifier]:
+                if message.get('turnId') == turn_id:
+                    message['turnStatus'] = 'completed'
+            for receipt in self.receipts.values():
+                if receipt.get('turnId') == turn_id:
+                    receipt['delivery'] = 'completed'
 
     def rpc(self, host, command, payload, timeout=20):
         if command == 'attachment':
@@ -71,15 +187,15 @@ class FakeNative:
         row = self.rows[source['id']]
         action = payload['action']
         with self.lock:
+            if action == 'capabilities':
+                return {'phase': row['phase'], 'cwd': row['cwd'], 'kind': row.get('kind')}
             if action == 'read':
                 supported = row['agent'] == 'codex'
                 ids = list(dict.fromkeys(([payload['requestId']] if payload.get('requestId') else []) + payload.get('requestIds', [])))
                 return {'phase': row['phase'], 'cwd': row['cwd'], 'messages': list(self.messages[row['id']]),
-                        'queuedMessages': list(self.queued[row['id']]),
-                        'queueState': {'available': supported, 'complete': supported, 'total': len(self.queued[row['id']]) if supported else None,
-                                       'truncated': False, 'reason': None if supported else 'Native 예약 읽기를 지원하지 않습니다.'},
                         'receipts': [{**self.receipts.get(identifier, {'delivery': 'unknown'}), 'requestId': identifier} for identifier in ids],
-                        'capabilities': {'canSend': supported, 'reason': None if supported else '이 Claude 실행은 실제 터미널에서 입력해 주세요.'}}
+                        'capabilities': {'canSend': supported, 'reason': None if supported else 'Claude 입력은 보드가 연결한 터미널로 전달합니다.'},
+                        'workingSince': self.since.get(row['id'])}
             if action == 'receipt':
                 return self.receipts.get(payload['requestId'], {'delivery': 'unknown'})
             if action != 'send':
@@ -98,21 +214,20 @@ class FakeNative:
                                    'size': record['size'], 'kind': kind, 'source': 'sessionholic'})
                 if kind == 'file':
                     text += '\n첨부 파일: ' + record['path']
-            queued = row['phase'] == 'working'
-            if queued:
-                self.queued[row['id']].append({'queueId': 'queue-' + rid, 'requestId': rid, 'text': text,
-                                              'textTruncated': False, 'contentAvailable': True, 'attachments': sent_files,
-                                              'status': 'queued', 'confirmed': True, 'readbackConfirmed': True,
-                                              'currentSnapshotConfirmed': True, 'acknowledged': True})
-            else:
-                self.messages[row['id']].append({'role': 'user', 'text': text, 'ts': time.time(),
-                                                 'clientId': rid, 'turnId': rid, 'turnStatus': 'inProgress', 'attachments': sent_files})
-            self.receipts[rid] = {'delivery': 'queued' if queued else 'accepted', 'confirmed': True,
-                                  'turnId': None if queued else rid, 'queueId': 'queue-' + rid if queued else None,
+            # Like native turn/start: a running turn absorbs the input, otherwise a new turn starts.
+            joined = row['phase'] == 'working'
+            turn_id = self.running.setdefault(row['id'], 'running-' + row['id']) if joined else rid
+            self.running[row['id']] = turn_id
+            self.messages[row['id']].append({'role': 'user', 'text': text, 'ts': time.time(), 'clientId': rid,
+                                             'turnId': turn_id, 'turnStatus': 'inProgress', 'attachments': sent_files})
+            self.receipts[rid] = {'delivery': 'accepted', 'confirmed': True, 'turnId': turn_id,
                                   'readbackConfirmed': True, 'currentSnapshotConfirmed': True,
                                   'acknowledged': True, 'attachments': sent_files}
+            if not joined:
+                self.since[row['id']] = int(time.time())
             row['phase'] = 'working'
-            timer = threading.Timer(8 if queued else 5, self.finish, args=(row['id'], rid, text))
+            self.pending[row['id']] += 1
+            timer = threading.Timer(8 if joined else 5, self.finish, args=(row['id'], rid, text))
             timer.daemon = True
             timer.start()
             if '[unknown]' in text:
@@ -126,6 +241,13 @@ def main(argv=None):
     parser.add_argument('--state-dir', type=Path)
     parser.add_argument('--token-file', type=Path)
     parser.add_argument('--tailscale-user-file', type=Path)
+    parser.add_argument('--menu-demo', action='store_true',
+                        help='보드 터미널을 방향키·Enter로 답하는 번호 메뉴로 실행하고 Claude 백그라운드 세션을 추가')
+    parser.add_argument('--live-tools', type=float, metavar='SECONDS',
+                        help='작업 중인 세션에 이 간격(초)마다 도구 실행 기록을 하나씩 추가')
+    parser.add_argument('--claude-paste-demo', action='store_true',
+                        help='작업 중인 Claude 백그라운드 세션을 추가하고, 보드 터미널에 보낸 메시지를 '
+                             'Claude Code처럼("[Image #1]본문") 대화 기록에 남긴 뒤 답변 두 개를 추가')
     args = parser.parse_args(argv)
     if not 0 <= args.port <= 65535:
         parser.error('포트는 0~65535 범위여야 합니다.')
@@ -144,18 +266,27 @@ def main(argv=None):
     tailscale_user = server.load_tailscale_user(args.tailscale_user_file) if args.tailscale_user_file else None
     now = int(time.time())
     rows = []
-    for index, (agent, home, title, phase) in enumerate([
-        ('codex', '.codex-isolated', '실제 세션 입력 · 한글과 첨부 검증', 'idle'),
-        ('codex', '.codex-isolated', '진행 중인 작업 · 대기열 검증', 'working'),
-        ('claude', '.claude', 'Claude · 터미널 입력과 첨부 경로 검증', 'needs_input'),
-    ], 1):
+    sessions = [
+        ('codex', '.codex-isolated', '실제 세션 입력 · 한글과 첨부 검증', 'idle', 'interactive'),
+        ('codex', '.codex-isolated', '진행 중인 작업 · 실행 중 입력 검증', 'working', 'interactive'),
+        ('claude', '.claude', 'Claude · 터미널 입력과 첨부 경로 검증', 'needs_input', 'interactive'),
+    ]
+    if args.menu_demo:
+        # No board terminal until "질문 불러오기" attaches it (promptOpenable).
+        sessions.append(('claude', '.claude', 'Claude 백그라운드 · 질문 응답 검증', 'needs_input', 'background'))
+    if args.claude_paste_demo:
+        # Sending needs a board terminal the user opens from the composer ("터미널 열기").
+        sessions.append(('claude', '.claude', 'Claude 백그라운드 · 이미지 전송 기록 검증', 'working', 'background'))
+    for index, (agent, home, title, phase, kind) in enumerate(sessions, 1):
         cwd = directory / ('workspace-' + str(index))
         cwd.mkdir(exist_ok=True, mode=0o700)
         rows.append({'id': f'019aaaaa-0000-7000-8000-{index:012d}', 'agent': agent, 'home': home,
-                     'title': title, 'phase': phase, 'cwd': str(cwd), 'kind': 'interactive',
+                     'title': title, 'phase': phase, 'cwd': str(cwd), 'kind': kind,
                      'account': '검증 계정', 'project': '메시지 검증', 'updatedAt': now - index,
                      'snippet': '모델·SSH 호출 없는 검증용 세션입니다.'})
     fake = FakeNative(rows)
+    if args.live_tools:
+        threading.Thread(target=fake.add_tool_records, args=(max(args.live_tools, 1.0),), daemon=True).start()
     hosts = [{'name': 'local', 'label': '입력 검증용', 'local': True}]
 
     def runner(host, command, timeout):
@@ -183,8 +314,20 @@ def main(argv=None):
         return result
     flow.profiles = profiles
     flow.transfers.rpc = fake.rpc
-    echo = "import sys\nprint('검증용 실제 PTY · 모델 호출 없음',flush=True)\nfor line in sys.stdin:\n print('받은 입력: '+line.rstrip(),flush=True)\n"
-    launch.build_launch = lambda *a, **kw: {'argv': [sys.executable, '-u', '-c', echo], 'cwd': str(directory), 'env': {'PATH': os.environ['PATH'], 'LANG': 'en_US.UTF-8'}}
+    if args.claude_paste_demo:
+        paste = manager.paste
+
+        def recorded_paste(terminal_id, text, submit=True):
+            result = paste(terminal_id, text, submit)
+            terminal = next((item for item in manager.list() if item.get('id') == terminal_id), {})
+            native = terminal.get('nativeSource') or terminal.get('metadata', {}).get('nativeSource') or {}
+            if native.get('agent') == 'claude' and native.get('id') in fake.rows:
+                fake.claude_paste(native['id'], text)
+            return result
+        manager.paste = recorded_paste
+    echo ="import sys\nprint('검증용 실제 PTY · 모델 호출 없음',flush=True)\nfor line in sys.stdin:\n print('받은 입력: '+line.rstrip(),flush=True)\n"
+    program = MENU_DEMO if args.menu_demo else echo
+    launch.build_launch = lambda *a, **kw: {'argv': [sys.executable, '-u', '-c', program], 'cwd': str(directory), 'env': {'PATH': os.environ['PATH'], 'LANG': 'en_US.UTF-8'}}
     httpd = server.make_server('127.0.0.1', args.port, board, token, terminals=manager, workflow=flow,
                               state_dir=directory, tailscale_user=tailscale_user)
     print(f'메시지 검증용 보드: http://127.0.0.1:{httpd.server_address[1]}/ · 상태 경로: {directory}', flush=True)

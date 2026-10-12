@@ -126,7 +126,7 @@ function client(
   vm.runInContext(messageSource, context);
   vm.runInContext(source, context);
   const api = vm.runInContext(
-    "({state,api,sourceOf,accountOf,sendInput,pasteDraft,prepareDraftPaste,startDraftComposition,endDraftComposition,inputDraft,stopTerminalReader,startTerminalReader,closePlan,navigateView,backToList,backFromTerminal,closeTerminal,cancelTerminalClose,confirmTerminalClose,populateAccount,populateRoute,updateContinue,renderPlan,launchPlan,openTerminal,saveDraft,draftKey,refreshTerminals,renderTerminals,renderTerminalReturn,renderFilters,terminalCloseCopy,warnDraftUnload,preparePlan,renderGroups,renderMessages,loadDetail,chatKey,chatEntry,currentChat,chatSupported,chatAttachmentsSupported,buildChatComposer,sendChat,loadChatState,applyChatReceipt,uploadChatFiles,pasteChat,scheduleChatPoll,stopChatPolling,openNativeChat,allSessions,buildContinuePanel,chatReceiptCopy,returnToBoard,readChatClipboard,accountDisplay,sessionAccountLabel,closeChatToolsOutside,closeChatToolsEscape,drawDetail,refreshDetail,loadCapabilities,matches,recoverConnection,networkOffline,poll,select,focusDetailBack,restoreSelectedCardFocus,showLogin,lock,beginAuthEpoch,resizeChatInput,updateViewport,draftKeydown,configureTerminalKeyboard,queueTerminalScroll,flushTerminalScroll,terminalScrollEnd,renderAttention,chatPollDelay,pullRefresh,readingScroll,renderJump,pullDistance,listScroll,setReading,renderPrompt,promptAction,renderUsage,loadUsage,applyTheme,setTheme,updateThemeColor,haptic,navTransition,setDetailShown,chatVisible,sheetRelease,BottomSheet,sheet,openSettings,closeSettings,setTyping,pinchFontSize,setTerminalFontSize,loadXterm,assetUrl,syncEvents,closeEvents,eventsHealthy,renderFreshness,schedule,touchDevice,togglePhaseFilter,renderCounts,createLongPress,swipeIntent,swipeRelease,groupMessageRows,setTextSize,applyTextSize,renderConnectivity,terminalForSession,swipeActionFor,openMessageMenu,openCardMenu,messageActions,outboxShape,outboxMatches,outboxOrigin,settleOutbox,retryOutbox,renderAttachmentTiles,attachmentThumb,sendUpload,openActionSheet,closeActionSheet,setListCollapsed,closeSwipe,settleSwipe,prepareSwipe,runSwipeAction,GESTURE,setChromeVisible,toggleChrome,revealChrome,isChromeTap,snapshotAnnounced,updateChatComposer,capabilitiesRevision,toolKindOf,userMessageParts,formatElapsed,tickWorking,renderTerminalMarks,renderDetailTerminal,terminalsAnnounced,goToSessionTerminal,rememberTerminal,terminalMenu,updateTerminalMenu,chooseTerminalMenu,clearTerminalMenu,renderNewSession,openNewSession,startNewSession,startAppServer,rememberConversationView,restoreConversationView,conversationIdentity,initiatorOf,initiatorLabel,documentKeydown})",
+    "({state,api,sourceOf,accountOf,sendInput,pasteDraft,prepareDraftPaste,startDraftComposition,endDraftComposition,inputDraft,stopTerminalReader,startTerminalReader,closePlan,navigateView,backToList,backFromTerminal,closeTerminal,cancelTerminalClose,confirmTerminalClose,populateAccount,populateRoute,updateContinue,renderPlan,launchPlan,openTerminal,saveDraft,draftKey,refreshTerminals,renderTerminals,renderTerminalReturn,renderFilters,terminalCloseCopy,warnDraftUnload,preparePlan,renderGroups,renderMessages,loadDetail,chatKey,chatEntry,currentChat,chatSupported,chatAttachmentsSupported,buildChatComposer,sendChat,loadChatState,applyChatReceipt,uploadChatFiles,pasteChat,scheduleChatPoll,stopChatPolling,openNativeChat,allSessions,buildContinuePanel,chatReceiptCopy,returnToBoard,readChatClipboard,accountDisplay,sessionAccountLabel,closeChatToolsOutside,closeChatToolsEscape,drawDetail,refreshDetail,loadCapabilities,matches,recoverConnection,networkOffline,poll,select,focusDetailBack,restoreSelectedCardFocus,showLogin,lock,beginAuthEpoch,resizeChatInput,updateViewport,draftKeydown,configureTerminalKeyboard,queueTerminalScroll,flushTerminalScroll,terminalScrollEnd,renderAttention,chatPollDelay,pullRefresh,readingScroll,renderJump,pullDistance,listScroll,setReading,renderPrompt,promptAction,renderUsage,loadUsage,applyTheme,setTheme,updateThemeColor,haptic,navTransition,setDetailShown,chatVisible,sheetRelease,BottomSheet,sheet,openSettings,closeSettings,setTyping,pinchFontSize,setTerminalFontSize,loadXterm,assetUrl,syncEvents,closeEvents,eventsHealthy,renderFreshness,schedule,touchDevice,togglePhaseFilter,renderCounts,createLongPress,swipeIntent,swipeRelease,groupMessageRows,setTextSize,applyTextSize,renderConnectivity,terminalForSession,swipeActionFor,openMessageMenu,openCardMenu,messageActions,outboxShape,outboxMatches,outboxOrigin,settleOutbox,retryOutbox,renderAttachmentTiles,attachmentThumb,sendUpload,openActionSheet,closeActionSheet,setListCollapsed,closeSwipe,settleSwipe,prepareSwipe,runSwipeAction,GESTURE,setChromeVisible,toggleChrome,revealChrome,isChromeTap,snapshotAnnounced,updateChatComposer,capabilitiesRevision,toolKindOf,userMessageParts,formatElapsed,tickWorking,renderTerminalMarks,renderDetailTerminal,terminalsAnnounced,goToSessionTerminal,rememberTerminal,terminalMenu,updateTerminalMenu,chooseTerminalMenu,clearTerminalMenu,renderNewSession,openNewSession,startNewSession,startAppServer,rememberConversationView,restoreConversationView,conversationIdentity,initiatorOf,initiatorLabel,documentKeydown,sessionCategoryOf,setSessionCategory,renderSessionCategories,prepareSessionListFor,sessionCategoryKeydown,render,resetFilters})",
     context,
   );
   api.state.csrf = "csrf-test";
@@ -5358,7 +5358,7 @@ test('the top shows "오프라인 · 다시 연결 중" while offline or after t
 
 test('the first paint shows skeleton cards, a collection in progress keeps them, and the list replaces them', () => {
   const html = indexPage();
-  assert.match(html, /<div id="groups" class="groups" aria-busy="true">\s*<div class="skeleton-list" aria-hidden="true">/);
+  assert.match(html, /<div id="groups" class="groups"[^>]*aria-busy="true">\s*<div class="skeleton-list" aria-hidden="true">/);
   assert.match(html, /<p class="sr-only" role="status">세션을 확인하고 있습니다…<\/p>/);
   const c = client(undefined, noChatTimers);
   c.state.snapshot = { hosts: [{ name: 'workstation', ok: true, refreshing: true }] };
@@ -7106,7 +7106,7 @@ test('session origin filters never equate execution surface with its initiator',
     c.state.filters.initiator = 'human'; assert.equal(c.matches(row, 100), false);
     c.state.filters.initiator = 'unknown'; assert.equal(c.matches(row, 100), true);
   }
-  c.state.filters.initiator = 'agent';
+  c.state.filters.initiator = 'agent'; c.state.sessionCategory = 'agent';
   assert.equal(c.matches({ initiator: 'agent', initiatorName: 'Planner' }, 100), true);
   assert.equal(c.initiatorLabel({ initiator: 'agent', initiatorName: 'Planner' }), '에이전트 시작 · Planner');
 });
@@ -7141,4 +7141,87 @@ test('Windows 저장 기록의 실행 미확인은 기기 연결·과거 live ph
   c.renderGroups(c.allSessions(), 1100); card = byClass(c.get('groups'), 'card')[0];
   assert.equal(byClass(card, 'badge')[0].textContent, '실행 확인 전');
   assert.equal(byClass(card, 'stale-tag')[0].hidden, false, '기기 연결이 끊긴 경우에는 별도 이전 정보 표시를 붙인다');
+});
+
+
+test('세션 분류는 명시 agent만 분리하고 일반 세션에 human과 미확인 실행을 중복 없이 남긴다', () => {
+  const c = client(undefined, noChatTimers);
+  const rows = [recentSession('human', { initiator: 'human' }), recentSession('agent', { initiator: 'agent' }),
+    ...['cli', 'background', 'exec'].map((kind) => recentSession(kind, { source: kind, kind, parentSessionId: 'agent', agentName: 'worker' }))];
+  setRecentSnapshot(c, rows);
+  const general = rows.filter(s => c.matches(s, 1100));
+  assert.deepEqual(general.map(s => s.id), ['human', 'cli', 'background', 'exec']);
+  c.state.sessionCategory = 'agent';
+  const agents = rows.filter(s => c.matches(s, 1100)); assert.deepEqual(agents.map(s => s.id), ['agent']);
+  assert.equal(new Set([...general, ...agents].map(s => s.key)).size, rows.length);
+  c.renderSessionCategories(rows, 1100);
+  assert.equal(c.get('session-category-general-count').textContent, '4');
+  assert.equal(c.get('session-category-agent-count').textContent, '1');
+  assert.equal(c.get('session-category-agent').attributes['aria-selected'], 'true');
+  assert.equal(c.get('groups').attributes['aria-labelledby'], 'session-category-agent');
+});
+
+test('검색은 선택 분류에서 동작하고 다른 분류의 일치 결과로 조건을 유지해 이동한다', () => {
+  const c = client(undefined, noChatTimers);
+  const rows = [recentSession('human', { initiator: 'human', title: '일반 문서 검토' }),
+    recentSession('agent', { initiator: 'agent', title: '검색 회귀 확인', phase: 'working' }),
+    recentSession('other-device', { initiator: 'agent', host: 'other', title: '검색 회귀 확인', phase: 'working' })];
+  setRecentSnapshot(c, rows.slice(0, 2));
+  c.state.snapshot.hosts.push({ name: 'other', label: '다른 기기', ok: true, data: { codex: [rows[2]] } });
+  c.state.search = '검색 회귀'; c.state.filters.host = 'workstation'; c.state.phaseFilter = 'working';
+  c.render();
+  assert.equal(byClass(c.get('groups'), 'card').length, 0);
+  assert.equal(c.get('session-category-search').hidden, false);
+  assert.match(c.get('session-category-search-action').textContent, /에이전트 세션.*1개/);
+  c.setSessionCategory(c.get('session-category-search-action').dataset.category);
+  assert.equal(c.state.search, '검색 회귀'); assert.equal(c.state.filters.host, 'workstation'); assert.equal(c.state.phaseFilter, 'working');
+  assert.equal(byClass(c.get('groups'), 'card').length, 1); assert.equal(c.get('session-category-search').hidden, true);
+});
+
+test('시작 주체 필터와 분류를 동기화하고 초기화는 현재 분류를 유지한다', () => {
+  const c = client(undefined, noChatTimers);
+  const rows = [recentSession('human', { initiator: 'human' }), recentSession('agent', { initiator: 'agent' }), recentSession('unknown')];
+  setRecentSnapshot(c, rows); c.renderFilters(rows);
+  let control = c.get('filter-initiator'); control.value = 'agent'; control.events.change();
+  assert.equal(c.state.sessionCategory, 'agent'); assert.equal(c.state.filters.initiator, 'agent');
+  assert.equal(byClass(c.get('groups'), 'card').length, 1);
+  c.resetFilters(); assert.equal(c.state.sessionCategory, 'agent'); assert.equal(c.state.filters.initiator, '');
+  control = c.get('filter-initiator'); control.value = 'unknown'; control.events.change();
+  assert.equal(c.state.sessionCategory, 'general'); assert.equal(byClass(c.get('groups'), 'card').length, 1);
+  control = c.get('filter-initiator'); control.value = 'human'; control.events.change();
+  assert.equal(c.get('session-category-note').hidden, true, '직접 시작만 보는 중에는 미확인 포함 안내를 숨긴다');
+  c.setSessionCategory('agent'); assert.equal(c.state.filters.initiator, '', '분류와 충돌하는 시작 주체 조건만 해제한다');
+  c.sessionCategoryKeydown({ key: 'Home', preventDefault() {} });
+  assert.equal(c.state.sessionCategory, 'general'); assert.equal(c.get('session-category-general').tabIndex, 0);
+  assert.ok(c.get('session-category-general').focusCount > 0);
+  c.sessionCategoryKeydown({ key: 'ArrowRight', preventDefault() {} });
+  assert.equal(c.state.sessionCategory, 'agent'); assert.equal(c.get('session-category-agent').attributes['aria-selected'], 'true');
+});
+
+test('작업에서 대화를 직접 열면 대상 분류와 목록 조건을 맞추고 분류 전환은 초안과 보기 기록을 보존한다', () => {
+  const c = client(undefined, noChatTimers); c.context.navigator = { onLine: false };
+  const human = recentSession('human', { initiator: 'human' }), agent = recentSession('agent', { initiator: 'agent', phase: 'working' });
+  setRecentSnapshot(c, [human, agent]);
+  c.select(human.key); const draft = c.chatEntry(human); draft.text = '보내지 않은 초안';
+  const view = { top: 125, anchor: 'saved-row', pinned: false, chromeVisible: false };
+  c.state.conversationViews.set(c.conversationIdentity(human), view);
+  c.state.filters.host = 'other'; c.state.filters.initiator = 'human'; c.state.search = '다른 대화'; c.state.phaseFilter = 'needs_input';
+  c.select(agent.key);
+  assert.equal(c.state.sessionCategory, 'agent'); assert.equal(c.state.selected, agent.key);
+  assert.equal(c.state.filters.host, ''); assert.equal(c.state.filters.initiator, ''); assert.equal(c.state.search, ''); assert.equal(c.state.phaseFilter, '');
+  assert.equal(c.matches(c.allSessions().find(s => s.key === agent.key), 1100), true);
+  c.chatEntry(agent).text = '워커 초안'; c.setSessionCategory('general');
+  assert.equal(c.state.selected, null); assert.equal(c.state.detailShown, false);
+  assert.equal(byClass(c.get('detail'), 'detail-head').length, 0, '다른 분류의 열린 대화를 남기지 않는다');
+  assert.equal(c.chatEntry(agent).text, '워커 초안'); assert.equal(draft.text, '보내지 않은 초안');
+  assert.equal(c.state.conversationViews.get(c.conversationIdentity(human)), view);
+  c.select(human.key); assert.equal(c.state.sessionCategory, 'general'); assert.equal(c.chatEntry(human).text, '보내지 않은 초안');
+});
+
+test('잠금은 분류 선택과 시작 주체 조건을 일반 세션으로 초기화한다', () => {
+  const c = client(undefined, noChatTimers);
+  c.state.sessionCategory = 'agent'; c.state.filters.initiator = 'agent'; c.showLogin();
+  assert.equal(c.state.sessionCategory, 'general'); assert.equal(c.state.filters.initiator, '');
+  assert.equal(c.get('session-category-general').attributes['aria-selected'], 'true');
+  assert.equal(c.get('session-category-agent-count').textContent, '0');
 });

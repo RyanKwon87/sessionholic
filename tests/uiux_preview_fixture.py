@@ -25,7 +25,8 @@ class AutomaticPreviewNative(fixture.FakeNative):
         for index, row in enumerate(rows):
             row.update(title=sample_titles[index] if index < len(sample_titles) else row['title'],
                        initiator='human' if index < 2 else 'unknown', initiatorEvidence='explicit' if index < 2 else 'unknown',
-                       parentSessionId=None, project='합성 UI 검수', fixtureHost='local')
+                       parentSessionId=None, project='합성 UI 검수', fixtureHost='local',
+                       source='cli' if index < 2 else 'background')
         parent = rows[1]
         for number, title, phase, parent_id, host in [
             (101, '검색 회귀 확인 워커', 'working', parent['id'], 'local'),
@@ -38,7 +39,9 @@ class AutomaticPreviewNative(fixture.FakeNative):
                          'account': '검증 계정', 'project': '합성 UI 검수', 'updatedAt': now - number,
                          'snippet': '모델·SSH·native 제어 없는 합성 검수 세션입니다.', 'fixtureHost': host,
                          'initiator': 'agent' if parent_id else 'human', 'initiatorEvidence': 'explicit',
-                         'parentSessionId': parent_id, 'agentName': '회귀 검토' if parent_id else None})
+                         'parentSessionId': parent_id, 'agentName': '회귀 검토' if parent_id else None,
+                         'initiatorName': '회귀 검토 에이전트' if parent_id else None,
+                         'source': 'subagent' if parent_id else 'cli'})
         super().__init__(rows)
         self.control_calls = []
         self.control_receipts = {}

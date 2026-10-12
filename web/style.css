@@ -6540,3 +6540,14 @@ input.switch:focus-visible {
 @media (max-width: 700px) {
   .session-control-dialog { width: 100%; }
 }
+
+/* Session classification is distinct from runtime status and device filters. */
+.session-categories { display: flex; flex: none; gap: 3px; margin: 8px 0 0; padding: 3px; border-radius: 11px; background: var(--fill); }
+.session-categories > button { display: flex; align-items: center; justify-content: center; gap: 6px; flex: 1 1 0; min-width: 0; min-height: 44px; padding: 6px 8px; border: 0; border-radius: 8px; background: transparent; color: var(--label-2); font-size: var(--fs-sub); white-space: nowrap; }
+.session-categories > button[aria-selected="true"] { background: var(--surface); color: var(--label); font-weight: 600; box-shadow: var(--shadow-segment); }
+.session-category-count { font-variant-numeric: tabular-nums; font-size: var(--fs-cap); }
+.session-category-note { min-height: 16px; margin: 5px 2px 10px; color: var(--label-2); font-size: var(--fs-cap); line-height: 1.4; }
+.session-category-search { margin: 0 0 8px; }
+.session-category-search button { width: 100%; min-height: 44px; padding: 8px 10px; border: 0; border-radius: 8px; background: var(--accent-tint); color: var(--accent-strong); font-size: var(--fs-sub); text-align: left; }
+@media (hover: hover) { .session-categories > button:not([aria-selected="true"]):hover { background: var(--fill-soft); } }
+@media (max-width: 900px) { .session-categories > button { gap: 4px; padding-inline: 4px; font-size: 13px; } }

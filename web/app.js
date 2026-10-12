@@ -113,6 +113,7 @@ const state = {
   // The status chips above the list ("needs_input" or "working"); tapping the
   // active chip again clears it.
   phaseFilter: "",
+  sessionCategory: "general",
   accountFilterRoutes: null,
   search: "",
   showOld: false,
@@ -742,11 +743,12 @@ function groupOf(s) {
       ? "working"
       : "rest";
 }
-function matches(s, now, { phase = true } = {}) {
+function matches(s, now, { phase = true, category = true, initiator = true } = {}) {
+  if (category && sessionCategoryOf(s) !== state.sessionCategory) return false;
   if (phase && state.phaseFilter && groupOf(s) !== state.phaseFilter) return false;
   for (const key of Object.keys(state.filters)) {
     if (key === "initiator") {
-      if (state.filters.initiator && initiatorOf(s) !== state.filters.initiator) return false;
+      if (initiator && state.filters.initiator && initiatorOf(s) !== state.filters.initiator) return false;
       continue;
     }
     if (key === "account" && state.filters.account && state.accountFilterRoutes) {
@@ -779,21 +781,24 @@ function matches(s, now, { phase = true } = {}) {
   );
 }
 
+function renderSessionList(sessions, now) {
+  // Updating list conditions must not redraw a retained conversation or reset
+  // its scroll anchor when the same source is opened again from a work card.
+  const base = sessions.filter((session) => matches(session, now, { phase: false }));
+  const shown = state.phaseFilter ? base.filter((session) => groupOf(session) === state.phaseFilter) : base;
+  renderCounts(base); renderSessionCategories(sessions, now);
+  renderFilters(sessions.filter((session) => sessionCategoryOf(session) === state.sessionCategory));
+  renderGroups(shown, now);
+  $("session-count").textContent = `${shown.length}개`;
+}
 function render() {
   if (!state.snapshot) return;
   const now = state.snapshot.serverTime || Date.now() / 1000;
   const sessions = allSessions();
-  // The status chips count what the other filters leave, so the inactive
-  // chip keeps its number while the other one filters the list.
-  const base = sessions.filter((s) => matches(s, now, { phase: false }));
-  const shown = state.phaseFilter ? base.filter((s) => groupOf(s) === state.phaseFilter) : base;
-  renderHosts(now);
-  renderFreshness(now);
-  renderCounts(base);
-  renderAttention(sessions);
-  renderFilters(sessions);
-  renderGroups(shown, now);
-  $("session-count").textContent = `${shown.length}개`;
+  const reading = state.detailShown && sessions.find((session) => session.key === state.selected);
+  if (reading && sessionCategoryOf(reading) !== state.sessionCategory) setSessionCategory(sessionCategoryOf(reading), { renderView: false, clearSelection: false });
+  renderHosts(now); renderFreshness(now); renderAttention(sessions);
+  renderSessionList(sessions, now);
   const selected = sessions.find((s) => s.key === state.selected);
   if (!state.selected && !$("detail").children.length) {
     const welcome = el("div", "welcome");
@@ -1013,6 +1018,69 @@ function initiatorOf(s) { return ["human", "agent"].includes(s?.initiator) ? s.i
 function initiatorLabel(s) {
   return INITIATOR_LABELS[initiatorOf(s)] + (s?.initiatorName ? ` · ${s.initiatorName}` : "");
 }
+const SESSION_CATEGORIES = { general: "일반 세션", agent: "에이전트 세션" };
+function sessionCategoryOf(session) { return initiatorOf(session) === "agent" ? "agent" : "general"; }
+function setSessionCategory(category, { renderView = true, clearSelection = true } = {}) {
+  if (!Object.hasOwn(SESSION_CATEGORIES, category) || state.launchBusy) return false;
+  const changed = state.sessionCategory !== category;
+  const selected = selectedSession();
+  if (clearSelection && selected && sessionCategoryOf(selected) !== category) {
+    rememberConversationView(); stopChatPolling();
+    state.selected = null; state.detailFor = null; state.detailRevision = null; state.detailRun += 1;
+    $("detail").replaceChildren(); $("detail").dataset.key = ""; setDetailShown(false); navigateView("list", true);
+  }
+  state.sessionCategory = category;
+  const origin = state.filters.initiator;
+  if (origin && (origin === "agent" ? "agent" : "general") !== category) state.filters.initiator = "";
+  if (renderView) { render(); if (changed) $("task-list-pane").scrollTop = 0; }
+  return changed;
+}
+function renderSessionCategories(sessions, now) {
+  const counts = { general: 0, agent: 0 };
+  for (const session of sessions) {
+    const category = sessionCategoryOf(session);
+    // Switching classification clears an incompatible origin filter. Its count
+    // previews precisely those results while retaining search/device/status.
+    if (matches(session, now, { category: false, initiator: category === state.sessionCategory })) counts[category] += 1;
+  }
+  for (const [category, label] of Object.entries(SESSION_CATEGORIES)) {
+    const control = $(`session-category-${category}`); const selected = state.sessionCategory === category;
+    control.setAttribute("aria-selected", String(selected)); control.tabIndex = selected ? 0 : -1;
+    control.setAttribute("aria-label", `${label} ${counts[category]}개`);
+    $(`session-category-${category}-count`).textContent = String(counts[category]);
+  }
+  $("groups").setAttribute("aria-labelledby", `session-category-${state.sessionCategory}`);
+  $("session-category-note").hidden = state.sessionCategory !== "general" || state.filters.initiator === "human";
+  const other = state.sessionCategory === "general" ? "agent" : "general";
+  const match = $("session-category-search");
+  match.hidden = !state.search.trim() || !counts[other];
+  $("session-category-search-action").textContent = `${SESSION_CATEGORIES[other]}에 검색 결과 ${counts[other]}개 · 보기`;
+  $("session-category-search-action").dataset.category = other;
+}
+function sessionCategoryKeydown(event) {
+  if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
+  event.preventDefault();
+  const category = event.key === "Home" ? "general" : event.key === "End" ? "agent" : state.sessionCategory === "general" ? "agent" : "general";
+  setSessionCategory(category); $(`session-category-${category}`).focus();
+}
+function prepareSessionListFor(session) {
+  let changed = setSessionCategory(sessionCategoryOf(session), { renderView: false, clearSelection: false });
+  for (const key of Object.keys(state.filters)) {
+    const value = key === "initiator" ? initiatorOf(session) : session[key];
+    const excluded = key === "account" && state.filters.account && state.accountFilterRoutes
+      ? !state.accountFilterRoutes.has(accountRouteKey(session)) : state.filters[key] && state.filters[key] !== value;
+    if (excluded) { state.filters[key] = ""; if (key === "account") state.accountFilterRoutes = null; changed = true; }
+  }
+  if (state.phaseFilter && groupOf(session) !== state.phaseFilter) { state.phaseFilter = ""; changed = true; }
+  const now = state.snapshot?.serverTime || Date.now() / 1000;
+  if (!state.showOld && groupOf(session) === "rest" && now - (session.updatedAt || 0) > RECENT_SECONDS) {
+    state.showOld = true; $("show-old").checked = true; changed = true;
+  }
+  if (state.search && !matches(session, now)) {
+    state.search = ""; $("search").value = ""; window.SessionholicGoals?.setQuery?.(""); changed = true;
+  }
+  return changed;
+}
 const FILTER_FIELDS = ["filter-host", "filter-agent", "filter-project", "filter-account", "filter-initiator"];
 function renderFilters(sessions) {
   const active = Object.values(state.filters).filter(Boolean).length + (state.showOld ? 1 : 0);
@@ -1049,6 +1117,7 @@ function renderFilters(sessions) {
     select.addEventListener("change", () => {
       state.filters[key] = select.value;
       if (key === "account") state.accountFilterRoutes = null;
+      if (key === "initiator" && select.value) setSessionCategory(select.value === "agent" ? "agent" : "general", { renderView: false });
       render();
     });
     field.append(select);
@@ -1877,6 +1946,9 @@ function restoreConversationView(list) {
 function select(key) {
   if (state.launchBusy) return;
   if (state.selected !== key) rememberConversationView();
+  const target = allSessions().find((session) => session.key === key);
+  const listChanged = target && prepareSessionListFor(target);
+  if (listChanged && state.selected === key) renderSessionList(allSessions(), state.snapshot?.serverTime || Date.now() / 1000);
   const mobile = phoneLayout();
   const entering = mobile && !state.detailShown;
   if (entering) navigateView("detail");
@@ -6612,6 +6684,8 @@ function showLogin() {
   state.conversationViews.clear();
   window.SessionholicGoals?.locked?.();
   state.phaseFilter = "";
+  state.sessionCategory = "general"; state.filters.initiator = "";
+  renderSessionCategories([], Date.now() / 1000);
   state.swipeOpen = null;
   state.pollFailures = 0;
   state.nativeSessions.clear();
@@ -6799,6 +6873,10 @@ window.addEventListener("DOMContentLoaded", () => {
   $("filter-close").addEventListener("click", () => closeSheet("filter-dialog", "filter-open"));
   $("filter-done").addEventListener("click", () => closeSheet("filter-dialog", "filter-open"));
   $("filter-reset").addEventListener("click", resetFilters);
+  for (const category of Object.keys(SESSION_CATEGORIES))
+    $(`session-category-${category}`).addEventListener("click", () => setSessionCategory(category));
+  $("session-categories").addEventListener("keydown", sessionCategoryKeydown);
+  $("session-category-search-action").addEventListener("click", (event) => setSessionCategory(event.currentTarget.dataset.category));
   $("running-terminals").addEventListener("click", () => sheet("terminals-dialog").open());
   $("terminals-close").addEventListener("click", () => closeSheet("terminals-dialog", "running-terminals"));
   $("new-session").addEventListener("click", () => openNewSession());

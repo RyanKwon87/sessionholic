@@ -108,15 +108,17 @@ def _origin(row):
     detail = explicit if isinstance(explicit, dict) else {}
     kind = detail.get('type', detail.get('kind')) if detail else explicit
     kind = {'user': 'human', 'human': 'human', 'agent': 'agent'}.get(kind) if isinstance(kind, str) else None
-    subagent = bool(spawn) or isinstance(sub, str) and sub in ('review', 'compact', 'memory_consolidation')
+    subagent = (isinstance(sub, str) and sub in ('review', 'compact', 'memory_consolidation')) or \
+        (isinstance(sub, dict) and
+         (isinstance(sub.get('thread_spawn'), dict) or isinstance(sub.get('other'), str)))
     parent = next((_metadata(row.get(key)) for key in ('parentThreadId', 'parent_thread_id', 'parentSessionId', 'parent_session_id') if _metadata(row.get(key))), None)
     return {'source': source, 'originator': _metadata(row.get('originator')),
             'initiator': kind or ('agent' if subagent else 'unknown'),
             'initiatorEvidence': 'explicit' if kind else 'subagent' if subagent else 'unknown',
-            'initiatorName': _metadata(detail.get('name') or row.get('initiator_name')),
+            'initiatorName': _metadata(row.get('initiatorName')) or _metadata(row.get('initiator_name')) or _metadata(detail.get('name')),
             'parentSessionId': parent or _metadata(spawn.get('parent_thread_id')),
-            'agentName': _metadata(row.get('agentNickname') or row.get('agent_nickname') or spawn.get('agent_nickname')),
-            'agentRole': _metadata(row.get('agentRole') or row.get('agent_role') or spawn.get('agent_role'))}
+            'agentName': _metadata(row.get('agentName')) or _metadata(row.get('agentNickname')) or _metadata(row.get('agent_nickname')) or _metadata(spawn.get('agent_nickname')),
+            'agentRole': _metadata(row.get('agentRole')) or _metadata(row.get('agent_role')) or _metadata(spawn.get('agent_role')) or _metadata(spawn.get('agent_type'))}
 
 
 def _phase(status, known=True):

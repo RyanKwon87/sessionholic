@@ -19,6 +19,33 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import windows_collector as wc
 
 
+class SessionOriginTest(unittest.TestCase):
+    def test_native_subagent_variants_keep_agent_origin_without_spawn_details(self):
+        for sub in ({'thread_spawn': {}}, {'other': 'native_worker'}, 'review', 'compact', 'memory_consolidation'):
+            for key in ('subAgent', 'subagent'):
+                with self.subTest(key=key, sub=sub):
+                    for source in ({key: sub}, json.dumps({key: sub})):
+                        origin = wc._origin({'source': source})
+                        self.assertEqual(origin['initiator'], 'agent')
+                        self.assertEqual(origin['initiatorEvidence'], 'subagent')
+
+    def test_execution_mode_and_parent_alone_do_not_imply_agent_origin(self):
+        for row in ({'source': 'exec'}, {'source': 'cli'}, {'kind': 'background'},
+                    {'parentSessionId': 'parent-thread'}, {'source': {'subAgent': {'unrecognized': True}}}):
+            with self.subTest(row=row):
+                self.assertEqual(wc._origin(row)['initiator'], 'unknown')
+        self.assertEqual(wc._origin({'initiator': 'human', 'source': {'subAgent': 'review'}})['initiator'], 'human')
+
+    def test_native_names_and_worker_role_are_preserved_separately(self):
+        origin = wc._origin({'initiator': {'type': 'agent', 'name': 'fallback'},
+                             'initiatorName': 'Planner', 'agentName': 'Reviewer',
+                             'source': {'subAgent': {'thread_spawn': {'agent_type': 'reviewer', 'parent_thread_id': 'parent-thread'}}}})
+        self.assertEqual(origin['initiatorName'], 'Planner')
+        self.assertEqual(origin['agentName'], 'Reviewer')
+        self.assertEqual(origin['agentRole'], 'reviewer')
+        self.assertEqual(origin['parentSessionId'], 'parent-thread')
+
+
 class FakeProxy:
     def __init__(self, rows, calls, read=None):
         self.rows, self.calls, self.read = rows, calls, read

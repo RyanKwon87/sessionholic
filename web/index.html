@@ -348,10 +348,13 @@
               aria-describedby="terminal-draft-keys"
               rows="1"
               maxlength="32000"
-              placeholder="입력 후 보내기 · 한글·음성 입력 가능"
+              placeholder="입력 후 보내기"
               autocapitalize="off"
               spellcheck="false"
             ></textarea
+            ><button id="draft-mic" class="draft-mic" type="button" aria-label="음성 입력" aria-pressed="false" title="음성 입력 (브라우저 음성 인식)" hidden>
+              <svg aria-hidden="true" viewBox="0 0 20 20" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><rect x="7" y="2.5" width="6" height="10" rx="3"/><path d="M4.5 9.5a5.5 5.5 0 0 0 11 0M10 15v2.5"/></svg>
+            </button
             ><button id="draft-type" class="draft-type" type="button" aria-label="Enter 없이 입력만">입력</button
             ><button id="draft-paste" class="draft-send" type="button" aria-label="입력하고 Enter">보내기</button>
           </div>

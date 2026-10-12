@@ -2677,6 +2677,45 @@ select:disabled {
 .draft-row button:disabled {
   opacity: 0.4;
 }
+/* 음성 입력: a mic beside each input, red and pulsing while it listens. */
+.draft-row .draft-mic {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 40px;
+  padding: 0;
+  background: var(--t-key);
+  color: var(--t-label);
+}
+.chat-composer .chat-main > #chat-mic {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: var(--tap);
+  min-width: var(--tap);
+  min-height: var(--tap);
+  margin: 0;
+  padding: 0;
+  border: 0;
+  border-radius: 22px;
+  background: transparent;
+  box-shadow: inset 0 0 0 1px var(--sep);
+  color: var(--label-2);
+}
+.chat-composer .chat-main > #chat-mic.is-listening,
+.draft-row .draft-mic.is-listening {
+  background: var(--red-fill);
+  box-shadow: none;
+  color: var(--on-accent);
+  animation: pulse 1.6s ease-in-out infinite;
+}
+@media (prefers-reduced-motion: reduce) {
+  .chat-composer .chat-main > #chat-mic.is-listening,
+  .draft-row .draft-mic.is-listening {
+    animation: none;
+  }
+}
 .draft-note {
   margin: 6px 2px 0;
   color: var(--t-label-2);
@@ -4663,7 +4702,7 @@ select:disabled {
    key row has its own lighter rule in section 9. */
 :is(.primary, .secondary, .icon-button, .quiet, .copy, .back, .home-button,
   .running-terminal, .running-terminal-close, .running-refresh, .jump-bottom,
-  .chat-toolbar > button, .chat-main > #chat-send, .chat-tools-actions > button,
+  .chat-toolbar > button, .chat-main > #chat-send, .chat-main > #chat-mic, .chat-tools-actions > button,
   .chat-prompt-option, .chat-prompt-terminal, .msg-copy, .message-block-copy,
   #return-terminal, .usage-refresh, .terminal-button, .terminal-live,
   .terminal-status-row > button, .draft-row button, .conversation-bar button):active:not(:disabled) {

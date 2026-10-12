@@ -3116,6 +3116,8 @@ const DICTATION_LANG = "ko-KR";
 const DICTATION_PREPARING = "마이크 준비 중…";
 const DICTATION_LISTENING = "듣는 중 · 끝내려면 마이크를 다시 누르세요";
 const DICTATION_STALLED = "음성 인식이 응답하지 않아 멈췄습니다. 들은 글은 남겨 두었습니다. 다시 누르거나 키보드의 받아쓰기를 써 주세요.";
+const DICTATION_NOT_STARTED = "음성 인식이 시작되지 않아 멈췄습니다. 권한 창이 떴다면 허용한 뒤 마이크를 다시 누르거나, 키보드의 받아쓰기를 써 주세요.";
+const DICTATION_SILENCE_END = "말이 없어 듣기를 끝냈습니다. 이어서 말하려면 마이크를 다시 누르세요.";
 const DICTATION_ENDED_AT_ONCE = "음성 인식이 바로 끝났습니다. 이 화면(홈 화면 앱 등)에서 막혀 있을 수 있습니다. 브라우저에서 열거나 키보드의 받아쓰기를 써 주세요.";
 const DICTATION_INTERRUPTED = "음성 인식이 중간에 끝났습니다. 들은 글은 남겨 두었습니다. 다시 눌러 이어서 말해 주세요.";
 const DICTATION_STOP_WAIT_MS = 3000;
@@ -3205,7 +3207,7 @@ function startDictation(field, { report, active }) {
   const start = Number.isInteger(field.selectionStart) ? Math.min(field.selectionStart, value.length) : value.length;
   const end = Number.isInteger(field.selectionEnd) ? Math.min(Math.max(start, field.selectionEnd), value.length) : start;
   const session = { field, recognition, report, active, prefix: value.slice(0, start), suffix: value.slice(end),
-    written: value, results: [], heard: false, started: false, error: "", applying: false, stopping: false,
+    written: value, results: [], heard: false, started: false, silent: false, error: "", applying: false, stopping: false,
     ticks: 0, idle: 0, timer: null, stopTimer: null };
   const listening = () => {
     if (state.dictation !== session || session.started) return;
@@ -3239,10 +3241,18 @@ function startDictation(field, { report, active }) {
       stopDictation({ abort: true });
       return;
     }
+    // An error the engine reported without ending (seen in WebKit) is said, with its code.
+    if (session.error) {
+      stopDictation({ abort: true, message: dictationOutcome(session) });
+      return;
+    }
     session.ticks++;
     session.idle++;
-    if (!session.started && session.ticks >= DICTATION_START_TICKS) stopDictation({ abort: true, message: DICTATION_STALLED });
-    else if (session.started && !session.stopping && session.idle >= DICTATION_SILENCE_TICKS) stopDictation();
+    if (!session.started && session.ticks >= DICTATION_START_TICKS) stopDictation({ abort: true, message: DICTATION_NOT_STARTED });
+    else if (session.started && !session.stopping && session.idle >= DICTATION_SILENCE_TICKS) {
+      session.silent = true;
+      stopDictation();
+    }
   }, 1000);
   report(DICTATION_PREPARING);
   renderDictation();
@@ -3272,20 +3282,25 @@ function applyDictation(session) {
     session.applying = false;
   }
 }
+// What the field's status line says when a listening ends ("" for a plain end after words).
+// Our own aborts never reach the end handler, so an "aborted" there is the platform's (or its
+// answer to our stop, which is a plain end).
+function dictationOutcome(session) {
+  if (!session.active()) return ""; // a field that left the screen is not told later, out of context
+  const platformAbort = session.error === "aborted" && !session.stopping;
+  const error = session.error === "aborted" ? "" : session.error;
+  if (platformAbort) return session.heard ? `${DICTATION_INTERRUPTED} (aborted)` : `${DICTATION_ENDED_AT_ONCE} (aborted)`;
+  if (error) return dictationErrorText(error);
+  if (!session.stopping && !session.heard && session.ticks === 0) return `${DICTATION_ENDED_AT_ONCE} (end)`;
+  if (!session.heard) return DICTATION_ERRORS["no-speech"];
+  return session.silent ? DICTATION_SILENCE_END : "";
+}
 function finishDictation(session) {
   if (state.dictation !== session) return;
   state.dictation = null;
   clearInterval(session.timer);
   clearTimeout(session.stopTimer);
-  // Our own aborts never reach here: an "aborted" is the platform's.
-  const platformAbort = session.error === "aborted";
-  const atOnce = !session.stopping && !session.heard && !session.error && session.ticks === 0;
-  // A field that left the screen is not told about it later, out of context.
-  session.report(!session.active() ? ""
-    : platformAbort ? (session.heard ? DICTATION_INTERRUPTED : DICTATION_ENDED_AT_ONCE)
-    : atOnce ? DICTATION_ENDED_AT_ONCE
-    : session.error ? dictationErrorText(session.error)
-    : session.heard ? "" : DICTATION_ERRORS["no-speech"]);
+  session.report(dictationOutcome(session));
   renderDictation();
 }
 // stop: the last words still arrive (onend finishes); pressed again while it ends, or not
@@ -3296,7 +3311,8 @@ function stopDictation({ abort = false, field = null, message = "" } = {}) {
   if (!abort && !session.stopping) {
     session.stopping = true;
     session.stopTimer = setTimeout(() => {
-      if (state.dictation === session) stopDictation({ abort: true, message: session.active() ? DICTATION_STALLED : "" });
+      if (state.dictation === session) stopDictation({ abort: true, message: !session.active() ? ""
+        : session.error ? dictationOutcome(session) : session.heard ? DICTATION_STALLED : DICTATION_NOT_STARTED });
     }, DICTATION_STOP_WAIT_MS);
     try {
       session.recognition.stop();
@@ -3521,6 +3537,8 @@ function buildChatComposer(s) {
       stopDictation({ field: input });
       return;
     }
+    if (entry.inputError && entry.error === entry.inputError) entry.error = "";
+    entry.inputError = "";
     startDictation(input, { report: reportDictation,
       active: () => editorCurrent() && chatVisible() && !input.disabled && !input.readOnly });
   });
@@ -3766,7 +3784,7 @@ function updateChatComposer(entry) {
   $("chat-attach").disabled = offline || !chatAttachmentsSupported(entry) || entry.sending || !!entry.pending || !!entry.uploads;
   $("chat-clipboard").disabled = $("chat-attach").disabled;
   $("chat-send").disabled = blocked || entry.composing || (!entry.text.trim() && !entry.attachments.length);
-  $("chat-mic").disabled = input.disabled || input.readOnly || entry.composing;
+  $("chat-mic").disabled = input.disabled || input.readOnly || (entry.composing && !dictationListening(input));
   renderDictation();
   $("chat-send").textContent = entry.sending ? "전송 중" : "보내기";
   $("chat-send").setAttribute("aria-label", "메시지 보내기");
@@ -3790,7 +3808,8 @@ function updateChatComposer(entry) {
     ? "메시지는 전송되지 않았습니다. 초안과 첨부는 유지됩니다." : "") : !supported && entry.attachments.length
     ? "첨부는 이 작업 폴더에 저장됐습니다. 첨부의 ‘경로’를 복사해 터미널에 붙여넣으세요."
     : entry.data?.capability?.reason || "직접 입력을 지원하지 않습니다. 터미널을 사용해 주세요.";
-  $("chat-status").textContent = (offline ? "오프라인입니다. 초안은 유지됩니다. 연결 후 상태를 확인하고 보내 주세요." : entry.dictationNotice || entry.error || (oneShot ? ONE_SHOT_NO_INPUT : entry.notice || (entry.uploads ? `첨부 ${entry.uploads}개를 올리고 있습니다…` : !entry.data ? (claudeWithoutId(selectedSession()) ? CLAUDE_NO_SEND : "메시지 전송 환경을 확인하고 있습니다…") : !supported ? unsupportedCopy : receiptNotice(entry) || phaseCopy))) + budgetNote;
+  const dictating = state.dictation?.field === input;
+  $("chat-status").textContent = (offline ? "오프라인입니다. 초안은 유지됩니다. 연결 후 상태를 확인하고 보내 주세요." : (dictating && entry.dictationNotice) || entry.error || (oneShot ? ONE_SHOT_NO_INPUT : entry.dictationNotice || entry.notice || (entry.uploads ? `첨부 ${entry.uploads}개를 올리고 있습니다…` : !entry.data ? (claudeWithoutId(selectedSession()) ? CLAUDE_NO_SEND : "메시지 전송 환경을 확인하고 있습니다…") : !supported ? unsupportedCopy : receiptNotice(entry) || phaseCopy))) + budgetNote;
   $("chat-status").setAttribute("data-attention", String(!!(offline || chatHostOffline(entry) || entry.error || entry.receipt?.status === "unknown")));
   const deliveryVisible = updateChatDeliveryEvidence(entry);
   const chips = $("chat-attachments");
@@ -4073,6 +4092,8 @@ function draftIsPending(entry) {
 // bubble resends what it showed; the editor is then left as it is.
 async function sendChat(entry, message = null) {
   if (networkOffline()) { updateChatComposer(entry); return; }
+  // What a finished dictation said gives way to what the send says.
+  if (!message && !dictationListening($("chat-input"))) entry.dictationNotice = "";
   const text = message ? String(message.text || "") : entry.text;
   const attachments = (message ? message.attachments || [] : entry.attachments).slice();
   if (!currentChat(entry) || !chatSupported(entry) || entry.composing || entry.sending || entry.pending || entry.uploads ||

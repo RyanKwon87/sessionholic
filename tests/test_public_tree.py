@@ -37,6 +37,22 @@ class PublicTreeTest(unittest.TestCase):
         self.assertEqual(result["findings"], [{"file": "README.md", "category": "github-token"}])
         self.assertNotIn(token, json.dumps(result))
 
+    def test_keys_in_strings_windows_homes_and_bare_tailnet_names_are_reported(self):
+        names = ["key.json", "fixture.py", "win.md", "win-json.json", "examples.md", "tailnet.py"]
+        self.allow(*names)
+        body = "A" * 64
+        (self.root / "key.json").write_text(json.dumps({"key": "-----BEGIN PRIVATE KEY-----\n" + body + "\n-----END PRIVATE KEY-----"}))
+        (self.root / "fixture.py").write_text('KEY = "-----BEGIN OPENSSH PRIVATE KEY-----\\nfixture-body\\n"')
+        # Joined at run time, so this test file is no finding itself.
+        person = "some" + "one"
+        (self.root / "win.md").write_text("C:\\Users\\" + person + "\\Projects")
+        (self.root / "win-json.json").write_text(json.dumps({"cwd": "C:\\Users\\" + person + "\\x"}))
+        (self.root / "examples.md").write_text("C:\\Users\\example\\x C:/Users/fixture/y remote.tail-example.ts.net *.ts.net")
+        (self.root / "tailnet.py").write_text('HOST = "board.' + "tail0a1b2c" + '.ts.net"')
+        found = {(item["file"], item["category"]) for item in public.audit(self.root)["findings"]}
+        self.assertEqual(found, {("key.json", "escaped-private-key"), ("win.md", "non-example-windows-home-path"),
+                                 ("win-json.json", "non-example-windows-home-path"), ("tailnet.py", "non-example-tailnet-name")})
+
     def test_links_rejected_before_content_and_license_is_explicit(self):
         self.allow("README.md")
         outside = self.root / "private-value.txt"

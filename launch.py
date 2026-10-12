@@ -228,7 +228,8 @@ def discover_profiles(home=None):
         profiles.append(_profile("claude", ".claude", home, _binary("claude", home)))
     router = agent_router.from_settings(config)
     suspended = set(router.suspended()) if router is not None else set()
-    if suspended:
+    unreadable = router is not None and router.policy_failed()
+    if suspended or unreadable:
         labels = router.labels()
         for profile in profiles:
             if profile["agent"] != "codex":
@@ -238,7 +239,11 @@ def discover_profiles(home=None):
                        if key.startswith(".codex-router/") else
                        key[len(".codex-personal-"):] if key.startswith(".codex-personal-") else
                        key[len(".codex-"):] if key.startswith(".codex-") else None)
-            if account in suspended:
+            if unreadable and account is not None:
+                # Fail closed: which accounts are suspended is unknown while the policy is unreadable.
+                profile.update(available=False, launchEnabled=False,
+                               reason="계정 실행 정책을 읽지 못해 이 계정의 실행을 멈췄습니다. 정책 파일을 확인해 주세요. 이전 기록은 계속 볼 수 있습니다.")
+            elif account in suspended:
                 profile.update(available=False, launchEnabled=False,
                                reason="이 계정은 실행 정책에서 중지되어 있습니다. 이전 기록은 계속 볼 수 있습니다.")
     return profiles

@@ -448,7 +448,9 @@ class ValidationTest(unittest.TestCase):
         cancel = ("send-keys", "-t", name, "-X", "cancel")
         process = Mock(pid=0)
         process.poll.return_value = None
-        with patch.object(self.manager, "_exists", return_value=True), patch.object(self.manager, "_configure"), \
+        # Popen is a fixture: no installed tmux is needed, only a path to name in its command.
+        with patch.object(self.manager, "tmux", "/usr/bin/false"), \
+                patch.object(self.manager, "_exists", return_value=True), patch.object(self.manager, "_configure"), \
                 patch.object(self.manager, "_run", side_effect=RuntimeError("fixture tmux")) as run, \
                 patch.object(terminal.subprocess, "Popen", return_value=process), \
                 patch.object(terminal.threading, "Thread") as thread:
@@ -469,7 +471,6 @@ class ValidationTest(unittest.TestCase):
         self.assertFalse(stream.attached_fresh)
 
 
-@unittest.skipUnless(shutil.which("tmux"), "tmux fixture requires installed tmux")
 class SocketRecordTest(unittest.TestCase):
     """A board started on another tmux socket must never tombstone live sessions (R1)."""
 
@@ -569,6 +570,7 @@ class SocketRecordTest(unittest.TestCase):
                 self.manager()
 
 
+@unittest.skipUnless(shutil.which("tmux"), "tmux fixture requires installed tmux")
 class TmuxFixtureTest(unittest.TestCase):
     """Only a Python echo fixture runs in a unique tmux server, never an agent."""
 

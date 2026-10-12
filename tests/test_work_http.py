@@ -10,6 +10,10 @@ ROW = {**REF, 'title': '자동 발견한 작업', 'phase': 'working'}
 SNAPSHOT = {'version': 1, 'hosts': [{'name': 'fixture', 'ok': True, 'data': {'codex': [ROW], 'claude': []}}]}
 
 
+# The same isolated configuration folder as the goal routes' tests.
+setUpModule = fixture.setUpModule
+
+
 class WorkHTTPTest(unittest.TestCase):
     setUp = fixture.GoalsHTTPTest.setUp
     tearDown = fixture.GoalsHTTPTest.tearDown

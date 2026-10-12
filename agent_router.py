@@ -54,23 +54,29 @@ class AgentRouter:
         return result
 
     def _policy(self):
+        """The policy object; None when one is configured but cannot be read."""
         if not self.account_policy:
             return {}
         try:
             data = json.loads(Path(self.account_policy).read_text(encoding="utf-8"))
         except (OSError, ValueError, UnicodeError):
-            return {}
-        return data if isinstance(data, dict) else {}
+            return None
+        return data if isinstance(data, dict) else None
+
+    def policy_failed(self):
+        """A configured policy that cannot be read names no suspended account: launches of
+        the accounts it governs stop until it reads again (`launch.discover_profiles`)."""
+        return self._policy() is None
 
     def accounts(self):
         """Account keys only; the e-mail values are never copied anywhere."""
         try:
-            return list(self._policy().get("accounts") or {})
+            return list((self._policy() or {}).get("accounts") or {})
         except TypeError:
             return []
 
     def suspended(self):
-        value = self._policy().get("suspended_accounts") or []
+        value = (self._policy() or {}).get("suspended_accounts") or []
         try:
             return [name for name in value if isinstance(name, str)]
         except TypeError:

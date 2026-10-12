@@ -20,6 +20,19 @@ FCM = "https://fcm.googleapis.com/fcm/send/fixture-token:APA91-fixture"
 OPENSSL = shutil.which("openssl", path="/usr/bin:/opt/homebrew/bin")
 
 
+def setUpModule():
+    # A board under test never reads this user's bot sources (nor, through them, a bot ledger).
+    import pathlib
+    import shutil
+    import tempfile
+    from unittest import mock
+    folder = tempfile.mkdtemp(prefix="sh-config-")
+    patcher = mock.patch.object(server, "CONFIG_DIR", pathlib.Path(folder))
+    patcher.start()
+    unittest.addModuleCleanup(patcher.stop)
+    unittest.addModuleCleanup(shutil.rmtree, folder, True)
+
+
 def unb64(value):
     return base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
 
@@ -210,6 +223,18 @@ class ServiceTest(unittest.TestCase):
         self.assertEqual(self.service.pending_for(self.service.subscriptions[0]["id"]), {"notifications": []})
         self.service.step()
         self.assertEqual(len(self.sent), 1)
+
+    def test_a_claude_row_without_an_id_notifies_under_the_lists_key(self):
+        self.subscribe()
+        claude = {"agent": "claude", "id": "", "kind": "interactive", "pid": 4242, "title": "정산 자동화",
+                  "sessionId": "0f9c3a52-1b7e-4c1a-9d6e-5a4b3c2d1e0f", "cwd": "/work/project", "startedAt": 1_799_999_000}
+        self.board.set({**claude, "phase": "working", "updatedAt": self.clock.now})
+        self.service.step()
+        self.board.set({**claude, "phase": "needs_input", "updatedAt": self.clock.now})
+        self.assertEqual([event["kind"] for event in self.service.step()], ["needs_input"])
+        notice = self.service.pending_for(self.service.subscriptions[0]["id"])["notifications"][0]
+        # The same key web/app.js gives the card, so the notice opens it.
+        self.assertEqual(notice["tag"], "session:laptop|claude||~4242:0f9c3a52-1b7e-4c1a-9d6e-5a4b3c2d1e0f:/work/project:1799999000")
 
     def test_agent_bot_one_shot_unknown_stale_and_offline_rows_never_notify(self):
         self.subscribe()
@@ -495,6 +520,8 @@ class RouteTest(unittest.TestCase):
         self.assertEqual(status, 200)
         pending = "/api/push/pending?id=" + push.subscription_id(APPLE)
         self.assertEqual(self.request("GET", pending, headers={"Cookie": cookie})[0], 403)
+        # A HEAD never clears the queue it cannot show.
+        self.assertEqual(self.request("HEAD", pending, headers={"Cookie": cookie, "X-Board-Push": "1"})[0], 405)
         status, body = self.request("GET", pending, headers={"Cookie": cookie, "X-Board-Push": "1"})
         self.assertEqual((status, [item["tag"] for item in body["notifications"]]), (200, ["notice-test"]))
         self.assertEqual(self.request("GET", "/api/push/pending?id=bad", headers={"Cookie": cookie, "X-Board-Push": "1"})[0], 400)

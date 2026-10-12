@@ -1459,7 +1459,8 @@ class Workflow:
         return None
 
     def ensure_direct_session(self, source):
-        if self.bot_request(source):
+        owns = getattr(getattr(self, "bot_requests", None), "owns", None)
+        if self.bot_request(source) or (owns is not None and owns(source)):
             raise ValueError("봇을 통해 받은 요청입니다. 요청자의 권한과 사용 범위를 유지하도록 원래 봇에서 이어가 주세요.")
 
     def ensure_direct_terminal(self, terminal_id):
@@ -2102,6 +2103,9 @@ class Handler(BaseHTTPRequestHandler):
                     # a cross-site request cannot add this header without a preflight.
                     if self.headers.get("X-Board-Push") != "1":
                         return self.send_json(403, {"error": "이 보드의 알림에서만 읽을 수 있습니다."})
+                    if self.command != "GET":
+                        # HEAD runs this route too; it would clear the queue without a body to show.
+                        return self.send_json(405, {"error": "알림 내용은 GET으로만 읽을 수 있습니다."})
                     return self.send_json(200, self.server.push.pending_for(query.get("id")))
                 goal_match = re.fullmatch(r"/api/goals/([a-f0-9]{32})", url.path)
                 if goal_match:

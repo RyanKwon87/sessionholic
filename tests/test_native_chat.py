@@ -715,9 +715,9 @@ class NativeChatTests(unittest.TestCase):
         thread['turns'] = [
             {'id': 'done', 'status': 'completed', 'startedAt': 1000, 'completedAt': 1600, 'items': [
                 {'type': 'userMessage', 'id': 'u1', 'content': [{'type': 'text', 'text': '질문'}]},
-                {'type': 'agentMessage', 'id': 'a1', 'text': '중간 보고'},
+                {'type': 'agentMessage', 'id': 'a1', 'text': '중간 보고', 'phase': 'commentary'},
                 {'type': 'commandExecution', 'id': 'c1', 'command': 'ls'},
-                {'type': 'agentMessage', 'id': 'a2', 'text': '최종 답'}]},
+                {'type': 'agentMessage', 'id': 'a2', 'text': '최종 답', 'phase': 'final_answer'}]},
             {'id': 'live', 'status': 'inProgress', 'startedAt': 2000, 'items': [
                 {'type': 'userMessage', 'id': 'u2', 'content': [{'type': 'text', 'text': '다음 질문'}]},
                 {'type': 'agentMessage', 'id': 'a3', 'text': '진행 중'}]}]
@@ -725,6 +725,9 @@ class NativeChatTests(unittest.TestCase):
         self.assertEqual([(m['itemId'], m['ts']) for m in result['messages']],
                          [('u1', 1000), ('a1', None), ('c1', None), ('a2', 1600), ('u2', 2000), ('a3', None)])
         self.assertEqual(result['messages'][2]['toolKind'], 'command')
+        # Marked as the list's reader marks them (collector.codex_messages): which answer is final.
+        self.assertEqual([(m.get('messageId'), m.get('phase')) for m in result['messages'][1:4]],
+                         [('a1', 'commentary'), ('c1', None), ('a2', 'final_answer')])
         self.assertEqual(result['workingSince'], 2000)
         thread['turns'] = thread['turns'][:1]
         thread['status'] = {'type': 'idle', 'activeFlags': []}

@@ -21,6 +21,19 @@ TOKEN = "test-token-123"
 HOSTS = [{"name": "remote", "label": "원격 기기", "local": False, "ssh": "remote", "python": "/usr/bin/python3"}]
 
 
+def setUpModule():
+    # A board under test never reads this user's bot sources (nor, through them, a bot ledger).
+    import pathlib
+    import shutil
+    import tempfile
+    from unittest import mock
+    folder = tempfile.mkdtemp(prefix="sh-config-")
+    patcher = mock.patch.object(server, "CONFIG_DIR", pathlib.Path(folder))
+    patcher.start()
+    unittest.addModuleCleanup(patcher.stop)
+    unittest.addModuleCleanup(shutil.rmtree, folder, True)
+
+
 def fake_runner(calls):
     def run(host, args, timeout):
         calls.append((host["name"], list(args)))
@@ -201,7 +214,7 @@ class ServerTest(unittest.TestCase):
     def test_foreign_host_header_is_refused(self):
         res, _ = self.request("GET", "/", headers={"Host": "evil.example:8790"})
         self.assertEqual(res.status, 421)
-        res, _ = self.request("GET", "/", headers={"Host": "remote.tailc1299f.ts.net"})
+        res, _ = self.request("GET", "/", headers={"Host": "remote.tail-example.ts.net"})
         self.assertEqual(res.status, 200)
 
     def test_csp_allows_blob_images_only_in_img_src(self):
@@ -854,7 +867,7 @@ class HelperTest(unittest.TestCase):
         self.assertTrue(server.host_allowed("127.0.0.1:8790"))
         self.assertTrue(server.host_allowed("localhost"))
         self.assertTrue(server.host_allowed("[::1]:8790"))
-        self.assertTrue(server.host_allowed("remote.tailc1299f.ts.net"))
+        self.assertTrue(server.host_allowed("remote.tail-example.ts.net"))
         self.assertFalse(server.host_allowed("ts.net.evil.com"))
         self.assertFalse(server.host_allowed(""))
 

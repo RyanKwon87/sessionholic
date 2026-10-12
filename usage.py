@@ -108,7 +108,7 @@ class UsageMeter:
             for item in results:
                 if item is None:
                     continue
-                if item["status"] != "ready" and previous.get(item["id"], {}).get("status") == "ready":
+                if item["status"] != "ready" and previous.get(item["id"], {}).get("status") in ("ready", "stale"):
                     # Keep the last good numbers, clearly marked as earlier ones.
                     kept = copy.deepcopy(previous[item["id"]])
                     kept["status"], kept["note"] = "stale", "이전 조회 값입니다. 최신 조회에 실패했습니다."

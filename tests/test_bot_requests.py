@@ -252,6 +252,23 @@ class BotRequestsTest(unittest.TestCase):
         self.assertEqual(stale['nativeRef']['id'], self.sid)
         self.assertEqual([row['ok'] for row in result['sources']], [False, True])
 
+    def test_a_bot_session_stays_the_bots_after_the_ledger_stops_naming_it(self):
+        self.ledger()
+        self.native()
+        api = self.configure()
+        api.snapshot()
+        source = {'host': 'mini', 'agent': 'codex', 'id': self.sid, 'home': '.codex'}
+        self.assertTrue(api.owns(source))
+        self.assertFalse(api.owns({**source, 'id': str(uuid.uuid4())}))
+        self.assertFalse(api.owns({**source, 'host': 'pc'}))
+        # Later requests pushed it out of the recent window (or a read could not confirm it).
+        with closing(sqlite3.connect(self.database())) as db, db:
+            db.execute('UPDATE tasks SET codex_thread=NULL')
+        self.assertEqual([row['nativeRef'] for row in api.snapshot(force=True)['requests']], [None])
+        self.assertTrue(api.owns(source))
+        self.assertTrue(self.configure().owns(source), 'kept for the next board process too')
+        self.assertEqual((self.home / 'state/bot-owners.json').stat().st_mode & 0o777, 0o600)
+
     def test_bad_config_keeps_prior_native_ownership_evidence_marked_stale(self):
         self.ledger()
         self.native()

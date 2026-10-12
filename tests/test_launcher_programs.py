@@ -85,6 +85,22 @@ class ProgramTest(unittest.TestCase):
         script = lp.describe([{"id": "a" * 32, "createdAt": started("Mon Oct 12 19:00:00 2026")}], ["/Users/example/bin/zz-launcher"], rows)
         self.assertEqual(script["a" * 32], {"program": "claude", "cwd": None, "pid": 90001})
 
+    def test_terminals_opened_close_together_never_share_a_launcher(self):
+        opened = started("Mon Oct 12 15:16:51 2026")
+        first, second = {"id": FIRST, "createdAt": opened}, {"id": SECOND, "createdAt": opened + 10}
+        launcher = lambda pid, after: (pid, 1, opened + after, "/bin/zsh -lic zz")
+        program = lambda pid, parent, after: (pid, parent, opened + after, "claude")
+        # Each launcher started after its own terminal: both are named, though the windows overlap.
+        rows = [launcher(10, 1), program(11, 10, 2), launcher(20, 11), program(21, 20, 12)]
+        self.assertEqual(lp.describe([first, second], LAUNCHER, rows),
+                         {FIRST: {"program": "claude", "cwd": None, "pid": 11}, SECOND: {"program": "claude", "cwd": None, "pid": 21}})
+        # The first one's launcher is gone: the second one's is not given to it as well.
+        self.assertEqual(lp.describe([first, second], LAUNCHER, rows[2:]),
+                         {FIRST: {"program": None}, SECOND: {"program": "claude", "cwd": None, "pid": 21}})
+        # Two terminals opened in the same second: their launchers name neither.
+        self.assertEqual(lp.describe([first, {**second, "createdAt": opened}], LAUNCHER, rows[2:]),
+                         {FIRST: {"program": None}, SECOND: {"program": None}})
+
     def test_a_host_without_a_launcher_reports_nothing(self):
         with patch("launch.new_session", side_effect=ValueError("no launcher")):
             self.assertEqual(lp.launcher_programs({"terminals": []}), {"terminals": {}})

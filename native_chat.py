@@ -191,13 +191,19 @@ def _messages(thread, identity=None, home=None):
         for item, rows in reversed(collector.codex_turn_rows(turn)):
             manifest = _history_attachments(identity, item.get("clientId"), home, item.get("content")) if rows and identity and item.get("type") == "userMessage" else []
             group = []
+            # As collector.codex_messages marks them: which answer is the turn's final one.
+            marks = {}
+            if collector.evidence_id(item.get("id")):
+                marks["messageId"] = item["id"]
+            if item.get("phase") in ("commentary", "final_answer"):
+                marks["phase"] = item["phase"]
             for row in rows:
                 if manifest:
                     generic = row.get("attachments", [])
                     images = [a for a in generic if a["kind"] == "image"]
                     extra_images = max(0, len(images) - sum(a["kind"] == "image" for a in manifest))
                     row["attachments"] = manifest + images[:extra_images] + [a for a in generic if a["kind"] != "image"]
-                group.append({**row, "turnId": turn.get("id"), "turnStatus": turn.get("status"),
+                group.append({**row, **marks, "turnId": turn.get("id"), "turnStatus": turn.get("status"),
                             "itemId": item.get("id"), "clientId": item.get("clientId")})
             out[0:0] = group
             if len(out) >= collector.MESSAGE_LIMIT:

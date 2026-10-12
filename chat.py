@@ -15,6 +15,8 @@ REQUEST = re.compile(r'[A-Za-z0-9_-]{8,100}\Z')
 STATE_REQUEST = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.:-]{7,127}\Z')
 CLAUDE_BLOCKED = ('Claude 터미널에 승인·선택 메뉴가 떠 있어 보내지 않았습니다. '
                   '입력이 메뉴 선택으로 처리될 수 있으니 터미널에서 먼저 선택해 주세요.')
+CLAUDE_WINDOWS = ('Windows PC의 Claude 세션은 아직 보드에서 입력할 수 없습니다. '
+                  '그 PC의 터미널에서 이어 주세요.')
 CLAUDE_EXTERNAL = ('이 Claude 세션은 보드 밖 터미널에서 실행 중이라 웹에서 입력할 수 없습니다. '
                    '그 터미널에서 입력하거나 백그라운드 세션(claude --bg)으로 실행해 주세요.')
 # A background session takes web input only through a board terminal the user opened.
@@ -414,7 +416,8 @@ class Chat:
             terminal, terminal_failed = None, True
         action = None
         if claude:
-            supported, reason, action = self._claude_capability(source, terminal, terminal_failed)
+            supported, reason, action = ((False, CLAUDE_WINDOWS, None) if host.get('platform') == 'windows'
+                                         else self._claude_capability(source, terminal, terminal_failed))
         else:
             supported, reason = bool(caps.get('canSend')), caps.get('reason') or result.get('reason')
         capability = {'supported': supported, 'attachments': bool(source.get('cwd')) and host.get('platform') != 'windows',
@@ -549,6 +552,10 @@ class Chat:
 
     def _board_terminal(self, source):
         for terminal in self.workflow.terminals.list():
+            # A 새 세션 link guessed from start times may name another terminal's session:
+            # it is shown as estimated and never receives a paste or a menu answer.
+            if terminal.get('linkConfidence') == 'estimated':
+                continue
             native = terminal.get('nativeSource') or terminal.get('metadata', {}).get('nativeSource')
             if terminal.get('alive') and not terminal.get('closed') and self._same_native(native, source):
                 return terminal
@@ -774,7 +781,9 @@ class Chat:
         text = message.get('text')
         probe, length = record.get('probe'), record.get('probeLength')
         if isinstance(probe, str) and isinstance(length, int):
-            collapsed = ' '.join(str(text or '').split())[:length]
+            # Whole for a short message ("확인" is not "확인해 주세요"); the opening for a long one.
+            collapsed = ' '.join(str(text or '').split())
+            collapsed = collapsed if length < CLAUDE_PROBE else collapsed[:length]
             if hashlib.sha256(collapsed.encode()).hexdigest() == probe:
                 return True
         probe, length = record.get('wordsProbe'), record.get('wordsLength')
@@ -806,6 +815,9 @@ class Chat:
         return receipt
 
     def _send_claude(self, ref, source, host, request_id, text, ids, manifest):
+        if host.get('platform') == 'windows':
+            # No board terminal reaches a Windows Claude session (windows_runtime.terminal_plan).
+            raise SendRejected(CLAUDE_WINDOWS, 409)
         if not self.claude_lock.acquire(timeout=30):
             raise SendRejected('다른 메시지를 전달하고 있습니다. 잠시 뒤 다시 보내 주세요.', 409)
         try:

@@ -156,6 +156,8 @@ class EventHubTest(unittest.TestCase):
         self.assertEqual(self.hub.streams, {staying.stream})
 
     def test_one_watcher_per_conversation_with_grace_stop(self):
+        # Room for a loaded machine: the reuse checks below sleep 0.2 seconds inside the grace.
+        self.hub.grace = 1.0
         first = Reader(self.hub, self.hub.open(dict(REF)))
         # The watcher's first digest is announced; an unchanged state is not repeated.
         wait_for(lambda: first.events("chat"))

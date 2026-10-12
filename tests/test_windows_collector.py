@@ -369,6 +369,15 @@ class WindowsCollectorTest(unittest.TestCase):
         self.assertEqual(row['agentRole'], 'reviewer')
         self.assertEqual(row['originator'], 'codex_cli')
 
+    def test_a_wal_database_left_without_its_index_is_read_without_creating_one(self):
+        connection = sqlite3.connect(self.db)
+        self.assertEqual(connection.execute('PRAGMA journal_mode=WAL').fetchone()[0], 'wal')
+        connection.close()
+        shm = Path(str(self.db) + '-shm')
+        self.assertFalse(shm.exists())
+        self.assertEqual([row['id'] for row in self.reader.database_rows()], [self.sid])
+        self.assertFalse(shm.exists(), 'nothing is created in the account home')
+
     def test_only_existing_exact_project_endpoint_reports_live_status(self):
         self.endpoint()
         result = self.reader.snapshot()

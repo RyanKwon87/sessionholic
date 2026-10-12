@@ -5,6 +5,10 @@ from unittest.mock import Mock, patch
 import test_goals_http
 
 
+# The same isolated configuration folder as the goal routes' tests.
+setUpModule = test_goals_http.setUpModule
+
+
 class BotRequestsHTTPTest(unittest.TestCase):
     setUpBase = test_goals_http.GoalsHTTPTest.setUp
     tearDown = test_goals_http.GoalsHTTPTest.tearDown

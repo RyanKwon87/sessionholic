@@ -288,6 +288,9 @@ def _verify_native_home(rows, home, deadline):
         row.pop("_candidate", None)
 
 
+OWNER_LIMIT = 4096  # bot sessions remembered after they leave the ledgers
+
+
 class BotRequests:
     def __init__(self, hosts, config_path, state_dir):
         self.hosts = {row["name"]: dict(row) for row in hosts}
@@ -295,6 +298,51 @@ class BotRequests:
         self.home = Path.home()
         self._lock = threading.Lock()
         self._cache, self._source_cache = None, {}
+        self._owner_keys = None
+
+    # A ledger lists only its recent requests: a bot's session stays the bot's after it
+    # leaves that window, or when a later read cannot confirm it (bot-owners.json).
+    @staticmethod
+    def owner_key(host, native):
+        return json.dumps([host, native.get("agent"), native.get("id"), native.get("home")])
+
+    def _owners(self):
+        if self._owner_keys is None:
+            try:
+                data = json.loads((self.state_dir / "bot-owners.json").read_text(encoding="utf-8"))
+            except (OSError, ValueError, UnicodeError):
+                data = []
+            self._owner_keys = [key for key in data if isinstance(key, str)][-OWNER_LIMIT:] if isinstance(data, list) else []
+        return self._owner_keys
+
+    def _remember(self, rows):
+        keys = self._owners()
+        known = set(keys)
+        new = [key for key in dict.fromkeys(self.owner_key(row["host"], row["nativeRef"]) for row in rows
+                                            if isinstance(row.get("nativeRef"), dict)) if key not in known]
+        if not new:
+            return
+        keys.extend(new)
+        del keys[:-OWNER_LIMIT]
+        try:
+            self.state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+            path = self.state_dir / "bot-owners.json"
+            temp = path.with_name(path.name + "." + os.urandom(6).hex())
+            fd = os.open(str(temp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as out:
+                    json.dump(keys, out)
+                os.replace(str(temp), str(path))
+            finally:
+                if temp.exists():
+                    temp.unlink()
+        except OSError:
+            pass  # kept for this process; the next new session tries the file again
+
+    def owns(self, source):
+        """Whether a ledger ever named this native session as a bot's."""
+        with self._lock:
+            return self.owner_key(source.get("host"), source) in set(self._owners())
 
     def _sources(self):
         if not self.config_path.exists():
@@ -396,6 +444,7 @@ class BotRequests:
                 result["requests"].extend(rows)
                 result["sources"].append(status)
             result["requests"].sort(key=lambda row: row["updatedAt"] or "", reverse=True)
+            self._remember(result["requests"])
             if not changed and self._cache and result["sources"] == self._cache["sources"]:
                 result["fetchedAt"] = self._cache["fetchedAt"]
             self._cache = result

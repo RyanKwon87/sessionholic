@@ -551,7 +551,9 @@ class SessionControl:
     def _terminate_process(self, observed, deadline):
         expected = observed["process"]
         children = _descendants(expected, deadline)
-        current = _process_info(expected["pid"], deadline)
+        # The kernel's own start time and executable, read right before the signal with no `ps`
+        # in between: a reused PID has another start (the remaining gap is the kernel's own).
+        current = _process_info(expected["pid"], deadline, start_label=False)
         if not current or any(current.get(key) != expected.get(key) for key in ("pid", "uid", "start", "exe")):
             return {"applied": False, "confirmed": False, "status": "stale", "reason": "원본 프로세스가 변경되어 종료하지 않았습니다."}
         # Never kill a process group: it could contain a user's shell or another

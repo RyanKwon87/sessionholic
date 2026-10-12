@@ -31,6 +31,19 @@ READ = {'phase': 'idle', 'messages': [{'role': 'assistant', 'messageId': 'answer
 REASON = server.WINDOWS_READ_ONLY
 
 
+def setUpModule():
+    # A board under test never reads this user's bot sources (nor, through them, a bot ledger).
+    import pathlib
+    import shutil
+    import tempfile
+    from unittest import mock
+    folder = tempfile.mkdtemp(prefix="sh-config-")
+    patcher = mock.patch.object(server, "CONFIG_DIR", pathlib.Path(folder))
+    patcher.start()
+    unittest.addModuleCleanup(patcher.stop)
+    unittest.addModuleCleanup(shutil.rmtree, folder, True)
+
+
 class WindowsConfigurationTest(unittest.TestCase):
     def load(self, rows):
         with tempfile.TemporaryDirectory() as temp:

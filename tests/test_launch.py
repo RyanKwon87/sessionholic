@@ -127,6 +127,18 @@ class LaunchTest(unittest.TestCase):
             self.assertIn('실행 정책에서 중지', profiles[key]['reason'])
         self.assertTrue(profiles['.codex-personal-betax']['available'])
         self.assertNotIn('DO-NOT-EXPOSE', json.dumps(profiles))
+        # A policy that cannot be read suspends nothing by name, so every named account stops.
+        for broken in ('{"accounts": ', '[1, 2]', None):
+            with self.subTest(policy=broken):
+                if broken is None:
+                    (self.home / 'policy.json').unlink()
+                else:
+                    (self.home / 'policy.json').write_text(broken)
+                profiles = {row['home']: row for row in launch.discover_profiles(self.home)}
+                for key in ('.codex-beta', '.codex-personal-beta', '.codex-personal-betax'):
+                    self.assertFalse(profiles[key]['launchEnabled'])
+                    self.assertIn('정책을 읽지 못해', profiles[key]['reason'])
+                self.assertTrue(profiles['.codex']['launchEnabled'], 'the default home names no account')
 
     def test_profile_scope_describes_environment_not_login_identity(self):
         for key in (".codex-isolated", ".codex-isolated-beta", ".codex-default",

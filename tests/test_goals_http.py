@@ -12,6 +12,19 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import server
 
 
+def setUpModule():
+    # A board under test never reads this user's bot sources (nor, through them, a bot ledger).
+    import pathlib
+    import shutil
+    import tempfile
+    from unittest import mock
+    folder = tempfile.mkdtemp(prefix="sh-config-")
+    patcher = mock.patch.object(server, "CONFIG_DIR", pathlib.Path(folder))
+    patcher.start()
+    unittest.addModuleCleanup(patcher.stop)
+    unittest.addModuleCleanup(shutil.rmtree, folder, True)
+
+
 class GoalsHTTPTest(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()

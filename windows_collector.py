@@ -478,6 +478,25 @@ class Proxy:
         self.close()
 
 
+def _wal_without_index(database):
+    """A database in WAL mode (header byte 18 is 2) with no `-shm` beside it."""
+    try:
+        with open(str(database), 'rb') as stream:
+            header = stream.read(20)
+    except OSError:
+        return False
+    return len(header) == 20 and header[18] == 2 and not Path(str(database) + '-shm').exists()
+
+
+def _open_read_only(database, immutable=False):
+    connection = sqlite3.connect(database.as_uri() + '?mode=ro' + ('&immutable=1' if immutable else ''), uri=True, timeout=1)
+    try:
+        connection.execute('PRAGMA schema_version').fetchone()
+    except sqlite3.Error:
+        connection.close()
+        raise
+    return connection
+
 class WindowsCollector:
     def __init__(self, home=None, proxy_factory=Proxy, process_reader=_process, hostname=None,
                  parent_reader=_parents, flags_reader=_claude_flags):
@@ -505,7 +524,15 @@ class WindowsCollector:
         database = self._database()
         if database is None:
             return []
-        connection = sqlite3.connect(database.as_uri() + '?mode=ro', uri=True, timeout=1)
+        # As collector.codex_db_threads: a WAL database whose daemon left no -shm index is read
+        # as immutable, since a read-only connection would fail or create the index in the home.
+        if _wal_without_index(database):
+            connection = _open_read_only(database, immutable=True)
+        else:
+            try:
+                connection = _open_read_only(database)
+            except sqlite3.OperationalError:
+                connection = _open_read_only(database, immutable=True)
         connection.row_factory = sqlite3.Row
         deadline = time.monotonic() + 1.5
         connection.set_progress_handler(lambda: int(time.monotonic() >= deadline), 1000)

@@ -86,12 +86,20 @@ def describe(terminals, launcher, rows):
     launchers = [(pid, started) for pid, _, started, command in rows
                  if command == expected or (command.endswith(" " + expected)
                                             and Path(command.split()[0]).name in INTERPRETERS)]
+    named = [(terminal["id"], terminal["createdAt"]) for terminal in terminals[:MAX_TERMINALS]
+             if isinstance(terminal.get("id"), str) and re.fullmatch(r"[0-9a-f]{32}", terminal["id"])
+             and type(terminal.get("createdAt")) is int]
+    # A launcher is the one of the terminal opened last before it started: two terminals
+    # opened close together never both take it (a tie takes it for neither).
+    owned = {}
+    for pid, started in launchers:
+        opened = [(created, identifier) for identifier, created in named if created - BEFORE <= started <= created + AFTER]
+        latest = max(opened, default=None)
+        if latest is not None and [created for created, _ in opened].count(latest[0]) == 1:
+            owned.setdefault(latest[1], []).append(pid)
     result = {}
-    for terminal in terminals[:MAX_TERMINALS]:
-        identifier, created = terminal.get("id"), terminal.get("createdAt")
-        if not isinstance(identifier, str) or not re.fullmatch(r"[0-9a-f]{32}", identifier) or type(created) is not int:
-            continue
-        matches = [pid for pid, started in launchers if created - BEFORE <= started <= created + AFTER]
+    for identifier, _ in named:
+        matches = owned.get(identifier, [])
         if len(matches) != 1:
             result[identifier] = {"program": None}
             continue

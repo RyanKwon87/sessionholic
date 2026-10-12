@@ -126,7 +126,7 @@ function client(
   vm.runInContext(messageSource, context);
   vm.runInContext(source, context);
   const api = vm.runInContext(
-    "({state,api,sourceOf,accountOf,sendInput,pasteDraft,prepareDraftPaste,startDraftComposition,endDraftComposition,inputDraft,stopTerminalReader,startTerminalReader,closePlan,navigateView,backToList,backFromTerminal,closeTerminal,cancelTerminalClose,confirmTerminalClose,populateAccount,populateRoute,updateContinue,renderPlan,launchPlan,openTerminal,saveDraft,draftKey,refreshTerminals,renderTerminals,renderTerminalReturn,renderFilters,terminalCloseCopy,warnDraftUnload,preparePlan,renderGroups,renderMessages,loadDetail,chatKey,chatEntry,currentChat,chatSupported,chatRecovery,recoverChatSession,openChatTerminal,chatAttachmentsSupported,buildChatComposer,sendChat,loadChatState,applyChatReceipt,uploadChatFiles,pasteChat,scheduleChatPoll,stopChatPolling,openNativeChat,allSessions,buildContinuePanel,chatReceiptCopy,returnToBoard,readChatClipboard,accountDisplay,sessionAccountLabel,closeChatToolsOutside,closeChatToolsEscape,drawDetail,refreshDetail,loadCapabilities,matches,recoverConnection,networkOffline,poll,select,focusDetailBack,restoreSelectedCardFocus,showLogin,lock,beginAuthEpoch,resizeChatInput,updateViewport,draftKeydown,configureTerminalKeyboard,queueTerminalScroll,flushTerminalScroll,terminalScrollEnd,renderAttention,chatPollDelay,pullRefresh,readingScroll,renderJump,pullDistance,listScroll,setReading,renderPrompt,promptAction,renderUsage,loadUsage,applyTheme,setTheme,updateThemeColor,haptic,navTransition,setDetailShown,chatVisible,sheetRelease,BottomSheet,sheet,openSettings,closeSettings,setTyping,pinchFontSize,setTerminalFontSize,loadXterm,assetUrl,syncEvents,closeEvents,eventsHealthy,renderFreshness,schedule,touchDevice,togglePhaseFilter,renderCounts,createLongPress,swipeIntent,swipeRelease,groupMessageRows,setTextSize,applyTextSize,renderConnectivity,terminalForSession,swipeActionFor,openMessageMenu,openCardMenu,messageActions,outboxShape,outboxMatches,outboxOrigin,settleOutbox,retryOutbox,renderAttachmentTiles,attachmentThumb,sendUpload,openActionSheet,closeActionSheet,setListCollapsed,closeSwipe,settleSwipe,prepareSwipe,runSwipeAction,GESTURE,setChromeVisible,toggleChrome,revealChrome,isChromeTap,snapshotAnnounced,updateChatComposer,capabilitiesRevision,toolKindOf,userMessageParts,formatElapsed,tickWorking,renderTerminalMarks,renderDetailTerminal,terminalsAnnounced,goToSessionTerminal,rememberTerminal,terminalMenu,updateTerminalMenu,chooseTerminalMenu,clearTerminalMenu,renderNewSession,openNewSession,startNewSession,startAppServer,rememberConversationView,restoreConversationView,conversationIdentity,initiatorOf,initiatorLabel,documentKeydown,sessionCategoryOf,setSessionCategory,renderSessionCategories,prepareSessionListFor,sessionCategoryKeydown,render,resetFilters,terminalTitle,renameTerminals,requestedSessionFrom,requestSessionOpen,openRequestedSession,answerOnOpen})",
+    "({state,api,sourceOf,accountOf,sendInput,pasteDraft,prepareDraftPaste,startDraftComposition,endDraftComposition,inputDraft,stopTerminalReader,startTerminalReader,closePlan,navigateView,backToList,backFromTerminal,closeTerminal,cancelTerminalClose,confirmTerminalClose,populateAccount,populateRoute,updateContinue,renderPlan,launchPlan,openTerminal,saveDraft,draftKey,refreshTerminals,renderTerminals,renderTerminalReturn,renderFilters,terminalCloseCopy,warnDraftUnload,preparePlan,renderGroups,renderMessages,loadDetail,chatKey,chatEntry,currentChat,chatSupported,chatRecovery,recoverChatSession,openChatTerminal,chatAttachmentsSupported,buildChatComposer,sendChat,loadChatState,applyChatReceipt,uploadChatFiles,pasteChat,scheduleChatPoll,stopChatPolling,openNativeChat,allSessions,buildContinuePanel,chatReceiptCopy,returnToBoard,readChatClipboard,accountDisplay,sessionAccountLabel,closeChatToolsOutside,closeChatToolsEscape,drawDetail,refreshDetail,loadCapabilities,matches,recoverConnection,networkOffline,poll,select,focusDetailBack,restoreSelectedCardFocus,showLogin,lock,beginAuthEpoch,resizeChatInput,updateViewport,draftKeydown,configureTerminalKeyboard,queueTerminalScroll,flushTerminalScroll,terminalScrollEnd,resetTerminalScroll,renderAttention,chatPollDelay,pullRefresh,readingScroll,renderJump,pullDistance,listScroll,setReading,renderPrompt,promptAction,renderUsage,loadUsage,applyTheme,setTheme,updateThemeColor,haptic,navTransition,setDetailShown,chatVisible,sheetRelease,BottomSheet,sheet,openSettings,closeSettings,setTyping,pinchFontSize,setTerminalFontSize,loadXterm,assetUrl,syncEvents,closeEvents,eventsHealthy,renderFreshness,schedule,touchDevice,togglePhaseFilter,renderCounts,createLongPress,swipeIntent,swipeRelease,groupMessageRows,setTextSize,applyTextSize,renderConnectivity,terminalForSession,swipeActionFor,openMessageMenu,openCardMenu,messageActions,outboxShape,outboxMatches,outboxOrigin,settleOutbox,retryOutbox,renderAttachmentTiles,attachmentThumb,sendUpload,openActionSheet,closeActionSheet,setListCollapsed,closeSwipe,settleSwipe,prepareSwipe,runSwipeAction,GESTURE,setChromeVisible,toggleChrome,revealChrome,isChromeTap,snapshotAnnounced,updateChatComposer,capabilitiesRevision,toolKindOf,userMessageParts,formatElapsed,tickWorking,renderTerminalMarks,renderDetailTerminal,terminalsAnnounced,goToSessionTerminal,rememberTerminal,terminalMenu,updateTerminalMenu,chooseTerminalMenu,clearTerminalMenu,renderNewSession,openNewSession,startNewSession,startAppServer,rememberConversationView,restoreConversationView,conversationIdentity,initiatorOf,initiatorLabel,documentKeydown,sessionCategoryOf,setSessionCategory,renderSessionCategories,prepareSessionListFor,sessionCategoryKeydown,render,resetFilters,terminalTitle,renameTerminals,requestedSessionFrom,requestSessionOpen,openRequestedSession,answerOnOpen})",
     context,
   );
   api.state.csrf = "csrf-test";
@@ -1980,6 +1980,15 @@ test('the open conversation\'s own phase shows on its header, card and counts un
   assert.equal(c.state.livePhases.size, 0);
   c.state.snapshot.hosts[0].data.codex[0] = { ...s, phase: 'needs_input' };
   assert.equal(c.allSessions()[0].phase, 'needs_input');
+  // A quick turn may end where it began (a new question): once the host is read again
+  // after the conversation, the list stands though its phase looks unchanged.
+  const host = c.state.snapshot.hosts[0];
+  host.fetchedAt = 1000;
+  c.state.livePhases.set(c.allSessions()[0].key, { phase: 'working', base: 'needs_input', fetchedAt: 1000 });
+  assert.equal(c.allSessions()[0].phase, 'working', 'the read stands while the list is no newer');
+  host.fetchedAt = 1060;
+  assert.equal(c.allSessions()[0].phase, 'needs_input');
+  assert.equal(c.state.livePhases.size, 0);
 });
 
 test('a terminal list whose first read failed is read again by the next regular read', async () => {
@@ -2334,6 +2343,14 @@ test('a delayed response body is also discarded when locking advances the authen
   c.showLogin();
   releaseBody({ csrfToken: 'old-csrf' }); await pending;
   assert.equal(c.state.authenticated, false); assert.equal(c.state.csrf, '');
+});
+
+test('an expired login closes every open sheet, the new-session one too, so the login form is reachable', () => {
+  const c = client(undefined, noChatTimers);
+  const sheets = ['plan-dialog', 'settings-dialog', 'usage-dialog', 'filter-dialog', 'terminals-dialog', 'new-session-dialog', 'action-sheet'];
+  for (const id of sheets) c.get(id).open = true;
+  c.showLogin();
+  assert.deepEqual(sheets.filter((id) => c.get(id).open), []);
 });
 
 test('late API and binary-upload 401 responses cannot lock a newly logged-in session or erase its new draft', async () => {
@@ -3278,6 +3295,32 @@ test('touch devices keep the xterm keyboard closed unless direct terminal input 
   assert.equal(field.attributes.inputmode, undefined);
 });
 
+test('a swipe made on one terminal never scrolls or marks the next one', async () => {
+  const calls = [];
+  const timers = [];
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  const c = client(async (url, opts) => {
+    calls.push([url, JSON.parse(opts.body)]);
+    await gate;
+    return { ok: true, status: 200, json: async () => ({ mode: 'history', position: 7 }) };
+  }, { setTimeout: (callback) => { timers.push(callback); return timers.length; }, clearTimeout() {} });
+  c.state.connected = true;
+  c.state.terminal = { id: 'term-1' };
+  c.state.terminalScrollPending = -3;
+  const flight = c.flushTerminalScroll();
+  c.queueTerminalScroll(-2);
+  // Another terminal opens while the reply for the first is on its way.
+  c.state.terminal = { id: 'term-2' };
+  c.resetTerminalScroll();
+  release();
+  await flight;
+  assert.deepEqual(calls, [['/api/terminal/term-1/scroll', { lines: -3 }]]);
+  assert.equal(c.state.terminalScrollLines, 0, "the first terminal's position is not the second's");
+  assert.equal(c.state.terminalScrollPending, 0, 'a swipe left over is not sent to the second');
+  assert.equal(timers.length, 0);
+});
+
 test('terminal swipes coalesce into tmux history scrolls that never pass below the live screen', async () => {
   const calls = [];
   const timers = [];
@@ -3490,6 +3533,28 @@ function findClass(root, name, out = []) {
   for (const child of root?.children || []) findClass(child, name, out);
   return out;
 }
+
+test('a question card keeps the keyboard on the chosen option, and arrows move the choice as in a radio group', () => {
+  const c = client(undefined, noChatTimers);
+  const { s, entry } = selectChat(c);
+  c.drawDetail(s);
+  const prompt = { agent: 'claude', fingerprint: 'e'.repeat(64), current: 1, multi: false, terminalId: 'a'.repeat(32),
+    question: 'Do you want to proceed?', options: [{ number: 1, label: 'Yes', detail: '' },
+      { number: 2, label: 'Yes, always', detail: '' }, { number: 3, label: 'No', detail: '' }] };
+  entry.data = { ...entry.data, prompt, phase: 'needs_input' };
+  c.renderPrompt(s, entry.data);
+  const options = () => findClass(c.get('chat-prompt'), 'chat-prompt-option');
+  assert.deepEqual(options().map((item) => item.tabIndex), [0, -1, -1], 'one stop in the tab order');
+  c.context.document.activeElement = options()[0];
+  options()[0].events.click();
+  assert.equal(options()[0].focusCount, 1, 'the redrawn choice takes the focus back');
+  c.context.document.activeElement = options()[0];
+  options()[0].events.keydown({ key: 'ArrowUp', preventDefault() {} });
+  assert.equal(entry.promptChoice.number, 3, 'up from the first wraps to the last');
+  assert.equal(options()[2].focusCount, 1);
+  assert.deepEqual(options().map((item) => item.tabIndex), [-1, -1, 0]);
+  c.context.document.activeElement = null;
+});
 
 test('a question card selects first and sends only on the second tap, with the exact menu fingerprint', async () => {
   const requests = [];
@@ -6642,6 +6707,12 @@ test('the session list groups what needs an answer, what runs, what stopped in t
   assert.ok(!shown.some((s) => s.id === 'ancient'), 'only the 이전 group drops sessions older than three days');
 });
 
+// The board's own clock format; ICU data differs between Node versions (오후 / PM),
+// so names are checked against the same formatter rather than a fixed spelling.
+const seoulClock = (ts) => new Date(ts * 1000).toLocaleString('ko-KR', {
+  timeZone: 'Asia/Seoul', month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+const escapeRegExp = (text) => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
 test('a 새 세션 terminal is named by what it runs, and a second view of the same Claude agents folder is marked as a repeat', () => {
   const c = client(undefined, noChatTimers);
   const launcher = (id, createdAt, program, programCwd, host = 'laptop') => ({ id, alive: true, title: 'zz', mode: 'new-session',
@@ -6658,10 +6729,10 @@ test('a 새 세션 terminal is named by what it runs, and a second view of the s
   const rows = byClass(c.get('running-list'), 'running-terminal-row');
   assert.deepEqual(rows.map((row) => byClass(row, 'running-terminal-title')[0].textContent),
     ['Claude 에이전트 목록 · project-a', 'Claude 에이전트 목록 · project-a', 'Claude 에이전트 목록 · project-b',
-      'Codex · 10. 12. 오후 04:43 시작', 'Claude 에이전트 목록 · project-a']);
+      `Codex · ${seoulClock(1791791000)} 시작`, 'Claude 에이전트 목록 · project-a']);
   const repeated = rows.filter((row) => row.className.includes('duplicate')).map((row) => row.children[0].dataset.terminalId);
   assert.deepEqual(repeated, ['later'], 'only the later view of one host and folder repeats the first');
-  assert.match(textOf(rows[0]), /같은 화면이 이미 열려 있어요\(10\. 12\. 오후 03:16 시작\)/);
+  assert.match(textOf(rows[0]), new RegExp(escapeRegExp(`같은 화면이 이미 열려 있어요(${seoulClock(1791785812)} 시작)`)));
   assert.equal(c.get('running-count').textContent, 5, 'the chip counts terminals the user opened');
   assert.match(c.get('running-terminals').attributes['aria-label'], /열린 터미널 5개, 세션 연결 1개/);
   assert.equal(byClass(c.get('running-list'), 'running-connections')[0].attributes['aria-expanded'], 'false');
@@ -6700,6 +6771,15 @@ test('a notification link opens its session once it is listed, and an old reques
   c.openRequestedSession();
   assert.equal(c.state.openRequest, null, 'a request older than its wait is dropped');
   assert.equal(c.state.selected, s.key);
+  // Opened while a terminal fills the screen: the terminal steps aside for the conversation.
+  const other = recentSession('notified-over-terminal');
+  setRecentSnapshot(c, [s, other]);
+  c.state.terminal = attachedTo(s);
+  c.state.terminalVisible = true;
+  c.requestSessionOpen('/?session=' + encodeURIComponent(other.key));
+  c.openRequestedSession();
+  assert.equal(c.state.terminalVisible, false);
+  assert.equal(c.state.selected, other.key);
 });
 
 test('an open terminal is named after the session it runs and follows a renamed session; a new-session terminal without one shows when it opened', async () => {
@@ -6714,7 +6794,7 @@ test('an open terminal is named after the session it runs and follows a renamed 
   c.renderTerminals();
   const titles = () => byClass(c.get('running-list'), 'running-terminal-title').map((node) => node.textContent);
   // A Codex connection the user opened is listed with the other terminals (only Claude ones fold).
-  assert.deepEqual(titles(), ['검토할 작업', 'zz · 10. 12. 오후 05:14 시작', 'zz · 10. 12. 오후 03:16 시작']);
+  assert.deepEqual(titles(), ['검토할 작업', `zz · ${seoulClock(1791792862)} 시작`, `zz · ${seoulClock(1791785812)} 시작`]);
   // A newer snapshot with the session renamed renames its terminal.
   // An open sheet is not rebuilt under the finger; it renames once it is not open.
   setRecentSnapshot(c, [{ ...s, title: '바뀐 작업 이름' }]);

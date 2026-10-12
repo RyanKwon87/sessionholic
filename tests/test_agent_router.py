@@ -52,6 +52,9 @@ class AdapterTest(Fixture):
         broken = self.router_dir / 'broken.json'
         broken.write_text('[1, 2]')
         self.assertEqual(agent_router.AgentRouter({'accountPolicy': str(broken)}).accounts(), [])
+        self.assertTrue(agent_router.AgentRouter({'accountPolicy': str(broken)}).policy_failed())
+        self.assertFalse(self.adapter.policy_failed())
+        self.assertFalse(agent_router.AgentRouter({'projectsFile': 'x'}).policy_failed(), 'no policy configured')
 
     def test_router_hash_labels_scope_fallback_and_unknown(self):
         digest = hashlib.sha256('one\0alpha\0default'.encode()).hexdigest()[:16]

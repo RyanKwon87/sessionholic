@@ -18,6 +18,19 @@ OTHER = {'id': 'codex:.codex-alt', 'agent': 'codex', 'home': '.codex-alt', 'labe
 REF = {'host': 'local', 'agent': 'codex', 'home': '.codex', 'id': SOURCE['id']}
 
 
+def setUpModule():
+    # A board under test never reads this user's bot sources (nor, through them, a bot ledger).
+    import pathlib
+    import shutil
+    import tempfile
+    from unittest import mock
+    folder = tempfile.mkdtemp(prefix="sh-config-")
+    patcher = mock.patch.object(server, "CONFIG_DIR", pathlib.Path(folder))
+    patcher.start()
+    unittest.addModuleCleanup(patcher.stop)
+    unittest.addModuleCleanup(shutil.rmtree, folder, True)
+
+
 class FakeTerminals:
     max_terminals = 4
     def __init__(self):

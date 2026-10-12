@@ -352,6 +352,12 @@ class SessionControlTest(unittest.TestCase):
             result = self.api._terminate_process(observed, time.monotonic() + 3)
         self.assertEqual(result['status'], 'stale')
         kill.assert_not_called()
+        # The last read before the signal is the kernel's alone: no `ps` widens the gap.
+        with patch.object(control, '_descendants', return_value=[]), \
+                patch.object(control, '_process_info', return_value=self.process) as info, \
+                patch.object(control, '_process_ended', return_value=True), patch.object(os, 'kill'):
+            self.api._terminate_process(observed, time.monotonic() + 3)
+        self.assertIs(info.call_args_list[0].kwargs.get('start_label'), False)
 
     def test_live_descendants_prevent_full_termination_confirmation(self):
         child = {**self.process, 'pid': 555555}

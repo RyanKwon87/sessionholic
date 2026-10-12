@@ -114,6 +114,19 @@ DEMO_MENU = """\
 """
 
 
+def setUpModule():
+    # A board under test never reads this user's bot sources (nor, through them, a bot ledger).
+    import pathlib
+    import shutil
+    import tempfile
+    from unittest import mock
+    folder = tempfile.mkdtemp(prefix="sh-config-")
+    patcher = mock.patch.object(server, "CONFIG_DIR", pathlib.Path(folder))
+    patcher.start()
+    unittest.addModuleCleanup(patcher.stop)
+    unittest.addModuleCleanup(shutil.rmtree, folder, True)
+
+
 class MenuParserTest(unittest.TestCase):
     def options(self, menu):
         return [(o['number'], o['label'], o['detail']) for o in menu['options']]
@@ -1058,6 +1071,28 @@ class ChatClaudeTest(unittest.TestCase):
         self.assertEqual(self.send()['status'], 'accepted')
         self.assertEqual(len(self.terms.pastes), 1)
 
+    def test_a_windows_claude_session_says_it_cannot_take_input(self):
+        self.board.hosts[0]['platform'] = 'windows'
+        try:
+            capability = self.state()['capability']
+            self.assertEqual((capability['supported'], capability['reason']), (False, chat.CLAUDE_WINDOWS))
+            self.assertEqual(self.rejected(), chat.CLAUDE_WINDOWS)
+            self.assertEqual(self.terms.pastes, [])
+            self.assertNotIn(('chat', 'capabilities'), self.calls)
+        finally:
+            self.board.hosts[0].pop('platform')
+
+    def test_a_new_session_terminal_linked_by_start_time_never_takes_a_paste(self):
+        # A 새 세션 terminal linked by start time may run another session: it is shown, not typed into.
+        self.kind('interactive')
+        self.terminal()['linkConfidence'] = 'estimated'
+        with patch.object(self.flow, 'plan') as plan:
+            self.assertEqual(self.rejected(), chat.CLAUDE_EXTERNAL)
+        plan.assert_not_called()
+        self.assertEqual(self.terms.pastes, [])
+        self.assertEqual(self.records(), [])
+        self.assertFalse(self.state()['capability']['supported'])
+
     def test_selection_menu_on_screen_or_unknown_state_never_types_into_terminal(self):
         self.terminal()
         self.phase = 'needs_input'
@@ -1215,6 +1250,12 @@ class ChatClaudeTest(unittest.TestCase):
         self.assertTrue(receipt['confirmed'])
         self.assertTrue(receipt['readbackConfirmed'])
         self.assertEqual(len(self.terms.pastes), 1, 'and nothing was sent again')
+        # A short message is matched whole: a longer one that starts the same is another message.
+        self.assertEqual(self.send(rid='request-0002', text='확인')['status'], 'unknown')
+        self.messages = [{'role': 'user', 'text': '확인해 주세요', 'ts': now}]
+        self.assertEqual(self.state(requestId='request-0002')['receipts'][0]['status'], 'unknown')
+        self.messages = [{'role': 'user', 'text': '확인', 'ts': now}]
+        self.assertEqual(self.state(requestId='request-0002')['receipts'][0]['status'], 'accepted')
 
     def test_attachment_paths_are_pasted_as_separate_lines(self):
         self.terminal()

@@ -565,6 +565,8 @@ function openRequestedSession() {
   if (Date.now() > request.until) { state.openRequest = null; return; }
   if (!state.authenticated || state.launchBusy || !allSessions().some((session) => session.key === request.key)) return;
   state.openRequest = null;
+  // Over an open terminal too: the conversation shows, and back returns to the terminal.
+  if (state.terminalVisible) returnToBoard({ selectLaunchedSource: false, animate: false });
   const target = allSessions().find((session) => session.key === request.key);
   if (target && groupOf(target) === "needs_input") answerOnOpen(target);
   select(request.key);
@@ -727,9 +729,13 @@ function allSessions() {
       // A Claude row listed without an id is told apart by its process (or folder and start).
       const key = [host.name, s.agent, s.home || "", s.id || (s.agent === "claude"
         ? `~${s.pid ?? ""}:${s.sessionId || ""}:${s.cwd || ""}:${s.startedAt ?? ""}` : "")].join("|");
-      // The list's own phase stands again once it changed since the conversation was read.
-      const live = state.livePhases.get(key);
-      if (live && live.base !== s.phase) state.livePhases.delete(key);
+      // The list's own phase stands again once it changed since the conversation was read,
+      // or once the host was read again after it (a quick turn may end where it began).
+      let live = state.livePhases.get(key);
+      if (live && (live.base !== s.phase || (host.fetchedAt ?? 0) > (live.fetchedAt ?? 0))) {
+        state.livePhases.delete(key);
+        live = null;
+      }
       out.push(labeledSession({
         ...s,
         phase: s.runtimeKnown === false ? "unknown" : live && live.base === s.phase ? live.phase : s.phase,
@@ -756,7 +762,7 @@ function noteLivePhase(s, data) {
   if (!listed || listed.runtimeKnown === false || listed.listedPhase === undefined && listed.nativeSource || !BADGES[data?.phase] ||
       chatKey(data.route || {}) !== chatKey(sourceOf(listed))) return;
   if (data.phase === listed.listedPhase) state.livePhases.delete(listed.key);
-  else state.livePhases.set(listed.key, { phase: data.phase, base: listed.listedPhase });
+  else state.livePhases.set(listed.key, { phase: data.phase, base: listed.listedPhase, fetchedAt: listed.fetchedAt });
   // Redrawn only where it shows (a detail not drawn yet takes it when drawn).
   // This read is the news: the header shows it without reading the
   // conversation again, and the list follows.
@@ -2429,6 +2435,10 @@ function renderPrompt(s, data) {
   if (card.dataset.fingerprint === revision) return;
   card.dataset.fingerprint = revision;
   if (entry.promptChoice && entry.promptChoice.fingerprint !== prompt?.fingerprint) entry.promptChoice = null;
+  // The choice that had the keyboard focus keeps it across this redraw (or the one an arrow moved to).
+  const focusedNumber = Number(document.activeElement?.dataset?.promptNumber) || null;
+  const focusNumber = entry.promptFocus ?? focusedNumber;
+  entry.promptFocus = null;
   const head = el("div", "chat-prompt-head");
   head.append(el("strong", null, prompt ? `${AGENT_NAMES[prompt.agent] || "에이전트"}가 답을 기다려요` : "답이 필요한 상태입니다"));
   const terminal = button("터미널", "chat-prompt-terminal", () => openChatTerminal(s));
@@ -2469,7 +2479,8 @@ function renderPrompt(s, data) {
   const many = selectable && prompt.options.length > PROMPT_INLINE_OPTIONS + 1;
   const inline = many ? prompt.options.filter((option, index) => index < PROMPT_INLINE_OPTIONS ||
     option.number === entry.promptChoice?.number) : prompt.options;
-  for (const option of inline) {
+  const items = new Map();
+  for (const [index, option] of inline.entries()) {
     const chosen = entry.promptChoice?.number === option.number;
     const item = button("", `chat-prompt-option${chosen ? " is-chosen" : ""}${option.number === prompt.current ? " is-current" : ""}`, () => {
       if (!selectable || entry.promptBusy) return;
@@ -2480,6 +2491,20 @@ function renderPrompt(s, data) {
     item.setAttribute("role", "radio");
     item.setAttribute("aria-checked", String(chosen));
     item.disabled = !selectable || !!entry.promptBusy;
+    // One stop in the tab order; arrows move the choice, as in any radio group.
+    item.dataset.promptNumber = String(option.number);
+    item.tabIndex = (entry.promptChoice ? chosen : index === 0) ? 0 : -1;
+    item.addEventListener?.("keydown", (event) => {
+      const step = { ArrowDown: 1, ArrowRight: 1, ArrowUp: -1, ArrowLeft: -1 }[event.key];
+      if (!step || !selectable || entry.promptBusy) return;
+      event.preventDefault?.();
+      const next = inline[(index + step + inline.length) % inline.length];
+      entry.promptChoice = { fingerprint: prompt.fingerprint, number: next.number };
+      entry.promptFocus = next.number;
+      haptic("select");
+      renderPrompt(s, entry.data);
+    });
+    items.set(option.number, item);
     item.append(el("span", "chat-prompt-number", String(option.number)), el("span", "chat-prompt-label", option.label));
     if (option.detail) item.append(el("span", "chat-prompt-detail", option.detail));
     options.append(item);
@@ -2516,6 +2541,7 @@ function renderPrompt(s, data) {
   }
   if (entry.promptNote) nodes.push(el("p", "chat-prompt-note", entry.promptNote));
   card.replaceChildren(...nodes);
+  if (focusNumber != null) items.get(focusNumber)?.focus?.({ preventScroll: true });
 }
 async function promptAction(s, body) {
   const entry = chatEntry(s);
@@ -5694,6 +5720,7 @@ async function openTerminal(terminal, { recordHistory = true } = {}) {
     bindDraftInput(next);
   }
   stopTerminalReader();
+  if (changing) resetTerminalScroll();
   state.inputEpoch++;
   state.inputQueue = Promise.resolve();
   state.inputFailed = false;
@@ -6015,10 +6042,13 @@ async function flushTerminalScroll() {
   if (lines > 0 && state.terminalScrollMode === "history") lines = Math.min(lines, state.terminalScrollLines);
   if (!lines) return;
   const estimate = Math.max(0, state.terminalScrollLines - lines);
+  // A reply or a later swipe belongs to the terminal the swipe was made on.
+  const target = state.terminal.id;
   state.terminalScrollInFlight = true;
   try {
-    const result = await api(`/api/terminal/${encodeURIComponent(state.terminal.id)}/scroll`,
+    const result = await api(`/api/terminal/${encodeURIComponent(target)}/scroll`,
       { method: "POST", body: { lines } });
+    if (state.terminal?.id !== target) return;
     if (result?.mode === "app") {
       state.terminalScrollMode = "app";
       state.terminalScrollLines = 0;
@@ -6027,14 +6057,17 @@ async function flushTerminalScroll() {
       state.terminalScrollLines = Number.isInteger(result?.position) ? result.position : estimate;
     }
   } catch {
+    if (state.terminal?.id !== target) return;
     state.terminalScrollLines = 0;
     stopTerminalMomentum();
   } finally {
     state.terminalScrollInFlight = false;
-    renderTerminalScroll();
-    // Swipes that arrived during the request are sent next, never dropped or doubled.
-    if (Math.trunc(state.terminalScrollPending) && !state.terminalScrollTimer)
-      state.terminalScrollTimer = setTimeout(flushTerminalScroll, 30);
+    if (state.terminal?.id === target) {
+      renderTerminalScroll();
+      // Swipes that arrived during the request are sent next, never dropped or doubled.
+      if (Math.trunc(state.terminalScrollPending) && !state.terminalScrollTimer)
+        state.terminalScrollTimer = setTimeout(flushTerminalScroll, 30);
+    }
   }
 }
 async function terminalScrollEnd() {
@@ -6049,6 +6082,16 @@ async function terminalScrollEnd() {
   } catch {
     /* typing also returns to the live screen */
   }
+}
+// Another terminal: swipes waiting for it, its reply and its position do not carry over.
+function resetTerminalScroll() {
+  clearTimeout(state.terminalScrollTimer);
+  state.terminalScrollTimer = null;
+  stopTerminalMomentum();
+  state.terminalScrollPending = 0;
+  state.terminalScrollLines = 0;
+  state.terminalScrollMode = null;
+  renderTerminalScroll();
 }
 function stopTerminalMomentum() {
   if (state.terminalMomentum) globalThis.cancelAnimationFrame?.(state.terminalMomentum);
@@ -7144,7 +7187,7 @@ function showLogin() {
   $("login").hidden = false;
   if ($("plan-dialog").open) $("plan-dialog").close();
   if ($("settings-dialog").open) $("settings-dialog").close();
-  for (const id of ["usage-dialog", "filter-dialog", "terminals-dialog", "action-sheet"]) if ($(id)?.open) $(id).close();
+  for (const id of ["usage-dialog", "filter-dialog", "terminals-dialog", "new-session-dialog", "action-sheet"]) if ($(id)?.open) $(id).close();
   renderConnectivity();
   updateThemeColor();
   $("login-token").focus();

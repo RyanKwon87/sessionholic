@@ -27,6 +27,19 @@ CLAUDE = {'schema_version': 1, 'status': 'ready', 'usage': {'windows': {
     'seven_day': {'used_percentage': 16, 'resets_at': '2026-10-14T22:59:59Z'}}}}
 
 
+def setUpModule():
+    # A board under test never reads this user's bot sources (nor, through them, a bot ledger).
+    import pathlib
+    import shutil
+    import tempfile
+    from unittest import mock
+    folder = tempfile.mkdtemp(prefix="sh-config-")
+    patcher = mock.patch.object(server, "CONFIG_DIR", pathlib.Path(folder))
+    patcher.start()
+    unittest.addModuleCleanup(patcher.stop)
+    unittest.addModuleCleanup(shutil.rmtree, folder, True)
+
+
 def config(folder, **extra):
     return {'provider': 'helper', 'resources': str(folder), 'python': str(Path(folder, 'python3')),
             'path': '/usr/bin:/bin', 'codex': '/fixture/codex', 'codexHelper': 'codex-usage.py',
@@ -83,6 +96,10 @@ class UsageMeterTest(unittest.TestCase):
         clock[0] += 25
         meter.snapshot(force=True)
         self.assertEqual(len(calls), 6, 'a manual refresh after its own interval reads again')
+        # A second failure in a row still keeps the last good numbers.
+        codex, claude = meter.snapshot()['providers']
+        self.assertEqual((codex['status'], codex['remaining']), ('stale', 68))
+        self.assertEqual((claude['status'], claude['remaining']), ('stale', 84))
 
     def test_missing_helpers_are_unavailable_and_never_run(self):
         meter = UsageMeter(config('/nonexistent/helpers'), runner=lambda argv: self.fail('ran'), threaded=False)

@@ -392,9 +392,14 @@ class PushService:
             known_host = host["name"] in self.observed_hosts
             for agent in ("codex", "claude"):
                 for row in host["data"].get(agent) or []:
-                    if not isinstance(row, dict) or not row.get("id"):
+                    identifier = row.get("id") if isinstance(row, dict) else None
+                    if isinstance(row, dict) and not identifier and agent == "claude":
+                        # A Claude row listed without an id, keyed as the list keys it (web/app.js).
+                        identifier = "~{}:{}:{}:{}".format(*("" if row.get(name) is None else row[name]
+                                                              for name in ("pid", "sessionId", "cwd", "startedAt")))
+                    if not identifier:
                         continue
-                    key = "|".join([host["name"], agent, row.get("home") or "", str(row["id"])])
+                    key = "|".join([host["name"], agent, row.get("home") or "", str(identifier)])
                     phase = "unknown" if row.get("runtimeKnown") is False else str(row.get("phase") or "unknown")
                     previous = self.seen.get(key)
                     previous = previous if isinstance(previous, dict) else None

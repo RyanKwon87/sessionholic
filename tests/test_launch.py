@@ -478,7 +478,7 @@ class LaunchTest(unittest.TestCase):
                    "sk-ant-api03-" + "b" * 48, "ghp_" + "c" * 40,
                    "github_pat_" + "d" * 50, "AKIA" + "A" * 16,
                    "Bearer " + "e" * 30, "aws_secret_access_key=" + "f" * 40,
-                   "-----BEGIN OPENSSH PRIVATE KEY-----\nfixture-body\n-----END OPENSSH PRIVATE KEY-----"]
+                   "-----BEGIN OPENSSH " + "PRIVATE KEY-----\nfixture-body\n-----END OPENSSH PRIVATE KEY-----"]
         messages = [{"role": "user", "text": "확인할 원문: " + "\n".join(secrets)}]
         result = self.build(self.profile("claude", ".claude"), messages=messages)
         text = Path(result["handoffPath"]).read_text()

@@ -288,7 +288,7 @@ def _verify_native_home(rows, home, deadline):
         row.pop("_candidate", None)
 
 
-OWNER_LIMIT = 4096  # bot sessions remembered after they leave the ledgers
+OWNER_LIMIT = 65536  # bot sessions remembered after they leave the ledgers (about 6 MiB)
 
 
 class BotRequests:
@@ -298,7 +298,7 @@ class BotRequests:
         self.home = Path.home()
         self._lock = threading.Lock()
         self._cache, self._source_cache = None, {}
-        self._owner_keys = None
+        self._owner_keys, self._owners_unsaved = None, False
 
     # A ledger lists only its recent requests: a bot's session stays the bot's after it
     # leaves that window, or when a later read cannot confirm it (bot-owners.json).
@@ -320,10 +320,12 @@ class BotRequests:
         known = set(keys)
         new = [key for key in dict.fromkeys(self.owner_key(row["host"], row["nativeRef"]) for row in rows
                                             if isinstance(row.get("nativeRef"), dict)) if key not in known]
-        if not new:
+        # A write that failed is tried again by the next read, with or without new sessions.
+        if not new and not self._owners_unsaved:
             return
         keys.extend(new)
         del keys[:-OWNER_LIMIT]
+        self._owners_unsaved = True
         try:
             self.state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
             path = self.state_dir / "bot-owners.json"
@@ -336,8 +338,9 @@ class BotRequests:
             finally:
                 if temp.exists():
                     temp.unlink()
+            self._owners_unsaved = False
         except OSError:
-            pass  # kept for this process; the next new session tries the file again
+            pass  # kept for this process; the next read tries the file again
 
     def owns(self, source):
         """Whether a ledger ever named this native session as a bot's."""

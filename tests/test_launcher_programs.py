@@ -94,8 +94,16 @@ class ProgramTest(unittest.TestCase):
         rows = [launcher(10, 1), program(11, 10, 2), launcher(20, 11), program(21, 20, 12)]
         self.assertEqual(lp.describe([first, second], LAUNCHER, rows),
                          {FIRST: {"program": "claude", "cwd": None, "pid": 11}, SECOND: {"program": "claude", "cwd": None, "pid": 21}})
-        # The first one's launcher is gone: the second one's is not given to it as well.
+        # A launcher slow to start (SSH) still belongs to the terminal opened first.
+        late = [launcher(10, 8), program(11, 10, 9), launcher(20, 16), program(21, 20, 17)]
+        self.assertEqual(lp.describe([first, second], LAUNCHER, late),
+                         {FIRST: {"program": "claude", "cwd": None, "pid": 11}, SECOND: {"program": "claude", "cwd": None, "pid": 21}})
+        # The first one's launcher is gone: the one left could be either's, so it names neither.
         self.assertEqual(lp.describe([first, second], LAUNCHER, rows[2:]),
+                         {FIRST: {"program": None}, SECOND: {"program": None}})
+        # A launcher only one terminal could have opened still names it.
+        self.assertEqual(lp.describe([first, {**second, "createdAt": opened + 30}], LAUNCHER,
+                                     [launcher(20, 31), program(21, 20, 32)]),
                          {FIRST: {"program": None}, SECOND: {"program": "claude", "cwd": None, "pid": 21}})
         # Two terminals opened in the same second: their launchers name neither.
         self.assertEqual(lp.describe([first, {**second, "createdAt": opened}], LAUNCHER, rows[2:]),

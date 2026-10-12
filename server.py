@@ -1199,16 +1199,19 @@ class Workflow:
         except (RuntimeError, OSError, ValueError):
             return
         now = time.time()
-        due = {}
+        live, due = {}, {}
         for terminal in terminals:
             if (terminal.get("mode") != "new-session" or not terminal.get("alive") or terminal.get("closed")
                     or type(terminal.get("createdAt")) is not int):
                 continue
+            # Every live one is sent, so a launcher is weighed against all of them; only those due are saved.
+            live.setdefault(terminal.get("host"), []).append({"id": terminal["id"], "createdAt": terminal["createdAt"]})
             seen = terminal.get("programAt")
             if type(seen) is int and now - seen < (self.PROGRAM_STALE if terminal.get("program") else self.PROGRAM_REFRESH):
                 continue
-            due.setdefault(terminal.get("host"), []).append({"id": terminal["id"], "createdAt": terminal["createdAt"]})
-        for name, rows in due.items():
+            due.setdefault(terminal.get("host"), set()).add(terminal["id"])
+        for name, wanted in due.items():
+            rows = live[name]
             host = next((h for h in self.board.hosts if h["name"] == name), None)
             if host is None or host.get("platform") == "windows" or not self.board.state.get(name, {}).get("ok"):
                 continue
@@ -1218,16 +1221,16 @@ class Workflow:
                 self.program_busy.add(name)
                 self.program_asked[name] = now
             try:
-                threading.Thread(target=self._describe_host, args=(host, rows), daemon=True,
+                threading.Thread(target=self._describe_host, args=(host, rows, wanted), daemon=True,
                                  name=THREAD_PREFIX + "-launcher-" + name).start()
             except RuntimeError:
                 with self.program_lock:
                     self.program_busy.discard(name)
 
-    def _describe_host(self, host, rows):
+    def _describe_host(self, host, rows, wanted=None):
         try:
             result = self.transfers.rpc(host, "launcher_programs", {"terminals": rows}, timeout=15)
-            asked = {row["id"] for row in rows}
+            asked = {row["id"] for row in rows} if wanted is None else set(wanted)
             for identifier, info in (result.get("terminals") or {}).items():
                 if identifier in asked and isinstance(info, dict):
                     try:

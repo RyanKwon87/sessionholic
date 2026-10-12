@@ -14,20 +14,26 @@ import sys
 ROOT = Path(__file__).resolve().parents[1]
 SKIP = {".git", "__pycache__", ".venv", "venv", ".DS_Store"}
 SECRET_PATTERNS = {
-    "private-key": re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH |DSA )?PRIVATE KEY-----\r?\n"),
-    # The same key kept inside a JSON or code string: escaped line breaks before its body.
-    "escaped-private-key": re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH |DSA |ENCRYPTED )?PRIVATE KEY-----(?:\\r)?\\n[A-Za-z0-9+/=]{40,}"),
+    "private-key": re.compile(r"-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY-----\r?\n"),
+    # The same key kept inside a JSON or code string: an escaped line break after its header.
+    "escaped-private-key": re.compile(r"-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY-----(?:\\r)?\\n"),
     "github-token": re.compile(r"\b(?:gh[pousr]_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{40,})\b"),
     "provider-token": re.compile(r"\bsk-(?:proj-|ant-api\d{2}-|ant-oat\d{2}-)[A-Za-z0-9_-]{32,}\b"),
     "slack-token": re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{24,}\b"),
 }
 HOME_PATH = re.compile(r"/Users/([A-Za-z0-9._-]+)/")
-# C:\Users\example, C:/Users/example and the doubled backslashes of a JSON or code string.
-WINDOWS_HOME_PATH = re.compile(r"\b[A-Za-z]:(?:\\{1,2}|/)Users(?:\\{1,2}|/)([A-Za-z0-9._-]+)")
+# C:\Users\example, C:/users/example and the doubled backslashes of a JSON or code string.
+# The whole folder name counts (spaces, any script); in prose it ends at the first space.
+WINDOWS_HOME_PATH = re.compile(r"\b[A-Za-z]:(?:\\{1,2}|/)[Uu][Ss][Ee][Rr][Ss](?:\\{1,2}|/)([^\\/:*?\"<>|\r\n'`]+)(\\|/)?")
 EXAMPLE_USERS = {"example", "test", "user", "u", "sample", "demo", "runner", "local", "source", "other", "fixture"}
 TAILNET_URL = re.compile(r"https?://[a-zA-Z0-9.-]+\.ts\.net(?=[:/\s\"'`]|$)")
 # A host name on a tailnet without its scheme: the label before `.ts.net` names the tailnet.
 TAILNET_NAME = re.compile(r"\b[a-zA-Z0-9-]+\.([a-zA-Z0-9-]+)\.ts\.net\b")
+
+
+def windows_user(match):
+    name = match.group(1) if match.group(2) else (match.group(1).split() or [""])[0]
+    return name.strip().rstrip(".,;:)]}").lower()
 
 
 def checked_files(root):
@@ -72,7 +78,7 @@ def audit(root=ROOT, release=False):
                 findings.append({"file": name, "category": category})
         if any(match.group(1) not in EXAMPLE_USERS for match in HOME_PATH.finditer(content)):
             findings.append({"file": name, "category": "non-example-home-path"})
-        if any(match.group(1).lower() not in EXAMPLE_USERS for match in WINDOWS_HOME_PATH.finditer(content)):
+        if any(windows_user(match) not in EXAMPLE_USERS for match in WINDOWS_HOME_PATH.finditer(content)):
             findings.append({"file": name, "category": "non-example-windows-home-path"})
         if any("example" not in match.group(0) for match in TAILNET_URL.finditer(content)):
             findings.append({"file": name, "category": "non-example-tailnet-url"})

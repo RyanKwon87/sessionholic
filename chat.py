@@ -450,7 +450,7 @@ class Chat:
                     # A menu on the board terminal's screen; the web may answer it.
                     'prompt': self._screen_prompt(terminal, source) if terminal else None,
                     # A background Claude session can be attached to read its menu.
-                    'promptOpenable': bool(claude and source.get('kind') == 'background'
+                    'promptOpenable': bool(claude and source.get('kind') == 'background' and host.get('platform') != 'windows'
                                            and terminal is None and not terminal_failed)}
         if recovery is not None:
             response['recovery'] = recovery
@@ -608,6 +608,8 @@ class Chat:
             raise ValueError('질문 응답 요청 식별자가 필요합니다.')
         source, host = self.source(data.get('source'))
         self._direct_session(source)
+        if source.get('agent') == 'claude' and host.get('platform') == 'windows':
+            raise PromptRejected(CLAUDE_WINDOWS, code='terminal_required')
         if action == 'open':
             return self._open_prompt(data.get('source'), source, request_id)
         fingerprint, number = data.get('fingerprint'), data.get('number')

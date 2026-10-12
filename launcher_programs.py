@@ -86,17 +86,39 @@ def describe(terminals, launcher, rows):
     launchers = [(pid, started) for pid, _, started, command in rows
                  if command == expected or (command.endswith(" " + expected)
                                             and Path(command.split()[0]).name in INTERPRETERS)]
+    started_at = dict(launchers)
     named = [(terminal["id"], terminal["createdAt"]) for terminal in terminals[:MAX_TERMINALS]
              if isinstance(terminal.get("id"), str) and re.fullmatch(r"[0-9a-f]{32}", terminal["id"])
              and type(terminal.get("createdAt")) is int]
-    # A launcher is the one of the terminal opened last before it started: two terminals
-    # opened close together never both take it (a tie takes it for neither).
+    window = {identifier: {pid for pid, started in launchers if created - BEFORE <= started <= created + AFTER}
+              for identifier, created in named}
     owned = {}
-    for pid, started in launchers:
-        opened = [(created, identifier) for identifier, created in named if created - BEFORE <= started <= created + AFTER]
-        latest = max(opened, default=None)
-        if latest is not None and [created for created, _ in opened].count(latest[0]) == 1:
-            owned.setdefault(latest[1], []).append(pid)
+    # Terminals whose windows share a launcher are weighed together. As many launchers as
+    # terminals, each in its own terminal's window in the order both started: each takes its
+    # own. Otherwise (one ended, one is another program's) only a launcher that a single
+    # terminal could have opened, and the only one in its window, names it.
+    left = [identifier for identifier, _ in named]
+    while left:
+        group, queue = set(), [left[0]]
+        while queue:
+            identifier = queue.pop()
+            if identifier in group:
+                continue
+            group.add(identifier)
+            queue.extend(other for other in left if other not in group and window[other] & window[identifier])
+        left = [identifier for identifier in left if identifier not in group]
+        members = sorted((created, identifier) for identifier, created in named if identifier in group)
+        pids = sorted({pid for identifier in group for pid in window[identifier]}, key=lambda pid: (started_at[pid], pid))
+        times = [created for created, _ in members]
+        if (len(pids) == len(members) and len(set(times)) == len(times)
+                and all(pid in window[identifier] for pid, (_, identifier) in zip(pids, members))):
+            owned.update({identifier: [pid] for pid, (_, identifier) in zip(pids, members)})
+            continue
+        for _, identifier in members:
+            if len(window[identifier]) == 1:
+                pid = next(iter(window[identifier]))
+                if all(pid not in window[other] for other in group if other != identifier):
+                    owned[identifier] = [pid]
     result = {}
     for identifier, _ in named:
         matches = owned.get(identifier, [])

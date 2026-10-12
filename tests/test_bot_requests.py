@@ -268,6 +268,18 @@ class BotRequestsTest(unittest.TestCase):
         self.assertTrue(api.owns(source))
         self.assertTrue(self.configure().owns(source), 'kept for the next board process too')
         self.assertEqual((self.home / 'state/bot-owners.json').stat().st_mode & 0o777, 0o600)
+        # A write that failed is tried again by a later read with nothing new.
+        other = self.configure()
+        with closing(sqlite3.connect(self.database())) as db, db:
+            db.execute('UPDATE tasks SET codex_thread=?', (self.sid,))
+        (self.home / 'state/bot-owners.json').unlink()
+        with patch.object(bots.os, 'replace', side_effect=OSError('fixture disk')):
+            other.snapshot(force=True)
+        self.assertFalse((self.home / 'state/bot-owners.json').exists())
+        with closing(sqlite3.connect(self.database())) as db, db:
+            db.execute('UPDATE tasks SET codex_thread=NULL')
+        other.snapshot(force=True)
+        self.assertTrue(self.configure().owns(source))
 
     def test_bad_config_keeps_prior_native_ownership_evidence_marked_stale(self):
         self.ledger()

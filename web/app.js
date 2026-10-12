@@ -170,6 +170,7 @@ const state = {
   terminalScrollTimer: null,
   terminalScrollMode: null,
   terminalScrollInFlight: false,
+  terminalScrollGeneration: 0,
   terminalMomentum: null,
   toastTimer: null,
   chats: new Map(),
@@ -566,7 +567,10 @@ function openRequestedSession() {
   if (!state.authenticated || state.launchBusy || !allSessions().some((session) => session.key === request.key)) return;
   state.openRequest = null;
   // Over an open terminal too: the conversation shows, and back returns to the terminal.
-  if (state.terminalVisible) returnToBoard({ selectLaunchedSource: false, animate: false });
+  if (state.terminalVisible) {
+    returnToBoard({ selectLaunchedSource: false, animate: false });
+    navigateView("detail");
+  }
   const target = allSessions().find((session) => session.key === request.key);
   if (target && groupOf(target) === "needs_input") answerOnOpen(target);
   select(request.key);
@@ -721,6 +725,8 @@ function labeledSession(session) {
 }
 function allSessions() {
   const out = [];
+  // The open conversation is read again every few seconds; its own read stands until then.
+  const following = chatVisible() ? state.selected : null;
   for (const host of state.snapshot?.hosts || []) {
     for (const s of [
       ...(host.data?.claude || []),
@@ -730,9 +736,10 @@ function allSessions() {
       const key = [host.name, s.agent, s.home || "", s.id || (s.agent === "claude"
         ? `~${s.pid ?? ""}:${s.sessionId || ""}:${s.cwd || ""}:${s.startedAt ?? ""}` : "")].join("|");
       // The list's own phase stands again once it changed since the conversation was read,
-      // or once the host was read again after it (a quick turn may end where it began).
+      // or, for a conversation no longer open, once the host was read again after it (a quick
+      // turn may end where it began).
       let live = state.livePhases.get(key);
-      if (live && (live.base !== s.phase || (host.fetchedAt ?? 0) > (live.fetchedAt ?? 0))) {
+      if (live && (live.base !== s.phase || (key !== following && (host.fetchedAt ?? 0) > (live.fetchedAt ?? 0)))) {
         state.livePhases.delete(key);
         live = null;
       }
@@ -6042,13 +6049,15 @@ async function flushTerminalScroll() {
   if (lines > 0 && state.terminalScrollMode === "history") lines = Math.min(lines, state.terminalScrollLines);
   if (!lines) return;
   const estimate = Math.max(0, state.terminalScrollLines - lines);
-  // A reply or a later swipe belongs to the terminal the swipe was made on.
-  const target = state.terminal.id;
+  // A reply or a later swipe belongs to the terminal the swipe was made on; a request
+  // still on its way for an earlier terminal never holds up the next one's.
+  const target = state.terminal.id, generation = state.terminalScrollGeneration;
+  const mine = () => generation === state.terminalScrollGeneration && state.terminal?.id === target;
   state.terminalScrollInFlight = true;
   try {
     const result = await api(`/api/terminal/${encodeURIComponent(target)}/scroll`,
       { method: "POST", body: { lines } });
-    if (state.terminal?.id !== target) return;
+    if (!mine()) return;
     if (result?.mode === "app") {
       state.terminalScrollMode = "app";
       state.terminalScrollLines = 0;
@@ -6057,12 +6066,12 @@ async function flushTerminalScroll() {
       state.terminalScrollLines = Number.isInteger(result?.position) ? result.position : estimate;
     }
   } catch {
-    if (state.terminal?.id !== target) return;
+    if (!mine()) return;
     state.terminalScrollLines = 0;
     stopTerminalMomentum();
   } finally {
-    state.terminalScrollInFlight = false;
-    if (state.terminal?.id === target) {
+    if (generation === state.terminalScrollGeneration) state.terminalScrollInFlight = false;
+    if (mine()) {
       renderTerminalScroll();
       // Swipes that arrived during the request are sent next, never dropped or doubled.
       if (Math.trunc(state.terminalScrollPending) && !state.terminalScrollTimer)
@@ -6085,6 +6094,8 @@ async function terminalScrollEnd() {
 }
 // Another terminal: swipes waiting for it, its reply and its position do not carry over.
 function resetTerminalScroll() {
+  state.terminalScrollGeneration++;
+  state.terminalScrollInFlight = false;
   clearTimeout(state.terminalScrollTimer);
   state.terminalScrollTimer = null;
   stopTerminalMomentum();

@@ -60,7 +60,7 @@ flowchart LR
 | `agentName`, `agentRole` | 현재 세션의 워커 이름·역할. 시작한 부모 이름과 별도 |
 | `source`, `originator` | native 시작 경로와 원본 originator 메타데이터 |
 
-Codex RPC의 `source.subAgent`와 DB의 `source.subagent` 구조를 보존하고, 알려진 하위 에이전트 source는 에이전트 시작으로 분류합니다. `cli / exec`, Claude `interactive / background`, agent 이름이나 부모 ID만으로 사람·에이전트 시작을 추정하지 않습니다. Claude 목록의 명시 initiator·부모 필드도 전달합니다. 같은 기기·도구·계정의 부모 참조가 목표 상세에 함께 있을 때 하위 세션을 접어 보여 줍니다. 공통 스키마가 모든 에이전트 adapter를 만드는 것은 아니며 현재 Codex·Claude Code만 지원합니다. Windows PC 연결은 목록과 대화 읽기 경로를 제공하며 macOS의 터미널·입력·실행 제어 경로와 지원 범위를 분리합니다.
+Codex RPC의 `source.subAgent`와 DB의 `source.subagent` 구조를 보존하고, 알려진 하위 에이전트 source는 에이전트 시작으로 분류합니다. `cli / exec`, Claude `interactive / background`, agent 이름이나 부모 ID만으로 사람·에이전트 시작을 추정하지 않습니다. Claude 목록의 명시 initiator·부모 필드도 전달합니다. 공통 스키마가 모든 에이전트 adapter를 만드는 것은 아니며 현재 Codex·Claude Code만 지원합니다. Windows PC 연결은 목록과 대화 읽기 경로를 제공하며 macOS의 터미널·입력·실행 제어 경로와 지원 범위를 분리합니다.
 
 ## 세션 목록과 대화 보기
 

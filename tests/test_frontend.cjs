@@ -1980,13 +1980,16 @@ test('the open conversation\'s own phase shows on its header, card and counts un
   assert.equal(c.state.livePhases.size, 0);
   c.state.snapshot.hosts[0].data.codex[0] = { ...s, phase: 'needs_input' };
   assert.equal(c.allSessions()[0].phase, 'needs_input');
-  // A quick turn may end where it began (a new question): once the host is read again
-  // after the conversation, the list stands though its phase looks unchanged.
+  // A quick turn may end where it began (a new question). While the conversation is open its
+  // next read decides, even if a list read finishes first (it may have begun before that read).
   const host = c.state.snapshot.hosts[0];
   host.fetchedAt = 1000;
   c.state.livePhases.set(c.allSessions()[0].key, { phase: 'working', base: 'needs_input', fetchedAt: 1000 });
   assert.equal(c.allSessions()[0].phase, 'working', 'the read stands while the list is no newer');
   host.fetchedAt = 1060;
+  assert.equal(c.allSessions()[0].phase, 'working', 'the open conversation is read again soon');
+  // Left: no read follows, so the next list read stands though its phase looks unchanged.
+  c.state.selected = null;
   assert.equal(c.allSessions()[0].phase, 'needs_input');
   assert.equal(c.state.livePhases.size, 0);
 });
@@ -3319,6 +3322,29 @@ test('a swipe made on one terminal never scrolls or marks the next one', async (
   assert.equal(c.state.terminalScrollLines, 0, "the first terminal's position is not the second's");
   assert.equal(c.state.terminalScrollPending, 0, 'a swipe left over is not sent to the second');
   assert.equal(timers.length, 0);
+  // The first terminal's request does not hold up the second's swipes, even while it is on its way.
+  let releaseFirst;
+  const slow = new Promise((resolve) => { releaseFirst = resolve; });
+  const d = client(async (url) => {
+    calls.push([url]);
+    if (url.includes('term-1')) await slow;
+    return { ok: true, status: 200, json: async () => ({ mode: 'history', position: 4 }) };
+  }, { setTimeout: (callback) => { timers.push(callback); return timers.length; }, clearTimeout() {} });
+  d.state.connected = true;
+  d.state.terminal = { id: 'term-1' };
+  d.state.terminalScrollPending = -3;
+  const first = d.flushTerminalScroll();
+  d.state.terminal = { id: 'term-2' };
+  d.resetTerminalScroll();
+  d.queueTerminalScroll(-4);
+  assert.equal(timers.length, 1, 'the second terminal schedules its own swipe');
+  await timers.pop()();
+  assert.deepEqual(calls.at(-1), ['/api/terminal/term-2/scroll']);
+  assert.equal(d.state.terminalScrollLines, 4);
+  releaseFirst();
+  await first;
+  assert.equal(d.state.terminalScrollLines, 4, "the first terminal's late reply changes nothing");
+  assert.equal(d.state.terminalScrollInFlight, false);
 });
 
 test('terminal swipes coalesce into tmux history scrolls that never pass below the live screen', async () => {
@@ -6776,10 +6802,17 @@ test('a notification link opens its session once it is listed, and an old reques
   setRecentSnapshot(c, [s, other]);
   c.state.terminal = attachedTo(s);
   c.state.terminalVisible = true;
+  c.context.window.history.state = { [c.context.INSTANCE?.historyKey || 'sessionholic'] : true, view: 'terminal' };
+  const pushed = [];
+  const push = c.context.window.history.pushState;
+  c.context.window.history.pushState = function (value) { pushed.push(value.view); return push.call(this, value); };
   c.requestSessionOpen('/?session=' + encodeURIComponent(other.key));
   c.openRequestedSession();
   assert.equal(c.state.terminalVisible, false);
   assert.equal(c.state.selected, other.key);
+  // A conversation entry over the terminal's: back returns to the terminal.
+  assert.deepEqual(pushed, ['detail']);
+  assert.equal(c.context.window.history.state.view, 'detail');
 });
 
 test('an open terminal is named after the session it runs and follows a renamed session; a new-session terminal without one shows when it opened', async () => {

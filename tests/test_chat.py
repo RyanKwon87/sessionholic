@@ -1074,8 +1074,12 @@ class ChatClaudeTest(unittest.TestCase):
     def test_a_windows_claude_session_says_it_cannot_take_input(self):
         self.board.hosts[0]['platform'] = 'windows'
         try:
-            capability = self.state()['capability']
-            self.assertEqual((capability['supported'], capability['reason']), (False, chat.CLAUDE_WINDOWS))
+            self.phase = 'needs_input'
+            state = self.state()
+            self.assertEqual((state['capability']['supported'], state['capability']['reason']), (False, chat.CLAUDE_WINDOWS))
+            self.assertFalse(state['promptOpenable'], 'no question to open where no terminal can attach')
+            with self.assertRaises(chat.PromptRejected):
+                self.chat.prompt({'action': 'open', 'source': CLAUDE_REF})
             self.assertEqual(self.rejected(), chat.CLAUDE_WINDOWS)
             self.assertEqual(self.terms.pastes, [])
             self.assertNotIn(('chat', 'capabilities'), self.calls)

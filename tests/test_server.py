@@ -297,6 +297,43 @@ class StaticAssetTest(unittest.TestCase):
         import hashlib
         return hashlib.sha256(data).hexdigest()
 
+    def test_a_page_load_burst_of_connections_is_never_reset(self):
+        # Every connection waits for the board before any is answered, as a page load through
+        # Serve does: a backlog of 5 would reset the rest.
+        import socket
+        with tempfile.TemporaryDirectory() as directory:
+            httpd = server.make_server("127.0.0.1", 0, server.Board(HOSTS, 60, runner=fake_runner([])), TOKEN,
+                                       state_dir=directory)
+            httpd.assets = server.StaticAssets(self.web)
+            port, clients, answers, serving = httpd.server_address[1], [], [], False
+            try:
+                for _ in range(48):
+                    try:
+                        clients.append(socket.create_connection(("127.0.0.1", port), timeout=5))
+                    except OSError as exc:
+                        answers.append(type(exc).__name__.encode())
+                threading.Thread(target=httpd.serve_forever, daemon=True).start()
+                serving = True
+                for client in clients:
+                    answer = b""
+                    try:
+                        client.sendall(b"GET /app.js HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+                        while True:
+                            chunk = client.recv(65536)
+                            if not chunk:
+                                break
+                            answer += chunk
+                    except OSError as exc:
+                        answer = type(exc).__name__.encode()
+                    answers.append(answer.split(b"\r\n", 1)[0])
+            finally:
+                for client in clients:
+                    client.close()
+                if serving:
+                    httpd.shutdown()
+                httpd.server_close()
+        self.assertEqual(answers, [b"HTTP/1.0 200 OK"] * 48)
+
     def test_gzip_etag_and_vary(self):
         import gzip
         raw = (self.web / "app.js").read_bytes()

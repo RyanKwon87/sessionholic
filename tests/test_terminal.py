@@ -650,6 +650,15 @@ class TmuxFixtureTest(unittest.TestCase):
         alive = {row["key"]: row["alive"] for row in self.manager.list()}
         self.assertEqual(alive, {"recent": True, "owned": True, "handoff": True, "launching": True})
 
+    def test_a_connection_loaded_after_a_restart_is_not_released_at_once(self):
+        self.connection("old", "attach")
+        self.manager.close()
+        self.manager = terminal.TerminalManager(state_dir=self.directory.name, socket_name=self.socket, max_terminals=1)
+        self.managers.append(self.manager)
+        with self.assertRaisesRegex(RuntimeError, "가득"):
+            with self.manager.reserve("next"):
+                self.fail("a connection loaded after a restart was released before its browser read again")
+
     def test_a_browser_read_keeps_a_connection_from_being_released(self):
         old = self.connection("old", "attach")
         self.manager.read(old["id"], 0, 0)

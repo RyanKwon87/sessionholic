@@ -142,8 +142,10 @@ class _Terminal:
         # Set when a new attach client starts: the first input then also leaves any
         # copy-mode, whose in-memory flag a gateway restart would have lost.
         self.attached_fresh = False
-        # Last read, input or resize from a browser (monotonic); 0 until one is seen.
-        self.touched = 0.0
+        # Last read, input or resize from a browser (monotonic). A row loaded after a
+        # restart counts from now, so a connection in use is not released before its
+        # browser reads again.
+        self.touched = time.monotonic()
 
     def append(self, data):
         with self.condition:

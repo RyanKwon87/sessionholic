@@ -5331,15 +5331,16 @@ function terminalTitle(terminal, fallback = "열어 둔 터미널") {
   if (info.nativeSource?.host) {
     const key = chatKey(info.nativeSource);
     const session = allSessions().find((s) => chatKey(sourceOf(s)) === key);
-    if (session?.title) return session.title;
+    if (session?.title) return terminalEstimated(terminal) ? `${session.title} · 연결 추정` : session.title;
   }
   const title = info.title || fallback;
   return info.mode === "new-session" && !info.nativeSource && Number.isInteger(info.createdAt)
     ? `${title} · ${clock(info.createdAt)} 시작` : title;
 }
-// Session titles arrive with each snapshot: open terminals follow them.
+// Session titles arrive with each snapshot: open terminals follow them. An open
+// sheet is not rebuilt under a finger reaching for 연결 닫기; it renames on reopen.
 function renameTerminals() {
-  renderTerminals();
+  if (!$("terminals-dialog")?.open) renderTerminals();
   if (state.terminal && state.terminalVisible)
     $("terminal-title").textContent = terminalTitle(state.terminal, "진행 중인 작업");
   renderTerminalReturn();
@@ -7194,7 +7195,10 @@ window.addEventListener("DOMContentLoaded", () => {
     $(`session-category-${category}`).addEventListener("click", () => setSessionCategory(category));
   $("session-categories").addEventListener("keydown", sessionCategoryKeydown);
   $("session-category-search-action").addEventListener("click", (event) => setSessionCategory(event.currentTarget.dataset.category));
-  $("running-terminals").addEventListener("click", () => sheet("terminals-dialog").open());
+  $("running-terminals").addEventListener("click", () => {
+    renderTerminals();
+    sheet("terminals-dialog").open();
+  });
   $("terminals-close").addEventListener("click", () => closeSheet("terminals-dialog", "running-terminals"));
   $("new-session").addEventListener("click", () => openNewSession());
   $("new-session-close").addEventListener("click", () => closeNewSession());

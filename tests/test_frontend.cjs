@@ -6596,9 +6596,17 @@ test('an open terminal is named after the session it runs and follows a renamed 
   const titles = () => byClass(c.get('running-list'), 'running-terminal-title').map((node) => node.textContent);
   assert.deepEqual(titles(), ['검토할 작업', 'zz · 10. 12. 오후 05:14 시작', 'zz · 10. 12. 오후 03:16 시작']);
   // A newer snapshot with the session renamed renames its terminal.
+  // An open sheet is not rebuilt under the finger; it renames once it is not open.
   setRecentSnapshot(c, [{ ...s, title: '바뀐 작업 이름' }]);
+  c.get('terminals-dialog').open = true;
+  c.renameTerminals();
+  assert.equal(titles()[0], '검토할 작업');
+  c.get('terminals-dialog').open = false;
   c.renameTerminals();
   assert.equal(titles()[0], '바뀐 작업 이름');
+  // A link estimated from start times says so.
+  assert.equal(c.terminalTitle({ ...attached, metadata: { ...attached.metadata, linkConfidence: 'estimated' } }),
+    '바뀐 작업 이름 · 연결 추정');
   // A session no longer listed leaves the title the terminal was opened with.
   setRecentSnapshot(c, []);
   assert.equal(c.terminalTitle(attached), '보드 터미널');

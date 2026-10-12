@@ -353,7 +353,7 @@ class RenderTest(unittest.TestCase):
         self.assertEqual(server.render_manifest(self.manifest), self.manifest)
         worker = server.render_service_worker(self.worker, "sessionholic-shell-0a1b2c3d")
         changed = [(a, b) for a, b in zip(self.worker.splitlines(), worker.splitlines()) if a != b]
-        self.assertEqual(changed, [('const CACHE = "sessionholic-shell-v13";', 'const CACHE = "sessionholic-shell-0a1b2c3d";')])
+        self.assertEqual(changed, [('const CACHE = "sessionholic-shell-v14";', 'const CACHE = "sessionholic-shell-0a1b2c3d";')])
         # The meta precedes theme-init.js so the stored look applies before the first paint.
         self.assertLess(rendered.index('name="sessionholic-instance"'), rendered.index('src="/theme-init.js"'))
 
@@ -424,8 +424,8 @@ class StaticRenderTest(unittest.TestCase):
         # does not pass a worker whose cache name cannot follow the assets.
         server.StaticAssets(self.web).check()
         worker = (WEB / "sw.js").read_text(encoding="utf-8")
-        for broken in (worker.replace('const CACHE = "sessionholic-shell-v13";\n', ""),
-                       worker.replace('const CACHE = "sessionholic-shell-v13";', 'let CACHE = "x";'),
+        for broken in (worker.replace('const CACHE = "sessionholic-shell-v14";\n', ""),
+                       worker.replace('const CACHE = "sessionholic-shell-v14";', 'let CACHE = "x";'),
                        worker + '\nconst CACHE = "again";\n'):
             self.assertNotEqual(broken, worker)
             (self.web / "sw.js").write_text(broken, encoding="utf-8")

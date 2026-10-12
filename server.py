@@ -36,6 +36,7 @@ import instance
 import settings
 from goals import GoalError, Goals
 from work_service import WorkService
+from session_labels import SessionLabels, reference as label_reference
 
 HERE = Path(__file__).resolve().parent
 WEB = HERE / "web"
@@ -797,11 +798,11 @@ class Board:
         with self.lock:
             self.listeners.remove(callback)
 
-    def changed(self):
-        """Bump `version` and tell listeners when the host state differs; callers hold self.lock."""
+    def changed(self, force=False):
+        """Announce host changes, or a committed board-only display change."""
         with self.lock:
             signature = self.state_signature()
-            if signature == self.signature:
+            if signature == self.signature and not force:
                 return
             self.signature = signature
             self.version += 1
@@ -1982,6 +1983,34 @@ class Handler(BaseHTTPRequestHandler):
             self.server.board.request_refresh(host["name"], force=False)
         return result
 
+    def session_label(self, data):
+        if set(data) != {'source', 'title'}:
+            raise ValueError('세션과 보드 표시 제목을 확인해 주세요.')
+        if isinstance(data['source'], dict) and data['source'].get('agent') == 'codex' and not data['source'].get('home'):
+            raise ValueError('Codex 세션의 계정 홈을 확인해 주세요.')
+        ref = label_reference(data['source'])
+        board = self.server.board
+        with board.lock:
+            board.source(ref)  # Validate the registered host and listed native selector.
+            host = board.state[ref['host']]
+            matches = []
+            for row in (host.get('data') or {}).get(ref['agent'], []):
+                candidate = {**copy.deepcopy(row), 'host': ref['host'], 'agent': ref['agent']}
+                try:
+                    if label_reference(candidate) == ref:
+                        matches.append(candidate)
+                except GoalError:
+                    continue
+            if len(matches) != 1:
+                raise ValueError('세션의 계정 홈 또는 중복 식별자를 확인해 주세요. 목록에서 다시 선택해 주세요.')
+            source = {**matches[0], **ref, 'hostLabel': host['label'], 'online': host['ok'], 'fetchedAt': host['fetchedAt']}
+            if ref['agent'] == 'claude' and (data['source'].get('sessionId') or None) != (source.get('sessionId') or None):
+                raise ValueError('Claude 세션의 대화 식별자가 바뀌었습니다. 목록에서 다시 선택해 주세요.')
+        self.server.workflow.ensure_direct_session(source)
+        result = self.server.session_labels.set(source, data['title'])
+        board.changed(force=True)
+        return result
+
     def do_HEAD(self):
         self.do_GET()
 
@@ -2062,7 +2091,8 @@ class Handler(BaseHTTPRequestHandler):
         """The board's snapshot with this server process's bootId."""
         # A "새 세션" terminal's session may have appeared in this snapshot.
         self.server.workflow.link_new_sessions()
-        return {**self.server.board.snapshot(), "bootId": self.server.boot_id}
+        snapshot = self.server.session_labels.decorate(self.server.board.snapshot())
+        return {**snapshot, "bootId": self.server.boot_id}
 
     def stream_events(self, query):
         """Server-sent events; the same cookie login as other reads, no CSRF for a GET."""
@@ -2205,6 +2235,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_json(200, self.server.work.update(work_match[1], data))
             if path in ("/api/session/preview", "/api/session/action", "/api/session/archive"):
                 return self.send_json(200, self.session_control(path, data))
+            if path == "/api/session/label":
+                return self.send_json(200, self.session_label(data))
             if path == "/api/goals":
                 return self.send_json(201, self.server.goals.save(data))
             goal_match = re.fullmatch(r"/api/goals/([a-f0-9]{32})", path)
@@ -2366,6 +2398,7 @@ def make_server(bind, port, board, token, terminals=None, workflow=None, state_d
     server.board, server.token, server.tailscale_user = board, token, tailscale_user
     server.usage = usage
     server.goals = Goals(state_dir)
+    server.session_labels = SessionLabels(state_dir)
     server.cookie_name = COOKIE + "_" + str(server.server_address[1])
     server.once, server.once_lock = ("", 0), threading.Lock()
     server.sessions, server.auth_lock = {}, threading.Lock()

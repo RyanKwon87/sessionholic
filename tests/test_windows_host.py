@@ -197,6 +197,41 @@ class WindowsRoutingTest(unittest.TestCase):
         self.assertEqual(result['phase'], 'unknown')
         self.assertFalse(result['runtimeKnown'])
 
+    def test_one_shot_claude_without_persistence_is_readable_status_not_missing_history(self):
+        service = chat.Chat(self.board, self.flow, self.root)
+        native = {'phase': 'working', 'runtimeKnown': True, 'messages': [], 'readOnly': True,
+                  'executionMode': 'one-shot', 'transcriptAvailability': 'disabled',
+                  'historyNotice': {'code': 'not_persisted', 'message': 'native notice'}}
+        with patch.object(self.flow.transfers, 'rpc', return_value=native):
+            result = service.state({'source': CLAUDE_REF})
+        self.assertEqual(result['historyNotice']['code'], 'not_persisted')
+        self.assertEqual(result['executionMode'], 'one-shot')
+        self.assertEqual(result['messages'], [])
+        self.assertFalse(result['capability']['supported'])
+        self.assertFalse(result['capability']['attachments'])
+        self.assertNotIn('action', result['capability'])
+        self.assertFalse(result['promptOpenable'])
+        self.assertFalse(result['requiresNativeTerminal'])
+        self.assertIn('일회성', result['capability']['reason'])
+
+    def test_one_shot_with_saved_messages_preserves_history_without_terminal_advice(self):
+        for persistence in ({}, {'transcriptAvailability': 'disabled'}):
+            with self.subTest(persistence=persistence):
+                service = chat.Chat(self.board, self.flow, self.root)
+                native = {**READ, 'phase': 'working', 'runtimeKnown': True, 'readOnly': True,
+                          'executionMode': 'one-shot', **persistence}
+                with patch.object(self.flow.transfers, 'rpc', return_value=native):
+                    result = service.state({'source': CLAUDE_REF})
+                self.assertEqual(result['messages'], READ['messages'])
+                self.assertEqual(result['executionMode'], 'one-shot')
+                self.assertNotIn('historyNotice', result)
+                self.assertNotIn('transcriptAvailability', result)
+                self.assertFalse(result['capability']['supported'])
+                self.assertFalse(result['capability']['attachments'])
+                self.assertNotIn('action', result['capability'])
+                self.assertIsNone(result['prompt'])
+                self.assertFalse(result['promptOpenable'])
+
     def test_text_send_is_once_and_upload_stays_unsupported(self):
         service = chat.Chat(self.board, self.flow, self.root)
         with patch.object(self.flow.transfers, 'rpc', return_value={'delivery': 'accepted', 'confirmed': True}) as rpc:

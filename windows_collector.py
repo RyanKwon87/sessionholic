@@ -31,6 +31,10 @@ MESSAGE_LIMIT = 80
 SID = re.compile(r'[0-9A-Za-z-]{8,64}\Z')
 CAPABILITIES = {'readOnly': True, 'canRead': True, 'canSend': False, 'canLaunch': False, 'canControl': False}
 CODEX_SOURCES = ['cli', 'vscode', 'exec', 'appServer', 'subAgent', 'unknown']
+CLAUDE_PROBE_LIMIT = 16
+CLAUDE_PROBE_SECONDS = 2
+ANCESTRY_LIMIT = 6
+NOT_PERSISTED = {'code': 'not_persisted', 'message': '대화 기록을 저장하지 않는 일회성 실행입니다. 실행 상태를 확인하고 결과는 요청한 에이전트에서 확인해 주세요.'}
 
 
 def _text(value, limit=4000):
@@ -137,10 +141,7 @@ def _flags(status):
     return [value for value in values[:20] if _metadata(value)] if isinstance(values, list) else []
 
 
-def _process(pid):
-    """Windows process creation FILETIME, executable and running state, no argv/env."""
-    if os.name != 'nt' or type(pid) is not int or pid <= 0:
-        return None
+def _process_api():
     kernel = ctypes.WinDLL('kernel32', use_last_error=True)
     kernel.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
     kernel.OpenProcess.restype = wintypes.HANDLE
@@ -148,22 +149,165 @@ def _process(pid):
     kernel.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
     kernel.GetProcessTimes.argtypes = [wintypes.HANDLE] + [ctypes.POINTER(wintypes.FILETIME)] * 4
     kernel.QueryFullProcessImageNameW.argtypes = [wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD)]
+    return kernel
+
+
+def _process_identity(kernel, handle, pid):
+    code = wintypes.DWORD()
+    created, exited, kernel_time, user_time = [wintypes.FILETIME() for unused in range(4)]
+    if not kernel.GetExitCodeProcess(handle, ctypes.byref(code)) or code.value != 259:
+        return None
+    if not kernel.GetProcessTimes(handle, ctypes.byref(created), ctypes.byref(exited), ctypes.byref(kernel_time), ctypes.byref(user_time)):
+        return None
+    length = wintypes.DWORD(32768)
+    image = ctypes.create_unicode_buffer(length.value)
+    if not kernel.QueryFullProcessImageNameW(handle, 0, image, ctypes.byref(length)):
+        return None
+    stamp = (created.dwHighDateTime << 32) | created.dwLowDateTime
+    return {'pid': pid, 'start': str(stamp), 'exe': image.value}
+
+
+def _same_process(left, right):
+    return bool(isinstance(left, dict) and isinstance(right, dict)
+                and type(left.get('pid')) is int and left['pid'] > 0
+                and left['pid'] == right.get('pid')
+                and isinstance(left.get('start'), str) and re.fullmatch(r'\d{17,20}', left['start'])
+                and left['start'] == right.get('start')
+                and isinstance(left.get('exe'), str) and left['exe']
+                and _norm(left['exe']) == _norm(right.get('exe')))
+
+
+def _process(pid):
+    """Windows process creation FILETIME, executable and running state, no argv/env."""
+    if os.name != 'nt' or type(pid) is not int or pid <= 0:
+        return None
+    kernel = _process_api()
     handle = kernel.OpenProcess(0x1000, False, pid)
     if not handle:
         return None
     try:
-        code = wintypes.DWORD()
-        created, exited, kernel_time, user_time = [wintypes.FILETIME() for unused in range(4)]
-        if not kernel.GetExitCodeProcess(handle, ctypes.byref(code)) or code.value != 259:
-            return None
-        if not kernel.GetProcessTimes(handle, ctypes.byref(created), ctypes.byref(exited), ctypes.byref(kernel_time), ctypes.byref(user_time)):
-            return None
-        length = wintypes.DWORD(32768)
-        image = ctypes.create_unicode_buffer(length.value)
-        if not kernel.QueryFullProcessImageNameW(handle, 0, image, ctypes.byref(length)):
-            return None
-        stamp = (created.dwHighDateTime << 32) | created.dwLowDateTime
-        return {'pid': pid, 'start': str(stamp), 'exe': image.value}
+        return _process_identity(kernel, handle, pid)
+    finally:
+        kernel.CloseHandle(handle)
+
+
+def _parents(deadline):
+    """One bounded Toolhelp snapshot; names and command lines are not retained."""
+    if os.name != 'nt' or time.monotonic() >= deadline:
+        return {}
+    class Entry(ctypes.Structure):
+        _fields_ = [('dwSize', wintypes.DWORD), ('cntUsage', wintypes.DWORD),
+                    ('th32ProcessID', wintypes.DWORD), ('th32DefaultHeapID', ctypes.c_size_t),
+                    ('th32ModuleID', wintypes.DWORD), ('cntThreads', wintypes.DWORD),
+                    ('th32ParentProcessID', wintypes.DWORD), ('pcPriClassBase', wintypes.LONG),
+                    ('dwFlags', wintypes.DWORD), ('szExeFile', wintypes.WCHAR * 260)]
+    kernel = _process_api()
+    kernel.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+    kernel.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+    for name in ('Process32FirstW', 'Process32NextW'):
+        getattr(kernel, name).argtypes = [wintypes.HANDLE, ctypes.POINTER(Entry)]
+    handle = kernel.CreateToolhelp32Snapshot(2, 0)  # TH32CS_SNAPPROCESS
+    if handle in (None, ctypes.c_void_p(-1).value):
+        return {}
+    try:
+        entry, result = Entry(), {}
+        entry.dwSize = ctypes.sizeof(entry)
+        valid = kernel.Process32FirstW(handle, ctypes.byref(entry))
+        while valid and len(result) < 8192 and time.monotonic() < deadline:
+            result[entry.th32ProcessID] = entry.th32ParentProcessID
+            valid = kernel.Process32NextW(handle, ctypes.byref(entry))
+        return result
+    finally:
+        kernel.CloseHandle(handle)
+
+
+def _claude_options(arguments):
+    """Conservative option-prefix parser; prompt/unknown options end observation."""
+    flags = {'print': False, 'noSessionPersistence': False}
+    values = {'--model', '--output-format', '--input-format', '--name', '-n', '--agent',
+              '--system-prompt', '--append-system-prompt', '--system-prompt-file',
+              '--append-system-prompt-file', '--session-id', '--permission-mode',
+              '--max-turns', '--max-budget-usd', '--fallback-model', '--effort',
+              '--json-schema', '--settings', '--setting-sources', '--mcp-config'}
+    switches = {'--verbose', '--debug', '--dangerously-skip-permissions',
+                '--allow-dangerously-skip-permissions', '--strict-mcp-config',
+                '--include-partial-messages', '--replay-user-messages', '--disable-slash-commands'}
+    index = 1  # executable argv[0]
+    while index < len(arguments):
+        value = arguments[index]
+        if value == '--' or not value.startswith('-'):
+            break
+        option, equal, unused = value.partition('=')
+        if option in ('-p', '--print', '--no-session-persistence') and not equal:
+            flags['noSessionPersistence' if option == '--no-session-persistence' else 'print'] = True
+        elif option in values:
+            if not equal:
+                index += 1
+                if index >= len(arguments):
+                    return {}
+        elif option not in switches or equal:
+            break
+        index += 1
+    return flags
+
+
+def _query_claude_flags(kernel, handle):
+    """Read one handle's bounded command line, returning only two booleans.
+
+    ProcessCommandLineInformation is optional: unsupported Windows versions fail
+    closed. No PEB/environment read or PowerShell/CIM fallback is performed.
+    """
+    class UnicodeString(ctypes.Structure):
+        _fields_ = [('Length', wintypes.USHORT), ('MaximumLength', wintypes.USHORT), ('Buffer', ctypes.c_void_p)]
+    query = ctypes.WinDLL('ntdll').NtQueryInformationProcess
+    query.argtypes = [wintypes.HANDLE, wintypes.ULONG, ctypes.c_void_p, wintypes.ULONG, ctypes.POINTER(wintypes.ULONG)]
+    query.restype = wintypes.LONG
+    size = wintypes.ULONG()
+    query(handle, 60, None, 0, ctypes.byref(size))
+    if size.value < ctypes.sizeof(UnicodeString) or size.value > 65536:
+        return {}
+    buffer = ctypes.create_string_buffer(size.value)
+    if query(handle, 60, buffer, len(buffer), ctypes.byref(size)) < 0:
+        return {}
+    value = UnicodeString.from_buffer(buffer)
+    begin, end = ctypes.addressof(buffer), ctypes.addressof(buffer) + len(buffer)
+    if (value.Length == 0 or value.Length % 2 or value.Length > value.MaximumLength
+            or not value.Buffer or value.Buffer < begin + ctypes.sizeof(UnicodeString)
+            or value.Buffer + value.Length > end):
+        return {}
+    command = ctypes.wstring_at(value.Buffer, value.Length // 2)
+    if '\0' in command:
+        return {}
+    shell = ctypes.WinDLL('shell32')
+    shell.CommandLineToArgvW.argtypes = [wintypes.LPCWSTR, ctypes.POINTER(ctypes.c_int)]
+    shell.CommandLineToArgvW.restype = ctypes.POINTER(wintypes.LPWSTR)
+    kernel.LocalFree.argtypes = [ctypes.c_void_p]
+    kernel.LocalFree.restype = ctypes.c_void_p
+    count = ctypes.c_int()
+    arguments = shell.CommandLineToArgvW(command, ctypes.byref(count))
+    try:
+        return _claude_options([arguments[i] for i in range(count.value)]) if arguments and 0 < count.value <= 256 else {}
+    finally:
+        if arguments:
+            kernel.LocalFree(arguments)
+
+
+def _claude_flags(expected, deadline):
+    if os.name != 'nt' or not _same_process(expected, expected) or time.monotonic() >= deadline:
+        return {}
+    kernel = _process_api()
+    handle = kernel.OpenProcess(0x1000, False, expected['pid'])
+    if not handle:
+        return {}
+    try:
+        if not _same_process(expected, _process_identity(kernel, handle, expected['pid'])):
+            return {}
+        flags = _query_claude_flags(kernel, handle)
+        if time.monotonic() >= deadline or not _same_process(expected, _process_identity(kernel, handle, expected['pid'])):
+            return {}
+        return flags
+    except (OSError, ValueError, AttributeError):
+        return {}
     finally:
         kernel.CloseHandle(handle)
 
@@ -335,12 +479,14 @@ class Proxy:
 
 
 class WindowsCollector:
-    def __init__(self, home=None, proxy_factory=Proxy, process_reader=_process, hostname=None):
+    def __init__(self, home=None, proxy_factory=Proxy, process_reader=_process, hostname=None,
+                 parent_reader=_parents, flags_reader=_claude_flags):
         self.home = Path(home) if home is not None else Path.home()
         self.codex_home = self.home / '.codex'
         self.claude_home = self.home / '.claude'
         self.binary = self.home / 'AppData/Local/Programs/OpenAI/Codex/bin/codex.exe'
         self.proxy_factory, self.process_reader = proxy_factory, process_reader
+        self.parent_reader, self.flags_reader = parent_reader, flags_reader
         self.hostname = hostname or socket.gethostname()
 
     def project(self, cwd):
@@ -510,7 +656,85 @@ class WindowsCollector:
         except (OSError, ValueError):
             return False
 
-    def claude_rows(self):
+    def _agent_executable(self, executable):
+        if self._codex_executable(executable):
+            return 'Codex'
+        if (self._claude_executable(executable)
+                and _norm(Path(_windows_path(executable)).parent) == _norm(self.home / '.local/bin')):
+            return 'Claude Code'
+        return None
+
+    def _shell_executable(self, executable):
+        if not isinstance(executable, str):
+            return False
+        # Only native installation locations, never a same-named cwd executable.
+        roots = [(os.environ.get('SystemRoot'), 'system'), (os.environ.get('ProgramFiles'), 'programs')]
+        for root, kind in roots:
+            if not root:
+                continue
+            try:
+                path = _safe(executable, root)
+                relative = _norm(path.relative_to(Path(root).resolve()))
+                if not path.is_file():
+                    continue
+                if kind == 'system' and relative in ('system32/cmd.exe', 'system32/windowspowershell/v1.0/powershell.exe'):
+                    return True
+                if kind == 'programs' and (relative in ('powershell/7/pwsh.exe', 'powershell/7-preview/pwsh.exe')
+                        or re.fullmatch(r'windowsapps/microsoft\.powershell_\d+\.\d+\.\d+\.\d+_(?:x64|x86|arm64)__8wekyb3d8bbwe/pwsh\.exe', relative)):
+                    return True
+            except (OSError, ValueError):
+                continue
+        return False
+
+    def _agent_ancestor(self, process, parents, deadline):
+        chain, seen, child = [process], {process['pid']}, process
+        name = None
+        for unused in range(ANCESTRY_LIMIT):
+            if time.monotonic() >= deadline:
+                return None
+            pid = parents.get(child['pid'])
+            if type(pid) is not int or pid <= 0 or pid in seen:
+                return None
+            parent = self.process_reader(pid)
+            if (not _same_process(parent, parent) or parent['pid'] != pid
+                    or int(parent['start']) > int(child['start'])):
+                return None  # A reused parent PID cannot prove who started the child.
+            chain.append(parent)
+            seen.add(pid)
+            name = self._agent_executable(parent['exe'])
+            if name:
+                break
+            if not self._shell_executable(parent['exe']):
+                return None
+            child = parent
+        if not name:
+            return None
+        # Recheck every observed process after traversing the chain. No process
+        # name, title, print flag, or historical PID alone establishes origin.
+        for item in reversed(chain):
+            if time.monotonic() >= deadline or not _same_process(item, self.process_reader(item['pid'])):
+                return None
+        return name
+
+    def _claude_details(self, process, parents, deadline):
+        if not _same_process(process, process) or time.monotonic() >= deadline:
+            return {}
+        flags = self.flags_reader(process, deadline)
+        name = self._agent_ancestor(process, parents, deadline)
+        if time.monotonic() >= deadline:
+            return {}
+        if not _same_process(process, self.process_reader(process['pid'])):
+            return None  # An observed identity change also invalidates runtime state.
+        result = {}
+        if name:
+            result.update(initiator='agent', initiatorEvidence='process_ancestry', initiatorName=name)
+        if isinstance(flags, dict) and flags.get('print') is True:
+            result['executionMode'] = 'one-shot'
+            if flags.get('noSessionPersistence') is True:
+                result['transcriptAvailability'] = 'disabled'
+        return result
+
+    def claude_rows(self, target_sid=None):
         records = {}
         for path in list((self.claude_home / 'sessions').glob('[0-9]*.json'))[:256]:
             try:
@@ -519,6 +743,8 @@ class WindowsCollector:
                     continue
                 sid = row.get('sessionId')
                 if not SID.fullmatch(sid or '') or row.get('kind') not in ('interactive', 'bg') or not path.stem.isdigit():
+                    continue
+                if target_sid is not None and sid != target_sid:
                     continue
                 pid = int(path.stem)
                 process = self.process_reader(pid)
@@ -530,18 +756,32 @@ class WindowsCollector:
                              and row['pidDomain'].casefold() == 'win32:' + self.hostname.casefold()
                              and self._claude_executable(process.get('exe')))
                 if sid in records:
-                    records[sid] = (row, False)  # Multiple owners stay visible, with unknown runtime.
+                    records[sid] = (row, False, None)  # Multiple owners stay visible, with unknown runtime.
                 else:
-                    records[sid] = (row, exact)
+                    records[sid] = (row, exact, process)
             except (OSError, ValueError, TypeError):
                 continue
         paths = self._transcripts()
         selected = sorted(paths, key=lambda sid: paths[sid].stat().st_mtime, reverse=True)[:LIMIT]
         ids = list(dict.fromkeys(list(records) + selected))
+        if target_sid is not None:
+            ids = [sid for sid in ids if sid == target_sid]
         output = []
+        deadline, probes, parents = time.monotonic() + CLAUDE_PROBE_SECONDS, 0, None
         for sid in ids[:LIMIT]:
-            row, exact = records.get(sid, ({}, False))
+            row, exact, process = records.get(sid, ({}, False, None))
             path = paths.get(sid)
+            details = {}
+            if exact and probes < CLAUDE_PROBE_LIMIT and time.monotonic() < deadline:
+                probes += 1
+                try:
+                    if parents is None:
+                        parents = self.parent_reader(deadline)
+                    details = self._claude_details(process, parents, deadline)
+                    if details is None:
+                        exact, details = False, {}
+                except (OSError, ValueError, TypeError):
+                    pass
             cwd = row.get('cwd') or ''
             if not cwd and path:
                 for entry in _head(path):
@@ -555,7 +795,8 @@ class WindowsCollector:
                 'title': _text(row.get('name'), 160) or '(Claude 대화)', 'cwd': cwd, 'project': project,
                 'phase': phase, 'state': phase, 'status': status if exact else None, 'runtimeKnown': exact and phase != 'unknown',
                 'startedAt': _epoch(row.get('startedAt')), 'updatedAt': int(path.stat().st_mtime) if path else None,
-                'readOnly': True, 'canRead': path is not None, 'snippet': '', **_origin(row)})
+                'readOnly': True, 'canRead': path is not None or details.get('transcriptAvailability') == 'disabled',
+                'snippet': '', **_origin(row), **details})
         return output
 
     def snapshot(self):
@@ -578,12 +819,17 @@ class WindowsCollector:
             raise ValueError('PC 대화 식별자가 올바르지 않습니다.')
         if agent == 'claude':
             path = self._transcripts().get(sid)
+            row = next(iter(self.claude_rows(target_sid=sid)), {})
             if path is None:
+                if row.get('transcriptAvailability') == 'disabled':
+                    return {'messages': [], 'phase': row.get('phase', 'unknown'), 'runtimeKnown': row.get('runtimeKnown', False),
+                            'activeFlags': [], 'updatedAt': row.get('updatedAt'), 'readOnly': True,
+                            'historyNotice': dict(NOT_PERSISTED), 'executionMode': 'one-shot', 'transcriptAvailability': 'disabled'}
                 raise ValueError('정확한 PC Claude 대화 기록을 찾지 못했습니다.')
             messages = _claude_messages(_tail(path))
-            row = next((row for row in self.claude_rows() if row['id'] == sid), {})
             return {'messages': messages, 'phase': row.get('phase', 'unknown'), 'runtimeKnown': row.get('runtimeKnown', False),
-                    'activeFlags': [], 'updatedAt': int(path.stat().st_mtime), 'readOnly': True}
+                    'activeFlags': [], 'updatedAt': int(path.stat().st_mtime), 'readOnly': True,
+                    **{key: row[key] for key in ('executionMode', 'transcriptAvailability') if key in row}}
         if home != '.codex':
             raise ValueError('등록된 PC Codex home만 읽을 수 있습니다.')
         if str(uuid.UUID(sid)) != sid:

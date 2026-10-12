@@ -2220,7 +2220,7 @@ test('service worker evicts only its own old shells and offline reads use the cu
   listeners.fetch({ request: { method: 'GET', url: 'https://app.example/' },
     respondWith: (promise) => { response = promise; }, waitUntil() {} });
   assert.equal(await response, currentShell);
-  assert.deepEqual(opened, ['sessionholic-shell-v13']);
+  assert.deepEqual(opened, ['sessionholic-shell-v14']);
 });
 
 test('an offline first launch restores authentication and already-open terminal rows without reopening their sessions', async () => {
@@ -3096,7 +3096,8 @@ test('recent cards give project and full task separate priority while retaining 
   assert.equal(byClass(card, 'card-title')[0].textContent, title.trim());
   assert.equal(byClass(card, 'card-snippet')[0].hidden, true);
   const meta = byClass(card, 'card-meta')[0];
-  assert.deepEqual(meta.children.map((child) => child.className.split(' ')[0]), ['badge', 'terminal-mark', 'card-agent', 'card-project', 'stale-tag', 'card-time']);
+  assert.deepEqual(meta.children.map((child) => child.className.split(' ')[0]), ['badge', 'terminal-mark', 'card-agent', 'card-execution', 'card-project', 'stale-tag', 'card-time']);
+  assert.equal(byClass(card, 'card-execution')[0].hidden, true, '일반 대화에는 일회성 실행 표식을 표시하지 않는다');
   assert.equal(byClass(card, 'card-terminal')[0].hidden, true, '"터미널 열림" only with a live board terminal');
   assert.match(byClass(card, 'card-project')[0].textContent, new RegExp('^' + project.trim()));
   assert.equal(byClass(card, 'stale-tag')[0].hidden, false);
@@ -4112,21 +4113,21 @@ test('service worker keeps only responses the server marked immutable, so a mism
   const cached = sw.fetched.length;
   assert.equal(await (await sw.run('/app.js?v=bbbbbbbb')).text(), '/app.js@bbbbbbbb');
   assert.equal(sw.fetched.length, cached, 'served from the cache');
-  assert.match(fs.readFileSync(path.join(__dirname, '../web/sw.js'), 'utf8'), /const CACHE = "sessionholic-shell-v13";/,
+  assert.match(fs.readFileSync(path.join(__dirname, '../web/sw.js'), 'utf8'), /const CACHE = "sessionholic-shell-v14";/,
     'a new cache name drops entries stored by the older rule');
 });
 
 test('service worker precache stores only immutable versioned assets and skips the terminal library', async () => {
   const versions = { '/app.js': 'aaaaaaaa', '/style.css': 'cccccccc', '/theme-init.js': 'eeeeeeee', '/vendor/xterm.js': 'dddddddd',
-    '/api/snapshot': 'ffffffff' };
+    '/session_labels.js': 'abababab', '/api/snapshot': 'ffffffff' };
   const page = `<meta name="sessionholic-assets" content="${JSON.stringify(versions).replace(/"/g, '&quot;')}">`;
   const sw = serviceWorkerHarness(page);
   // The server already serves a different app.js than the page names.
-  Object.assign(sw.current, { '/app.js': '99999999', '/style.css': 'cccccccc', '/theme-init.js': 'eeeeeeee', '/vendor/xterm.js': 'dddddddd' });
+  Object.assign(sw.current, { '/app.js': '99999999', '/style.css': 'cccccccc', '/theme-init.js': 'eeeeeeee', '/vendor/xterm.js': 'dddddddd', '/session_labels.js': 'abababab' });
   let installed;
   sw.listeners.install({ waitUntil: (promise) => { installed = promise; } });
   await installed;
-  assert.deepEqual([...sw.store.keys()].sort(), ['https://app.example/', 'https://app.example/style.css?v=cccccccc',
+  assert.deepEqual([...sw.store.keys()].sort(), ['https://app.example/', 'https://app.example/session_labels.js?v=abababab', 'https://app.example/style.css?v=cccccccc',
     'https://app.example/theme-init.js?v=eeeeeeee']);
   assert.ok(sw.fetched.includes('/app.js?v=aaaaaaaa'), 'fetched, then refused by its header');
   assert.ok(!sw.fetched.some((url) => url.includes('xterm') || url.includes('/api/')));
@@ -7302,4 +7303,159 @@ test('external sessions expose management beside the conversation and Windows in
   assert.equal(c.get('chat-input').disabled, false, 'snapshot read-only does not override live canSend');
   entry.data.capability.supported = false; c.updateChatComposer(entry);
   assert.equal(c.get('chat-input').disabled, true);
+});
+
+const ONE_SHOT_HISTORY = '대화 기록을 저장하지 않는 일회성 실행입니다. 실행 상태를 확인하고 결과는 요청한 에이전트에서 확인해 주세요.';
+const ONE_SHOT_INPUT = '일회성 실행에는 후속 메시지를 보낼 수 없습니다. 결과는 요청한 에이전트에서 확인해 주세요.';
+function selectWindowsOneShot(c) {
+  const s = recentSession('claude-oneshot-4102', { host: 'windows-pc', hostLabel: 'Windows PC', agent: 'claude', home: '',
+    executionMode: 'one-shot', transcriptAvailability: 'disabled', initiator: 'agent', initiatorName: 'Codex', phase: 'working' });
+  c.state.snapshot = { serverTime: 1100, hosts: [{ name: s.host, label: s.hostLabel, ok: true, data: { claude: [s] } }] };
+  c.state.selected = s.key; c.state.authenticated = true;
+  const entry = c.chatEntry(s);
+  entry.data = { route: c.sourceOf(s), executionMode: s.executionMode, transcriptAvailability: s.transcriptAvailability,
+    capability: { supported: false, reason: ONE_SHOT_INPUT }, phase: 'working', messages: [],
+    historyNotice: { code: 'not_persisted', message: ONE_SHOT_HISTORY } };
+  c.get('chat-composer').dataset.source = c.chatKey(entry.source);
+  return { s, entry };
+}
+function assertOneShotHistory(c) {
+  const messages = c.get('messages'), notices = byClass(messages, 'conversation-history-notice');
+  assert.equal(notices.length, 1);
+  assert.match(textOf(notices[0]), /일회성 실행 · 기록 저장 안 함/);
+  assert.ok(textOf(notices[0]).includes(ONE_SHOT_HISTORY));
+  for (const className of ['conversation-read-error', 'group-empty', 'msg-working'])
+    assert.equal(byClass(messages, className).length, 0, className);
+}
+
+test('Windows 일회성 Claude는 에이전트 분류·기기·호출자를 유지하고 정상 chat/state에서 기록 미저장 안내를 표시한다', async () => {
+  const calls = []; let stateData;
+  const c = client(async (url, options) => {
+    calls.push({ url, body: JSON.parse(options.body) });
+    assert.equal(url, '/api/chat/state');
+    return { ok: true, status: 200, json: async () => stateData };
+  }, noChatTimers);
+  const { s, entry } = selectWindowsOneShot(c);
+  stateData = entry.data; entry.data = null;
+  assert.equal(c.sessionCategoryOf(s), 'agent');
+  c.renderSessionCategories([s], 1100); c.renderGroups([s], 1100);
+  assert.equal(c.get('session-category-agent-count').textContent, '1');
+  assert.equal(c.get('session-category-general-count').textContent, '0');
+  const card = byClass(c.get('groups'), 'card')[0];
+  assert.match(textOf(card), /Windows PC/); assert.match(textOf(card), /Codex/);
+  assert.equal(byClass(card, 'card-execution')[0].hidden, false);
+  c.drawDetail(s); await c.loadDetail(s, true);
+  assertOneShotHistory(c);
+  assert.match(textOf(c.get('detail')), /일회성 실행/);
+  assert.match(textOf(c.get('detail')), /에이전트 시작 · Codex/);
+  assert.equal(c.get('chat-status').textContent, ONE_SHOT_INPUT);
+  assert.equal(c.get('chat-input').disabled, true);
+  assert.deepEqual(calls, [{ url: '/api/chat/state', body: { source: { host: 'windows-pc', agent: 'claude', id: s.id } } }]);
+  assert.equal(entry.source.id, 'claude-oneshot-4102');
+  assert.equal(entry.data.route.id, entry.source.id);
+});
+
+test('일회성 Claude의 /api/read fallback도 정상 미저장 안내를 표시하고 일반 세션으로 바꾸면 안내를 제거한다', async () => {
+  const calls = []; let readData;
+  const c = client(async (url) => {
+    calls.push(url);
+    return url === '/api/chat/state'
+      ? { ok: false, status: 404, json: async () => ({ error: '채팅 상태 경로 없음' }) }
+      : { ok: true, status: 200, json: async () => readData };
+  }, noChatTimers);
+  const selected = selectWindowsOneShot(c);
+  readData = { ...selected.entry.data, historyNotice: { code: 'not_persisted', message: ONE_SHOT_HISTORY + ' 수집기 확인 안내입니다.' } };
+  selected.entry.data = null;
+  c.drawDetail(selected.s); await c.loadDetail(selected.s, true);
+  assert.deepEqual(calls.map((url) => url.split('?')[0]), ['/api/chat/state', '/api/read']);
+  const query = new URL(calls[1], 'https://fixture.invalid').searchParams;
+  assert.equal(query.get('host'), 'windows-pc'); assert.equal(query.get('agent'), 'claude');
+  assert.equal(query.get('id'), 'claude-oneshot-4102');
+  assertOneShotHistory(c);
+  assert.match(textOf(c.get('messages')), /수집기 확인 안내입니다/);
+  assert.equal(selected.entry.error, '', '읽기 성공 뒤 chat/state fallback 오류를 입력 안내에 남기지 않는다');
+  const messages = c.get('messages');
+  const ordinary = selectChat(c, { agent: 'claude', home: '', id: 'ordinary-claude-session' });
+  c.renderMessages(ordinary.s, [{ role: 'assistant', text: '일반 세션의 저장된 대화' }]);
+  assert.equal(c.get('messages'), messages, '같은 목록 DOM에서 이전 안내가 제거된다');
+  assert.equal(byClass(messages, 'conversation-history-notice').length, 0);
+  assert.match(textOf(messages), /일반 세션의 저장된 대화/);
+  assert.doesNotMatch(textOf(messages), /기록 저장 안 함|결과는 요청한 에이전트/);
+  assert.equal(calls.length, 2);
+});
+
+test('일회성 Claude는 남은 전송·터미널 capability도 거부하고 세션 관리의 원본 식별자는 유지한다', async () => {
+  const calls = [];
+  const c = client(async (url) => { calls.push(url); throw new Error('일회성 실행은 입력·터미널 요청을 보내지 않는다'); }, noChatTimers);
+  const { s, entry } = selectWindowsOneShot(c);
+  entry.data.capability = { supported: true, attachments: true, action: 'open_terminal' };
+  entry.text = '보내지 않을 초안';
+  c.drawDetail(s); c.updateChatComposer(entry);
+  const { terminalRequired } = vm.runInContext('({ terminalRequired })', c.context);
+  assert.equal(c.chatSupported(entry), false); assert.equal(c.chatAttachmentsSupported(entry), false);
+  assert.equal(terminalRequired(entry), false);
+  assert.equal(c.get('chat-input').disabled, true); assert.equal(c.get('chat-send').disabled, true);
+  assert.equal(c.get('chat-attach').disabled, true); assert.equal(c.get('chat-terminal-gate').hidden, true);
+  assert.equal(c.get('chat-terminal').disabled, true);
+  assert.equal(c.get('chat-status').textContent, ONE_SHOT_INPUT);
+  await c.sendChat(entry); c.openChatTerminal(s);
+  c.state.route = { host: s.host, agent: s.agent, account: 'claude:default' };
+  await c.preparePlan();
+  assert.equal(calls.length, 0); assert.equal(entry.text, '보내지 않을 초안');
+  assert.equal(c.get('plan-dialog').open, undefined);
+  const manage = c.get('detail-manage-session');
+  assert.equal(manage.textContent, '세션 관리'); assert.equal(manage.disabled, false);
+  vm.runInContext('manageSession = (s) => { globalThis.managedSource = sourceOf(s); }', c.context);
+  manage.events.click({ currentTarget: manage });
+  assert.deepEqual({ ...c.context.managedSource }, { host: 'windows-pc', agent: 'claude', id: s.id });
+});
+
+test('저장된 일회성 대화는 이전 미저장 안내보다 우선하며 disabled 메타데이터만으로 안내를 만들지 않는다', async () => {
+  for (const fallback of [false, true]) {
+    let saved;
+    const c = client(async (url) => {
+      if (fallback && url === '/api/chat/state') return { ok: false, status: 404, json: async () => ({ error: '상태 경로 없음' }) };
+      return { ok: true, status: 200, json: async () => saved };
+    }, noChatTimers);
+    const { s, entry } = selectWindowsOneShot(c);
+    s.historyNotice = { code: 'not_persisted', message: ONE_SHOT_HISTORY };
+    c.drawDetail(s);
+    entry.conversation = { identity: c.conversationIdentity(s), authEpoch: c.state.authEpoch,
+      messages: [], historyNotice: s.historyNotice, executionMode: 'one-shot', transcriptAvailability: 'disabled' };
+    c.renderMessages(s, []); assertOneShotHistory(c);
+    saved = { route: c.sourceOf(s), phase: 'idle', executionMode: 'one-shot', transcriptAvailability: 'disabled',
+      messages: [{ role: 'assistant', text: '이전에 저장된 실제 대화입니다.' }], capability: { supported: false, reason: ONE_SHOT_INPUT } };
+    await c.loadDetail(s, true);
+    assert.match(textOf(c.get('messages')), /이전에 저장된 실제 대화/);
+    assert.equal(byClass(c.get('messages'), 'conversation-history-notice').length, 0, `저장 본문 우선, fallback=${fallback}`);
+    assert.equal(entry.conversation.historyNotice, null);
+    assert.equal(entry.error, '', '일회성 기록 읽기가 성공하면 실패한 상태 경로의 오류를 지운다');
+    c.renderMessages(s, []);
+    assert.equal(byClass(c.get('messages'), 'conversation-history-notice').length, 0, '새 읽기의 명시 안내 부재가 이전 snapshot·cache 안내를 무효화한다');
+    assert.equal(c.chatSupported(entry), false, '본문 유무와 일회성 입력 제한은 별개다');
+  }
+});
+
+test('보드 표시명은 목록·검색에 반영되고 원본 제목·세션 경로는 보존한다', () => {
+  const c = client(undefined, noChatTimers), now = Math.floor(Date.now() / 1000);
+  const original = { id: 'label-native-id', agent: 'codex', home: '.codex-fixture', name: 'native-runtime-name',
+    cwd: '/fixture/original', title: '원본 찾기', originalTitle: '원본 찾기', displayTitle: '보드 별칭 찾기',
+    titleAlias: '보드 별칭 찾기', phase: 'working', updatedAt: now, initiator: 'agent' };
+  c.state.snapshot = { sessionLabels: { ok: true, revision: 4 }, hosts: [{ name: 'local', label: '합성 PC', ok: true, data: { codex: [original] } }] };
+  c.state.sessionCategory = 'agent';
+  const row = c.allSessions()[0];
+  assert.equal(row.title, '보드 별칭 찾기');
+  assert.equal(row.originalTitle, '원본 찾기');
+  for (const field of ['id', 'name', 'cwd', 'home']) assert.equal(row[field], original[field]);
+  assert.equal(original.title, '원본 찾기', 'snapshot native title remains untouched');
+  for (const query of ['보드 별칭', '원본 찾기']) { c.state.search = query; assert.equal(c.matches(row, now), true); }
+  let decorated;
+  c.context.window.SessionholicLabels = { decorate: (value, metadata) => {
+    decorated = { value, metadata }; return { ...value, displayTitle: '저장 직후 제목' };
+  } };
+  assert.equal(c.allSessions()[0].title, '저장 직후 제목');
+  assert.equal(decorated.value.host, 'local', 'identity is complete before applying the saved alias');
+  assert.equal(decorated.metadata.revision, 4);
+  const html = fs.readFileSync(path.join(__dirname, '../web/index.html'), 'utf8');
+  assert.ok(html.indexOf('src="/session_labels.js"') < html.indexOf('src="/app.js"'), 'module loads before app initialization');
 });

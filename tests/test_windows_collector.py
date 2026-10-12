@@ -67,6 +67,235 @@ class FakeProxy:
         raise AssertionError('unexpected native mutation: ' + method)
 
 
+class ClaudeProcessOriginTest(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.home = Path(temporary.name).resolve()
+        self.parents = {300: 200, 200: 100}
+        self.stamp = 134360000000003000
+        self.calls, self.flag_calls, self.parent_calls = [], [], []
+        self.reader = wc.WindowsCollector(self.home, hostname='example-pc', process_reader=self.process,
+                                         parent_reader=self.parent_map, flags_reader=self.flags)
+        self.child = self.home / '.local/bin/claude.exe'
+        self.programs = self.home / 'Program Files'
+        self.shell = self.programs / 'WindowsApps/Microsoft.PowerShell_7.6.6.0_x64__8wekyb3d8bbwe/pwsh.exe'
+        for path in (self.child, self.shell, self.reader.binary):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.touch()
+        self.processes = {300: {'pid': 300, 'start': str(self.stamp), 'exe': str(self.child)},
+                          200: {'pid': 200, 'start': str(self.stamp - 100), 'exe': str(self.shell)},
+                          100: {'pid': 100, 'start': str(self.stamp - 200), 'exe': str(self.reader.binary)}}
+        env = patch.dict(wc.os.environ, {'ProgramFiles': str(self.programs), 'SystemRoot': str(self.home / 'Windows')})
+        env.start()
+        self.addCleanup(env.stop)
+        self.sid = str(uuid.uuid4())
+        self.registry = self.reader.claude_home / 'sessions/300.json'
+        self.registry.parent.mkdir(parents=True)
+        self.row = {'pid': 300, 'sessionId': self.sid, 'procStart': str(self.stamp), 'pidDomain': 'win32:example-pc',
+                    'kind': 'interactive', 'entrypoint': 'sdk-cli', 'status': 'busy',
+                    'cwd': str(self.home / 'Projects/review'), 'name': 'example-review'}
+        self.registry.write_text(json.dumps(self.row), encoding='utf-8')
+
+    def process(self, pid):
+        self.calls.append(pid)
+        return dict(self.processes[pid]) if pid in self.processes else None
+
+    def parent_map(self, deadline):
+        self.parent_calls.append(deadline)
+        return self.parents
+
+    def flags(self, expected, deadline):
+        self.flag_calls.append(expected['pid'])
+        return {'print': True, 'noSessionPersistence': True}
+
+    def test_exact_agent_shell_child_has_origin_and_readable_nonpersistent_notice(self):
+        row = self.reader.claude_rows()[0]
+        self.assertEqual((row['id'], row['sessionId'], row['home']), (self.sid, self.sid, '.claude'))
+        self.assertEqual((row['initiator'], row['initiatorEvidence'], row['initiatorName']),
+                         ('agent', 'process_ancestry', 'Codex'))
+        self.assertEqual((row['executionMode'], row['transcriptAvailability']), ('one-shot', 'disabled'))
+        self.assertTrue(row['canRead'])
+        self.assertEqual(row['phase'], 'working')
+        result = self.reader.read('claude', self.sid)
+        self.assertEqual(result['messages'], [])
+        self.assertEqual(result['historyNotice'], wc.NOT_PERSISTED)
+        self.assertTrue(result['runtimeKnown'])
+        self.assertTrue(result['readOnly'])
+
+    def test_verified_native_claude_parent_is_named_claude_code(self):
+        self.parents = {300: 100}
+        self.processes[100]['exe'] = str(self.child)
+        self.assertEqual(self.reader.claude_rows()[0]['initiatorName'], 'Claude Code')
+
+    def test_same_named_untrusted_native_parent_is_not_an_agent(self):
+        for name in ('codex.exe', 'claude.exe', 'other.exe'):
+            executable = self.home / 'Projects' / name
+            executable.parent.mkdir(exist_ok=True)
+            executable.touch()
+            self.processes[100]['exe'] = str(executable)
+            with self.subTest(name=name):
+                self.assertEqual(self.reader.claude_rows()[0]['initiator'], 'unknown')
+
+    def test_print_and_sdk_registry_name_without_native_ancestor_do_not_prove_agent_origin(self):
+        self.parents = {300: 200}
+        row = self.reader.claude_rows()[0]
+        self.assertEqual(row['initiator'], 'unknown')
+        self.assertEqual(row['initiatorEvidence'], 'unknown')
+        self.assertEqual(row['executionMode'], 'one-shot')
+        self.assertEqual(self.reader.read('claude', self.sid)['historyNotice']['code'], 'not_persisted')
+
+    def test_reused_parent_pid_and_reversed_creation_order_are_unknown(self):
+        for pid in (100, 200):
+            previous = self.processes[pid]['start']
+            self.processes[pid]['start'] = str(self.stamp + 1)
+            with self.subTest(pid=pid):
+                self.assertEqual(self.reader.claude_rows()[0]['initiator'], 'unknown')
+            self.processes[pid]['start'] = previous
+
+    def test_ancestor_reuse_or_exit_during_readback_drops_origin(self):
+        for failure in ('reused', 'exited', 'different_exe'):
+            counts = {}
+            def racing(pid):
+                result = self.process(pid)
+                counts[pid] = counts.get(pid, 0) + 1
+                if pid == 100 and counts[pid] > 1:
+                    if failure == 'reused':
+                        result['start'] = str(self.stamp + 1)
+                    elif failure == 'different_exe':
+                        result['exe'] = str(self.child)
+                    else:
+                        return None
+                return result
+            self.reader.process_reader = racing
+            with self.subTest(failure=failure):
+                self.assertEqual(self.reader.claude_rows()[0]['initiator'], 'unknown')
+
+    def test_child_race_never_reports_nonpersistent_history(self):
+        count = 0
+        def racing(pid):
+            nonlocal count
+            result = self.process(pid)
+            if pid == 300:
+                count += 1
+                if count > 1:
+                    result['start'] = str(self.stamp + 1)
+            return result
+        self.reader.process_reader = racing
+        row = self.reader.claude_rows()[0]
+        self.assertFalse(row['runtimeKnown'])
+        self.assertEqual(row['phase'], 'unknown')
+        self.assertIsNone(row['status'])
+        self.assertNotIn('executionMode', row)
+        count = 0
+        with self.assertRaisesRegex(ValueError, '대화 기록'):
+            self.reader.read('claude', self.sid)
+
+    def test_registry_identity_mismatch_and_wrong_child_exe_skip_all_probes(self):
+        for change in ({'procStart': str(self.stamp - 1)}, {'pidDomain': 'win32:other-pc'}, {'pid': 301}):
+            self.registry.write_text(json.dumps({**self.row, **change}))
+            row = self.reader.claude_rows()[0]
+            self.assertNotIn('executionMode', row)
+            self.assertFalse(row['runtimeKnown'])
+        self.registry.write_text(json.dumps(self.row))
+        self.processes[300]['exe'] = str(self.reader.binary)
+        self.assertFalse(self.reader.claude_rows()[0]['runtimeKnown'])
+        self.assertEqual(self.flag_calls, [])
+        self.assertEqual(self.parent_calls, [])
+
+    def test_duplicate_registry_never_claims_nonpersistent_history(self):
+        self.processes[301] = {**self.processes[300], 'pid': 301}
+        self.registry.with_name('301.json').write_text(json.dumps({**self.row, 'pid': 301}))
+        with self.assertRaisesRegex(ValueError, '대화 기록'):
+            self.reader.read('claude', self.sid)
+        self.assertEqual(self.flag_calls, [])
+
+    def test_existing_saved_transcript_takes_precedence(self):
+        path = self.reader.claude_home / 'projects/example' / (self.sid + '.jsonl')
+        path.parent.mkdir(parents=True)
+        path.write_text(json.dumps({'type': 'assistant', 'uuid': 'message', 'message': {'content': 'saved example'}}))
+        result = self.reader.read('claude', self.sid)
+        self.assertEqual(result['messages'][0]['text'], 'saved example')
+        self.assertNotIn('historyNotice', result)
+
+    def test_missing_unknown_history_still_errors(self):
+        for flags in ({}, {'print': True}, {'noSessionPersistence': True}, {'print': True, 'noSessionPersistence': False}):
+            self.reader.flags_reader = lambda *unused: flags
+            with self.subTest(flags=flags), self.assertRaisesRegex(ValueError, '대화 기록'):
+                self.reader.read('claude', self.sid)
+
+    def test_probe_limit_is_per_snapshot_and_targeted_read_still_works(self):
+        self.parents = {}
+        for index in range(wc.CLAUDE_PROBE_LIMIT + 2):
+            pid = 400 + index
+            self.processes[pid] = {**self.processes[300], 'pid': pid}
+            sid = str(uuid.uuid4())
+            self.registry.with_name(str(pid) + '.json').write_text(json.dumps({**self.row, 'pid': pid, 'sessionId': sid}))
+        rows = self.reader.claude_rows()
+        self.assertEqual(len(self.flag_calls), wc.CLAUDE_PROBE_LIMIT)
+        self.assertEqual(len(self.parent_calls), 1)
+        skipped = next(row for row in rows if not row['canRead'])
+        self.assertEqual(self.reader.read('claude', skipped['id'])['historyNotice']['code'], 'not_persisted')
+
+    def test_expired_budget_stops_followups_without_losing_rows(self):
+        self.reader.parent_reader = lambda deadline: self.parents
+        with patch.object(wc.time, 'monotonic', side_effect=[0, 0, 3]):
+            row = self.reader.claude_rows()[0]
+        self.assertEqual(row['id'], self.sid)
+        self.assertNotIn('executionMode', row)
+        self.assertEqual(self.flag_calls, [])
+
+    def test_ancestry_cycles_and_unknown_intermediate_executable_fail_closed(self):
+        self.parents = {300: 200, 200: 300}
+        self.assertEqual(self.reader.claude_rows()[0]['initiator'], 'unknown')
+        self.parents = {300: 200, 200: 100}
+        unknown = self.home / 'Projects/pwsh.exe'
+        unknown.parent.mkdir(exist_ok=True)
+        unknown.touch()
+        self.processes[200]['exe'] = str(unknown)
+        self.assertEqual(self.reader.claude_rows()[0]['initiator'], 'unknown')
+
+    def test_flags_output_cannot_leak_prompt_or_raw_command_line(self):
+        secret = 'EXAMPLE_PRIVATE_PROMPT_DO_NOT_OUTPUT'
+        raw = ['claude.exe', '-p', '--model', 'opus', '--no-session-persistence', '--output-format', 'json', secret]
+        self.reader.flags_reader = lambda *unused: wc._claude_options(raw)
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output), contextlib.redirect_stderr(output):
+            data = {'rows': self.reader.claude_rows(), 'read': self.reader.read('claude', self.sid)}
+        self.assertNotIn(secret, json.dumps(data))
+        self.assertEqual(output.getvalue(), '')
+        self.assertFalse(any(key in data['rows'][0] for key in ('argv', 'commandLine', 'environment', 'parentPid')))
+
+
+class ClaudeFlagParserTest(unittest.TestCase):
+    def test_options_are_parsed_before_prompt_and_known_values_are_not_flags(self):
+        args = ['claude.exe', '-p', '--model', 'opus', '--no-session-persistence', '--output-format=json']
+        self.assertEqual(wc._claude_options(args), {'print': True, 'noSessionPersistence': True})
+        for args in (['claude.exe', '-p', '--', '--no-session-persistence'],
+                     ['claude.exe', '-p', 'prompt', '--no-session-persistence'],
+                     ['claude.exe', '-p', '--system-prompt', '--no-session-persistence'],
+                     ['claude.exe', '-p', '--append-system-prompt=--no-session-persistence'],
+                     ['claude.exe', '-p', 'prompt mentioning --no-session-persistence'],
+                     ['claude.exe', '-p', '--unknown-value-option', '--no-session-persistence']):
+            with self.subTest(args=args):
+                self.assertFalse(wc._claude_options(args).get('noSessionPersistence'))
+        self.assertFalse(wc._claude_options(['claude.exe', '--model', '-p']).get('print'))
+
+    def test_exact_handle_rechecked_before_and_after_flag_read(self):
+        expected = {'pid': 123, 'start': '134360000000003000', 'exe': 'C:/Users/example/.local/bin/claude.exe'}
+        reused = {**expected, 'start': '134360000000003001'}
+        for identities, query_count in (([reused], 0), ([expected, reused], 1), ([expected, None], 1)):
+            from unittest.mock import Mock
+            kernel = Mock()
+            kernel.OpenProcess.return_value = 456
+            with patch.object(wc.os, 'name', 'nt'), patch.object(wc, '_process_api', return_value=kernel), \
+                 patch.object(wc, '_process_identity', side_effect=identities), \
+                 patch.object(wc, '_query_claude_flags', return_value={'print': True, 'noSessionPersistence': True}) as query:
+                self.assertEqual(wc._claude_flags(expected, time.monotonic() + 1), {})
+                self.assertEqual(query.call_count, query_count)
+                kernel.CloseHandle.assert_called_once_with(456)
+
+
 class WindowsCollectorTest(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()

@@ -17,6 +17,8 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import chat_preview_fixture as fixture
 
+ONE_SHOT_HISTORY = {'code': 'not_persisted', 'message': '대화 기록을 저장하지 않는 일회성 실행입니다. 실행 상태를 확인하고 결과는 요청한 에이전트에서 확인해 주세요.'}
+
 
 class AutomaticPreviewNative(fixture.FakeNative):
     def __init__(self, rows):
@@ -51,11 +53,24 @@ class AutomaticPreviewNative(fixture.FakeNative):
                              'account': '검증 계정', 'project': '합성 재개 검수', 'updatedAt': now - number,
                              'fixtureHost': 'local', 'fixtureClosedByBoard': closed_by_board,
                              'initiator': 'human', 'initiatorEvidence': 'explicit', 'source': 'vscode'})
+        if os.environ.get('SESSIONHOLIC_ONESHOT_PREVIEW') == '1':
+            cwd = directory / 'workspace-oneshot'; cwd.mkdir(exist_ok=True, mode=0o700)
+            rows.append({'id': 'oneshot-native-000106', 'agent': 'claude', 'home': '.claude',
+                         'sessionId': 'oneshot-native-000106', 'title': '일회성 리뷰 실행 샘플',
+                         'phase': 'working', 'runtimeKnown': True, 'readOnly': True,
+                         'cwd': str(cwd), 'kind': 'background', 'account': '검증 Claude',
+                         'project': '합성 일회성 검수', 'updatedAt': now, 'fixtureHost': 'local',
+                         'initiator': 'agent', 'initiatorName': 'Codex', 'initiatorEvidence': 'process_ancestry',
+                         'executionMode': 'one-shot', 'transcriptAvailability': 'disabled',
+                         'historyNotice': copy.deepcopy(ONE_SHOT_HISTORY)})
         super().__init__(rows)
         self.control_calls = []
         self.control_receipts = {}
         self.control_proofs = {}
         for index, row in enumerate(rows):
+            if row.get('executionMode') == 'one-shot':
+                self.messages[row['id']] = []
+                continue
             self.messages[row['id']][0]['text'] = row['title']
             work = {'title': row['title'], 'current': '합성 화면에서 진행 상황을 확인하고 있어요.'}
             if index == 0:
@@ -78,6 +93,10 @@ class AutomaticPreviewNative(fixture.FakeNative):
             result = super().rpc(host, command, payload, timeout)
             if command == 'chat' and payload.get('action') == 'read' and self.rows[payload['source']['id']]['phase'] == 'closed':
                 result['capabilities'] = {'canSend': False, 'reason': '연결이 끝난 합성 세션입니다.'}
+            if command == 'chat' and payload.get('action') == 'read' and self.rows[payload['source']['id']].get('executionMode') == 'one-shot':
+                result.update(messages=[], executionMode='one-shot', transcriptAvailability='disabled',
+                              historyNotice=copy.deepcopy(ONE_SHOT_HISTORY), readOnly=True,
+                              capabilities={'canSend': False, 'reason': '일회성 실행에는 후속 메시지를 보낼 수 없습니다.'})
             return result
         source = payload['source']; row = self.rows[source['id']]
         if source.get('agent') != row['agent'] or source.get('home') != row['home'] or host['name'] != row['fixtureHost']:
@@ -95,7 +114,7 @@ class AutomaticPreviewNative(fixture.FakeNative):
                             'interrupt': {'supported': row['agent'] == 'codex' and row['phase'] == 'working',
                                           'reason': None if row['agent'] == 'codex' and row['phase'] == 'working' else '현재 합성 세션은 응답 중단을 지원하지 않습니다.'},
                             'terminate': {'supported': row['phase'] != 'closed', 'reason': None,
-                                          'effect': '선택한 세션과 하위 에이전트를 종료하고 대화 기록을 보관합니다.'}}}
+                                          'effect': '선택한 원본 일회성 실행을 종료합니다.' if row.get('executionMode') == 'one-shot' else '선택한 세션과 하위 에이전트를 종료하고 대화 기록을 보관합니다.'}}}
             rid = payload['requestId']
             if rid in self.control_receipts:
                 return copy.deepcopy(self.control_receipts[rid])
@@ -161,6 +180,9 @@ def main():
         fake = httpd.workflow.transfers.rpc.__self__
         httpd.bot_requests = SyntheticBotRequests(fake)
         httpd.workflow.bot_requests = httpd.bot_requests
+        if os.environ.get('SESSIONHOLIC_ONESHOT_PREVIEW') == '1':
+            httpd.board.hosts[0]['label'] = '합성 Windows PC'
+            httpd.board.state['local']['label'] = '합성 Windows PC'
         offline = {'name': 'offline-demo', 'label': '오프라인 샘플', 'local': True}
         httpd.board.hosts.append(offline)
         httpd.board.host_locks[offline['name']] = threading.Lock()
@@ -177,7 +199,10 @@ def main():
                 return snapshot(host['name'])
             if command[0] == 'read':
                 row = fake.rows[command[2]]
-                return {'messages': copy.deepcopy(fake.messages[row['id']]), 'phase': row['phase']}
+                result = {'messages': copy.deepcopy(fake.messages[row['id']]), 'phase': row['phase']}
+                if row.get('executionMode') == 'one-shot':
+                    result.update(executionMode='one-shot', transcriptAvailability='disabled', historyNotice=copy.deepcopy(ONE_SHOT_HISTORY), readOnly=True)
+                return result
             raise ValueError('합성 수집 범위 밖입니다.')
 
         httpd.board.runner = synthetic_runner

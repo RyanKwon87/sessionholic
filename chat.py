@@ -450,6 +450,17 @@ class Chat:
             response['recovery'] = recovery
         if result.get('conversationUnavailable'):
             response['conversationUnavailable'] = True
+        if claude and result.get('executionMode') == 'one-shot':
+            response.update(executionMode='one-shot',
+                            readOnly=True, prompt=None, promptOpenable=False, requiresNativeTerminal=False)
+            response['capability'] = {'supported': False, 'attachments': False,
+                                      'reason': '일회성 작업은 후속 대화를 받지 않습니다. 요청한 에이전트에서 이어가 주세요.'}
+            notice = result.get('historyNotice')
+            if (result.get('transcriptAvailability') == 'disabled'
+                    and isinstance(notice, dict) and notice.get('code') == 'not_persisted'):
+                response.update(historyNotice={'code': 'not_persisted',
+                                'message': '대화 기록을 저장하지 않는 일회성 실행입니다. 실행 상태를 확인하고 결과는 요청한 에이전트에서 확인해 주세요.'},
+                                transcriptAvailability='disabled')
         bot_lookup = getattr(self.workflow, 'bot_request', None)
         if bot_lookup is not None and bot_lookup(source):
             response.update(readOnly=True, recovery=None, prompt=None, promptOpenable=False)

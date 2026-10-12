@@ -221,7 +221,7 @@ class ServerTest(unittest.TestCase):
             self.assertEqual(res.getheader("Vary"), "Accept-Encoding")
             self.assertEqual(res.getheader("Cache-Control"), "no-store")
             self.assertEqual(int(res.getheader("Content-Length")), len(data))
-            served = {**large, "bootId": self.httpd.boot_id}
+            served = {**large, "sessionLabels": {"ok": True, "revision": 0}, "bootId": self.httpd.boot_id}
             self.assertEqual(json.loads(gzip.decompress(data)), served)
             for header in ({}, {"Accept-Encoding": "gzip;q=0"}, {"Accept-Encoding": "identity"}):
                 res, data = self.request("GET", "/api/snapshot", headers={"Authorization": "Bearer " + TOKEN, **header})

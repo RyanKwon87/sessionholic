@@ -22,7 +22,7 @@
     return Object.hasOwn(ORIGINS, value) ? value : 'unknown';
   }
   function sessionText(session) {
-    return [session.title, session.project, session.host, session.hostLabel, session.agent,
+    return [session.title, session.originalTitle, session.project, session.host, session.hostLabel, session.agent,
       ORIGINS[originOf(session)], session.initiatorName].join(' ');
   }
   function linkedSessions(goal, sessions) {

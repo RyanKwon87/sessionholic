@@ -6555,6 +6555,15 @@ input.switch:focus-visible {
 /* Recovery is an explicit user action and stays available in focused reading. */
 .conversation-actions { display: flex; align-items: center; gap: 8px; min-width: 0; }
 .conversation-actions button { min-height: 44px; white-space: nowrap; }
+.conversation-bar { flex-wrap: wrap; gap: 0 12px; }
+.conversation-actions { flex-wrap: wrap; margin-left: auto; }
+.session-label-body > label { display: block; margin-bottom: 8px; font-size: var(--fs-sub); font-weight: 600; }
+.session-label-body > input { width: 100%; min-width: 0; min-height: 44px; padding: 10px 12px; border: 1px solid var(--sep); border-radius: var(--radius-s); background: var(--fill-soft); color: var(--label); font: inherit; }
+.session-label-body > input::placeholder { color: var(--label-2); opacity: 1; }
+.session-label-body .muted, .session-label-original { margin: 12px 0; color: var(--label-2); font-size: var(--fs-sub); line-height: 1.5; overflow-wrap: anywhere; }
+.session-label-body > button { min-height: 44px; padding: 8px 0; color: var(--accent-strong); text-align: left; }
+.session-label-body > button:disabled { color: var(--label-3); }
+@media (max-width: 700px) { .session-label-dialog { width: 100%; } }
 .chat-recovery { display: flex; align-items: center; flex-wrap: wrap; gap: 8px 12px; min-width: 0; }
 .chat-recovery[hidden] { display: none; }
 .chat-recovery .chat-terminal-gate-text { flex: 1 1 170px; }
@@ -6583,3 +6592,10 @@ input.switch:focus-visible {
 .bot-request-metadata dt { color: var(--label-2); }
 .bot-request-metadata dd { margin: 0; overflow-wrap: anywhere; }
 .bot-native-note { margin-top: 20px; font-size: var(--fs-sub); line-height: 1.6; color: var(--label-2); }
+
+/* Non-persistent runs have an execution state, without a saved conversation. */
+.card-execution, .detail-execution { color: var(--label-2); font-size: var(--fs-cap); }
+.card-execution { flex: none; white-space: nowrap; }
+.conversation-history-notice { padding: 20px; border-radius: 12px; background: var(--fill-soft); color: var(--label); line-height: 1.65; overflow-wrap: anywhere; }
+.conversation-history-notice strong { font-size: var(--fs-body); }
+.conversation-history-notice p { margin: 8px 0 0; color: var(--label-2); font-size: var(--fs-sub); }

@@ -1626,10 +1626,13 @@ class Workflow:
         if same and source["agent"] == "claude" and source.get("kind") != "background" and not windows:
             allowed, reason = False, "이 Claude 세션은 기존 터미널에서 실행 중입니다. 백그라운드 세션만 직접 연결할 수 있어요."
         windows_resumed = False
+        route_key = hashlib.sha256(json.dumps([self.identity(source), target], sort_keys=True).encode()).hexdigest()
+        existing = next((item for item in self.terminals.list() if item.get("alive") and item.get("key", "").split(":")[0] == route_key), None)
         if allowed and resume:
             preview = self.resume_preview(source)
             allowed, reason = preview["allowed"], preview.get("reason")
-        elif allowed and windows:
+        elif allowed and windows and not existing:
+            # A PC conversation resumed in an open board terminal now runs there: that one is reopened.
             try:
                 spec = self.transfers.rpc(host, "terminal_plan", {"source": source}, timeout=12)
                 windows_resumed = spec.get("resumed") is True
@@ -1653,8 +1656,6 @@ class Workflow:
                    "기존 작업의 터미널에 연결합니다." if same else "작업 맥락을 자동으로 넘겨 새 터미널을 준비합니다.")
         if windows_resumed:
             summary = "PC에 저장된 대화를 그 PC의 터미널에서 다시 엽니다. 메시지는 보내지 않습니다."
-        route_key = hashlib.sha256(json.dumps([self.identity(source), target], sort_keys=True).encode()).hexdigest()
-        existing = next((item for item in self.terminals.list() if item.get("alive") and item.get("key", "").split(":")[0] == route_key), None)
         if allowed and existing:
             mode, summary = "reconnect", "이미 열어 둔 터미널에 다시 연결합니다."
             if not same:

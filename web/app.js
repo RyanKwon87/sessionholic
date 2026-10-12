@@ -5621,6 +5621,14 @@ function terminalCloseCopy(terminal) {
     ended: "새 세션의 실행이 종료되었습니다. 대화 기록은 보드의 작업 목록에서 확인하세요.",
     done: "새 세션의 실행을 종료했습니다. 대화 기록은 보드의 작업 목록에서 확인하세요.",
   };
+  // A PC conversation resumed in this terminal runs in it: closing it ends that run.
+  if (mode === "resume") return {
+    action: "실행 종료", title: "이 터미널의 실행을 종료할까요?", danger: true,
+    description: "이 보드에서 다시 연 대화의 실행을 종료합니다. 진행 중인 응답이 중단될 수 있고, 대화 기록은 남습니다.",
+    context: "저장된 대화를 이 보드 터미널에서 다시 열었습니다. 보드로 돌아가거나 브라우저를 닫아도 실행은 유지됩니다.",
+    ended: "다시 연 대화의 실행이 종료되었습니다. 대화 기록은 보드의 작업 목록에서 확인하세요.",
+    done: "다시 연 대화의 실행을 종료했습니다. 대화 기록은 보드의 작업 목록에서 확인하세요.",
+  };
   if (mode === "handoff" || mode === "transfer") return {
     action: "실행 종료", title: "이 터미널의 실행을 종료할까요?", danger: true,
     description: "이 보드에서 새로 시작한 작업을 종료합니다. 진행 중인 응답이 중단될 수 있고, 대화 기록은 남습니다. 이어서 하려면 실행 기기의 최근 작업을 선택하세요.",

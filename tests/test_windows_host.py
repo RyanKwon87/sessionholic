@@ -236,6 +236,23 @@ class WindowsRoutingTest(unittest.TestCase):
         self.assertEqual(rpc.call_args.args[1], 'terminal_plan')
         self.terms.reserve.assert_not_called()
 
+    def test_a_pc_conversation_resumed_in_a_board_terminal_is_reopened_not_resumed_again(self):
+        import hashlib
+        target = {'host': HOST['name'], 'agent': 'claude', 'account': 'claude:default'}
+        with patch.object(self.flow.transfers, 'rpc', return_value={'argv': ['fixture'], 'cwd': ROW['cwd'], 'resumed': True}) as rpc, \
+                patch.object(server.shutil, 'which', return_value='/fixture/tmux'):
+            first = self.flow.plan({'source': CLAUDE_REF, 'target': target})
+            self.assertEqual((first['mode'], first['allowed']), ('attach', True))
+            self.assertIn('PC에 저장된 대화', first['summary'])
+            # It now runs in that terminal, so the PC would refuse a second resume.
+            key = hashlib.sha256(json.dumps([self.flow.identity(self.board.source(CLAUDE_REF)), target],
+                                            sort_keys=True).encode()).hexdigest()
+            self.terms.list = lambda: [{'alive': True, 'key': key + ':fixture'}]
+            rpc.side_effect = ValueError('이 Claude 세션은 PC 터미널에서 실행 중입니다.')
+            again = self.flow.plan({'source': CLAUDE_REF, 'target': target})
+        self.assertEqual((again['mode'], again['allowed']), ('reconnect', True))
+        self.assertEqual(rpc.call_count, 1)
+
     def test_cross_host_or_account_plan_remains_unsupported(self):
         with self.assertRaisesRegex(ValueError, REASON):
             self.flow.plan({'source': REF, 'target': {'host': HOST['name'], 'agent': 'codex', 'account': 'codex:.codex-other'}})

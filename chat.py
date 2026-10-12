@@ -18,9 +18,9 @@ CLAUDE_BLOCKED = ('Claude 터미널에 승인·선택 메뉴가 떠 있어 보�
 CLAUDE_WINDOWS = ('Windows PC의 Claude 백그라운드 세션은 보드에서 입력할 수 없습니다. '
                   '그 PC의 터미널에서 이어 주세요.')
 # A PC Claude conversation takes input through the board terminal it was resumed in
-# (windows_runtime._claude_resume): only one no PC process still runs.
-CLAUDE_WINDOWS_OPEN = ('보내려면 먼저 터미널에서 이어 여세요. 그 PC에서 아직 실행 중이면 '
-                       '그 PC의 터미널에서 이어 주세요.')
+# (windows_runtime._claude_resume), which opens only while no PC process runs it.
+CLAUDE_WINDOWS_OPEN = ('보내려면 먼저 터미널을 열어 이 대화를 이어 주세요. 그 PC에서 아직 실행 중이면 '
+                       '그 PC의 터미널에서 입력해 주세요.')
 CLAUDE_EXTERNAL = ('이 Claude 세션은 보드 밖 터미널에서 실행 중이라 웹에서 입력할 수 없습니다. '
                    '그 터미널에서 입력하거나 백그라운드 세션(claude --bg)으로 실행해 주세요.')
 # A background session takes web input only through a board terminal the user opened.

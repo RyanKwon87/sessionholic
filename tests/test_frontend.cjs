@@ -7430,6 +7430,11 @@ test('opening a new session posts once per host and request, then opens its term
   assert.ok(c.state.terminals.some((item) => item.id === terminal.id));
   assert.equal(c.terminalCloseCopy(terminal).action, '실행 종료');
   assert.equal(c.terminalCloseCopy(terminal).danger, true);
+  // A PC conversation resumed in a board terminal runs there: closing it ends the run.
+  const resumed = c.terminalCloseCopy({ metadata: { mode: 'resume', launchMode: 'attach' } });
+  assert.equal(resumed.action, '실행 종료');
+  assert.equal(resumed.danger, true);
+  assert.match(resumed.description, /다시 연 대화/);
 });
 
 // The conversation keeps its newest message in view (pinnedToEnd, keepAtEnd).

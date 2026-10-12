@@ -332,6 +332,10 @@ def queued_prompt(entry):
     return prompt if isinstance(prompt, list) else None
 
 
+def evidence_id(value):
+    return value if isinstance(value, str) and re.fullmatch(r"[A-Za-z0-9_.:-]{1,256}", value) else None
+
+
 def claude_messages(entries):
     out = []
     # Queued input since the last answer; an interrupt hands it back to the input line, and
@@ -379,6 +383,11 @@ def claude_messages(entries):
                 attachment_row = {"role": "user", "text": "[이미지 첨부]" if all(a["kind"] == "image" for a in attached) else "[파일 첨부]", "ts": ts}
                 out.append(attachment_row)
             attachment_row["attachments"] = attached
+        for row in out[start:]:
+            if evidence_id(entry.get("uuid")):
+                row["messageId"] = entry["uuid"]
+            if evidence_id(entry.get("parentUuid")):
+                row["parentMessageId"] = entry["parentUuid"]
         if kind == "assistant":
             queued = []
         elif attachment_row is not None:
@@ -1019,6 +1028,15 @@ def codex_messages(turns):
         if not isinstance(turn, dict):
             continue
         for _item, rows in codex_turn_rows(turn):
+            for row in rows:
+                if evidence_id(turn.get("id")):
+                    row["turnId"] = turn["id"]
+                if isinstance(turn.get("status"), str):
+                    row["turnStatus"] = turn["status"]
+                if evidence_id(_item.get("id")):
+                    row["messageId"] = _item["id"]
+                if _item.get("phase") in ("commentary", "final_answer"):
+                    row["phase"] = _item["phase"]
             out.extend(rows)
     return out[-MESSAGE_LIMIT:]
 
@@ -1100,8 +1118,16 @@ def read(agent, session_id, home_key=None):
         except (OSError, RpcError) as exc:
             return {"messages": [], "error": "Codex 대화를 읽지 못했습니다: " + str(exc)}
         thread = result.get("thread") if isinstance(result, dict) else None
+        if not isinstance(thread, dict) or thread.get("id") != session_id:
+            return {"messages": [], "error": "요청한 Codex 대화의 식별자를 확인하지 못했습니다."}
         turns = thread.get("turns") if isinstance(thread, dict) else None
-        return {"messages": codex_messages(turns if isinstance(turns, list) else [])}
+        status = thread.get("status") or {}
+        status = status if isinstance(status, dict) else {"type": status}
+        flags = status.get("activeFlags") or []
+        phase = {"active": "needs_input" if flags else "working", "idle": "idle", "notLoaded": "unavailable"}.get(status.get("type"), "unavailable")
+        return {"messages": codex_messages(turns if isinstance(turns, list) else []),
+                "phase": phase, "activeFlags": flags, "updatedAt": thread.get("updatedAt"),
+                "turns": [{"id": turn.get("id"), "status": turn.get("status")} for turn in (turns or []) if isinstance(turn, dict)]}
     raise ValueError("지원하지 않는 에이전트입니다.")
 
 

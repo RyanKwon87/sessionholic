@@ -5251,7 +5251,7 @@ select:disabled {
   grid-template-areas:
     "title chevron"
     "snippet chevron"
-    "initiator chevron"
+    "provenance chevron"
     "goals chevron"
     "meta chevron";
   align-items: center;
@@ -6504,3 +6504,39 @@ input.switch:focus-visible {
   transform: rotate(45deg);
 }
 .detail-head .back::after { content: none; }
+.session-control-dialog { width: min(520px, calc(100vw - 32px)); }
+.session-control-body h3 { margin: 0 0 8px; overflow-wrap: anywhere; }
+.session-control-status { padding: 12px 0; line-height: 1.5; }
+.session-control-actions { display: grid; gap: 12px; }
+.session-control-row { padding: 12px 0; border-top: 1px solid var(--sep); }
+.session-control-body .muted { margin: 8px 0; font-size: 13px; line-height: 1.5; }
+.session-control-confirmation { margin-top: 20px; padding-top: 16px; border-top: 1px solid var(--sep); }
+.session-control-confirmation button { margin: 8px 8px 0 0; min-height: 44px; }
+.session-control-dialog .danger { color: var(--red); }
+
+/* Keep full-width work links on their own row; they must never consume the
+   conversation title's flexible width. The same grid survives focus mode. */
+.detail-head {
+  display: grid;
+  grid-template-columns: 44px minmax(0, 1fr) auto;
+  align-items: start;
+  gap: 4px 12px;
+}
+.detail-head > .back { grid-column: 1; grid-row: 1; }
+.detail-head > .detail-titles { grid-column: 2; grid-row: 1; }
+.detail-head > .focus-toggle { grid-column: 3; grid-row: 1; }
+.detail-meta > span { min-width: 0; overflow-wrap: anywhere; }
+.card-provenance { grid-area: provenance; display: flex; align-items: center; flex-wrap: wrap; gap: 4px 8px; min-width: 0; margin-top: 3px; }
+.card-device { display: inline-flex; align-items: center; gap: 5px; max-width: 100%; padding: 3px 6px; border-radius: 6px; background: var(--fill); color: var(--label); font-size: var(--fs-cap); font-weight: 600; line-height: 1.3; }
+.card-device-icon, .card-device-icon svg { display: block; width: 15px; height: 15px; flex: none; }
+.card-device-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.card-provenance .card-initiator { min-width: 0; }
+@media (max-width: 700px) {
+  .detail-head { column-gap: 6px; }
+  .card-device { padding: 4px 7px; }
+}
+
+.session-control-body { padding-bottom: max(16px, env(safe-area-inset-bottom)); }
+@media (max-width: 700px) {
+  .session-control-dialog { width: 100%; }
+}

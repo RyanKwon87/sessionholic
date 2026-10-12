@@ -1936,7 +1936,7 @@ test('online recovery reads one selected state and snapshot without resending un
   }, noChatTimers);
   const { s, entry } = selectChat(c); snapshot = c.state.snapshot;
   c.state.detailFor = s.key; c.state.detailUpdatedAt = s.updatedAt;
-  c.state.detailRevision = JSON.stringify([false, undefined, undefined, undefined, '현재 계정 설정', 'Workstation', undefined, null, null, undefined, undefined, undefined, undefined]);
+  c.state.detailRevision = vm.runInContext('detailRevision', c.context)(c.allSessions().find((item) => item.key === s.key));
   c.state.capabilities = {}; c.state.capabilitiesRevision = c.capabilitiesRevision(c.state.snapshot);
   entry.pending = { requestId: 'unknown-request', revision: entry.revision }; entry.text = '전송 결과 모르는 초안';
   c.state.offline = true; c.context.navigator = { onLine: true };
@@ -2119,7 +2119,7 @@ test('offline visibility and return-online events restart only bounded reads and
   await new Promise((resolve) => setImmediate(resolve));
   const { s, entry } = selectChat(c);
   c.state.detailFor = s.key; c.state.detailUpdatedAt = s.updatedAt;
-  c.state.detailRevision = JSON.stringify([false, undefined, undefined, undefined, '현재 계정 설정', 'Workstation', undefined, null, null, undefined, undefined, undefined, undefined]);
+  c.state.detailRevision = vm.runInContext('detailRevision', c.context)(c.allSessions().find((item) => item.key === s.key));
   c.state.capabilities = {}; c.state.capabilitiesRevision = c.capabilitiesRevision(c.state.snapshot);
   entry.text = '미전송 초안';
   c.windowEvents.offline(); assert.equal(c.state.offline, true);
@@ -3092,7 +3092,7 @@ test('recent cards give project and full task separate priority while retaining 
   const card = byClass(c.get('groups'), 'card')[0];
   assert.equal(card.tagName, 'BUTTON'); assert.equal(card.type, 'button');
   // Three short lines: title, preview, then status · agent · project · time.
-  assert.deepEqual(card.children.map((child) => child.className), ['card-title', 'card-snippet', 'card-initiator', 'card-goals', 'card-meta', 'card-chevron']);
+  assert.deepEqual(card.children.map((child) => child.className), ['card-title', 'card-snippet', 'card-provenance', 'card-goals', 'card-meta', 'card-chevron']);
   assert.equal(byClass(card, 'card-title')[0].textContent, title.trim());
   assert.equal(byClass(card, 'card-snippet')[0].hidden, true);
   const meta = byClass(card, 'card-meta')[0];
@@ -3104,7 +3104,10 @@ test('recent cards give project and full task separate priority while retaining 
   assert.equal(card.attributes['aria-pressed'], 'true');
   assert.equal(byClass(card, 'agent').length, 0);
   assert.equal(byClass(card, 'card-agent')[0].textContent, 'Codex');
-  // Device and account move to the accessible name and the conversation header.
+  // Device gets an independent readable badge; the initiator stays separate.
+  assert.equal(byClass(card, 'card-device-label')[0].textContent, 'Workstation');
+  assert.equal(byClass(card, 'card-device-icon')[0].attributes['aria-hidden'], 'true');
+  assert.equal(byClass(card, 'card-initiator')[0].textContent, '출처 미확인');
   assert.match(textOf(card), /Workstation.*출처 미확인/);
   assert.doesNotMatch(textOf(card), /Sample profile/);
   assert.equal(calls, 0); assert.equal(c.state.chats.size, 0);
@@ -4178,7 +4181,7 @@ test('live updates follow the open conversation, reread only on newer events, sl
   c.state.capabilitiesRevision = c.capabilitiesRevision(c.state.snapshot);
   c.state.usageAt = Date.now();
   c.state.detailFor = s.key; c.state.detailUpdatedAt = s.updatedAt;
-  c.state.detailRevision = JSON.stringify([false, undefined, undefined, undefined, '현재 계정 설정', 'Workstation', undefined, null, null, undefined, undefined, undefined, undefined]);
+  c.state.detailRevision = vm.runInContext('detailRevision', c.context)(c.allSessions().find((item) => item.key === s.key));
   c.syncEvents();
   assert.equal(sources.length, 1);
   assert.equal(sources[0].url, '/api/events?host=workstation&agent=codex&home=.codex-example&id=native-session');
@@ -5089,7 +5092,7 @@ test('a swipe offers 터미널 열기, or 연결 닫기 when the session has a b
   assert.equal(c.get('close-terminal-confirm').textContent, '실행 종료');
   c.cancelTerminalClose();
   c.openCardMenu(row);
-  assert.deepEqual(c.get('action-list').children.map((item) => item.textContent), ['대화 열기', '터미널로 돌아가기', '실행 종료']);
+  assert.deepEqual(c.get('action-list').children.map((item) => item.textContent), ['대화 열기', '세션 관리', '터미널로 돌아가기', '실행 종료']);
   // A vertical drag is a scroll: no swipe, no menu.
   groups.events.pointerdown({ target, pointerId: 4, pointerType: 'touch', clientX: 300, clientY: 100 });
   groups.events.pointermove({ target, pointerId: 4, clientX: 296, clientY: 130, cancelable: true, preventDefault() {} });
@@ -7114,4 +7117,28 @@ test('Ctrl or Command K focuses the visible unified search without submitting a 
   assert.equal(c.get('search').focusCount, 1); assert.equal(prevented, 1);
   c.documentKeydown({ key: 'k', metaKey: true, isComposing: true, preventDefault() { prevented++; } });
   assert.equal(prevented, 1);
+});
+
+
+test('Windows 저장 기록의 실행 미확인은 기기 연결·과거 live phase와 별개로 표시한다', () => {
+  const c = client(undefined, noChatTimers);
+  const row = recentSession('windows-record', { host: 'windows-pc', phase: 'unknown', runtimeKnown: false, readOnly: true });
+  c.state.authenticated = true;
+  c.state.snapshot = { serverTime: 1100, hosts: [{ name: 'windows-pc', label: '작업실 PC', ok: true, fetchedAt: 1099, data: { codex: [row] } }] };
+  c.state.livePhases.set(row.key, { base: 'unknown', phase: 'working' });
+  const record = c.allSessions()[0];
+  assert.equal(record.phase, 'unknown'); assert.equal(record.stale, false); assert.equal(record.hostLabel, '작업실 PC');
+  c.renderGroups([record], 1100);
+  let card = byClass(c.get('groups'), 'card')[0];
+  assert.equal(byClass(card, 'badge')[0].textContent, '실행 확인 전');
+  assert.equal(byClass(card, 'card-device-label')[0].textContent, '작업실 PC');
+  assert.equal(byClass(card, 'stale-tag')[0].hidden, true, '실행 미확인을 오프라인으로 표시하지 않는다');
+  const detailMeta = vm.runInContext('detailMetaChildren', c.context)(record);
+  assert.equal(detailMeta[0].textContent, '실행 확인 전');
+  vm.runInContext('noteLivePhase', c.context)(record, { route: c.sourceOf(record), phase: 'idle' });
+  assert.equal(c.allSessions()[0].phase, 'unknown', '저장된 대화의 phase는 실행 상태의 증거가 아니다');
+  c.state.snapshot.hosts[0].ok = false;
+  c.renderGroups(c.allSessions(), 1100); card = byClass(c.get('groups'), 'card')[0];
+  assert.equal(byClass(card, 'badge')[0].textContent, '실행 확인 전');
+  assert.equal(byClass(card, 'stale-tag')[0].hidden, false, '기기 연결이 끊긴 경우에는 별도 이전 정보 표시를 붙인다');
 });

@@ -122,32 +122,32 @@
         hidden
       ></div>
       <nav id="primary-nav" class="primary-nav" role="tablist" aria-label="주 메뉴">
-        <button id="nav-goals" type="button" role="tab" aria-selected="true" aria-controls="goals-workspace">작업</button>
-        <button id="nav-sessions" type="button" role="tab" aria-selected="false" aria-controls="session-layout" tabindex="-1">세션</button>
+        <button id="nav-goals" type="button" role="tab" aria-selected="false" aria-controls="goals-workspace" tabindex="-1">작업</button>
+        <button id="nav-sessions" type="button" role="tab" aria-selected="true" aria-controls="session-layout">세션</button>
       </nav>
-      <section id="goals-workspace" class="goals-workspace" aria-label="목표 작업 보드" hidden>
+      <section id="goals-workspace" class="goals-workspace" aria-label="자동 작업 모아보기" hidden>
         <div class="goal-board-pane">
           <header class="goal-board-heading">
-            <div><h1>하던 일 이어가기</h1><p id="goal-count" class="goal-help"></p></div>
-            <button id="goal-new" type="button" class="primary">새 작업 시작</button>
+            <div><h1>지금 돌아가는 일</h1><p id="goal-count" class="goal-help"></p></div>
+            <button id="goal-new" type="button" class="primary">일 시작하기</button>
           </header>
           <div class="goal-toolbar">
-            <label class="goal-search-wrap"><span class="sr-only">목표·세션·프로젝트·기기 검색</span><input id="goal-search" type="search" placeholder="목표·세션·프로젝트 검색" autocomplete="off" /></label>
+            <label class="goal-search-wrap"><span class="sr-only">작업·세션·프로젝트·기기 검색</span><input id="goal-search" type="search" placeholder="작업·세션·프로젝트 검색" autocomplete="off" /></label>
             <button id="goal-filter-toggle" class="goal-toolbar-button" type="button" aria-expanded="false" aria-controls="goal-filters">필터</button>
-            <button id="goal-refresh" class="goal-toolbar-button" type="button" aria-label="목표 작업 새로고침">새로고침</button>
+            <button id="goal-refresh" class="goal-toolbar-button" type="button" aria-label="자동 작업 새로고침">새로고침</button>
           </div>
           <div id="goal-filters" class="goal-filters" hidden></div>
           <div id="goal-recent" class="goal-recent" hidden></div>
-          <div class="goal-board-options"><span class="goal-help">목표별로 이어지는 작업</span><div class="goal-view-picker" role="group" aria-label="작업 보기"><button id="goal-view-list" type="button" aria-pressed="false">목록</button><button id="goal-view-kanban" type="button" aria-pressed="true">칸반</button></div></div>
+          <div class="goal-board-options"><span class="goal-help">세션에서 자동으로 정리해요</span><div class="goal-view-picker" role="group" aria-label="작업 보기"><button id="goal-view-list" type="button" aria-pressed="true">모아보기</button><button id="goal-view-kanban" type="button" aria-pressed="false">칸반</button></div></div>
           <p id="goal-notice" class="goal-notice" role="status" hidden></p>
           <div id="goal-board-scroll" class="goal-board-scroll">
-            <div id="goal-empty" class="goal-empty" hidden><h2 id="goal-empty-title"></h2><p id="goal-empty-copy"></p><div><button id="goal-empty-new" class="goal-text-button" type="button">새 작업 시작</button><button id="goal-reset" class="goal-text-button" type="button" hidden>검색·필터 초기화</button></div></div>
+            <div id="goal-empty" class="goal-empty" hidden><h2 id="goal-empty-title"></h2><p id="goal-empty-copy"></p><div><button id="goal-empty-new" class="goal-text-button" type="button">일 시작하기</button><button id="goal-reset" class="goal-text-button" type="button" hidden>검색·필터 초기화</button></div></div>
             <div id="goal-board" class="goal-board" aria-busy="false"></div>
             <section id="goal-search-sessions" class="goal-search-sessions" aria-label="통합 세션 검색 결과" hidden></section>
           </div>
         </div>
         <div id="goal-resizer" class="goal-resizer" role="separator" tabindex="0" aria-orientation="vertical" aria-label="보드와 상세 너비 조절" aria-valuemin="290" aria-valuenow="420" aria-valuemax="1000" hidden></div>
-        <aside id="goal-detail" class="goal-detail" aria-label="목표 상세" hidden></aside>
+        <aside id="goal-detail" class="goal-detail" aria-label="작업 요약과 연결된 세션" hidden></aside>
         <section id="goal-conversation-slot" class="goal-conversation-slot" aria-label="작업에 연결된 대화" hidden></section>
       </section>
       <div id="session-layout" class="layout">
@@ -207,8 +207,8 @@
               ><input
                 id="search"
                 type="search"
-                placeholder="목표·세션·프로젝트 검색"
-                aria-label="목표·세션·프로젝트·기기 검색"
+                placeholder="작업·세션·프로젝트 검색"
+                aria-label="작업·세션·프로젝트·기기 검색"
                 autocomplete="off"
             /></label>
             <button

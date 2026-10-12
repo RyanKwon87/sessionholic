@@ -367,7 +367,7 @@ class Chat:
         result = self.rpc(host, 'read', source, **kwargs)
         caps = result.get('capabilities', {})
         phase = result.get('phase', 'unavailable')
-        if phase in ('unknown', 'notLoaded'): phase = 'unavailable'
+        if phase in ('unknown', 'notLoaded') and not result.get('readOnly'): phase = 'unavailable'
         from server import scrub_payload
         messages = scrub_payload(result.get('messages', []))
         claude = source.get('agent') == 'claude'
@@ -391,11 +391,14 @@ class Chat:
         except (RuntimeError, OSError, ValueError):
             terminal, terminal_failed = None, True
         action = None
-        if claude:
+        if host.get('platform') == 'windows':
+            from server import WINDOWS_READ_ONLY
+            supported, reason, action = False, WINDOWS_READ_ONLY, None
+        elif claude:
             supported, reason, action = self._claude_capability(source, terminal, terminal_failed)
         else:
             supported, reason = bool(caps.get('canSend')), caps.get('reason') or result.get('reason')
-        capability = {'supported': supported, 'attachments': bool(source.get('cwd')),
+        capability = {'supported': supported, 'attachments': bool(source.get('cwd')) and host.get('platform') != 'windows',
                       'reason': None if supported else reason}
         if action:
             # What the user can do to make sending possible ("open_terminal": the board's terminal button).
@@ -419,6 +422,12 @@ class Chat:
                  and since > 0)
         response['workingSince'] = int(since) if valid else None
         response['workingSinceApprox'] = bool(valid and result.get('workingSinceApprox'))
+        # Stable native references let work summaries cite the actual message/turn.
+        for field in ('activeTurnId', 'activeFlags', 'turns', 'updatedAt'):
+            if field in result:
+                response[field] = scrub_payload(result[field])
+        if result.get('readOnly'):
+            response.update(readOnly=True, runtimeKnown=result.get('runtimeKnown') is True)
         with self.lock:
             cached = self.cache.get(key)
             # The ids whose receipts this read carries are kept with it: a later read may
@@ -535,7 +544,10 @@ class Chat:
         if (action == 'answer' or request_id is not None) and (
                 not isinstance(request_id, str) or not REQUEST.fullmatch(request_id)):
             raise ValueError('질문 응답 요청 식별자가 필요합니다.')
-        source, _ = self.source(data.get('source'))
+        source, host = self.source(data.get('source'))
+        if host.get('platform') == 'windows':
+            from server import WINDOWS_READ_ONLY
+            raise ValueError(WINDOWS_READ_ONLY)
         if action == 'open':
             return self._open_prompt(data.get('source'), source, request_id)
         fingerprint, number = data.get('fingerprint'), data.get('number')
@@ -814,6 +826,9 @@ class Chat:
 
     def upload(self, ref, name, content):
         source, host = self.source(ref)
+        if host.get('platform') == 'windows':
+            from server import WINDOWS_READ_ONLY
+            raise ValueError(WINDOWS_READ_ONLY)
         if not isinstance(name, str) or len(name.encode()) > 512:
             raise ValueError('파일 이름이 너무 깁니다.')
         if not content or len(content) > MAX_FILE:
@@ -866,6 +881,9 @@ class Chat:
     def send(self, data):
         try:
             source, host, request_id, text, ids, manifest = self._prepare_send(data)
+            if host.get('platform') == 'windows':
+                from server import WINDOWS_READ_ONLY
+                raise ValueError(WINDOWS_READ_ONLY)
         except (ValueError, RuntimeError, OSError, KeyError) as exc:
             reason = str(exc) if isinstance(exc, (ValueError, RuntimeError)) else '메시지와 첨부 정보를 다시 확인해 주세요.'
             raise SendRejected(reason, 409 if isinstance(exc, RuntimeError) else 400) from None

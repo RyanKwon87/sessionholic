@@ -380,6 +380,12 @@ def _rpc(request):
     if op == 'attachment':
         from attachments import receive
         return receive(args)
+    if op in ('control_preview', 'control_execute'):
+        from session_control import SessionControl
+        control = SessionControl()
+        if op == 'control_preview':
+            return control.preview(args['source'])
+        return control.execute(args['source'], args['action'], args.get('targetProof'), args.get('requestId'))
     if op == 'profiles':
         from launch import new_session_status
         return {'profiles': profiles(), 'home': str(Path.home()), 'launcher': new_session_status()}

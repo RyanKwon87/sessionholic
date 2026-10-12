@@ -25,7 +25,7 @@ MAX_ARCHIVE = 128 * 1024 * 1024
 PROFILE_FAILURE_TTL = 120
 RUNTIME_MODULES = ('collector.py', 'launch.py', 'transfer_native.py', 'transfer_workspace.py', 'transfer_worker.py',
                    'native_chat.py', 'attachments.py', 'managed_launch.py', 'settings.py', 'instance.py',
-                   'agent_router.py')
+                   'agent_router.py', 'session_control.py')
 # Prepare stages before a native session is bound; a failure there started nothing.
 PRE_BIND_STAGES = frozenset(('validate', 'import', 'build'))
 UNKNOWN_PREPARE = ('대상 준비 결과를 확인하지 못했습니다. 이미 작업이 시작되었을 수 있으므로 '
@@ -138,6 +138,9 @@ class Transfers:
         return ssh_control_options(self.base_dir)
 
     def command(self, host, args, tty=False):
+        if host.get('platform') == 'windows':
+            from server import WINDOWS_READ_ONLY
+            raise ValueError(WINDOWS_READ_ONLY)
         python = host.get('python') or '/usr/bin/python3'
         if host.get('local'):
             return [sys.executable] + args
@@ -173,6 +176,19 @@ class Transfers:
         return data.get('needRuntime') is True and data.get('sha256') == self.runtime()['sha256']
 
     def rpc(self, host, op, args=None, timeout=30):
+        if host.get('platform') == 'windows':
+            from server import WINDOWS_READ_ONLY, run_collector, SESSION_ID, HOME_KEY
+            args = args or {}
+            source = args.get('source') or {}
+            if op != 'chat' or args.get('action') != 'read':
+                raise ValueError(WINDOWS_READ_ONLY)
+            agent, sid, home = source.get('agent'), source.get('id'), source.get('home')
+            if (agent not in ('codex', 'claude') or not isinstance(sid, str) or not SESSION_ID.fullmatch(sid)
+                    or agent == 'codex' and (not isinstance(home, str) or not HOME_KEY.fullmatch(home))):
+                raise ValueError('Windows 세션 정보를 확인해 주세요.')
+            result = run_collector(host, ['read', agent, sid] + ([home] if agent == 'codex' else []),
+                                   min(timeout, 30), state_dir=self.base_dir)
+            return {**result, 'readOnly': True, 'capabilities': {'canSend': False, 'reason': WINDOWS_READ_ONLY}}
         request = {'op': op, 'args': args or {}}
         name = host['name']
         with self.lock:

@@ -7,6 +7,7 @@ Standard library only and Python 3.9 compatible so it can later run on POSIX hos
 from __future__ import annotations
 
 import argparse
+import base64
 import copy
 import gzip
 import hashlib
@@ -34,10 +35,13 @@ from urllib.parse import parse_qs, urlparse, unquote
 import instance
 import settings
 from goals import GoalError, Goals
+from work_service import WorkService
 
 HERE = Path(__file__).resolve().parent
 WEB = HERE / "web"
 COLLECTOR = HERE / "collector.py"
+WINDOWS_COLLECTOR = HERE / "windows_collector.py"
+WINDOWS_READ_ONLY = "Windows 기기는 현재 세션 목록과 대화 읽기를 지원합니다."
 # Installation names (instance.json); without one these are the public names.
 NAMES = instance.current()
 BRAND = NAMES["brand"]
@@ -128,22 +132,30 @@ def load_hosts(path):
     if not isinstance(rows, list) or not 1 <= len(rows) <= 16:
         raise ValueError("기기 설정은 1~16개 항목의 JSON 목록이어야 합니다.")
     for row in rows:
-        if (not isinstance(row, dict) or set(row) - {"name", "label", "local", "ssh", "python"}
+        if (not isinstance(row, dict) or set(row) - {"name", "label", "local", "ssh", "python", "platform"}
                 or type(row.get("local", False)) is not bool
                 or not isinstance(row.get("name"), str)
                 or not isinstance(row.get("python") or "/usr/bin/python3", str)
                 or not isinstance(row.get("label", row["name"]), str)
                 or len(row.get("label", row["name"]).encode()) > 256):
             raise ValueError("기기 설정 형식이 올바르지 않습니다.")
-        name, python = row.get("name", ""), row.get("python") or "/usr/bin/python3"
+        platform = row.get("platform", "posix")
+        if platform not in ("posix", "windows") or platform == "windows" and row.get("local"):
+            raise ValueError("기기의 운영체제 설정을 확인해 주세요.")
+        name, python = row.get("name", ""), row.get("python") or ("python.exe" if platform == "windows" else "/usr/bin/python3")
         if not NAME.fullmatch(name):
             raise ValueError("기기 이름이 올바르지 않습니다.")
         if not row.get("local") and (not isinstance(row.get("ssh"), str) or not NAME.fullmatch(row["ssh"])):
             raise ValueError("SSH 별칭이 올바르지 않습니다.")
-        if not PYTHON_PATH.fullmatch(python):
+        valid_python = PYTHON_PATH.fullmatch(python) if platform != "windows" else (
+            python == "python.exe" or re.fullmatch(r"[A-Za-z]:[\\/][A-Za-z0-9_ .\\/-]{1,220}[\\/]python\.exe", python, re.I)
+            and ".." not in re.split(r"[\\/]", python))
+        if not valid_python:
             raise ValueError("Python 실행 경로가 올바르지 않습니다.")
         hosts.append({"name": name, "label": row.get("label") or name, "local": bool(row.get("local")),
                       "ssh": row.get("ssh"), "python": python})
+        if platform == "windows":
+            hosts[-1]["platform"] = "windows"
     if len({h["name"] for h in hosts}) != len(hosts):
         raise ValueError("기기 이름이 중복됩니다.")
     if sum(bool(h["local"]) for h in hosts) > 1:
@@ -223,6 +235,12 @@ def collector_command(host, args, state_dir=None):
     """Local hosts run the file; SSH hosts read it from stdin so nothing is left on the remote."""
     if host["local"]:
         return [sys.executable, "-I", str(COLLECTOR)] + list(args)
+    if host.get("platform") == "windows":
+        quote = lambda value: "'" + str(value).replace("'", "''") + "'"
+        script = "$ErrorActionPreference='Stop'; $env:PYTHONIOENCODING='utf-8'; & " + " ".join(
+            quote(value) for value in [host.get("python") or "python.exe", "-I", "-"] + list(args)) + "; exit $LASTEXITCODE"
+        encoded = base64.b64encode(script.encode("utf-16le")).decode("ascii")
+        return ssh_command(host, "powershell.exe -NoProfile -NonInteractive -EncodedCommand " + encoded, state_dir)
     remote = (f"PATH={REMOTE_PATH} {shlex.quote(host['python'])} -I - "
               + " ".join(shlex.quote(a) for a in args))
     return ssh_command(host, remote, state_dir)
@@ -252,6 +270,8 @@ def remote_program():
 def watch_command(host, board_id, state_dir=None):
     """`collector.py watch` for one host. A remote watcher reads its program from stdin as
     `<byte length>\\n<program>` and keeps reading stdin for pings, so nothing is left on disk."""
+    if host.get("platform") == "windows":
+        raise ValueError("Windows 기기는 제한된 주기의 목록 수집을 사용합니다.")
     if not isinstance(board_id, str) or not BOARD_ID.fullmatch(board_id):
         raise ValueError("보드 식별자가 올바르지 않습니다.")
     args = ["watch", "--board", board_id]
@@ -280,7 +300,7 @@ def run_collector(host, args, timeout, state_dir=None):
     stdin = None
     if not host["local"]:
         # Remote stdin remains a single self-contained program.
-        stdin = remote_program()
+        stdin = WINDOWS_COLLECTOR.read_bytes() if host.get("platform") == "windows" else remote_program()
     try:
         done = subprocess.run(collector_command(host, args, state_dir), input=stdin, capture_output=True,
                               timeout=timeout)
@@ -296,6 +316,8 @@ def run_collector(host, args, timeout, state_dir=None):
         raise RuntimeError("수집기 응답 형식 오류") from None
     if not isinstance(result, dict):
         raise RuntimeError("수집기 응답 형식 오류")
+    if args and args[0] == "snapshot" and result.get("error"):
+        raise RuntimeError("세션 목록을 읽지 못했습니다. 마지막 기록은 유지됩니다.")
     return result
 
 
@@ -969,7 +991,7 @@ class Board:
                             elif now >= stream.next_ping:
                                 stream.next_ping = now + self.live_ping
                                 pings.append(stream)
-                        elif (wanted and not self.state[name]["paused"]
+                        elif (wanted and host.get("platform") != "windows" and not self.state[name]["paused"]
                               and now >= self.stream_backoff.get(name, (0, 0.0))[1]):
                             # A paused host waits for a successful one-shot collection first.
                             self.streams[name] = HostStream(self, host)
@@ -1088,8 +1110,11 @@ class Board:
             raise ValueError("지원하지 않는 에이전트입니다.")
         with self.lock:
             for row in (host.get("data") or {}).get(agent, []):
-                if row.get("id") == ref.get("id") and (agent != "codex" or row.get("home") == ref.get("home")):
-                    return {**copy.deepcopy(row), "host": host["name"], "hostLabel": host["label"],
+                identifier = row.get("id")
+                if not identifier and agent == "claude" and row.get("kind") == "interactive" and SESSION_ID.fullmatch(row.get("sessionId") or ""):
+                    identifier = row["sessionId"]
+                if identifier and identifier == ref.get("id") and (agent != "codex" or row.get("home") == ref.get("home")):
+                    return {**copy.deepcopy(row), "id": identifier, "host": host["name"], "hostLabel": host["label"],
                             "online": host["ok"], "fetchedAt": host["fetchedAt"]}
         raise ValueError("목록에서 작업을 다시 선택해 주세요.")
 
@@ -1169,7 +1194,7 @@ class Workflow:
         for host in self.board.hosts:
             status = self.board.state[host["name"]]
             accounts = profiles if host["local"] else []
-            if not host["local"] and status["ok"]:
+            if not host["local"] and status["ok"] and host.get("platform") != "windows":
                 try:
                     accounts = self.transfers.profiles(host)
                 except (RuntimeError, OSError, ValueError):
@@ -1187,6 +1212,8 @@ class Workflow:
                                 presentation = {"label": row.get("account") or "현재 계정 설정"}
                             accounts.append({**presentation, "id": key, "agent": agent,
                                              "home": home, "available": True})
+            if host.get("platform") == "windows":
+                accounts = [{**p, "available": False, "launchEnabled": False, "reason": WINDOWS_READ_ONLY} for p in accounts]
             hosts.append({"name": host["name"], "label": host["label"], "online": status["ok"],
                 "newSession": self.new_session_status(host, status["ok"]),
                 "agents": [{"id": agent, "label": "Claude Code" if agent == "claude" else "Codex",
@@ -1199,6 +1226,8 @@ class Workflow:
 
     def new_session_status(self, host, online=True):
         """Whether this host's launcher can open "새 세션", read from that host's own settings."""
+        if host.get("platform") == "windows":
+            return {"available": False, "label": None, "reason": WINDOWS_READ_ONLY}
         if host["local"]:
             from launch import new_session_status
             return new_session_status()
@@ -1221,6 +1250,8 @@ class Workflow:
         key = payload.get("home")
         if host is None or not isinstance(key, str) or not HOME_KEY.fullmatch(key):
             raise ValueError("기기와 Codex 계정을 확인해 주세요.")
+        if host.get("platform") == "windows":
+            raise ValueError(WINDOWS_READ_ONLY)
         if host["local"]:
             from launch import start_app_server
             result = start_app_server(key)
@@ -1249,6 +1280,8 @@ class Workflow:
         host = next((h for h in self.board.hosts if h["name"] == host_name), None)
         if host is None:
             raise ValueError("새 세션을 열 기기를 선택해 주세요.")
+        if host.get("platform") == "windows":
+            raise ValueError(WINDOWS_READ_ONLY)
         with self.lock:
             if request_id in self.requests:
                 previous, result = self.requests[request_id]
@@ -1371,6 +1404,8 @@ class Workflow:
         same = source["host"] == target["host"] and source["agent"] == target["agent"] and current == target.get("account")
         cross_host = source["host"] != target["host"]
         source_host = next(h for h in self.board.hosts if h["name"] == source["host"])
+        if source_host.get("platform") == "windows" or host.get("platform") == "windows":
+            raise ValueError(WINDOWS_READ_ONLY)
         allowed, reason, profile = True, None, None
         warnings, transfer_preview = [], None
         if cross_host:
@@ -1463,6 +1498,8 @@ class Workflow:
         try:
             source = json.loads(terminal["sourceKey"])
             count = self.goals.link_sessions(source, terminal["nativeSource"], actor_label=BRAND["shortName"])
+            if getattr(self, "work", None) is not None:
+                self.work.link_sessions(source, terminal["nativeSource"])
             if count:
                 result["goalLinksUpdated"] = count
             result.pop("goalLinkWarning", None)
@@ -1630,6 +1667,8 @@ class Workflow:
     def remote_attach(self, host, source):
         # The owning helper resolves binaries and explicit environment settings.
         # No configuration values or credentials cross back into an SSH command.
+        if host.get("platform") == "windows":
+            raise ValueError(WINDOWS_READ_ONLY)
         profiles = self.transfers.profiles(host, refresh=True)
         identity = "claude:default" if source["agent"] == "claude" else "codex:" + source["home"]
         profile = next((p for p in profiles if p.get("id") == identity and p.get("available")), None)
@@ -1828,6 +1867,56 @@ class Handler(BaseHTTPRequestHandler):
         return data
 
     # ---------- routes ----------
+    def observe_work(self, source, conversation):
+        if not isinstance(source, dict) or not all(source.get(k) for k in ("host", "agent", "id")):
+            return
+        try:
+            self.server.work.observe(source, conversation)
+        except (GoalError, OSError, ValueError):
+            # Optional organization cannot turn a successful conversation read into a failure.
+            self.server.work.health = {"state": "limited", "message": "작업 요약의 최신 내용을 저장하지 못했습니다."}
+
+    def session_control(self, path, data):
+        ref = data.get("source")
+        source = self.server.board.source(ref)
+        source["agent"] = ref.get("agent")
+        source["home"] = source.get("home") or (".codex" if source["agent"] == "codex" else ".claude")
+        if path == "/api/session/archive":
+            archived = data.get("archived", True)
+            if type(archived) is not bool:
+                raise ValueError("보관 여부를 확인해 주세요.")
+            return self.server.work.archive_session(source, archived)
+        if not source.get("online"):
+            raise RuntimeError("기기에 연결할 수 없습니다. 마지막 실행 상태를 유지합니다.")
+        host = next(h for h in self.server.board.hosts if h["name"] == source["host"])
+        if host.get("platform") == "windows":
+            if path == "/api/session/action":
+                raise ValueError(WINDOWS_READ_ONLY)
+            return {"source": {key: source.get(key) for key in ("agent", "id", "home")}, "phase": source.get("phase", "unknown"),
+                    "capabilities": {key: {"supported": False, "reason": WINDOWS_READ_ONLY} for key in ("interrupt", "terminate")}, "targetProof": None}
+        selector = {key: source.get(key) for key in ("agent", "id", "home", "cwd", "kind", "sessionId", "phase")}
+        args = {"source": selector}
+        action = path == "/api/session/action"
+        if action:
+            if (data.get("action") not in ("interrupt", "terminate")
+                    or not isinstance(data.get("requestId"), str)
+                    or not re.fullmatch(r"[A-Za-z0-9_-]{8,100}", data["requestId"])
+                    or not isinstance(data.get("targetProof"), str) or len(data["targetProof"]) > 4096
+                    or not re.fullmatch(r"[A-Za-z0-9_-]+\.[a-f0-9]{64}", data["targetProof"])):
+                raise ValueError("실행 대상과 요청 정보를 다시 확인해 주세요.")
+            args.update({key: data[key] for key in ("action", "requestId", "targetProof")})
+        try:
+            result = self.server.workflow.transfers.rpc(host, "control_execute" if action else "control_preview",
+                                                       args, timeout=12 if action else 8)
+        except (RuntimeError, OSError):
+            raise RuntimeError("세션 제어 결과를 확인하지 못했습니다. 현재 실행 상태를 확인해 주세요. 요청은 자동으로 다시 보내지 않습니다.") from None
+        if not isinstance(result, dict) or (action and type(result.get("confirmed")) is not bool):
+            raise RuntimeError("세션 제어 결과를 확인하지 못했습니다. 요청은 자동으로 다시 보내지 않습니다.")
+        if action and result.get("confirmed"):
+            self.server.chat._forget_state(source)
+            self.server.board.request_refresh(host["name"], force=False)
+        return result
+
     def do_HEAD(self):
         self.do_GET()
 
@@ -1852,6 +1941,8 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 if url.path == "/api/goals":
                     return self.send_json(200, self.server.goals.snapshot())
+                if url.path == "/api/work":
+                    return self.send_json(200, self.server.work.snapshot())
                 goal_match = re.fullmatch(r"/api/goals/([a-f0-9]{32})", url.path)
                 if goal_match:
                     return self.send_json(200, self.server.goals.get(goal_match[1]))
@@ -1861,6 +1952,7 @@ class Handler(BaseHTTPRequestHandler):
                     return self.send_json(200, self.snapshot())
                 if url.path == "/api/read":
                     result = self.server.board.read(query.get("host"), query.get("agent"), query.get("id"), query.get("home"))
+                    self.observe_work(query, result)
                     return self.send_json(200, result)
                 if url.path == "/api/usage" and self.server.usage is not None:
                     return self.send_json(200, self.server.usage.snapshot(refresh=True))
@@ -2039,6 +2131,11 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_json(403, {"error": "보안 연결을 갱신한 뒤 다시 시도해 주세요.",
                                         "code": "csrf_expired", **not_started})
         try:
+            work_match = re.fullmatch(r"/api/work/([a-f0-9]{32})", path)
+            if work_match:
+                return self.send_json(200, self.server.work.update(work_match[1], data))
+            if path in ("/api/session/preview", "/api/session/action", "/api/session/archive"):
+                return self.send_json(200, self.session_control(path, data))
             if path == "/api/goals":
                 return self.send_json(201, self.server.goals.save(data))
             goal_match = re.fullmatch(r"/api/goals/([a-f0-9]{32})", path)
@@ -2059,7 +2156,9 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/usage/refresh" and self.server.usage is not None:
                 return self.send_json(200, self.server.usage.snapshot(force=True))
             if path == "/api/chat/state":
-                return self.send_json(200, self.server.chat.state(data))
+                result = self.server.chat.state(data)
+                self.observe_work(result.get("route") or data.get("source"), result)
+                return self.send_json(200, result)
             if path == "/api/chat/send":
                 result = self.server.chat.send(data)
                 self.follow_closely(data)
@@ -2166,6 +2265,9 @@ class Handler(BaseHTTPRequestHandler):
 
 class BoardHTTPServer(ThreadingHTTPServer):
     def server_close(self):
+        work = getattr(self, "work", None)
+        if work is not None:
+            work.close()
         # Open event streams and conversation watchers end instead of outliving the server.
         events = getattr(self, "events", None)
         if events is not None:
@@ -2180,7 +2282,7 @@ class BoardHTTPServer(ThreadingHTTPServer):
 
 
 def make_server(bind, port, board, token, terminals=None, workflow=None, state_dir=STATE_DIR, max_terminals=4,
-                tailscale_user=None, usage=None):
+                tailscale_user=None, usage=None, automatic_work=False):
     """`usage` (usage.UsageMeter) serves /api/usage; without it the routes stay 404."""
     if bind not in ("127.0.0.1", "::1"):
         raise ValueError("서버는 loopback에서만 실행할 수 있습니다.")
@@ -2211,12 +2313,16 @@ def make_server(bind, port, board, token, terminals=None, workflow=None, state_d
         raise
     server.workflow = workflow if workflow is not None else Workflow(board, server.terminals, state_dir)
     server.workflow.goals = server.goals
+    server.work = WorkService(board, server.goals, state_dir)
+    server.workflow.work = server.work
     from chat import Chat
     server.chat = Chat(board, server.workflow, state_dir)
     from events import EventHub
     # Also announces the terminal list: what the board's terminals report, and while
     # anyone follows the stream, terminals that ended on their own.
     server.events = EventHub(board, server.chat, boot_id=server.boot_id, terminals=server.terminals)
+    if automatic_work:
+        server.work.start()
     return server
 
 
@@ -2239,6 +2345,7 @@ def main(argv=None):
     parser.add_argument("--state-dir", type=Path, default=STATE_DIR)
     parser.add_argument("--no-live", action="store_true",
                         help="상주 수집기를 쓰지 않고 화면 요청 때만 일회성으로 수집")
+    parser.add_argument("--no-auto-work", action="store_true", help="화면 밖 자동 작업 관찰을 끔")
     parser.add_argument("--tailscale-user-file", type=Path,
                         help="비공개 파일에 적힌 Tailscale 사용자에게 HTTPS Serve 자동 인증 허용")
     parser.add_argument("--open", action="store_true",
@@ -2268,8 +2375,9 @@ def main(argv=None):
         from usage import UsageMeter
         meter = UsageMeter(config["usage"])
     httpd = make_server(args.bind, args.port, board, token, state_dir=args.state_dir,
-                        max_terminals=args.max_terminals, tailscale_user=tailscale_user, usage=meter)
-    print(f"{LOG_PREFIX}: http://127.0.0.1:{args.port}/ · 화면을 열 때만 수집합니다.", file=sys.stderr)
+                        max_terminals=args.max_terminals, tailscale_user=tailscale_user, usage=meter,
+                        automatic_work=not args.no_auto_work)
+    print(f"{LOG_PREFIX}: http://127.0.0.1:{args.port}/ · 제한된 주기로 세션 작업을 정리합니다.", file=sys.stderr)
     if args.open:
         print(issue_login_link(httpd), flush=True)
         print(f"표준 출력의 일회용 로그인 링크를 {ONCE_TTL // 60}분 안에 개인 브라우저에서 여세요. 한 번만 사용할 수 있습니다.",

@@ -43,6 +43,7 @@ const BADGES = {
   idle: ["열림", "gray"],
   done: ["완료", "gray"],
   closed: ["닫힘", "gray"],
+  unknown: ["실행 확인 전", "gray"],
 };
 const AGENTS = { claude: "Claude Code", codex: "Codex" };
 const POLL_MS = 60000;
@@ -513,6 +514,7 @@ const SHEETS = {
   "terminals-dialog": { onDismiss: () => closeSheet("terminals-dialog", "running-terminals") },
   "new-session-dialog": { onDismiss: () => closeNewSession() },
   "action-sheet": { detents: ["medium"], onDismiss: () => closeActionSheet() },
+  "session-control-dialog": { onDismiss: () => closeSessionControl() },
 };
 function sheet(id) {
   return BottomSheet.attach($(id), SHEETS[id]);
@@ -681,7 +683,7 @@ function allSessions() {
       if (live && live.base !== s.phase) state.livePhases.delete(key);
       out.push({
         ...s,
-        phase: live && live.base === s.phase ? live.phase : s.phase,
+        phase: s.runtimeKnown === false ? "unknown" : live && live.base === s.phase ? live.phase : s.phase,
         listedPhase: s.phase,
         host: host.name,
         account: sessionAccountLabel({ ...s, host: host.name }),
@@ -702,7 +704,7 @@ function allSessions() {
 // card, header and counts follow the read until the list's phase changes.
 function noteLivePhase(s, data) {
   const listed = allSessions().find((value) => value.key === s?.key);
-  if (!listed || listed.listedPhase === undefined && listed.nativeSource || !BADGES[data?.phase] ||
+  if (!listed || listed.runtimeKnown === false || listed.listedPhase === undefined && listed.nativeSource || !BADGES[data?.phase] ||
       chatKey(data.route || {}) !== chatKey(sourceOf(listed))) return;
   if (data.phase === listed.listedPhase) state.livePhases.delete(listed.key);
   else state.livePhases.set(listed.key, { phase: data.phase, base: listed.listedPhase });
@@ -1217,8 +1219,8 @@ function cardTitle(s) {
   return !rawTitle || ["(제목 없음)", "(이름 없음)"].includes(rawTitle) ? "제목 없는 작업" : rawTitle;
 }
 // A card is three short lines (title, a one-line preview, status · agent ·
-// project · time) with a disclosure chevron; device and account stay in its
-// accessible name and in the conversation header. The row holds the card and
+// project · time) with a disclosure chevron and an explicit device badge.
+// Account details stay in its accessible name and conversation header. The row holds the card and
 // the action a left swipe reveals.
 function card(s) {
   const row = el("div", "card-row");
@@ -1245,15 +1247,23 @@ function card(s) {
   const project = el("span", "card-project");
   const stale = el("span", "stale-tag", "이전 정보");
   const time = el("span", "card-time");
+  const provenance = el("span", "card-provenance");
+  const device = el("span", "card-device");
+  const deviceIcon = el("span", "card-device-icon");
+  deviceIcon.setAttribute("aria-hidden", "true");
+  deviceIcon.innerHTML = '<svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="2.5" y="3" width="15" height="10.5" rx="1.5"/><path d="M10 13.5V17M6.5 17h7"/></svg>';
+  const host = el("span", "card-device-label");
+  device.append(deviceIcon, host);
   const initiator = el("span", "card-initiator");
+  provenance.append(device, initiator);
   const goals = el("span", "card-goals");
   // A live board terminal of this session (renderTerminalMarks keeps it current).
   const terminal = terminalMark("card-terminal");
   meta.append(badge, terminal, agent, project, stale, time);
   const chevron = el("span", "card-chevron");
   chevron.setAttribute("aria-hidden", "true");
-  node.append(title, snippet, initiator, goals, meta, chevron);
-  node.cardParts = { title, snippet, badge, terminal, agent, project, stale, time, initiator, goals };
+  node.append(title, snippet, provenance, goals, meta, chevron);
+  node.cardParts = { title, snippet, badge, terminal, agent, project, stale, time, initiator, host, goals };
   node.cardRow = row;
   row.append(action, node);
   row.card = node;
@@ -1271,7 +1281,7 @@ function updateCard(node, s, now, folderHint = "") {
   const agent = AGENTS[s.agent] || s.agent || "에이전트";
   const host = s.hostLabel || s.host || "기기 확인 필요";
   const account = cardLine(s.account);
-  const [label, tone] = BADGES[s.phase] || [s.phase || "상태 확인 필요", "gray"];
+  const [label, tone] = BADGES[s.runtimeKnown === false ? "unknown" : s.phase] || ["상태 확인 필요", "gray"];
   const time = ago(s.updatedAt, now);
   node.className = `card${state.selected === s.key ? " selected" : ""}`;
   node.setAttribute("aria-pressed", String(state.selected === s.key));
@@ -1288,7 +1298,8 @@ function updateCard(node, s, now, folderHint = "") {
   write(p.agent, agent); p.agent.className = `card-agent ${s.agent}`;
   write(p.project, place); p.project.title = place;
   write(p.time, time);
-  write(p.initiator, `${host} · ${initiatorLabel(s)}`);
+  write(p.host, host); p.host.title = `기기: ${host}`;
+  write(p.initiator, initiatorLabel(s));
   const linkedGoals = window.SessionholicGoals?.linkedTitles?.(s) || "";
   write(p.goals, linkedGoals);
   p.goals.hidden = !linkedGoals;
@@ -1571,6 +1582,7 @@ function cardActions(s) {
   const terminal = terminalForSession(s);
   const actions = [
     { label: "대화 열기", run: () => select(s.key) },
+    { label: "세션 관리", run: () => manageSession(s) },
     { label: terminal ? "터미널로 돌아가기" : "터미널 열기", run: () => openSessionTerminal(s), disabled: state.launchBusy },
   ];
   if (terminal) {
@@ -1697,6 +1709,132 @@ function closeActionSheet({ restoreFocus = true } = {}) {
   if (restoreFocus && trigger && trigger.isConnected !== false) trigger.focus?.({ preventScroll: true });
 }
 
+// Original execution controls are separate from closing the board's attached terminal.
+let sessionControl = null;
+function closeSessionControl(force = false) {
+  if (!force && sessionControl?.busy) return;
+  const previous = sessionControl;
+  sessionControl = null;
+  const dialog = $("session-control-dialog");
+  if (dialog?.open) dialog.close();
+  const handle = dialog?.querySelector?.(".sheet-handle");
+  dialog?.replaceChildren(...(handle ? [handle] : []));
+  if (!force) previous?.trigger?.focus?.({ preventScroll: true });
+}
+async function manageSession(s, trigger = null) {
+  if (!s || !state.authenticated || sessionControl?.busy) return;
+  closeSessionControl(true);
+  let dialog = $("session-control-dialog");
+  if (!dialog) {
+    dialog = el("dialog", "plan-dialog session-control-dialog"); dialog.id = "session-control-dialog";
+    dialog.setAttribute("aria-labelledby", "session-control-title");
+    dialog.addEventListener("cancel", (event) => { event.preventDefault(); closeSessionControl(); });
+    document.body.append(dialog);
+  }
+  const source = sourceOf(s);
+  if (!source.id && s.agent === "claude" && s.kind === "interactive" && /^[0-9A-Za-z-]{8,64}$/.test(s.sessionId || "")) source.id = s.sessionId;
+  const context = { source, s, trigger, authEpoch: state.authEpoch, busy: false, preview: null, used: false };
+  sessionControl = context;
+  const top = el("div", "dialog-top");
+  const title = el("h2", "", "세션 관리"); title.id = "session-control-title";
+  const close = button("닫기", "secondary", () => closeSessionControl()); close.id = "session-control-close";
+  top.append(title, close);
+  const body = el("div", "dialog-body session-control-body");
+  const name = el("h3", "", cardTitle(s));
+  body.append(name, el("p", "muted", `${s.hostLabel || s.host} · ${s.agent === "claude" ? "Claude" : "Codex"}`));
+  const status = el("p", "session-control-status", "현재 실행 상태를 확인하고 있습니다…");
+  status.id = "session-control-status"; status.setAttribute("role", "status");
+  body.append(status);
+  const actions = el("div", "session-control-actions");
+  for (const [action, label, explanation] of [
+    ["interrupt", "응답 중단", "현재 생성 중인 응답을 멈춥니다. 대화 기록은 유지됩니다."],
+    ["terminate", "실행 종료", "이 세션의 원본 실행을 끝냅니다. 대화 기록은 남습니다."],
+  ]) {
+    const row = el("div", "session-control-row");
+    const actionButton = button(label, action === "terminate" ? "secondary danger" : "secondary", () => confirmSessionAction(context, action));
+    actionButton.id = `session-control-${action}`; actionButton.disabled = true;
+    const reason = el("p", "muted", explanation); reason.id = `session-control-${action}-reason`;
+    row.append(actionButton, reason); actions.append(row);
+  }
+  const archive = button("작업 보관", "secondary", () => archiveSessionWork(context, true));
+  archive.id = "session-control-archive";
+  actions.append(archive, el("p", "muted", "이 세션의 작업 카드를 보관합니다. 실행은 계속됩니다."));
+  body.append(actions);
+  const confirmation = el("div", "session-control-confirmation"); confirmation.id = "session-control-confirmation"; confirmation.hidden = true;
+  body.append(confirmation); dialog.append(top, body);
+  sheet(dialog.id).open();
+  try {
+    const result = await api("/api/session/preview", { method: "POST", body: { source: context.source }, authEpoch: context.authEpoch });
+    if (sessionControl !== context) return;
+    context.preview = result;
+    status.textContent = "이 세션에서 사용할 동작을 선택하세요.";
+    for (const action of ["interrupt", "terminate"]) {
+      const capability = result.capabilities?.[action];
+      $(`session-control-${action}`).disabled = !capability?.supported;
+      if (!capability?.supported) $(`session-control-${action}-reason`).textContent = capability?.reason || "현재 실행에서 지원하지 않습니다.";
+    }
+  } catch (err) {
+    if (sessionControl === context && !err.staleAuth && !err.unauthorized) status.textContent = err.message || "실행 상태를 확인하지 못했습니다.";
+  }
+}
+function confirmSessionAction(context, action) {
+  if (sessionControl !== context || context.busy || context.used || !context.preview?.capabilities?.[action]?.supported) return;
+  const confirmation = $("session-control-confirmation"); confirmation.hidden = false;
+  const label = action === "terminate" ? "실행 종료" : "응답 중단";
+  const confirm = button(label, "primary", () => executeSessionAction(context, action));
+  confirm.id = "session-control-confirm";
+  confirmation.replaceChildren(el("p", "", `${cardTitle(context.s)} · ${context.s.hostLabel || context.s.host}: ${label}합니다. 대화 기록은 남습니다.`),
+    confirm, button("취소", "secondary", () => { confirmation.hidden = true; }));
+  confirm.focus();
+}
+function sessionControlBusy(context, busy) {
+  context.busy = busy;
+  for (const item of $("session-control-dialog").querySelectorAll("button")) item.disabled = busy;
+  if (!busy) for (const action of ["interrupt", "terminate"])
+    $(`session-control-${action}`).disabled = context.used || !context.preview?.capabilities?.[action]?.supported;
+}
+async function executeSessionAction(context, action) {
+  if (sessionControl !== context || context.busy || context.used) return;
+  context.used = true;
+  sessionControlBusy(context, true);
+  $("session-control-status").textContent = "요청 결과를 확인하고 있습니다…";
+  try {
+    const result = await api("/api/session/action", { method: "POST", body: { source: context.source, action,
+      targetProof: context.preview.targetProof, requestId: requestId() }, authEpoch: context.authEpoch, csrfRetry: false });
+    if (sessionControl !== context) return;
+    $("session-control-status").textContent = result.confirmed === true
+      ? (action === "terminate" ? "이 세션의 실행 종료를 확인했습니다. 기록은 남아 있습니다." : "현재 응답이 중단된 것을 확인했습니다.")
+      : result.reason || "처리 결과를 확인하지 못했습니다. 실행 상태를 다시 확인해 주세요. 자동으로 재요청하지 않습니다.";
+    if (result.confirmed === true) {
+      await window.SessionholicGoals?.refresh?.();
+      poll(false);
+    }
+  } catch (err) {
+    if (sessionControl === context && !err.staleAuth && !err.unauthorized)
+      $("session-control-status").textContent = "처리 결과를 확인하지 못했습니다. 실행 상태를 다시 확인해 주세요. 요청을 자동으로 다시 보내지 않습니다.";
+  } finally {
+    if (sessionControl === context) {
+      $("session-control-confirmation").hidden = true;
+      sessionControlBusy(context, false);
+    }
+  }
+}
+async function archiveSessionWork(context, archived) {
+  if (sessionControl !== context || context.busy) return;
+  sessionControlBusy(context, true);
+  try {
+    await api("/api/session/archive", { method: "POST", body: { source: context.source, archived }, authEpoch: context.authEpoch });
+    if (sessionControl !== context) return;
+    $("session-control-status").textContent = archived ? "작업을 보관했습니다. 세션 실행은 계속됩니다." : "작업을 복원했습니다.";
+    const archive = $("session-control-archive");
+    const replacement = button(archived ? "보관 되돌리기" : "작업 보관", "secondary", () => archiveSessionWork(context, !archived));
+    replacement.id = archive.id; archive.replaceWith(replacement);
+    await window.SessionholicGoals?.refresh?.();
+  } catch (err) {
+    if (sessionControl === context && !err.staleAuth && !err.unauthorized) $("session-control-status").textContent = err.message;
+  } finally { if (sessionControl === context) sessionControlBusy(context, false); }
+}
+
 function focusDetailBack() {
   $("detail").querySelector(".back")?.focus({ preventScroll: true });
 }
@@ -1773,7 +1911,7 @@ function select(key) {
 }
 function detailRevision(s) {
   return JSON.stringify([s.stale, s.phase, s.title, s.project, s.account, s.hostLabel, s.fetchedAt,
-    s.cwd || null, s.sessionId || null, s.initiator, s.initiatorName, s.initiatorEvidence, s.parentSessionId]);
+    s.cwd || null, s.sessionId || null, s.runtimeKnown, s.readOnly, s.initiator, s.initiatorName, s.initiatorEvidence, s.parentSessionId]);
 }
 function refreshDetail(s) {
   const revision = detailRevision(s);
@@ -1792,7 +1930,7 @@ function refreshDetail(s) {
   loadDetail(s, fresh);
 }
 function detailMetaChildren(s) {
-  const [label, tone] = BADGES[s.phase] || [s.phase || "상태 확인 필요", "gray"];
+  const [label, tone] = BADGES[s.runtimeKnown === false ? "unknown" : s.phase] || ["상태 확인 필요", "gray"];
   return [el("span", `badge ${tone}`, label),
     el("span", null, [AGENTS[s.agent], s.account, s.hostLabel].filter(Boolean).join(" · ")),
     el("span", null, initiatorLabel(s)), el("span", null, clock(s.updatedAt))];
@@ -2637,7 +2775,9 @@ function buildChatComposer(s) {
   expand.addEventListener("pointerdown", (event) => event.preventDefault());
   tools.append(el("summary", null, "도구"));
   const toolsActions = el("div", "chat-tools-actions");
-  toolsActions.append(clipboard, check, native, closeTerm);
+  const manage = button("세션 관리", "secondary", (event) => { if (editorCurrent()) { tools.open = false; manageSession(s, event.currentTarget); } });
+  manage.id = "chat-manage";
+  toolsActions.append(clipboard, check, native, closeTerm, manage);
   for (const action of [clipboard, check, native, closeTerm])
     action.addEventListener("pointerdown", (event) => event.preventDefault());
   tools.append(toolsActions);
@@ -6448,6 +6588,7 @@ function bindPullToRefresh(root) {
 }
 function showLogin() {
   beginAuthEpoch();
+  closeSessionControl(true);
   state.loginBusy = false;
   state.launchBusy = false;
   state.terminalCloseBusy = false;
@@ -6602,6 +6743,7 @@ function warnDraftUnload(event) {
 window.addEventListener("DOMContentLoaded", () => {
   navigateView("list", true);
   window.SessionholicGoals?.init?.({ api, sessions: allSessions, openSession: select,
+    startWork: openNewSession, manageSession,
     hideSession: () => setDetailShown(false), getSheet: sheet,
     onChanged: render,
     onSearch: (query) => { state.search = query.trim(); $("search").value = query; render(); } });
@@ -6731,7 +6873,7 @@ window.addEventListener("DOMContentLoaded", () => {
   });
   $("home").addEventListener("click", () => {
     rememberConversationView();
-    if (window.SessionholicGoals) window.SessionholicGoals.openTab("goals", { clearSelection: true });
+    if (window.SessionholicGoals) window.SessionholicGoals.openTab("sessions", { clearSelection: true });
     else backToList();
   });
   $("refresh").addEventListener("click", manualRefresh);

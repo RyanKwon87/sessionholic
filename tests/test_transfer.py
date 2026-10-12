@@ -780,7 +780,7 @@ class SshReuseTest(unittest.TestCase):
 
 @unittest.skipUnless(shutil.which('git'),'requires local git')
 class LocalTransferEndToEndTest(unittest.TestCase):
-    """preview→export→send→receive→prepare with real local helpers; only bind is synthetic.
+    """preview→export→send→receive→prepare with real local helpers and synthetic native IO.
 
     Native session state and turn interruption need a live CLI, so those replies
     and export/inspect/prepare run in-process with the real worker code. The
@@ -825,9 +825,40 @@ class LocalTransferEndToEndTest(unittest.TestCase):
         def bind(spec,profile,host,**kwargs):
             self.bound.append(spec['cwd'])
             return {**spec,'nativeSource':{'host':host,'agent':'codex','id':'019bbbbb-0000-7000-8000-000000000002'},'connectionMode':'attach'}
+        self.native_start=patch('managed_launch.ensure_app_server',return_value=False)
+        self.ensure_app_server=self.native_start.start();self.addCleanup(self.native_start.stop)
+        # The system CLI is searched before ~/.local/bin in production. This test
+        # exercises file transfer, so neither app-server startup nor binary discovery
+        # may escape to an installed native CLI, even when one exists on the machine.
         for context in (patch('transfer_worker.source_ready',return_value={'safeToTransfer':True,'revision':'r1'}),
+                        patch.object(launch,'_binary',side_effect=lambda agent,home:str(home/'.local/bin'/agent)),
                         patch('managed_launch.bind',side_effect=bind)):
             context.start();self.addCleanup(context.stop)
+        self.helpers=[]
+        real_popen=subprocess.Popen
+        allowed={str(Path(sys.executable).resolve()),str(Path(shutil.which('git')).resolve())}
+        def helper_process(args,*positional,**kwargs):
+            self.assertIsInstance(args,(list,tuple))
+            executable=args[0] if os.path.isabs(args[0]) else shutil.which(args[0],path=kwargs.get('env',os.environ).get('PATH'))
+            self.assertIsNotNone(executable)
+            self.assertIn(str(Path(executable).resolve()),allowed,'native CLI escaped the transfer fixture')
+            process=real_popen(args,*positional,**kwargs)
+            self.helpers.append(process)
+            return process
+        process_patch=patch.object(subprocess,'Popen',side_effect=helper_process)
+        process_patch.start();self.addCleanup(process_patch.stop)
+        self.addCleanup(self.reap_helpers)
+    def reap_helpers(self):
+        leaked=[]
+        for process in self.helpers:
+            if process.poll() is not None:continue
+            leaked.append(process.pid)
+            # Only Popen handles owned by this test; no PID search or process groups.
+            process.terminate()
+            try:process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                process.kill();process.wait(timeout=2)
+        self.assertEqual(leaked,[],'transfer helper remained alive before temporary HOME cleanup')
     def test_workspace_moves_through_real_helper_processes(self):
         preview=self.flow.preview(self.source,self.target,self.hosts[0],self.hosts[1])
         workspace=preview['workspace']
@@ -842,6 +873,11 @@ class LocalTransferEndToEndTest(unittest.TestCase):
         destination=Path(result['destinationCwd'])
         self.assertEqual(destination,self.home/'.local/share/sessionholic/workspaces'/result['transferId']/'project')
         self.assertEqual(self.bound,[str(destination)])
+        self.ensure_app_server.assert_called_once()
+        spec,profile=self.ensure_app_server.call_args[0]
+        self.assertEqual(spec['argv'][0],str(self.home/'.local/bin/codex'))
+        self.assertEqual(spec['env']['CODEX_HOME'],str(self.home/'.codex-isolated'))
+        self.assertEqual(profile['home'],'.codex-isolated')
         for name in ('README.md','.claude/agents/reviewer.md','.claude/settings.json','.codex/AGENTS.md','notes.txt'):
             self.assertEqual((destination/name).read_text(),(self.repo/name).read_text(),name)
         for name in ('client_secret_x.json','.claude/settings.local.json','target'):

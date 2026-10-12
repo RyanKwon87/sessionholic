@@ -278,7 +278,7 @@ class ServiceTest(unittest.TestCase):
         self.subscribe()
         self.assertEqual(self.service.test({"endpoint": APPLE}), {"ok": True})
         self.assertEqual(self.service.pending_for(self.service.subscriptions[0]["id"])["notifications"][0]["tag"],
-                         "sessionholic-test")
+                         "notice-test")
         self.status = 403
         with self.assertRaisesRegex(RuntimeError, "403"):
             self.service.test({"endpoint": APPLE})
@@ -353,7 +353,7 @@ class RouteTest(unittest.TestCase):
         pending = "/api/push/pending?id=" + push.subscription_id(APPLE)
         self.assertEqual(self.request("GET", pending, headers={"Cookie": cookie})[0], 403)
         status, body = self.request("GET", pending, headers={"Cookie": cookie, "X-Sessionholic-Push": "1"})
-        self.assertEqual((status, [item["tag"] for item in body["notifications"]]), (200, ["sessionholic-test"]))
+        self.assertEqual((status, [item["tag"] for item in body["notifications"]]), (200, ["notice-test"]))
         self.assertEqual(self.request("GET", "/api/push/pending?id=bad", headers={"Cookie": cookie, "X-Sessionholic-Push": "1"})[0], 400)
         status, body = self.request("POST", "/api/push/unsubscribe", json.dumps({"endpoint": APPLE}),
                                     {"Cookie": cookie, "Content-Type": "application/json", "X-CSRF-Token": csrf})

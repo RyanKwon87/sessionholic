@@ -392,6 +392,9 @@ def _rpc(request):
     if op == 'resume_preview':
         from launch import resume_preview
         return resume_preview(args['source'])
+    if op == 'launcher_programs':
+        from launcher_programs import launcher_programs
+        return launcher_programs(args)
     if op == 'state': return source_state(args['source'])
     if op == 'interrupt': return interrupt_source(args['source'])
     if op == 'inspect':

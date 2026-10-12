@@ -659,6 +659,41 @@ class TmuxFixtureTest(unittest.TestCase):
             with self.manager.reserve("next"):
                 self.fail("a connection loaded after a restart was released before its browser read again")
 
+    def test_a_connection_unused_for_ten_minutes_closes_even_with_room(self):
+        self.manager.max_terminals = 4
+        old = self.connection("old", "attach")
+        self.manager.terminals[old["id"]].touched = time.monotonic() - terminal.CLOSE_IDLE - 1
+        recent = self.connection("recent", "attach")
+        owned = self.connection("owned", "new-session")
+        self.manager.terminals[owned["id"]].touched = time.monotonic() - terminal.CLOSE_IDLE - 1
+        changes = []
+        self.manager.add_listener(lambda: changes.append(1))
+        rows = {row["key"]: row for row in self.manager.list()}
+        self.assertEqual((rows["old"]["alive"], rows["old"]["closedReason"]), (False, "released"))
+        self.assertTrue(rows["recent"]["alive"])
+        self.assertTrue(rows["owned"]["alive"], "a terminal running its own CLI never closes by itself")
+        self.assertTrue(changes)
+        self.assertIsNotNone(recent)
+
+    def test_a_new_session_terminal_records_what_it_runs_and_announces_only_a_change(self):
+        self.manager.max_terminals = 4
+        launched = self.connection("launched", "new-session", idle=False)
+        attached = self.connection("attached", "attach", idle=False)
+        changes = []
+        self.manager.add_listener(lambda: changes.append(1))
+        self.assertTrue(self.manager.set_program(launched["id"], {"program": "claude-agents", "cwd": "/Users/example/project"}))
+        self.assertEqual(len(changes), 1)
+        self.assertTrue(self.manager.set_program(launched["id"], {"program": "claude-agents", "cwd": "/Users/example/project"}))
+        self.assertEqual(len(changes), 1, "the same program read again is saved without an announcement")
+        row = next(item for item in self.manager.list() if item["key"] == "launched")
+        self.assertEqual((row["program"], row["programCwd"]), ("claude-agents", "/Users/example/project"))
+        self.assertIsInstance(row["programAt"], int)
+        self.assertFalse(self.manager.set_program(attached["id"], {"program": "codex"}))
+        self.manager.set_program(launched["id"], {"program": "codex", "cwd": "relative"})
+        self.assertIsNone(next(item for item in self.manager.list() if item["key"] == "launched")["programCwd"])
+        with self.assertRaises(ValueError):
+            self.manager.set_program(launched["id"], {"program": "rm -rf"})
+
     def test_a_browser_read_keeps_a_connection_from_being_released(self):
         old = self.connection("old", "attach")
         self.manager.read(old["id"], 0, 0)

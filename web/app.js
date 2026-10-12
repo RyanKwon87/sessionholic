@@ -565,7 +565,14 @@ function openRequestedSession() {
   if (Date.now() > request.until) { state.openRequest = null; return; }
   if (!state.authenticated || state.launchBusy || !allSessions().some((session) => session.key === request.key)) return;
   state.openRequest = null;
+  const target = allSessions().find((session) => session.key === request.key);
+  if (target && groupOf(target) === "needs_input") answerOnOpen(target);
   select(request.key);
+}
+// Opened from the 답 필요 group or its notification: the question is loaded once,
+// as "질문 불러오기" would, so the choices are there without another tap.
+function answerOnOpen(s) {
+  state.answerOnOpen = { key: s.key, until: Date.now() + 30000 };
 }
 function closeSettings() {
   if (!$("settings-dialog").open) return;
@@ -1487,7 +1494,10 @@ function card(s) {
     if (state.swipeOpen === row) { closeSwipe(row); return; }
     const mounted = [...$("groups").children].some((section) => [...(section.children || [])].includes(row));
     const current = allSessions().find((session) => session.key === row.dataset.sessionKey);
-    if (state.authenticated && mounted && current && chatKey(sourceOf(current)) === row.dataset.sourceKey) select(current.key);
+    if (state.authenticated && mounted && current && chatKey(sourceOf(current)) === row.dataset.sourceKey) {
+      if (groupOf(current) === "needs_input") answerOnOpen(current);
+      select(current.key);
+    }
   });
   node.dataset.sessionKey = s.key;
   node.dataset.sourceKey = row.dataset.sourceKey;
@@ -2390,6 +2400,12 @@ function renderPrompt(s, data) {
   const entry = chatEntry(s);
   const prompt = data?.prompt && Array.isArray(data.prompt.options) && data.prompt.options.length ? data.prompt : null;
   const openable = !prompt && data?.promptOpenable === true && data?.phase === "needs_input";
+  const asked = state.answerOnOpen;
+  if (asked?.key === s.key && (prompt || Date.now() > asked.until)) state.answerOnOpen = null;
+  else if (asked?.key === s.key && openable && !entry.promptBusy && !entry.promptNote && !networkOffline()) {
+    state.answerOnOpen = null;
+    Promise.resolve().then(() => promptAction(s, { action: "open" }));
+  }
   if (!prompt && !openable) {
     card.hidden = true;
     card.chooseNumber = null;
@@ -3624,6 +3640,8 @@ async function sendChat(entry, message = null) {
       throw new Error("요청 확인 번호가 일치하지 않습니다.");
     applyChatReceipt(entry, { ...result.receipt, requestId: pending.requestId, status: result.status || "unknown" });
     if (["accepted", "queued", "completed"].includes(result.status)) haptic("success");
+    // A Claude send may have attached the session's board terminal: its marks show it now.
+    if (pending.source?.agent === "claude" && result.receipt?.terminalId) refreshTerminals();
   } catch (err) {
     if (authEpoch === state.authEpoch && !err.unauthorized && !err.staleAuth) {
       haptic("error");
@@ -5366,8 +5384,34 @@ function terminalTitle(terminal, fallback = "열어 둔 터미널") {
     if (session?.title) return terminalEstimated(terminal) ? `${session.title} · 연결 추정` : session.title;
   }
   const title = info.title || fallback;
-  return info.mode === "new-session" && !info.nativeSource && Number.isInteger(info.createdAt)
-    ? `${title} · ${clock(info.createdAt)} 시작` : title;
+  if (info.mode === "new-session" && !info.nativeSource) {
+    // What the launcher ended up running, read from its host (launcher_programs).
+    const folder = String(info.programCwd || "").split("/").filter(Boolean).pop();
+    if (info.program === "claude-agents") return `Claude 에이전트 목록${folder ? ` · ${folder}` : ""}`;
+    const started = Number.isInteger(info.createdAt) ? ` · ${clock(info.createdAt)} 시작` : "";
+    if (AGENTS[info.program]) return `${AGENTS[info.program]}${started}`;
+    return `${title}${started}`;
+  }
+  return title;
+}
+// A board connection to an existing session: the board opens and closes these itself.
+function connectionTerminal(terminal) {
+  const info = terminalInfo(terminal);
+  return info.mode === "attach" && (!info.launchMode || info.launchMode === "attach");
+}
+// Two 새 세션 terminals on one host showing the same Claude agent view (same folder):
+// every later one repeats the first. {terminal id: the first terminal}.
+function duplicateTerminals(terminals) {
+  const first = new Map(), repeats = new Map();
+  const ordered = [...terminals].sort((a, b) => (terminalInfo(a).createdAt || 0) - (terminalInfo(b).createdAt || 0));
+  for (const terminal of ordered) {
+    const info = terminalInfo(terminal);
+    if (info.mode !== "new-session" || info.program !== "claude-agents") continue;
+    const key = [info.host, info.program, info.programCwd || ""].join("|");
+    if (first.has(key)) repeats.set(terminal.id, first.get(key));
+    else first.set(key, terminal);
+  }
+  return repeats;
 }
 // Session titles arrive with each snapshot: open terminals follow them. An open
 // sheet is not rebuilt under a finger reaching for 연결 닫기; it renames on reopen.
@@ -6277,17 +6321,20 @@ function renderTerminals() {
   const restoreFocus = focused?.terminalId ? { id: focused.terminalId, action: focused.action } : null;
   list.replaceChildren();
   const alive = state.terminals.filter((t) => t.alive !== false && !t.closed);
+  const direct = alive.filter((terminal) => !connectionTerminal(terminal));
+  const connections = alive.filter(connectionTerminal);
+  const repeats = duplicateTerminals(direct);
   // A chip in the list's top row; the rows themselves live in a sheet.
   const chip = $("running-terminals");
   chip.hidden = !alive.length && !state.terminalsError;
   setClass(chip, "has-error", !!state.terminalsError);
-  chip.setAttribute?.("aria-label", `열린 터미널 ${alive.length}개${state.terminalsError ? ", 목록 확인 필요" : ""}`);
+  chip.setAttribute?.("aria-label", `열린 터미널 ${direct.length}개${connections.length ? `, 세션 연결 ${connections.length}개` : ""}${state.terminalsError ? ", 목록 확인 필요" : ""}`);
   if (chip.hidden && $("terminals-dialog")?.open) closeSheet("terminals-dialog");
   $("running-error").textContent = state.terminalsError;
   $("running-error").hidden = !state.terminalsError;
   $("running-refresh").hidden = !state.terminalsError;
-  $("running-count").textContent = alive.length;
-  for (const terminal of alive) {
+  $("running-count").textContent = direct.length || connections.length;
+  const row = (terminal) => {
     const node = button("", "running-terminal", () => {
       closeSheet("terminals-dialog");
       openTerminal(terminal);
@@ -6295,10 +6342,13 @@ function renderTerminals() {
     node.dataset.terminalId = terminal.id;
     node.dataset.action = "open";
     const labels = el("span", "running-terminal-copy");
+    const repeated = repeats.get(terminal.id);
     labels.append(
       el("strong", "running-terminal-title", terminalTitle(terminal)),
       el("span", "running-terminal-meta", targetLabel(terminalInfo(terminal))),
     );
+    if (repeated) labels.append(el("span", "running-terminal-duplicate",
+      `같은 화면이 이미 열려 있어요(${clock(terminalInfo(repeated).createdAt)} 시작). 이 터미널은 닫아도 세션은 계속 돌아가요.`));
     const arrow = el("span", null, "↗");
     arrow.setAttribute("aria-hidden", "true");
     node.append(
@@ -6306,16 +6356,27 @@ function renderTerminals() {
       labels,
       arrow,
     );
-    const row = el("div", "running-terminal-row");
+    const item = el("div", `running-terminal-row${repeated ? " duplicate" : ""}`);
     const copy = terminalCloseCopy(terminal);
     const close = button(copy.action, `running-terminal-close${copy.danger ? " danger-quiet" : ""}`, () => closeTerminal(terminal.id));
     close.dataset.terminalId = terminal.id;
     close.dataset.action = "close";
     close.setAttribute("aria-label", `${terminalTitle(terminal, "터미널")} ${copy.action}`);
-    row.append(node, close);
-    list.append(row);
+    item.append(node, close);
+    list.append(item);
     if (restoreFocus?.id === terminal.id)
       (restoreFocus.action === "close" ? close : node).focus();
+  };
+  direct.forEach(row);
+  if (connections.length) {
+    // Connections the board opened to send or answer: folded, since they close by themselves.
+    const toggle = button(`세션 연결 ${connections.length}개 · 10분 쓰지 않으면 보드가 닫아요`, "running-connections",
+      () => { state.showConnections = !state.showConnections; renderTerminals(); });
+    toggle.setAttribute("aria-expanded", String(!!state.showConnections));
+    toggle.dataset.action = "connections";
+    list.append(toggle);
+    if (restoreFocus?.action === "connections") toggle.focus();
+    if (state.showConnections) connections.forEach(row);
   }
   // Cards and the open conversation offer "연결 닫기" for these terminals, and
   // show "터미널 열림" while one is live.
@@ -6388,6 +6449,17 @@ function renderNewSessionHosts() {
     arrow.setAttribute("aria-hidden", "true");
     node.append(copy, arrow);
     list.append(node);
+    // Already open here: going back to one is usually what was meant, and avoids a repeat.
+    for (const terminal of state.terminals.filter((t) => t.alive !== false && !t.closed && !connectionTerminal(t)
+        && terminalInfo(t).mode === "new-session" && terminalInfo(t).host === host.name)) {
+      const open = button("", "new-session-open", () => {
+        closeSheet("new-session-dialog");
+        openTerminal(terminal);
+      });
+      open.dataset.terminalId = terminal.id;
+      open.append(el("span", "new-session-open-label", "열린 화면으로"), el("strong", null, terminalTitle(terminal)));
+      list.append(open);
+    }
   }
 }
 function openNewSession() {
@@ -7453,7 +7525,7 @@ window.addEventListener("DOMContentLoaded", () => {
   if ("serviceWorker" in navigator) {
     navigator.serviceWorker.register("/sw.js").catch(() => {});
     navigator.serviceWorker.addEventListener?.("message", (event) => {
-      if (event.data?.type === "sessionholic-open") requestSessionOpen(event.data.url);
+      if (event.data?.type === "open-session") requestSessionOpen(event.data.url);
     });
   }
   // Opened from a notification: remember the session, then drop it from the address.

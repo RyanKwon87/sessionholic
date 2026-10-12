@@ -43,6 +43,9 @@ MAX_TERMINALS = 16
 # A board connection to an existing session left unused this long may be released
 # for a new terminal; the session itself keeps running.
 RELEASE_IDLE = 60
+# Unused this long, such a connection is closed even with room to spare; sending to the
+# session (or 질문 불러오기) attaches it again.
+CLOSE_IDLE = 600
 HISTORY_LIMIT = 20000
 SCROLL_LIMIT = 200
 WHEEL_LIMIT = 40
@@ -726,9 +729,17 @@ class TerminalManager:
     def list(self):
         with self.lock:
             result = []
-            changed, adopted = [], []
+            changed, adopted, released = [], [], False
+            now = time.monotonic()
             for terminal in self.terminals.values():
                 terminal.alive = self._exists(terminal)
+                if terminal.alive and self._releasable(terminal) and now - terminal.touched >= CLOSE_IDLE:
+                    try:
+                        self._end(terminal, "released")
+                        released = True
+                    except (RuntimeError, ValueError, OSError):
+                        pass
+                    terminal.alive = self._exists(terminal)
                 if self._foreign(terminal):
                     # Another socket's session is not visible here, not ended: no tombstone.
                     self._warn_foreign(terminal)
@@ -755,6 +766,8 @@ class TerminalManager:
                     for terminal in adopted:
                         terminal.record.pop("socket", None)
                     raise
+            if released:
+                self._changed()
             return result
 
     def _foreign_message(self, terminal):
@@ -784,6 +797,29 @@ class TerminalManager:
                     process.wait(timeout=2)
         self._changed()
         return {"ok": True}
+
+    def set_program(self, terminal_id, info):
+        """Record what a 새 세션 terminal runs (read from its host); never its identity or command."""
+        program = info.get("program") if isinstance(info, dict) else None
+        if program not in (None, "claude-agents", "claude", "codex"):
+            raise ValueError("실행 프로그램 정보가 올바르지 않습니다.")
+        cwd = info.get("cwd")
+        cwd = cwd if isinstance(cwd, str) and cwd.startswith("/") and len(cwd) <= 4096 and "\0" not in cwd else None
+        with self.lock:
+            terminal = self._get(terminal_id)
+            if terminal.record.get("closed", False) or terminal.record["metadata"].get("mode") != "new-session":
+                return False
+            previous = terminal.record["metadata"]
+            terminal.record["metadata"] = _metadata({**previous, "program": program, "programCwd": cwd,
+                                                     "programAt": int(time.time())})
+            try:
+                self._save()
+            except BaseException:
+                terminal.record["metadata"] = previous
+                raise
+        if (previous.get("program"), previous.get("programCwd")) != (program, cwd):
+            self._changed()
+        return True
 
     def close_terminal(self, terminal_id):
         """Stop one generated tmux session; retain its key as a closed record."""
@@ -843,6 +879,13 @@ class TerminalManager:
             live -= 1
         return True
 
+    def _releasable(self, terminal):
+        """A board connection to an existing session ("attach"), not one being launched."""
+        metadata = terminal.record["metadata"]
+        return (metadata.get("mode") == "attach" and metadata.get("launchMode") in (None, "attach")
+                and terminal.record["key"] not in self.reservations and not terminal.record.get("closed", False)
+                and not self._unrecorded(terminal) and not self._foreign(terminal))
+
     def _release_idle(self, keep):
         """Close the least recently used board connection to an existing session.
 
@@ -853,10 +896,8 @@ class TerminalManager:
         """
         now = time.monotonic()
         idle = [t for t in self.terminals.values()
-                if t.record["metadata"].get("mode") == "attach"
-                and t.record["metadata"].get("launchMode") in (None, "attach")
-                and t.record["key"] != keep and t.record["key"] not in self.reservations
-                and now - t.touched >= RELEASE_IDLE and not self._unrecorded(t) and self._exists(t)]
+                if self._releasable(t) and t.record["key"] != keep
+                and now - t.touched >= RELEASE_IDLE and self._exists(t)]
         if not idle:
             return False
         self._end(min(idle, key=lambda t: t.touched), "released")

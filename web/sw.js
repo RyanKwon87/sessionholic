@@ -187,8 +187,8 @@ async function showPushed() {
     });
     return;
   }
-  await self.registration.showNotification("세션홀릭", {
-    body: "확인할 세션이 있어요. 눌러서 보드를 열어 주세요.", tag: "sessionholic-generic",
+  await self.registration.showNotification("확인할 세션이 있어요", {
+    body: "눌러서 보드를 열어 주세요.", tag: "board-notice",
     icon: "/icon-192.png", data: { url: "/" },
   });
 }
@@ -200,7 +200,7 @@ async function openFromNotification(url) {
   const board = windows.find((client) => new URL(client.url).origin === self.location.origin);
   if (board) {
     await board.focus();
-    board.postMessage({ type: "sessionholic-open", url });
+    board.postMessage({ type: "open-session", url });
     return;
   }
   await self.clients.openWindow(url);

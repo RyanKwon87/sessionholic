@@ -1183,6 +1183,59 @@ class Workflow:
         self.lock = threading.RLock()
         from transfer import Transfers
         self.transfers = Transfers(board.hosts, state_dir)
+        # What 새 세션 terminals run, read from their host at most once a minute.
+        self.program_lock, self.program_busy, self.program_asked = threading.Lock(), set(), {}
+
+    PROGRAM_REFRESH = 60   # seconds between launcher reads on one host
+    PROGRAM_STALE = 300    # a named program is read again after this long (the launcher may switch)
+
+    def describe_launchers(self):
+        """Name what each 새 세션 terminal runs (`launcher_programs` on its host), in the background:
+        a list read never waits on SSH. A change is saved on the terminal and announced."""
+        if getattr(self.terminals, "set_program", None) is None:
+            return
+        try:
+            terminals = self.terminals.list()
+        except (RuntimeError, OSError, ValueError):
+            return
+        now = time.time()
+        due = {}
+        for terminal in terminals:
+            if (terminal.get("mode") != "new-session" or not terminal.get("alive") or terminal.get("closed")
+                    or type(terminal.get("createdAt")) is not int):
+                continue
+            seen = terminal.get("programAt")
+            if type(seen) is int and now - seen < (self.PROGRAM_STALE if terminal.get("program") else self.PROGRAM_REFRESH):
+                continue
+            due.setdefault(terminal.get("host"), []).append({"id": terminal["id"], "createdAt": terminal["createdAt"]})
+        for name, rows in due.items():
+            host = next((h for h in self.board.hosts if h["name"] == name), None)
+            if host is None or host.get("platform") == "windows" or not self.board.state.get(name, {}).get("ok"):
+                continue
+            with self.program_lock:
+                if name in self.program_busy or now - self.program_asked.get(name, 0) < self.PROGRAM_REFRESH:
+                    continue
+                self.program_busy.add(name)
+                self.program_asked[name] = now
+            try:
+                threading.Thread(target=self._describe_host, args=(host, rows), daemon=True,
+                                 name=THREAD_PREFIX + "-launcher-" + name).start()
+            except RuntimeError:
+                with self.program_lock:
+                    self.program_busy.discard(name)
+
+    def _describe_host(self, host, rows):
+        try:
+            result = self.transfers.rpc(host, "launcher_programs", {"terminals": rows}, timeout=15)
+            asked = {row["id"] for row in rows}
+            for identifier, info in (result.get("terminals") or {}).items():
+                if identifier in asked and isinstance(info, dict):
+                    self.terminals.set_program(identifier, info)
+        except (RuntimeError, OSError, ValueError, KeyError, AttributeError):
+            pass
+        finally:
+            with self.program_lock:
+                self.program_busy.discard(host["name"])
 
     def profiles(self):
         from launch import discover_profiles
@@ -2068,6 +2121,7 @@ class Handler(BaseHTTPRequestHandler):
                     # Read before the list: a change in between is announced with a newer
                     # version, so the client reads again rather than missing it.
                     self.server.workflow.link_new_sessions()
+                    self.server.workflow.describe_launchers()
                     version = self.server.events.terminals_version
                     records = self.server.terminals.list()
                     result = {"terminals": records, "version": version}
@@ -2456,7 +2510,8 @@ def make_server(bind, port, board, token, terminals=None, workflow=None, state_d
         except (RuntimeError, OSError, ValueError):
             return "unknown"
         return "agent" if row.get("initiator") == "agent" else "general"
-    server.push = PushService(board, state_dir, classify=push_category, labels=server.session_labels.decorate)
+    server.push = PushService(board, state_dir, classify=push_category, labels=server.session_labels.decorate,
+                              log_prefix=LOG_PREFIX)
     if push:
         server.push.start()
     if automatic_work:

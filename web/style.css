@@ -1054,6 +1054,40 @@ select:disabled {
 .running-terminal-row + .running-terminal-row {
   border-top: 1px solid var(--sep);
 }
+/* A later view of the same Claude agents folder: still usable, marked so it can go. */
+.running-terminal-duplicate {
+  color: var(--orange);
+  font-size: var(--fs-sub);
+  font-weight: 400;
+  line-height: 1.3;
+}
+/* Session connections the board opens and closes itself, folded under one row. */
+.running-connections {
+  display: flex;
+  align-items: center;
+  width: 100%;
+  min-height: 48px;
+  padding: 8px 16px;
+  border: 0;
+  border-top: 1px solid var(--sep);
+  background: transparent;
+  color: var(--label-2);
+  font-size: var(--fs-sub);
+  text-align: left;
+}
+.running-connections::after {
+  content: "›";
+  content: "›" / "";
+  margin-left: auto;
+  padding-left: 12px;
+  transition: transform 0.15s ease;
+}
+.running-connections[aria-expanded="true"]::after {
+  transform: rotate(90deg);
+}
+.running-connections + .running-terminal-row {
+  border-top: 1px solid var(--sep);
+}
 .running-terminal-row .running-terminal {
   flex: 1;
   min-width: 0;
@@ -1180,6 +1214,27 @@ select:disabled {
   text-align: left;
 }
 .new-session-host + .new-session-host {
+  border-top: 1px solid var(--sep);
+}
+/* A terminal already open on the host above: going back to it avoids a repeat. */
+.new-session-open {
+  display: grid;
+  gap: 2px;
+  width: 100%;
+  min-height: 48px;
+  padding: 6px 16px 8px 60px;
+  border: 0;
+  border-top: 1px solid var(--sep);
+  background: transparent;
+  color: var(--label);
+  font-size: var(--fs-sub);
+  text-align: left;
+}
+.new-session-open-label {
+  color: var(--accent);
+  font-weight: 600;
+}
+.new-session-open + .new-session-host {
   border-top: 1px solid var(--sep);
 }
 .new-session-host::before {

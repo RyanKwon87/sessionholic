@@ -126,7 +126,7 @@ function client(
   vm.runInContext(messageSource, context);
   vm.runInContext(source, context);
   const api = vm.runInContext(
-    "({state,api,sourceOf,accountOf,sendInput,pasteDraft,prepareDraftPaste,startDraftComposition,endDraftComposition,inputDraft,stopTerminalReader,startTerminalReader,closePlan,navigateView,backToList,backFromTerminal,closeTerminal,cancelTerminalClose,confirmTerminalClose,populateAccount,populateRoute,updateContinue,renderPlan,launchPlan,openTerminal,saveDraft,draftKey,refreshTerminals,renderTerminals,renderTerminalReturn,renderFilters,terminalCloseCopy,warnDraftUnload,preparePlan,renderGroups,renderMessages,loadDetail,chatKey,chatEntry,currentChat,chatSupported,chatRecovery,recoverChatSession,openChatTerminal,chatAttachmentsSupported,buildChatComposer,sendChat,loadChatState,applyChatReceipt,uploadChatFiles,pasteChat,scheduleChatPoll,stopChatPolling,openNativeChat,allSessions,buildContinuePanel,chatReceiptCopy,returnToBoard,readChatClipboard,accountDisplay,sessionAccountLabel,closeChatToolsOutside,closeChatToolsEscape,drawDetail,refreshDetail,loadCapabilities,matches,recoverConnection,networkOffline,poll,select,focusDetailBack,restoreSelectedCardFocus,showLogin,lock,beginAuthEpoch,resizeChatInput,updateViewport,draftKeydown,configureTerminalKeyboard,queueTerminalScroll,flushTerminalScroll,terminalScrollEnd,renderAttention,chatPollDelay,pullRefresh,readingScroll,renderJump,pullDistance,listScroll,setReading,renderPrompt,promptAction,renderUsage,loadUsage,applyTheme,setTheme,updateThemeColor,haptic,navTransition,setDetailShown,chatVisible,sheetRelease,BottomSheet,sheet,openSettings,closeSettings,setTyping,pinchFontSize,setTerminalFontSize,loadXterm,assetUrl,syncEvents,closeEvents,eventsHealthy,renderFreshness,schedule,touchDevice,togglePhaseFilter,renderCounts,createLongPress,swipeIntent,swipeRelease,groupMessageRows,setTextSize,applyTextSize,renderConnectivity,terminalForSession,swipeActionFor,openMessageMenu,openCardMenu,messageActions,outboxShape,outboxMatches,outboxOrigin,settleOutbox,retryOutbox,renderAttachmentTiles,attachmentThumb,sendUpload,openActionSheet,closeActionSheet,setListCollapsed,closeSwipe,settleSwipe,prepareSwipe,runSwipeAction,GESTURE,setChromeVisible,toggleChrome,revealChrome,isChromeTap,snapshotAnnounced,updateChatComposer,capabilitiesRevision,toolKindOf,userMessageParts,formatElapsed,tickWorking,renderTerminalMarks,renderDetailTerminal,terminalsAnnounced,goToSessionTerminal,rememberTerminal,terminalMenu,updateTerminalMenu,chooseTerminalMenu,clearTerminalMenu,renderNewSession,openNewSession,startNewSession,startAppServer,rememberConversationView,restoreConversationView,conversationIdentity,initiatorOf,initiatorLabel,documentKeydown,sessionCategoryOf,setSessionCategory,renderSessionCategories,prepareSessionListFor,sessionCategoryKeydown,render,resetFilters,terminalTitle,renameTerminals,requestedSessionFrom,requestSessionOpen,openRequestedSession})",
+    "({state,api,sourceOf,accountOf,sendInput,pasteDraft,prepareDraftPaste,startDraftComposition,endDraftComposition,inputDraft,stopTerminalReader,startTerminalReader,closePlan,navigateView,backToList,backFromTerminal,closeTerminal,cancelTerminalClose,confirmTerminalClose,populateAccount,populateRoute,updateContinue,renderPlan,launchPlan,openTerminal,saveDraft,draftKey,refreshTerminals,renderTerminals,renderTerminalReturn,renderFilters,terminalCloseCopy,warnDraftUnload,preparePlan,renderGroups,renderMessages,loadDetail,chatKey,chatEntry,currentChat,chatSupported,chatRecovery,recoverChatSession,openChatTerminal,chatAttachmentsSupported,buildChatComposer,sendChat,loadChatState,applyChatReceipt,uploadChatFiles,pasteChat,scheduleChatPoll,stopChatPolling,openNativeChat,allSessions,buildContinuePanel,chatReceiptCopy,returnToBoard,readChatClipboard,accountDisplay,sessionAccountLabel,closeChatToolsOutside,closeChatToolsEscape,drawDetail,refreshDetail,loadCapabilities,matches,recoverConnection,networkOffline,poll,select,focusDetailBack,restoreSelectedCardFocus,showLogin,lock,beginAuthEpoch,resizeChatInput,updateViewport,draftKeydown,configureTerminalKeyboard,queueTerminalScroll,flushTerminalScroll,terminalScrollEnd,renderAttention,chatPollDelay,pullRefresh,readingScroll,renderJump,pullDistance,listScroll,setReading,renderPrompt,promptAction,renderUsage,loadUsage,applyTheme,setTheme,updateThemeColor,haptic,navTransition,setDetailShown,chatVisible,sheetRelease,BottomSheet,sheet,openSettings,closeSettings,setTyping,pinchFontSize,setTerminalFontSize,loadXterm,assetUrl,syncEvents,closeEvents,eventsHealthy,renderFreshness,schedule,touchDevice,togglePhaseFilter,renderCounts,createLongPress,swipeIntent,swipeRelease,groupMessageRows,setTextSize,applyTextSize,renderConnectivity,terminalForSession,swipeActionFor,openMessageMenu,openCardMenu,messageActions,outboxShape,outboxMatches,outboxOrigin,settleOutbox,retryOutbox,renderAttachmentTiles,attachmentThumb,sendUpload,openActionSheet,closeActionSheet,setListCollapsed,closeSwipe,settleSwipe,prepareSwipe,runSwipeAction,GESTURE,setChromeVisible,toggleChrome,revealChrome,isChromeTap,snapshotAnnounced,updateChatComposer,capabilitiesRevision,toolKindOf,userMessageParts,formatElapsed,tickWorking,renderTerminalMarks,renderDetailTerminal,terminalsAnnounced,goToSessionTerminal,rememberTerminal,terminalMenu,updateTerminalMenu,chooseTerminalMenu,clearTerminalMenu,renderNewSession,openNewSession,startNewSession,startAppServer,rememberConversationView,restoreConversationView,conversationIdentity,initiatorOf,initiatorLabel,documentKeydown,sessionCategoryOf,setSessionCategory,renderSessionCategories,prepareSessionListFor,sessionCategoryKeydown,render,resetFilters,terminalTitle,renameTerminals,requestedSessionFrom,requestSessionOpen,openRequestedSession,answerOnOpen})",
     context,
   );
   api.state.csrf = "csrf-test";
@@ -3554,6 +3554,37 @@ test('menus the web cannot drive stay readable with disabled options, and a wait
   assert.equal(c.get('chat-prompt').hidden, true);
 });
 
+test('a 답 필요 session opened from its card or notification loads its question once, without another tap', async () => {
+  const requests = [];
+  const c = client(async (url, opts) => {
+    requests.push([url, JSON.parse(opts.body || '{}')]);
+    return { ok: true, status: 200, json: async () => ({ prompt: null, messages: [] }) };
+  }, noChatTimers);
+  const { s, entry } = selectChat(c);
+  c.drawDetail(s);
+  const opens = () => requests.filter(([url, body]) => url === '/api/chat/prompt' && body.action === 'open').length;
+  // Opened another way: the card waits for "질문 불러오기".
+  entry.data = { ...entry.data, phase: 'needs_input', prompt: null, promptOpenable: true };
+  c.renderPrompt(s, entry.data);
+  await settle();
+  assert.equal(opens(), 0);
+  c.answerOnOpen(s);
+  c.renderPrompt(s, { ...entry.data });
+  await settle();
+  assert.equal(opens(), 1);
+  assert.equal(c.state.answerOnOpen, null);
+  c.renderPrompt(s, { ...entry.data });
+  await settle();
+  assert.equal(opens(), 1, 'later renders never load it again by themselves');
+  // A request that waited too long, or one for a question already shown, does nothing.
+  c.answerOnOpen(s);
+  c.state.answerOnOpen.until = Date.now() - 1;
+  c.renderPrompt(s, { ...entry.data });
+  await settle();
+  assert.equal(opens(), 1);
+  assert.equal(c.state.answerOnOpen, null);
+});
+
 test('a failed "질문 불러오기" says why on its card, and the note never follows to the next question', async () => {
   const c = client(async (url, opts) => {
     if (url === '/api/chat/prompt') return { ok: false, status: 409, json: async () => ({ error: '질문 화면을 불러오지 못했습니다.' }) };
@@ -4316,6 +4347,9 @@ test('the usage line is one chip that opens a sheet of per-account bars, and ope
   assert.equal(c.get('running-count').textContent, 1);
   c.get('running-terminals').events.click();
   assert.equal(c.get('terminals-dialog').open, true);
+  // A connection to an existing session is folded under one row until asked for.
+  assert.doesNotMatch(textOf(c.get('running-list')), /열어 둔 작업/);
+  byClass(c.get('running-list'), 'running-connections')[0].events.click();
   assert.match(textOf(c.get('running-list')), /열어 둔 작업/);
   c.state.terminals = [];
   c.renderTerminals();
@@ -6608,6 +6642,31 @@ test('the session list groups what needs an answer, what runs, what stopped in t
   assert.ok(!shown.some((s) => s.id === 'ancient'), 'only the 이전 group drops sessions older than three days');
 });
 
+test('a 새 세션 terminal is named by what it runs, and a second view of the same Claude agents folder is marked as a repeat', () => {
+  const c = client(undefined, noChatTimers);
+  const launcher = (id, createdAt, program, programCwd, host = 'laptop') => ({ id, alive: true, title: 'zz', mode: 'new-session',
+    host, createdAt, metadata: { mode: 'new-session', host, createdAt, program, programCwd } });
+  c.state.terminals = [
+    launcher('later', 1791792862, 'claude-agents', '/Users/example/project-a'),
+    launcher('first', 1791785812, 'claude-agents', '/Users/example/project-a'),
+    launcher('other-folder', 1791790000, 'claude-agents', '/Users/example/project-b'),
+    launcher('codex', 1791791000, 'codex', null),
+    launcher('mini', 1791791500, 'claude-agents', '/Users/example/project-a', 'mini'),
+    { id: 'link', alive: true, title: '세션 연결', mode: 'attach', metadata: { mode: 'attach' } },
+  ];
+  c.renderTerminals();
+  const rows = byClass(c.get('running-list'), 'running-terminal-row');
+  assert.deepEqual(rows.map((row) => byClass(row, 'running-terminal-title')[0].textContent),
+    ['Claude 에이전트 목록 · project-a', 'Claude 에이전트 목록 · project-a', 'Claude 에이전트 목록 · project-b',
+      'Codex · 10. 12. 오후 04:43 시작', 'Claude 에이전트 목록 · project-a']);
+  const repeated = rows.filter((row) => row.className.includes('duplicate')).map((row) => row.children[0].dataset.terminalId);
+  assert.deepEqual(repeated, ['later'], 'only the later view of one host and folder repeats the first');
+  assert.match(textOf(rows[0]), /같은 화면이 이미 열려 있어요\(10\. 12\. 오후 03:16 시작\)/);
+  assert.equal(c.get('running-count').textContent, 5, 'the chip counts terminals the user opened');
+  assert.match(c.get('running-terminals').attributes['aria-label'], /열린 터미널 5개, 세션 연결 1개/);
+  assert.equal(byClass(c.get('running-list'), 'running-connections')[0].attributes['aria-expanded'], 'false');
+});
+
 test('a notification link opens its session once it is listed, and an old request expires', async () => {
   const c = client(async () => ({ ok: true, status: 200, json: async () => ({ terminals: [] }) }), noChatTimers);
   assert.equal(c.requestedSessionFrom('/?session=workstation%7Ccodex%7C.codex-example%7Cnote'), 'workstation|codex|.codex-example|note');
@@ -6637,18 +6696,20 @@ test('an open terminal is named after the session it runs and follows a renamed 
   const launcher = (id, createdAt) => ({ id, alive: true, title: 'zz', mode: 'new-session', createdAt,
     metadata: { mode: 'new-session', createdAt } });
   c.state.terminals = [attached, launcher('first', 1791792862), launcher('second', 1791785812)];
+  c.state.showConnections = true;
   c.renderTerminals();
   const titles = () => byClass(c.get('running-list'), 'running-terminal-title').map((node) => node.textContent);
-  assert.deepEqual(titles(), ['검토할 작업', 'zz · 10. 12. 오후 05:14 시작', 'zz · 10. 12. 오후 03:16 시작']);
+  // Terminals the user opened come first, then the folded session connections.
+  assert.deepEqual(titles(), ['zz · 10. 12. 오후 05:14 시작', 'zz · 10. 12. 오후 03:16 시작', '검토할 작업']);
   // A newer snapshot with the session renamed renames its terminal.
   // An open sheet is not rebuilt under the finger; it renames once it is not open.
   setRecentSnapshot(c, [{ ...s, title: '바뀐 작업 이름' }]);
   c.get('terminals-dialog').open = true;
   c.renameTerminals();
-  assert.equal(titles()[0], '검토할 작업');
+  assert.equal(titles()[2], '검토할 작업');
   c.get('terminals-dialog').open = false;
   c.renameTerminals();
-  assert.equal(titles()[0], '바뀐 작업 이름');
+  assert.equal(titles()[2], '바뀐 작업 이름');
   // A link estimated from start times says so.
   assert.equal(c.terminalTitle({ ...attached, metadata: { ...attached.metadata, linkConfidence: 'estimated' } }),
     '바뀐 작업 이름 · 연결 추정');

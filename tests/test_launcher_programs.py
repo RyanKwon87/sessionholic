@@ -1,0 +1,126 @@
+from pathlib import Path
+import sys
+import tempfile
+import threading
+import time
+import unittest
+from unittest.mock import patch
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import launcher_programs as lp  # noqa: E402
+
+LAUNCHER = ["/bin/zsh", "-lic", "zz"]
+FIRST, SECOND = "a" * 32, "b" * 32
+
+
+def started(text):
+    return int(time.mktime(time.strptime(text, lp.LSTART)))
+
+
+PS = """  501     1 Mon Oct 12 15:16:50 2026     /usr/sbin/sshd
+57597   501 Mon Oct 12 15:16:52 2026     /bin/zsh -lic zz
+57608 57597 Mon Oct 12 15:16:59 2026     /bin/zsh -c _zz_run
+57623 57608 Mon Oct 12 15:17:00 2026     /Users/example/.local/bin/claude agents --dangerously-skip-permissions --cwd /Users/example/project --mcp-config /x.json
+57635 57623 Mon Oct 12 15:17:00 2026     /Users/example/.local/bin/claude daemon run --origin transient
+67233   501 Mon Oct 12 17:14:22 2026     /bin/zsh -lic zz
+67255 67233 Mon Oct 12 17:14:29 2026     node /opt/homebrew/bin/codex --cd /Users/example/other
+67260 67255 Mon Oct 12 17:14:29 2026     /opt/homebrew/lib/node_modules/@openai/codex/vendor/codex --cd /Users/example/other
+70000   501 Mon Oct 12 17:30:00 2026     /bin/zsh -lic zz
+70001   501 Mon Oct 12 17:30:02 2026     /bin/zsh -lic zz
+not a process line
+"""
+
+
+class TableTest(unittest.TestCase):
+    def test_ps_rows_are_parsed_in_the_c_locale_and_bad_lines_are_skipped(self):
+        commands = []
+        rows = lp.table(lambda command: commands.append(command) or PS)
+        self.assertEqual(commands, [[lp.PS, "-axww", "-o", "pid=,ppid=,lstart=,command="]])
+        self.assertEqual(len(rows), 10)
+        self.assertEqual(rows[1], (57597, 501, started("Mon Oct 12 15:16:52 2026"), "/bin/zsh -lic zz"))
+
+
+class ProgramTest(unittest.TestCase):
+    def test_agent_clis_are_named_and_claude_helpers_are_not(self):
+        cases = {
+            "/Users/example/.local/bin/claude agents --cwd /Users/example/project": {"program": "claude-agents", "cwd": "/Users/example/project"},
+            "/Users/example/.local/bin/claude agents --cwd=relative": {"program": "claude-agents", "cwd": None},
+            "claude": {"program": "claude", "cwd": None},
+            "/x/claude daemon run": None, "claude bg-pty-host --bg-pty-host x": None, "claude bg-spare": None,
+            "node /opt/homebrew/bin/codex resume 019a": {"program": "codex", "cwd": None},
+            "/opt/homebrew/bin/codex app-server --listen unix://": None,
+            "/bin/zsh -lic zz": None, "": None,
+        }
+        for command, expected in cases.items():
+            with self.subTest(command=command):
+                self.assertEqual(lp.program_of(command), expected)
+
+    def test_each_terminal_names_its_own_launcher_and_the_first_cli_below_it(self):
+        rows = lp.table(lambda command: PS)
+        terminals = [{"id": FIRST, "createdAt": started("Mon Oct 12 15:16:51 2026")},
+                     {"id": SECOND, "createdAt": started("Mon Oct 12 17:14:21 2026")},
+                     {"id": "c" * 32, "createdAt": started("Mon Oct 12 17:30:00 2026")},
+                     {"id": "d" * 32, "createdAt": started("Mon Oct 12 09:00:00 2026")},
+                     {"id": "../x", "createdAt": 1}, {"id": "e" * 32, "createdAt": "soon"}]
+        result = lp.describe(terminals, LAUNCHER, rows)
+        self.assertEqual(result[FIRST], {"program": "claude-agents", "cwd": "/Users/example/project", "pid": 57623})
+        self.assertEqual(result[SECOND], {"program": "codex", "cwd": None, "pid": 67255})
+        # Two launchers in the same window, or none: no guess.
+        self.assertEqual(result["c" * 32], {"program": None})
+        self.assertEqual(result["d" * 32], {"program": None})
+        self.assertEqual(set(result), {FIRST, SECOND, "c" * 32, "d" * 32})
+
+    def test_a_host_without_a_launcher_reports_nothing(self):
+        with patch("launch.new_session", side_effect=ValueError("no launcher")):
+            self.assertEqual(lp.launcher_programs({"terminals": []}), {"terminals": {}})
+        with patch("launch.new_session", return_value={"argv": LAUNCHER}), self.assertRaises(ValueError):
+            lp.launcher_programs({"terminals": "x"})
+
+
+class WorkflowTest(unittest.TestCase):
+    def test_reads_run_in_the_background_once_a_minute_per_host_and_save_the_program(self):
+        import server
+
+        class Terminals:
+            def __init__(self):
+                self.saved, self.rows = [], [
+                    {"id": FIRST, "mode": "new-session", "alive": True, "host": "laptop", "createdAt": 100},
+                    {"id": SECOND, "mode": "attach", "alive": True, "host": "laptop", "createdAt": 100},
+                    {"id": "c" * 32, "mode": "new-session", "alive": True, "host": "pc", "createdAt": 100},
+                ]
+
+            def list(self):
+                return self.rows
+
+            def set_program(self, identifier, info):
+                self.saved.append((identifier, info))
+                return True
+
+        class Board:
+            hosts = [{"name": "laptop", "label": "노트북"}, {"name": "pc", "label": "PC", "platform": "windows"}]
+            state = {"laptop": {"ok": True}, "pc": {"ok": True}}
+
+        with tempfile.TemporaryDirectory() as directory:
+            terminals = Terminals()
+            flow = server.Workflow(Board(), terminals, directory)
+            done = threading.Event()
+            calls = []
+
+            def rpc(host, op, args, timeout):
+                calls.append((host["name"], op, args))
+                done.set()
+                return {"terminals": {FIRST: {"program": "claude-agents", "cwd": "/p"}, "f" * 32: {"program": "codex"}}}
+            with patch.object(flow.transfers, "rpc", side_effect=rpc):
+                flow.describe_launchers()
+                self.assertTrue(done.wait(3))
+                for _ in range(50):
+                    if terminals.saved:
+                        break
+                    time.sleep(0.02)
+                flow.describe_launchers()
+        self.assertEqual(calls, [("laptop", "launcher_programs", {"terminals": [{"id": FIRST, "createdAt": 100}]})])
+        self.assertEqual(terminals.saved, [(FIRST, {"program": "claude-agents", "cwd": "/p"})])
+
+
+if __name__ == "__main__":
+    unittest.main()

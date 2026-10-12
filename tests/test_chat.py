@@ -934,13 +934,11 @@ class ChatClaudeTest(unittest.TestCase):
                 self.assertFalse(state['requiresNativeTerminal'])
         self.terms.rows = []
         self.kind('background')
-        # Without a board terminal even a background session cannot take input: the board
-        # never opens one by itself, it asks the user to (the composer's button).
+        # A background session without a board terminal takes input too: sending attaches it.
         capability = self.state()['capability']
-        self.assertFalse(capability['supported'])
-        self.assertEqual(capability['reason'], chat.CLAUDE_OPEN_TERMINAL)
-        self.assertEqual(capability['reason'], '보내려면 먼저 터미널을 여세요.')
-        self.assertEqual(capability['action'], 'open_terminal')
+        self.assertTrue(capability['supported'])
+        self.assertIsNone(capability['reason'])
+        self.assertNotIn('action', capability)
         # A session waiting for the user still takes a reply; menus are checked at send time.
         self.phase = 'needs_input'
         self.terminal()
@@ -982,25 +980,41 @@ class ChatClaudeTest(unittest.TestCase):
         self.assertEqual(len(self.terms.pastes), 1)
         self.assertEqual(self.calls, [('chat', 'capabilities')])
 
-    def test_background_without_terminal_is_refused_and_never_opens_one(self):
-        # Sending never opens a terminal: only the user's own "터미널 열기" (or the question
-        # card's "질문 불러오기") does. The refusal is before any reservation, so the draft stays.
+    def test_background_without_terminal_attaches_it_once_then_pastes(self):
+        # 보내기 on a background session with no board terminal attaches that exact session
+        # first. A failed attach is refused before any reservation, so the draft stays.
         with patch.object(self.chat, '_open_claude_terminal',
-                          side_effect=AssertionError('sending must not open a terminal')) as opened, \
-                patch.object(self.flow, 'plan') as plan, patch.object(self.flow, 'launch') as launched:
+                          side_effect=chat.SendRejected('Claude 터미널이 준비되지 않았습니다.', 409)) as failing:
             with self.assertRaises(chat.SendRejected) as caught:
                 self.send(rid='request-0002', text='백그라운드 확인')
-        self.assertEqual((caught.exception.status, caught.exception.code), (409, 'terminal_required'))
-        self.assertEqual(str(caught.exception), chat.CLAUDE_OPEN_TERMINAL)
-        opened.assert_not_called(); plan.assert_not_called(); launched.assert_not_called()
-        self.assertEqual(self.terms.pastes, [])
-        self.assertEqual(self.terms.log, [])
-        self.assertEqual(self.records(), [])
-        # Once the user opened the terminal, the same request is delivered into it, once.
-        self.terminal()
-        self.assertEqual(self.send(rid='request-0002', text='백그라운드 확인')['status'], 'accepted')
-        self.send(rid='request-0003', text='두 번째')
+        self.assertEqual((caught.exception.status, caught.exception.code), (409, 'terminal_unavailable'))
+        failing.assert_called_once()
+        self.assertEqual((self.terms.pastes, self.records()), ([], []))
+        with patch.object(self.chat, '_open_claude_terminal', side_effect=RuntimeError('열린 터미널 4개가 가득 찼습니다.')):
+            with self.assertRaises(chat.SendRejected) as caught:
+                self.send(rid='request-0003', text='백그라운드 확인')
+        self.assertEqual((str(caught.exception), caught.exception.code), ('열린 터미널 4개가 가득 찼습니다.', 'terminal_unavailable'))
+        self.assertEqual((self.terms.pastes, self.records()), ([], []))
+        opened = []
+
+        def attach(ref, source, request_id):
+            opened.append((ref['id'], source['kind'], request_id))
+            return self.terminal()
+        with patch.object(self.chat, '_open_claude_terminal', side_effect=attach):
+            result = self.send(rid='request-0004', text='  백그라운드 확인  ')
+            self.assertEqual(result['status'], 'accepted')
+            # The attached terminal is used from then on; nothing opens a second one.
+            self.assertEqual(self.send(rid='request-0005', text='두 번째')['status'], 'accepted')
+        self.assertEqual(opened, [(CLAUDE_REF['id'], 'background', 'request-0004')])
         self.assertEqual(self.terms.pastes, [(TERMINAL_ID, '백그라운드 확인', True), (TERMINAL_ID, '두 번째', True)])
+        self.assertEqual(len(self.records()), 2)
+        # An interactive session still cannot be attached and is refused as before.
+        self.terms.rows = []
+        self.kind('interactive')
+        with patch.object(self.chat, '_open_claude_terminal', side_effect=AssertionError('interactive is never attached')):
+            with self.assertRaises(chat.SendRejected) as caught:
+                self.send(rid='request-0006', text='대화형')
+        self.assertEqual(str(caught.exception), chat.CLAUDE_EXTERNAL)
 
     def test_question_card_attach_failures_type_nothing(self):
         # "질문 불러오기" still attaches a background session; its failures reach the card.

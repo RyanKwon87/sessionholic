@@ -73,7 +73,7 @@ test("with nothing queued a push shows the latest notice again quietly, or a gen
   for (const options of [{}, { fetchFails: true }, { subscribed: false }]) {
     const generic = worker(options);
     await generic.fire("push");
-    assert.deepEqual(generic.notifications.map((item) => [item.title, item.tag, item.data.url]), [["세션홀릭", "sessionholic-generic", "/"]]);
+    assert.deepEqual(generic.notifications.map((item) => [item.title, item.tag, item.data.url]), [["확인할 세션이 있어요", "board-notice", "/"]]);
   }
 });
 
@@ -84,7 +84,7 @@ test("tapping a notice focuses an open board and asks it to open the session, or
   const open = worker({ windows: [other, board] });
   const closed = [];
   await open.fire("notificationclick", { notification: { data: { url: "/?session=a%7Cb" }, close: () => closed.push(1) } });
-  assert.deepEqual([focused, plain(messages), closed.length], [1, [{ type: "sessionholic-open", url: "/?session=a%7Cb" }], 1]);
+  assert.deepEqual([focused, plain(messages), closed.length], [1, [{ type: "open-session", url: "/?session=a%7Cb" }], 1]);
   const cold = worker();
   await cold.fire("notificationclick", { notification: { data: { url: "javascript:alert(1)" }, close() {} } });
   assert.deepEqual(cold.opened, ["/"]);

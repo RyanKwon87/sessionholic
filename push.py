@@ -201,8 +201,8 @@ def http_post(url, headers, timeout=SEND_TIMEOUT):
 
 class PushService:
     def __init__(self, board, state_dir, classify=None, labels=None, sender=None, vapid=None,
-                 clock=time.time, monotonic=time.monotonic):
-        self.board = board
+                 clock=time.time, monotonic=time.monotonic, log_prefix="세션 알림"):
+        self.board, self.log_prefix = board, log_prefix
         self.directory = Path(state_dir) / "push"
         self.classify = classify or (lambda host, row: "general")
         self.labels = labels or (lambda snapshot: snapshot)
@@ -283,8 +283,8 @@ class PushService:
             target = next((row for row in self.subscriptions if row["id"] == identifier), None)
         if target is None:
             raise ValueError("이 기기는 알림을 받도록 등록되어 있지 않습니다. 알림을 다시 켜 주세요.")
-        notice = {"title": "세션홀릭 알림 테스트", "body": "이 기기에서 알림을 받을 수 있어요.",
-                  "tag": "sessionholic-test", "url": "/", "createdAt": int(self.clock())}
+        notice = {"title": "알림 테스트", "body": "이 기기에서 알림을 받을 수 있어요.",
+                  "tag": "notice-test", "url": "/", "createdAt": int(self.clock())}
         self._queue([target], notice)
         status = self._send(target, ttl=300, urgency="high")
         if status not in (200, 201, 202):
@@ -296,7 +296,7 @@ class PushService:
         if self.thread is not None:
             return
         self.board.add_listener(self.changed)
-        self.thread = threading.Thread(target=self.run, daemon=True, name="sessionholic-push")
+        self.thread = threading.Thread(target=self.run, daemon=True, name="board-push")
         self.thread.start()
 
     def changed(self, *_):
@@ -319,7 +319,7 @@ class PushService:
             try:
                 self.step()
             except Exception as exc:  # noqa: BLE001 - the watcher must survive one bad round
-                sys.stderr.write("세션홀릭 알림: 상태 확인 실패 (%s)\n" % type(exc).__name__)
+                sys.stderr.write("%s: 알림 상태 확인 실패 (%s)\n" % (self.log_prefix, type(exc).__name__))
 
     def step(self):
         with self.lock:
@@ -388,7 +388,7 @@ class PushService:
         try:
             write_private(self.directory / "seen.json", rows)
         except OSError:
-            sys.stderr.write("세션홀릭 알림: 상태 기록 저장 실패\n")
+            sys.stderr.write("%s: 알림 상태 기록 저장 실패\n" % self.log_prefix)
 
     # ---------- sending ----------
     def notice(self, event):
@@ -451,4 +451,4 @@ class PushService:
         if mark in self.reported:
             return
         self.reported.add(mark)
-        sys.stderr.write("세션홀릭 알림: 알림 서비스 응답 %s %s\n" % (status, reason))
+        sys.stderr.write("%s: 알림 서비스 응답 %s %s\n" % (self.log_prefix, status, reason))

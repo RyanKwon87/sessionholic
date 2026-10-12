@@ -552,8 +552,8 @@ class Chat:
         return None
 
     def _claude_capability(self, source, terminal, failed):
-        """(supported, reason, action). Only a live board terminal takes input; the board never
-        opens one by itself, so a background session without one asks the user to open it."""
+        """(supported, reason, action). Input goes through a live board terminal; for a background
+        session without one, sending attaches it first (`_send_claude`)."""
         # A session waiting for the user can still take a reply; a menu on its
         # screen is checked at send time, right before anything is pasted.
         if failed:
@@ -561,7 +561,7 @@ class Chat:
         if terminal:
             return True, None, None
         if source.get('kind') == 'background':
-            return False, CLAUDE_OPEN_TERMINAL, 'open_terminal'
+            return True, None, None
         # An interactive session cannot be attached (launch.build_launch), so no button is offered.
         return False, CLAUDE_EXTERNAL, None
 
@@ -709,7 +709,7 @@ class Chat:
 
     def _open_claude_terminal(self, ref, source, request_id):
         """Attach the exact background session in a board terminal, never a new session.
-        Used only by the question card's "질문 불러오기", a button the user presses; sending never opens one."""
+        Used by the question card's "질문 불러오기" and by sending to a session with no board terminal."""
         plan = self.workflow.plan({'source': ref, 'target': {
             'host': source['host'], 'agent': 'claude', 'account': 'claude:default'}})
         if not plan.get('allowed'):
@@ -817,9 +817,16 @@ class Chat:
             if terminal is None:
                 if source.get('kind') != 'background':
                     raise SendRejected(CLAUDE_EXTERNAL, 409)
-                # Terminals open only when the user asks (the composer's "터미널 열기");
-                # nothing was reserved or pasted, so the draft stays and may be sent later.
-                raise SendRejected(CLAUDE_OPEN_TERMINAL, 409, code='terminal_required')
+                # The user pressed 보내기: attach this exact background session first. A failure
+                # here is before any reservation or paste, so the draft stays for a later send.
+                try:
+                    terminal = self._open_claude_terminal(ref, source, request_id)
+                except SendRejected as exc:
+                    raise SendRejected(str(exc), exc.status, code='terminal_unavailable') from None
+                except (ValueError, RuntimeError, OSError) as exc:
+                    raise SendRejected(str(exc) if isinstance(exc, (ValueError, RuntimeError)) else
+                                       'Claude 터미널을 열지 못했습니다.', 409, code='terminal_unavailable') from None
+                self._forget_state(source)
             try:
                 screen = self.workflow.terminals.capture(terminal['id'])
             except (RuntimeError, ValueError, KeyError, OSError):

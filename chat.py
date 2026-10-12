@@ -19,6 +19,7 @@ CLAUDE_EXTERNAL = ('이 Claude 세션은 보드 밖 터미널에서 실행 중�
                    '그 터미널에서 입력하거나 백그라운드 세션(claude --bg)으로 실행해 주세요.')
 # A background session takes web input only through a board terminal the user opened.
 CLAUDE_OPEN_TERMINAL = '보내려면 먼저 터미널을 여세요.'
+CLAUDE_NOT_READY = 'Claude 터미널이 준비되지 않았습니다. 잠시 뒤 다시 보내거나 터미널을 열어 상태를 확인해 주세요.'
 CONTROL = re.compile(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]')
 CLAUDE_READY_SECONDS = 12
 CLAUDE_PROBE = 160
@@ -222,6 +223,8 @@ class Chat:
         self.upload_gate = threading.BoundedSemaphore(2)
         # Serialises everything the board types into agent terminals (pastes, menu keys).
         self.claude_lock = threading.Lock()
+        # Terminals a send opened that were still loading when it gave up.
+        self.unsettled = set()
         self.prompt_results = {}
         # state key -> {request id: monotonic expiry}, oldest first.
         self.waiting = {}
@@ -716,19 +719,24 @@ class Chat:
             raise SendRejected(plan.get('reason') or CLAUDE_EXTERNAL, 409)
         launch_id = 'chat_' + hashlib.sha256(request_id.encode()).hexdigest()[:40]
         terminal = self.workflow.launch(plan['id'], launch_id)['terminal']
-        # The attach UI redraws while it loads; paste only after it settles.
+        if not self._settled(terminal['id']):
+            # A retry finds this terminal; it waits for the attach screen again before a paste.
+            self.unsettled.add(terminal['id'])
+            raise SendRejected(CLAUDE_NOT_READY, 409)
+        return terminal
+
+    def _settled(self, terminal_id):
+        """The attach UI redraws while it loads; it is ready once output stops for a moment."""
         deadline, after, seen, quiet = time.monotonic() + CLAUDE_READY_SECONDS, 0, False, time.monotonic()
         while time.monotonic() < deadline:
-            chunk = self.workflow.terminals.read(terminal['id'], after, 0.25)
+            chunk = self.workflow.terminals.read(terminal_id, after, 0.25)
             if chunk['after'] != after:
                 after, seen, quiet = chunk['after'], True, time.monotonic()
             elif seen and time.monotonic() - quiet >= 0.8:
-                return terminal
+                return True
             if not chunk.get('alive', True):
                 break
-        if not seen:
-            raise SendRejected('Claude 터미널이 준비되지 않았습니다. 터미널을 열어 상태를 확인해 주세요.', 409)
-        return terminal
+        return seen
 
     def _claude_record_path(self, source, request_id):
         folder = self.root / 'claude-sends'
@@ -827,6 +835,11 @@ class Chat:
                     raise SendRejected(str(exc) if isinstance(exc, (ValueError, RuntimeError)) else
                                        'Claude 터미널을 열지 못했습니다.', 409, code='terminal_unavailable') from None
                 self._forget_state(source)
+            elif terminal['id'] in self.unsettled:
+                # Opened by an earlier send that timed out waiting: never paste into a loading screen.
+                if not self._settled(terminal['id']):
+                    raise SendRejected(CLAUDE_NOT_READY, 409, code='terminal_unavailable')
+            self.unsettled.discard(terminal['id'])
             try:
                 screen = self.workflow.terminals.capture(terminal['id'])
             except (RuntimeError, ValueError, KeyError, OSError):

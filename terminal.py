@@ -43,7 +43,7 @@ MAX_TERMINALS = 16
 # A board connection to an existing session left unused this long may be released
 # for a new terminal; the session itself keeps running.
 RELEASE_IDLE = 60
-# Unused this long, such a connection is closed even with room to spare; sending to the
+# Unused this long, a Claude connection is closed even with room to spare; sending to the
 # session (or 질문 불러오기) attaches it again.
 CLOSE_IDLE = 600
 HISTORY_LIMIT = 20000
@@ -733,7 +733,10 @@ class TerminalManager:
             now = time.monotonic()
             for terminal in self.terminals.values():
                 terminal.alive = self._exists(terminal)
-                if terminal.alive and self._releasable(terminal) and now - terminal.touched >= CLOSE_IDLE:
+                # Only Claude connections, which the board opens itself to send or answer;
+                # a Codex connection the user opened closes only when room is needed.
+                if (terminal.alive and self._releasable(terminal) and terminal.record["metadata"].get("agent") == "claude"
+                        and now - terminal.touched >= CLOSE_IDLE):
                     try:
                         self._end(terminal, "released")
                         released = True

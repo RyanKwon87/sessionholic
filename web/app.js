@@ -6318,7 +6318,8 @@ function rememberTerminal(terminal, changes = {}) {
 function renderTerminals() {
   const list = $("running-list");
   const focused = document.activeElement?.dataset;
-  const restoreFocus = focused?.terminalId ? { id: focused.terminalId, action: focused.action } : null;
+  const restoreFocus = focused?.terminalId ? { id: focused.terminalId, action: focused.action }
+    : focused?.action === "connections" ? { action: "connections" } : null;
   list.replaceChildren();
   const alive = state.terminals.filter((t) => t.alive !== false && !t.closed);
   const direct = alive.filter((terminal) => !connectionTerminal(terminal));

@@ -17,16 +17,20 @@ def started(text):
     return int(time.mktime(time.strptime(text, lp.LSTART)))
 
 
-PS = """  501     1 Mon Oct 12 15:16:50 2026     /usr/sbin/sshd
-57597   501 Mon Oct 12 15:16:52 2026     /bin/zsh -lic zz
-57608 57597 Mon Oct 12 15:16:59 2026     /bin/zsh -c _zz_run
-57623 57608 Mon Oct 12 15:17:00 2026     /Users/example/.local/bin/claude agents --dangerously-skip-permissions --cwd /Users/example/project --mcp-config /x.json
-57635 57623 Mon Oct 12 15:17:00 2026     /Users/example/.local/bin/claude daemon run --origin transient
-67233   501 Mon Oct 12 17:14:22 2026     /bin/zsh -lic zz
-67255 67233 Mon Oct 12 17:14:29 2026     node /opt/homebrew/bin/codex --cd /Users/example/other
-67260 67255 Mon Oct 12 17:14:29 2026     /opt/homebrew/lib/node_modules/@openai/codex/vendor/codex --cd /Users/example/other
-70000   501 Mon Oct 12 17:30:00 2026     /bin/zsh -lic zz
-70001   501 Mon Oct 12 17:30:02 2026     /bin/zsh -lic zz
+PS = """  501   501     1 Mon Oct 12 15:16:50 2026     /usr/sbin/sshd
+  501 57597   501 Mon Oct 12 15:16:52 2026     /bin/zsh -lic zz
+  501 57608 57597 Mon Oct 12 15:16:59 2026     /bin/zsh -c _zz_run
+  501 57623 57608 Mon Oct 12 15:17:00 2026     /Users/example/.local/bin/claude agents --dangerously-skip-permissions --cwd /Users/example/My Project --mcp-config /x.json
+  501 57635 57623 Mon Oct 12 15:17:00 2026     /Users/example/.local/bin/claude daemon run --origin transient
+  501 67233   501 Mon Oct 12 17:14:22 2026     /bin/zsh -lic zz
+  501 67255 67233 Mon Oct 12 17:14:29 2026     node /opt/homebrew/bin/codex --cd /Users/example/other
+  501 67260 67255 Mon Oct 12 17:14:29 2026     /opt/homebrew/lib/node_modules/@openai/codex/vendor/codex --cd /Users/example/other
+  501 70000   501 Mon Oct 12 17:30:00 2026     /bin/zsh -lic zz
+  501 70001   501 Mon Oct 12 17:30:02 2026     /bin/zsh -lic zz
+  502 80000     1 Mon Oct 12 18:00:00 2026     /bin/zsh -lic zz
+  502 80001 80000 Mon Oct 12 18:00:01 2026     claude agents --cwd /Users/other/secret
+  501 90000   501 Mon Oct 12 19:00:00 2026     /bin/zsh /Users/example/bin/zz-launcher
+  501 90001 90000 Mon Oct 12 19:00:03 2026     claude
 not a process line
 """
 
@@ -34,9 +38,9 @@ not a process line
 class TableTest(unittest.TestCase):
     def test_ps_rows_are_parsed_in_the_c_locale_and_bad_lines_are_skipped(self):
         commands = []
-        rows = lp.table(lambda command: commands.append(command) or PS)
-        self.assertEqual(commands, [[lp.PS, "-axww", "-o", "pid=,ppid=,lstart=,command="]])
-        self.assertEqual(len(rows), 10)
+        rows = lp.table(lambda command: commands.append(command) or PS, uid=501)
+        self.assertEqual(commands, [[lp.PS, "-axww", "-o", "uid=,pid=,ppid=,lstart=,command="]])
+        self.assertEqual(len(rows), 12, "another user's processes are never read")
         self.assertEqual(rows[1], (57597, 501, started("Mon Oct 12 15:16:52 2026"), "/bin/zsh -lic zz"))
 
 
@@ -56,19 +60,24 @@ class ProgramTest(unittest.TestCase):
                 self.assertEqual(lp.program_of(command), expected)
 
     def test_each_terminal_names_its_own_launcher_and_the_first_cli_below_it(self):
-        rows = lp.table(lambda command: PS)
+        rows = lp.table(lambda command: PS, uid=501)
         terminals = [{"id": FIRST, "createdAt": started("Mon Oct 12 15:16:51 2026")},
                      {"id": SECOND, "createdAt": started("Mon Oct 12 17:14:21 2026")},
                      {"id": "c" * 32, "createdAt": started("Mon Oct 12 17:30:00 2026")},
                      {"id": "d" * 32, "createdAt": started("Mon Oct 12 09:00:00 2026")},
+                     {"id": "f" * 32, "createdAt": started("Mon Oct 12 18:00:00 2026")},
                      {"id": "../x", "createdAt": 1}, {"id": "e" * 32, "createdAt": "soon"}]
         result = lp.describe(terminals, LAUNCHER, rows)
-        self.assertEqual(result[FIRST], {"program": "claude-agents", "cwd": "/Users/example/project", "pid": 57623})
+        self.assertEqual(result[FIRST], {"program": "claude-agents", "cwd": "/Users/example/My Project", "pid": 57623})
         self.assertEqual(result[SECOND], {"program": "codex", "cwd": None, "pid": 67255})
         # Two launchers in the same window, or none: no guess.
         self.assertEqual(result["c" * 32], {"program": None})
         self.assertEqual(result["d" * 32], {"program": None})
-        self.assertEqual(set(result), {FIRST, SECOND, "c" * 32, "d" * 32})
+        self.assertEqual(result["f" * 32], {"program": None}, "another user's launcher never names this terminal")
+        self.assertEqual(set(result), {FIRST, SECOND, "c" * 32, "d" * 32, "f" * 32})
+        # A script launcher appears behind its interpreter.
+        script = lp.describe([{"id": "a" * 32, "createdAt": started("Mon Oct 12 19:00:00 2026")}], ["/Users/example/bin/zz-launcher"], rows)
+        self.assertEqual(script["a" * 32], {"program": "claude", "cwd": None, "pid": 90001})
 
     def test_a_host_without_a_launcher_reports_nothing(self):
         with patch("launch.new_session", side_effect=ValueError("no launcher")):

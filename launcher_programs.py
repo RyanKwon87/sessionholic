@@ -21,12 +21,16 @@ LSTART = "%a %b %d %H:%M:%S %Y"
 CLAUDE_HELPERS = {"daemon", "bg-pty-host", "bg-spare", "--chrome-native-host", "mcp", "doctor"}
 
 
-def table(runner=None):
-    """[(pid, ppid, started_epoch, argv_text)] from `ps`, in the C locale."""
-    command = [PS, "-axww", "-o", "pid=,ppid=,lstart=,command="]
+def table(runner=None, uid=None):
+    """[(pid, ppid, started_epoch, argv_text)] of this user's processes from `ps`, in the C
+    locale and this process's time zone (so `lstart` and `mktime` agree)."""
+    uid = os.getuid() if uid is None else uid
+    command = [PS, "-axww", "-o", "uid=,pid=,ppid=,lstart=,command="]
     if runner is None:
-        done = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=10,
-                              env={"PATH": "/usr/bin:/bin", "LC_ALL": "C", "LANG": "C"})
+        env = {"PATH": "/usr/bin:/bin", "LC_ALL": "C", "LANG": "C"}
+        if os.environ.get("TZ"):
+            env["TZ"] = os.environ["TZ"]
+        done = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=10, env=env)
         if done.returncode != 0:
             raise RuntimeError("프로세스 목록을 읽지 못했습니다.")
         text = done.stdout.decode("utf-8", "replace")
@@ -34,14 +38,14 @@ def table(runner=None):
         text = runner(command)
     rows = []
     for line in text.splitlines():
-        match = re.match(r"\s*(\d+)\s+(\d+)\s+(\w{3} \w{3}\s+\d+ \d\d:\d\d:\d\d \d{4})\s+(.*)$", line)
-        if not match:
+        match = re.match(r"\s*(\d+)\s+(\d+)\s+(\d+)\s+(\w{3} \w{3}\s+\d+ \d\d:\d\d:\d\d \d{4})\s+(.*)$", line)
+        if not match or int(match[1]) != uid:
             continue
         try:
-            started = time.mktime(time.strptime(re.sub(r"\s+", " ", match[3]), LSTART))
+            started = time.mktime(time.strptime(re.sub(r"\s+", " ", match[4]), LSTART))
         except ValueError:
             continue
-        rows.append((int(match[1]), int(match[2]), int(started), match[4].strip()))
+        rows.append((int(match[2]), int(match[3]), int(started), match[5].strip()))
     return rows
 
 
@@ -56,12 +60,9 @@ def program_of(command):
         name, rest = "codex", rest[1:]
     if name == "claude":
         if rest[:1] == ["agents"]:
-            cwd = None
-            for index, word in enumerate(rest):
-                if word == "--cwd" and index + 1 < len(rest):
-                    cwd = rest[index + 1]
-                elif word.startswith("--cwd="):
-                    cwd = word.split("=", 1)[1]
+            # `ps` joins arguments with spaces, so a folder runs until the next option.
+            found = re.search(r"\s--cwd(?:=|\s+)(.+?)(?=\s+-{1,2}[A-Za-z]|$)", command)
+            cwd = found[1].strip() if found else None
             return {"program": "claude-agents", "cwd": cwd if cwd and cwd.startswith("/") else None}
         if rest[:1] and rest[0] in CLAUDE_HELPERS:
             return None
@@ -80,7 +81,9 @@ def describe(terminals, launcher, rows):
     for pid, ppid, _, _ in rows:
         children.setdefault(ppid, []).append(pid)
     by_pid = {pid: (ppid, started, command) for pid, ppid, started, command in rows}
-    launchers = [(pid, started) for pid, _, started, command in rows if command == expected]
+    # A script launcher shows its interpreter first (`/bin/zsh /path/launcher`).
+    launchers = [(pid, started) for pid, _, started, command in rows
+                 if command == expected or command.endswith(" " + expected)]
     result = {}
     for terminal in terminals[:MAX_TERMINALS]:
         identifier, created = terminal.get("id"), terminal.get("createdAt")

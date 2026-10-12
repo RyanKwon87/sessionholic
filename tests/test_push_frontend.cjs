@@ -57,7 +57,7 @@ test("a push shows each queued notice with a safe board link, read with the boar
   const id = crypto.createHash("sha256").update(ENDPOINT).digest("hex").slice(0, 32);
   assert.equal(w.fetches.length, 1);
   assert.equal(w.fetches[0].url, `/api/push/pending?id=${id}`);
-  assert.equal(w.fetches[0].options.headers["X-Sessionholic-Push"], "1");
+  assert.equal(w.fetches[0].options.headers["X-Board-Push"], "1");
   assert.equal(w.fetches[0].options.credentials, "same-origin");
   assert.deepEqual(w.notifications.map((item) => [item.title, item.tag, item.data.url, item.renotify]), [
     ["정산 자동화", "session:a|codex||1", "/?session=a%7Ccodex%7C%7C1", true],
@@ -70,10 +70,11 @@ test("with nothing queued a push shows the latest notice again quietly, or a gen
   const quiet = worker({ shown: [{ title: "older", tag: "x" }, latest] });
   await quiet.fire("push");
   assert.deepEqual(quiet.notifications.map((item) => [item.title, item.tag, item.renotify]), [["이전 알림", "session:c", false]]);
-  for (const options of [{}, { fetchFails: true }, { subscribed: false }]) {
+  // The board could not be read: a new alert was sent, so the old notice is not reused.
+  for (const options of [{}, { fetchFails: true }, { subscribed: false }, { fetchFails: true, shown: [latest] }]) {
     const generic = worker(options);
     await generic.fire("push");
-    assert.deepEqual(generic.notifications.map((item) => [item.title, item.tag, item.data.url]), [["확인할 세션이 있어요", "board-notice", "/"]]);
+    assert.deepEqual(generic.notifications.map((item) => [item.title, item.tag, item.data.url, item.renotify]), [["확인할 세션이 있어요", "board-notice", "/", true]]);
   }
 });
 

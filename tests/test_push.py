@@ -117,7 +117,7 @@ class VapidTest(unittest.TestCase):
 
 class EndpointTest(unittest.TestCase):
     def test_only_https_push_services_are_accepted(self):
-        for endpoint in (APPLE, FCM, "https://updates.push.services.mozilla.com/wpush/v2/abc",
+        for endpoint in (APPLE, FCM, "https://FCM.googleapis.com:443/fcm/send/x", "https://updates.push.services.mozilla.com/wpush/v2/abc",
                          "https://wns2-par02p.notify.windows.com/w/?token=abc", "https://api.push.apple.com/3/device/x"):
             with self.subTest(endpoint=endpoint):
                 self.assertTrue(push.valid_endpoint(endpoint))
@@ -125,7 +125,9 @@ class EndpointTest(unittest.TestCase):
                          "https://evil.test/push.apple.com", "https://user:pw@fcm.googleapis.com/x",
                          "https://fcm.googleapis.com:8443/x", "https://fcm.googleapis.com/", "https://fcm.googleapis.com/x#a",
                          "https://127.0.0.1/x", "https://mini.example.ts.net/x", "https://fcm.googleapis.com/a b",
-                         "https://fcm.googleapis.com/" + "a" * 3000, None, 5):
+                         "https://fcm.googleapis.com/" + "a" * 3000, None, 5,
+                         "https://[fcm.googleapis.com].127.0.0.1.nip.io/x", "https://[fcm.googleapis.com].localhost/x",
+                         "https://@fcm.googleapis.com/x", "https://fcm.googleapis.com./x"):
             with self.subTest(endpoint=endpoint):
                 self.assertFalse(push.valid_endpoint(endpoint))
 
@@ -242,6 +244,91 @@ class ServiceTest(unittest.TestCase):
         self.assertEqual([event["kind"] for event in restarted.step()], ["finished"])
         self.assertEqual(self.make().step(), [])
 
+    def test_a_session_first_seen_waiting_notifies_once_the_host_was_looked_at(self):
+        self.subscribe()
+        self.board.set(row(phase="working"))
+        self.service.step()
+        newcomer = row("019a0000-0000-7000-8000-000000000009", phase="needs_input", startedAt=self.clock.now - 40)
+        self.board.set(row(phase="working"), newcomer)
+        self.assertEqual([event["kind"] for event in self.service.step()], ["needs_input"])
+        # After a restart the first look at a host stays a baseline for new sessions.
+        other = row("019a0000-0000-7000-8000-000000000010", phase="needs_input", startedAt=self.clock.now - 40)
+        restarted = self.make()
+        self.board.set(row(phase="working"), newcomer, other)
+        self.assertEqual(restarted.step(), [])
+
+    def test_work_length_ends_at_the_rows_last_update_not_at_the_look(self):
+        self.subscribe()
+        self.board.set(row(phase="working"))
+        self.service.step()
+        started = self.clock.now
+        self.clock.now += 130
+        # It stopped 30 seconds in; the look came much later.
+        self.board.set(row(phase="idle", updatedAt=started + 30))
+        self.assertEqual(self.service.step(), [])
+
+    def test_unknown_runtime_keeps_the_last_phase_and_codex_exec_never_notifies(self):
+        self.subscribe()
+        self.board.set(row(phase="needs_input"), row("019a0000-0000-7000-8000-000000000011", phase="working", source="exec"))
+        self.service.step()
+        self.board.set(row(phase="needs_input", runtimeKnown=False))
+        self.service.step()
+        self.board.set(row(phase="needs_input"))
+        self.assertEqual(self.service.step(), [], "the same question is not announced again")
+        self.clock.now += push.MIN_WORK
+        self.board.set(row(phase="needs_input"), row("019a0000-0000-7000-8000-000000000011", phase="idle", source="exec",
+                                                     updatedAt=self.clock.now))
+        self.assertEqual(self.service.step(), [])
+
+    def test_a_passing_failure_is_retried_and_one_device_never_stops_the_others(self):
+        import http.client
+        self.subscribe(FCM)
+        self.subscribe()
+        calls = []
+
+        def sender(endpoint, headers):
+            calls.append(endpoint)
+            if endpoint == FCM and len(calls) == 1:
+                raise http.client.BadStatusLine("x")
+            return 201, {}, b""
+        self.service.sender = sender
+        self.board.set(row(phase="working"))
+        self.service.step()
+        self.board.set(row(phase="needs_input", updatedAt=self.clock.now))
+        self.service.step()
+        self.assertEqual(calls, [FCM, APPLE], "the second device is woken despite the first one's error")
+        self.service.step()
+        self.assertEqual(len(calls), 2, "a retry waits RETRY seconds")
+        self.clock.now += push.RETRY
+        self.service.step()
+        self.assertEqual(calls, [FCM, APPLE, FCM], "the failed device is woken again while its notice waits")
+        self.clock.now += push.RETRY
+        self.service.step()
+        self.assertEqual(len(calls), 3, "a delivered wake-up is not repeated")
+
+    def test_a_redirect_is_never_followed(self):
+        import http.server
+        hits = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                hits.append(self.path)
+                self.send_response(302)
+                self.send_header("Location", "/elsewhere")
+                self.end_headers()
+            do_GET = do_POST
+
+            def log_message(self, *args):
+                pass
+        httpd = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+        try:
+            status, _, _ = push.http_post("http://127.0.0.1:%d/start" % httpd.server_address[1], {"TTL": "1"}, timeout=5)
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+        self.assertEqual((status, hits), (302, ["/start"]))
+
     def test_no_subscription_means_no_background_collection(self):
         self.board.set(row(phase="working"))
         self.assertEqual(self.service.step(), [])
@@ -306,6 +393,8 @@ class RouteTest(unittest.TestCase):
         cls.board = server.Board([{"name": "local", "label": "로컬", "local": True}], 60,
                                  runner=lambda host, args, timeout: {"codex": [], "claude": [], "tmux": [], "errors": []})
         cls.httpd = server.make_server("127.0.0.1", 0, cls.board, cls.TOKEN, state_dir=cls.temp.name, push=False)
+        # Enabled without its background watcher: the routes alone are exercised.
+        cls.httpd.push.enabled = True
         cls.httpd.push.vapid = FakeVapid()
         cls.httpd.push.sender = lambda endpoint, headers: (201, {}, b"")
         cls.port = cls.httpd.server_address[1]
@@ -333,6 +422,20 @@ class RouteTest(unittest.TestCase):
         connection.close()
         return response.getheader("Set-Cookie").split(";", 1)[0], csrf
 
+    def test_a_board_run_with_no_push_says_so_and_takes_no_device(self):
+        cookie, csrf = self.session()
+        self.httpd.push.enabled = False
+        try:
+            status, body = self.request("GET", "/api/push", headers={"Cookie": cookie})
+            self.assertEqual((status, body["available"]), (200, False))
+            self.assertIn("--no-push", body["reason"])
+            for path, payload in (("/api/push/subscribe", {"subscription": {"endpoint": APPLE}}), ("/api/push/test", {"endpoint": APPLE})):
+                status, body = self.request("POST", path, json.dumps(payload),
+                                            {"Cookie": cookie, "Content-Type": "application/json", "X-CSRF-Token": csrf})
+                self.assertEqual(status, 409)
+        finally:
+            self.httpd.push.enabled = True
+
     def test_routes_need_login_csrf_and_the_service_worker_header(self):
         self.assertEqual(self.request("GET", "/api/push")[0], 401)
         cookie, csrf = self.session()
@@ -352,9 +455,9 @@ class RouteTest(unittest.TestCase):
         self.assertEqual(status, 200)
         pending = "/api/push/pending?id=" + push.subscription_id(APPLE)
         self.assertEqual(self.request("GET", pending, headers={"Cookie": cookie})[0], 403)
-        status, body = self.request("GET", pending, headers={"Cookie": cookie, "X-Sessionholic-Push": "1"})
+        status, body = self.request("GET", pending, headers={"Cookie": cookie, "X-Board-Push": "1"})
         self.assertEqual((status, [item["tag"] for item in body["notifications"]]), (200, ["notice-test"]))
-        self.assertEqual(self.request("GET", "/api/push/pending?id=bad", headers={"Cookie": cookie, "X-Sessionholic-Push": "1"})[0], 400)
+        self.assertEqual(self.request("GET", "/api/push/pending?id=bad", headers={"Cookie": cookie, "X-Board-Push": "1"})[0], 400)
         status, body = self.request("POST", "/api/push/unsubscribe", json.dumps({"endpoint": APPLE}),
                                     {"Cookie": cookie, "Content-Type": "application/json", "X-CSRF-Token": csrf})
         self.assertEqual((status, body["subscriptions"]), (200, 0))

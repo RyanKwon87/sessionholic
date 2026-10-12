@@ -6667,6 +6667,20 @@ test('a 새 세션 terminal is named by what it runs, and a second view of the s
   assert.equal(byClass(c.get('running-list'), 'running-connections')[0].attributes['aria-expanded'], 'false');
 });
 
+test('the folded session connections row keeps the keyboard focus as it opens', () => {
+  const c = client(undefined, noChatTimers);
+  c.state.terminals = [{ id: 'link', alive: true, title: '세션 연결', mode: 'attach', metadata: { mode: 'attach' } }];
+  c.renderTerminals();
+  const first = byClass(c.get('running-list'), 'running-connections')[0];
+  c.context.document.activeElement = first;
+  first.events.click();
+  const reopened = byClass(c.get('running-list'), 'running-connections')[0];
+  assert.equal(reopened.attributes['aria-expanded'], 'true');
+  assert.equal(reopened.focusCount, 1, 'the redrawn row takes the focus back');
+  assert.equal(byClass(c.get('running-list'), 'running-terminal-row').length, 1, 'opening it shows the connection');
+  c.context.document.activeElement = null;
+});
+
 test('a notification link opens its session once it is listed, and an old request expires', async () => {
   const c = client(async () => ({ ok: true, status: 200, json: async () => ({ terminals: [] }) }), noChatTimers);
   assert.equal(c.requestedSessionFrom('/?session=workstation%7Ccodex%7C.codex-example%7Cnote'), 'workstation|codex|.codex-example|note');

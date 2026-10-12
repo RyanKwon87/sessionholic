@@ -153,33 +153,36 @@ async function pushId() {
   const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(subscription.endpoint));
   return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("").slice(0, 32);
 }
+// null when the board could not be read (offline, signed out, an error): a new alert
+// was sent, so a fresh notification sounds instead of an old one shown again.
 async function pendingNotifications() {
   const id = await pushId();
-  if (!id) return [];
+  if (!id) return null;
   const response = await fetch(`/api/push/pending?id=${id}`, {
-    credentials: "same-origin", cache: "no-store", headers: { "X-Sessionholic-Push": "1" },
+    credentials: "same-origin", cache: "no-store", headers: { "X-Board-Push": "1" },
   });
-  if (!response.ok) return [];
+  if (!response.ok) return null;
   const data = await response.json();
   return (Array.isArray(data?.notifications) ? data.notifications : [])
     .filter((item) => item && typeof item.title === "string" && typeof item.tag === "string")
     .slice(-20);
 }
 async function showPushed() {
-  let items = [];
+  let items = null;
   try {
     items = await pendingNotifications();
   } catch {
-    items = [];
+    items = null;
   }
-  if (items.length) {
+  if (items?.length) {
     await Promise.all(items.map((item) => self.registration.showNotification(item.title.slice(0, 120), {
       body: String(item.body || "").slice(0, 300), tag: item.tag.slice(0, 700), renotify: true,
       icon: "/icon-192.png", data: { url: pushUrl(item.url) },
     })));
     return;
   }
-  const shown = await self.registration.getNotifications();
+  // Read, but nothing new (another wake-up already showed it): the latest notice again, quietly.
+  const shown = items ? await self.registration.getNotifications() : [];
   const latest = shown[shown.length - 1];
   if (latest) {
     await self.registration.showNotification(latest.title, {
@@ -188,7 +191,7 @@ async function showPushed() {
     return;
   }
   await self.registration.showNotification("확인할 세션이 있어요", {
-    body: "눌러서 보드를 열어 주세요.", tag: "board-notice",
+    body: "눌러서 보드를 열어 주세요.", tag: "board-notice", renotify: true,
     icon: "/icon-192.png", data: { url: "/" },
   });
 }

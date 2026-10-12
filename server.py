@@ -1230,7 +1230,10 @@ class Workflow:
             asked = {row["id"] for row in rows}
             for identifier, info in (result.get("terminals") or {}).items():
                 if identifier in asked and isinstance(info, dict):
-                    self.terminals.set_program(identifier, info)
+                    try:
+                        self.terminals.set_program(identifier, info)
+                    except (RuntimeError, OSError, ValueError, KeyError):
+                        continue
         except (RuntimeError, OSError, ValueError, KeyError, AttributeError):
             pass
         finally:
@@ -2097,7 +2100,7 @@ class Handler(BaseHTTPRequestHandler):
                 if url.path == "/api/push/pending":
                     # Only this board's service worker reads (and so clears) a device's queue:
                     # a cross-site request cannot add this header without a preflight.
-                    if self.headers.get("X-Sessionholic-Push") != "1":
+                    if self.headers.get("X-Board-Push") != "1":
                         return self.send_json(403, {"error": "이 보드의 알림에서만 읽을 수 있습니다."})
                     return self.send_json(200, self.server.push.pending_for(query.get("id")))
                 goal_match = re.fullmatch(r"/api/goals/([a-f0-9]{32})", url.path)
@@ -2511,7 +2514,7 @@ def make_server(bind, port, board, token, terminals=None, workflow=None, state_d
             return "unknown"
         return "agent" if row.get("initiator") == "agent" else "general"
     server.push = PushService(board, state_dir, classify=push_category, labels=server.session_labels.decorate,
-                              log_prefix=LOG_PREFIX)
+                              log_prefix=LOG_PREFIX, enabled=push)
     if push:
         server.push.start()
     if automatic_work:
@@ -2574,7 +2577,8 @@ def main(argv=None):
     httpd = make_server(args.bind, args.port, board, token, state_dir=args.state_dir,
                         max_terminals=args.max_terminals, tailscale_user=tailscale_user, usage=meter,
                         automatic_work=args.auto_work and not args.no_auto_work, push=not args.no_push)
-    print(f"{LOG_PREFIX}: http://127.0.0.1:{args.port}/ · 화면을 열 때만 수집합니다.", file=sys.stderr)
+    collecting = "화면을 열 때와 알림을 받는 기기가 있을 때 수집합니다." if not args.no_push else "화면을 열 때만 수집합니다."
+    print(f"{LOG_PREFIX}: http://127.0.0.1:{args.port}/ · {collecting}", file=sys.stderr)
     if args.open:
         print(issue_login_link(httpd), flush=True)
         print(f"표준 출력의 일회용 로그인 링크를 {ONCE_TTL // 60}분 안에 개인 브라우저에서 여세요. 한 번만 사용할 수 있습니다.",

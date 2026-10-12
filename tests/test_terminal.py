@@ -660,10 +660,12 @@ class TmuxFixtureTest(unittest.TestCase):
                 self.fail("a connection loaded after a restart was released before its browser read again")
 
     def test_a_connection_unused_for_ten_minutes_closes_even_with_room(self):
-        self.manager.max_terminals = 4
-        old = self.connection("old", "attach")
+        self.manager.max_terminals = 5
+        old = self.connection("old", "attach", agent="claude")
         self.manager.terminals[old["id"]].touched = time.monotonic() - terminal.CLOSE_IDLE - 1
-        recent = self.connection("recent", "attach")
+        codex = self.connection("codex", "attach", agent="codex")
+        self.manager.terminals[codex["id"]].touched = time.monotonic() - terminal.CLOSE_IDLE - 1
+        recent = self.connection("recent", "attach", agent="claude")
         owned = self.connection("owned", "new-session")
         self.manager.terminals[owned["id"]].touched = time.monotonic() - terminal.CLOSE_IDLE - 1
         changes = []
@@ -672,6 +674,7 @@ class TmuxFixtureTest(unittest.TestCase):
         self.assertEqual((rows["old"]["alive"], rows["old"]["closedReason"]), (False, "released"))
         self.assertTrue(rows["recent"]["alive"])
         self.assertTrue(rows["owned"]["alive"], "a terminal running its own CLI never closes by itself")
+        self.assertTrue(rows["codex"]["alive"], "a Codex connection closes only when room is needed")
         self.assertTrue(changes)
         self.assertIsNotNone(recent)
 

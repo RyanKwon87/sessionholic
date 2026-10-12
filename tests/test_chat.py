@@ -980,6 +980,19 @@ class ChatClaudeTest(unittest.TestCase):
         self.assertEqual(len(self.terms.pastes), 1)
         self.assertEqual(self.calls, [('chat', 'capabilities')])
 
+    def test_a_terminal_still_loading_from_an_earlier_send_is_waited_for_before_a_paste(self):
+        self.terminal()
+        self.chat.unsettled.add(TERMINAL_ID)
+        with patch.object(self.chat, '_settled', return_value=False) as waited:
+            with self.assertRaises(chat.SendRejected) as caught:
+                self.send(rid='request-0011', text='아직 로딩 중')
+        waited.assert_called_once_with(TERMINAL_ID)
+        self.assertEqual((caught.exception.code, self.terms.pastes, self.records()), ('terminal_unavailable', [], []))
+        with patch.object(self.chat, '_settled', return_value=True):
+            self.assertEqual(self.send(rid='request-0012', text='이제 준비됨')['status'], 'accepted')
+        self.assertNotIn(TERMINAL_ID, self.chat.unsettled)
+        self.assertEqual(self.terms.pastes, [(TERMINAL_ID, '이제 준비됨', True)])
+
     def test_background_without_terminal_attaches_it_once_then_pastes(self):
         # 보내기 on a background session with no board terminal attaches that exact session
         # first. A failed attach is refused before any reservation, so the draft stays.

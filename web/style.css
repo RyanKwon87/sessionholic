@@ -1310,6 +1310,9 @@ select:disabled {
 .group-head.amber {
   color: var(--orange);
 }
+.group-head.green {
+  color: var(--green);
+}
 .group-count {
   margin-left: auto;
   color: var(--label-3);

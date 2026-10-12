@@ -32,11 +32,15 @@ const INSTANCE = (() => {
   }
   return Object.freeze(names);
 })();
+// The list reads top to bottom as what needs you, what is running, what just
+// stopped (FINISHED_SECONDS) and everything else.
 const GROUPS = [
-  { key: "needs_input", label: "내 답이 필요한 작업", tone: "red" },
-  { key: "working", label: "진행 중", tone: "amber" },
-  { key: "rest", label: "최근 작업", tone: "gray" },
+  { key: "needs_input", label: "답 필요", tone: "red" },
+  { key: "working", label: "작업 중", tone: "amber" },
+  { key: "finished", label: "최근 끝남", tone: "green" },
+  { key: "rest", label: "이전", tone: "gray" },
 ];
+const FINISHED_SECONDS = 3 * 3600;
 const BADGES = {
   needs_input: ["답 필요", "red"],
   working: ["작업 중", "amber"],
@@ -773,17 +777,16 @@ function accountOf(s) {
 function selectedSession() {
   return allSessions().find((s) => s.key === state.selected);
 }
-function groupOf(s) {
-  return s.phase === "needs_input"
-    ? "needs_input"
-    : s.phase === "working"
-      ? "working"
-      : "rest";
+function groupOf(s, now = state.snapshot?.serverTime || Date.now() / 1000) {
+  if (s.phase === "needs_input") return "needs_input";
+  if (s.phase === "working") return "working";
+  if (["idle", "done", "closed"].includes(s.phase) && now - (s.updatedAt || 0) <= FINISHED_SECONDS) return "finished";
+  return "rest";
 }
 function matches(s, now, { phase = true, category = true, initiator = true } = {}) {
   if (botRequestForNative(sourceOf(s))) return false;
   if (category && sessionCategoryOf(s) !== state.sessionCategory) return false;
-  if (phase && state.phaseFilter && groupOf(s) !== state.phaseFilter) return false;
+  if (phase && state.phaseFilter && groupOf(s, now) !== state.phaseFilter) return false;
   for (const key of Object.keys(state.filters)) {
     if (key === "initiator") {
       if (initiator && state.filters.initiator && initiatorOf(s) !== state.filters.initiator) return false;
@@ -797,7 +800,7 @@ function matches(s, now, { phase = true, category = true, initiator = true } = {
   }
   if (
     !state.showOld &&
-    groupOf(s) === "rest" &&
+    groupOf(s, now) === "rest" &&
     now - (s.updatedAt || 0) > RECENT_SECONDS
   )
     return false;
@@ -826,7 +829,7 @@ function renderSessionList(sessions, now) {
   // Updating list conditions must not redraw a retained conversation or reset
   // its scroll anchor when the same source is opened again from a work card.
   const base = sessions.filter((session) => matches(session, now, { phase: false }));
-  const shown = state.phaseFilter ? base.filter((session) => groupOf(session) === state.phaseFilter) : base;
+  const shown = state.phaseFilter ? base.filter((session) => groupOf(session, now) === state.phaseFilter) : base;
   renderCounts(base); renderSessionCategories(sessions, now);
   renderFilters(sessions.filter((session) => sessionCategoryOf(session) === state.sessionCategory));
   renderGroups(shown, now);
@@ -1371,7 +1374,7 @@ function renderGroups(shown, now) {
   const visible = new Set();
   for (const group of GROUPS) {
     const items = shown
-      .filter((s) => groupOf(s) === group.key)
+      .filter((s) => groupOf(s, now) === group.key)
       .sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
     if (!items.length) continue;
     let section = sections.get(group.key);
@@ -1412,23 +1415,23 @@ function renderGroups(shown, now) {
     };
     let empty;
     if (state.phaseFilter && !searching && !filtering) {
-      empty = emptyState("filter", state.phaseFilter === "needs_input" ? "답이 필요한 작업이 없습니다." : "진행 중인 작업이 없습니다.",
-        "다른 작업은 필터를 해제하면 보입니다.", button("필터 해제", "secondary", () => togglePhaseFilter(state.phaseFilter)));
+      empty = emptyState("filter", state.phaseFilter === "needs_input" ? "답이 필요한 세션이 없습니다." : "작업 중인 세션이 없습니다.",
+        "다른 세션은 필터를 해제하면 보입니다.", button("필터 해제", "secondary", () => togglePhaseFilter(state.phaseFilter)));
     } else if (searching || filtering || state.phaseFilter) {
-      empty = emptyState("search", "조건에 맞는 작업이 없습니다.",
+      empty = emptyState("search", "조건에 맞는 세션이 없습니다.",
         `${searching ? `‘${state.search}’ 검색. ` : ""}${filtering ? "선택한 필터가 적용되어 있습니다. " : ""}${state.showOld ? "오래된 기록도 포함했습니다." : "3일 지난 대화는 제외되어 있습니다. 필터에서 오래된 기록을 포함할 수 있습니다."}`,
         button("검색·필터 초기화", "secondary", clearAll));
     } else if (unconfigured) {
       empty = emptyState("setup", "연결할 기기가 아직 설정되지 않았습니다.",
         "설치 안내에 따라 기기를 설정한 뒤 새로고침해 주세요.");
     } else if (offline) {
-      empty = emptyState("offline", "기기에 연결되지 않아 작업을 확인하지 못했습니다.",
+      empty = emptyState("offline", "기기에 연결되지 않아 세션을 확인하지 못했습니다.",
         "기기 연결과 에이전트 설치 상태를 확인한 뒤 다시 확인해 주세요.", button("다시 확인", "secondary", manualRefresh));
     } else if (state.snapshot?.hosts?.some((host) => host.refreshing)) {
       loading = true;
-      empty = skeletonList("기기에서 작업을 확인하고 있습니다…");
+      empty = skeletonList("기기에서 세션을 확인하고 있습니다…");
     } else {
-      empty = emptyState("none", "표시할 최근 작업이 없습니다.",
+      empty = emptyState("none", "표시할 최근 세션이 없습니다.",
         "설정한 기기에서 Claude Code나 Codex로 대화를 시작한 뒤 새로고침해 주세요. 3일 지난 대화는 필터에서 볼 수 있습니다.");
     }
     desired.push(empty);

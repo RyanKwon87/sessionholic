@@ -1071,7 +1071,7 @@ test("empty lists distinguish filtered results, offline hosts, and pending colle
   c.state.search = "없는 작업";
   c.state.filters.host = "homeserver";
   c.renderGroups([], Date.now());
-  assert.match(textOf(c.get("groups")), /조건에 맞는 작업/);
+  assert.match(textOf(c.get("groups")), /조건에 맞는 세션/);
   assert.match(textOf(c.get("groups")), /‘없는 작업’ 검색.*필터.*3일 지난 대화/s);
   byClass(c.get("groups"), "secondary")[0].events.click();
   assert.equal(c.state.search, "");
@@ -4290,7 +4290,7 @@ test('status chips filter the list to answers or running work, keep both counts,
   // A filter that leaves nothing explains itself and clears with one tap.
   c.state.snapshot.hosts[0].data.codex = rows.filter((s) => s.phase !== 'working');
   after[1].events.click();
-  assert.match(textOf(c.get('groups')), /진행 중인 작업이 없습니다/);
+  assert.match(textOf(c.get('groups')), /작업 중인 세션이 없습니다/);
   byClass(c.get('groups'), 'secondary')[0].events.click();
   assert.equal(c.state.phaseFilter, '');
   assert.equal(byClass(c.get('groups'), 'card').length, 3);
@@ -6583,6 +6583,30 @@ function attachedTo(s, fields = {}) {
 function cardOf(c, s) {
   return byClass(c.get('groups'), 'card').find((card) => card.dataset.sessionKey === s.key);
 }
+
+test('the session list groups what needs an answer, what runs, what stopped in the last three hours and the rest', () => {
+  const c = client(undefined, noChatTimers);
+  const now = 2_000_000;
+  const sessions = [
+    recentSession('old-question', { phase: 'needs_input', updatedAt: now - 10 * 86400 }),
+    recentSession('running', { phase: 'working', updatedAt: now - 60 }),
+    recentSession('just-done', { phase: 'done', updatedAt: now - 3600 }),
+    recentSession('just-idle', { phase: 'idle', updatedAt: now - 3 * 3600 }),
+    recentSession('earlier', { phase: 'idle', updatedAt: now - 3 * 3600 - 1 }),
+    recentSession('unknown', { phase: 'unknown', updatedAt: now - 60 }),
+    recentSession('ancient', { phase: 'closed', updatedAt: now - 5 * 86400 }),
+  ];
+  c.state.snapshot = { serverTime: now, hosts: [{ name: 'workstation', label: 'Workstation', ok: true, data: { codex: sessions, claude: [] } }] };
+  c.state.authenticated = true;
+  const shown = c.allSessions().filter((s) => c.matches(s, now));
+  c.renderGroups(shown, now);
+  const sections = c.get('groups').children.filter((node) => node.dataset?.groupKey);
+  assert.deepEqual(sections.map((section) => section.cardHeading.textContent), ['답 필요', '작업 중', '최근 끝남', '이전']);
+  const ids = (section) => section.children.filter((node) => node.dataset?.sessionKey).map((node) => node.dataset.sessionKey.split('|').pop());
+  assert.deepEqual(sections.map(ids), [['old-question'], ['running'], ['just-done', 'just-idle'], ['unknown', 'earlier']]);
+  assert.equal(sections[2].cardHeading.className, 'group-head green');
+  assert.ok(!shown.some((s) => s.id === 'ancient'), 'only the 이전 group drops sessions older than three days');
+});
 
 test('a notification link opens its session once it is listed, and an old request expires', async () => {
   const c = client(async () => ({ ok: true, status: 200, json: async () => ({ terminals: [] }) }), noChatTimers);

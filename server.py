@@ -1979,6 +1979,31 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urlparse(origin)
         return parsed.scheme in ("http", "https") and parsed.netloc == self.headers.get("Host")
 
+    DISCARD_LIMIT = 1024 * 1024
+
+    def discard_body(self, length):
+        """Read a refused body that is not huge before answering, then close: a socket closed
+        with the body unread resets the connection, and the client sees that instead of the
+        answer. A larger one, or one that stalls, only closes."""
+        self.close_connection = True
+        if not 0 < length <= self.DISCARD_LIMIT:
+            return
+        previous = self.connection.gettimeout()
+        try:
+            self.connection.settimeout(5)
+            while length > 0:
+                chunk = self.rfile.read(min(length, 65536))
+                if not chunk:
+                    break
+                length -= len(chunk)
+        except OSError:
+            pass
+        finally:
+            try:
+                self.connection.settimeout(previous)
+            except OSError:
+                pass
+
     def json_body(self):
         if self.headers.get_content_type() != "application/json":
             raise ValueError("JSON 요청만 사용할 수 있습니다.")
@@ -1987,6 +2012,7 @@ class Handler(BaseHTTPRequestHandler):
         except ValueError:
             raise ValueError("요청 크기가 올바르지 않습니다.") from None
         if not 0 < length <= 65536:
+            self.discard_body(length)
             raise ValueError("요청이 비었거나 너무 큽니다.")
         try:
             data = json.loads(self.rfile.read(length))

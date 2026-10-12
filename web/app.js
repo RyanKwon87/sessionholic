@@ -6483,9 +6483,11 @@ function terminalKeyFromEvent(event, { draftEmpty = true, focusless = false } = 
   if (TERMINAL_MODIFIER_NAMES.includes(key)) return null;
   const options = { windows: terminalOnWindows() };
   // A typed draft keeps the keyboard's own editing: ⌘ and ⌥ (Ctrl on a PC) arrows and ⌫ move
-  // and delete in it, and ⌥ prints its characters (⌥₩ is \ on a Korean Mac). Modifiers held
-  // on the bar are meant for the CLI.
+  // and delete in it, and a Mac's ⌥ prints its characters (⌥₩ is \ on a Korean Mac). A PC's
+  // Alt types nothing (and Alt+← is the browser's Back), so it stays Meta for the CLI, as do
+  // modifiers held on the bar.
   const typed = !focusless && !draftEmpty;
+  const apple = appleBrowser();
   // ⌘C, ⌘V and the rest stay the browser's; ⌘ only edits the line.
   if (mods.meta) {
     if (!["ArrowLeft", "ArrowRight", "Backspace"].includes(key) || (typed && !sticky.meta)) return null;
@@ -6494,7 +6496,7 @@ function terminalKeyFromEvent(event, { draftEmpty = true, focusless = false } = 
   if (TERMINAL_ALWAYS_KEYS.test(key)) return terminalKeyBytes(key, mods, options);
   if ([...key].length === 1) {
     const raw = String(event.key || "");
-    if (!appleBrowser() && event.ctrlKey && !sticky.ctrl) {
+    if (!apple && event.ctrlKey && !sticky.ctrl) {
       // AltGr (Ctrl+Alt on a PC) prints a character: into the input bar, or as it is.
       if (event.altKey && [...raw].length === 1 && raw.toLowerCase() !== key.toLowerCase())
         return focusless ? raw : null;
@@ -6502,12 +6504,12 @@ function terminalKeyFromEvent(event, { draftEmpty = true, focusless = false } = 
       // on Apple keyboards ⌘ does those (and Ctrl+V reaches the CLI, which pastes images).
       if (!focusless && (key.toLowerCase() === "v" || (typed && "cxaz".includes(key.toLowerCase())))) return null;
     }
-    if (!focusless && event.altKey && !sticky.alt && !mods.ctrl) return null;
+    if (!focusless && apple && event.altKey && !sticky.alt && !mods.ctrl) return null;
     if (mods.ctrl || mods.alt || focusless) return terminalKeyBytes(key, mods, options);
     return null;
   }
   if (key === "Enter") return focusless ? terminalKeyBytes(key, mods, options) : null;
-  if (TERMINAL_EDIT_KEYS.has(key) && (!typed || sticky.ctrl || sticky.alt))
+  if (TERMINAL_EDIT_KEYS.has(key) && (!typed || sticky.ctrl || sticky.alt || (event.altKey && !apple)))
     return terminalKeyBytes(key, mods, options);
   return null;
 }
@@ -6582,8 +6584,11 @@ function draftBeforeInput(event) {
 function terminalDocumentKey(event) {
   if (!state.terminalVisible || event.defaultPrevented || editingText()) return false;
   const active = document.activeElement;
-  if (active && active !== document.body && active !== document.documentElement) return false;
-  if (event.key === "Tab") return false;
+  if ((active && active !== document.body && active !== document.documentElement) || event.key === "Tab") {
+    // Not for the CLI: a held bar modifier must not wait for a later key either.
+    if (releasesTerminalMods(event)) clearTerminalMods();
+    return false;
+  }
   if (event.target?.closest?.(".xterm, dialog[open], details[open]")) return false;
   if (document.querySelector?.("dialog[open]")) return false;
   const bytes = terminalKeyFromEvent(event, { focusless: true });

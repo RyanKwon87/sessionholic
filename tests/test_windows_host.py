@@ -95,6 +95,9 @@ class WindowsConfigurationTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, '새 세션 선택지 형식'):
                 server.windows_launcher_setting({'choices': [{**choice, 'command': [choice['command'][0], argument]}]})
         server.windows_launcher_setting({'choices': [{**choice, 'command': [choice['command'][0], 'C:\\Folder\\']}]})
+        # A label or folder is no program argument: any name a PC allows.
+        server.windows_launcher_setting({'label': '"PC" 메뉴', 'choices': [
+            {**choice, 'label': 'Codex "main"', 'cwd': 'C:\\Example Folder\\Projects\\'}]})
         long = [{**choice, 'command': [choice['command'][0]] + ['x' * 300] * 4} for _ in range(12)]
         with self.assertRaisesRegex(ValueError, '너무 많거나 깁니다'):
             server.windows_launcher_setting({'choices': long})

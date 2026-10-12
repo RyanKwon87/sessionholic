@@ -126,13 +126,14 @@ SECURITY_HEADERS = {
 def windows_launcher_setting(value):
     """`{label, choices: [{label, command, cwd}]}`: each command a program on a PC drive
     (C:\\…, not a network share) and literal arguments (no control characters, nothing
-    PowerShell 5.1 would pass on altered), each cwd a folder on a PC drive. The whole menu
-    must fit one remote command line."""
+    PowerShell 5.1 would pass on altered), each cwd a folder on a PC drive (any name: it is
+    not an argument). The whole menu must fit one remote command line."""
     from transfer import WINDOWS_COMMAND_LIMIT, windows_encoded_command, windows_launcher_script, windows_literal_argument
     bad = ValueError("PC 새 세션 선택지 형식이 올바르지 않습니다.")
-    text = lambda v, limit: (isinstance(v, str) and 0 < len(v) <= limit and not any(ord(c) < 32 for c in v)
-                             and windows_literal_argument(v))
+    text = lambda v, limit: isinstance(v, str) and 0 < len(v) <= limit and not any(ord(c) < 32 for c in v)
     absolute = lambda v: text(v, 1024) and re.fullmatch(r"[A-Za-z]:[\\/].*", v) is not None
+    # Only a program and its arguments pass through PowerShell's native argument quoting.
+    argument = lambda v, limit: text(v, limit) and windows_literal_argument(v)
     if not isinstance(value, dict) or set(value) - {"label", "choices"}:
         raise bad
     label, choices = value.get("label", "새 세션"), value.get("choices")
@@ -142,7 +143,8 @@ def windows_launcher_setting(value):
     for choice in choices:
         if (not isinstance(choice, dict) or set(choice) - {"label", "command", "cwd"} or not text(choice.get("label"), 64)
                 or not isinstance(choice.get("command"), list) or not 1 <= len(choice["command"]) <= 16
-                or not absolute(choice["command"][0]) or not all(text(arg, 4096) for arg in choice["command"][1:])
+                or not absolute(choice["command"][0]) or not argument(choice["command"][0], 1024)
+                or not all(argument(arg, 4096) for arg in choice["command"][1:])
                 or "cwd" in choice and not absolute(choice["cwd"])):
             raise bad
         result.append({"label": choice["label"], "command": list(choice["command"]),

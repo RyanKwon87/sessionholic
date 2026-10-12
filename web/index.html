@@ -341,9 +341,11 @@
         </div>
         <div id="draft-panel" class="draft-panel">
           <label for="terminal-draft" class="sr-only">터미널에 보낼 입력</label>
+          <p id="terminal-draft-keys" class="sr-only">비어 있을 때 방향키·Tab·Esc는 터미널로 갑니다. 입력줄을 벗어나려면 글자를 입력한 뒤 Tab을 누르세요.</p>
           <div class="draft-row">
             <textarea
               id="terminal-draft"
+              aria-describedby="terminal-draft-keys"
               rows="1"
               maxlength="32000"
               placeholder="입력 후 보내기 · 한글·음성 입력 가능"

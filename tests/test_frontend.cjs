@@ -3307,9 +3307,16 @@ test('a hardware keyboard reaches the CLI: by key place, without taking a typed 
   // AltGr (Ctrl+Alt on a PC) prints its character.
   assert.equal(key({ key: '@', code: 'KeyQ', ctrlKey: true, altKey: true }, { draftEmpty: false }), null);
   assert.equal(key({ key: '@', code: 'KeyQ', ctrlKey: true, altKey: true }, { focusless: true }), '@');
+  // A PC's Alt types nothing: it stays Meta for the CLI (Claude Code's Alt+P, Alt+T), and Alt+←
+  // in a typed draft never becomes the browser's Back.
+  assert.equal(key({ key: 'p', code: 'KeyP', altKey: true }, { draftEmpty: true }), '\x1bp');
+  assert.equal(key({ key: 'p', code: 'KeyP', altKey: true }, { draftEmpty: false }), '\x1bp');
+  assert.equal(key({ key: 'ArrowLeft', altKey: true }, { draftEmpty: false }), '\x1bb');
+  assert.equal(key({ key: 'ArrowLeft', ctrlKey: true }, { draftEmpty: false }), null, 'Ctrl+← moves by word in the draft');
   // A Mac: Ctrl+V reaches the CLI (it pastes images there).
   c.context.navigator = { platform: 'MacIntel' };
   assert.equal(key({ key: 'v', code: 'KeyV', ctrlKey: true }, { draftEmpty: true }), '\x16');
+  assert.equal(key({ key: 'π', code: 'KeyP', altKey: true }, { draftEmpty: true }), null, "a Mac's ⌥ prints π");
 });
 
 test('held bar modifiers combine with the next key from the bar, the input bar or xterm, then release', async () => {
@@ -3401,9 +3408,14 @@ test('a focused control and Tab keep their keys, and a held bar modifier never w
   c.context.document.activeElement = { tagName: 'BUTTON' };
   for (const key of ['Enter', ' ', 'Tab', 'ArrowDown'])
     assert.equal(c.terminalDocumentKey(event({ key })), false, key);
+  c.toggleTerminalMod('ctrl');
+  assert.equal(c.terminalDocumentKey(event({ key: ' ' })), false);
+  assert.equal(c.state.terminalMods.ctrl, false, 'a key left to a control releases a held modifier');
   // Nothing focused: Tab still moves the focus to the page's controls.
   c.context.document.activeElement = null;
+  c.toggleTerminalMod('ctrl');
   assert.equal(c.terminalDocumentKey(event({ key: 'Tab' })), false);
+  assert.equal(c.state.terminalMods.ctrl, false, 'Ctrl does not wait past Tab to interrupt a later c');
   assert.equal(c.terminalDocumentKey(event({ key: 'Tab', shiftKey: true })), false);
   // ⌘ held on the bar and a letter it does not combine with: the letter types, ⌘ is released.
   c.toggleTerminalMod('meta');

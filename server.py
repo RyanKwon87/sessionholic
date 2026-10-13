@@ -1739,14 +1739,41 @@ class Workflow:
                 except OSError:
                     pass
 
+    LEFTOVER_SWEEP_SECONDS = 3600
+
+    def sweep_leftovers(self):
+        """Have each Mac (this board's own included) end what tests left there (see
+        transfer_worker.sweep_leftovers); said in the log when something was."""
+        for host in self.board.hosts:
+            if host.get("platform") == "windows" or (not host.get("local") and not self.board.state[host["name"]]["ok"]):
+                continue
+            try:
+                if host.get("local"):
+                    from transfer_worker import sweep_leftovers
+                    result = sweep_leftovers()
+                else:
+                    result = self.transfers.rpc(host, "leftovers", {}, timeout=20)
+            except (RuntimeError, OSError, ValueError):
+                continue
+            if isinstance(result, dict) and (result.get("processes") or result.get("sockets")):
+                sys.stderr.write("테스트가 남긴 실행 %s개와 tmux 소켓 파일 %s개를 정리했습니다: %s\n"
+                                 % (result.get("processes", 0), result.get("sockets", 0), host["name"]))
+
     def start_hold_sweep(self):
         def run():
             time.sleep(self.HOLD_SWEEP_FIRST)
+            swept = None
             while True:
                 try:
                     self.sweep_holds()
                 except Exception as exc:  # The sweep never stops the board.
                     sys.stderr.write("실행 보관 정리에 실패했습니다: %s\n" % type(exc).__name__)
+                if swept is None or time.monotonic() - swept >= self.LEFTOVER_SWEEP_SECONDS:
+                    swept = time.monotonic()
+                    try:
+                        self.sweep_leftovers()
+                    except Exception as exc:
+                        sys.stderr.write("테스트 잔여물 정리에 실패했습니다: %s\n" % type(exc).__name__)
                 time.sleep(self.HOLD_SWEEP_SECONDS)
         threading.Thread(target=run, name="hold-sweep", daemon=True).start()
 

@@ -659,10 +659,13 @@ class RealTerminalEventsTest(unittest.TestCase):
                                    terminals=self.manager, terminal_interval=0.05, terminal_error=0.1)
 
     def tearDown(self):
+        import terminal
         self.hub.close()
         self.manager.close()
         subprocess.run([shutil.which("tmux"), "-L", self.socket, "kill-server"],
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
+        # tmux keeps the socket file of an ended server.
+        (terminal.socket_dir() / self.socket).unlink(missing_ok=True)
         self.directory.cleanup()
 
     def create(self, key):

@@ -1629,6 +1629,8 @@ class MenuDemoTmuxTest(unittest.TestCase):
         socket = 'sb-test-' + secrets.token_hex(8)
         self.manager = terminal.TerminalManager(state_dir=root / 'terminals', socket_name=socket, max_terminals=1)
         # This unique test socket is the only server this fixture may stop.
+        # tmux keeps the socket file of an ended server (cleanups run last first).
+        self.addCleanup(lambda: (terminal.socket_dir() / socket).unlink(missing_ok=True))
         self.addCleanup(subprocess.run, [shutil.which('tmux'), '-L', socket, 'kill-server'],
                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
         self.addCleanup(self.manager.close)

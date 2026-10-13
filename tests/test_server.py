@@ -1176,6 +1176,36 @@ class OperationsLogTest(unittest.TestCase):
             handler.guarded(lambda: (_ for _ in ()).throw(BrokenPipeError("fixture: a helper's pipe")))
         self.assertIn("예상하지 못한 오류 (BrokenPipeError)", log.getvalue())
 
+    def test_a_terminal_reader_that_left_gets_no_second_answer_and_no_failure_log(self):
+        # A phone that went away during a terminal output wait: the late answer meets a closed
+        # connection. It was taken for an unavailable run connection (a 503 that failed too).
+        handler = server.Handler.__new__(server.Handler)
+        handler.command, handler.request_version = "GET", "HTTP/1.1"
+        handler.path = "/api/terminal/" + "a" * 32 + "/events?after=0&wait=0"
+        handler.requestline, handler.started = "GET " + handler.path + " HTTP/1.1", time.monotonic()
+        handler.close_connection = False
+        handler.headers = {"Host": "127.0.0.1:8447"}
+        handler._headers_buffer = []
+        handler.authorized = lambda: True
+        class Gone:
+            def write(self, data):
+                raise BrokenPipeError("fixture: client left")
+            def flush(self):
+                pass
+        handler.wfile = Gone()
+        class Terms:
+            def read(self, *args, **kwargs):
+                return {"output": "", "next": 0}
+        handler.server = type("S", (), {"terminals": Terms()})()
+        codes = []
+        sent = server.Handler.send_response
+        handler.send_response = lambda code, message=None: (codes.append(code), sent(handler, code, message))
+        with patch("sys.stderr", new_callable=io.StringIO) as log:
+            handler.guarded(handler.route_get)
+        self.assertEqual(codes, [200])
+        self.assertNotIn("예상하지 못한 오류", log.getvalue())
+        self.assertTrue(handler.close_connection)
+
     def test_a_request_line_says_the_status_and_time_but_never_the_query(self):
         handler = server.Handler.__new__(server.Handler)
         handler.command, handler.path = "GET", "/login?once=fixture-secret"

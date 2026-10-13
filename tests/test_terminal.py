@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import secrets
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -629,6 +630,8 @@ class SocketRecordTest(unittest.TestCase):
         before = (self.state / "sessions.json").read_bytes()
         manager = self.manager()
         self.assertEqual((self.state / "sessions.json").read_bytes(), before, "nothing is written at load")
+        # Still running on another live tmux server of this user (an earlier socket name).
+        manager._elsewhere = lambda terminal: True
         listed = manager.list()
         manager.list()
         self.assertEqual([(row["alive"], row["closed"]) for row in listed], [(False, False)] * 2)
@@ -652,6 +655,43 @@ class SocketRecordTest(unittest.TestCase):
             with self.assertRaises(OSError):
                 manager.list()
         self.assertNotIn("socket", manager.terminals["b" * 32].record)
+
+    def test_an_unrecorded_row_no_live_tmux_server_has_is_closed_once_looked_for(self):
+        # Old rows from before sockets were recorded stayed listed as open forever.
+        (self.state / "sessions.json").write_text(json.dumps(self.rows()))
+        manager = self.manager()
+        socket_dir = Path(self.directory.name) / "tmux"
+        socket_dir.mkdir()
+        manager.socket_dir = socket_dir
+        # A file left by an ended server (no server answers) and a live server that lacks it.
+        dead = socket_dir / "sb-fixture-old"
+        live = socket_dir / "sb-fixture-live"
+        server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        server.bind(str(live)); server.listen(8)
+        self.addCleanup(server.close)
+        probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); probe.bind(str(dead)); probe.close()
+        asked = []
+        real = subprocess.run
+        def run(argv, **kwargs):
+            if argv[1:3] == ["-L", "sb-fixture-live"]:
+                asked.append(argv[-1])
+                return subprocess.CompletedProcess(argv, 1 if argv[-1] == "=sb-" + "a" * 32 else 0)
+            return real(argv, **kwargs)
+        with patch.object(terminal.subprocess, "run", side_effect=run):
+            listed = manager.list()
+            # Looked for once per start.
+            manager.list()
+        self.assertEqual(asked, ["=sb-" + "a" * 32, "=sb-" + "b" * 32])
+        self.assertEqual([(row["alive"], row["closed"]) for row in listed], [(False, True), (False, False)])
+        saved = {row["id"][0]: row for row in self.saved()}
+        self.assertEqual((saved["a"]["closedReason"], saved["a"]["socket"]), ("connection_ended", "sb-fixture-current"))
+        self.assertNotIn("socket", saved["b"], "found on the live server: left as it was")
+        # Nothing could be told (no socket folder): nothing is closed.
+        manager.close()
+        (self.state / "sessions.json").write_text(json.dumps(self.rows()))
+        other = self.manager()
+        other.socket_dir = Path(self.directory.name) / "missing"
+        self.assertEqual([row["closed"] for row in other.list()], [False, False])
 
     def test_rows_of_another_socket_are_not_closed_by_listing_closing_or_reopening(self):
         (self.state / "sessions.json").write_text(json.dumps(self.rows(socket="sb-fixture-old")))
@@ -714,6 +754,8 @@ class TmuxFixtureTest(unittest.TestCase):
         # This unique test socket is the only server this fixture may stop.
         subprocess.run([shutil.which("tmux"), "-L", self.socket, "kill-server"],
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
+        # tmux keeps the socket file of an ended server.
+        (terminal.socket_dir() / self.socket).unlink(missing_ok=True)
         self.directory.cleanup()
 
     def create(self, key="fixture", account="account-one"):

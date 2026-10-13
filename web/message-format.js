@@ -47,7 +47,17 @@ const MessageFormat = (() => {
   // right after it stays text), then loses the punctuation that ends its sentence and a ")"
   // or "]" it did not open.
   function bareAddress(text) {
-    const url = text.slice(0, 2048).match(/^https?:\/\/[A-Za-z0-9\-._~:/?#[\]@!$&'()*+,;=%]+/i)?.[0] || "";
+    const head = text.slice(0, 2048);
+    let url = head.match(/^https?:\/\/[A-Za-z0-9\-._~:/?#[\]@!$&'()*+,;=%]*/i)?.[0] || "";
+    // Letters of another script continue it only where a part begins (a host, a path segment
+    // or a query value: `/경로`, `?q=한글`); right after ASCII (`/12에서`) they are the
+    // sentence's particle. A part that begins with them keeps them all.
+    while (url.length < head.length && /[/=?&#]$/.test(url) && /[^\x00-\x7f]/.test(head[url.length])) {
+      const run = head.slice(url.length).match(/^[\p{L}\p{N}\p{M}]+/u)?.[0];
+      if (!run) break;
+      url += run;
+      url += head.slice(url.length).match(/^[A-Za-z0-9\-._~:/?#[\]@!$&'()*+,;=%]*/)[0];
+    }
     const open = { ")": 0, "]": 0 }; const close = { ")": 0, "]": 0 };
     for (const char of url) {
       if (char === "(") open[")"]++; else if (char === "[") open["]"]++; else if (char in close) close[char]++;
@@ -115,6 +125,23 @@ const MessageFormat = (() => {
       }
       return -1;
     };
+    // The "~~" that closes a strike opened just before `start`; code spans and escapes are
+    // skipped (`~~` inside code is text).
+    const strikeEnd = (start) => {
+      for (let cursor = start; cursor < text.length;) {
+        spend(budget, "work");
+        if (text[cursor] === "\\") { cursor += 2; continue; }
+        if (text[cursor] === "`") {
+          const codeMarker = text.slice(cursor).match(/^`+/)[0];
+          const end = codeEnd(codeMarker, cursor + codeMarker.length);
+          cursor = end < 0 ? cursor + codeMarker.length : end + codeMarker.length;
+          continue;
+        }
+        if (text.startsWith("~~", cursor)) return cursor;
+        cursor++;
+      }
+      return -1;
+    };
     // The "]" that closes a link label opened just before `start`: nested
     // brackets are counted, escapes and code spans skipped.
     const lastClose = text.lastIndexOf("]");
@@ -165,7 +192,7 @@ const MessageFormat = (() => {
         }
       }
       if (char === "~" && text.startsWith("~~", index) && !/\s/.test(text[index + 2] || " ")) {
-        const end = find("~~", index + 2);
+        const end = strikeEnd(index + 2);
         if (end > index + 2 && !/\s/.test(text[end - 1])) {
           flush(); out.push(make(budget, "del", { children: inline(text.slice(index + 2, end), budget, depth + 1, links) }));
           index = end + 2; continue;
@@ -287,13 +314,19 @@ const MessageFormat = (() => {
     let text = line.trim();
     if (text.startsWith("|")) text = text.slice(1);
     if (text.endsWith("|") && !text.endsWith("\\|")) text = text.slice(0, -1);
+    // A run of backticks opens a code span only when a run as long comes later on the line
+    // (an unpaired one is text, as inline code reads it); where each length last occurs.
+    const last = new Map();
+    for (const match of text.matchAll(/`+/g)) last.set(match[0].length, match.index);
     const out = []; let cell = ""; let ticks = 0;
     for (let index = 0; index < text.length; index++) {
       const char = text[index];
       if (char === "\\" && text[index + 1] === "|") { cell += "|"; index++; continue; }
       if (char === "`") {
         let run = 1; while (text[index + run] === "`") run++;
-        ticks = ticks === run ? 0 : ticks || run; cell += text.slice(index, index + run); index += run - 1; continue;
+        if (ticks === run) ticks = 0;
+        else if (!ticks && last.get(run) > index) ticks = run;
+        cell += text.slice(index, index + run); index += run - 1; continue;
       }
       if (char === "|" && !ticks) { out.push(cell.trim()); cell = ""; continue; }
       cell += char;

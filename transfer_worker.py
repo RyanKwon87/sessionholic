@@ -7,6 +7,8 @@ from pathlib import Path
 import re
 import secrets
 import shutil
+import signal
+import socket
 import sys
 import stat
 import subprocess
@@ -35,6 +37,11 @@ HOLD_OPTIONS = (('status', 'off'), ('prefix', 'None'), ('prefix2', 'None'), ('mo
                 ('terminal-overrides', '*:smcup@:rmcup@'))
 HOLD_TIMEOUT = 10
 HOLD_STALE_ENVELOPE = 600  # an envelope this old was never run (hold-run removes it first)
+# What tests leave on a host (sweep_leftovers): tmux socket files of these names, and Codex
+# app-server daemons a test's Codex home under this user's temporary folder started.
+TEST_SOCKET_PREFIXES = ('sb-test-', 'sb-browser-', 'sb-validation-')
+LEFTOVER_PROCESS_AGE = 3600
+LEFTOVER_SOCKET_AGE = 86400
 # Set by `hold <name>` before a terminal step: its final exec then runs in that session.
 _hold = None
 
@@ -417,6 +424,8 @@ def _rpc(request):
         return hold_list()
     if op == 'hold_kill':
         return hold_kill(args.get('name'))
+    if op == 'leftovers':
+        return sweep_leftovers()
     if op == 'state': return source_state(args['source'])
     if op == 'interrupt': return interrupt_source(args['source'])
     if op == 'inspect':
@@ -602,6 +611,85 @@ def hold_list():
         if HOLD_NAME.fullmatch(name) and created.isdigit():
             holds.append({'name': name, 'age': max(0, now - int(created))})
     return {'holds': holds}
+
+
+def _user_temp():
+    """This user's temporary folder, resolved (an SSH session's TMPDIR may not name it)."""
+    try:
+        path = subprocess.run(['getconf', 'DARWIN_USER_TEMP_DIR'], capture_output=True, text=True,
+                              timeout=5).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return os.path.realpath(path).rstrip('/') if path.startswith('/') else None
+
+
+def _elapsed(text):
+    """Seconds of a `ps` elapsed time, `[[dd-]hh:]mm:ss`."""
+    days, _, clock = text.rpartition('-')
+    parts = [int(part) for part in clock.split(':')]
+    if not 2 <= len(parts) <= 3:
+        raise ValueError('elapsed')
+    hours, minutes, seconds = ([0] + parts)[-3:]
+    return int(days or 0) * 86400 + hours * 3600 + minutes * 60 + seconds
+
+
+def sweep_leftovers(listing=None, temp=None, sockets=None, now=None, kill=os.kill):
+    """End what tests left on this host and say how much: Codex app-server daemons a test's
+    Codex home under this user's temporary folder started, orphaned for an hour or more, and
+    socket files of ended test tmux servers (tmux keeps them) a day old. Nothing else matches:
+    a user's own Codex homes are not under the temporary folder, and the board's and the
+    user's tmux servers have other names."""
+    ended = removed = 0
+    temp = _user_temp() if temp is None else temp
+    if temp:
+        if listing is None:
+            try:
+                listing = subprocess.run(['ps', '-axwwo', 'pid=,ppid=,uid=,etime=,args='], capture_output=True,
+                                         text=True, timeout=10).stdout
+            except (OSError, subprocess.SubprocessError):
+                listing = ''
+        for line in listing.splitlines():
+            fields = line.split(None, 5)
+            if len(fields) < 6:
+                continue
+            pid, ppid, uid, elapsed, program, rest = fields
+            if (not pid.isdigit() or ppid != '1' or uid != str(os.getuid()) or not program.startswith(temp + '/tmp')
+                    or '/packages/app-server-daemon/' not in program or not program.endswith('/bin/codex')
+                    or rest.split(' ', 1)[0] != 'app-server'):
+                continue
+            try:
+                if _elapsed(elapsed) < LEFTOVER_PROCESS_AGE:
+                    continue
+                kill(int(pid), signal.SIGTERM)
+                ended += 1
+            except (ValueError, OSError):
+                continue
+    folder = Path(sockets) if sockets is not None else Path(os.environ.get('TMUX_TMPDIR') or '/tmp') / ('tmux-%d' % os.getuid())
+    now = time.time() if now is None else now
+    try:
+        paths = [path for path in folder.iterdir() if path.name.startswith(TEST_SOCKET_PREFIXES)]
+    except OSError:
+        paths = []
+    for path in paths:
+        try:
+            info = path.lstat()
+            if (not stat.S_ISSOCK(info.st_mode) or info.st_uid != os.getuid()
+                    or now - info.st_mtime < LEFTOVER_SOCKET_AGE):
+                continue
+            probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            probe.settimeout(0.5)
+            try:
+                probe.connect(str(path))
+                continue  # A server still answers there: not left over.
+            except OSError:
+                pass
+            finally:
+                probe.close()
+            path.unlink()
+            removed += 1
+        except OSError:
+            continue
+    return {'processes': ended, 'sockets': removed}
 
 
 def hold_kill(name):

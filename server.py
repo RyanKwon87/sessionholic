@@ -1664,8 +1664,11 @@ class Workflow:
                 self._finish(request_id, signature, record=False)
 
     HOLD_SWEEP_SECONDS = 300
-    HOLD_SWEEP_FIRST = 180  # after a start; a deploy canary is done by then
+    HOLD_SWEEP_FIRST = 180  # after a start
     HOLD_GRACE_SECONDS = 120  # a hold younger than this may belong to a terminal being created
+    # A terminal that ended by itself (a connection it could not take back) may have left its
+    # run going: kept this long, as is a hold no terminal record names any more.
+    HOLD_KEEP_SECONDS = 24 * 3600
 
     def end_hold(self, terminal):
         """The run a closed terminal kept on its host ends too, in the background (a remote
@@ -1685,21 +1688,29 @@ class Workflow:
         threading.Thread(target=end, daemon=True).start()
         return False
 
+    def hold_ends(self, host, item):
+        """Whether the sweep ends a hold this board made on `host`: its terminal was closed by
+        its user or released by the board; a terminal that ended by itself, or none at all,
+        only after HOLD_KEEP_SECONDS. Read afresh per host (a host's calls can be slow)."""
+        terminal = None
+        for row in self.terminals.list():
+            if (row.get("holdName") or (row.get("metadata") or {}).get("holdName")) == item["name"]:
+                terminal = row
+        if terminal is not None and not terminal.get("closed"):
+            return False
+        if item["age"] < self.HOLD_GRACE_SECONDS:
+            return False
+        if terminal is not None and terminal.get("closedReason") in ("user", "released"):
+            return True
+        if terminal is not None and isinstance(terminal.get("closedAt"), int):
+            return time.time() - terminal["closedAt"] >= self.HOLD_KEEP_SECONDS
+        return item["age"] >= self.HOLD_KEEP_SECONDS
+
     def sweep_holds(self):
-        """End held runs that no open board terminal names (closed while their host was away,
-        released by the board, or left by a terminal record that is gone)."""
-        try:
-            terminals = self.terminals.list()
-        except (RuntimeError, OSError, ValueError):
-            return
-        live = {}
-        for terminal in terminals:
-            hold = terminal.get("holdName") or (terminal.get("metadata") or {}).get("holdName")
-            if hold and not terminal.get("closed"):
-                live.setdefault(terminal.get("host"), set()).add(hold)
+        """End held runs no open board terminal names (see hold_ends); only this board's."""
         for host in self.board.hosts:
             with self.transfers.lock:
-                held = self.transfers.hold_support.get(host["name"]) is True
+                held = bool(self.transfers.hold_support.get(host["name"]))
             if host.get("local") or host.get("platform") == "windows" or not held or not self.board.state[host["name"]]["ok"]:
                 continue
             try:
@@ -1707,8 +1718,13 @@ class Workflow:
             except (RuntimeError, OSError, ValueError, AttributeError):
                 continue
             for item in holds if isinstance(holds, list) else []:
-                if (not isinstance(item, dict) or item.get("name") in live.get(host["name"], set())
-                        or not isinstance(item.get("age"), int) or item["age"] < self.HOLD_GRACE_SECONDS):
+                if not isinstance(item, dict) or not isinstance(item.get("age"), int) or not self.transfers.holds_mine(item.get("name")):
+                    continue
+                try:
+                    ends = self.hold_ends(host, item)
+                except (RuntimeError, OSError, ValueError):
+                    return  # No terminal list: end nothing.
+                if not ends:
                     continue
                 try:
                     self.transfers.rpc(host, "hold_kill", {"name": item["name"]}, timeout=12)

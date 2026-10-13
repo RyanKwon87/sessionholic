@@ -885,6 +885,10 @@ class Chat:
             # Enter would confirm the highlighted choice of an open menu.
             if parse_menu(screen):
                 raise SendRejected(CLAUDE_BLOCKED, 409)
+            # A run its host keeps, while this terminal attaches again: keys typed now are dropped.
+            hold = terminal.get('holdName')
+            if hold and (Path(self.workflow.transfers.hold_waiting) / hold).exists():
+                raise SendRejected('실행 기기에 다시 연결하는 중이라 보내지 않았습니다. 연결된 뒤 다시 보내 주세요.', 409)
             lines = [text.strip()] if text.strip() else []
             for aid in ids:
                 record = json.loads((self.root / 'attachments' / (aid + '.json')).read_text())

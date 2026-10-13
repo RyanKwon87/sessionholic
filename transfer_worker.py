@@ -28,7 +28,13 @@ CHECK_MESSAGES = [{'role': 'user', 'text': '점검용 인계 메시지입니다.
 # connection or a sleeping host does not end it; the board attaches again by its name.
 HOLD_SOCKET = 'sessionholic-hold'
 HOLD_NAME = re.compile(r'sh-[0-9a-f]{16}\Z')
-HOLD_OPTIONS = (('status', 'off'), ('prefix', 'None'), ('prefix2', 'None'), ('mouse', 'off'), ('escape-time', '10'))
+HOLD_OPTIONS = (('status', 'off'), ('prefix', 'None'), ('prefix2', 'None'), ('mouse', 'off'), ('escape-time', '10'),
+                # The attached client draws on the board terminal's own screen, not an alternate
+                # one: a run's last output stays there when it ends, and plain output scrolls
+                # into the board's history. Mouse modes still pass to a run that asks for them.
+                ('terminal-overrides', '*:smcup@:rmcup@'))
+HOLD_TIMEOUT = 10
+HOLD_STALE_ENVELOPE = 600  # an envelope this old was never run (hold-run removes it first)
 # Set by `hold <name>` before a terminal step: its final exec then runs in that session.
 _hold = None
 
@@ -396,8 +402,11 @@ def _rpc(request):
         return control.execute(args['source'], args['action'], args.get('targetProof'), args.get('requestId'))
     if op == 'profiles':
         from launch import new_session_status
+        tmux = _tmux()
+        # The board attaches again with this tmux directly, never through a helper file
+        # that a later deploy may remove.
         return {'profiles': profiles(), 'home': str(Path.home()), 'launcher': new_session_status(),
-                'holds': bool(_tmux())}
+                'holds': bool(tmux), 'holdTmux': tmux or None}
     if op == 'resume_preview':
         from launch import resume_preview
         return resume_preview(args['source'])
@@ -489,9 +498,21 @@ def _client_env():
     return {key: value for key, value in os.environ.items() if key not in ('TMUX', 'TMUX_PANE')}
 
 
+def _hold_run(tmux, *args, **kwargs):
+    """One call to the hold server, bounded; a call that does not answer counts as failed."""
+    try:
+        return subprocess.run(_hold_command(tmux, *args), timeout=HOLD_TIMEOUT, **kwargs)
+    except subprocess.TimeoutExpired:
+        return subprocess.CompletedProcess(args, 1, '', '')
+
+
 def _hold_alive(tmux, name):
-    return subprocess.run(_hold_command(tmux, 'has-session', '-t', '=' + name),
-                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+    return _hold_run(tmux, 'has-session', '-t', '=' + name,
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+
+
+def _hold_server(tmux):
+    return _hold_run(tmux, 'list-sessions', stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
 
 
 def _execve(argv, env):
@@ -515,16 +536,22 @@ def hold_start(tmux, name, argv, env):
         except OSError:
             columns, rows = 80, 24
         options = []
-        for option, value in HOLD_OPTIONS:
-            options += [';', 'set-option', '-g', option, value]
-        started = subprocess.run(_hold_command(tmux, 'new-session', '-d', '-s', name, '-x', str(columns), '-y', str(rows),
-                                               sys.executable, '-I', sys.argv[0], 'hold-run', str(envelope), *options),
-                                 env=_client_env(), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        if started.returncode != 0:
+        if not _hold_server(tmux):
+            # Server options, set once by the session that starts the server.
+            for option, value in HOLD_OPTIONS:
+                options += [';', 'set-option', '-g', option, value]
+            options += [';', 'set-option', '-ga', 'terminal-features', ',xterm-256color:RGB']
+        started = _hold_run(tmux, 'new-session', '-d', '-s', name, '-x', str(columns), '-y', str(rows),
+                            sys.executable, '-I', sys.argv[0], 'hold-run', str(envelope), *options,
+                            env=_client_env(), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if started.returncode != 0 and not _hold_alive(tmux, name):
             if envelope.exists():
+                # The run never started there: run it here as before rather than not at all.
                 envelope.unlink()
-            # No hold: run here as before rather than not at all.
-            os.execve(argv[0], argv, env)
+                os.execve(argv[0], argv, env)
+            # It started there (its envelope is used) and already ended: never a second run.
+            print('[하던 일] 실행이 바로 끝났습니다.', flush=True)
+            raise SystemExit(1)
     os.execve(tmux, _hold_command(tmux, 'attach-session', '-t', '=' + name), _client_env())
 
 
@@ -558,8 +585,15 @@ def hold_list():
     tmux = _tmux()
     if not tmux:
         return {'holds': []}
-    listed = subprocess.run(_hold_command(tmux, 'list-sessions', '-F', '#{session_name} #{session_created}'),
-                            capture_output=True, text=True)
+    # An envelope left behind (its run never started) holds an environment: removed when old.
+    folder = root() / 'holds'
+    for envelope in folder.glob('*.json') if folder.is_dir() else []:
+        try:
+            if time.time() - envelope.lstat().st_mtime > HOLD_STALE_ENVELOPE:
+                envelope.unlink()
+        except OSError:
+            continue
+    listed = _hold_run(tmux, 'list-sessions', '-F', '#{session_name} #{session_created}', capture_output=True, text=True)
     if listed.returncode != 0:
         return {'holds': []}  # No hold server running.
     now, holds = int(time.time()), []
@@ -575,8 +609,7 @@ def hold_kill(name):
     tmux = _tmux()
     if not tmux or not _hold_alive(tmux, name):
         return {'killed': False}
-    done = subprocess.run(_hold_command(tmux, 'kill-session', '-t', '=' + name),
-                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    done = _hold_run(tmux, 'kill-session', '-t', '=' + name, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     return {'killed': done.returncode == 0}
 
 

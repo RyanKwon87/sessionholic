@@ -231,7 +231,7 @@ class WorkflowNewSessionTest(unittest.TestCase):
         self.assertEqual(result['terminal']['mode'], 'new-session')
 
     def test_a_remote_that_holds_runs_opens_the_reconnect_loop_and_names_its_hold(self):
-        self.flow.transfers.hold_support['remote'] = True
+        self.flow.transfers.hold_support['remote'] = '/opt/homebrew/bin/tmux'
         self.flow.new_session({'host': 'remote', 'requestId': 'request-0013'})
         created = self.terms.created[0]
         self.assertEqual(created['argv'][3], '--hold-loop')
@@ -361,14 +361,14 @@ PC = {'name': 'pc', 'label': 'PC', 'local': False, 'ssh': 'pc', 'platform': 'win
 
 class Ran:
     """subprocess.run stand-in: answers by tmux subcommand, records every call."""
-    def __init__(self, alive=False, started=0, listed=''):
-        self.alive, self.started, self.listed, self.calls = alive, started, listed, []
+    def __init__(self, alive=False, started=0, listed='', server=False):
+        self.alive, self.started, self.listed, self.server, self.calls = alive, started, listed, server or alive, []
 
     def __call__(self, argv, **kwargs):
         self.calls.append(argv)
         step = argv[5]
         code = {'has-session': 0 if self.alive else 1, 'new-session': self.started,
-                'list-sessions': 0, 'kill-session': 0}.get(step, 0)
+                'list-sessions': 0 if self.server or self.listed else 1, 'kill-session': 0}.get(step, 0)
         return SimpleNamespace(returncode=code, stdout=self.listed if step == 'list-sessions' else '')
 
 
@@ -411,7 +411,9 @@ class WorkerHoldTest(unittest.TestCase):
         self.assertEqual(start[6:12], ['-d', '-s', HOLD, '-x', '120', '-y'])
         self.assertIn('hold-run', start)
         self.assertNotIn('/usr/bin/agent', start, 'argv and environment never ride on tmux argv')
-        for option in (['status', 'off'], ['prefix', 'None'], ['prefix2', 'None'], ['mouse', 'off'], ['escape-time', '10']):
+        # The server's options, set by the session that starts it; its client draws on the main screen.
+        for option in (['status', 'off'], ['prefix', 'None'], ['prefix2', 'None'], ['mouse', 'off'], ['escape-time', '10'],
+                       ['terminal-overrides', '*:smcup@:rmcup@']):
             self.assertIn(';', start)
             self.assertTrue(any(start[i:i + 4] == ['set-option', '-g'] + option for i in range(len(start))), option)
         program, argv, env = execve.call_args.args
@@ -428,6 +430,35 @@ class WorkerHoldTest(unittest.TestCase):
                     transfer_worker._execve(['/usr/bin/agent'], {'HOME': str(self.home)})
                 self.assertEqual(execve.call_args.args[:2], ('/usr/bin/agent', ['/usr/bin/agent']))
                 self.assertFalse((self.holds() / (HOLD + '.json')).exists())
+
+    def test_a_running_hold_server_keeps_its_options(self):
+        with self.remote(ran=Ran(server=True)) as (ran, _), patch.object(transfer_worker, '_hold', HOLD):
+            with self.assertRaises(SystemExit):
+                transfer_worker._execve(['/usr/bin/agent'], {})
+        start = next(argv for argv in ran.calls if argv[5] == 'new-session')
+        self.assertNotIn('set-option', start, 'options are set once, never appended again')
+
+    def test_a_refused_start_never_runs_twice(self):
+        # tmux answered an error, yet the session is up: attach to it, never run here as well.
+        class Racing(Ran):
+            def __call__(self, argv, **kwargs):
+                result = super().__call__(argv, **kwargs)
+                if argv[5] == 'new-session':
+                    self.alive = True
+                return result
+        with self.remote(ran=Racing(started=1)) as (ran, execve), patch.object(transfer_worker, '_hold', HOLD):
+            with self.assertRaises(SystemExit):
+                transfer_worker._execve(['/usr/bin/agent'], {})
+            (self.holds() / (HOLD + '.json')).unlink()  # As hold-run would have.
+        self.assertEqual(execve.call_args.args[1][-3:], ['attach-session', '-t', '=' + HOLD])
+        # tmux failed and the session is gone, but its envelope was used: it ran there; not again.
+        with self.remote(ran=Ran(started=1)) as (ran, execve), patch.object(transfer_worker, '_hold', HOLD), \
+                patch.object(transfer_worker, 'save'), patch('sys.stdout', new_callable=io.StringIO) as out:
+            with self.assertRaises(SystemExit) as stopped:
+                transfer_worker._execve(['/usr/bin/agent'], {})
+        self.assertEqual(stopped.exception.code, 1)
+        execve.assert_not_called()
+        self.assertIn('바로 끝났습니다', out.getvalue())
 
     def test_an_existing_hold_is_attached_without_starting_anything(self):
         with self.remote(ran=Ran(alive=True)) as (ran, execve), patch.object(transfer_worker, '_hold', HOLD):
@@ -497,17 +528,27 @@ class WorkerHoldTest(unittest.TestCase):
                              {'holds': [{'name': HOLD, 'age': 300}, {'name': 'sh-fedcba9876543210', 'age': 5}]})
             self.assertEqual(transfer_worker._rpc({'op': 'hold_kill', 'args': {'name': HOLD}}), {'killed': True})
             self.assertEqual(ran.calls[-1][5:], ['kill-session', '-t', '=' + HOLD])
+            # An envelope never run is removed once old; a fresh one stays.
+            folder = transfer_worker.private_dir(self.holds())
+            old, fresh = folder / 'sh-0000000000000001.json', folder / 'sh-0000000000000002.json'
+            old.write_text('{}'); fresh.write_text('{}')
+            os.utime(old, (now - 3600, now - 3600))
+            os.utime(fresh, (now - 60, now - 60))
+            with patch.object(transfer_worker.time, 'time', return_value=now):
+                transfer_worker.hold_list()
+            self.assertEqual((old.exists(), fresh.exists()), (False, True))
             with self.assertRaises(ValueError):
                 transfer_worker._rpc({'op': 'hold_kill', 'args': {'name': 'other'}})
         with self.remote(tmux=None):
             self.assertEqual(transfer_worker.hold_list(), {'holds': []})
             self.assertEqual(transfer_worker.hold_kill(HOLD), {'killed': False})
 
-    def test_profiles_say_whether_this_host_can_hold_runs(self):
+    def test_profiles_say_whether_and_with_which_tmux_this_host_holds_runs(self):
         for tmux, expected in ((HOLD_TMUX, True), (None, False)):
             with self.subTest(tmux=tmux), patch.dict(os.environ, {'HOME': str(self.home)}), \
                     patch('transfer_native.profiles', return_value=[]), patch.object(transfer_worker, '_tmux', return_value=tmux):
-                self.assertIs(transfer_worker._rpc({'op': 'profiles'})['holds'], expected)
+                reply = transfer_worker._rpc({'op': 'profiles'})
+                self.assertEqual((reply['holds'], reply['holdTmux']), (expected, tmux))
 
 
 class TransfersTerminalTest(unittest.TestCase):
@@ -517,26 +558,35 @@ class TransfersTerminalTest(unittest.TestCase):
         self.flow = Transfers([LOCAL, REMOTE, PC], self.temp.name)
 
     def test_a_host_that_holds_runs_gets_the_reconnect_loop(self):
-        with patch.object(self.flow, 'rpc', return_value={'profiles': [], 'holds': True}):
+        with patch.object(self.flow, 'rpc', return_value={'profiles': [], 'holds': True, 'holdTmux': '/opt/homebrew/bin/tmux'}):
             self.flow.profiles(REMOTE, refresh=True)
         argv, name = self.flow.terminal(REMOTE, ['-I', RUNTIME, 'new-session'])
         self.assertRegex(name, r'^sh-[0-9a-f]{16}$')
+        self.assertTrue(self.flow.holds_mine(name))
+        self.assertFalse(self.flow.holds_mine('sh-' + ('0' if name[3] != '0' else '1') + name[4:]), "another board's")
         self.assertEqual(argv[:4], [sys.executable, '-I', str(Path(terminal.__file__).resolve()), '--hold-loop'])
         spec = json.loads(argv[4])
         self.assertEqual(spec['first'][-1], 'exec /usr/bin/python3 -I %s hold %s new-session' % (RUNTIME, name))
-        self.assertEqual(spec['again'][-1], 'exec /usr/bin/python3 -I %s reattach %s' % (RUNTIME, name))
+        # Attaching again needs only the host's tmux, never the helper file of the day it opened.
+        self.assertEqual(spec['again'][-1], 'exec /opt/homebrew/bin/tmux -L sessionholic-hold -f /dev/null attach-session -t =' + name)
+        self.assertNotIn(RUNTIME, spec['again'][-1])
+        self.assertEqual(spec['wait'], str(self.flow.hold_waiting / name))
         for command in (spec['first'], spec['again']):
             self.assertIn('ControlPath=none', command)
             self.assertEqual(command[1], '-tt')
         self.assertNotEqual(self.flow.terminal(REMOTE, ['-I', RUNTIME, 'new-session'])[1], name, 'a new name each time')
 
     def test_elsewhere_the_plain_command_and_no_name(self):
+        for reply in ({'holds': True, 'holdTmux': 'tmux'}, {'holds': True, 'holdTmux': '/bin/t mux'}):
+            with self.subTest(reply=reply), patch.object(self.flow, 'rpc', return_value={'profiles': [], **reply}):
+                self.flow.profiles(REMOTE, refresh=True)
+                self.assertIsNone(self.flow.terminal(REMOTE, ['-I', RUNTIME, 'new-session'])[1], 'an unsafe tmux path is not used')
         with patch.object(self.flow, 'rpc', return_value={'profiles': [], 'holds': False}):
             self.flow.profiles(REMOTE, refresh=True)
         argv, name = self.flow.terminal(REMOTE, ['-I', RUNTIME, 'new-session'])
         self.assertIsNone(name)
         self.assertEqual(argv, self.flow.command(REMOTE, ['-I', RUNTIME, 'new-session'], tty=True))
-        self.flow.hold_support.update(local=True, pc=True)
+        self.flow.hold_support.update(local='/usr/bin/tmux', pc='/usr/bin/tmux')
         self.assertIsNone(self.flow.terminal(LOCAL, ['-I', RUNTIME, 'new-session'])[1])
 
 
@@ -570,6 +620,27 @@ class HoldLoopTest(unittest.TestCase):
         self.assertIn('기기 연결이 끊겼습니다', out)
         self.assertGreaterEqual(flush.call_count, 6, 'keys typed while away are dropped')
 
+    def test_the_wait_is_marked_for_the_board_and_leaves_the_runs_modes(self):
+        with tempfile.TemporaryDirectory(dir='/tmp', prefix='sh-hold-wait-') as folder:
+            mark = Path(folder) / 'hold-waiting' / HOLD
+            seen = []
+            spec = {**self.SPEC, 'wait': str(mark)}
+            codes, now = [255, 0], [0.0]
+
+            def run(argv):
+                seen.append((argv[1], mark.exists()))
+                now[0] += 3600
+                return codes.pop(0)
+            out = io.StringIO()
+            with patch.object(terminal.termios, 'tcflush'):
+                terminal._hold_loop(spec, run=run, sleep=lambda s: seen.append(('sleep', mark.exists())),
+                                    clock=lambda: now[0], out=out)
+            # Marked only while waiting; gone before it attaches again and after the loop.
+            self.assertEqual(seen, [('first', False), ('sleep', True), ('again', False)])
+            self.assertFalse(mark.exists())
+            self.assertTrue(out.getvalue().startswith(terminal.HOLD_RESET), 'mouse and paste modes off first')
+            self.assertIn('그 기기의 실행도 끝냅니다', out.getvalue())
+
     def test_other_ends_are_the_terminals_end(self):
         for codes, durations, expected in (([0], [100], 0), ([1], [100], 1), ([-15], [100], 1),
                                            ([255], [3], 255)):
@@ -581,39 +652,56 @@ class HoldLoopTest(unittest.TestCase):
 
 
 class BoardHoldTest(unittest.TestCase):
-    def flow(self, terminals=(), holds=(), online=True, support=True):
+    TAG = 'feedface'
+
+    def flow(self, terminals=(), holds=(), online=True, support='/usr/bin/tmux'):
         calls = []
 
         def rpc(host, op, args, timeout=30):
             calls.append((host['name'], op, args))
             return {'holds': list(holds)} if op == 'hold_list' else {'killed': True}
-        transfers = SimpleNamespace(lock=threading.RLock(), hold_support={'remote': support, 'local': True}, rpc=rpc)
+        transfers = SimpleNamespace(lock=threading.RLock(), hold_support={'remote': support, 'local': '/usr/bin/tmux'}, rpc=rpc,
+                                    holds_mine=lambda name: isinstance(name, str) and name.startswith('sh-' + self.TAG))
         board = SimpleNamespace(hosts=[LOCAL, REMOTE, PC], state={'local': {'ok': True}, 'remote': {'ok': online}, 'pc': {'ok': True}})
         flow = SimpleNamespace(board=board, transfers=transfers, terminals=SimpleNamespace(list=lambda: list(terminals)),
-                               HOLD_GRACE_SECONDS=server.Workflow.HOLD_GRACE_SECONDS)
+                               HOLD_GRACE_SECONDS=server.Workflow.HOLD_GRACE_SECONDS,
+                               HOLD_KEEP_SECONDS=server.Workflow.HOLD_KEEP_SECONDS)
+        flow.hold_ends = lambda host, item: server.Workflow.hold_ends(flow, host, item)
         return flow, calls
 
-    def test_the_sweep_ends_only_old_holds_no_open_terminal_names(self):
-        open_one = {'id': 'a' * 32, 'host': 'remote', 'holdName': 'sh-000000000000000a', 'closed': False}
-        closed = {'id': 'b' * 32, 'host': 'remote', 'metadata': {'holdName': 'sh-000000000000000b'}, 'closed': True}
-        holds = [{'name': 'sh-000000000000000a', 'age': 9999}, {'name': 'sh-000000000000000b', 'age': 9999},
-                 {'name': 'sh-000000000000000c', 'age': 10}, {'name': 'sh-000000000000000d', 'age': 600}]
-        flow, calls = self.flow([open_one, closed], holds)
-        with patch('sys.stderr', new_callable=io.StringIO):
+    def name(self, last):
+        return 'sh-' + self.TAG + '0000000' + last
+
+    def test_the_sweep_ends_what_its_user_or_the_board_closed_and_keeps_a_run_that_lost_its_terminal(self):
+        now = 2_000_000_000
+        rows = [{'id': 'a' * 32, 'host': 'remote', 'holdName': self.name('a'), 'closed': False},
+                {'id': 'b' * 32, 'host': 'remote', 'metadata': {'holdName': self.name('b')}, 'closed': True, 'closedReason': 'user'},
+                {'id': 'c' * 32, 'host': 'remote', 'holdName': self.name('c'), 'closed': True, 'closedReason': 'released'},
+                # Ended by itself (a reattach that could not happen): its run may go on; kept a day.
+                {'id': 'd' * 32, 'host': 'remote', 'holdName': self.name('d'), 'closed': True,
+                 'closedReason': 'connection_ended', 'closedAt': now - 3600},
+                {'id': 'e' * 32, 'host': 'remote', 'holdName': self.name('e'), 'closed': True,
+                 'closedReason': 'connection_ended', 'closedAt': now - 2 * 86400}]
+        holds = [{'name': self.name(x), 'age': 9999} for x in 'abcde'] + [
+            {'name': self.name('f'), 'age': 600}, {'name': self.name('9'), 'age': 2 * 86400},  # no record
+            {'name': self.name('8'), 'age': 10},  # just created
+            {'name': 'sh-0123456789abcdef', 'age': 9 * 86400}]  # another board's
+        flow, calls = self.flow(rows, holds)
+        with patch('sys.stderr', new_callable=io.StringIO), patch.object(server.time, 'time', return_value=now):
             server.Workflow.sweep_holds(flow)
-        self.assertEqual([call for call in calls if call[1] == 'hold_kill'],
-                         [('remote', 'hold_kill', {'name': 'sh-000000000000000b'}),
-                          ('remote', 'hold_kill', {'name': 'sh-000000000000000d'})])
-        for offline, support in ((False, True), (True, False)):
+        self.assertEqual([call[2]['name'] for call in calls if call[1] == 'hold_kill'],
+                         [self.name('b'), self.name('c'), self.name('e'), self.name('9')])
+        holds = [{'name': self.name('d'), 'age': 600}]
+        for offline, support in ((False, '/usr/bin/tmux'), (True, None)):
             flow, calls = self.flow([], holds, online=offline, support=support)
             server.Workflow.sweep_holds(flow)
             self.assertEqual(calls, [], 'an offline or non-holding host is left alone')
 
     def test_a_terminal_list_failure_ends_nothing(self):
-        flow, calls = self.flow([], [{'name': 'sh-000000000000000d', 'age': 600}])
+        flow, calls = self.flow([], [{'name': self.name('d'), 'age': 9 * 86400}])
         flow.terminals = SimpleNamespace(list=lambda: (_ for _ in ()).throw(RuntimeError('tmux')))
         server.Workflow.sweep_holds(flow)
-        self.assertEqual(calls, [])
+        self.assertEqual([call for call in calls if call[1] == 'hold_kill'], [])
 
     def test_a_closed_terminal_ends_its_hold_now_or_says_it_will(self):
         row = {'id': 'a' * 32, 'host': 'remote', 'holdName': 'sh-000000000000000a'}

@@ -37,11 +37,19 @@ class FakeAppServer:
             return response
         if method == "turn/interrupt":
             return {}
+        if method == "thread/turns/list":
+            # Newest first, from the snapshot the metadata read just took.
+            turns = self.current["thread"].get("turns")
+            return {"data": list(reversed(turns)) if isinstance(turns, list) else turns, "nextCursor": None}
         if method != "thread/read":
             raise AssertionError("unexpected native command: " + method)
         response = next(self.reads)
         if isinstance(response, Exception):
             raise response
+        self.current = response
+        thread = response.get("thread") if isinstance(response, dict) else None
+        if isinstance(thread, dict) and not params.get("includeTurns"):
+            return {**response, "thread": {**thread, "turns": []}}
         return response
 
 
@@ -149,7 +157,8 @@ class TransferNativeTest(unittest.TestCase):
         self.assertEqual(result["interruptedTurnId"], "exact-turn")
         self.assertEqual([call for call in client.calls if call[0] == "turn/interrupt"],
                          [("turn/interrupt", {"threadId": self.source["id"], "turnId": "exact-turn"})])
-        self.assertTrue(all(params == {"threadId": self.source["id"], "includeTurns": True}
+        # Turn statuses come page by page; the whole history is never read.
+        self.assertTrue(all(params == {"threadId": self.source["id"], "includeTurns": False}
                             for method, params in client.calls if method == "thread/read"))
 
     def test_new_turn_after_interrupt_is_not_interrupted_or_exported(self):
@@ -242,6 +251,65 @@ class TransferNativeTest(unittest.TestCase):
                 private.chmod(0o777)
                 with self.assertRaises(ValueError):
                     native._socket_path(self.source, home)
+
+
+class PagedTurnsTest(unittest.TestCase):
+    """Every turn's status, page by page, never the whole history."""
+    class Pages:
+        def __init__(self, turns, errors=None, page=None):
+            self.turns, self.errors, self.page, self.calls = turns, errors or {}, page, []
+
+        def call(self, method, params):
+            self.calls.append((method, params))
+            if method in self.errors:
+                raise self.errors[method]
+            if method == "thread/queue/list":
+                return {"data": [], "nextCursor": None}
+            if method == "thread/read":
+                if params.get("includeTurns"):
+                    return {"thread": {"id": "t-1", "status": {"type": "idle"}, "turns": self.turns}}
+                return {"thread": {"id": "t-1", "status": {"type": "idle"}, "turns": []}}
+            if method == "thread/turns/list":
+                if self.page is not None:
+                    return self.page
+                newest = list(reversed(self.turns))
+                start = int(params.get("cursor") or 0)
+                end = start + params["limit"]
+                return {"data": newest[start:end], "nextCursor": str(end) if end < len(newest) else None}
+            raise AssertionError(method)
+
+    def turns(self, count):
+        return [{"id": "turn-%d" % index, "status": "completed", "items": []} for index in range(count)]
+
+    def test_turns_come_oldest_first_across_pages(self):
+        client = self.Pages(self.turns(250))
+        result = native._thread_turns(client, "t-1")
+        self.assertEqual([turn["id"] for turn in result["thread"]["turns"]], ["turn-%d" % i for i in range(250)])
+        self.assertEqual([m for m, _ in client.calls], ["thread/read"] + ["thread/turns/list"] * 3)
+        self.assertNotIn(True, [p.get("includeTurns") for m, p in client.calls if m == "thread/read"])
+        self.assertTrue(all(p["itemsView"] == "notLoaded" and p["sortDirection"] == "desc"
+                            for m, p in client.calls if m == "thread/turns/list"))
+
+    def test_a_thread_that_cannot_be_paged_is_read_whole(self):
+        for error in (collector.RpcReplyError("thread/turns/list is not supported yet", -32601),
+                      collector.RpcReplyError("Invalid request: unknown variant `thread/turns/list`, expected one of `x`", -32600)):
+            with self.subTest(error=str(error)[:30]):
+                client = self.Pages(self.turns(2), errors={"thread/turns/list": error})
+                self.assertIsNone(native._thread_turns(client, "t-1"))
+                state = native._codex_state(client, {"agent": "codex", "id": "t-1", "home": ".codex"})
+                self.assertEqual(state["lastTurnId"], "turn-1")
+                self.assertIn(("thread/read", {"threadId": "t-1", "includeTurns": True}), client.calls)
+        rejected = collector.RpcReplyError("Invalid request: unknown variant `notloaded`", -32600)
+        with self.assertRaises(collector.RpcReplyError):
+            native._thread_turns(self.Pages(self.turns(2), errors={"thread/turns/list": rejected}), "t-1")
+
+    def test_more_turns_than_pages_are_read_whole_and_a_malformed_page_is_refused(self):
+        with patch.object(native, "TURN_PAGES", 2):
+            self.assertIsNone(native._thread_turns(self.Pages(self.turns(250)), "t-1"))
+        client = self.Pages(self.turns(2), page={"data": "malformed", "nextCursor": None})
+        state = native._codex_state(client, {"agent": "codex", "id": "t-1", "home": ".codex"})
+        self.assertFalse(state["confirmed"])
+        self.assertEqual(state["phase"], "unknown")
 
 
 class TransferredLaunchTest(unittest.TestCase):

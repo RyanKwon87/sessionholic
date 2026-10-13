@@ -46,7 +46,13 @@ class Client:
             result = next(self.threads)
             if isinstance(result, Exception):
                 raise result
-            return result
+            # The metadata read; the turns come by thread/turns/list from the same snapshot.
+            self.current = result
+            thread = result.get('thread') if isinstance(result, dict) else None
+            return {**result, 'thread': {**thread, 'turns': []}} if isinstance(thread, dict) and not params.get('includeTurns') else result
+        if method == 'thread/turns/list':
+            turns = self.current['thread'].get('turns')
+            return {'data': list(reversed(turns)) if isinstance(turns, list) else turns, 'nextCursor': None}
         raise AssertionError(method)
 
 

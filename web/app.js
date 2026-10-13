@@ -1532,7 +1532,9 @@ function setSessionCategory(category, { renderView = true, clearSelection = true
   if (!Object.hasOwn(SESSION_CATEGORIES, category) || state.launchBusy) return false;
   const changed = state.sessionCategory !== category;
   const selected = selectedSession();
-  if (clearSelection && ((selected && sessionCategoryOf(selected) !== category) || (state.selectedBotRequest && category !== "bot"))) {
+  // With a bot picked, every tab but 봇 요청 lists its sessions: the open one stays open.
+  const kept = botFilter() && category !== "bot";
+  if (clearSelection && !kept && ((selected && sessionCategoryOf(selected) !== category) || (state.selectedBotRequest && category !== "bot"))) {
     rememberConversationView(); stopChatPolling();
     state.selected = null; state.selectedBotRequest = null; state.detailFor = null; state.detailRevision = null; state.detailRun += 1;
     $("detail").replaceChildren(); $("detail").dataset.key = ""; setDetailShown(false); navigateView("list", true);
@@ -1551,8 +1553,8 @@ function renderSessionCategories(sessions, now) {
     const category = sessionCategoryOf(session);
     if (category !== "bot" && matches(session, now, { category: false, initiator: category === state.sessionCategory })) counts[category] += 1;
   }
-  // A bot picked: its sessions are listed in this tab whatever their own tab.
-  if (botFilter() && state.sessionCategory !== "bot") counts[state.sessionCategory] = sessions.filter((session) => matches(session, now)).length;
+  // A bot picked: its sessions are listed in either session tab whatever their own tab.
+  if (botFilter()) counts.general = counts.agent = sessions.filter((session) => matches(session, now, { category: false })).length;
   for (const [category, label] of Object.entries(SESSION_CATEGORIES)) {
     const control = $(`session-category-${category}`); const selected = state.sessionCategory === category;
     control.setAttribute("aria-selected", String(selected)); control.tabIndex = selected ? 0 : -1;
@@ -8254,6 +8256,8 @@ function serverBooted(bootId) {
     state.eventsTerminalsVersion = null;
   }
   state.serverBoot = bootId;
+  // A new process counts its versions from 0: remove marks waiting for a version are dropped.
+  state.removedLocal?.clear?.();
 }
 // capabilities: false (a read announced by a snapshot event) reads the
 // snapshot only; the next regular read catches the capabilities up.
@@ -8808,6 +8812,9 @@ window.addEventListener("DOMContentLoaded", () => {
   applyTextSize();
   // List chips and their sheets.
   $("usage").addEventListener("click", openUsage);
+  // A top chip reached by the keyboard scrolls into the header's view (a phone scrolls it).
+  for (const id of ["usage", "hardware"])
+    $(id).addEventListener("focus", (event) => event.currentTarget.scrollIntoView?.({ block: "nearest", inline: "nearest" }));
   $("usage-close").addEventListener("click", () => closeSheet("usage-dialog", "usage"));
   $("hardware").addEventListener("click", openHardware);
   $("hardware-close").addEventListener("click", () => closeSheet("hardware-dialog", "hardware"));

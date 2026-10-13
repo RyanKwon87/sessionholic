@@ -4187,10 +4187,14 @@ test('기기 상태와 사용량은 목록이 아니라 맨 위 헤더의 기기
   const list = html.slice(html.indexOf('<aside id="task-list-pane"'), html.indexOf('</aside>'));
   for (const id of ['hosts', 'hardware', 'usage']) assert.ok(header.includes(`id="${id}"`), id + ' in the header');
   for (const id of ['hardware', 'usage']) assert.ok(!list.includes(`id="${id}"`), id + ' not in the list');
-  // Hardware and usage lead the scroller: a phone shows them without scrolling.
-  assert.ok(header.indexOf('class="top-status"') < header.indexOf('id="hardware"'));
-  assert.ok(header.indexOf('id="hardware"') < header.indexOf('id="usage"'));
-  assert.ok(header.indexOf('id="usage"') < header.indexOf('id="hosts"'));
+  // Usage leads the scroller, then hardware: a phone shows them without scrolling.
+  assert.ok(header.indexOf('class="top-status"') < header.indexOf('id="usage"'));
+  assert.ok(header.indexOf('id="usage"') < header.indexOf('id="hardware"'));
+  assert.ok(header.indexOf('id="hardware"') < header.indexOf('id="hosts"'));
+  // A phone's header gives the brand label's room to them.
+  const phone = cssBlock(fs.readFileSync(path.join(__dirname, '../web/style.css'), 'utf8'), '@media (max-width: 700px)');
+  assert.equal(phone['display'], undefined);
+  assert.match(fs.readFileSync(path.join(__dirname, '../web/style.css'), 'utf8'), /\.top \.home-label \{\n    display: none;/);
 });
 
 function classes() {
@@ -8628,11 +8632,18 @@ test('시작 주체에서 봇을 고르면 그 봇이 연 세션만 보이고, �
   assert.equal(c.state.sessionCategory, 'general'); assert.equal(c.state.filters.initiator, 'bot:헤르메스');
   vm.runInContext('render()', c.context);
   assert.equal(c.state.sessionCategory, 'general'); assert.equal(c.state.filters.initiator, 'bot:헤르메스');
+  // Another session tab lists the same sessions, with the same count, and the open one stays.
+  c.setSessionCategory('agent');
+  assert.equal(c.state.selected, worker.key);
+  assert.equal(c.get('session-category-agent-count').textContent, c.get('session-category-general-count').textContent);
+  c.setSessionCategory('general');
+  assert.equal(c.state.selected, worker.key);
   pick('bot:안내봇'); assert.deepEqual(titles(), ['안내봇 작업']);
   // The card says which bot started it.
   assert.equal(c.initiatorLabel(second), '안내봇 시작');
   assert.equal(c.initiatorLabel(mine), '직접 시작');
-  pick(''); assert.deepEqual(titles(), ['직접 연 작업', '헤르메스 작업'].sort());
+  // No bot: the list follows the open conversation's own tab again (its worker is an agent session).
+  pick(''); assert.equal(c.state.sessionCategory, 'agent'); assert.deepEqual(titles(), ['헤르메스 하위 작업']);
 });
 
 test('작업에서 대화를 직접 열면 대상 분류와 목록 조건을 맞추고 분류 전환은 초안과 보기 기록을 보존한다', () => {

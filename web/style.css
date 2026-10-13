@@ -2955,6 +2955,10 @@ li[data-task] {
     --detail-pad: 16px;
     --sheet-pad: 16px;
   }
+  /* The header keeps its ↗ home icon only: its room goes to the usage and hardware chips. */
+  .top .home-label {
+    display: none;
+  }
   /* The top scroller fades at its end, so chips past it read as more to see. */
   .top-status {
     -webkit-mask-image: linear-gradient(to right, currentColor calc(100% - 18px), transparent);

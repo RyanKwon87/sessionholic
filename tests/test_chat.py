@@ -1533,20 +1533,22 @@ class ChatClaudeTest(unittest.TestCase):
         self.terms.screen = '> '
         self.assertIsNone(self.chat.state({'source': CLAUDE_REF})['prompt'])
         self.assertEqual(len(self.calls), reads + 1)
-        self.assertTrue(self.chat.claude_lock.acquire(blocking=False))
-        self.chat.claude_lock.release()
-        # A paste or another answer in progress holds the same terminal input lock.
-        lock = self.chat.claude_lock
-        self.chat.claude_lock = Mock(acquire=Mock(return_value=False))
-        try:
+        source = self.chat.source(CLAUDE_REF)[0]
+        lock = self.chat._claude_lock_for(source)
+        self.assertTrue(lock.acquire(blocking=False))
+        lock.release()
+        # One session's input lock only: another session's is its own.
+        self.assertIs(self.chat._claude_lock_for(source), lock)
+        self.assertIsNot(self.chat._claude_lock_for({**source, 'id': 'another-session'}), lock)
+        # A paste or another answer in progress on this session holds its terminal input lock.
+        busy = Mock(acquire=Mock(return_value=False))
+        with patch.object(self.chat, '_claude_lock_for', return_value=busy):
             self.terms.screen = CLAUDE_PERMISSION
             exc = self.refused(1, rid='answer-0002')
             self.assertEqual(exc.code, 'busy')
             with self.assertRaises(chat.PromptRejected):
                 self.chat.prompt({'source': CLAUDE_REF, 'action': 'open'})
-            self.chat.claude_lock.acquire.assert_called_with(timeout=30)
-        finally:
-            self.chat.claude_lock = lock
+            busy.acquire.assert_called_with(timeout=30)
         self.assertEqual(len(self.terms.keys), 1)
 
 

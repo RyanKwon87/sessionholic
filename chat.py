@@ -227,8 +227,9 @@ class Chat:
         self.cache_epoch = 0
         self.read_sequence = 0
         self.upload_gate = threading.BoundedSemaphore(2)
-        # Serialises everything the board types into agent terminals (pastes, menu keys).
-        self.claude_lock = threading.Lock()
+        # Serialises what the board types into one session's terminal (pastes, menu keys):
+        # one lock per session (_claude_lock_for), so a slow session never holds up another.
+        self.claude_locks = {}
         # Terminals a send opened that were still loading when it gave up.
         self.unsettled = set()
         self.prompt_results = {}
@@ -628,9 +629,16 @@ class Chat:
             raise ValueError('선택지 번호가 올바르지 않습니다.')
         return self._answer_prompt(source, request_id, fingerprint, number)
 
+    def _claude_lock_for(self, source):
+        """The input lock of one session (its identity), made on first use."""
+        key = json.dumps(self.identity(source), sort_keys=True)
+        with self.lock:
+            return self.claude_locks.setdefault(key, threading.Lock())
+
     def _open_prompt(self, ref, source, request_id):
         """Show a menu: attach a background Claude session first when it has no terminal."""
-        if not self.claude_lock.acquire(timeout=30):
+        turn = self._claude_lock_for(source)
+        if not turn.acquire(timeout=30):
             raise PromptRejected(PROMPT_BUSY, code='busy')
         try:
             terminal = self._prompt_terminal(source)
@@ -645,7 +653,7 @@ class Chat:
                     raise PromptRejected(str(exc) if isinstance(exc, (ValueError, RuntimeError)) else
                                          'Claude 터미널을 열지 못했습니다.', 409, 'terminal_unavailable') from None
         finally:
-            self.claude_lock.release()
+            turn.release()
         self._forget_state(source)
         return {'prompt': self._screen_prompt(terminal, source)}
 
@@ -676,7 +684,8 @@ class Chat:
         previous = saved()
         if previous:
             return previous
-        if not self.claude_lock.acquire(timeout=30):
+        turn = self._claude_lock_for(source)
+        if not turn.acquire(timeout=30):
             raise PromptRejected(PROMPT_BUSY, code='busy')
         try:
             previous = saved()
@@ -725,7 +734,7 @@ class Chat:
                 self.prompt_results[key] = ([fingerprint, number], result)
             return result
         finally:
-            self.claude_lock.release()
+            turn.release()
             self._forget_state(source)
 
     def _open_claude_terminal(self, ref, source, request_id):
@@ -830,7 +839,8 @@ class Chat:
         if windows and source.get('kind') == 'background':
             # Only a PC conversation resumed in a board terminal takes input (windows_runtime.terminal_plan).
             raise SendRejected(CLAUDE_WINDOWS, 409)
-        if not self.claude_lock.acquire(timeout=30):
+        turn = self._claude_lock_for(source)
+        if not turn.acquire(timeout=30):
             raise SendRejected('다른 메시지를 전달하고 있습니다. 잠시 뒤 다시 보내 주세요.', 409)
         try:
             previous = self._claude_read_record(source, request_id)
@@ -918,7 +928,7 @@ class Chat:
                 receipt = {**receipt, 'ledgerPending': True}
             return {**receipt, 'attachments': manifest}
         finally:
-            self.claude_lock.release()
+            turn.release()
 
     def upload(self, ref, name, content):
         source, host = self.source(ref)

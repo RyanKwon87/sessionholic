@@ -132,7 +132,9 @@ class EventHubTest(unittest.TestCase):
         self.assertNotIn(self.hub.snapshot_changed, self.board.listeners)
 
     def test_snapshot_announcements_to_a_stream_are_spaced_and_carry_the_newest_version(self):
-        hub = events.EventHub(self.board, self.chat, heartbeat=5, peer_check=0.02, snapshot_gap=0.4)
+        # A gap wide enough that a slow runner noticing the first announcement late still sees
+        # the wait (a 0.4 s gap failed on CI).
+        hub = events.EventHub(self.board, self.chat, heartbeat=5, peer_check=0.02, snapshot_gap=1.5)
         self.addCleanup(hub.close)
         self.board.version = 1
         reader = Reader(hub, hub.open())
@@ -142,10 +144,10 @@ class EventHubTest(unittest.TestCase):
         first = time.monotonic()
         for _ in range(5):
             self.board.change()
-        time.sleep(0.2)
+        time.sleep(0.3)
         self.assertEqual(len(reader.events("snapshot")), 1, "changes within the gap wait")
-        wait_for(lambda: len(reader.events("snapshot")) >= 2)
-        self.assertGreaterEqual(time.monotonic() - first, 0.35)
+        wait_for(lambda: len(reader.events("snapshot")) >= 2, timeout=5)
+        self.assertGreaterEqual(time.monotonic() - first, 1.0)
         self.assertEqual(reader.events("snapshot"), [{"version": 2}, {"version": 7}], "one announcement of the newest")
 
     def test_a_change_other_than_a_watchers_is_announced_without_waiting(self):

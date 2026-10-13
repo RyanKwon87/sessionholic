@@ -8777,6 +8777,8 @@ test('a list that merges or drops its changing results, or repeats what it heard
     ['Mozilla/5.0 (Linux; Android 15)', [[fin('오늘 날씨')], [mid('오늘 날씨 어때')]], '오늘 날씨 어때'],
     // WebKit starts over with only what follows: the earlier final stays.
     ['', [[fin('하나')], [mid('둘')]], '하나 둘'],
+    // ... even when the new words begin like the old ones (a repeat said on purpose).
+    ['Mozilla/5.0 (iPhone; CPU iPhone OS 26_6 like Mac OS X)', [[fin('네')], [mid('네 알겠습니다')]], '네 네 알겠습니다'],
   ];
   for (const [agent, events, expected] of cases) {
     const { c, recognitions, FakeRecognition } = dictationClient();

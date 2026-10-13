@@ -3434,7 +3434,8 @@ function startDictation(field, { report, active, releaseKeyboard = false }) {
     }
     const same = (a, b) => dictationRepeats(a, b) && dictationRepeats(b, a);
     const kept = session.finals.every((text, i) => i < finals.length && same(text, finals[i]));
-    if (!kept && session.finalText && !dictationRepeats(session.finalText, String(list[0]?.[0]?.transcript || ""))) {
+    const repeats = dictationCumulative() && dictationRepeats(session.finalText, String(list[0]?.[0]?.transcript || ""));
+    if (!kept && session.finalText && !repeats) {
       session.prefix += (session.prefix && !/\s$/.test(session.prefix) ? " " : "") + session.finalText;
     }
     session.finals = finals;

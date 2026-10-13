@@ -4516,6 +4516,35 @@ li[data-task] {
 .terminal-screen {
   position: relative;
 }
+/* A wide screen keeps the board on the left and the terminal beside it
+   (app.js applyDock sets --dock-w); with too little room the list steps aside. */
+body.terminal-docked .app {
+  margin-right: var(--dock-w);
+}
+body.terminal-docked .terminal-screen {
+  position: fixed;
+  top: 0;
+  right: 0;
+  left: auto;
+  width: var(--dock-w);
+  padding-left: 0;
+  border-left: 1px solid var(--t-sep);
+}
+body.dock-solo .layout {
+  grid-template-columns: minmax(0, 1fr);
+}
+body.dock-solo .list-pane {
+  display: none;
+}
+body.terminal-docked .toast,
+body.terminal-docked .offline-banner,
+body.terminal-docked .pull-refresh {
+  left: calc((100% - var(--dock-w)) / 2);
+  max-width: calc(100% - var(--dock-w) - 32px);
+}
+body.terminal-docked .terminal-screen:not([hidden]) ~ .toast {
+  bottom: calc(24px + env(safe-area-inset-bottom));
+}
 .terminal-live {
   position: absolute;
   right: 12px;

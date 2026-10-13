@@ -205,6 +205,12 @@ const state = {
   resizeTimer: null,
   lastSize: "",
   fontSize: prefs.get("fontSize", 14),
+  // A wide screen shows the terminal beside the conversation ("나란히"); "크게" covers the board.
+  terminalDock: prefs.get("terminalDock", true) !== false,
+  docked: false,
+  dockSolo: false,
+  dockWidth: 0,
+  dockSide: "terminal",
   screenReaderMode: prefs.get("screenReaderMode", false) === true,
   directTerminalInput: prefs.get("directTerminalInput", null),
   terminalScrollLines: 0,
@@ -315,7 +321,7 @@ function setTextSize(size) {
 }
 function updateThemeColor() {
   // Both media-specific metas take the forced color; "auto" restores them.
-  const forced = state.terminalVisible ? THEME_COLORS.terminal
+  const forced = boardCovered() ? THEME_COLORS.terminal
     : state.theme === "auto" ? null : THEME_COLORS[state.theme];
   for (const meta of document.querySelectorAll?.('meta[name="theme-color"]') || []) {
     if (meta.dataset && meta.dataset.original == null) meta.dataset.original = meta.getAttribute?.("content") || "";
@@ -618,8 +624,9 @@ function openRequestedSession() {
   if (Date.now() > request.until) { state.openRequest = null; return; }
   if (!state.authenticated || state.launchBusy || !allSessions().some((session) => session.key === request.key)) return;
   state.openRequest = null;
-  // Over an open terminal too: the conversation shows, and back returns to the terminal.
-  if (state.terminalVisible) {
+  // Over an open terminal too (or beside one of another session): the conversation
+  // shows, and back returns to the terminal.
+  if (state.terminalVisible && (boardCovered() || sessionForTerminal(state.terminal)?.key !== request.key)) {
     returnToBoard({ selectLaunchedSource: false, animate: false });
     navigateView("detail", false, { notice: request.key });
   }
@@ -2636,6 +2643,9 @@ function restoreConversationView(list) {
 }
 function select(key) {
   if (state.launchBusy) return;
+  // A docked terminal stays beside its own conversation; another one shows without it.
+  const beside = state.docked && sessionForTerminal(state.terminal);
+  if (beside && beside.key !== key) undock();
   if (state.selected !== key) rememberConversationView();
   const target = allSessions().find((session) => session.key === key);
   const bot = target && botRequestForNative(sourceOf(target));
@@ -3401,7 +3411,7 @@ function networkOffline() {
   return state.offline || globalThis.navigator?.onLine === false;
 }
 function chatVisible() {
-  return !document.hidden && !state.terminalVisible && (!phoneLayout() || state.detailShown);
+  return !document.hidden && !boardCovered() && (!phoneLayout() || state.detailShown);
 }
 function chatHostOffline(entry) {
   const session = selectedSession();
@@ -4119,7 +4129,7 @@ function promptKeydown(event) {
       event.keyCode === 229 || event.defaultPrevented) return false;
   const target = event.target;
   if (target?.isContentEditable || target?.closest?.("input, textarea, select, [contenteditable]")) return false;
-  if (state.terminalVisible || !chatVisible() || Object.keys(SHEETS).some((id) => $(id)?.open)) return false;
+  if (boardKeysBlocked() || !chatVisible() || Object.keys(SHEETS).some((id) => $(id)?.open)) return false;
   const card = $("chat-prompt");
   if (!card || card.hidden || typeof card.chooseNumber !== "function" || !card.chooseNumber(Number(key))) return false;
   event.preventDefault();
@@ -4135,8 +4145,10 @@ function documentKeydown(event) {
     noteHardwareKey(event);
     return;
   }
-  if (!state.terminalVisible && (event.metaKey || event.ctrlKey) && String(event.key).toLowerCase() === "k" && !event.isComposing) {
+  if (!boardKeysBlocked() && (event.metaKey || event.ctrlKey) && String(event.key).toLowerCase() === "k" && !event.isComposing) {
     event.preventDefault();
+    // Search is in the list, which a docked terminal may have moved aside.
+    if (state.dockSolo) undock();
     const search = window.SessionholicGoals?.searchElement?.() || $("search");
     search?.focus();
     search?.select?.();
@@ -4152,7 +4164,7 @@ function documentKeydown(event) {
 // Typing, an input method's composition, a terminal or an open sheet keep their keys.
 function listNavigationKeydown(event) {
   // A key something else already took (closing the tools menu with Esc) is not taken again.
-  if (event.defaultPrevented || state.terminalVisible || event.isComposing || event.keyCode === 229 ||
+  if (event.defaultPrevented || boardKeysBlocked() || event.isComposing || event.keyCode === 229 ||
       event.altKey || event.shiftKey) return false;
   const target = event.target;
   if (target?.closest?.("dialog")) return false;
@@ -4183,6 +4195,7 @@ function listNavigationKeydown(event) {
   if (!back || !state.selected || !$("session-layout") || $("session-layout").hidden) return false;
   event.preventDefault();
   if (phoneLayout() && state.detailShown) backToList();
+  else if (state.dockSolo) backFromTerminal();
   else restoreSelectedCardFocus();
   return true;
 }
@@ -5295,7 +5308,7 @@ function openNativeChat(terminal) {
       account: sessionAccountLabel({ ...source, account: info.account }),
       phase: "idle", project: "이어가는 실제 세션", updatedAt: Date.now() / 1000 });
   }
-  if (state.terminalVisible) returnToBoard({ selectLaunchedSource: false });
+  if (boardCovered()) returnToBoard({ selectLaunchedSource: false });
   select(key);
 }
 // --- Tool records: consecutive tool rows fold into one line -----------------
@@ -5836,6 +5849,11 @@ function navigateView(view, replace = false, extra = {}) {
   );
 }
 function backToList() {
+  // The list stepped aside for a docked terminal: back brings it, the terminal steps aside.
+  if (state.dockSolo) {
+    backFromTerminal();
+    return;
+  }
   rememberConversationView();
   if (!state.selectedBotRequest && window.SessionholicGoals?.backFromSession?.()) return;
   stopChatPolling();
@@ -6670,6 +6688,8 @@ function setTerminalFontSize(size, { persist = true } = {}) {
   if (persist) prefs.set("fontSize", next);
   if (changed && state.term) {
     state.term.options.fontSize = next;
+    // A pinch decides beside-or-covering once, at its end (endPinch).
+    if (persist) redock();
     fitTerminal();
   }
   return changed;
@@ -6712,8 +6732,117 @@ function fitTerminal() {
   }, 180);
 }
 function showTerminalScreen(visible) {
-  $("app").hidden = visible;
   $("terminal-screen").hidden = !visible;
+  applyDock();
+}
+// Docked, the terminal keeps 80 columns (64 at least, where a CLI's boxes still fit) and
+// leaves the conversation 420px; the list stays beside them when 820px are left.
+// chrome: the viewport's padding, xterm's scrollbar and the dock's border.
+const DOCK = { cols: 80, minCols: 64, share: 0.45, minChat: 420, withList: 820, chrome: 34 };
+function terminalCellWidth() {
+  const size = state.fontSize || 14;
+  try {
+    state.cellCanvas ||= document.createElement("canvas");
+    const context = state.cellCanvas.getContext?.("2d");
+    if (context) {
+      context.font = `${size}px ${TERMINAL_FONT}`;
+      const width = context.measureText("W".repeat(32)).width / 32;
+      if (width > 0) return width;
+    }
+  } catch {
+    /* estimated below */
+  }
+  return size * 0.62;
+}
+// The width a terminal takes beside the conversation on this screen; 0 covers the board.
+function dockWidth({ preferred = state.terminalDock } = {}) {
+  const width = window.innerWidth || 0;
+  if (!preferred || width <= 0 || phoneLayout() || shortLayout()) return 0;
+  const cell = terminalCellWidth();
+  const wanted = Math.max(Math.ceil(cell * DOCK.cols) + DOCK.chrome, Math.round(width * DOCK.share));
+  const docked = Math.min(wanted, width - DOCK.minChat);
+  return docked >= cell * DOCK.minCols + DOCK.chrome ? Math.floor(docked) : 0;
+}
+function boardCovered() {
+  return state.terminalVisible && !state.docked;
+}
+// Docked, a key typed with nothing focused belongs to the side last touched.
+function boardKeysBlocked() {
+  return state.terminalVisible && !(state.docked && state.dockSide === "board");
+}
+function noteDockSide(side) {
+  if (state.docked) state.dockSide = side;
+}
+// Beside the conversation or over the board: decided on open, resize and font change.
+function applyDock() {
+  const width = state.terminalVisible ? dockWidth() : 0;
+  const docked = width > 0;
+  const changed = docked !== state.docked;
+  // Newly beside the conversation, the terminal has the keys (as when it opens).
+  if (changed && docked) state.dockSide = "terminal";
+  state.docked = docked;
+  state.dockWidth = width;
+  document.documentElement.style?.setProperty?.("--dock-w", `${width}px`);
+  state.dockSolo = docked && (window.innerWidth || 0) - width < DOCK.withList;
+  const classes = document.body?.classList;
+  classes?.[docked ? "add" : "remove"]("terminal-docked");
+  classes?.[state.dockSolo ? "add" : "remove"]("dock-solo");
+  $("app").hidden = state.terminalVisible && !docked;
+  // Beside the conversation (the page's main) the terminal is one region of it.
+  $("terminal-screen").setAttribute("role", docked ? "region" : "main");
+  renderDockToggle();
+  renderTerminalReturn();
+  if (changed) renderConnectivity();
+  return changed;
+}
+// Docked, the board stays on screen with its focus (the control that opened the terminal):
+// keys typed next belong to the terminal, so that focus is let go.
+function releaseBoardFocus() {
+  const active = document.activeElement;
+  if (state.docked && active?.closest?.("#app")) active.blur?.();
+}
+// The terminal steps aside for the board, and its history entry gives way to the board's.
+// The conversation beside it was already reading: no second read.
+function undock() {
+  returnToBoard({ selectLaunchedSource: false, animate: false, loadChat: false });
+  if (window.history.state?.[INSTANCE.historyKey] && window.history.state.view === "terminal") navigateView("list", true);
+}
+// Beside a terminal the board reads on; covered by one it rests (as in openTerminal).
+function syncBoardLive() {
+  updateThemeColor();
+  schedule();
+  syncEvents();
+  if (boardCovered()) {
+    stopChatPolling();
+    return;
+  }
+  const selected = selectedSession();
+  if (selected) loadChatState(selected, true);
+}
+function redock() {
+  if (state.terminalVisible && applyDock()) syncBoardLive();
+}
+function renderDockToggle() {
+  const toggle = $("terminal-dock");
+  if (toggle) {
+    toggle.hidden = !state.terminalVisible || !(dockWidth({ preferred: true }) > 0);
+    toggle.textContent = state.docked ? "크게" : "나란히";
+    toggle.setAttribute("aria-label", state.docked ? "터미널을 화면 가득 보기" : "터미널을 대화 옆에 보기");
+  }
+  const back = $("terminal-back");
+  back.textContent = state.docked ? "숨기기" : "보드";
+  const label = state.docked ? "터미널 칸 숨기기" : back.dataset?.boardLabel;
+  if (label) back.setAttribute("aria-label", label);
+}
+// "크게"/"나란히" is remembered for every terminal on this device.
+function toggleDock() {
+  state.terminalDock = !state.docked;
+  prefs.set("terminalDock", state.terminalDock);
+  // Pressed in the terminal's header: its keys stay with it either way.
+  state.dockSide = "terminal";
+  redock();
+  $("terminal-dock").blur?.();
+  fitTerminal();
 }
 // Keeps the toast above the key bar (style.css, section 8).
 function measureTerminalTools() {
@@ -6785,7 +6914,8 @@ function loadXterm() {
   return xtermLoading;
 }
 async function openTerminal(terminal, { recordHistory = true } = {}) {
-  stopChatPolling();
+  const docking = dockWidth() > 0;
+  if (!docking) stopChatPolling();
   if (recordHistory) navigateView("terminal");
   const presenting = !state.terminalVisible;
   const openRun = ++state.terminalOpenRun;
@@ -6814,14 +6944,17 @@ async function openTerminal(terminal, { recordHistory = true } = {}) {
   state.terminal = terminal;
   state.terminalAlive = terminal.alive !== false && !terminal.closed;
   state.terminalVisible = true;
+  state.dockSide = "terminal";
   renderConnectivity();
-  const shown = presenting ? navTransition("present", () => showTerminalScreen(true)) : (showTerminalScreen(true), null);
+  const shown = presenting && !docking ? navTransition("present", () => showTerminalScreen(true)) : (showTerminalScreen(true), null);
+  releaseBoardFocus();
   updateThemeColor();
-  closeEvents();
+  if (boardCovered()) closeEvents();
   $("terminal-title").textContent = terminalTitle(terminal, "진행 중인 작업");
   $("terminal-route").textContent = targetLabel(terminalInfo(terminal));
   const nativeHost = terminalInfo(terminal).nativeSource?.host || terminalInfo(terminal).host;
-  $("terminal-back").setAttribute("aria-label", `${hostLabel(nativeHost)}의 작업을 보드에서 보기`);
+  $("terminal-back").dataset.boardLabel = `${hostLabel(nativeHost)}의 작업을 보드에서 보기`;
+  renderDockToggle();
   const copy = terminalCloseCopy(terminal);
   $("terminal-close").textContent = copy.action;
   $("terminal-close").setAttribute("aria-label", copy.action);
@@ -6835,6 +6968,18 @@ async function openTerminal(terminal, { recordHistory = true } = {}) {
   terminalError();
   renderTerminalReturn();
   $("terminal-reopen").hidden = true;
+  // Docked, the conversation beside it is the terminal's own.
+  const beside = state.docked && sessionForTerminal(terminal);
+  if (beside && beside.key !== state.selected) {
+    // A launch opens its terminal while still busy; showing its conversation is part of it.
+    const busy = state.launchBusy;
+    state.launchBusy = false;
+    try {
+      select(beside.key);
+    } finally {
+      state.launchBusy = busy;
+    }
+  }
   if (!state.terminalAlive) {
     showTerminalEnded();
     return;
@@ -7076,14 +7221,15 @@ function sendInput(text) {
   state.inputQueue = send.catch(() => {});
   return send;
 }
-function returnToBoard({ selectLaunchedSource = true, animate = true } = {}) {
+function returnToBoard({ selectLaunchedSource = true, animate = true, loadChat = true } = {}) {
   saveDraft();
   stopTerminalReader();
   state.inputEpoch++;
   state.terminalOpenRun++;
+  const wasDocked = state.docked;
   state.terminalVisible = false;
   renderConnectivity();
-  if (animate) navTransition("dismiss", () => showTerminalScreen(false));
+  if (animate && !wasDocked) navTransition("dismiss", () => showTerminalScreen(false));
   else showTerminalScreen(false);
   updateThemeColor();
   renderTerminalReturn();
@@ -7097,11 +7243,11 @@ function returnToBoard({ selectLaunchedSource = true, animate = true } = {}) {
     openNativeChat(state.terminal);
   }
   const selected = selectedSession();
-  if (selected) loadChatState(selected, true);
+  if (selected && loadChat) loadChatState(selected, true);
 }
 function renderTerminalReturn() {
   const exists = !!state.terminal && state.terminalAlive && state.terminal.alive !== false && !state.terminal.closed;
-  $("terminal-return").hidden = !exists;
+  $("terminal-return").hidden = !exists || state.terminalVisible;
   const info = terminalInfo(state.terminal);
   const host = capsHost(info.host)?.label || info.host;
   $("terminal-return-label").textContent = exists
@@ -7244,6 +7390,8 @@ function bindTerminalTouchScroll(node) {
   const endPinch = () => {
     if (pinch?.changed) {
       prefs.set("fontSize", state.fontSize);
+      redock();
+      fitTerminal();
       toast(`터미널 글자 크기 ${state.fontSize}`);
     }
     pinch = null;
@@ -7507,7 +7655,8 @@ function draftBeforeInput(event) {
 // With nothing focused (the terminal just opened), a hardware keyboard types into the CLI.
 // A focused control keeps its keys, and Tab moves the focus as on any page.
 function terminalDocumentKey(event) {
-  if (!state.terminalVisible || event.defaultPrevented || editingText()) return false;
+  if (!state.terminalVisible || (state.docked && state.dockSide !== "terminal") || event.defaultPrevented ||
+      editingText()) return false;
   const active = document.activeElement;
   if ((active && active !== document.body && active !== document.documentElement) || event.key === "Tab") {
     // Not for the CLI: a held bar modifier must not wait for a later key either.
@@ -8067,6 +8216,7 @@ function finishTerminalClose(closing) {
     rememberTerminal({ id: closing.id }, { alive: false, closed: true });
   if (state.terminal?.id === closing.id) {
     const wasVisible = state.terminalVisible;
+    const wasDocked = state.docked;
     saveDraft();
     stopTerminalReader();
     state.inputEpoch++;
@@ -8082,8 +8232,9 @@ function finishTerminalClose(closing) {
     showTerminalScreen(false);
     updateThemeColor();
     renderTerminalReturn();
-    if (wasVisible) {
-      navigateView("list", true);
+    if (wasVisible) navigateView("list", true);
+    // A covering terminal returns to the list; beside the conversation, that stays.
+    if (wasVisible && !wasDocked) {
       stopChatPolling();
       setDetailShown(false, { focus: true });
     }
@@ -8168,7 +8319,7 @@ function fallbackEvents() {
 function syncEvents() {
   const Source = globalThis.EventSource;
   if (typeof Source !== "function" || !state.authenticated || document.hidden || networkOffline() ||
-      state.terminalVisible || Date.now() < state.eventsRetryAt) {
+      boardCovered() || Date.now() < state.eventsRetryAt) {
     closeEvents();
     return;
   }
@@ -8274,7 +8425,7 @@ function snapshotAnnounced(version, { immediate = false } = {}) {
 function schedule() {
   clearTimeout(state.pollTimer);
   state.pollTimer = null;
-  if (!state.authenticated || networkOffline() || state.terminalVisible || document.hidden) return;
+  if (!state.authenticated || networkOffline() || boardCovered() || document.hidden) return;
   // Reading a collection already in flight does not start another host request.
   const collecting =
     state.snapshot?.hosts?.some((host) => host.refreshing) &&
@@ -8344,7 +8495,7 @@ function poll(refresh = false, options = {}) {
   return run;
 }
 async function pollOnce(refresh = false, { capabilities = true } = {}) {
-  if (networkOffline() || state.loginBusy || state.pollBusy || document.hidden || state.terminalVisible) return false;
+  if (networkOffline() || state.loginBusy || state.pollBusy || document.hidden || boardCovered()) return false;
   const authEpoch = state.authEpoch;
   state.pollBusy = true;
   if (refresh) state.refreshDeadline = Date.now() + 60000;
@@ -8533,7 +8684,7 @@ function bindPullToRefresh(root) {
   root.addEventListener("touchstart", (event) => {
     start = null;
     distance = 0;
-    if (event.touches.length !== 1 || state.terminalVisible || state.pullRefreshing) return;
+    if (event.touches.length !== 1 || boardCovered() || state.pullRefreshing) return;
     if (event.target?.closest?.("textarea, input, select, dialog[open]")) return;
     // In a conversation the message list decides, wherever the finger starts.
     const scroller = event.target?.closest?.("#detail") ? $("messages") : scrollParent(event.target);
@@ -8643,6 +8794,7 @@ function showLogin() {
   $("detail").replaceChildren();
   $("groups").replaceChildren();
   $("terminal-screen").hidden = true;
+  applyDock();
   $("app").hidden = true;
   $("login").hidden = false;
   if ($("plan-dialog").open) $("plan-dialog").close();
@@ -8683,6 +8835,7 @@ function viewportHeight() {
 function updateViewport() {
   const height = Math.round(viewportHeight());
   document.documentElement.style.setProperty("--app-height", `${height}px`);
+  redock();
   syncChromeMode();
   const selected = selectedSession();
   if (selected) resizeChatInput(chatEntry(selected));
@@ -8736,7 +8889,7 @@ function renderConnectivity() {
   if (text && !$("offline-text").textContent) revealChrome();
   if ($("offline-text").textContent !== text) $("offline-text").textContent = text;
   box.dataset.kind = offline ? "offline" : failing ? "retrying" : "";
-  box.hidden = !text || state.terminalVisible;
+  box.hidden = !text || boardCovered();
   // A connection problem is said first; the newer screen waits for it.
   if (update) update.hidden = !state.updateAvailable || !!text || state.terminalVisible;
 }
@@ -8758,7 +8911,7 @@ function recoverConnection() {
     terminalStatus("네트워크 연결이 돌아왔습니다. 다시 연결하고 있습니다…");
     state.terminalRetry = 0;
     startTerminalReader();
-    return;
+    if (boardCovered()) return;
   }
   const initialAuthentication = !state.authenticated;
   const authEpoch = state.authEpoch;
@@ -8781,9 +8934,10 @@ function pageShown() {
   if (state.offline && globalThis.navigator?.onLine !== false) {
     state.shownAt = Date.now();
     recoverConnection();
-  } else if (state.terminalVisible) {
+  } else if (boardCovered()) {
     startTerminalReader();
   } else if (state.authenticated) {
+    if (state.terminalVisible) startTerminalReader();
     state.shownAt = Date.now();
     if (reloadForUpdate()) return;
     poll(true);
@@ -8989,6 +9143,9 @@ window.addEventListener("DOMContentLoaded", () => {
     closePlan();
   });
   $("terminal-back").addEventListener("click", backFromTerminal);
+  $("terminal-dock").addEventListener("click", toggleDock);
+  for (const [id, side] of [["app", "board"], ["terminal-screen", "terminal"]])
+    for (const type of ["pointerdown", "focusin"]) $(id).addEventListener(type, () => noteDockSide(side));
   $("terminal-close").addEventListener("click", () => {
     if (state.terminal) closeTerminal(state.terminal.id);
   });

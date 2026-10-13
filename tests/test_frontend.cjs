@@ -10043,3 +10043,34 @@ test('with an on-screen keyboard up, the app follows what iOS scrolled on screen
   c.updateViewport();
   assert.equal(classes.has('app-shifted'), false);
 });
+
+test('a menu whose taps iPadOS kept for its own selection still works once the opening finger is long gone', () => {
+  const c = client(undefined, noChatTimers);
+  let cleared = 0;
+  c.context.window.getSelection = () => ({ removeAllRanges() { cleared++; } });
+  const ran = [];
+  c.openActionSheet({ title: '메뉴', actions: [{ label: '복사', run: () => ran.push('복사') }] });
+  const dialog = c.get('action-sheet');
+  assert.equal(dialog.open, true);
+  assert.equal(cleared, 1, 'a selection left on the page is cleared as the menu opens');
+  const [item] = c.get('action-list').children;
+  // The finger that opened it lifts over the item at once: nothing runs.
+  item.events.click({ detail: 1 });
+  assert.deepEqual(ran, []);
+  assert.equal(dialog.open, true);
+  // A tap whose pointerdown iPadOS kept, well after the menu opened: it runs.
+  dialog.bottomSheet.openedAt = Date.now() - 800;
+  item.events.click({ detail: 1 });
+  assert.deepEqual(ran, ['복사']);
+  assert.equal(dialog.open, false);
+  // The backdrop the same way: closes only once the opening finger is long gone.
+  c.openActionSheet({ title: '메뉴', actions: [{ label: '복사', run: () => ran.push('again') }] });
+  dialog.getBoundingClientRect = () => ({ left: 100, right: 400, top: 100, bottom: 400 });
+  const outside = { target: dialog, clientX: 10, clientY: 10 };
+  dialog.events.click(outside);
+  assert.equal(dialog.open, true);
+  dialog.bottomSheet.openedAt = Date.now() - 800;
+  dialog.events.click(outside);
+  assert.equal(dialog.open, false);
+  assert.deepEqual(ran, ['복사']);
+});

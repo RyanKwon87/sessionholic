@@ -459,6 +459,8 @@ function sheetRelease({ offset = 0, velocity = 0, height = 0, detent = "medium",
       (offset < -GESTURE.sheetExpandPx || velocity < -GESTURE.sheetExpandSpeed)) return "large";
   return detent;
 }
+// See BottomSheet.unseenPressTaken.
+const SHEET_UNSEEN_PRESS_MS = 700;
 class BottomSheet {
   static attach(dialog, options = {}) {
     if (!dialog) return null;
@@ -498,7 +500,15 @@ class BottomSheet {
     // only a press that starts on the open sheet's backdrop dismisses it.
     this.pressedSinceOpen = false;
     this.pressTarget = null;
+    this.openedAt = Date.now();
     if (!this.dialog.open) this.dialog.showModal();
+  }
+  // A tap whose press this sheet never saw: iPadOS keeps a pointerdown for its own text
+  // selection (one it made under the finger that opened the menu, or one left on the page).
+  // Taken once the finger that opened it is long gone (a click after a hold that long is
+  // not that finger's: a long press makes no click).
+  unseenPressTaken() {
+    return !this.pressedSinceOpen && Date.now() - (this.openedAt || 0) >= SHEET_UNSEEN_PRESS_MS;
   }
   close() {
     if (this.dialog.open) this.dialog.close();
@@ -562,7 +572,7 @@ class BottomSheet {
     this.offset(0);
   }
   outsideClick(event) {
-    if (event.target !== this.dialog || !this.dialog.open || !this.pressedSinceOpen) return;
+    if (event.target !== this.dialog || !this.dialog.open || !(this.pressedSinceOpen || this.unseenPressTaken())) return;
     const rect = this.dialog.getBoundingClientRect?.();
     if (!rect || (event.clientX >= rect.left && event.clientX <= rect.right &&
         event.clientY >= rect.top && event.clientY <= rect.bottom)) return;
@@ -2413,6 +2423,12 @@ function openActionSheet({ eyebrow = "", title = "", preview = "", actions = [],
   });
   $("action-list").replaceChildren(...items);
   state.actionTrigger = trigger;
+  // A selection left on the page (or one iPadOS starts under the finger) keeps taps for itself.
+  try {
+    window.getSelection?.()?.removeAllRanges?.();
+  } catch {
+    /* nothing selected */
+  }
   const popover = !!at && !phoneLayout();
   setClass(dialog, "is-popover", popover);
   if (dialog.style) {
@@ -2429,6 +2445,7 @@ function openActionSheet({ eyebrow = "", title = "", preview = "", actions = [],
 // must run nothing. A keyboard's click (Enter, Space) has no pointer: detail 0.
 function menuItemPressed(dialog, item, event) {
   if (!event?.detail) return true;
+  if (dialog?.bottomSheet?.unseenPressTaken()) return true;
   const target = dialog?.bottomSheet?.pressedSinceOpen ? dialog.bottomSheet.pressTarget : null;
   return !!target && (target === item || !!item.contains?.(target));
 }

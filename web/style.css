@@ -5780,6 +5780,13 @@ body.app-shifted .app {
   display: none;
 }
 /* Action sheet: a grouped list of large rows; a popover for right clicks. */
+/* The menu opens under the finger that held the message: its words are not selectable,
+   or iPadOS would select them and keep the next taps for that selection. */
+.action-sheet {
+  -webkit-user-select: none;
+  user-select: none;
+  -webkit-touch-callout: none;
+}
 .action-sheet h2.action-title {
   overflow: hidden;
   margin-bottom: 8px;

@@ -49,6 +49,21 @@ const TIDY_GRACE_SECONDS = 120;
 function sessionTidied(s) {
   return Number.isInteger(s?.tidiedAt) && (Number(s.updatedAt) || 0) <= s.tidiedAt + TIDY_GRACE_SECONDS;
 }
+// 목록에서 지우기: unlike a tidy, it stays away after it changes again. This page's own choice
+// counts at once (removedLocal) until the board's record says the same.
+function sessionRemoved(s) {
+  if (!s) return false;
+  if (state.removedLocal?.has(s.key)) {
+    const local = state.removedLocal.get(s.key);
+    if (Number.isInteger(local) === Number.isInteger(s.removedAt)) state.removedLocal.delete(s.key);
+    else return Number.isInteger(local);
+  }
+  return Number.isInteger(s.removedAt);
+}
+// A removed session that answers or works again is shown (its user would miss it otherwise).
+function sessionHidden(s) {
+  return sessionRemoved(s) && s.phase !== "needs_input" && s.phase !== "working";
+}
 const BADGES = {
   needs_input: ["답 필요", "red"],
   working: ["작업 중", "amber"],
@@ -147,6 +162,8 @@ const state = {
   manualRun: null, // the manual refresh in flight (manualRefresh), shared by a second press or pull
   seenLocal: new Map(), // session key -> update time this page marked read (markSeen)
   seenFailed: new Map(), // session key -> when its last mark failed (markSeen waits SEEN_RETRY_MS)
+  removedLocal: new Map(), // session key -> removedAt (null: shown again) this page set until read back
+  openedLocal: new Map(), // session key -> when this page opened its conversation (markOpened)
   updateAvailable: false, // the board serves a newer screen than this page runs (checkWebVersion)
   shownAt: Date.now(), // when the page was last shown (visibilitychange)
   authenticated: false,
@@ -730,7 +747,8 @@ function beginAuthEpoch() {
 // never is: it waits for a new press (sendChat).
 const CSRF_RETRY = new Set(["/api/chat/state", "/api/chat/prompt", "/api/plan", "/api/launch",
   "/api/new-session", "/api/app-server", "/api/refresh", "/api/usage/refresh", "/api/hardware/refresh",
-  "/api/push/subscribe", "/api/push/unsubscribe", "/api/session/seen", "/api/session/tidy"]);
+  "/api/push/subscribe", "/api/push/unsubscribe", "/api/session/seen", "/api/session/tidy", "/api/session/remove",
+  "/api/session/opened"]);
 // A terminal's size and scrolling; its keys never (sendInput reads the token instead).
 const CSRF_RETRY_TERMINAL = /^\/api\/terminal\/[a-f0-9]{32}\/(resize|scroll|scroll-end)$/;
 function csrfRetryable(path) {
@@ -920,7 +938,7 @@ function selectedSession() {
 function groupOf(s, now = state.snapshot?.serverTime || Date.now() / 1000) {
   if (s.phase === "needs_input") return "needs_input";
   if (s.phase === "working") return "working";
-  if (sessionTidied(s)) return "rest";
+  if (sessionTidied(s) || sessionRemoved(s)) return "rest";
   if (["idle", "done", "closed"].includes(s.phase) && now - (s.updatedAt || 0) <= FINISHED_SECONDS) return "finished";
   return "rest";
 }
@@ -939,6 +957,8 @@ function matches(s, now, { phase = true, category = true, initiator = true } = {
     }
     if (state.filters[key] && s[key] !== state.filters[key]) return false;
   }
+  // Removed: away unless old records are asked for or it is searched for (then marked 지움).
+  if (sessionHidden(s) && !state.showOld && !state.search) return false;
   if (
     !state.showOld &&
     groupOf(s, now) === "rest" &&
@@ -1535,7 +1555,8 @@ function prepareSessionListFor(session) {
   }
   if (state.phaseFilter && groupOf(session) !== state.phaseFilter) { state.phaseFilter = ""; changed = true; }
   const now = state.snapshot?.serverTime || Date.now() / 1000;
-  if (!state.showOld && groupOf(session) === "rest" && (now - (session.updatedAt || 0) > RECENT_SECONDS || sessionTidied(session))) {
+  if (!state.showOld && groupOf(session) === "rest" &&
+      (now - (session.updatedAt || 0) > RECENT_SECONDS || sessionTidied(session) || sessionHidden(session))) {
     state.showOld = true; $("show-old").checked = true; changed = true;
   }
   if (state.search && !matches(session, now)) {
@@ -1636,6 +1657,15 @@ const TITLE_ORDER = new Intl.Collator("ko", { numeric: true, sensitivity: "base"
 function titleOrder(a, b) {
   return TITLE_ORDER.compare(cardTitle(a), cardTitle(b)) || (String(a.key) < String(b.key) ? -1 : String(a.key) > String(b.key) ? 1 : 0);
 }
+// When a session's conversation was last opened on this board (any device, or this page).
+function openedAt(s) {
+  return Math.max(Number(s.openedAt) || 0, state.openedLocal?.get(s.key) || 0);
+}
+// 이전: the most recently opened first, then the most recently changed (the groups above keep
+// their fixed title order).
+function recentOrder(a, b) {
+  return openedAt(b) - openedAt(a) || (Number(b.updatedAt) || 0) - (Number(a.updatedAt) || 0) || titleOrder(a, b);
+}
 function placeChildren(parent, desired) {
   for (const child of [...parent.children]) if (!desired.includes(child)) parent.removeChild(child);
   for (let index = 0; index < desired.length; index++)
@@ -1659,7 +1689,7 @@ function renderGroups(shown, now) {
   const desired = [];
   const visible = new Set();
   for (const group of GROUPS) {
-    const items = shown.filter((s) => groupOf(s, now) === group.key).sort(titleOrder);
+    const items = shown.filter((s) => groupOf(s, now) === group.key).sort(group.key === "rest" ? recentOrder : titleOrder);
     if (!items.length) continue;
     let section = sections.get(group.key);
     if (!section) {
@@ -1785,6 +1815,8 @@ function card(s) {
   const agent = el("span", "card-agent");
   const project = el("span", "card-project");
   const stale = el("span", "stale-tag", "이전 정보");
+  const removed = el("span", "removed-tag", "지움");
+  removed.title = "목록에서 지운 세션입니다. 검색이나 '오래된 기록 포함'에서만 보입니다.";
   const execution = el("span", "card-execution", "일회성 실행");
   const time = el("span", "card-time");
   const provenance = el("span", "card-provenance");
@@ -1803,11 +1835,11 @@ function card(s) {
   const unread = el("span", "card-unread");
   unread.setAttribute("aria-hidden", "true");
   unread.hidden = true;
-  meta.append(unread, badge, terminal, agent, execution, project, stale, time);
+  meta.append(unread, badge, terminal, agent, execution, project, stale, removed, time);
   const chevron = el("span", "card-chevron");
   chevron.setAttribute("aria-hidden", "true");
   node.append(title, snippet, provenance, goals, meta, chevron);
-  node.cardParts = { title, snippet, badge, terminal, agent, execution, project, stale, time, initiator, host, goals, unread };
+  node.cardParts = { title, snippet, badge, terminal, agent, execution, project, stale, removed, time, initiator, host, goals, unread };
   node.cardRow = row;
   row.append(action, node);
   row.card = node;
@@ -1851,6 +1883,7 @@ function updateCard(node, s, now, folderHint = "") {
   p.goals.hidden = !linkedGoals;
   p.stale.hidden = !s.stale;
   p.stale.title = s.stale ? "기기에 연결되지 않아 마지막으로 확인한 정보입니다." : "";
+  if (p.removed) p.removed.hidden = !sessionHidden(s);
   if (p.unread) { p.unread.hidden = !unread; p.unread.title = unread ? "아직 열어 보지 않은 결과" : ""; }
 }
 // ---------- 읽음 표시 ----------
@@ -1878,6 +1911,16 @@ function seenSource(s) {
     if (s.sessionId) source.sessionId = s.sessionId;
   }
   return source;
+}
+// Opening a conversation is kept by the board (the list orders 이전 by it); once a minute at most.
+const OPENED_SPACING_SECONDS = 60;
+function markOpened(s) {
+  const now = Math.floor(Date.now() / 1000);
+  if (now - openedAt(s) < OPENED_SPACING_SECONDS) return;
+  (state.openedLocal ||= new Map()).set(s.key, now);
+  api("/api/session/opened", { method: "POST", body: { source: seenSource(s) } }).catch(() => {
+    // Not kept: this page still orders by it; another device will not.
+  });
 }
 function markSeen(s) {
   const at = Number(s?.updatedAt) || 0;
@@ -2178,7 +2221,45 @@ function cardActions(s) {
     const copy = terminalCloseCopy(terminal);
     actions.push({ label: copy.action, danger: copy.danger, run: () => closeTerminal(terminal.id) });
   }
+  // 목록에서 지우기 only changes the list; with a board terminal open, it can close that first.
+  const removed = sessionRemoved(s);
+  if (terminal && !removed) {
+    const copy = terminalCloseCopy(terminal);
+    actions.push({ label: `${copy.action} 뒤 목록에서 지우기`, danger: copy.danger, run: () => closeTerminal(terminal.id, { thenRemove: s }) });
+  }
+  actions.push({ label: removed || sessionTidied(s) ? "목록에 다시 표시" : "목록에서 지우기",
+    run: () => (removed || sessionTidied(s) ? showSessionAgain(s) : removeSession(s, true)) });
   return actions;
+}
+// 목록에서 지우기 / 다시 표시: the board's own record (session-removed); the run is untouched.
+async function removeSession(s, removed, { quiet = false } = {}) {
+  const key = s.key;
+  (state.removedLocal ||= new Map()).set(key, removed ? Math.floor(Date.now() / 1000) : null);
+  render();
+  try {
+    await api("/api/session/remove", { method: "POST", body: { source: seenSource(s), removed } });
+    if (!quiet) toast(removed ? "목록에서 지웠습니다. 답이 필요하거나 다시 작업하면 돌아옵니다." : "목록에 다시 표시합니다.");
+    poll(false);
+    return true;
+  } catch (err) {
+    state.removedLocal.delete(key);
+    render();
+    if (!err.staleAuth && !err.unauthorized) toast(err.message || "목록을 바꾸지 못했습니다.");
+    return false;
+  }
+}
+// Both records that keep a session off the list are cleared (a tidy from an end on the board).
+async function showSessionAgain(s) {
+  if (sessionTidied(s)) {
+    try {
+      await api("/api/session/tidy", { method: "POST", body: { source: seenSource(s), tidied: false } });
+    } catch (err) {
+      if (!err.staleAuth && !err.unauthorized) toast(err.message || "목록을 바꾸지 못했습니다.");
+      return;
+    }
+  }
+  if (sessionRemoved(s)) await removeSession(s, false);
+  else { toast("목록에 다시 표시합니다."); poll(false); }
 }
 function openCardMenu(row, at = null) {
   const s = sessionForRow(row);
@@ -2350,10 +2431,10 @@ async function manageSession(s, trigger = null) {
   const archive = button("작업 보관", "secondary", () => archiveSessionWork(context, true));
   archive.id = "session-control-archive";
   actions.append(archive, el("p", "muted", "이 세션의 작업 카드를 보관합니다. 실행은 계속됩니다."));
-  const tidied = sessionTidied(s);
-  const tidy = button(tidied ? "목록에 다시 표시" : "목록에서 정리", "secondary", () => tidySession(context, !tidied));
+  const away = sessionRemoved(s) || sessionTidied(s);
+  const tidy = button(away ? "목록에 다시 표시" : "목록에서 지우기", "secondary", () => tidySession(context, !away));
   tidy.id = "session-control-tidy";
-  actions.append(tidy, el("p", "muted", "실행과 대화 기록은 그대로 두고, 다시 갱신될 때까지 기본 목록에서 내립니다. 검색이나 '오래된 기록 포함'으로 볼 수 있습니다."));
+  actions.append(tidy, el("p", "muted", "실행과 대화 기록은 그대로 두고 목록에서 지웁니다. 답이 필요하거나 다시 작업하면 돌아오고, 검색이나 '오래된 기록 포함'으로 볼 수 있습니다."));
   body.append(actions);
   const confirmation = el("div", "session-control-confirmation"); confirmation.id = "session-control-confirmation"; confirmation.hidden = true;
   body.append(confirmation); dialog.append(top, body);
@@ -2432,19 +2513,26 @@ async function archiveSessionWork(context, archived) {
   } finally { if (sessionControl === context) sessionControlBusy(context, false); }
 }
 
-// 목록에서 정리 / 목록에 다시 표시: the board's own record (session-tidied); the run is untouched.
-async function tidySession(context, tidied) {
+// 목록에서 지우기 / 목록에 다시 표시 (session-removed; showing again clears a tidy from an end
+// on the board too); the run is untouched.
+async function tidySession(context, away) {
   if (sessionControl !== context || context.busy) return;
   sessionControlBusy(context, true);
   try {
-    await api("/api/session/tidy", { method: "POST", body: { source: seenSource(context.s), tidied }, authEpoch: context.authEpoch });
+    const source = seenSource(context.s);
+    if (!away && sessionTidied(context.s))
+      await api("/api/session/tidy", { method: "POST", body: { source, tidied: false }, authEpoch: context.authEpoch });
+    if (away || sessionRemoved(context.s))
+      await api("/api/session/remove", { method: "POST", body: { source, removed: away }, authEpoch: context.authEpoch });
+    (state.removedLocal ||= new Map()).set(context.s.key, away ? Math.floor(Date.now() / 1000) : null);
     if (sessionControl !== context) return;
-    $("session-control-status").textContent = tidied
-      ? "목록에서 정리했습니다. 다시 갱신되면 목록에 돌아옵니다."
+    $("session-control-status").textContent = away
+      ? "목록에서 지웠습니다. 답이 필요하거나 다시 작업하면 돌아옵니다."
       : "목록에 다시 표시합니다.";
     const tidy = $("session-control-tidy");
-    const replacement = button(tidied ? "목록에 다시 표시" : "목록에서 정리", "secondary", () => tidySession(context, !tidied));
+    const replacement = button(away ? "목록에 다시 표시" : "목록에서 지우기", "secondary", () => tidySession(context, !away));
     replacement.id = tidy.id; tidy.replaceWith(replacement);
+    render();
     poll(false);
   } catch (err) {
     if (sessionControl === context && !err.staleAuth && !err.unauthorized) $("session-control-status").textContent = err.message;
@@ -2499,6 +2587,7 @@ function select(key) {
   const bot = target && botRequestForNative(sourceOf(target));
   if (bot) { selectBotRequest(botRequestKey(bot)); return; }
   if (target && sessionUnread(target)) markSeen(target);
+  if (target) markOpened(target);
   state.selectedBotRequest = null;
   const listChanged = target && prepareSessionListFor(target);
   if (listChanged && state.selected === key) renderSessionList(allSessions(), state.snapshot?.serverTime || Date.now() / 1000);
@@ -7790,7 +7879,7 @@ function chooseTerminalMenu(key) {
   sendInput(`${key}\r`).catch(() => {});
 }
 
-function closeTerminal(id) {
+function closeTerminal(id, { thenRemove = null } = {}) {
   if (state.terminalCloseBusy) return;
   if ($("close-terminal-dialog").open) {
     $("close-terminal-cancel").focus();
@@ -7800,7 +7889,7 @@ function closeTerminal(id) {
     (state.terminal?.id === id ? state.terminal : null);
   if (!terminal) return;
   const copy = terminalCloseCopy(terminal);
-  state.closingTerminal = { ...terminal, id, title: terminalTitle(terminal), copy, trigger: document.activeElement };
+  state.closingTerminal = { ...terminal, id, title: terminalTitle(terminal), copy, trigger: document.activeElement, thenRemove };
   $("close-terminal-title").textContent = copy.title;
   $("close-terminal-description").textContent = copy.description;
   $("close-terminal-name").textContent = state.closingTerminal.title;
@@ -7855,6 +7944,9 @@ function finishTerminalClose(closing) {
   state.closingTerminal = null;
   $("close-terminal-dialog").close();
   toast(closing.copy.done);
+  if (closing.thenRemove) removeSession(closing.thenRemove, true, { quiet: true }).then((done) => {
+    if (done) toast(`${closing.copy.done} 목록에서도 지웠습니다.`);
+  });
 }
 async function confirmTerminalClose() {
   if (!state.closingTerminal || state.closingTerminal.uncertain || state.terminalCloseBusy) return;

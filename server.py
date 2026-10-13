@@ -39,7 +39,7 @@ import instance
 import settings
 from goals import GoalError, Goals
 from work_service import WorkService
-from session_labels import SessionLabels, SessionSeen, SessionTidied, reference as label_reference
+from session_labels import SessionLabels, SessionOpened, SessionRemoved, SessionSeen, SessionTidied, reference as label_reference
 
 HERE = Path(__file__).resolve().parent
 WEB = HERE / "web"
@@ -2561,6 +2561,31 @@ class Handler(BaseHTTPRequestHandler):
             self.server.board.changed(force=True)
         return {'tidiedAt': result['seenAt']}
 
+    def session_remove(self, data):
+        """목록에서 지우기 (removed: true) or 목록에 다시 표시 (false); the session itself is untouched."""
+        if not isinstance(data, dict) or set(data) != {'source', 'removed'} or type(data['removed']) is not bool:
+            raise ValueError('지울 세션과 동작을 확인해 주세요.')
+        source = self.listed_source(data['source'])
+        if data['removed']:
+            result, changed = self.server.session_removed.mark(source, int(time.time()))
+        else:
+            changed = self.server.session_removed.unmark(source)
+            result = {'seenAt': None}
+        if changed:
+            self.server.board.changed(force=True)
+        return {'removedAt': result['seenAt']}
+
+    def session_opened(self, data):
+        """A listed session's conversation was opened now: the list orders older sessions by
+        it. Announced with the next change (the opening screen already knows)."""
+        if not isinstance(data, dict) or set(data) != {'source'}:
+            raise ValueError('연 세션을 확인해 주세요.')
+        source = self.listed_source(data['source'])
+        result, changed = self.server.session_opened.mark(source, int(time.time()))
+        if changed:
+            self.server.board.changed(force=True, live=True)
+        return {'openedAt': result['seenAt']}
+
     def tidy_after_close(self, native, ended=True):
         """A session the board just ended (or whose terminal its user closed) leaves 최근 끝남.
         `ended` False is a view closed while its run goes on: a running or waiting session is
@@ -2722,6 +2747,8 @@ class Handler(BaseHTTPRequestHandler):
         snapshot = self.server.session_labels.decorate(self.server.board.snapshot())
         snapshot = self.server.session_seen.decorate(snapshot)
         snapshot = self.server.session_tidied.decorate(snapshot)
+        snapshot = self.server.session_removed.decorate(snapshot)
+        snapshot = self.server.session_opened.decorate(snapshot)
         return {**snapshot, "bootId": self.server.boot_id}
 
     def stream_events(self, query):
@@ -2877,6 +2904,10 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_json(200, self.session_seen(data))
             if path == "/api/session/tidy":
                 return self.send_json(200, self.session_tidy(data))
+            if path == "/api/session/remove":
+                return self.send_json(200, self.session_remove(data))
+            if path == "/api/session/opened":
+                return self.send_json(200, self.session_opened(data))
             if path == "/api/goals":
                 return self.send_json(201, self.server.goals.save(data))
             goal_match = re.fullmatch(r"/api/goals/([a-f0-9]{32})", path)
@@ -3063,6 +3094,8 @@ def make_server(bind, port, board, token, terminals=None, workflow=None, state_d
     server.session_labels = SessionLabels(state_dir)
     server.session_seen = SessionSeen(state_dir)
     server.session_tidied = SessionTidied(state_dir)
+    server.session_removed = SessionRemoved(state_dir)
+    server.session_opened = SessionOpened(state_dir)
     server.cookie_name = COOKIE + "_" + str(server.server_address[1])
     server.once, server.once_lock = ("", 0), threading.Lock()
     server.sessions, server.auth_lock = {}, threading.Lock()

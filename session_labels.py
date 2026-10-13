@@ -254,3 +254,18 @@ class SessionTidied(SessionSeen):
     writes a short grace). Display only: the native session and its history stay as they are."""
     NAME, ROW_FIELD, SNAPSHOT_FIELD, CODE = 'session-tidied', 'tidiedAt', 'sessionTidied', 'session_tidied'
     WHAT = '목록 정리 기록'
+
+
+class SessionRemoved(SessionSeen):
+    """When a session was removed from the list (목록에서 지우기). Unlike a tidy it stays away
+    after it changes again; only answering or working brings it back (the screen decides).
+    Display only: the native session and its history stay as they are."""
+    NAME, ROW_FIELD, SNAPSHOT_FIELD, CODE = 'session-removed', 'removedAt', 'sessionRemoved', 'session_removed'
+    WHAT = '목록에서 지운 기록'
+
+
+class SessionOpened(SessionSeen):
+    """When a session's conversation was last opened on this board (any device): the list
+    orders its older sessions by it."""
+    NAME, ROW_FIELD, SNAPSHOT_FIELD, CODE = 'session-opened', 'openedAt', 'sessionOpened', 'session_opened'
+    WHAT = '대화를 연 기록'

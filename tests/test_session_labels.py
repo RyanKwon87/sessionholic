@@ -304,6 +304,31 @@ class SessionLabelsHTTPTest(unittest.TestCase):
             self.assertEqual(self.request('POST', '/api/session/tidy', payload)[0].status, 400)
         self.assertEqual(self.request('POST', '/api/session/tidy', {'source': self.source, 'tidied': True}, csrf=False)[0].status, 403)
 
+    def test_a_listed_session_is_removed_from_the_list_and_shown_again(self):
+        response, result = self.request('POST', '/api/session/remove', {'source': self.source, 'removed': True})
+        self.assertEqual(response.status, 200)
+        self.assertEqual(type(result['removedAt']), int)
+        row = self.request('GET', '/api/snapshot')[1]['hosts'][0]['data']['codex'][0]
+        self.assertEqual(row['removedAt'], result['removedAt'])
+        # A later change does not undo it (unlike a tidy): the screen keeps it away.
+        self.native['updatedAt'] = result['removedAt'] + 9999
+        self.assertEqual(self.request('GET', '/api/snapshot')[1]['hosts'][0]['data']['codex'][0]['removedAt'], result['removedAt'])
+        self.assertEqual(self.request('POST', '/api/session/remove', {'source': self.source, 'removed': False})[1], {'removedAt': None})
+        self.assertIsNone(self.request('GET', '/api/snapshot')[1]['hosts'][0]['data']['codex'][0]['removedAt'])
+        for payload in ({'source': self.source}, {'source': self.source, 'removed': 1},
+                        {'source': {**self.source, 'id': str(uuid.uuid4())}, 'removed': True}):
+            self.assertEqual(self.request('POST', '/api/session/remove', payload)[0].status, 400)
+        self.assertEqual(self.request('POST', '/api/session/remove', {'source': self.source, 'removed': True}, csrf=False)[0].status, 403)
+
+    def test_opening_a_listed_session_is_kept_with_its_time(self):
+        response, result = self.request('POST', '/api/session/opened', {'source': self.source})
+        self.assertEqual(response.status, 200)
+        self.assertEqual(type(result['openedAt']), int)
+        self.assertEqual(self.request('GET', '/api/snapshot')[1]['hosts'][0]['data']['codex'][0]['openedAt'], result['openedAt'])
+        for payload in ({'source': self.source, 'at': 1}, {'source': {**self.source, 'id': str(uuid.uuid4())}}):
+            self.assertEqual(self.request('POST', '/api/session/opened', payload)[0].status, 400)
+        self.assertEqual(self.request('POST', '/api/session/opened', {'source': self.source}, csrf=False)[0].status, 403)
+
     def test_a_terminal_its_user_closes_puts_its_session_away(self):
         closed = []
         linked = {'id': 'a' * 32, 'mode': 'new-session', 'alive': True, 'closed': False, 'linkConfidence': 'estimated',

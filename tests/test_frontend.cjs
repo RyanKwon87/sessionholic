@@ -128,7 +128,7 @@ function client(
   vm.runInContext(messageSource, context);
   vm.runInContext(source, context);
   const api = vm.runInContext(
-    "({state,api,sourceOf,accountOf,sendInput,pasteDraft,prepareDraftPaste,startDraftComposition,endDraftComposition,inputDraft,stopTerminalReader,startTerminalReader,closePlan,navigateView,backToList,backFromTerminal,closeTerminal,cancelTerminalClose,confirmTerminalClose,populateAccount,populateRoute,updateContinue,renderPlan,launchPlan,openTerminal,saveDraft,draftKey,refreshTerminals,renderTerminals,renderTerminalReturn,renderFilters,terminalCloseCopy,warnDraftUnload,preparePlan,renderGroups,renderMessages,loadDetail,chatKey,chatEntry,currentChat,chatSupported,chatRecovery,recoverChatSession,openChatTerminal,chatAttachmentsSupported,buildChatComposer,sendChat,loadChatState,applyChatReceipt,uploadChatFiles,pasteChat,scheduleChatPoll,stopChatPolling,openNativeChat,allSessions,buildContinuePanel,chatReceiptCopy,returnToBoard,readChatClipboard,accountDisplay,sessionAccountLabel,closeChatToolsOutside,closeChatToolsEscape,drawDetail,refreshDetail,loadCapabilities,matches,recoverConnection,networkOffline,poll,select,focusDetailBack,restoreSelectedCardFocus,showLogin,lock,beginAuthEpoch,resizeChatInput,updateViewport,draftKeydown,configureTerminalKeyboard,queueTerminalScroll,flushTerminalScroll,terminalScrollEnd,resetTerminalScroll,renderAttention,chatPollDelay,pullRefresh,readingScroll,renderJump,pullDistance,listScroll,setReading,renderPrompt,promptAction,renderUsage,loadUsage,applyTheme,setTheme,updateThemeColor,haptic,navTransition,setDetailShown,chatVisible,sheetRelease,BottomSheet,sheet,openSettings,closeSettings,setTyping,pinchFontSize,setTerminalFontSize,loadXterm,assetUrl,syncEvents,closeEvents,eventsHealthy,renderFreshness,schedule,touchDevice,togglePhaseFilter,renderCounts,createLongPress,swipeIntent,swipeRelease,groupMessageRows,setTextSize,applyTextSize,renderConnectivity,terminalForSession,swipeActionFor,openMessageMenu,openCardMenu,messageActions,outboxShape,outboxMatches,outboxOrigin,settleOutbox,retryOutbox,renderAttachmentTiles,attachmentThumb,sendUpload,openActionSheet,closeActionSheet,setListCollapsed,closeSwipe,settleSwipe,prepareSwipe,runSwipeAction,GESTURE,setChromeVisible,toggleChrome,revealChrome,isChromeTap,snapshotAnnounced,updateChatComposer,capabilitiesRevision,toolKindOf,userMessageParts,formatElapsed,tickWorking,renderTerminalMarks,renderDetailTerminal,terminalsAnnounced,goToSessionTerminal,rememberTerminal,terminalMenu,updateTerminalMenu,chooseTerminalMenu,clearTerminalMenu,renderNewSession,openNewSession,startNewSession,startAppServer,rememberConversationView,restoreConversationView,conversationIdentity,initiatorOf,initiatorLabel,documentKeydown,sessionCategoryOf,setSessionCategory,renderSessionCategories,prepareSessionListFor,sessionCategoryKeydown,render,resetFilters,terminalTitle,renameTerminals,requestedSessionFrom,requestSessionOpen,openRequestedSession,answerOnOpen,hardReload,terminalKeyBytes,terminalKeyFromEvent,pressTerminalKey,toggleTerminalMod,clearTerminalMods,renderTerminalMods,draftBeforeInput,terminalDocumentKey,xtermKeyEvent,renderHardware,loadHardware,startDictation,stopDictation,dictationText,toggleDraftDictation,renderDictation,DICTATION_LISTENING,DICTATION_ERRORS,DICTATION_PREPARING,DICTATION_STALLED,DICTATION_ENDED_AT_ONCE,DICTATION_INTERRUPTED,DICTATION_NOT_STARTED,DICTATION_SILENCE_END,DICTATION_CHANGED,DICTATION_ENDING,bindDraftInput,insertChatText,reloadForUpdate,checkWebVersion,unsavedWork,detailMetaChildren,updateBannerPressed,manualRefresh,listNavigationKeydown,sessionUnread,markSeen,quickReplies,saveQuickReplies,openQuickReplies,terminalEndedCopy,terminalContextCopy,sessionForTerminal,showTerminalEnded,reopenEndedTerminal,csrfRetryable,tidySession})",
+    "({state,api,sourceOf,accountOf,sendInput,pasteDraft,prepareDraftPaste,startDraftComposition,endDraftComposition,inputDraft,stopTerminalReader,startTerminalReader,closePlan,navigateView,backToList,backFromTerminal,closeTerminal,cancelTerminalClose,confirmTerminalClose,populateAccount,populateRoute,updateContinue,renderPlan,launchPlan,openTerminal,saveDraft,draftKey,refreshTerminals,renderTerminals,renderTerminalReturn,renderFilters,terminalCloseCopy,warnDraftUnload,preparePlan,renderGroups,renderMessages,loadDetail,chatKey,chatEntry,currentChat,chatSupported,chatRecovery,recoverChatSession,openChatTerminal,chatAttachmentsSupported,buildChatComposer,sendChat,loadChatState,applyChatReceipt,uploadChatFiles,pasteChat,scheduleChatPoll,stopChatPolling,openNativeChat,allSessions,buildContinuePanel,chatReceiptCopy,returnToBoard,readChatClipboard,accountDisplay,sessionAccountLabel,closeChatToolsOutside,closeChatToolsEscape,drawDetail,refreshDetail,loadCapabilities,matches,recoverConnection,networkOffline,poll,select,focusDetailBack,restoreSelectedCardFocus,showLogin,lock,beginAuthEpoch,resizeChatInput,updateViewport,draftKeydown,configureTerminalKeyboard,queueTerminalScroll,flushTerminalScroll,terminalScrollEnd,resetTerminalScroll,renderAttention,chatPollDelay,pullRefresh,readingScroll,renderJump,pullDistance,listScroll,setReading,renderPrompt,promptAction,renderUsage,loadUsage,applyTheme,setTheme,updateThemeColor,haptic,navTransition,setDetailShown,chatVisible,sheetRelease,BottomSheet,sheet,openSettings,closeSettings,setTyping,pinchFontSize,setTerminalFontSize,loadXterm,assetUrl,syncEvents,closeEvents,eventsHealthy,renderFreshness,schedule,touchDevice,togglePhaseFilter,renderCounts,createLongPress,swipeIntent,swipeRelease,groupMessageRows,setTextSize,applyTextSize,renderConnectivity,terminalForSession,swipeActionFor,openMessageMenu,openCardMenu,messageActions,outboxShape,outboxMatches,outboxOrigin,settleOutbox,retryOutbox,renderAttachmentTiles,attachmentThumb,sendUpload,openActionSheet,closeActionSheet,setListCollapsed,closeSwipe,settleSwipe,prepareSwipe,runSwipeAction,GESTURE,setChromeVisible,toggleChrome,revealChrome,isChromeTap,snapshotAnnounced,updateChatComposer,capabilitiesRevision,toolKindOf,userMessageParts,formatElapsed,tickWorking,renderTerminalMarks,renderDetailTerminal,terminalsAnnounced,goToSessionTerminal,rememberTerminal,terminalMenu,updateTerminalMenu,chooseTerminalMenu,clearTerminalMenu,renderNewSession,openNewSession,startNewSession,startAppServer,rememberConversationView,restoreConversationView,conversationIdentity,initiatorOf,initiatorLabel,documentKeydown,sessionCategoryOf,setSessionCategory,renderSessionCategories,prepareSessionListFor,sessionCategoryKeydown,render,resetFilters,terminalTitle,renameTerminals,requestedSessionFrom,requestSessionOpen,openRequestedSession,answerOnOpen,hardReload,terminalKeyBytes,terminalKeyFromEvent,pressTerminalKey,toggleTerminalMod,clearTerminalMods,renderTerminalMods,draftBeforeInput,terminalDocumentKey,xtermKeyEvent,renderHardware,loadHardware,startDictation,stopDictation,dictationText,toggleDraftDictation,renderDictation,DICTATION_LISTENING,DICTATION_ERRORS,DICTATION_PREPARING,DICTATION_STALLED,DICTATION_ENDED_AT_ONCE,DICTATION_INTERRUPTED,DICTATION_NOT_STARTED,DICTATION_SILENCE_END,DICTATION_CHANGED,DICTATION_ENDING,bindDraftInput,insertChatText,reloadForUpdate,checkWebVersion,unsavedWork,detailMetaChildren,updateBannerPressed,manualRefresh,listNavigationKeydown,sessionUnread,markSeen,quickReplies,saveQuickReplies,openQuickReplies,terminalEndedCopy,terminalContextCopy,sessionForTerminal,showTerminalEnded,reopenEndedTerminal,csrfRetryable,tidySession,sessionRemoved,removeSession,showSessionAgain,markOpened,groupOf})",
     context,
   );
   api.state.csrf = "csrf-test";
@@ -3291,7 +3291,7 @@ test('recent cards give project and full task separate priority while retaining 
   assert.equal(byClass(card, 'card-title')[0].textContent, title.trim());
   assert.equal(byClass(card, 'card-snippet')[0].hidden, true);
   const meta = byClass(card, 'card-meta')[0];
-  assert.deepEqual(meta.children.map((child) => child.className.split(' ')[0]), ['card-unread', 'badge', 'terminal-mark', 'card-agent', 'card-execution', 'card-project', 'stale-tag', 'card-time']);
+  assert.deepEqual(meta.children.map((child) => child.className.split(' ')[0]), ['card-unread', 'badge', 'terminal-mark', 'card-agent', 'card-execution', 'card-project', 'stale-tag', 'removed-tag', 'card-time']);
   assert.equal(byClass(card, 'card-unread')[0].hidden, true, 'no read marks kept yet: nothing is unread');
   assert.equal(byClass(card, 'card-execution')[0].hidden, true, '일반 대화에는 일회성 실행 표식을 표시하지 않는다');
   assert.equal(byClass(card, 'card-terminal')[0].hidden, true, '"터미널 열림" only with a live board terminal');
@@ -3371,7 +3371,10 @@ test('recent card updates retain mounted buttons, selection, keyboard focus and 
 
 test('card activation keeps exact home identity and one initial read, while removed and prior-authentication buttons cannot activate later sessions', async () => {
   const requests = [];
-  const c = client(async (url, options) => { requests.push({ url, body: JSON.parse(options.body) });
+  const c = client(async (url, options) => {
+    // Opening a conversation is also kept (/api/session/opened); only reads are counted here.
+    if (url === '/api/session/opened') return { ok: true, status: 200, json: async () => ({ openedAt: 1 }) };
+    requests.push({ url, body: JSON.parse(options.body) });
     return { ok: true, status: 200, json: async () => queueStateReply(JSON.parse(options.body).source, [], [], { total: 0 }) };
   }, noChatTimers);
   const first = recentSession('same-session', { home: '.codex-first', project: 'Same project', title: 'Same title' });
@@ -5974,7 +5977,8 @@ test('a swipe offers 터미널 열기, or 연결 닫기 when the session has a b
   assert.equal(c.get('close-terminal-confirm').textContent, '실행 종료');
   c.cancelTerminalClose();
   c.openCardMenu(row);
-  assert.deepEqual(c.get('action-list').children.map((item) => item.textContent), ['대화 열기', '세션 관리', '터미널로 돌아가기', '실행 종료']);
+  assert.deepEqual(c.get('action-list').children.map((item) => item.textContent),
+    ['대화 열기', '세션 관리', '터미널로 돌아가기', '실행 종료', '실행 종료 뒤 목록에서 지우기', '목록에서 지우기']);
   // A vertical drag is a scroll: no swipe, no menu.
   groups.events.pointerdown({ target, pointerId: 4, pointerType: 'touch', clientX: 300, clientY: 100 });
   groups.events.pointermove({ target, pointerId: 4, clientX: 296, clientY: 130, cancelable: true, preventDefault() {} });
@@ -7573,11 +7577,11 @@ test('a session put away from the list leaves 최근 끝남 until it changes aga
   assert.ok(c.allSessions().filter((s) => c.matches(s, now)).some((s) => s.id === 'ended-here'));
 });
 
-test('목록에서 정리 asks the board to keep the session away and offers 목록에 다시 표시', async () => {
+test('목록에서 지우기 in 세션 관리 asks the board to keep the session away and offers 목록에 다시 표시', async () => {
   const requests = [];
   const c = client(async (url, options) => {
     requests.push([url, options?.body && JSON.parse(options.body)]);
-    return { ok: true, status: 200, json: async () => (url === '/api/session/tidy' ? { tidiedAt: 1 } : { hosts: [] }) };
+    return { ok: true, status: 200, json: async () => (url === '/api/session/remove' ? { removedAt: 1 } : { hosts: [] }) };
   }, noChatTimers);
   const { s } = selectChat(c);
   const context = { source: c.sourceOf(s), s, authEpoch: c.state.authEpoch, busy: false };
@@ -7585,10 +7589,98 @@ test('목록에서 정리 asks the board to keep the session away and offers 목
   const tidy = c.get('session-control-tidy');
   tidy.replaceWith = (node) => { c.context.__replaced = node; };
   await c.tidySession(context, true);
-  const sent = requests.find(([url]) => url === '/api/session/tidy');
-  assert.deepEqual(sent[1], JSON.parse(JSON.stringify({ source: vm.runInContext('seenSource', c.context)(s), tidied: true })));
-  assert.match(c.get('session-control-status').textContent, /목록에서 정리했습니다/);
+  const sent = requests.find(([url]) => url === '/api/session/remove');
+  assert.deepEqual(sent[1], JSON.parse(JSON.stringify({ source: vm.runInContext('seenSource', c.context)(s), removed: true })));
+  assert.match(c.get('session-control-status').textContent, /목록에서 지웠습니다/);
   assert.equal(c.context.__replaced.textContent, '목록에 다시 표시');
+  assert.equal(c.sessionRemoved(s), true, 'counted at once, before the board reads back');
+});
+
+test('a removed session leaves the list for good, but comes back to answer or work; search and old records show it marked', async () => {
+  const requests = [];
+  const c = client(async (url, options) => {
+    requests.push([url, options?.body && JSON.parse(options.body)]);
+    return { ok: true, status: 200, json: async () => ({ removedAt: url === '/api/session/remove' ? 1 : null, hosts: [] }) };
+  }, noChatTimers);
+  const now = 2_000_000;
+  const gone = recentSession('gone', { phase: 'done', updatedAt: now - 60, removedAt: now - 30, title: '지운 작업' });
+  const kept = recentSession('kept', { phase: 'done', updatedAt: now - 60, title: '남긴 작업' });
+  c.state.snapshot = { serverTime: now, hosts: [{ name: 'workstation', label: 'Workstation', ok: true, data: { codex: [gone, kept], claude: [] } }] };
+  c.state.authenticated = true;
+  const shown = () => [...c.allSessions().filter((s) => c.matches(s, now))].map((s) => s.id);
+  assert.deepEqual(shown(), ['kept']);
+  // A change after it (unlike a tidy) does not bring it back.
+  gone.updatedAt = now; assert.deepEqual(shown(), ['kept']);
+  // Searched for, or with old records, it is shown and marked.
+  c.state.search = '지운'; assert.deepEqual(shown(), ['gone']); c.state.search = '';
+  c.state.showOld = true; assert.ok(shown().includes('gone'));
+  c.renderGroups(c.allSessions().filter((s) => c.matches(s, now)), now);
+  const card = byClass(c.get('groups'), 'card').find((node) => node.dataset.sessionKey.endsWith('gone'));
+  assert.equal(byClass(card, 'removed-tag')[0].hidden, false);
+  c.state.showOld = false;
+  // Waiting for an answer again: back on the list (and in 답 필요).
+  gone.phase = 'needs_input'; assert.deepEqual(shown().sort(), ['gone', 'kept']);
+  assert.equal(c.groupOf(c.allSessions().find((s) => s.id === 'gone'), now), 'needs_input');
+  // From the card menu: removed at once, then the board is asked; 다시 표시 asks again.
+  gone.phase = 'done';
+  const keptSession = c.allSessions().find((s) => s.id === 'kept');
+  await c.removeSession(keptSession, true);
+  assert.deepEqual(shown(), []);
+  assert.equal(requests.filter(([url]) => url === '/api/session/remove').at(-1)[1].removed, true);
+  await c.showSessionAgain(c.allSessions().find((s) => s.id === 'gone'));
+  assert.equal(requests.filter(([url]) => url === '/api/session/remove').at(-1)[1].removed, false);
+});
+
+test('닫고 지우기 removes the session from the list only after its board terminal closed', async () => {
+  const requests = [];
+  let closeFails = true;
+  const c = client(async (url, options) => {
+    requests.push([url, options?.body && JSON.parse(options.body)]);
+    if (url.endsWith('/close') && closeFails) return { ok: false, status: 409, json: async () => ({ error: 'fixture: busy' }) };
+    return { ok: true, status: 200, json: async () => ({ ok: true, removedAt: 1, hosts: [] }) };
+  }, noChatTimers);
+  const s = recentSession('close-me');
+  setRecentSnapshot(c, [s]);
+  const open = () => { c.state.terminals = [{ id: 'a'.repeat(32), alive: true, mode: 'attach',
+    metadata: { nativeSource: { host: s.host, agent: s.agent, home: s.home, id: s.id }, mode: 'attach' } }]; };
+  open();
+  const terminal = c.terminalForSession(s);
+  c.closeTerminal(terminal.id, { thenRemove: s });
+  await c.confirmTerminalClose();
+  assert.equal(requests.filter(([url]) => url === '/api/session/remove').length, 0, 'a close that failed removes nothing');
+  closeFails = false;
+  c.cancelTerminalClose();
+  open();
+  c.closeTerminal(terminal.id, { thenRemove: s });
+  await c.confirmTerminalClose();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(requests.filter(([url]) => url === '/api/session/remove').map(([, body]) => body.removed), [true]);
+});
+
+test('이전 lists the most recently opened first (on any device), then the most recently changed; opening is kept once a minute', async () => {
+  const requests = [];
+  const c = client(async (url, options) => {
+    requests.push([url, options?.body && JSON.parse(options.body)]);
+    return { ok: true, status: 200, json: async () => ({ openedAt: 1, hosts: [] }) };
+  }, noChatTimers);
+  const now = 2_000_000;
+  const old = (id, extra) => recentSession(id, { phase: 'idle', updatedAt: now - 5 * 3600, ...extra });
+  const sessions = [old('a-never', { updatedAt: now - 4 * 3600 }), old('b-seen-long-ago', { openedAt: now - 9000 }),
+    old('c-seen-recently', { openedAt: now - 100 }), old('d-never', { updatedAt: now - 6 * 3600 })];
+  c.state.snapshot = { serverTime: now, hosts: [{ name: 'workstation', label: 'Workstation', ok: true, data: { codex: sessions, claude: [] } }] };
+  c.state.authenticated = true;
+  const order = () => {
+    c.renderGroups(c.allSessions().filter((s) => c.matches(s, now)), now);
+    const section = c.get('groups').children.find((node) => node.dataset?.groupKey === 'rest');
+    return section.children.filter((node) => node.dataset?.sessionKey).map((node) => node.dataset.sessionKey.split('|').pop());
+  };
+  assert.deepEqual(order(), ['c-seen-recently', 'b-seen-long-ago', 'a-never', 'd-never']);
+  // Opened here: first at once, and the board is told once (not again within a minute).
+  c.context.Date = { now: () => now * 1000 };
+  const d = c.allSessions().find((s) => s.id === 'd-never');
+  c.markOpened(d); c.markOpened(d);
+  assert.deepEqual(order(), ['d-never', 'c-seen-recently', 'b-seen-long-ago', 'a-never']);
+  assert.equal(requests.filter(([url]) => url === '/api/session/opened').length, 1);
 });
 
 test('the session list groups what needs an answer, what runs, what stopped in the last three hours and the rest', () => {
@@ -7610,8 +7702,9 @@ test('the session list groups what needs an answer, what runs, what stopped in t
   const sections = c.get('groups').children.filter((node) => node.dataset?.groupKey);
   assert.deepEqual(sections.map((section) => section.cardHeading.textContent), ['답 필요', '작업 중', '최근 끝남', '이전']);
   const ids = (section) => section.children.filter((node) => node.dataset?.sessionKey).map((node) => node.dataset.sessionKey.split('|').pop());
-  // One title throughout: within a group the session key decides, never the update time.
-  assert.deepEqual(sections.map(ids), [['old-question'], ['running'], ['just-done', 'just-idle'], ['earlier', 'unknown']]);
+  // One title throughout: within a group the session key decides, never the update time; 이전
+  // goes by when it was last opened, then last changed (recentOrder).
+  assert.deepEqual(sections.map(ids), [['old-question'], ['running'], ['just-done', 'just-idle'], ['unknown', 'earlier']]);
   assert.equal(sections[2].cardHeading.className, 'group-head green');
   assert.ok(!shown.some((s) => s.id === 'ancient'), 'only the 이전 group drops sessions older than three days');
 });

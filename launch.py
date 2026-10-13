@@ -289,13 +289,34 @@ def start_app_server(key, home=None):
     return {"started": ensure_app_server({"argv": [binary], "env": env}, profile, home)}
 
 
-def new_session(home=None):
+# 새 세션 presets: a model and an effort for whichever agent the launcher then starts, handed
+# to it as one JSON variable (PRESET_ENV); the launcher checks them again and ignores what it
+# does not know. Permissions are not part of a preset (the launcher keeps its own).
+PRESET_ENV = "SESSIONHOLIC_LAUNCH_PRESET"
+LAUNCH_PRESETS = {
+    "fast": {"label": "빠르게", "preset": {"claude": {"model": "sonnet", "effort": "medium"}, "codex": {"effort": "low"}}},
+    "max": {"label": "최대", "preset": {"claude": {"model": "opus", "effort": "max"}, "codex": {"effort": "xhigh"}}},
+}
+
+
+def launch_preset(preset):
+    """A known preset id, or None for the host's own settings."""
+    if preset in (None, ""):
+        return None
+    if not isinstance(preset, str) or preset not in LAUNCH_PRESETS:
+        raise ValueError("새 세션 실행 설정이 올바르지 않습니다.")
+    return preset
+
+
+def new_session(home=None, preset=None):
     """This host's launcher (`launcher` in the host settings) as a terminal launch.
 
     The board only opens it in a terminal; the launcher chooses the project, agent and
     account and owns their checks. Its variables are the usual terminal ones (plus the
-    user's SSH agent socket, as in their own terminal), never board or credential overrides.
+    user's SSH agent socket, as in their own terminal), never board or credential overrides;
+    a chosen preset adds PRESET_ENV only.
     """
+    preset = launch_preset(preset)
     home = _home(home)
     launcher = settings.load(home).get("launcher")
     if not launcher:
@@ -313,6 +334,8 @@ def new_session(home=None):
     env.setdefault("PATH", "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin")
     env.setdefault("TERM", "xterm-256color")
     env.setdefault("LANG", "en_US.UTF-8")
+    if preset:
+        env[PRESET_ENV] = json.dumps(LAUNCH_PRESETS[preset]["preset"], separators=(",", ":"))
     return {"argv": list(launcher["command"]), "cwd": str(cwd), "env": env, "label": launcher["label"]}
 
 

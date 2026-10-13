@@ -7829,6 +7829,44 @@ async function startAppServer(s, trigger) {
 
 // "새 세션": a host's own launcher (settings `launcher`), opened in a board
 // terminal. The launcher, not the board, chooses the project, agent and account.
+// 새 세션 presets (launch.LAUNCH_PRESETS on the board): whatever the launcher then starts runs
+// with this model and effort; 기본 keeps the device's own settings. A PC's launcher choices
+// are its own commands, so a preset never reaches them. Remembered in this browser.
+const NEW_SESSION_PRESETS = [
+  { id: "", label: "기본", note: "기기에 설정된 모델과 수준 그대로 시작합니다." },
+  { id: "fast", label: "빠르게", note: "Claude는 Sonnet·보통, Codex는 낮은 추론으로 시작합니다." },
+  { id: "max", label: "최대", note: "Claude는 Opus·최대, Codex는 가장 높은 추론으로 시작합니다." },
+];
+function newSessionPresetKey() {
+  return INSTANCE.storagePrefix + "newSessionPreset";
+}
+function newSessionPreset() {
+  let id = "";
+  try { id = localStorage.getItem(newSessionPresetKey()) || ""; } catch { /* storage blocked: 기본 */ }
+  return NEW_SESSION_PRESETS.some((preset) => preset.id === id) ? id : "";
+}
+function renderNewSessionPresets() {
+  const box = $("new-session-presets");
+  if (!box) return;
+  const current = newSessionPreset();
+  box.replaceChildren(...NEW_SESSION_PRESETS.map((preset) => {
+    const option = el("label", "theme-option");
+    const input = el("input");
+    input.type = "radio"; input.name = "new-session-preset"; input.value = preset.id;
+    input.checked = preset.id === current;
+    input.disabled = !!state.newSessionBusy;
+    input.addEventListener("change", () => {
+      try { localStorage.setItem(newSessionPresetKey(), preset.id); } catch { /* this page only */ }
+      // Another preset is another launch: a retry id from before does not carry over.
+      state.newSessionRequests = new Map();
+      renderNewSessionPresets(); renderNewSessionHosts();
+    });
+    option.append(input, el("span", null, preset.label));
+    return option;
+  }));
+  $("new-session-preset-note").textContent = NEW_SESSION_PRESETS.find((preset) => preset.id === current).note
+    + (current && newSessionHosts().some((host) => host.platform === "windows") ? " PC는 기기 설정 그대로 엽니다." : "");
+}
 function newSessionHosts() {
   return (state.capabilities?.hosts || []).filter((host) => host.newSession);
 }
@@ -7842,7 +7880,8 @@ function newSessionHostMeta(host) {
   const status = host.newSession;
   if (host.online === false) return "기기에 연결할 수 없습니다.";
   if (!status.available) return status.reason || "이 기기에서는 열 수 없습니다.";
-  return `${status.label || "새 세션"} 실행`;
+  const preset = host.platform === "windows" ? null : NEW_SESSION_PRESETS.find((item) => item.id && item.id === newSessionPreset());
+  return `${status.label || "새 세션"} 실행` + (preset ? ` · ${preset.label}` : "");
 }
 function renderNewSessionHosts() {
   const list = $("new-session-hosts");
@@ -7881,6 +7920,7 @@ function openNewSession() {
   state.newSessionRequests = new Map();
   $("new-session-error").textContent = "";
   $("new-session-error").hidden = true;
+  renderNewSessionPresets();
   renderNewSessionHosts();
   sheet("new-session-dialog").open();
 }
@@ -7896,9 +7936,10 @@ async function startNewSession(hostName) {
   $("new-session-error").hidden = true;
   renderNewSessionHosts();
   try {
+    const preset = newSessionPreset();
     const result = await api("/api/new-session", {
       method: "POST",
-      body: { host: hostName, requestId: state.newSessionRequests.get(hostName) }, authEpoch,
+      body: { host: hostName, requestId: state.newSessionRequests.get(hostName), ...(preset ? { preset } : {}) }, authEpoch,
     });
     assertAuthEpoch(authEpoch);
     if (!result.terminal?.id) throw new Error("터미널 연결 정보를 받지 못했습니다.");

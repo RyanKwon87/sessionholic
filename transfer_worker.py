@@ -706,11 +706,12 @@ def hold_kill(name):
     return {'killed': done.returncode == 0}
 
 
-def new_session_main():
-    """The terminal step of "새 세션": run this host's own launcher, with its own settings."""
+def new_session_main(preset=None):
+    """The terminal step of "새 세션": run this host's own launcher, with its own settings (and
+    the chosen preset, see launch.LAUNCH_PRESETS)."""
     from launch import new_session
     try:
-        spec = new_session()
+        spec = new_session(preset=preset)
         os.chdir(spec['cwd'])
         _execve(spec['argv'], spec['env'])
     except (ValueError, OSError) as exc:
@@ -732,6 +733,8 @@ def _main():
         return handoff_main(sys.argv[2:])
     if len(sys.argv) == 2 and sys.argv[1] == 'new-session':
         return new_session_main()
+    if len(sys.argv) == 4 and sys.argv[1] == 'new-session' and sys.argv[2] == '--preset':
+        return new_session_main(sys.argv[3])
     if len(sys.argv) == 3 and sys.argv[1] == 'attach':
         try:
             attach(json.loads(sys.argv[2]))

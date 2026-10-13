@@ -745,14 +745,25 @@ class SshReuseTest(unittest.TestCase):
         self.addCleanup(shutil.rmtree,self.base,True)
     def options(self,command):
         return [command[index+1] for index,value in enumerate(command[:-2]) if value=='-o']
-    def test_private_control_socket_is_shared_by_rpc_and_terminal_commands(self):
+    def test_private_control_socket_is_shared_by_rpc_but_not_by_terminals(self):
         flow=Transfers(HOSTS,self.base)
-        for tty in (False,True):
-            command=flow.command(HOSTS[1],['-I','/fixture/worker.pyz','exec','f'*32],tty=tty)
+        command=flow.command(HOSTS[1],['-I','/fixture/worker.pyz','status','f'*32])
+        options=self.options(command)
+        self.assertIn('ControlMaster=auto',options);self.assertIn('ControlPersist=60',options)
+        self.assertIn('ControlPath='+str(self.base/'ssh'/'cm-%C'),options)
+        self.assertLess(command.index('ControlPath='+str(self.base/'ssh'/'cm-%C')),command.index('--'))
+        # A terminal keeps its own connection, so one dropped connection never ends the others,
+        # and it outlasts a short sleep of the host (15 s x 8) instead of collection's 15 s.
+        terminals=[flow.command(HOSTS[1],['-I','/fixture/worker.pyz','exec','f'*32],tty=True),
+                   flow._windows_ssh({**HOSTS[1],'platform':'windows'},'Write-Output fixture')]
+        for command in terminals:
             options=self.options(command)
-            self.assertIn('ControlMaster=auto',options);self.assertIn('ControlPersist=60',options)
-            self.assertIn('ControlPath='+str(self.base/'ssh'/'cm-%C'),options)
-            self.assertLess(command.index('ControlPath='+str(self.base/'ssh'/'cm-%C')),command.index('--'))
+            self.assertEqual(command[1],'-tt')
+            self.assertIn('ControlMaster=no',options);self.assertIn('ControlPath=none',options)
+            self.assertNotIn('ControlMaster=auto',options)
+            self.assertIn('ServerAliveInterval=15',options);self.assertIn('ServerAliveCountMax=8',options)
+            self.assertIn('BatchMode=yes',options)
+            self.assertLess(command.index('-o'),command.index('--'))
         self.assertEqual((self.base/'ssh').stat().st_mode&0o777,0o700)
         (self.base/'ssh').chmod(0o755)
         flow.command(HOSTS[1],['x'])

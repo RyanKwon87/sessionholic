@@ -3554,6 +3554,12 @@ function startDictation(field, { report, active, releaseKeyboard = false }) {
   const Recognition = speechRecognitionClass();
   if (!Recognition || !field || field.disabled || field.readOnly) return false;
   stopDictation({ abort: true });
+  // Android keyboards (Samsung's among them) rewrite or commit again a focused field's text
+  // they did not type, which reads as the user's own typing and ends the listening. There the
+  // chat input's keyboard lets go while it listens; elsewhere it stays open. (The terminal's
+  // input line keeps its focus: without it, keys would go straight to the CLI.) It lets go
+  // before the field is read: letting go may write the words it held once more.
+  if (releaseKeyboard && touchDevice() && dictationCumulative() && document.activeElement === field) field.blur?.();
   let recognition;
   try {
     recognition = new Recognition();
@@ -3569,10 +3575,21 @@ function startDictation(field, { report, active, releaseKeyboard = false }) {
   const start = Number.isInteger(field.selectionStart) ? Math.min(field.selectionStart, value.length) : value.length;
   const end = Number.isInteger(field.selectionEnd) ? Math.min(Math.max(start, field.selectionEnd), value.length) : start;
   const session = { field, recognition, report, active, prefix: value.slice(0, start), suffix: value.slice(end),
-    written: value, results: [], finals: [], finalText: "", restarts: 0, heard: false, started: false, silent: false, error: "", applying: false, stopping: false,
+    written: value, wrote: false, results: [], finals: [], finalText: "", restarts: 0, heard: false, started: false, silent: false, error: "", applying: false, stopping: false,
     ticks: 0, idle: 0, timer: null, stopTimer: null };
+  // A recognition whose listening already ended (aborted before the platform started it) does
+  // not keep the microphone: its first sign of life stops it.
+  const orphaned = () => {
+    if (state.dictation === session) return false;
+    try {
+      recognition.abort();
+    } catch {
+      // Already ended.
+    }
+    return true;
+  };
   const listening = () => {
-    if (state.dictation !== session || session.started) return;
+    if (orphaned() || session.started) return;
     session.started = true;
     session.idle = 0;
     session.report(DICTATION_LISTENING);
@@ -3580,13 +3597,13 @@ function startDictation(field, { report, active, releaseKeyboard = false }) {
   recognition.onstart = listening;
   recognition.onaudiostart = listening;
   recognition.onresult = (event) => {
-    if (state.dictation !== session) return;
+    if (orphaned()) return;
     // Off screen, or the text changed by other means (a paste, a restored message): those win.
     if (!session.active()) {
       stopDictation({ abort: true });
       return;
     }
-    if (field.value !== session.written) {
+    if (field.value !== session.written && !rebaseDictation(session)) {
       stopDictation({ abort: true, message: DICTATION_CHANGED });
       return;
     }
@@ -3654,11 +3671,6 @@ function startDictation(field, { report, active, releaseKeyboard = false }) {
       stopDictation();
     }
   }, 1000);
-  // Android keyboards (Samsung's among them) rewrite or commit again a focused field's text
-  // they did not type, which reads as the user's own typing and ends the listening. There the
-  // chat input's keyboard lets go while it listens; elsewhere it stays open. (The terminal's
-  // input line keeps its focus: without it, keys would go straight to the CLI.)
-  if (releaseKeyboard && touchDevice() && dictationCumulative() && document.activeElement === field) field.blur?.();
   report(DICTATION_PREPARING);
   renderDictation();
   try {
@@ -3678,6 +3690,7 @@ function applyDictation(session) {
   const before = session.prefix + lead + text;
   field.value = before + trail + session.suffix;
   session.written = field.value;
+  if (text) session.wrote = true;
   if (document.activeElement === field) field.setSelectionRange?.(before.length, before.length);
   // The field's own input handling (draft saving, sizing) runs as for typing.
   session.applying = true;
@@ -3752,7 +3765,20 @@ function stopDictation({ abort = false, field = null, message = "" } = {}) {
 // input method only re-marking the words that landed changes nothing and stops nothing.
 function dictationTyped(field) {
   const session = state.dictation;
-  if (session?.field === field && !session.applying && field.value !== session.written) stopDictation({ abort: true });
+  if (session?.field === field && !session.applying && field.value !== session.written && !rebaseDictation(session))
+    stopDictation({ abort: true });
+}
+// Before any words landed, a change while the field has no focus is the keyboard letting go
+// (committing or writing again the words it held, a moment later on Android): the field's
+// text stays and the words will go where its caret is. Returns whether it took the change.
+function rebaseDictation(session) {
+  const { field } = session;
+  if (session.wrote || document.activeElement === field) return false;
+  const value = String(field.value || "");
+  const start = Number.isInteger(field.selectionStart) ? Math.min(field.selectionStart, value.length) : value.length;
+  const end = Number.isInteger(field.selectionEnd) ? Math.min(Math.max(start, field.selectionEnd), value.length) : start;
+  Object.assign(session, { prefix: value.slice(0, start), suffix: value.slice(end), written: value });
+  return true;
 }
 function draftDictationNote(text) {
   const note = $("draft-note");

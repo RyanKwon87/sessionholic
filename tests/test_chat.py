@@ -10,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+from types import SimpleNamespace
 import time
 import unittest
 from urllib.parse import quote
@@ -963,6 +964,92 @@ class ChatClaudeTest(unittest.TestCase):
             self.send(**kwargs)
         self.assertEqual(caught.exception.status, 409)
         return str(caught.exception)
+
+    def test_input_ready_reads_claude_codes_input_line_not_a_transcript_message(self):
+        ruled = '답변 끝\n✻ Cooked for 3s\n───── title ─\n❯ \n──────────\n  Opus · xhigh\n  ⏵⏵ bypass permissions on'
+        boxed = '답변 끝\n╭──────────╮\n│ >        │\n╰──────────╯\n  ? for shortcuts'
+        self.assertTrue(chat.input_ready(ruled))
+        self.assertTrue(chat.input_ready(boxed))
+        # A message in the transcript has text below it, not a rule; nor a message or a quote
+        # with a rule below and no box or rule above (no input box drawn).
+        self.assertFalse(chat.input_ready('> 사용자 메시지\n답변 첫 줄\n답변 둘째 줄'))
+        self.assertFalse(chat.input_ready('> 사용자 메시지\n──────────\n  Opus · xhigh'))
+        self.assertFalse(chat.input_ready('❯ 사용자 메시지\n──────────\n  ⏵⏵ bypass'))
+        self.assertFalse(chat.input_ready('답변\n> 인용문\n──────────\n다음'))
+        # An open menu is not an input line.
+        self.assertFalse(chat.input_ready('Do you want to proceed?\n❯ 1. Yes\n  2. No\n──────────'))
+        self.assertFalse(chat.input_ready(''))
+
+    def test_a_working_sessions_attach_is_ready_once_its_input_line_shows(self):
+        # Its spinner never stops: waiting for quiet alone took the whole limit (about 14s sends).
+        counter = iter(range(1, 10000))
+        self.terms.read = lambda terminal_id, after=0, wait=20, epoch=None: (
+            time.sleep(0.02), {'after': next(counter), 'alive': True})[1]
+        self.terms.screen = '✻ Working…\n──────────\n❯ \n──────────\n  Opus'
+        started = time.monotonic()
+        self.assertTrue(self.chat._settled(TERMINAL_ID))
+        self.assertLess(time.monotonic() - started, 3)
+        # Without an input line it waits as before, and at the limit takes what it saw.
+        self.terms.screen = '✻ Working…\n> 사용자 메시지\n답변'
+        with patch.object(chat, 'CLAUDE_READY_SECONDS', 1.5):
+            started = time.monotonic()
+            self.assertTrue(self.chat._settled(TERMINAL_ID))
+            self.assertGreaterEqual(time.monotonic() - started, 1.4)
+
+    def test_starting_a_message_opens_a_background_sessions_attach_once(self):
+        opened, gate = [], threading.Event()
+        def attach(ref, source, request_id):
+            opened.append(request_id)
+            gate.wait(3)
+            return {'id': TERMINAL_ID}
+        with patch.object(self.chat, '_open_claude_terminal', side_effect=attach):
+            self.assertEqual(self.chat.warm({'source': CLAUDE_REF}), {'warming': True})
+            # Again while it opens: no second attach.
+            self.assertEqual(self.chat.warm({'source': CLAUDE_REF}), {'warming': True})
+            # A send pressed meanwhile waits on the same lock instead of opening another.
+            wait_for(lambda: self.chat._claude_lock_for(self.chat.resolve(CLAUDE_REF)).locked())
+            gate.set()
+            wait_for(lambda: not self.chat.warming)
+        self.assertEqual(len(opened), 1)
+        self.assertTrue(opened[0].startswith('warm_'))
+        # A board terminal already there, an interactive session, a full board: nothing opens.
+        with patch.object(self.chat, '_open_claude_terminal', side_effect=AssertionError('no warm-up')):
+            self.terminal()
+            self.chat.warm({'source': CLAUDE_REF}); wait_for(lambda: not self.chat.warming)
+            self.terms.rows.clear()
+            self.terms.rows.extend({'id': '%032x' % index, 'alive': True, 'closed': False} for index in range(15))
+            self.chat.warm({'source': CLAUDE_REF}); wait_for(lambda: not self.chat.warming)
+            self.terms.rows.clear()
+            # A finished session is not woken by typing.
+            self.row['phase'] = 'done'; self.board.poll(HOST)
+            self.assertEqual(self.chat.warm({'source': CLAUDE_REF}), {'warming': False})
+            self.row['phase'] = 'idle'
+            self.kind('interactive')
+            self.assertEqual(self.chat.warm({'source': CLAUDE_REF}), {'warming': False})
+        with self.assertRaises(ValueError):
+            self.chat.warm({'source': CLAUDE_REF, 'text': 'x'})
+
+    def test_a_send_waiting_on_a_warm_up_says_so(self):
+        source = self.chat.resolve(CLAUDE_REF)
+        held = SimpleNamespace(acquire=lambda *args, **kwargs: False, release=lambda: None)
+        self.chat.warming.add(self.chat._warm_key(source))
+        try:
+            with patch.object(self.chat, '_claude_lock_for', return_value=held):
+                self.assertIn('연결을 여는 중', self.rejected())
+                self.chat.warming.clear()
+                self.assertIn('다른 메시지를 전달하고', self.rejected())
+        finally:
+            self.chat.warming.clear()
+
+    def test_a_warm_up_never_holds_up_a_send_in_progress(self):
+        lock = self.chat._claude_lock_for(self.chat.resolve(CLAUDE_REF))
+        lock.acquire()
+        try:
+            with patch.object(self.chat, '_open_claude_terminal', side_effect=AssertionError('the send opens it')):
+                self.chat.warm({'source': CLAUDE_REF})
+                wait_for(lambda: not self.chat.warming)
+        finally:
+            lock.release()
 
     def test_state_capability_follows_board_terminal_background_and_needs_input(self):
         self.kind('interactive')

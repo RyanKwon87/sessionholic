@@ -4197,6 +4197,40 @@ test('기기 상태와 사용량은 목록이 아니라 맨 위 헤더의 기기
   assert.match(fs.readFileSync(path.join(__dirname, '../web/style.css'), 'utf8'), /\.top \.home-label \{\n    display: none;/);
 });
 
+test('Claude 백그라운드 대화에 입력을 시작하면 그 연결을 한 번 미리 열고, Codex나 터미널이 있으면 열지 않는다', () => {
+  const requests = [];
+  const c = client(async (url, options) => {
+    requests.push([url, options?.body && JSON.parse(options.body)]);
+    return { ok: true, status: 200, json: async () => ({ warming: true }) };
+  }, noChatTimers);
+  const { s, entry } = selectChat(c, { agent: 'claude', home: '.claude', id: 'bg12345678' });
+  c.state.snapshot.hosts[0].data.claude[0].kind = 'background';
+  const composer = c.buildChatComposer(c.allSessions()[0]);
+  const input = findId(composer, 'chat-input');
+  const type = (text) => { input.value = text; input.events.input(); };
+  type('안'); type('안녕');
+  const warmed = () => requests.filter(([url]) => url === '/api/chat/warm');
+  assert.equal(warmed().length, 1, 'once a minute');
+  assert.deepEqual(warmed()[0][1], { source: JSON.parse(JSON.stringify(entry.source)) });
+  // A minute later, again; with a board terminal there is nothing to open.
+  entry.warmedAt -= 61000; entry.warmCheckedAt = 0; type('안녕하');
+  assert.equal(warmed().length, 2);
+  c.state.terminals = [{ id: 'a'.repeat(32), alive: true, mode: 'attach',
+    metadata: { nativeSource: { host: s.host, agent: s.agent, home: s.home, id: s.id }, mode: 'attach' } }];
+  entry.warmedAt -= 61000; entry.warmCheckedAt = 0; type('안녕하세');
+  assert.equal(warmed().length, 2);
+  // A finished session is not woken by typing.
+  c.state.terminals = []; c.state.snapshot.hosts[0].data.claude[0].phase = 'done';
+  entry.warmedAt -= 61000; entry.warmCheckedAt = 0; type('안녕하세요');
+  assert.equal(warmed().length, 2);
+  // Codex takes input through its own server: never warmed.
+  const codex = client(async (url) => { requests.push([url]); return { ok: true, status: 200, json: async () => ({}) }; }, noChatTimers);
+  const other = selectChat(codex);
+  const codexInput = findId(codex.buildChatComposer(other.s), 'chat-input');
+  codexInput.value = '안녕'; codexInput.events.input();
+  assert.equal(warmed().length, 2);
+});
+
 function classes() {
   const set = new Set();
   return { set, add: (name) => set.add(name), remove: (name) => set.delete(name), contains: (name) => set.has(name),

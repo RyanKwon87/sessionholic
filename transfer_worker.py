@@ -706,11 +706,12 @@ def hold_kill(name):
     return {'killed': done.returncode == 0}
 
 
-def new_session_main():
-    """The terminal step of "새 세션": run this host's own launcher, with its own settings."""
+def new_session_main(preset=None):
+    """The terminal step of "새 세션": run this host's own launcher, with its own settings (and
+    the chosen preset, see launch.LAUNCH_PRESETS)."""
     from launch import new_session
     try:
-        spec = new_session()
+        spec = new_session(preset=preset)
         os.chdir(spec['cwd'])
         _execve(spec['argv'], spec['env'])
     except (ValueError, OSError) as exc:
@@ -730,8 +731,13 @@ def _main():
         return hold_attach(sys.argv[2])
     if len(sys.argv) >= 3 and sys.argv[1] == 'handoff':
         return handoff_main(sys.argv[2:])
-    if len(sys.argv) == 2 and sys.argv[1] == 'new-session':
-        return new_session_main()
+    if len(sys.argv) >= 2 and sys.argv[1] == 'new-session':
+        if len(sys.argv) == 2:
+            return new_session_main()
+        if len(sys.argv) == 4 and sys.argv[2] == '--preset':
+            return new_session_main(sys.argv[3])
+        print('새 세션을 열지 못했습니다. 실행 요청 형식이 올바르지 않습니다.', file=sys.stderr)
+        raise SystemExit(1)
     if len(sys.argv) == 3 and sys.argv[1] == 'attach':
         try:
             attach(json.loads(sys.argv[2]))

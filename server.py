@@ -1618,12 +1618,16 @@ class Workflow:
         host_name, request_id = payload.get("host"), payload.get("requestId")
         if not isinstance(request_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{8,100}", request_id):
             raise ValueError("실행 요청 식별자가 필요합니다.")
+        from launch import LAUNCH_PRESETS, launch_preset
+        preset = launch_preset(payload.get("preset"))
         host = next((h for h in self.board.hosts if h["name"] == host_name), None)
         if host is None:
             raise ValueError("새 세션을 열 기기를 선택해 주세요.")
         if host.get("platform") == "windows" and not host.get("launcher"):
             raise ValueError("이 PC의 새 세션 선택지가 기기 설정에 없습니다.")
-        signature = ("new-session", host["name"])
+        if host.get("platform") == "windows":
+            preset = None  # A PC's launcher choices are its own commands: no preset reaches them.
+        signature = ("new-session", host["name"], preset)
         done, result = self._begin(request_id, signature)
         if done:
             return result
@@ -1635,7 +1639,7 @@ class Workflow:
             with self.terminals.reserve(key):
                 if host["local"]:
                     from launch import new_session
-                    spec = new_session()
+                    spec = new_session(preset=preset)
                     label = spec["label"]
                 elif host.get("platform") == "windows":
                     import collector
@@ -1649,9 +1653,11 @@ class Workflow:
                         raise ValueError(status["reason"] or "이 기기에는 새 세션 실행 명령이 설정되지 않았습니다.")
                     import collector
                     label = status["label"] or "새 세션"
-                    argv, hold = self.transfers.terminal(host, ["-I", self.transfers.runtime_paths[host["name"]], "new-session"])
+                    argv, hold = self.transfers.terminal(host, ["-I", self.transfers.runtime_paths[host["name"]], "new-session"]
+                                                         + (["--preset", preset] if preset else []))
                     spec = {"argv": argv, "holdName": hold, "cwd": str(Path.home()), "env": collector.tool_env()}
-                metadata = {"title": label, "host": host["name"], "mode": "new-session", "createdAt": int(time.time())}
+                metadata = {"title": label + (" · " + LAUNCH_PRESETS[preset]["label"] if preset else ""),
+                            "host": host["name"], "mode": "new-session", "createdAt": int(time.time())}
                 if spec.get("holdName"):
                     metadata["holdName"] = spec["holdName"]
                 terminal = self.terminals.create(key, spec["argv"], spec["cwd"], spec["env"], metadata)

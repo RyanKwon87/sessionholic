@@ -117,6 +117,33 @@ class WorkerNewSessionTest(TempHome):
         self.assertEqual((program, argv), (str(self.program), [str(self.program), '--menu']))
         self.assertEqual(env['HOME'], str(self.home))
 
+    def test_a_preset_reaches_the_launcher_as_one_checked_variable(self):
+        self.write({'command': ['~/bin/start', '--menu']})
+        with self.remote_home() as (execve, _), patch.object(sys, 'argv', ['worker.pyz', 'new-session', '--preset', 'fast']):
+            transfer_worker._main()
+        env = execve.call_args.args[2]
+        # Claude only: a Codex config override would leave the shared app-server the board uses.
+        self.assertEqual(json.loads(env['SESSIONHOLIC_LAUNCH_PRESET']), {'claude': {'model': 'sonnet', 'effort': 'medium'}})
+        # Without one, the launcher gets none; an unknown one runs nothing.
+        with self.remote_home() as (execve, _):
+            transfer_worker._main()
+        self.assertNotIn('SESSIONHOLIC_LAUNCH_PRESET', execve.call_args.args[2])
+        error = io.StringIO()
+        with self.remote_home() as (execve, _), redirect_stderr(error), \
+                patch.object(sys, 'argv', ['worker.pyz', 'new-session', '--preset', 'turbo']):
+            with self.assertRaises(SystemExit):
+                transfer_worker._main()
+        execve.assert_not_called()
+        self.assertIn('실행 설정이 올바르지 않습니다', error.getvalue())
+        # Any other shape of the step is refused in its own branch.
+        error = io.StringIO()
+        with self.remote_home() as (execve, _), redirect_stderr(error), \
+                patch.object(sys, 'argv', ['worker.pyz', 'new-session', '--preset']):
+            with self.assertRaises(SystemExit):
+                transfer_worker._main()
+        execve.assert_not_called()
+        self.assertIn('실행 요청 형식', error.getvalue())
+
     def test_new_session_step_refusal_prints_the_reason_and_runs_nothing(self):
         self.write()
         error = io.StringIO()
@@ -202,7 +229,7 @@ class WorkflowNewSessionTest(unittest.TestCase):
     def test_a_new_session_request_repeated_while_it_opens_waits_and_opens_once(self):
         started, release = threading.Event(), threading.Event()
         local = {'argv': ['/bin/sh'], 'cwd': '/tmp', 'env': {'HOME': '/tmp'}, 'label': '런처'}
-        def slow():
+        def slow(**_preset):
             started.set()
             release.wait(5)
             return dict(local)
@@ -230,6 +257,24 @@ class WorkflowNewSessionTest(unittest.TestCase):
         # No launcher setting or value crosses the SSH command.
         self.assertNotIn('HOME=', ' '.join(argv))
         self.assertEqual(result['terminal']['mode'], 'new-session')
+
+    def test_a_preset_goes_with_the_step_and_names_the_terminal(self):
+        self.flow.new_session({'host': 'remote', 'requestId': 'request-0021', 'preset': 'max'})
+        created = self.terms.created[0]
+        self.assertEqual(created['argv'][-1], 'exec /usr/bin/python3 -I ' + RUNTIME + ' new-session --preset max')
+        self.assertEqual(created['metadata']['title'], '원격 런처 · 최대')
+        # Locally it is the launcher's variable; a held run carries it in its step.
+        with patch('launch.new_session', return_value={'argv': ['/bin/sh'], 'cwd': '/tmp', 'env': {}, 'label': '런처'}) as made:
+            self.flow.new_session({'host': 'local', 'requestId': 'request-0022', 'preset': 'fast'})
+        made.assert_called_once_with(preset='fast')
+        self.flow.transfers.hold_support['remote'] = '/opt/homebrew/bin/tmux'
+        self.flow.new_session({'host': 'remote', 'requestId': 'request-0023', 'preset': 'fast'})
+        self.assertTrue(json.loads(self.terms.created[-1]['argv'][4])['first'][-1].endswith(' new-session --preset fast'))
+        # The same request with another preset is another launch; an unknown preset is refused.
+        with self.assertRaisesRegex(ValueError, '이미 사용한 요청'):
+            self.flow.new_session({'host': 'remote', 'requestId': 'request-0021', 'preset': 'fast'})
+        with self.assertRaisesRegex(ValueError, '실행 설정이 올바르지 않습니다'):
+            self.flow.new_session({'host': 'remote', 'requestId': 'request-0024', 'preset': 'turbo'})
 
     def test_a_remote_that_holds_runs_opens_the_reconnect_loop_and_names_its_hold(self):
         self.flow.transfers.hold_support['remote'] = '/opt/homebrew/bin/tmux'

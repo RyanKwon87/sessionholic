@@ -8836,10 +8836,25 @@ function updateViewport() {
   const height = Math.round(viewportHeight());
   document.documentElement.style.setProperty("--app-height", `${height}px`);
   redock();
+  renderKeyboardRoom();
   syncChromeMode();
   const selected = selectedSession();
   if (selected) resizeChatInput(chatEntry(selected));
   fitTerminal();
+}
+// An iPad's on-screen keyboard takes half the screen: while typing with it the board's top
+// bar and the terminal's note fold away (phones fold their own way, "is-typing"). Beside a
+// docked terminal, typing on the board leaves the terminal its full height, so the keyboard
+// opening and closing does not resize (redraw) the CLI. Returns whether that changed.
+function renderKeyboardRoom() {
+  const typing = touchDevice() && !phoneLayout() && !shortLayout() && editingText() && keyboardOpen();
+  const beside = typing && state.docked && !!document.activeElement?.closest?.("#app");
+  const classes = document.body?.classList;
+  const changed = !!classes?.contains?.("keyboard-beside") !== beside;
+  classes?.[typing ? "add" : "remove"]("keyboard-typing");
+  classes?.[beside ? "add" : "remove"]("keyboard-beside");
+  document.documentElement.style?.setProperty?.("--layout-height", `${Math.round(state.viewportTall || window.innerHeight || 0)}px`);
+  return changed;
 }
 // Back on screen (from the background, a minimized window or the app switcher): the
 // sizes WebKit reports settle a moment later and may come with no resize event, so the
@@ -9145,7 +9160,11 @@ window.addEventListener("DOMContentLoaded", () => {
   $("terminal-back").addEventListener("click", backFromTerminal);
   $("terminal-dock").addEventListener("click", toggleDock);
   for (const [id, side] of [["app", "board"], ["terminal-screen", "terminal"]])
-    for (const type of ["pointerdown", "focusin"]) $(id).addEventListener(type, () => noteDockSide(side));
+    for (const type of ["pointerdown", "focusin"]) $(id).addEventListener(type, () => {
+      noteDockSide(side);
+      // The keyboard may stay up while the focus crosses sides: the terminal's height follows.
+      if (type === "focusin" && renderKeyboardRoom()) fitTerminal();
+    });
   $("terminal-close").addEventListener("click", () => {
     if (state.terminal) closeTerminal(state.terminal.id);
   });

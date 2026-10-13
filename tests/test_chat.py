@@ -379,7 +379,52 @@ class ChatTest(unittest.TestCase):
         self.assertEqual(first['route'],REF)
         self.assertEqual(len(self.calls),1)
         self.board.state['local']['ok']=False
+        # A host that went away: the conversation as last read, read-only, with no remote call.
+        self.chat.cache.clear()
+        stale=self.chat.state({'source':REF,'requestId':'request-0009'})
+        self.assertEqual(len(self.calls),1)
+        self.assertEqual((stale['stale'],stale['readOnly'],stale['capability']['supported']),(True,True,False))
+        self.assertIn('마지막으로 읽은 대화',stale['capability']['reason'])
+        self.assertEqual(stale['messages'],first['messages'])
+        self.assertEqual(stale['receipts'][0]['status'],'unknown')
+        # Sending still needs the host.
+        with self.assertRaises(RuntimeError): self.chat.source(REF)
+    def test_a_read_before_the_first_collection_asks_the_host(self):
+        # Right after a restart nothing is collected yet: a read still asks the host.
+        self.board.state['local']['ok']=False
+        self.assertEqual(self.chat.state({'source':REF})['route'],REF)
+        self.assertEqual(len(self.calls),1)
+        # It cannot be reached and nothing was read before: the read fails as before.
+        self.chat.cache.clear()
+        self.chat.last_good.clear()
+        self.flow.transfers.rpc=lambda *a,**k:(_ for _ in ()).throw(RuntimeError('fixture: unreachable'))
         with self.assertRaises(RuntimeError): self.chat.state({'source':REF})
+    def test_stale_read_is_only_for_an_unreachable_host_and_the_same_session(self):
+        from transfer import WorkerError
+        working={'cwd':str(self.project),'phase':'working','workingSince':1791334800,'capabilities':{'canSend':True},
+                 'messages':[{'role':'assistant','text':'진행 중'}]}
+        self.flow.transfers.rpc=lambda *a,**k:working
+        first=self.chat.state({'source':REF})
+        self.assertEqual(first['phase'],'working')
+        fail=lambda exc:(lambda *a,**k:(_ for _ in ()).throw(exc))
+        # Unreachable: the last read, with nothing of its work or actions carried over.
+        self.chat.cache.clear()
+        self.flow.transfers.rpc=fail(RuntimeError('fixture: unreachable'))
+        stale=self.chat.state({'source':REF})
+        self.assertEqual((stale['stale'],stale['phase'],stale['workingSince'],stale['recovery']),(True,'unavailable',None,None))
+        self.assertNotIn('action',stale['capability'])
+        self.assertEqual(stale['messages'],first['messages'])
+        # A failure the host reported is shown as it is.
+        self.chat.cache.clear()
+        self.flow.transfers.rpc=fail(WorkerError('fixture: reported'))
+        with self.assertRaises(WorkerError): self.chat.state({'source':REF})
+        # The same id in another folder is another conversation: it has no last read.
+        self.chat.cache.clear()
+        self.flow.transfers.rpc=fail(RuntimeError('fixture: unreachable'))
+        moved=self.root/'moved'; moved.mkdir()
+        self.source['cwd']=str(moved); self.board.poll(HOST)
+        with self.assertRaises(RuntimeError) as caught: self.chat.state({'source':REF})
+        self.assertEqual(str(caught.exception),'fixture: unreachable')
     def test_receipt_lookup_answers_plain_reads_from_cache_without_receipts(self):
         receipt=self.chat.state({'source':REF,'requestId':'request-0001'})
         self.assertEqual(receipt['receipts'][0]['requestId'],'request-0001')

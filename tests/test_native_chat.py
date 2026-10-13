@@ -785,6 +785,18 @@ class NativeChatTests(unittest.TestCase):
             self.assertEqual([m['role'] for m in read['messages']], ['user', 'tool'])
 
 
+class StoppedOnErrorTest(unittest.TestCase):
+    def test_a_codex_stopped_on_an_error_reads_as_waiting_and_says_why_input_is_locked(self):
+        source = {'agent': 'codex', 'home': '.codex-isolated', 'id': str(uuid.uuid4()), 'cwd': '/tmp/project'}
+        thread = {'id': source['id'], 'cwd': '/tmp/project', 'status': {'type': 'systemError'}, 'canAcceptDirectInput': True,
+                  'source': 'cli', 'updatedAt': 1, 'turns': [{'id': 't-1', 'status': 'failed', 'items': []}]}
+        with patch.object(chat, '_client', return_value=FakeClient(thread)):
+            result = chat.handle({'action': 'read', 'source': source})
+        self.assertEqual(result['phase'], 'needs_input', 'as the list says (답 필요)')
+        self.assertFalse(result['capabilities']['canSend'])
+        self.assertIn('오류로 멈췄습니다', result['capabilities']['reason'])
+
+
 class RecentHistoryTests(unittest.TestCase):
     """A conversation read pages the latest history instead of loading the whole rollout."""
     def setUp(self):

@@ -224,6 +224,9 @@ class Chat:
         self.root = Path(state_dir) / 'chat'
         self.lock = threading.RLock()
         self.cache = {}
+        # state key -> (epoch seconds, the last view read from its host), shown read-only while
+        # that host cannot be reached (_stale).
+        self.last_good = {}
         self.cache_epoch = 0
         self.read_sequence = 0
         self.upload_gate = threading.BoundedSemaphore(2)
@@ -265,10 +268,13 @@ class Chat:
                     return {**native, 'title': terminal.get('title', '이어가는 작업')}
             raise
 
-    def source(self, ref):
+    def source(self, ref, sending=True):
+        """The listed source and its host. Sending needs the host's collection to be up; a read
+        does not (right after a restart nothing is collected yet, and a host that went away
+        still has the conversation last read, see _stale)."""
         source = self.resolve(ref)
         host = next(h for h in self.board.hosts if h['name'] == source['host'])
-        if not self.board.state[host['name']]['ok']:
+        if sending and not self.board.state[host['name']]['ok']:
             raise RuntimeError('기기 연결을 다시 확인한 뒤 메시지를 보내 주세요.')
         return source, host
 
@@ -303,7 +309,7 @@ class Chat:
         """The conversation view. A watcher read (watching=True) also carries the receipts
         clients recently asked for, so their next read is answered from the cache; a read
         still in progress is shared by readers asking for a subset of its receipts."""
-        source, host = self.source(data.get('source'))
+        source, host = self.source(data.get('source'), sending=False)
         identity = self.identity(source)
         key = self.state_key(source)
         request_id = data.get('requestId')
@@ -379,10 +385,20 @@ class Chat:
     def _read_state(self, source, host, identity, key, request_ids, kwargs, sequence, epoch):
         """One remote read with the receipts of `request_ids`, cached unless a send or a newer
         read came in meanwhile."""
+        if not self.board.state[host['name']]['ok']:
+            stale = self._stale(key, source, request_ids)
+            if stale is not None:
+                return stale
         try:
             result = self.rpc(host, 'read', source, **kwargs)
-        except (RuntimeError, OSError, ValueError):
+        except (RuntimeError, OSError, ValueError) as exc:
             if source.get('agent') != 'codex' or source.get('phase') not in ('closed', 'notLoaded'):
+                from transfer import WorkerError
+                # Only a host that could not be reached shows its last read; a failure the
+                # host reported, or a request refused here, is shown as it is.
+                stale = None if isinstance(exc, (ValueError, WorkerError)) else self._stale(key, source, request_ids)
+                if stale is not None:
+                    return stale
                 raise
             # A disconnected daemon does not erase the saved conversation.
             try:
@@ -501,7 +517,33 @@ class Chat:
                     self.cache.pop(next(iter(self.cache)))
                 self.cache[key] = (time.monotonic(), response, sequence, source.get('cwd'),
                                    frozenset(request_ids))
+            # Newest read last: the least recently read conversation leaves first.
+            self.last_good.pop(key, None)
+            if len(self.last_good) >= 64:
+                self.last_good.pop(next(iter(self.last_good)))
+            self.last_good[key] = (time.time(), response, source.get('cwd'), source.get('sessionId'))
         return response
+
+    def _stale(self, key, source, request_ids):
+        """The conversation as last read, read-only, while its host cannot be reached, or None
+        when none was read for this exact session (a reused Claude id or a moved folder is
+        another conversation). Never cached, so the next read asks the host again; its state
+        then is unknown, so nothing of the last read's work or actions carries over."""
+        with self.lock:
+            entry = self.last_good.get(key)
+        if entry is None or entry[2:] != (source.get('cwd'), source.get('sessionId')):
+            return None
+        at, last = entry[:2]
+        known = {receipt['requestId']: receipt for receipt in last.get('receipts', [])}
+        receipts = [known.get(request_id) or self.receipt(
+            {'delivery': 'unknown', 'reason': '기기에 연결되지 않아 전송 결과를 확인하지 못했습니다.'}, request_id)
+            for request_id in request_ids]
+        capability = {name: value for name, value in last.get('capability', {}).items() if name != 'action'}
+        capability.update(supported=False, attachments=False,
+                          reason='기기에 연결되지 않아 마지막으로 읽은 대화를 보여 줍니다. 연결되면 다시 읽습니다.')
+        return {**last, 'receipts': receipts, 'capability': capability, 'stale': True, 'staleSince': int(at),
+                'phase': 'unavailable', 'workingSince': None, 'recovery': None,
+                'readOnly': True, 'prompt': None, 'promptOpenable': False}
 
     @staticmethod
     def _cached_view(response, request_ids):

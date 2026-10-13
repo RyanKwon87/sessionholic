@@ -105,7 +105,8 @@ def _state(thread):
         flags = ["unknown"]
     active = [t for t in thread["turns"] if t.get("status") == "inProgress"]
     kind = status.get("type")
-    phase = ("needs_input" if flags else "working") if kind == "active" else (
+    # Codex stopped on an error (systemError): the list calls it 답 필요, and so does this view.
+    phase = ("needs_input" if flags else "working") if kind == "active" else "needs_input" if kind == "systemError" else (
         "idle" if kind == "idle" and not active else "closed" if kind == "notLoaded" and not active else "unknown")
     if thread.get("unknownTurnStatus") and phase == "idle":
         phase = "unknown"
@@ -125,10 +126,15 @@ def _remote(value):
 
 def _capabilities(thread):
     state = _state(thread)
+    stopped = (thread.get("status") or {}).get("type") == "systemError"
     can = (thread.get("canAcceptDirectInput") is True and not _remote(thread.get("source"))
-           and not _remote(thread.get("threadSource")) and state["phase"] in ("idle", "working", "needs_input"))
+           and not _remote(thread.get("threadSource")) and state["phase"] in ("idle", "working", "needs_input")
+           and not stopped)
     if can:
         reason = None
+    elif stopped:
+        # Whether the app server takes a new turn in this state is not known: the terminal does.
+        reason = "Codex가 오류로 멈췄습니다. 원본 터미널에서 확인한 뒤 이어서 입력해 주세요."
     elif _remote(thread.get("source")) or _remote(thread.get("threadSource")):
         reason = "이 원격 세션은 로컬 직접 입력을 지원하지 않습니다. 원본 터미널을 사용하세요."
     elif state["phase"] == "closed":

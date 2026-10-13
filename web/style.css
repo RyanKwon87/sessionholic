@@ -1866,6 +1866,58 @@ button.host:focus-visible {
   border-radius: 0 10px 10px 0;
   background: var(--surface);
 }
+.message-rule {
+  margin: 0.9em 0;
+  border: 0;
+  border-top: 1px solid var(--sep-strong);
+}
+li[data-task] {
+  list-style: none;
+}
+.message-task {
+  display: inline-block;
+  width: 1.25em;
+  margin-left: -1.25em;
+}
+/* A Markdown table in an answer: its own sideways scroll when wider than the bubble. */
+.message-table-wrap {
+  max-width: 100%;
+  margin: 0.65em 0 0.85em;
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+}
+.message-table {
+  /* Columns as wide as their content up to the cell cap below; a wider table scrolls in its
+     wrapper instead of squeezing every column to its longest word. */
+  width: max-content;
+  border-collapse: collapse;
+  font-size: 0.95em;
+  line-height: 1.4;
+}
+.message-table th,
+.message-table td {
+  padding: 6px 10px;
+  border: 1px solid var(--sep-strong);
+  text-align: left;
+  vertical-align: top;
+  max-width: 16em;
+  word-break: keep-all;
+  /* Not `anywhere` (inherited from the bubble): words are not split letter by letter. */
+  overflow-wrap: break-word;
+}
+.message-table a {
+  overflow-wrap: anywhere; /* A long address alone may break anywhere. */
+}
+.message-table th {
+  background: var(--surface);
+  font-weight: 600;
+}
+.message-table [data-align="right"] {
+  text-align: right;
+}
+.message-table [data-align="center"] {
+  text-align: center;
+}
 .message-code {
   margin: 0;
   padding: 12px 14px;

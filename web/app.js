@@ -3317,6 +3317,12 @@ const DICTATION_STOP_WAIT_MS = 8000;
 // or nothing heard for this many after it, ends the listening.
 const DICTATION_START_TICKS = 15;
 const DICTATION_SILENCE_TICKS = 10;
+// Android's recognizer service may end a session after an utterance though Chrome asked it for
+// continuous dictation; the board starts it again (this many times in a row with nothing heard
+// between) unless the user ended it, it left the screen, it was refused, or nothing was said
+// for the silence above.
+const DICTATION_RESTARTS = 30;
+const DICTATION_HARD_ERRORS = new Set(["not-allowed", "service-not-allowed", "audio-capture", "network", "language-not-supported"]);
 const DICTATION_ERRORS = {
   "not-allowed": "마이크 사용이 허용되지 않았습니다. 브라우저의 사이트 권한이나 기기 설정(마이크·음성 인식)에서 허용해 주세요.",
   "service-not-allowed": "이 화면에서는 음성 인식을 쓸 수 없습니다. 브라우저에서 열거나 키보드의 받아쓰기를 쓰고, 기기 설정에서 받아쓰기가 켜져 있는지 확인해 주세요.",
@@ -3399,7 +3405,7 @@ function startDictation(field, { report, active, releaseKeyboard = false }) {
   const start = Number.isInteger(field.selectionStart) ? Math.min(field.selectionStart, value.length) : value.length;
   const end = Number.isInteger(field.selectionEnd) ? Math.min(Math.max(start, field.selectionEnd), value.length) : start;
   const session = { field, recognition, report, active, prefix: value.slice(0, start), suffix: value.slice(end),
-    written: value, results: [], finals: [], finalText: "", heard: false, started: false, silent: false, error: "", applying: false, stopping: false,
+    written: value, results: [], finals: [], finalText: "", restarts: 0, heard: false, started: false, silent: false, error: "", applying: false, stopping: false,
     ticks: 0, idle: 0, timer: null, stopTimer: null };
   const listening = () => {
     if (state.dictation !== session || session.started) return;
@@ -3422,6 +3428,7 @@ function startDictation(field, { report, active, releaseKeyboard = false }) {
     }
     listening();
     session.idle = 0;
+    session.restarts = 0;  // Heard: a long dictation restarts once per phrase without limit.
     // Final results never change and keep their places while the list grows (results still
     // changing may merge or drop). A list whose earlier finals are gone or say something
     // else started over (WebKit after a pause): the words those finals wrote stay, and the
@@ -3447,7 +3454,21 @@ function startDictation(field, { report, active, releaseKeyboard = false }) {
   recognition.onerror = (event) => {
     if (state.dictation === session) session.error = String(event?.error || "unknown");
   };
-  recognition.onend = () => finishDictation(session);
+  recognition.onend = () => {
+    if (state.dictation === session && dictationResumable(session)) {
+      // What it wrote stays; the next round's words follow it.
+      const text = dictationText(session.results);
+      if (text) session.prefix += (session.prefix && !/\s$/.test(session.prefix) ? " " : "") + text;
+      Object.assign(session, { results: [], finals: [], finalText: "", error: "", restarts: session.restarts + 1 });
+      try {
+        recognition.start();
+        return;
+      } catch {
+        // Not startable again: it ends as before.
+      }
+    }
+    finishDictation(session);
+  };
   state.dictation = session;
   session.timer = setInterval(() => {
     if (state.dictation !== session) return;
@@ -3456,7 +3477,8 @@ function startDictation(field, { report, active, releaseKeyboard = false }) {
       return;
     }
     // An error the engine reported without ending (seen in WebKit) is said, with its code.
-    if (session.error) {
+    // On Android "no speech" is followed by its end, which listens on (dictationResumable).
+    if (session.error && !(dictationCumulative() && session.error === "no-speech" && dictationResumable(session))) {
       stopDictation({ abort: true, message: dictationOutcome(session) });
       return;
     }
@@ -3513,6 +3535,13 @@ function dictationOutcome(session) {
   if (!session.stopping && !session.heard && session.ticks === 0) return `${DICTATION_ENDED_AT_ONCE} (end)`;
   if (!session.heard) return DICTATION_ERRORS["no-speech"];
   return session.silent ? DICTATION_SILENCE_END : "";
+}
+// An end the user did not ask for, on Android, while it is on screen and was heard or only
+// paused: listen on (see DICTATION_RESTARTS).
+function dictationResumable(session) {
+  return dictationCumulative() && !session.stopping && session.started && session.active()
+    && session.restarts < DICTATION_RESTARTS && session.idle < DICTATION_SILENCE_TICKS
+    && !DICTATION_HARD_ERRORS.has(session.error) && session.error !== "aborted";
 }
 function finishDictation(session) {
   if (state.dictation !== session) return;

@@ -1141,6 +1141,15 @@ class OperationsLogTest(unittest.TestCase):
     failing differently or recovering is one line each, a watcher's stderr is a few lines,
     and the server's own log files do not grow for good."""
 
+    def test_a_board_without_the_work_list_observes_no_work(self):
+        observed = []
+        work = SimpleNamespace(observe=lambda *a: observed.append(a), health=None)
+        for work_list, expected in ((False, 0), (True, 1)):
+            handler = server.Handler.__new__(server.Handler)
+            handler.server = SimpleNamespace(work=work, work_list=work_list)
+            handler.observe_work({'host': 'local', 'agent': 'codex', 'id': 'x' * 8}, {'messages': []})
+            self.assertEqual(len(observed), expected, work_list)
+
     def test_a_client_that_left_mid_answer_is_not_logged_as_a_route_failure(self):
         handler = server.Handler.__new__(server.Handler)
         handler.command, handler.path, handler.request_version = "GET", "/api/snapshot", "HTTP/1.1"

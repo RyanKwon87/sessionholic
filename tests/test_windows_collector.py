@@ -607,6 +607,36 @@ class WindowsCollectorTest(unittest.TestCase):
         self.assertEqual([row['text'] for row in result['messages']], ['합성 Claude 요청', '합성 Claude 결과'])
         self.assertFalse(result['runtimeKnown'])
 
+    def test_claude_list_row_titles_from_transcript_end_or_first_request(self):
+        # Unnamed rows used to all read '(Claude 대화)' with no preview.
+        sid, path = self.claude_transcript()
+        row = self.reader.snapshot()['claude'][0]
+        self.assertEqual((row['title'], row['snippet']), ('합성 Claude 요청', '합성 Claude 결과'))
+        filler = {'type': 'progress', 'data': 'x' * 1000}
+        entries = [{'type': 'user', 'cwd': self.cwd, 'message': {'content': '<command-name>/clear</command-name>'}},
+                   {'type': 'user', 'isMeta': True, 'message': {'content': '펼친 스킬 본문'}},
+                   {'type': 'user', 'message': {'content': '첫  요청\n둘째 줄'}},
+                   {'type': 'ai-title', 'aiTitle': '오래된 제목', 'sessionId': sid},
+                   {'type': 'custom-title', 'customTitle': '처음 바꾼 이름', 'sessionId': sid},
+                   *[filler] * 80,  # Pushed out of the read end: no longer the newest.
+                   {'type': 'ai-title', 'aiTitle': '생성된 제목', 'sessionId': sid},
+                   {'type': 'agent-name', 'agentName': '에이전트 이름', 'sessionId': sid},
+                   {'type': 'assistant', 'message': {'content': [{'type': 'text', 'text': '마지막\n  답변'}]}},
+                   {'type': 'user', 'message': {'content': [{'type': 'tool_result', 'content': 'ok'}]}}]
+        self.claude_transcript(sid, entries)
+        row = self.reader.snapshot()['claude'][0]
+        self.assertEqual((row['title'], row['snippet']), ('에이전트 이름', '마지막 답변'))
+        entries.insert(-2, {'type': 'custom-title', 'customTitle': '새 이름', 'sessionId': sid})
+        self.claude_transcript(sid, entries)
+        self.assertEqual(self.reader.snapshot()['claude'][0]['title'], '새 이름')
+        # No title record in the end: the first real request, on one line.
+        self.claude_transcript(sid, [entry for entry in entries if entry['type'] in ('user', 'progress')])
+        row = self.reader.snapshot()['claude'][0]
+        self.assertEqual((row['title'], row['snippet']), ('첫 요청 둘째 줄', ''))
+        # Nothing to name it by keeps the placeholder.
+        self.claude_transcript(sid, [entries[0], filler])
+        self.assertEqual(self.reader.snapshot()['claude'][0]['title'], '(Claude 대화)')
+
     def test_claude_runtime_requires_pid_start_identity(self):
         sid, path = self.claude_transcript()
         folder = self.reader.claude_home / 'sessions'

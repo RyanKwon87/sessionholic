@@ -8872,6 +8872,65 @@ test('an iPad app back from the background takes its full height again, with no 
   assert.equal(last(), '1024px');
 });
 
+test('on Android a recognition that ends by itself listens on, and what it heard stays', async () => {
+  const run = (agent) => {
+    const tools = dictationClient();
+    tools.c.context.webkitSpeechRecognition = tools.FakeRecognition;
+    tools.c.context.navigator = { userAgent: agent, onLine: true };
+    const { s, entry } = selectChat(tools.c);
+    const composer = tools.c.buildChatComposer(s);
+    const input = findId(composer, 'chat-input');
+    findId(composer, 'chat-mic').events.click();
+    const rec = tools.recognitions.at(-1); rec.onstart();
+    return { ...tools, entry, input, mic: findId(composer, 'chat-mic'), rec };
+  };
+  const android = 'Mozilla/5.0 (Linux; Android 15; SM-F741N) Chrome/141';
+  // A Samsung recognizer ends after one phrase: it starts again and the next words follow.
+  let t = run(android);
+  t.rec.onresult(t.result('하나 둘 셋'));
+  t.rec.onend();
+  assert.equal(t.rec.started, 2);
+  assert.equal(t.c.state.dictation?.recognition, t.rec, 'still listening');
+  t.rec.onresult(t.result('넷 다섯'));
+  assert.equal(t.input.value, '하나 둘 셋 넷 다섯');
+  // Ended by its user: no new round.
+  t.rec.stop = function () { this.stopped++; };
+  t.mic.events.click();
+  t.rec.onend();
+  await t.settle();
+  assert.equal(t.rec.started, 2);
+  assert.equal(t.c.state.dictation, null);
+  // A hard error ends it, and says so.
+  t = run(android);
+  t.rec.onerror({ error: 'network' });
+  t.rec.onend();
+  assert.equal(t.rec.started, 1);
+  assert.match(t.entry.dictationNotice, /network/);
+  // Not on an iPad: its recognition ending ends the listening as before.
+  t = run('Mozilla/5.0 (iPad; CPU OS 26_6 like Mac OS X)');
+  t.rec.onresult(t.result('하나'));
+  t.rec.onend();
+  assert.equal(t.rec.started, 1);
+  assert.equal(t.c.state.dictation, null);
+  // "No speech" reported a moment before its end: the check in between does not end it.
+  t = run(android);
+  t.rec.onerror({ error: 'no-speech' });
+  t.tick();
+  t.rec.onend();
+  assert.equal(t.rec.started, 2);
+  assert.equal(t.c.state.dictation?.recognition, t.rec);
+  // A long dictation, one phrase per round, listens on past the bound: what it hears resets it.
+  t = run(android);
+  for (let round = 0; round < 40; round++) { t.rec.onresult(t.result('말' + round)); t.rec.onend(); }
+  assert.equal(t.rec.started, 41);
+  assert.equal(t.c.state.dictation?.recognition, t.rec);
+  // Bounded: rounds in a row with nothing heard end it.
+  t = run(android);
+  t.c.state.dictation.restarts = 1e6;
+  t.rec.onend();
+  assert.equal(t.c.state.dictation, null);
+});
+
 test('only an Android keyboard lets go of the field while it listens', async () => {
   for (const [agent, coarse, blurred] of [['Mozilla/5.0 (Linux; Android 15; SM-F741N)', true, 1],
     ['Mozilla/5.0 (iPad; CPU OS 26_6 like Mac OS X)', true, 0], ['Mozilla/5.0 (Linux; Android 15)', false, 0]]) {

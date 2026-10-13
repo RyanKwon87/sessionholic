@@ -753,6 +753,14 @@ button.host {
 .host.bad .dot {
   background: var(--red-fill);
 }
+.host.warn::after {
+  content: "확인 필요";
+  color: var(--t-orange);
+  font-weight: 500;
+}
+.host.warn .dot {
+  background: var(--t-orange);
+}
 .host.checking .dot {
   background: var(--t-orange);
   animation: pulse 1.4s ease-in-out infinite;
@@ -6746,6 +6754,7 @@ input.switch:focus-visible {
 
 /* Non-persistent runs have an execution state, without a saved conversation. */
 .card-execution, .detail-execution { color: var(--label-2); font-size: var(--fs-cap); }
+.detail-runtime { flex-basis: 100%; color: var(--label-2); font-size: var(--fs-cap); }
 .card-execution { flex: none; white-space: nowrap; }
 .conversation-history-notice { padding: 20px; border-radius: 12px; background: var(--fill-soft); color: var(--label); line-height: 1.65; overflow-wrap: anywhere; }
 .conversation-history-notice strong { font-size: var(--fs-body); }

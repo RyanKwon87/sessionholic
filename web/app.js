@@ -994,9 +994,14 @@ function render() {
 // A lost connection comes first: on a phone the chips scroll sideways and only the
 // first fit, so a device that is down is never the one pushed out of sight. A tap
 // says what each one's dot means (a touch has no hover title).
-const HOST_ORDER = { bad: 0, checking: 1, ok: 2 };
+// A device that answers but reports a problem of its own (a PC project server that is
+// off) is "warn": reachable, with something to check.
+const HOST_ORDER = { bad: 0, warn: 1, checking: 2, ok: 3 };
+function hostErrors(host) {
+  return (Array.isArray(host.data?.errors) ? host.data.errors : []).filter((text) => typeof text === "string" && text);
+}
 function hostTone(host) {
-  return host.refreshing ? "checking" : host.ok ? "ok" : "bad";
+  return host.refreshing ? "checking" : !host.ok ? "bad" : hostErrors(host).length ? "warn" : "ok";
 }
 function renderHosts(now) {
   const box = $("hosts");
@@ -1007,10 +1012,12 @@ function renderHosts(now) {
     const chip = el("button", `host ${hostTone(host)}`);
     chip.type = "button";
     chip.append(el("span", "dot"), el("span", null, host.label));
+    const errors = hostErrors(host);
+    const problems = errors.length ? ` · ${errors[0]}${errors.length > 1 ? ` 외 ${errors.length - 1}건` : ""}` : "";
     chip.title = host.refreshing
       ? `${host.label} · 작업 확인 중`
       : host.ok
-        ? `${host.label} · ${ago(host.fetchedAt, now)} 확인`
+        ? `${host.label} · ${ago(host.fetchedAt, now)} 확인${problems}`
         : `${host.label} · ${host.error || "연결 확인 필요"}${host.fetchedAt ? ` · 마지막 확인 ${ago(host.fetchedAt, now)}` : ""}`;
     chip.setAttribute("aria-label", chip.title);
     chip.addEventListener("click", () => toast(chip.title));
@@ -2440,7 +2447,9 @@ function detailMetaChildren(s) {
   const [label, tone] = BADGES[s.runtimeKnown === false ? "unknown" : s.phase] || ["상태 확인 필요", "gray"];
   return [el("span", `badge ${tone}`, label),
     el("span", null, [AGENTS[s.agent], s.account, s.hostLabel].filter(Boolean).join(" · ")),
-    el("span", null, initiatorLabel(s)), ...(sessionOneShot(s) ? [el("span", "detail-execution", "일회성 실행")] : []), el("span", null, clock(s.updatedAt))];
+    el("span", null, initiatorLabel(s)), ...(sessionOneShot(s) ? [el("span", "detail-execution", "일회성 실행")] : []), el("span", null, clock(s.updatedAt)),
+    // Why a PC record's state is what it is (its project server off, a codex exec running).
+    ...(typeof s.runtimeReason === "string" && s.runtimeReason ? [el("span", "detail-runtime", s.runtimeReason)] : [])];
 }
 function patchDetailMetadata(s) {
   const pane = $("detail");

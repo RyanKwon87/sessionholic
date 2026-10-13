@@ -27,6 +27,10 @@ import uuid
 LIMIT = 100
 ENDPOINT_LIMIT = 16
 TAIL_BYTES = 2 * 1024 * 1024
+# A Claude list row reads only a transcript's end: Claude appends its rename and generated
+# titles again and again, so the newest of each and the last answer sit in the final kilobytes.
+CLAUDE_LABEL_TAIL = 64 * 1024
+CLAUDE_TITLES = (('custom-title', 'customTitle'), ('agent-name', 'agentName'), ('ai-title', 'aiTitle'))
 MESSAGE_LIMIT = 80
 SID = re.compile(r'[0-9A-Za-z-]{8,64}\Z')
 CAPABILITIES = {'readOnly': True, 'canRead': True, 'canSend': False, 'canLaunch': False, 'canControl': False}
@@ -956,12 +960,19 @@ class WindowsCollector:
             status = row.get('status')
             phase = ('working' if status == 'busy' else 'needs_input' if status == 'waiting' else 'idle' if status == 'idle' else 'unknown') if exact else 'unknown'
             project = self.project(cwd)
+            title, snippet = _one_line(row.get('name'), 160), ''
+            if path:
+                try:
+                    named, snippet = _claude_label(path)
+                    title = title or named
+                except (OSError, ValueError):
+                    pass  # A transcript that cannot be read keeps the row without its label.
             output.append({'agent': 'claude', 'id': sid, 'sessionId': sid, 'home': '.claude', 'kind': 'background' if row.get('kind') == 'bg' else 'interactive',
-                'title': _text(row.get('name'), 160) or '(Claude 대화)', 'cwd': cwd, 'project': project,
+                'title': title or '(Claude 대화)', 'cwd': cwd, 'project': project,
                 'phase': phase, 'state': phase, 'status': status if exact else None, 'runtimeKnown': exact and phase != 'unknown',
                 'startedAt': _epoch(row.get('startedAt')), 'updatedAt': int(path.stat().st_mtime) if path else None,
                 'readOnly': True, 'canRead': path is not None or details.get('transcriptAvailability') == 'disabled',
-                'snippet': '', **_origin(row), **details})
+                'snippet': snippet, **_origin(row), **details})
         return output
 
     def snapshot(self):
@@ -1048,14 +1059,32 @@ def _head(path):
     return _entries(raw.splitlines()[:30])
 
 
-def _tail(path):
+def _tail(path, limit=TAIL_BYTES):
     with path.open('rb') as stream:
         stream.seek(0, os.SEEK_END)
         size = stream.tell()
-        stream.seek(max(0, size - TAIL_BYTES))
-        raw = stream.read(TAIL_BYTES)
+        stream.seek(max(0, size - limit))
+        raw = stream.read(limit)
     lines = raw.splitlines()
-    return _entries(lines[1:] if size > TAIL_BYTES else lines)
+    return _entries(lines[1:] if size > limit else lines)
+
+
+def _one_line(value, limit):
+    return ' '.join(value.split())[:limit] if isinstance(value, str) else ''
+
+
+def _claude_label(path):
+    """A list row's (title, last answer): the newest rename, else agent name, else generated
+    title from the transcript's end; with none, its first request from the start."""
+    entries = _tail(path, CLAUDE_LABEL_TAIL)
+    title = next((entry[key] for kind, key in CLAUDE_TITLES for entry in reversed(entries)
+                  if entry.get('type') == kind and _metadata(entry.get(key))), '')
+    if not title:
+        title = next((message['text'] for message in _claude_messages(_head(path))
+                      if message['role'] == 'user' and not message['text'].lstrip().startswith('<')), '')
+        title = _one_line(title, 60)
+    answer = next((message['text'] for message in reversed(_claude_messages(entries)) if message['role'] == 'assistant'), '')
+    return _one_line(title, 160), _one_line(answer, 140)
 
 
 def _entries(lines):

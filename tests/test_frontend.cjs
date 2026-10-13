@@ -3169,7 +3169,7 @@ test('recent card updates retain mounted buttons, selection, keyboard focus and 
   c.state.selected = first.key;
   c.renderGroups([first, second], 1100);
   const cards = byClass(c.get('groups'), 'card'); const selected = cards.find((card) => card.dataset.sessionKey === first.key);
-  assert.equal(cards[0].dataset.sessionKey, second.key); // Existing recent sort is unchanged.
+  assert.equal(cards[0].dataset.sessionKey, first.key); // The same title: the session key keeps the order.
   selected.focus = function () { this.focusCount = (this.focusCount || 0) + 1; c.context.document.activeElement = this; };
   c.context.document.activeElement = selected;
   const pane = c.get('task-list-pane'); pane.scrollTop = 55;
@@ -3221,7 +3221,7 @@ test('changing list filters removes hidden cards without changing the selected s
   const first = recentSession('preview-a', { title: '설정 점검', snippet: '이전에 확인한 대화의 본문', project: 'First project' });
   const second = recentSession('preview-b', { project: 'Second project' });
   c.state.selected = first.key; c.renderGroups([first, second], 1100);
-  const original = byClass(c.get('groups'), 'card')[0];
+  const original = byClass(c.get('groups'), 'card').find((card) => card.dataset.sessionKey === first.key);
   assert.equal(byClass(original, 'card-snippet')[0].textContent, '이전에 확인한 대화의 본문');
   assert.match(original.attributes['aria-label'], /대화 미리보기: 이전에 확인한 대화의 본문/);
   c.state.filters.project = 'Second project'; c.renderGroups([second], 1100);
@@ -3650,6 +3650,57 @@ test('pull to refresh reloads the board once and never overlaps a running refres
   await Promise.all([first, second]);
   assert.equal(c.state.pullRefreshing, false);
   assert.equal(requests[0], '/api/refresh');
+});
+
+test('a request with no answer within its limit fails as a timeout, so a held read never blocks the next; sends and launches wait longer', async () => {
+  const limits = [];
+  const c = client((path, options) => new Promise((resolve, reject) => {
+    options.signal.addEventListener('abort', () => reject(Object.assign(new Error('The operation was aborted.'), { name: 'AbortError' })));
+  }), noChatTimers);
+  c.context.AbortSignal = { timeout(ms) { const controller = new AbortController(); limits.push({ ms, controller }); return controller.signal; } };
+  const read = c.api('/api/snapshot');
+  assert.equal(limits[0].ms, 30000);
+  limits[0].controller.abort();
+  await assert.rejects(read, (err) => err.timeout === true && /응답이 늦어 기다리기를 멈췄습니다/.test(err.message));
+  const send = c.api('/api/chat/send', { method: 'POST', body: {} }).catch((err) => err);
+  const launch = c.api('/api/launch', { method: 'POST', body: {} }).catch((err) => err);
+  assert.deepEqual(limits.slice(1).map((item) => item.ms), [90000, 420000]);
+  // The caller's own abort still ends the request, and is not called a timeout.
+  const caller = new AbortController();
+  const own = c.api('/api/terminals', { signal: caller.signal });
+  caller.abort();
+  await assert.rejects(own, (err) => err.name === 'AbortError' && !err.timeout);
+  for (const item of limits) item.controller.abort();
+  assert.equal((await send).timeout, true); assert.equal((await launch).timeout, true);
+});
+
+test('pull to refresh waits for a list read in flight, then says it could not refresh when the read fails', async () => {
+  const requests = [];
+  let release = null;
+  const c = client(async (url) => {
+    requests.push(url);
+    if (url.startsWith('/api/snapshot')) {
+      if (!release) await new Promise((resolve) => { release = resolve; });
+      throw new TypeError('Load failed');
+    }
+    return { ok: true, status: 200, json: async () => ({ ok: true, hosts: [], terminals: [] }) };
+  }, { setTimeout: (callback, delay) => (delay === 700 ? setImmediate(callback) : 1), clearTimeout() {} });
+  c.state.authenticated = true;
+  const label = c.get('pull-refresh-label'); const seen = []; let text = '';
+  Object.defineProperty(label, 'textContent', { get: () => text, set: (value) => { text = value; seen.push(value); } });
+  const inFlight = c.poll(false);
+  await new Promise((resolve) => setImmediate(resolve));
+  const pulled = c.pullRefresh();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(requests.includes('/api/refresh'), false); // The read in flight is waited for first.
+  release();
+  assert.equal(await inFlight, false);
+  await pulled;
+  assert.ok(requests.indexOf('/api/refresh') > requests.indexOf('/api/snapshot'));
+  assert.equal(requests.filter((url) => url.startsWith('/api/snapshot')).length, 2);
+  assert.ok(seen.includes('새로고침하지 못했습니다'));
+  assert.ok(!seen.includes('업데이트됨'));
+  assert.ok(c.state.pollFailures >= 2);
 });
 
 function classes() {
@@ -7061,9 +7112,25 @@ test('the session list groups what needs an answer, what runs, what stopped in t
   const sections = c.get('groups').children.filter((node) => node.dataset?.groupKey);
   assert.deepEqual(sections.map((section) => section.cardHeading.textContent), ['답 필요', '작업 중', '최근 끝남', '이전']);
   const ids = (section) => section.children.filter((node) => node.dataset?.sessionKey).map((node) => node.dataset.sessionKey.split('|').pop());
-  assert.deepEqual(sections.map(ids), [['old-question'], ['running'], ['just-done', 'just-idle'], ['unknown', 'earlier']]);
+  // One title throughout: within a group the session key decides, never the update time.
+  assert.deepEqual(sections.map(ids), [['old-question'], ['running'], ['just-done', 'just-idle'], ['earlier', 'unknown']]);
   assert.equal(sections[2].cardHeading.className, 'group-head green');
   assert.ok(!shown.some((s) => s.id === 'ancient'), 'only the 이전 group drops sessions older than three days');
+});
+
+test('each list group keeps its sessions in title order (가나다, numbers by value) however often they update; a rename moves one', () => {
+  const c = client(undefined, noChatTimers);
+  const now = 2_000_000;
+  const at = (id, title, updatedAt) => recentSession(id, { phase: 'working', title, updatedAt });
+  const titles = () => byClass(c.get('groups'), 'card').map((card) => byClass(card, 'card-title')[0].textContent);
+  c.renderGroups([at('a', '작업 10', now - 1), at('b', '나 정리', now - 50), at('c', '작업 2', now - 9), at('d', '가 검토', now - 30)], now);
+  assert.deepEqual(titles(), ['가 검토', '나 정리', '작업 2', '작업 10']);
+  // Every session updates (in another order): the list does not move.
+  c.renderGroups([at('a', '작업 10', now - 40), at('b', '나 정리', now), at('c', '작업 2', now - 70), at('d', '가 검토', now - 2)], now);
+  assert.deepEqual(titles(), ['가 검토', '나 정리', '작업 2', '작업 10']);
+  // A 제목 수정 is how one is moved.
+  c.renderGroups([at('a', '0 먼저 볼 작업', now), at('b', '나 정리', now), at('c', '작업 2', now), at('d', '가 검토', now)], now);
+  assert.deepEqual(titles(), ['0 먼저 볼 작업', '가 검토', '나 정리', '작업 2']);
 });
 
 // The board's own clock format; ICU data differs between Node versions (오후 / PM),

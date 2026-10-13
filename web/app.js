@@ -138,7 +138,7 @@ const state = {
   pollTimer: null,
   pollBusy: false,
   pollRun: null, // the list read in flight (poll), shared by callers that wait for it
-  manualRefreshing: false,
+  manualRun: null, // the manual refresh in flight (manualRefresh), shared by a second press or pull
   updateAvailable: false, // the board serves a newer screen than this page runs (checkWebVersion)
   shownAt: Date.now(), // when the page was last shown (visibilitychange)
   authenticated: false,
@@ -702,7 +702,7 @@ function beginAuthEpoch() {
   state.authEpoch++;
   state.pollBusy = false;
   state.pollRun = null;
-  state.manualRefreshing = false;
+  state.manualRun = null;
   state.terminalsRefreshing = false;
   return state.authEpoch;
 }
@@ -726,13 +726,20 @@ const UPDATE_RETURN_MS = 15000;
 // (poll, refresh, chat state); one that runs out fails like a lost connection.
 // Paths the server answers only after remote work (a send, a launch) wait longer.
 const API_TIMEOUT_MS = { GET: 30000, POST: 45000 };
+// Each is longer than the server's own bound for that route.
 const API_PATH_TIMEOUT_MS = {
-  "/api/read": 45000, "/api/chat/send": 90000, "/api/chat/prompt": 60000, "/api/plan": 120000,
-  "/api/new-session": 120000, "/api/app-server": 120000, "/api/launch": 420000,
+  "/api/capabilities": 90000, "/api/read": 45000, "/api/chat/send": 90000, "/api/chat/prompt": 60000,
+  "/api/plan": 120000, "/api/new-session": 120000, "/api/app-server": 200000, "/api/launch": 660000,
 };
 const API_TIMEOUT_MESSAGE = "응답이 늦어 기다리기를 멈췄습니다. 연결을 확인한 뒤 다시 시도해 주세요.";
+// Where the server may already have acted: say so instead of inviting a blind retry.
+const API_TIMEOUT_STARTED = "응답이 늦어 기다리기를 멈췄습니다. 이미 시작됐거나 전달됐을 수 있으니 목록과 터미널을 확인한 뒤 다시 시도해 주세요.";
+const API_STARTED_PATHS = new Set(["/api/launch", "/api/new-session", "/api/app-server", "/api/chat/prompt"]);
+function apiPathname(path) {
+  return String(path).split("?")[0];
+}
 function apiTimeout(path, method) {
-  return API_PATH_TIMEOUT_MS[path] ?? API_TIMEOUT_MS[method] ?? API_TIMEOUT_MS.POST;
+  return API_PATH_TIMEOUT_MS[apiPathname(path)] ?? API_TIMEOUT_MS[method] ?? API_TIMEOUT_MS.POST;
 }
 // The caller's signal and the time limit, as one. A browser without
 // AbortSignal.timeout keeps the old behaviour (no limit).
@@ -749,9 +756,9 @@ function apiSignal(signal, timeout) {
   }
   return { signal: controller.signal, limit };
 }
-function apiTimedOut(limit) {
+function apiTimedOut(limit, path = "") {
   if (!limit?.aborted) return null;
-  const err = new Error(API_TIMEOUT_MESSAGE);
+  const err = new Error(API_STARTED_PATHS.has(apiPathname(path)) ? API_TIMEOUT_STARTED : API_TIMEOUT_MESSAGE);
   err.timeout = true;
   return err;
 }
@@ -768,7 +775,7 @@ async function api(path, { method = "GET", body, signal: callerSignal, authEpoch
       method, headers, body: body === undefined ? undefined : JSON.stringify(body),
       credentials: "same-origin", cache: "no-store", signal,
     });
-  } catch (err) { assertAuthEpoch(authEpoch); throw apiTimedOut(limit) || err; }
+  } catch (err) { assertAuthEpoch(authEpoch); throw apiTimedOut(limit, path) || err; }
   assertAuthEpoch(authEpoch);
   if (response.status === 401) {
     showLogin();
@@ -779,7 +786,7 @@ async function api(path, { method = "GET", body, signal: callerSignal, authEpoch
   const data = await response.json().catch(() => ({}));
   assertAuthEpoch(authEpoch);
   // A body cut off by the limit is not an empty answer.
-  const late = apiTimedOut(limit);
+  const late = apiTimedOut(limit, path);
   if (late) throw late;
   if (!response.ok && response.status === 403 && data.code === "csrf_expired" && csrfRetry &&
       method !== "GET" && CSRF_RETRY.has(path)) {
@@ -994,26 +1001,34 @@ function render() {
 // A lost connection comes first: on a phone the chips scroll sideways and only the
 // first fit, so a device that is down is never the one pushed out of sight. A tap
 // says what each one's dot means (a touch has no hover title).
-// A device that answers but reports a problem of its own (a PC project server that is
-// off) is "warn": reachable, with something to check.
-const HOST_ORDER = { bad: 0, warn: 1, checking: 2, ok: 3 };
-function hostErrors(host) {
-  return (Array.isArray(host.data?.errors) ? host.data.errors : []).filter((text) => typeof text === "string" && text);
+// A device that answers but warns of something to check (a PC project server that is
+// off, data.warnings) is "warn". The order follows what was last known (a lost device,
+// one with a warning, the rest as configured): a collection in progress only pulses the
+// dot, so chips never trade places every minute.
+const HOST_ORDER = { bad: 0, warn: 1, ok: 2 };
+function hostNotes(host, key) {
+  return (Array.isArray(host.data?.[key]) ? host.data[key] : []).filter((text) => typeof text === "string" && text);
+}
+function hostRank(host) {
+  return !host.ok ? "bad" : hostNotes(host, "warnings").length ? "warn" : "ok";
 }
 function hostTone(host) {
-  return host.refreshing ? "checking" : !host.ok ? "bad" : hostErrors(host).length ? "warn" : "ok";
+  return host.refreshing ? "checking" : hostRank(host);
 }
 function renderHosts(now) {
   const box = $("hosts");
+  // Rebuilt on every snapshot: a chip that had the keyboard keeps it.
+  const focused = box.contains?.(document.activeElement) ? document.activeElement.dataset?.host : null;
   box.replaceChildren();
   const hosts = state.snapshot.hosts.map((host, index) => ({ host, index }))
-    .sort((a, b) => HOST_ORDER[hostTone(a.host)] - HOST_ORDER[hostTone(b.host)] || a.index - b.index);
+    .sort((a, b) => HOST_ORDER[hostRank(a.host)] - HOST_ORDER[hostRank(b.host)] || a.index - b.index);
   for (const { host } of hosts) {
     const chip = el("button", `host ${hostTone(host)}`);
     chip.type = "button";
+    chip.dataset.host = host.name;
     chip.append(el("span", "dot"), el("span", null, host.label));
-    const errors = hostErrors(host);
-    const problems = errors.length ? ` · ${errors[0]}${errors.length > 1 ? ` 외 ${errors.length - 1}건` : ""}` : "";
+    const notes = [...hostNotes(host, "warnings"), ...hostNotes(host, "errors")];
+    const problems = notes.length ? ` · ${notes[0]}${notes.length > 1 ? ` 외 ${notes.length - 1}건` : ""}` : "";
     chip.title = host.refreshing
       ? `${host.label} · 작업 확인 중`
       : host.ok
@@ -1022,6 +1037,7 @@ function renderHosts(now) {
     chip.setAttribute("aria-label", chip.title);
     chip.addEventListener("click", () => toast(chip.title));
     box.append(chip);
+    if (focused && host.name === focused) chip.focus?.({ preventScroll: true });
   }
 }
 // While hosts are still collecting, say how old the list on screen is; the
@@ -6413,12 +6429,11 @@ async function startTerminalReader() {
     !document.hidden
   ) {
     try {
-      // A silently dropped connection (Wi-Fi to LTE) must not hold the long poll forever.
-      const signal = globalThis.AbortSignal?.any && AbortSignal.timeout
-        ? AbortSignal.any([controller.signal, AbortSignal.timeout(35000)]) : controller.signal;
+      // A silently dropped connection (Wi-Fi to LTE) must not hold the long poll forever:
+      // the server answers within 20 seconds, so 35 without one is a lost connection.
       const result = await api(
         `/api/terminal/${encodeURIComponent(id)}/events?after=${state.terminalAfter}&wait=20${state.terminalEpoch ? `&epoch=${encodeURIComponent(state.terminalEpoch)}` : ""}`,
-        { signal },
+        { signal: controller.signal, timeout: 35000 },
       );
       if (run !== state.terminalRun) return;
       // A malformed reply counts as a failed read, so it can never spin this loop.
@@ -7809,14 +7824,21 @@ async function pollOnce(refresh = false, { capabilities = true } = {}) {
     }
   }
 }
-// Resolves true when the list was read again. A read already in flight is
-// waited for (each one is time-limited) and then followed by this one, never
-// reported as a refresh that did not happen.
-async function manualRefresh() {
+// Resolves true when the list was read again, false when it was not, null when it
+// was not tried (a launch is being prepared). A read already in flight is waited for
+// (each one is time-limited) and then followed by this one, never reported as a
+// refresh that did not happen; a refresh in flight is shared by a second press or pull.
+function manualRefresh() {
   if (state.sessionCategory === "bot" && !$("session-layout").hidden) return loadBotRequests({ refresh: true });
-  if (state.launchBusy || state.manualRefreshing) return false;
+  if (state.manualRun) return state.manualRun;
+  if (state.launchBusy) return Promise.resolve(null);
+  const run = manualRefreshOnce();
+  state.manualRun = run;
+  run.finally(() => { if (state.manualRun === run) state.manualRun = null; });
+  return run;
+}
+async function manualRefreshOnce() {
   const authEpoch = state.authEpoch;
-  state.manualRefreshing = true;
   $("refresh").disabled = true;
   try {
     if (state.pollRun) await state.pollRun;
@@ -7838,10 +7860,7 @@ async function manualRefresh() {
     if (!err.unauthorized && !err.staleAuth) notice(err.message);
     return false;
   } finally {
-    if (authEpoch === state.authEpoch) {
-      state.manualRefreshing = false;
-      $("refresh").disabled = false;
-    }
+    if (authEpoch === state.authEpoch) $("refresh").disabled = false;
   }
 }
 // Phones (iOS large title): "작업" scrolls with the list. Once it has passed
@@ -7900,6 +7919,7 @@ async function pullRefresh() {
     if (selected && chatVisible()) await loadChatState(selected, true);
     if (networkOffline()) label = "오프라인입니다";
     else if (read === false) label = "새로고침하지 못했습니다";
+    else if (read === null) label = "실행을 준비하는 중이라 잠시 뒤 다시 당겨 주세요";
   } catch {
     label = "새로고침하지 못했습니다";
   } finally {
@@ -8077,10 +8097,20 @@ function checkWebVersion() {
 }
 // A newer screen loads now unless a reload would lose something (what warnDraftUnload
 // guards), interrupt a terminal or close an open sheet; the banner offers it then.
+// A plain reload is enough: the page is read from the network and assets carry ?v=.
 function reloadForUpdate() {
-  if (!state.updateAvailable || state.terminalVisible || unsavedWork() || document.querySelector?.("dialog[open]")) return false;
-  hardReload();
+  if (!state.updateAvailable || networkOffline() || state.terminalVisible || unsavedWork() ||
+      document.querySelector?.("dialog[open]")) return false;
+  window.location.reload();
   return true;
+}
+// The banner's tap: never at the cost of unsent words (a home-screen app shows no leave prompt).
+function updateBannerPressed() {
+  if (unsavedWork()) {
+    toast("보내지 않은 글이나 첨부가 있어 새로고침하지 않았습니다. 보내거나 지운 뒤 다시 눌러 주세요.");
+    return;
+  }
+  window.location.reload();
 }
 function renderConnectivity() {
   const update = $("update-banner");
@@ -8186,7 +8216,7 @@ window.addEventListener("DOMContentLoaded", () => {
   $("settings-close").addEventListener("click", closeSettings);
   $("settings-done").addEventListener("click", closeSettings);
   $("hard-reload")?.addEventListener("click", hardReload);
-  $("update-banner")?.addEventListener("click", hardReload);
+  $("update-banner")?.addEventListener("click", updateBannerPressed);
   $("settings-dialog").addEventListener("cancel", (event) => {
     event.preventDefault();
     closeSettings();

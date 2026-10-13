@@ -551,6 +551,30 @@ class ListingTest(unittest.TestCase):
         self.assertEqual(self.manager.terminals["c" * 32].read(0, 0)["data"], "")
         self.assertEqual(bytes(recent.output), b"just closed", "still readable right after closing")
 
+    def test_another_thread_never_reads_a_listings_answer(self):
+        row = self.add("a")
+        seen = []
+        def names():
+            # While this listing holds its answer, a reader thread asks on its own.
+            other = threading.Thread(target=lambda: seen.append(self.manager._exists(row)))
+            other.start(); other.join()
+            return {"sb-" + "a" * 32}
+        with patch.object(self.manager, "_live_names", side_effect=names), \
+                patch.object(self.manager, "_run", return_value=Mock(returncode=1)) as run:
+            self.assertTrue(self.manager.list()[0]["alive"])
+        self.assertEqual(seen, [False], "the other thread got tmux's own answer")
+        self.assertEqual(run.call_args.args[0], "has-session")
+
+    def test_the_oldest_closes_are_forgotten_first_whatever_order_they_were_opened(self):
+        for letter, closed_at in (("a", 300), ("b", 100), ("c", 200)):
+            self.add(letter, closed=True, reason="user").record["closedAt"] = closed_at
+        with patch.object(terminal, "USER_CLOSED_KEEP", 2):
+            self.assertEqual([row["id"][0] for row in self.manager.list()], ["a", "c"])
+        self.assertEqual(self.manager.take_forgotten(), [{"id": "b" * 32, "closed": True}])
+        self.assertEqual(self.manager.take_forgotten(), [])
+        self.manager.restore_forgotten([{"id": "b" * 32, "closed": True}])
+        self.assertEqual([row["id"] for row in self.manager.take_forgotten()], ["b" * 32])
+
     def test_rows_not_saved_as_forgotten_are_kept(self):
         for letter in "abc":
             self.add(letter, closed=True, reason="connection_ended")
@@ -994,7 +1018,8 @@ class TmuxFixtureTest(unittest.TestCase):
         saved = json.loads((Path(self.directory.name) / "sessions.json").read_text())
         closed = next(row for row in saved if row["id"] == first["id"])
         self.assertTrue(closed["closed"])
-        self.assertEqual(set(closed), {"id", "name", "key", "metadata", "closed", "closedReason", "socket"})
+        self.assertEqual(set(closed), {"id", "name", "key", "metadata", "closed", "closedReason", "closedAt", "socket"})
+        self.assertIs(type(closed["closedAt"]), int)
         self.assertEqual(closed["closedReason"], "user")
         self.assertEqual(closed["socket"], self.socket)
         self.assertNotIn("FIXTURE_READY", json.dumps(saved))

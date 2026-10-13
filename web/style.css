@@ -697,6 +697,9 @@ select:disabled {
   min-width: 0;
   overflow-x: auto;
   scrollbar-width: none;
+  /* Room inside the scroller for each chip's taller tap area and focus ring. */
+  padding-block: 7px;
+  margin-block: -7px;
 }
 .hosts::-webkit-scrollbar {
   display: none;
@@ -715,10 +718,21 @@ select:disabled {
   white-space: nowrap;
 }
 button.host {
+  position: relative;
   border: 0;
   color: inherit;
   font-family: inherit;
   cursor: pointer;
+}
+/* A 44px tall tap target around the 30px chip. */
+button.host::before {
+  content: "";
+  position: absolute;
+  inset: -7px 0;
+}
+/* Drawn inside: the sideways scroller would cut the first and last chip's ring. */
+button.host:focus-visible {
+  outline-offset: -3px;
 }
 .host > span:last-child {
   max-width: 140px;
@@ -6551,6 +6565,10 @@ input.switch:focus-visible {
 @media (max-width: 700px) {
   .offline-banner {
     top: calc(var(--top-inset) + var(--nav-h) + 6px);
+  }
+  /* On a phone's conversation screen the pill would sit over its header's buttons. */
+  body.show-detail .update-banner {
+    display: none;
   }
   body.show-detail .offline-banner {
     top: calc(var(--top-inset) + 8px);

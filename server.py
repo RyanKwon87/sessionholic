@@ -444,13 +444,17 @@ CLIENT_GONE = (BrokenPipeError, ConnectionResetError)
 # writes a line); past this size such a file is rotated (rotate_own_logs), checked this often.
 LOG_ROTATE_BYTES = 20 * 1024 * 1024
 LOG_ROTATE_SECONDS = 1800
+# What <name>.1 keeps of a rotated log: its end.
+LOG_KEEP_BYTES = 5 * 1024 * 1024
 
 
 def rotate_own_logs(state_dir, limit=LOG_ROTATE_BYTES):
     """A *.log file in the state folder that is this process's stdout or stderr (same file),
-    opened for append and over `limit`, is copied to <name>.1 (replacing the previous copy)
-    and emptied in place: an append-only writer simply goes on at the new end. Returns the
-    names rotated; anything unclear (another file, no append mode) is left alone."""
+    opened for append and over `limit`, keeps its last LOG_KEEP_BYTES in <name>.1 (replacing
+    the previous copy) and is emptied in place: an append-only writer simply goes on at the
+    new end. A copy that fails (a full disk) is removed and the log is emptied anyway, so
+    the rotation frees space rather than taking more. Returns the names rotated; anything
+    unclear (another file, no append mode) is left alone."""
     rotated = []
     try:
         candidates = [path for path in Path(state_dir).glob("*.log") if path.is_file() and not path.is_symlink()]
@@ -471,9 +475,21 @@ def rotate_own_logs(state_dir, limit=LOG_ROTATE_BYTES):
                 continue
             if not same:
                 continue
+            kept = path.with_name(path.name + ".1")
             try:
                 stream.flush()
-                shutil.copyfile(path, path.with_name(path.name + ".1"))
+            except (OSError, ValueError):
+                pass
+            try:
+                with open(path, "rb") as source, open(kept, "wb") as target:
+                    source.seek(max(0, info.st_size - LOG_KEEP_BYTES))
+                    shutil.copyfileobj(source, target)
+            except OSError:
+                try:
+                    kept.unlink()
+                except OSError:
+                    pass
+            try:
                 os.ftruncate(fd, 0)
                 rotated.append(path.name)
             except OSError:
@@ -1228,6 +1244,8 @@ class Board:
             if not (same and row["ok"] and row["live"] and not row["paused"] and row["error"] is None):
                 row.update(data=data, ok=True, paused=False, error=None, fetchedAt=int(now), live=True)
                 self.backoff.pop(stream.name, None)
+                # A failure logged by a one-shot collection is over: the watcher delivers.
+                self.log_collection(stream.name, {"ok": True, "durationMs": 0})
                 self.changed()
             moment = time.monotonic()
             if moment - self.live_saved.get(stream.name, moment - 30) >= 30:
@@ -2086,8 +2104,11 @@ class Handler(BaseHTTPRequestHandler):
         self.responded = False
         try:
             route()
-        except CLIENT_GONE:
-            # The client left mid-answer (a closed tab, a phone asleep): not this route's failure.
+        except CLIENT_GONE as exc:
+            # Once the answer has started, a broken connection is the client leaving (a closed
+            # tab, a phone asleep), not this route's failure; before it, it is logged as usual.
+            if not self.responded:
+                log_failure(f"{self.command} {urlparse(self.path).path} 처리", exc)
             self.close_connection = True
         except Exception as exc:
             log_failure(f"{self.command} {urlparse(self.path).path} 처리", exc)
@@ -2399,9 +2420,14 @@ class Handler(BaseHTTPRequestHandler):
                     version = self.server.events.terminals_version
                     records = self.server.terminals.list()
                     result = {"terminals": records, "version": version}
+                    # Rows the terminal list forgot (old closes) still may have receipts.
+                    take = getattr(self.server.terminals, "take_forgotten", None)
+                    forgotten = take() if take else []
                     try:
-                        self.server.terminal_inputs.prune_all_closed(records)
+                        self.server.terminal_inputs.prune_all_closed(records + forgotten)
                     except (ValueError, RuntimeError, OSError):
+                        if forgotten:
+                            self.server.terminals.restore_forgotten(forgotten)
                         result["inputCleanupPending"] = True
                     return self.send_json(200, result)
                 match = re.fullmatch(r"/api/terminal/([a-f0-9]{32})/events", url.path)

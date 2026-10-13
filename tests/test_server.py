@@ -1148,12 +1148,18 @@ class OperationsLogTest(unittest.TestCase):
         handler.wfile = Gone()
         handler.headers = {}
         handler._headers_buffer = []
+        def answered_then_reset():
+            handler.responded = True
+            raise ConnectionResetError("fixture: client left mid-answer")
         with patch("sys.stderr", new_callable=io.StringIO) as log:
             handler.send_json(200, {"ok": True})
             self.assertTrue(handler.close_connection)
-            handler.guarded(lambda: (_ for _ in ()).throw(ConnectionResetError("fixture")))
+            handler.guarded(answered_then_reset)
         self.assertNotIn("예상하지 못한 오류", log.getvalue())
-        self.assertNotIn("Traceback", log.getvalue())
+        # Before any answer a broken pipe is not known to be the client's: logged as before.
+        with patch("sys.stderr", new_callable=io.StringIO) as log:
+            handler.guarded(lambda: (_ for _ in ()).throw(BrokenPipeError("fixture: a helper's pipe")))
+        self.assertIn("예상하지 못한 오류 (BrokenPipeError)", log.getvalue())
 
     def test_a_request_line_says_the_status_and_time_but_never_the_query(self):
         handler = server.Handler.__new__(server.Handler)
@@ -1213,10 +1219,40 @@ class OperationsLogTest(unittest.TestCase):
             os.write(2, b"after\n")
         finally:
             os.dup2(saved, 2); os.close(saved); os.close(fd)
-        self.assertEqual((state / "service.stderr.log.1").read_bytes(), b"x" * 4096)
+        self.assertEqual((state / "service.stderr.log.1").read_bytes(), b"x" * 4096)  # under LOG_KEEP_BYTES: all of it
         self.assertEqual(log.read_bytes(), b"after\n", "an append-only writer goes on at the new end")
         self.assertEqual(other.read_bytes(), b"y" * 8192, "a file that is not this process's log is left alone")
         self.assertEqual(server.rotate_own_logs(state, limit=1024), [], "under the limit nothing is rotated")
+
+    def test_a_rotation_keeps_only_the_end_and_still_empties_the_log_when_the_copy_fails(self):
+        state = Path(tempfile.mkdtemp()); self.addCleanup(shutil.rmtree, state)
+        log = state / "stderr.log"
+        fd = os.open(str(log), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        os.write(fd, b"a" * 3000 + b"b" * 1000)
+        saved = os.dup(2)
+        try:
+            os.dup2(fd, 2)
+            with patch.object(server, "LOG_KEEP_BYTES", 1000):
+                self.assertEqual(server.rotate_own_logs(state, limit=1024), ["stderr.log"])
+            self.assertEqual((state / "stderr.log.1").read_bytes(), b"b" * 1000)
+            os.write(2, b"c" * 2000)
+            with patch.object(server.shutil, "copyfileobj", side_effect=OSError(28, "No space left on device")):
+                self.assertEqual(server.rotate_own_logs(state, limit=1024), ["stderr.log"])
+        finally:
+            os.dup2(saved, 2); os.close(saved); os.close(fd)
+        self.assertEqual(log.read_bytes(), b"", "a full disk still gets the space back")
+        self.assertFalse((state / "stderr.log.1").exists(), "no half-written copy is left behind")
+
+    def test_a_watcher_delivering_ends_a_logged_failure(self):
+        board = server.Board(HOSTS, 60, runner=lambda host, args, timeout: (_ for _ in ()).throw(RuntimeError("SSH 연결 실패")))
+        stream = server.HostStream(board, HOSTS[0])
+        with patch("sys.stderr", new_callable=io.StringIO) as log:
+            board.poll(HOSTS[0])
+            board.streams[HOSTS[0]["name"]] = stream
+            board.apply_live(stream, {"claude": [], "codex": [], "tmux": [], "errors": []})
+        lines = [line for line in log.getvalue().splitlines() if "기기 수집" in line]
+        self.assertEqual(len(lines), 2, lines)
+        self.assertIn("기기 수집 복구 remote", lines[1])
 
     def test_a_full_disk_is_named_in_an_unavailable_answer(self):
         import errno

@@ -36,6 +36,8 @@ CLAUDE_PROBE_LIMIT = 16
 WRITER_LOCK_LIMIT = 64
 WRITER_LOCK_SECONDS = 3
 SERVER_DOWN = '이 프로젝트의 Codex 서버가 PC에서 꺼져 있어 실행 상태를 확인하지 못했습니다.'
+# A stopped server is mentioned only for projects used this recently.
+SERVER_DOWN_RECENT_SECONDS = 7 * 86400
 CLAUDE_PROBE_SECONDS = 2
 ANCESTRY_LIMIT = 6
 NOT_PERSISTED = {'code': 'not_persisted', 'message': '대화 기록을 저장하지 않는 일회성 실행입니다. 실행 상태를 확인하고 결과는 요청한 에이전트에서 확인해 주세요.'}
@@ -547,8 +549,10 @@ class WindowsCollector:
         self.proxy_factory, self.process_reader = proxy_factory, process_reader
         self.parent_reader, self.flags_reader = parent_reader, flags_reader
         self.owner_reader = owner_reader
-        # Project servers that ran here and are gone (endpoints fills it on each snapshot).
-        self.down = []
+        # Project servers that ran here and are gone, every server name and every server
+        # process recorded (endpoints fills them on each snapshot).
+        self.down, self.servers, self.server_pids = [], [], set()
+        self.warnings = []
         self.hostname = hostname or socket.gethostname()
 
     def project(self, cwd):
@@ -633,14 +637,23 @@ class WindowsCollector:
 
     def endpoints(self):
         root = self.codex_home / 'agents-servers'
-        found, self.down = [], []
+        found, self.down, self.servers, self.server_pids = [], [], [], set()
         # Only existing, bounded server-state files belonging to this home are considered.
         for state in sorted(root.glob('*/server-state.json'))[:ENDPOINT_LIMIT]:
+            self.servers.append(state.parent.name)
             path = self.endpoint(state.parent.name)
             if path is not None:
                 found.append(path)
             elif self._server_down(state.parent.name):
+                # Its pid may already belong to another process (a codex exec): not a server's.
                 self.down.append(state.parent.name)
+                continue
+            try:
+                recorded = _json(state, self.codex_home)
+                if isinstance(recorded, dict) and type(recorded.get('server_pid')) is int:
+                    self.server_pids.add(recorded['server_pid'])
+            except (OSError, ValueError):
+                pass
         return found
 
     def _server_down(self, project):
@@ -684,8 +697,13 @@ class WindowsCollector:
         for path in locks:
             if time.monotonic() >= deadline:
                 break
-            owners = self.owner_reader(path)
-            if not isinstance(owners, list) or len(owners) != 1 or not isinstance(owners[0], dict):
+            try:
+                owners = self.owner_reader(path)
+            except Exception:
+                continue
+            # A project server holds the locks of the threads it has loaded: not a writer outside it.
+            if (not isinstance(owners, list) or len(owners) != 1 or not isinstance(owners[0], dict)
+                    or owners[0].get('pid') in self.server_pids):
                 continue
             process = self.process_reader(owners[0].get('pid'))
             if (isinstance(process, dict) and isinstance(owners[0].get('start'), str)
@@ -751,20 +769,24 @@ class WindowsCollector:
             except (OSError, ValueError, TimeoutError, subprocess.SubprocessError):
                 errors.append('PC 프로젝트 서버 상태를 읽지 못했습니다. 저장된 기록을 표시합니다.')
                 # A failed endpoint is never retried during this collection.
-        if self.down:
-            errors.append('PC 프로젝트 Codex 서버가 꺼져 있어 그 프로젝트의 실행 상태를 확인하지 못했습니다: '
-                          + ', '.join(self.down[:6]) + '. PC에서 그 프로젝트를 열면 서버가 켜집니다.')
+        # A stopped server is a warning (not a collection error) for projects used lately.
+        servers = {row['id']: self.project_server(row.get('cwd'), self.servers) for row in rows}
+        recent = time.time() - SERVER_DOWN_RECENT_SECONDS
+        down = [name for name in self.down if any(server == name and (_epoch(row.get('updated_at')) or 0) >= recent
+                                                 for row in rows for server in [servers[row['id']]])]
+        if down:
+            self.warnings.append('PC 프로젝트 Codex 서버가 꺼져 있어 그 프로젝트의 실행 상태를 확인하지 못했습니다: '
+                                 + ', '.join(down[:6]) + '. PC에서 그 프로젝트를 열면 서버가 켜집니다.')
         try:
             held = self.writer_owners({row['id'] for row in rows if row['id'] not in live or row['id'] in ambiguous})
-        except (OSError, ValueError):
+        except Exception:
             held = {}
         output = []
         for row in rows:
             observed = None if row['id'] in ambiguous else live.get(row['id'])
             if observed and _norm(observed.get('cwd')) != _norm(row.get('cwd')):
                 observed = None
-            output.append(self._row(row, observed, held=row['id'] in held,
-                                    down=bool(self.down) and self.project_server(row.get('cwd'), self.down) is not None))
+            output.append(self._row(row, observed, held=row['id'] in held, down=servers[row['id']] in self.down))
         return output
 
     def _transcripts(self):
@@ -944,6 +966,8 @@ class WindowsCollector:
 
     def snapshot(self):
         errors = []
+        # Something to check on this PC that is not a failed collection (a stopped server).
+        self.warnings = []
         try:
             codex = self.codex_rows(errors)
         except (OSError, ValueError, sqlite3.Error):
@@ -955,7 +979,7 @@ class WindowsCollector:
             claude = []
             errors.append('PC Claude 저장 목록을 읽지 못했습니다.')
         return {'collectedAt': int(time.time()), 'codex': codex, 'claude': claude, 'tmux': [],
-                'errors': errors, 'capabilities': dict(CAPABILITIES), 'platform': 'windows'}
+                'errors': errors, 'warnings': list(self.warnings), 'capabilities': dict(CAPABILITIES), 'platform': 'windows'}
 
     def read(self, agent, sid, home=None):
         if not SID.fullmatch(sid or '') or agent not in ('codex', 'claude'):

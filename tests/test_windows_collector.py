@@ -404,19 +404,54 @@ class WindowsCollectorTest(unittest.TestCase):
     def test_a_project_server_that_is_gone_is_said_on_the_board_and_on_its_records(self):
         self.reader.binary.parent.mkdir(parents=True, exist_ok=True)
         self.endpoint('fixture-project', exit_code=1)
+        connection = sqlite3.connect(self.db)
+        connection.execute('UPDATE threads SET updated_at=?', (int(time.time()) - 3600,))
+        connection.commit(); connection.close()
         result = self.reader.snapshot()
-        self.assertEqual(len(result['errors']), 1)
-        self.assertIn('PC 프로젝트 Codex 서버가 꺼져 있어', result['errors'][0])
-        self.assertIn('fixture-project', result['errors'][0])
+        self.assertEqual(result['errors'], [], 'a stopped server is a warning, not a failed collection')
+        self.assertEqual(len(result['warnings']), 1)
+        self.assertIn('PC 프로젝트 Codex 서버가 꺼져 있어', result['warnings'][0])
+        self.assertIn('fixture-project', result['warnings'][0])
         row = result['codex'][0]
         self.assertEqual((row['phase'], row['runtimeReason']), ('unknown', wc.SERVER_DOWN))
         # Its process gone is the same; an elevated server is unverifiable, not down.
         self.endpoint('fixture-project')
         with patch.object(self.reader, 'process_reader', return_value=None):
-            self.assertIn('fixture-project', self.reader.snapshot()['errors'][0])
+            self.assertIn('fixture-project', self.reader.snapshot()['warnings'][0])
         self.endpoint('fixture-project', elevated=True)
-        self.assertEqual(self.reader.snapshot()['errors'], [])
+        self.assertEqual(self.reader.snapshot()['warnings'], [])
+        # A project not used for a week is not warned about (its records still say why).
+        self.endpoint('fixture-project', exit_code=1)
+        connection = sqlite3.connect(self.db)
+        connection.execute('UPDATE threads SET updated_at=?', (int(time.time()) - 8 * 86400,))
+        connection.commit(); connection.close()
+        result = self.reader.snapshot()
+        self.assertEqual(result['warnings'], [])
+        self.assertEqual(result['codex'][0]['runtimeReason'], wc.SERVER_DOWN)
         self.assertEqual(self.calls, [])
+
+    def test_a_running_project_server_of_the_folder_wins_over_a_stopped_look_alike(self):
+        self.reader.binary.parent.mkdir(parents=True, exist_ok=True)
+        self.endpoint('fixture-project')
+        self.endpoint('fixture-project-old', exit_code=1)
+        self.live = {**self.live, 'id': 'not-this-thread'}
+        row = self.reader.snapshot()['codex'][0]
+        self.assertNotEqual(row.get('runtimeReason'), wc.SERVER_DOWN)
+
+    def test_a_project_server_holding_its_loaded_threads_lock_is_not_a_writer_outside_it(self):
+        sid = self.exec_row()
+        self.endpoint('fixture-server', elevated=True, server_pid=4242)
+        self.reader.owner_reader = lambda path: [{'pid': 4242, 'start': '123456'}] if path.stem == sid else None
+        row = next(row for row in self.reader.snapshot()['codex'] if row['id'] == sid)
+        self.assertEqual((row['phase'], row['runtimeKnown']), ('unknown', False))
+        self.assertNotIn('서버 밖', row.get('runtimeReason') or '')
+        # A stopped server's pid, given again to a codex exec, is that exec's.
+        self.endpoint('fixture-server', exit_code=1, server_pid=4242)
+        row = next(row for row in self.reader.snapshot()['codex'] if row['id'] == sid)
+        self.assertEqual(row['phase'], 'working')
+        # A failing Restart Manager call never fails the collection.
+        self.reader.owner_reader = lambda path: (_ for _ in ()).throw(AttributeError('fixture'))
+        self.assertEqual(len(self.reader.snapshot()['codex']), 2)
 
     def test_a_codex_exec_that_holds_its_writer_lock_shows_as_working(self):
         sid = self.exec_row()

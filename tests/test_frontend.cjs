@@ -9891,3 +9891,57 @@ test("typing with an iPad's on-screen keyboard folds the top bar; beside a docke
   c.updateViewport();
   assert.equal(classes.has("keyboard-typing"), false);
 });
+
+test('an Android keyboard rewriting the draft as it lets go does not end the listening, and its words land', async () => {
+  const android = 'Mozilla/5.0 (Linux; Android 15; SM-F741N) Chrome/141';
+  const { c, recognitions, FakeRecognition, result } = dictationClient();
+  c.context.webkitSpeechRecognition = FakeRecognition;
+  c.context.navigator = { userAgent: android, onLine: true };
+  c.context.window.matchMedia = (query) => ({ matches: query === '(pointer: coarse)' });
+  const { s, entry } = selectChat(c);
+  entry.text = '앞 글';
+  const composer = c.buildChatComposer(s);
+  const input = findId(composer, 'chat-input');
+  input.selectionStart = input.selectionEnd = 3;
+  // Letting go, Samsung's keyboard takes back the word it held and writes it again.
+  input.blur = () => {
+    c.context.document.activeElement = c.context.document.body;
+    input.value = '앞 '; input.events.input();
+    input.value = '앞 글'; input.events.input();
+  };
+  c.context.document.activeElement = input;
+  findId(composer, 'chat-mic').events.click();
+  const [rec] = recognitions;
+  assert.equal(rec.started, 1);
+  assert.equal(c.state.dictation?.recognition, rec, 'still listening after the keyboard let go');
+  rec.onstart();
+  assert.equal(c.get('chat-status').textContent, c.DICTATION_LISTENING);
+  // A late commit from the keyboard, before any words: the field's text, not an edit to stop for.
+  input.value = '앞 글.'; input.selectionStart = input.selectionEnd = 4; input.events.input();
+  assert.equal(c.state.dictation?.recognition, rec);
+  rec.onresult(result('안녕하세요'));
+  assert.equal(input.value, '앞 글. 안녕하세요');
+  assert.equal(entry.text, input.value);
+  // Once words landed, a change still ends it (the user's edit wins).
+  c.context.document.activeElement = input;
+  input.value = '앞 글. 안녕'; input.events.input();
+  assert.equal(c.state.dictation, null);
+});
+
+test('a recognition left behind by an ended listening is stopped when it starts or answers', async () => {
+  const { c, recognitions, FakeRecognition, result } = dictationClient();
+  c.context.webkitSpeechRecognition = FakeRecognition;
+  const { s } = selectChat(c);
+  const composer = c.buildChatComposer(s);
+  const input = findId(composer, 'chat-input');
+  findId(composer, 'chat-mic').events.click();
+  const [old] = recognitions;
+  c.stopDictation({ abort: true });
+  const aborted = old.aborted;
+  // A platform that still starts it, or still sends words, does not hold the microphone.
+  old.onstart();
+  assert.equal(old.aborted, aborted + 1);
+  old.onresult(result('늦은 말'));
+  assert.equal(old.aborted, aborted + 2);
+  assert.equal(input.value, '');
+});

@@ -128,7 +128,7 @@ function client(
   vm.runInContext(messageSource, context);
   vm.runInContext(source, context);
   const api = vm.runInContext(
-    "({state,api,sourceOf,accountOf,sendInput,pasteDraft,prepareDraftPaste,startDraftComposition,endDraftComposition,inputDraft,stopTerminalReader,startTerminalReader,closePlan,navigateView,backToList,backFromTerminal,closeTerminal,cancelTerminalClose,confirmTerminalClose,populateAccount,populateRoute,updateContinue,renderPlan,launchPlan,openTerminal,saveDraft,draftKey,refreshTerminals,renderTerminals,renderTerminalReturn,renderFilters,terminalCloseCopy,warnDraftUnload,preparePlan,renderGroups,renderMessages,loadDetail,chatKey,chatEntry,currentChat,chatSupported,chatRecovery,recoverChatSession,openChatTerminal,chatAttachmentsSupported,buildChatComposer,sendChat,loadChatState,applyChatReceipt,uploadChatFiles,pasteChat,scheduleChatPoll,stopChatPolling,openNativeChat,allSessions,buildContinuePanel,chatReceiptCopy,returnToBoard,readChatClipboard,accountDisplay,sessionAccountLabel,closeChatToolsOutside,closeChatToolsEscape,drawDetail,refreshDetail,loadCapabilities,matches,recoverConnection,networkOffline,poll,select,focusDetailBack,restoreSelectedCardFocus,showLogin,lock,beginAuthEpoch,resizeChatInput,updateViewport,draftKeydown,configureTerminalKeyboard,queueTerminalScroll,flushTerminalScroll,terminalScrollEnd,resetTerminalScroll,renderAttention,chatPollDelay,pullRefresh,readingScroll,renderJump,pullDistance,listScroll,setReading,renderPrompt,promptAction,renderUsage,loadUsage,applyTheme,setTheme,updateThemeColor,haptic,navTransition,setDetailShown,chatVisible,sheetRelease,BottomSheet,sheet,openSettings,closeSettings,setTyping,pinchFontSize,setTerminalFontSize,loadXterm,assetUrl,syncEvents,closeEvents,eventsHealthy,renderFreshness,schedule,touchDevice,togglePhaseFilter,renderCounts,createLongPress,swipeIntent,swipeRelease,groupMessageRows,setTextSize,applyTextSize,renderConnectivity,terminalForSession,swipeActionFor,openMessageMenu,openCardMenu,messageActions,outboxShape,outboxMatches,outboxOrigin,settleOutbox,retryOutbox,renderAttachmentTiles,attachmentThumb,sendUpload,openActionSheet,closeActionSheet,setListCollapsed,closeSwipe,settleSwipe,prepareSwipe,runSwipeAction,GESTURE,setChromeVisible,toggleChrome,revealChrome,isChromeTap,snapshotAnnounced,updateChatComposer,capabilitiesRevision,toolKindOf,userMessageParts,formatElapsed,tickWorking,renderTerminalMarks,renderDetailTerminal,terminalsAnnounced,goToSessionTerminal,rememberTerminal,terminalMenu,updateTerminalMenu,chooseTerminalMenu,clearTerminalMenu,renderNewSession,openNewSession,startNewSession,startAppServer,rememberConversationView,restoreConversationView,conversationIdentity,initiatorOf,initiatorLabel,documentKeydown,sessionCategoryOf,setSessionCategory,renderSessionCategories,prepareSessionListFor,sessionCategoryKeydown,render,resetFilters,terminalTitle,renameTerminals,requestedSessionFrom,requestSessionOpen,openRequestedSession,answerOnOpen,hardReload,terminalKeyBytes,terminalKeyFromEvent,pressTerminalKey,toggleTerminalMod,clearTerminalMods,renderTerminalMods,draftBeforeInput,terminalDocumentKey,xtermKeyEvent,renderHardware,loadHardware,startDictation,stopDictation,dictationText,toggleDraftDictation,renderDictation,DICTATION_LISTENING,DICTATION_ERRORS,DICTATION_PREPARING,DICTATION_STALLED,DICTATION_ENDED_AT_ONCE,DICTATION_INTERRUPTED,DICTATION_NOT_STARTED,DICTATION_SILENCE_END,DICTATION_CHANGED,bindDraftInput,insertChatText,reloadForUpdate,checkWebVersion,unsavedWork,detailMetaChildren,updateBannerPressed,manualRefresh,listNavigationKeydown,sessionUnread,markSeen,quickReplies,saveQuickReplies,openQuickReplies,terminalEndedCopy,terminalContextCopy,sessionForTerminal,showTerminalEnded,reopenEndedTerminal,csrfRetryable,tidySession})",
+    "({state,api,sourceOf,accountOf,sendInput,pasteDraft,prepareDraftPaste,startDraftComposition,endDraftComposition,inputDraft,stopTerminalReader,startTerminalReader,closePlan,navigateView,backToList,backFromTerminal,closeTerminal,cancelTerminalClose,confirmTerminalClose,populateAccount,populateRoute,updateContinue,renderPlan,launchPlan,openTerminal,saveDraft,draftKey,refreshTerminals,renderTerminals,renderTerminalReturn,renderFilters,terminalCloseCopy,warnDraftUnload,preparePlan,renderGroups,renderMessages,loadDetail,chatKey,chatEntry,currentChat,chatSupported,chatRecovery,recoverChatSession,openChatTerminal,chatAttachmentsSupported,buildChatComposer,sendChat,loadChatState,applyChatReceipt,uploadChatFiles,pasteChat,scheduleChatPoll,stopChatPolling,openNativeChat,allSessions,buildContinuePanel,chatReceiptCopy,returnToBoard,readChatClipboard,accountDisplay,sessionAccountLabel,closeChatToolsOutside,closeChatToolsEscape,drawDetail,refreshDetail,loadCapabilities,matches,recoverConnection,networkOffline,poll,select,focusDetailBack,restoreSelectedCardFocus,showLogin,lock,beginAuthEpoch,resizeChatInput,updateViewport,draftKeydown,configureTerminalKeyboard,queueTerminalScroll,flushTerminalScroll,terminalScrollEnd,resetTerminalScroll,renderAttention,chatPollDelay,pullRefresh,readingScroll,renderJump,pullDistance,listScroll,setReading,renderPrompt,promptAction,renderUsage,loadUsage,applyTheme,setTheme,updateThemeColor,haptic,navTransition,setDetailShown,chatVisible,sheetRelease,BottomSheet,sheet,openSettings,closeSettings,setTyping,pinchFontSize,setTerminalFontSize,loadXterm,assetUrl,syncEvents,closeEvents,eventsHealthy,renderFreshness,schedule,touchDevice,togglePhaseFilter,renderCounts,createLongPress,swipeIntent,swipeRelease,groupMessageRows,setTextSize,applyTextSize,renderConnectivity,terminalForSession,swipeActionFor,openMessageMenu,openCardMenu,messageActions,outboxShape,outboxMatches,outboxOrigin,settleOutbox,retryOutbox,renderAttachmentTiles,attachmentThumb,sendUpload,openActionSheet,closeActionSheet,setListCollapsed,closeSwipe,settleSwipe,prepareSwipe,runSwipeAction,GESTURE,setChromeVisible,toggleChrome,revealChrome,isChromeTap,snapshotAnnounced,updateChatComposer,capabilitiesRevision,toolKindOf,userMessageParts,formatElapsed,tickWorking,renderTerminalMarks,renderDetailTerminal,terminalsAnnounced,goToSessionTerminal,rememberTerminal,terminalMenu,updateTerminalMenu,chooseTerminalMenu,clearTerminalMenu,renderNewSession,openNewSession,startNewSession,startAppServer,rememberConversationView,restoreConversationView,conversationIdentity,initiatorOf,initiatorLabel,documentKeydown,sessionCategoryOf,setSessionCategory,renderSessionCategories,prepareSessionListFor,sessionCategoryKeydown,render,resetFilters,terminalTitle,renameTerminals,requestedSessionFrom,requestSessionOpen,openRequestedSession,answerOnOpen,hardReload,terminalKeyBytes,terminalKeyFromEvent,pressTerminalKey,toggleTerminalMod,clearTerminalMods,renderTerminalMods,draftBeforeInput,terminalDocumentKey,xtermKeyEvent,renderHardware,loadHardware,startDictation,stopDictation,dictationText,toggleDraftDictation,renderDictation,DICTATION_LISTENING,DICTATION_ERRORS,DICTATION_PREPARING,DICTATION_STALLED,DICTATION_ENDED_AT_ONCE,DICTATION_INTERRUPTED,DICTATION_NOT_STARTED,DICTATION_SILENCE_END,DICTATION_CHANGED,DICTATION_ENDING,bindDraftInput,insertChatText,reloadForUpdate,checkWebVersion,unsavedWork,detailMetaChildren,updateBannerPressed,manualRefresh,listNavigationKeydown,sessionUnread,markSeen,quickReplies,saveQuickReplies,openQuickReplies,terminalEndedCopy,terminalContextCopy,sessionForTerminal,showTerminalEnded,reopenEndedTerminal,csrfRetryable,tidySession})",
     context,
   );
   api.state.csrf = "csrf-test";
@@ -8763,6 +8763,62 @@ test('heard words are kept: a briefly locked input, a list that starts over, a s
   await settle();
 });
 
+test('a list that merges or drops its changing results, or repeats what it heard, writes each word once', async () => {
+  const fin = (text) => Object.assign([{ transcript: text }], { isFinal: true });
+  const mid = (text) => [{ transcript: text }];
+  const cases = [
+    // Chrome: a final with changing results after it, which merge into one final.
+    ['', [[fin('안녕하세요'), mid('오늘'), mid('날씨')], [fin('안녕하세요'), fin('오늘 날씨')]], '안녕하세요 오늘 날씨'],
+    // Chrome: two changing results become one final.
+    ['', [[mid('오늘'), mid('날씨')], [fin('오늘 날씨')]], '오늘 날씨'],
+    // A final whose punctuation changes is the same words.
+    ['', [[fin('안녕하세요'), mid('오늘')], [fin('안녕하세요.'), mid('오늘')]], '안녕하세요. 오늘'],
+    // Android starts over with everything it heard so far.
+    ['Mozilla/5.0 (Linux; Android 15)', [[fin('오늘 날씨')], [mid('오늘 날씨 어때')]], '오늘 날씨 어때'],
+    // WebKit starts over with only what follows: the earlier final stays.
+    ['', [[fin('하나')], [mid('둘')]], '하나 둘'],
+  ];
+  for (const [agent, events, expected] of cases) {
+    const { c, recognitions, FakeRecognition } = dictationClient();
+    c.context.webkitSpeechRecognition = FakeRecognition;
+    c.context.navigator = { userAgent: agent, onLine: true };
+    const { s } = selectChat(c);
+    const composer = c.buildChatComposer(s);
+    const input = findId(composer, 'chat-input');
+    findId(composer, 'chat-mic').events.click();
+    const rec = recognitions.at(-1);
+    rec.onstart();
+    for (const results of events) rec.onresult({ results });
+    assert.equal(input.value, expected, JSON.stringify(events));
+  }
+});
+
+test('a listening mic can always end it, and says it is finishing', async () => {
+  const { c, recognitions, FakeRecognition, settle } = dictationClient();
+  c.context.webkitSpeechRecognition = FakeRecognition;
+  const { s, entry } = selectChat(c);
+  const composer = c.buildChatComposer(s);
+  const input = findId(composer, 'chat-input');
+  const mic = findId(composer, 'chat-mic');
+  mic.events.click();
+  const rec = recognitions.at(-1);
+  rec.onstart();
+  rec.stop = function () { this.stopped++; };
+  // A send whose result is not known yet locks the input (read-only).
+  entry.pending = { requestId: 'request-0001', revision: entry.revision };
+  c.updateChatComposer(entry);
+  assert.equal(input.readOnly, true);
+  assert.equal(mic.disabled, false, 'locked input, mic still ends the listening');
+  mic.events.click();
+  assert.equal(rec.stopped, 1);
+  assert.equal(entry.dictationNotice, c.DICTATION_ENDING);
+  rec.onend();
+  await settle();
+  assert.equal(c.state.dictation, null);
+  c.updateChatComposer(entry);
+  assert.equal(mic.disabled, true, 'not listening: a locked input keeps its mic off');
+});
+
 test('only an Android keyboard lets go of the field while it listens', async () => {
   for (const [agent, coarse, blurred] of [['Mozilla/5.0 (Linux; Android 15; SM-F741N)', true, 1],
     ['Mozilla/5.0 (iPad; CPU OS 26_6 like Mac OS X)', true, 0], ['Mozilla/5.0 (Linux; Android 15)', false, 0]]) {
@@ -8779,6 +8835,15 @@ test('only an Android keyboard lets go of the field while it listens', async () 
     findId(composer, 'chat-mic').events.click();
     assert.equal(recognitions.length, 1, agent);
     assert.equal(blurs, blurred, agent);
+    // The terminal's input line keeps its focus everywhere: keys would go to the CLI otherwise.
+    c.stopDictation({ abort: true });
+    const draft = c.get('terminal-draft');
+    let draftBlurs = 0;
+    draft.blur = () => { draftBlurs++; };
+    c.context.document.activeElement = draft;
+    c.state.terminal = { id: 'term-1' };
+    c.toggleDraftDictation();
+    assert.equal(draftBlurs, 0, agent);
   }
 });
 

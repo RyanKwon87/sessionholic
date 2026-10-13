@@ -3587,12 +3587,14 @@ function startDictation(field, { report, active, releaseKeyboard = false }) {
   if (!Recognition || !field || field.disabled || field.readOnly) return false;
   stopDictation({ abort: true });
   const focusedAtPress = document.activeElement === field;
-  // Android keyboards (Samsung's among them) rewrite or commit again a focused field's text
-  // they did not type, which reads as the user's own typing and ends the listening. There the
-  // chat input's keyboard lets go while it listens; elsewhere it stays open. (The terminal's
-  // input line keeps its focus: without it, keys would go straight to the CLI.) It lets go
-  // before the field is read: letting go may write the words it held once more.
-  const letGo = releaseKeyboard && touchDevice() && dictationCumulative() && focusedAtPress;
+  // Touch keyboards get in the listening's way: Android's (Samsung's among them) rewrite or
+  // commit again a focused field's text they did not type, which reads as the user's own
+  // typing, and iPadOS gives the recognition no sound while its on-screen keyboard is up (it
+  // starts, and hears nothing). So the chat input's keyboard lets go while it listens. The
+  // terminal's input line lets go only of an on-screen keyboard: with a hardware keyboard,
+  // keys typed with nothing focused would go straight to the CLI. It lets go before the field
+  // is read: letting go may write the words it held once more.
+  const letGo = touchDevice() && focusedAtPress && (releaseKeyboard || keyboardOpen());
   const valueAtPress = String(field.value || "").length;
   if (letGo) field.blur?.();
   let recognition;
@@ -8943,6 +8945,8 @@ function updateViewport() {
   document.documentElement.style.setProperty("--app-height", `${height}px`);
   redock();
   renderKeyboardRoom();
+  renderAppShift();
+  traceKeyboardRoom();
   syncChromeMode();
   const selected = selectedSession();
   if (selected) resizeChatInput(chatEntry(selected));
@@ -8961,6 +8965,49 @@ function renderKeyboardRoom() {
   classes?.[beside ? "add" : "remove"]("keyboard-beside");
   document.documentElement.style?.setProperty?.("--layout-height", `${Math.round(state.viewportTall || window.innerHeight || 0)}px`);
   return changed;
+}
+// iOS scrolls the page to show a focused field above its keyboard before the app shrinks to
+// the space left (--app-height): the app then sits above what is on screen, which is blank
+// unless scrolled back. While an on-screen keyboard is up the app follows the visible area.
+function renderAppShift() {
+  const viewport = window.visualViewport;
+  const top = viewport && touchDevice() && editingText() && keyboardOpen()
+    ? Math.max(0, Math.round(viewport.pageTop ?? ((window.scrollY || 0) + (viewport.offsetTop || 0)))) : 0;
+  if (top === (state.appShift || 0)) return;
+  state.appShift = top;
+  document.documentElement.style?.setProperty?.("--app-shift", `${top}px`);
+  document.body?.classList?.[top ? "add" : "remove"]("app-shifted");
+}
+// The keyboard's room as this device reports it (sizes and offsets, never content), sent to
+// the board like the mic's trace when an on-screen keyboard opens: at once, once it settled
+// and a second later. A few per page.
+const KEYBOARD_TRACES = 12;
+function traceKeyboardRoom() {
+  const open = touchDevice() && editingText() && keyboardOpen();
+  if (open === !!state.keyboardTraced) return;
+  state.keyboardTraced = open;
+  if (!open || (state.keyboardTraces = (state.keyboardTraces || 0) + 1) > KEYBOARD_TRACES) return;
+  const t0 = Date.now();
+  const events = [];
+  const env = { kind: "viewport", field: String(document.activeElement?.id || ""), touch: true,
+    standalone: !!window.matchMedia?.("(display-mode: standalone)")?.matches, phone: phoneLayout(),
+    width: Math.round(window.innerWidth || 0), docked: !!state.docked };
+  const box = (node) => node?.getBoundingClientRect?.() || null;
+  const round = (value) => (Number.isFinite(value) ? Math.round(value) : null);
+  const snap = (e) => {
+    const viewport = window.visualViewport;
+    const app = box($("app"));
+    const field = box(document.activeElement);
+    events.push({ t: Date.now() - t0, e, ih: round(window.innerHeight), vh: round(viewport?.height),
+      vt: round(viewport?.offsetTop), pt: round(viewport?.pageTop), sy: round(window.scrollY), at: round(app?.top),
+      ah: round(app?.height), it: round(field?.top), ib: round(field?.bottom), shift: state.appShift || 0 });
+  };
+  snap("open");
+  setTimeout(() => snap("settled"), 400);
+  setTimeout(() => snap("later"), 1500);
+  setTimeout(() => {
+    api("/api/diagnostics/dictation", { method: "POST", body: { env, outcome: "viewport", events } }).catch(() => {});
+  }, 1700);
 }
 // Back on screen (from the background, a minimized window or the app switcher): the
 // sizes WebKit reports settle a moment later and may come with no resize event, so the
@@ -9398,6 +9445,8 @@ window.addEventListener("DOMContentLoaded", () => {
   // Dialog sheets: drag handle, detents and outside taps (BottomSheet).
   for (const id of Object.keys(SHEETS)) sheet(id);
   window.visualViewport?.addEventListener("resize", updateViewport);
+  // iOS moves the visible area with no resize (its keyboard's own scroll, or a drag).
+  window.visualViewport?.addEventListener("scroll", renderAppShift);
   updateViewport();
   if ("serviceWorker" in navigator) {
     navigator.serviceWorker.register("/sw.js").catch(() => {});

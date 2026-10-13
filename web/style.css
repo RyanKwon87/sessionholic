@@ -4555,6 +4555,11 @@ body.keyboard-typing:not(.keyboard-beside) .terminal-context {
 body.keyboard-beside .terminal-screen {
   height: var(--layout-height, 100dvh);
 }
+/* iOS scrolled the page for its keyboard: the app follows what is on screen
+   (app.js renderAppShift), instead of leaving the area above the keyboard blank. */
+body.app-shifted .app {
+  transform: translateY(var(--app-shift, 0px));
+}
 .terminal-live {
   position: absolute;
   right: 12px;

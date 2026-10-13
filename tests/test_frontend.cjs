@@ -9283,13 +9283,14 @@ test('on Android a recognition that ends by itself listens on, and what it heard
   assert.equal(t.c.state.dictation, null);
 });
 
-test('only an Android keyboard lets go of the field while it listens', async () => {
+test('a touch keyboard lets go of the chat input while it listens; the terminal line only of an on-screen one', async () => {
+  // iPadOS gives the recognition no sound while its keyboard is up (sent, then the mic again).
   for (const [agent, coarse, blurred] of [['Mozilla/5.0 (Linux; Android 15; SM-F741N)', true, 1],
-    ['Mozilla/5.0 (iPad; CPU OS 26_6 like Mac OS X)', true, 0], ['Mozilla/5.0 (Linux; Android 15)', false, 0]]) {
+    ['Mozilla/5.0 (iPad; CPU OS 26_6 like Mac OS X)', true, 1], ['Mozilla/5.0 (Linux; Android 15)', false, 0]]) {
     const { c, recognitions, FakeRecognition } = dictationClient();
     c.context.webkitSpeechRecognition = FakeRecognition;
     c.context.navigator = { userAgent: agent, onLine: true };
-    c.context.window.matchMedia = () => ({ matches: coarse });
+    c.context.window.matchMedia = (query) => ({ matches: coarse && query === '(pointer: coarse)' });
     const { s } = selectChat(c);
     const composer = c.buildChatComposer(s);
     const input = findId(composer, 'chat-input');
@@ -9299,15 +9300,25 @@ test('only an Android keyboard lets go of the field while it listens', async () 
     findId(composer, 'chat-mic').events.click();
     assert.equal(recognitions.length, 1, agent);
     assert.equal(blurs, blurred, agent);
-    // The terminal's input line keeps its focus everywhere: keys would go to the CLI otherwise.
+    // The terminal's input line keeps its focus with no on-screen keyboard (a hardware keyboard's
+    // keys would go to the CLI), and lets go of one that is up.
     c.stopDictation({ abort: true });
     const draft = c.get('terminal-draft');
+    draft.tagName = 'TEXTAREA';
     let draftBlurs = 0;
     draft.blur = () => { draftBlurs++; };
     c.context.document.activeElement = draft;
     c.state.terminal = { id: 'term-1' };
     c.toggleDraftDictation();
     assert.equal(draftBlurs, 0, agent);
+    c.stopDictation({ abort: true });
+    c.context.window.innerWidth = 1180;
+    c.context.window.innerHeight = 820;
+    c.context.window.visualViewport = { height: 420, scale: 1 };
+    c.context.document.activeElement = draft;
+    c.toggleDraftDictation();
+    assert.equal(draftBlurs, coarse ? 1 : 0, agent);
+    c.stopDictation({ abort: true });
   }
 });
 
@@ -9984,4 +9995,51 @@ test('a listening is traced to the board after it ends, with codes and lengths b
   const result0 = trace.events.find((event) => event.e === 'result');
   assert.deepEqual([result0.n, result0.len, result0.cur], [1, 5, true]);
   assert.doesNotMatch(JSON.stringify(trace), /[가-힣]/, 'no words, only lengths and codes');
+});
+
+test('with an on-screen keyboard up, the app follows what iOS scrolled on screen, and the room is traced', async () => {
+  const timers = [];
+  const posts = [];
+  const c = client(async (url, opts) => {
+    if (String(url).includes('/api/diagnostics/dictation')) posts.push(JSON.parse(opts.body));
+    return { ok: true, status: 200, json: async () => ({ ok: true }) };
+  }, { setTimeout: (callback, ms) => { timers.push({ callback, ms }); return timers.length; }, clearTimeout() {} });
+  const classes = new Set();
+  c.context.document.body.classList = { add: (n) => classes.add(n), remove: (n) => classes.delete(n), contains: (n) => classes.has(n) };
+  const vars = {};
+  c.context.document.documentElement.style = { setProperty: (name, value) => { vars[name] = value; } };
+  c.context.window.matchMedia = (query) => ({ matches: query === '(pointer: coarse)' });
+  c.context.window.innerWidth = 1180;
+  c.context.window.innerHeight = 820;
+  const field = { tagName: 'TEXTAREA', id: 'chat-input', getBoundingClientRect: () => ({ top: 780, bottom: 812 }) };
+  c.context.document.activeElement = field;
+  // iOS scrolled the page by its keyboard's height to show the field, then the app shrank.
+  c.context.window.visualViewport = { height: 420, scale: 1, offsetTop: 0, pageTop: 400 };
+  c.updateViewport();
+  assert.equal(vars['--app-height'], '420px');
+  assert.equal(classes.has('app-shifted'), true);
+  assert.equal(vars['--app-shift'], '400px');
+  // The trace: at once, settled and a second later, then sent; numbers only.
+  for (const timer of timers.filter((t) => [400, 1500].includes(t.ms))) timer.callback();
+  timers.find((t) => t.ms === 1700).callback();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(posts.length, 1);
+  assert.equal(posts[0].env.kind, 'viewport');
+  assert.deepEqual(posts[0].events.map((event) => event.e), ['open', 'settled', 'later']);
+  assert.deepEqual([posts[0].events[0].ih, posts[0].events[0].vh, posts[0].events[0].pt, posts[0].events[0].it], [820, 420, 400, 780]);
+  // Scrolled back, or the keyboard gone: no shift.
+  c.context.window.visualViewport = { height: 420, scale: 1, offsetTop: 0, pageTop: 0 };
+  c.updateViewport();
+  assert.equal(classes.has('app-shifted'), false);
+  c.context.window.visualViewport = { height: 820, scale: 1, offsetTop: 0, pageTop: 0 };
+  c.context.document.activeElement = null;
+  c.updateViewport();
+  assert.equal(classes.has('app-shifted'), false);
+  assert.equal(vars['--app-shift'], '0px');
+  // A mouse device is never shifted.
+  c.context.window.matchMedia = () => ({ matches: false });
+  c.context.document.activeElement = field;
+  c.context.window.visualViewport = { height: 420, scale: 1, offsetTop: 0, pageTop: 400 };
+  c.updateViewport();
+  assert.equal(classes.has('app-shifted'), false);
 });

@@ -150,6 +150,15 @@ class ServerTest(unittest.TestCase):
         res, _ = self.request("GET", "/api/snapshot", headers={"Cookie": cookie})
         self.assertEqual(res.status, 200)
 
+    def test_capabilities_name_the_screen_served_now(self):
+        cookie = self.login_cookie()
+        res, data = self.request("GET", "/api/capabilities", headers={"Cookie": cookie})
+        self.assertEqual(res.status, 200)
+        version = json.loads(data)["webVersion"]
+        self.assertEqual(version, self.httpd.assets.manifest()["/app.js"])
+        res, page = self.request("GET", "/", headers={"Cookie": cookie})
+        self.assertIn(('/app.js?v=%s"' % version).encode(), page, "the page loads the same app.js it names")
+
     def test_snapshots_name_the_server_process_and_a_restart_names_another(self):
         # H3: a client that sees another bootId reads /api/capabilities (its CSRF token) again.
         cookie, csrf = self.csrf_session()

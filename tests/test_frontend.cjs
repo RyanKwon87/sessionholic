@@ -48,7 +48,7 @@ function client(
     json: async () => ({ ok: true }),
   }),
   timers = { setTimeout, clearTimeout },
-  { instanceMeta } = {},
+  { instanceMeta, currentScript } = {},
 ) {
   const nodes = new Map();
   const frames = [];
@@ -79,6 +79,7 @@ function client(
     },
   };
   // The server fills <meta name="sessionholic-instance">; app.js reads it once at load.
+  if (currentScript !== undefined) document.currentScript = currentScript;
   if (instanceMeta !== undefined) {
     document.querySelector = (selector) => (selector === 'meta[name="sessionholic-instance"]'
       ? { getAttribute: (name) => (name === 'content' ? instanceMeta : null) } : null);
@@ -127,7 +128,7 @@ function client(
   vm.runInContext(messageSource, context);
   vm.runInContext(source, context);
   const api = vm.runInContext(
-    "({state,api,sourceOf,accountOf,sendInput,pasteDraft,prepareDraftPaste,startDraftComposition,endDraftComposition,inputDraft,stopTerminalReader,startTerminalReader,closePlan,navigateView,backToList,backFromTerminal,closeTerminal,cancelTerminalClose,confirmTerminalClose,populateAccount,populateRoute,updateContinue,renderPlan,launchPlan,openTerminal,saveDraft,draftKey,refreshTerminals,renderTerminals,renderTerminalReturn,renderFilters,terminalCloseCopy,warnDraftUnload,preparePlan,renderGroups,renderMessages,loadDetail,chatKey,chatEntry,currentChat,chatSupported,chatRecovery,recoverChatSession,openChatTerminal,chatAttachmentsSupported,buildChatComposer,sendChat,loadChatState,applyChatReceipt,uploadChatFiles,pasteChat,scheduleChatPoll,stopChatPolling,openNativeChat,allSessions,buildContinuePanel,chatReceiptCopy,returnToBoard,readChatClipboard,accountDisplay,sessionAccountLabel,closeChatToolsOutside,closeChatToolsEscape,drawDetail,refreshDetail,loadCapabilities,matches,recoverConnection,networkOffline,poll,select,focusDetailBack,restoreSelectedCardFocus,showLogin,lock,beginAuthEpoch,resizeChatInput,updateViewport,draftKeydown,configureTerminalKeyboard,queueTerminalScroll,flushTerminalScroll,terminalScrollEnd,resetTerminalScroll,renderAttention,chatPollDelay,pullRefresh,readingScroll,renderJump,pullDistance,listScroll,setReading,renderPrompt,promptAction,renderUsage,loadUsage,applyTheme,setTheme,updateThemeColor,haptic,navTransition,setDetailShown,chatVisible,sheetRelease,BottomSheet,sheet,openSettings,closeSettings,setTyping,pinchFontSize,setTerminalFontSize,loadXterm,assetUrl,syncEvents,closeEvents,eventsHealthy,renderFreshness,schedule,touchDevice,togglePhaseFilter,renderCounts,createLongPress,swipeIntent,swipeRelease,groupMessageRows,setTextSize,applyTextSize,renderConnectivity,terminalForSession,swipeActionFor,openMessageMenu,openCardMenu,messageActions,outboxShape,outboxMatches,outboxOrigin,settleOutbox,retryOutbox,renderAttachmentTiles,attachmentThumb,sendUpload,openActionSheet,closeActionSheet,setListCollapsed,closeSwipe,settleSwipe,prepareSwipe,runSwipeAction,GESTURE,setChromeVisible,toggleChrome,revealChrome,isChromeTap,snapshotAnnounced,updateChatComposer,capabilitiesRevision,toolKindOf,userMessageParts,formatElapsed,tickWorking,renderTerminalMarks,renderDetailTerminal,terminalsAnnounced,goToSessionTerminal,rememberTerminal,terminalMenu,updateTerminalMenu,chooseTerminalMenu,clearTerminalMenu,renderNewSession,openNewSession,startNewSession,startAppServer,rememberConversationView,restoreConversationView,conversationIdentity,initiatorOf,initiatorLabel,documentKeydown,sessionCategoryOf,setSessionCategory,renderSessionCategories,prepareSessionListFor,sessionCategoryKeydown,render,resetFilters,terminalTitle,renameTerminals,requestedSessionFrom,requestSessionOpen,openRequestedSession,answerOnOpen,hardReload,terminalKeyBytes,terminalKeyFromEvent,pressTerminalKey,toggleTerminalMod,clearTerminalMods,renderTerminalMods,draftBeforeInput,terminalDocumentKey,xtermKeyEvent,renderHardware,loadHardware,startDictation,stopDictation,dictationText,toggleDraftDictation,renderDictation,DICTATION_LISTENING,DICTATION_ERRORS,DICTATION_PREPARING,DICTATION_STALLED,DICTATION_ENDED_AT_ONCE,DICTATION_INTERRUPTED,DICTATION_NOT_STARTED,DICTATION_SILENCE_END,bindDraftInput,insertChatText})",
+    "({state,api,sourceOf,accountOf,sendInput,pasteDraft,prepareDraftPaste,startDraftComposition,endDraftComposition,inputDraft,stopTerminalReader,startTerminalReader,closePlan,navigateView,backToList,backFromTerminal,closeTerminal,cancelTerminalClose,confirmTerminalClose,populateAccount,populateRoute,updateContinue,renderPlan,launchPlan,openTerminal,saveDraft,draftKey,refreshTerminals,renderTerminals,renderTerminalReturn,renderFilters,terminalCloseCopy,warnDraftUnload,preparePlan,renderGroups,renderMessages,loadDetail,chatKey,chatEntry,currentChat,chatSupported,chatRecovery,recoverChatSession,openChatTerminal,chatAttachmentsSupported,buildChatComposer,sendChat,loadChatState,applyChatReceipt,uploadChatFiles,pasteChat,scheduleChatPoll,stopChatPolling,openNativeChat,allSessions,buildContinuePanel,chatReceiptCopy,returnToBoard,readChatClipboard,accountDisplay,sessionAccountLabel,closeChatToolsOutside,closeChatToolsEscape,drawDetail,refreshDetail,loadCapabilities,matches,recoverConnection,networkOffline,poll,select,focusDetailBack,restoreSelectedCardFocus,showLogin,lock,beginAuthEpoch,resizeChatInput,updateViewport,draftKeydown,configureTerminalKeyboard,queueTerminalScroll,flushTerminalScroll,terminalScrollEnd,resetTerminalScroll,renderAttention,chatPollDelay,pullRefresh,readingScroll,renderJump,pullDistance,listScroll,setReading,renderPrompt,promptAction,renderUsage,loadUsage,applyTheme,setTheme,updateThemeColor,haptic,navTransition,setDetailShown,chatVisible,sheetRelease,BottomSheet,sheet,openSettings,closeSettings,setTyping,pinchFontSize,setTerminalFontSize,loadXterm,assetUrl,syncEvents,closeEvents,eventsHealthy,renderFreshness,schedule,touchDevice,togglePhaseFilter,renderCounts,createLongPress,swipeIntent,swipeRelease,groupMessageRows,setTextSize,applyTextSize,renderConnectivity,terminalForSession,swipeActionFor,openMessageMenu,openCardMenu,messageActions,outboxShape,outboxMatches,outboxOrigin,settleOutbox,retryOutbox,renderAttachmentTiles,attachmentThumb,sendUpload,openActionSheet,closeActionSheet,setListCollapsed,closeSwipe,settleSwipe,prepareSwipe,runSwipeAction,GESTURE,setChromeVisible,toggleChrome,revealChrome,isChromeTap,snapshotAnnounced,updateChatComposer,capabilitiesRevision,toolKindOf,userMessageParts,formatElapsed,tickWorking,renderTerminalMarks,renderDetailTerminal,terminalsAnnounced,goToSessionTerminal,rememberTerminal,terminalMenu,updateTerminalMenu,chooseTerminalMenu,clearTerminalMenu,renderNewSession,openNewSession,startNewSession,startAppServer,rememberConversationView,restoreConversationView,conversationIdentity,initiatorOf,initiatorLabel,documentKeydown,sessionCategoryOf,setSessionCategory,renderSessionCategories,prepareSessionListFor,sessionCategoryKeydown,render,resetFilters,terminalTitle,renameTerminals,requestedSessionFrom,requestSessionOpen,openRequestedSession,answerOnOpen,hardReload,terminalKeyBytes,terminalKeyFromEvent,pressTerminalKey,toggleTerminalMod,clearTerminalMods,renderTerminalMods,draftBeforeInput,terminalDocumentKey,xtermKeyEvent,renderHardware,loadHardware,startDictation,stopDictation,dictationText,toggleDraftDictation,renderDictation,DICTATION_LISTENING,DICTATION_ERRORS,DICTATION_PREPARING,DICTATION_STALLED,DICTATION_ENDED_AT_ONCE,DICTATION_INTERRUPTED,DICTATION_NOT_STARTED,DICTATION_SILENCE_END,bindDraftInput,insertChatText,reloadForUpdate,checkWebVersion,unsavedWork})",
     context,
   );
   api.state.csrf = "csrf-test";
@@ -3701,6 +3702,51 @@ test('pull to refresh waits for a list read in flight, then says it could not re
   assert.ok(seen.includes('새로고침하지 못했습니다'));
   assert.ok(!seen.includes('업데이트됨'));
   assert.ok(c.state.pollFailures >= 2);
+});
+
+test('a page older than the screen the board serves offers a reload, and reloads on coming back when nothing would be lost', async () => {
+  const capabilities = { csrfToken: 'csrf-test', webVersion: 'bbbb2222' };
+  const c = client(async () => ({ ok: true, status: 200, json: async () => capabilities }), noChatTimers,
+    { currentScript: { src: 'https://board.test/app.js?v=aaaa1111' } });
+  let reloaded = 0;
+  c.context.window.location = { reload: () => { reloaded += 1; } };
+  c.state.authenticated = true; c.state.snapshot = { hosts: [] };
+  c.state.shownAt = 0; // Not just back on the page: the banner offers it.
+  await c.loadCapabilities(c.state.authEpoch, { refreshView: false });
+  assert.equal(c.state.updateAvailable, true);
+  assert.equal(c.get('update-banner').hidden, false);
+  assert.equal(reloaded, 0);
+  // Something unsent in a composer, or a terminal on screen: coming back still only offers it.
+  c.state.chats.set('draft', { text: '보내지 않은 말', attachments: [] });
+  assert.equal(c.unsavedWork(), true);
+  assert.equal(c.reloadForUpdate(), false);
+  c.state.chats.clear();
+  c.state.terminalVisible = true;
+  assert.equal(c.reloadForUpdate(), false);
+  c.state.terminalVisible = false;
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(reloaded, 0);
+  // Nothing would be lost: coming back loads the newer screen.
+  assert.equal(c.reloadForUpdate(), true);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(reloaded, 1);
+  // Found right after coming back, it loads at once.
+  const back = client(async () => ({ ok: true, status: 200, json: async () => capabilities }), noChatTimers,
+    { currentScript: { src: 'https://board.test/app.js?v=aaaa1111' } });
+  let again = 0;
+  back.context.window.location = { reload: () => { again += 1; } };
+  back.state.shownAt = Date.now();
+  await back.loadCapabilities(back.state.authEpoch, { refreshView: false });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(again, 1);
+  // The same screen, or a page that cannot tell its own, offers nothing.
+  const same = client(async () => ({ ok: true, status: 200, json: async () => ({ csrfToken: 'x', webVersion: 'aaaa1111' }) }),
+    noChatTimers, { currentScript: { src: 'https://board.test/app.js?v=aaaa1111' } });
+  await same.loadCapabilities(same.state.authEpoch, { refreshView: false });
+  assert.equal(same.state.updateAvailable, false);
+  const unknown = client(async () => ({ ok: true, status: 200, json: async () => capabilities }), noChatTimers);
+  await unknown.loadCapabilities(unknown.state.authEpoch, { refreshView: false });
+  assert.equal(unknown.state.updateAvailable, false);
 });
 
 function classes() {

@@ -6523,6 +6523,17 @@ input.switch:focus-visible {
 .offline-banner[data-kind="offline"] .offline-dot {
   background: var(--red-fill);
 }
+/* The same pill, pressable: a newer screen is ready. */
+.update-banner {
+  border: 0;
+  font-family: inherit;
+  cursor: pointer;
+  pointer-events: auto;
+}
+.update-banner .offline-dot {
+  background: var(--accent);
+  animation: none;
+}
 @media (max-width: 700px) {
   .offline-banner {
     top: calc(var(--top-inset) + var(--nav-h) + 6px);

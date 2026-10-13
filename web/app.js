@@ -139,6 +139,8 @@ const state = {
   pollBusy: false,
   pollRun: null, // the list read in flight (poll), shared by callers that wait for it
   manualRefreshing: false,
+  updateAvailable: false, // the board serves a newer screen than this page runs (checkWebVersion)
+  shownAt: Date.now(), // when the page was last shown (visibilitychange)
   authenticated: false,
   authEpoch: 0,
   loginBusy: false,
@@ -711,6 +713,14 @@ function beginAuthEpoch() {
 const CSRF_RETRY = new Set(["/api/chat/state", "/api/chat/prompt", "/api/plan", "/api/launch",
   "/api/new-session", "/api/app-server", "/api/refresh", "/api/usage/refresh", "/api/hardware/refresh",
   "/api/push/subscribe", "/api/push/unsubscribe"]);
+// The screen this page runs: its app.js ?v=, as the board served it. A tab opened
+// before a deploy keeps the old screen until it reloads; the board names the one it
+// serves now (capabilities.webVersion) and checkWebVersion compares the two.
+const APP_VERSION = (() => {
+  try { return new URL(document.currentScript?.src || "").searchParams.get("v") || ""; } catch { return ""; }
+})();
+// Back on the page this recently, a newer screen loads at once when nothing would be lost.
+const UPDATE_RETURN_MS = 15000;
 // How long a request waits for its answer. A phone back from sleep or between
 // networks can hold one open forever, and a held read blocks every later one
 // (poll, refresh, chat state); one that runs out fails like a lost connection.
@@ -7658,6 +7668,7 @@ async function loadCapabilities(authEpoch = state.authEpoch, { refreshView = tru
   assertAuthEpoch(authEpoch);
   state.capabilities = capabilities;
   state.csrf = state.capabilities.csrfToken || "";
+  checkWebVersion();
   renderNewSession();
   $("logout").hidden = state.capabilities.authMode === "tailscale";
   if ($("settings-lock")) $("settings-lock").hidden = $("logout").hidden;
@@ -8039,7 +8050,23 @@ function updateViewport() {
 // "오프라인 · 다시 연결 중" at the top while the browser is offline or the
 // board failed to answer twice in a row; it goes away by itself once a read
 // succeeds. The terminal shows its own connection state instead.
+function checkWebVersion() {
+  const served = state.capabilities?.webVersion;
+  const behind = !!APP_VERSION && typeof served === "string" && !!served && served !== APP_VERSION;
+  const found = behind && !state.updateAvailable;
+  state.updateAvailable = behind;
+  if (found && Date.now() - (state.shownAt || 0) < UPDATE_RETURN_MS && reloadForUpdate()) return;
+  renderConnectivity();
+}
+// A newer screen loads now unless a reload would lose something (what warnDraftUnload
+// guards), interrupt a terminal or close an open sheet; the banner offers it then.
+function reloadForUpdate() {
+  if (!state.updateAvailable || state.terminalVisible || unsavedWork() || document.querySelector?.("dialog[open]")) return false;
+  hardReload();
+  return true;
+}
 function renderConnectivity() {
+  const update = $("update-banner");
   const box = $("offline-banner");
   if (!box) return;
   const offline = networkOffline();
@@ -8051,6 +8078,8 @@ function renderConnectivity() {
   if ($("offline-text").textContent !== text) $("offline-text").textContent = text;
   box.dataset.kind = offline ? "offline" : failing ? "retrying" : "";
   box.hidden = !text || state.terminalVisible;
+  // A connection problem is said first; the newer screen waits for it.
+  if (update) update.hidden = !state.updateAvailable || !!text || state.terminalVisible;
 }
 function showOfflineStart() {
   if (state.snapshot || state.terminalVisible) return;
@@ -8081,9 +8110,13 @@ function recoverConnection() {
   const selected = selectedSession();
   if (selected) { updateChatComposer(chatEntry(selected)); loadChatState(selected, true); }
 }
+// Unsent words or files on this page: what leaving or reloading it would lose.
+function unsavedWork() {
+  return [...state.drafts.values(), state.terminal ? $("terminal-draft").value : ""].some(Boolean) ||
+    [...state.chats.values()].some((entry) => entry.text || entry.attachments.length || entry.pending || entry.uploads);
+}
 function warnDraftUnload(event) {
-  if (![...state.drafts.values(), state.terminal ? $("terminal-draft").value : ""].some(Boolean) &&
-      ![...state.chats.values()].some((entry) => entry.text || entry.attachments.length || entry.pending || entry.uploads)) return;
+  if (!unsavedWork()) return;
   event.preventDefault();
   event.returnValue = "";
 }
@@ -8136,6 +8169,7 @@ window.addEventListener("DOMContentLoaded", () => {
   $("settings-close").addEventListener("click", closeSettings);
   $("settings-done").addEventListener("click", closeSettings);
   $("hard-reload")?.addEventListener("click", hardReload);
+  $("update-banner")?.addEventListener("click", hardReload);
   $("settings-dialog").addEventListener("cancel", (event) => {
     event.preventDefault();
     closeSettings();
@@ -8338,6 +8372,8 @@ window.addEventListener("DOMContentLoaded", () => {
     } else if (state.terminalVisible) {
       startTerminalReader();
     } else if (state.authenticated) {
+      state.shownAt = Date.now();
+      if (reloadForUpdate()) return;
       poll(true);
       const selected = selectedSession();
       if (selected) loadChatState(selected, true);

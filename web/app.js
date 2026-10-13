@@ -946,12 +946,14 @@ function groupOf(s, now = state.snapshot?.serverTime || Date.now() / 1000) {
   return "rest";
 }
 function matches(s, now, { phase = true, category = true, initiator = true } = {}) {
-  if (botRequestForNative(sourceOf(s))) return false;
-  if (category && sessionCategoryOf(s) !== state.sessionCategory) return false;
+  // A bot picked in 시작 주체 lists the sessions it opened (its requests' own too) in any tab.
+  const bot = botFilter();
+  if (!bot && botRequestForNative(sourceOf(s))) return false;
+  if (category && !bot && sessionCategoryOf(s) !== state.sessionCategory) return false;
   if (phase && state.phaseFilter && groupOf(s, now) !== state.phaseFilter) return false;
   for (const key of Object.keys(state.filters)) {
     if (key === "initiator") {
-      if (initiator && state.filters.initiator && initiatorOf(s) !== state.filters.initiator) return false;
+      if (initiator && state.filters.initiator && (bot ? botNameOf(s) !== bot : initiatorOf(s) !== state.filters.initiator)) return false;
       continue;
     }
     if (key === "account" && state.filters.account && state.accountFilterRoutes) {
@@ -1364,7 +1366,25 @@ function renderCounts(sessions) {
 const INITIATOR_LABELS = { human: "직접 시작", agent: "에이전트 시작", unknown: "출처 미확인" };
 function initiatorOf(s) { return ["human", "agent"].includes(s?.initiator) ? s.initiator : "unknown"; }
 function initiatorLabel(s) {
+  const bot = botNameOf(s);
+  if (bot) return `${bot} 시작`;
   return INITIATOR_LABELS[initiatorOf(s)] + (s?.initiatorName ? ` · ${s.initiatorName}` : "");
+}
+// The bot that opened a session: a bot request's source (홀릭이, 뷰링이; "홀릭이 · Slack" is
+// 홀릭이) or Codex's originator (헤르메스). 시작 주체 can pick one (value BOT_FILTER_PREFIX + name).
+const BOT_FILTER_PREFIX = "bot:";
+const ORIGINATOR_BOTS = { hermes: "헤르메스" };
+function botNameOf(s) {
+  const request = s && state.botRequests?.requests ? botRequestForNative(sourceOf(s)) : null;
+  if (request) {
+    const source = (state.botRequests.sources || []).find((item) => item.id === request.sourceId);
+    return String(source?.label || request.botName || "").split(" · ")[0].trim() || null;
+  }
+  return ORIGINATOR_BOTS[s?.originator] || null;
+}
+function botFilter() {
+  const value = state.filters?.initiator || "";
+  return value.startsWith(BOT_FILTER_PREFIX) ? value.slice(BOT_FILTER_PREFIX.length) : "";
 }
 const ONE_SHOT_NO_INPUT = "일회성 실행에는 후속 메시지를 보낼 수 없습니다. 결과는 요청한 에이전트에서 확인해 주세요.";
 const ONE_SHOT_HISTORY = "대화 기록을 저장하지 않는 일회성 실행입니다. 실행 상태를 확인하고 결과는 요청한 에이전트에서 확인해 주세요.";
@@ -1527,6 +1547,8 @@ function renderSessionCategories(sessions, now) {
     const category = sessionCategoryOf(session);
     if (category !== "bot" && matches(session, now, { category: false, initiator: category === state.sessionCategory })) counts[category] += 1;
   }
+  // A bot picked: its sessions are listed in this tab whatever their own tab.
+  if (botFilter() && state.sessionCategory !== "bot") counts[state.sessionCategory] = sessions.filter((session) => matches(session, now)).length;
   for (const [category, label] of Object.entries(SESSION_CATEGORIES)) {
     const control = $(`session-category-${category}`); const selected = state.sessionCategory === category;
     control.setAttribute("aria-selected", String(selected)); control.tabIndex = selected ? 0 : -1;
@@ -1551,7 +1573,7 @@ function sessionCategoryKeydown(event) {
 function prepareSessionListFor(session) {
   let changed = setSessionCategory(sessionCategoryOf(session), { renderView: false, clearSelection: false });
   for (const key of Object.keys(state.filters)) {
-    const value = key === "initiator" ? initiatorOf(session) : session[key];
+    const value = key === "initiator" ? (botFilter() ? BOT_FILTER_PREFIX + botNameOf(session) : initiatorOf(session)) : session[key];
     const excluded = key === "account" && state.filters.account && state.accountFilterRoutes
       ? !state.accountFilterRoutes.has(accountRouteKey(session)) : state.filters[key] && state.filters[key] !== value;
     if (excluded) { state.filters[key] = ""; if (key === "account") state.accountFilterRoutes = null; changed = true; }
@@ -1588,7 +1610,14 @@ function renderFilters(sessions) {
     ["initiator", "시작 주체", (s) => [initiatorOf(s), INITIATOR_LABELS[initiatorOf(s)]]],
   ]) {
     const options = new Map(sessions.map(pick).filter(([v]) => v));
-    if (key === "initiator") for (const [value, text] of Object.entries(INITIATOR_LABELS)) options.set(value, text);
+    if (key === "initiator") {
+      for (const [value, text] of Object.entries(INITIATOR_LABELS)) options.set(value, text);
+      // Every bot that opened a listed session, from all tabs (its requests are in 봇 요청).
+      for (const session of allSessions()) {
+        const bot = botNameOf(session);
+        if (bot) options.set(BOT_FILTER_PREFIX + bot, `봇 · ${bot}`);
+      }
+    }
     const field = el("label", null, label);
     const select = el("select");
     select.id = `filter-${key}`;
@@ -3435,6 +3464,10 @@ const DICTATION_ERRORS = {
 const MIC_ICON = '<svg aria-hidden="true" viewBox="0 0 20 20" width="20" height="20" fill="none" stroke="currentColor" ' +
   'stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><rect x="7" y="2.5" width="6" height="10" rx="3"/>' +
   '<path d="M4.5 9.5a5.5 5.5 0 0 0 11 0M10 15v2.5"/></svg>';
+// 빠른 답장: a speech bubble with a quick line.
+const QUICK_ICON = '<svg aria-hidden="true" viewBox="0 0 20 20" width="20" height="20" fill="none" stroke="currentColor" ' +
+  'stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M4 4.5h12a1.5 1.5 0 0 1 1.5 1.5v6.5a1.5 1.5 0 0 1-1.5 1.5H9l-3.5 2.5V14H4a1.5 1.5 0 0 1-1.5-1.5V6A1.5 1.5 0 0 1 4 4.5Z"/>' +
+  '<path d="M6.5 8.25h7M6.5 10.75h4"/></svg>';
 function speechRecognitionClass() {
   return globalThis.SpeechRecognition || globalThis.webkitSpeechRecognition || null;
 }
@@ -3953,8 +3986,19 @@ function buildChatComposer(s) {
     action.addEventListener("pointerdown", (event) => event.preventDefault());
   tools.append(toolsActions);
   actions.append(attach, expand, terminal, keyHint, tools);
+  // 빠른 답장 beside 보내기 while 집중 모드 folds 도구 (style.css shows it only then). The
+  // keyboard stays on the input: the press never takes focus.
+  const quickInline = button("", "chat-quick-inline", (event) => {
+    if (!editorCurrent() || input.disabled || input.readOnly || entry.composing) return;
+    openQuickReplies(entry, input, event.currentTarget);
+  });
+  quickInline.id = "chat-quick-inline";
+  quickInline.innerHTML = QUICK_ICON;
+  quickInline.setAttribute("aria-label", "빠른 답장");
+  quickInline.title = "빠른 답장";
+  quickInline.addEventListener("pointerdown", (event) => event.preventDefault());
   const main = el("div", "chat-main");
-  main.append(input, mic, send);
+  main.append(input, mic, quickInline, send);
   box.append(heading, status, recovery, gate, evidence, attachmentsLabel, attachments, main, files, actions, hint);
   queueMicrotask(() => {
     if (!editorCurrent()) return;
@@ -4186,6 +4230,7 @@ function updateChatComposer(entry) {
   $("chat-send").disabled = blocked || entry.composing || (!entry.text.trim() && !entry.attachments.length);
   // A listening mic always stays pressable, so a locked input can still end it.
   $("chat-mic").disabled = !dictationListening(input) && (input.disabled || input.readOnly || entry.composing);
+  if ($("chat-quick-inline")) $("chat-quick-inline").disabled = input.disabled || input.readOnly || entry.composing;
   renderDictation();
   $("chat-send").textContent = entry.sending ? "전송 중" : "보내기";
   $("chat-send").setAttribute("aria-label", "메시지 보내기");

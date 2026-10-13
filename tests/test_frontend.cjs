@@ -4148,6 +4148,41 @@ test('quick replies come from this browser\'s list (the defaults until edited) a
   assert.equal(c.get('action-list').children[0].disabled, true);
 });
 
+test('집중 모드에서는 보내기 옆 빠른 답장 버튼이 같은 문구 목록을 열고, 입력이 막히면 비활성이다', () => {
+  const c = client(undefined, noChatTimers);
+  const { s, entry } = selectChat(c);
+  const composer = c.buildChatComposer(s);
+  const main = byClass(composer, 'chat-main')[0];
+  assert.deepEqual(main.children.map((child) => child.id), ['chat-input', 'chat-mic', 'chat-quick-inline', 'chat-send']);
+  const quick = findId(composer, 'chat-quick-inline');
+  assert.equal(quick.attributes['aria-label'], '빠른 답장');
+  quick.events.click({ currentTarget: quick });
+  assert.match(c.get('action-eyebrow').textContent, /보내지 않음/);
+  assert.equal(c.get('action-list').children[0].textContent, c.quickReplies()[0]);
+  c.closeActionSheet();
+  // Shown only while the bars are folded (집중 모드), where 도구 › 빠른 답장 is out of sight.
+  const css = fs.readFileSync(path.join(__dirname, '../web/style.css'), 'utf8');
+  const hide = css.lastIndexOf('.chat-composer .chat-main > #chat-quick-inline {\n  display: none;');
+  const shared = css.indexOf('.chat-composer .chat-main > #chat-quick-inline,');
+  assert.ok(hide > shared && shared > 0, 'hidden by default after the shared button style');
+  assert.match(css, /\.detail-pane\.is-reading \.chat-composer \.chat-main > #chat-quick-inline \{\n  display: inline-flex;/);
+  // While the input cannot take text, it is off too.
+  // A send whose result is not known yet locks the input (read-only).
+  entry.pending = { requestId: 'request-0001', revision: entry.revision };
+  c.updateChatComposer(entry);
+  assert.equal(findId(composer, 'chat-input').readOnly, true);
+  assert.equal(quick.disabled, true);
+});
+
+test('기기 상태와 사용량은 목록이 아니라 맨 위 헤더의 기기 칩 옆에 있다', () => {
+  const html = fs.readFileSync(path.join(__dirname, '../web/index.html'), 'utf8');
+  const header = html.slice(html.indexOf('<header class="top">'), html.indexOf('</header>'));
+  const list = html.slice(html.indexOf('<aside id="task-list-pane"'), html.indexOf('</aside>'));
+  for (const id of ['hosts', 'hardware', 'usage']) assert.ok(header.includes(`id="${id}"`), id + ' in the header');
+  for (const id of ['hardware', 'usage']) assert.ok(!list.includes(`id="${id}"`), id + ' not in the list');
+  assert.ok(header.indexOf('class="top-status"') < header.indexOf('id="hosts"'));
+});
+
 function classes() {
   const set = new Set();
   return { set, add: (name) => set.add(name), remove: (name) => set.delete(name), contains: (name) => set.has(name),
@@ -8524,6 +8559,38 @@ test('시작 주체 필터와 분류를 동기화하고 초기화는 현재 분�
   assert.ok(c.get('session-category-general').focusCount > 0);
   c.sessionCategoryKeydown({ key: 'ArrowRight', preventDefault() {} });
   assert.equal(c.state.sessionCategory, 'agent'); assert.equal(c.get('session-category-agent').attributes['aria-selected'], 'true');
+});
+
+test('시작 주체에서 헤르메스·홀릭이·뷰링이를 고르면 그 봇이 연 세션만 보이고, 봇 요청에 묶인 세션도 일반 탭에 나온다', () => {
+  const c = client(undefined, noChatTimers);
+  const hermes = recentSession('by-hermes', { originator: 'hermes', title: '헤르메스 작업' });
+  const holic = recentSession('by-holic', { title: '홀릭이 요청 작업' });
+  const viewer = recentSession('by-beuring', { title: '뷰링이 요청 작업' });
+  const mine = recentSession('mine', { initiator: 'human', title: '직접 연 작업' });
+  const rows = [hermes, holic, viewer, mine];
+  setRecentSnapshot(c, rows);
+  c.state.botRequests = { requests: [
+    { id: 'r1', sourceId: 'holic-gateway', host: holic.host, nativeRef: { agent: holic.agent, id: holic.id, home: holic.home } },
+    { id: 'r2', sourceId: 'beuring', host: viewer.host, nativeRef: { agent: viewer.agent, id: viewer.id, home: viewer.home } }],
+    sources: [{ id: 'holicii', label: '홀릭이' }, { id: 'holic-gateway', label: '홀릭이 · Slack' }, { id: 'beuring', label: '뷰링이' }],
+    loaded: true, busy: false, error: '', readAt: 0, fetchedAt: null, promise: null };
+  const titles = () => byClass(c.get('groups'), 'card').map((card) => byClass(card, 'card-title')[0].textContent).sort();
+  c.render();
+  // Without a bot picked, a session a bot request carries stays in 봇 요청.
+  assert.deepEqual(titles(), ['직접 연 작업', '헤르메스 작업'].sort());
+  const options = c.get('filter-initiator').children.map((option) => [option.value, option.textContent]);
+  for (const name of ['헤르메스', '홀릭이', '뷰링이']) assert.ok(options.some(([value, text]) => value === 'bot:' + name && text === '봇 · ' + name), name);
+  const pick = (value) => { const control = c.get('filter-initiator'); control.value = value; control.events.change(); };
+  pick('bot:홀릭이');
+  assert.equal(c.state.sessionCategory, 'general');
+  assert.deepEqual(titles(), ['홀릭이 요청 작업']);
+  assert.equal(c.get('session-category-general-count').textContent, '1');
+  pick('bot:헤르메스'); assert.deepEqual(titles(), ['헤르메스 작업']);
+  pick('bot:뷰링이'); assert.deepEqual(titles(), ['뷰링이 요청 작업']);
+  // The card says which bot started it.
+  assert.equal(c.initiatorLabel(viewer), '뷰링이 시작');
+  assert.equal(c.initiatorLabel(mine), '직접 시작');
+  pick(''); assert.deepEqual(titles(), ['직접 연 작업', '헤르메스 작업'].sort());
 });
 
 test('작업에서 대화를 직접 열면 대상 분류와 목록 조건을 맞추고 분류 전환은 초안과 보기 기록을 보존한다', () => {

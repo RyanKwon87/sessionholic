@@ -67,7 +67,24 @@
         </button>
         <!-- Phones: the small title that replaces the large one once it scrolls away. -->
         <button id="nav-title" class="nav-title" type="button" aria-label="세션 목록 맨 위로">세션</button>
-        <div id="hosts" class="hosts" aria-label="기기 연결 상태"></div>
+        <!-- Devices, their hardware and the agents' usage, above every view (not in the list). -->
+        <div class="top-status">
+          <div id="hosts" class="hosts" aria-label="기기 연결 상태"></div>
+          <button
+            id="hardware"
+            class="list-chip usage-chip hardware-chip top-chip"
+            type="button"
+            aria-haspopup="dialog"
+            hidden
+          ><span id="hardware-summary" class="usage-summary"></span></button>
+          <button
+            id="usage"
+            class="list-chip usage-chip top-chip"
+            type="button"
+            aria-haspopup="dialog"
+            hidden
+          ><span id="usage-summary" class="usage-summary"></span></button>
+        </div>
         <button
           id="refresh"
           class="icon-button"
@@ -151,20 +168,6 @@
               hidden
             ><span class="terminals-chip-icon" aria-hidden="true">›_</span><span class="terminals-chip-label">터미널</span
             ><span id="running-count" class="terminals-chip-count"></span></button>
-            <button
-              id="usage"
-              class="list-chip usage-chip"
-              type="button"
-              aria-haspopup="dialog"
-              hidden
-            ><span id="usage-summary" class="usage-summary"></span></button>
-            <button
-              id="hardware"
-              class="list-chip usage-chip hardware-chip"
-              type="button"
-              aria-haspopup="dialog"
-              hidden
-            ><span id="hardware-summary" class="usage-summary"></span></button>
           </div>
           <div class="filters">
             <label class="search-wrap"

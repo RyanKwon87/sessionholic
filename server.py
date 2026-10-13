@@ -39,7 +39,7 @@ import instance
 import settings
 from goals import GoalError, Goals
 from work_service import WorkService
-from session_labels import SessionLabels, SessionSeen, reference as label_reference
+from session_labels import SessionLabels, SessionSeen, SessionTidied, reference as label_reference
 
 HERE = Path(__file__).resolve().parent
 WEB = HERE / "web"
@@ -2399,6 +2399,8 @@ class Handler(BaseHTTPRequestHandler):
             raise RuntimeError("세션 제어 결과를 확인하지 못했습니다. 요청은 자동으로 다시 보내지 않습니다.")
         if action and result.get("confirmed"):
             self.server.chat._forget_state(source)
+            if data.get("action") == "terminate":
+                self.tidy_after_close(ref)
             self.server.board.request_refresh(host["name"], force=False)
         return result
 
@@ -2413,6 +2415,34 @@ class Handler(BaseHTTPRequestHandler):
         if changed:
             self.server.board.changed(force=True)
         return result
+
+    def session_tidy(self, data):
+        """목록에서 정리 (tidied: true) or 목록에 다시 표시 (false); the session itself is untouched."""
+        if not isinstance(data, dict) or set(data) != {'source', 'tidied'} or type(data['tidied']) is not bool:
+            raise ValueError('정리할 세션과 동작을 확인해 주세요.')
+        source = self.listed_source(data['source'])
+        if data['tidied']:
+            result, changed = self.server.session_tidied.mark(source, int(time.time()))
+        else:
+            changed = self.server.session_tidied.unmark(source)
+            result = {'seenAt': None}
+        if changed:
+            self.server.board.changed(force=True)
+        return {'tidiedAt': result['seenAt']}
+
+    def tidy_after_close(self, native):
+        """A session the board just ended (or whose terminal its user closed) leaves 최근 끝남.
+        Best effort: the close itself already succeeded, and an unlisted session has no card."""
+        if not isinstance(native, dict):
+            return
+        try:
+            source = self.listed_source({key: native.get(key) for key in ('host', 'agent', 'id', 'home', 'kind', 'sessionId')
+                                         if native.get(key) is not None})
+            _result, changed = self.server.session_tidied.mark(source, int(time.time()))
+        except (GoalError, ValueError, KeyError, RuntimeError, OSError):
+            return
+        if changed:
+            self.server.board.changed(force=True)
 
     def session_label(self, data):
         if set(data) != {'source', 'title'}:
@@ -2556,6 +2586,7 @@ class Handler(BaseHTTPRequestHandler):
         self.server.workflow.link_new_sessions()
         snapshot = self.server.session_labels.decorate(self.server.board.snapshot())
         snapshot = self.server.session_seen.decorate(snapshot)
+        snapshot = self.server.session_tidied.decorate(snapshot)
         return {**snapshot, "bootId": self.server.boot_id}
 
     def stream_events(self, query):
@@ -2709,6 +2740,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_json(200, self.session_label(data))
             if path == "/api/session/seen":
                 return self.send_json(200, self.session_seen(data))
+            if path == "/api/session/tidy":
+                return self.send_json(200, self.session_tidy(data))
             if path == "/api/goals":
                 return self.send_json(201, self.server.goals.save(data))
             goal_match = re.fullmatch(r"/api/goals/([a-f0-9]{32})", path)
@@ -2772,7 +2805,10 @@ class Handler(BaseHTTPRequestHandler):
                 elif action == "scroll-end":
                     self.server.terminals.scroll_end(tid)
                 elif action == "close":
+                    row = next((t for t in self.server.terminals.list() if t.get("id") == tid), None)
                     self.server.terminals.close_terminal(tid)
+                    if row is not None:
+                        self.tidy_after_close(row.get("nativeSource") or (row.get("metadata") or {}).get("nativeSource"))
                     try:
                         self.server.terminal_inputs.prune_closed(tid, self.server.terminals.list())
                     except (ValueError, RuntimeError, OSError):
@@ -2884,6 +2920,7 @@ def make_server(bind, port, board, token, terminals=None, workflow=None, state_d
     server.goals = Goals(state_dir)
     server.session_labels = SessionLabels(state_dir)
     server.session_seen = SessionSeen(state_dir)
+    server.session_tidied = SessionTidied(state_dir)
     server.cookie_name = COOKIE + "_" + str(server.server_address[1])
     server.once, server.once_lock = ("", 0), threading.Lock()
     server.sessions, server.auth_lock = {}, threading.Lock()

@@ -15,7 +15,7 @@ import uuid
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from goals import GoalError
-from session_labels import SessionLabels, SessionSeen, reference
+from session_labels import SessionLabels, SessionSeen, SessionTidied, reference
 import server
 
 
@@ -219,6 +219,26 @@ class SessionSeenTest(unittest.TestCase):
             SessionSeen(Path(self.temp.name)).mark(self.source, -1)
 
 
+class SessionTidiedTest(unittest.TestCase):
+    """When a session was put away from the list: its own file and field, cleared on request."""
+    def test_a_tidy_mark_is_kept_apart_from_read_marks_and_can_be_cleared(self):
+        with tempfile.TemporaryDirectory() as temp:
+            tidied = SessionTidied(Path(temp), clock=lambda: 5000)
+            source = {'host': 'example-mini', 'agent': 'codex', 'id': str(uuid.uuid4()), 'home': '.codex', 'updatedAt': 4000}
+            snapshot = {'version': 1, 'hosts': [{'name': 'example-mini', 'data': {'codex': [dict(source)], 'claude': []}}]}
+            self.assertEqual(tidied.mark(source, 4100), ({'seenAt': 4100}, True))
+            decorated = tidied.decorate(snapshot)
+            self.assertEqual(decorated['hosts'][0]['data']['codex'][0]['tidiedAt'], 4100)
+            self.assertNotIn('seenAt', decorated['hosts'][0]['data']['codex'][0])
+            self.assertTrue(decorated['sessionTidied']['ok'])
+            self.assertTrue((Path(temp) / 'session-tidied.json').exists())
+            self.assertFalse((Path(temp) / 'session-seen.json').exists())
+            self.assertEqual(stat.S_IMODE((Path(temp) / 'session-tidied.json').stat().st_mode), 0o600)
+            self.assertTrue(tidied.unmark(source))
+            self.assertFalse(tidied.unmark(source), 'nothing left to clear')
+            self.assertIsNone(tidied.decorate(snapshot)['hosts'][0]['data']['codex'][0]['tidiedAt'])
+
+
 class SessionLabelsHTTPTest(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -270,6 +290,46 @@ class SessionLabelsHTTPTest(unittest.TestCase):
                         {'source': {**self.source, 'id': str(uuid.uuid4())}, 'updatedAt': 1}):
             self.assertEqual(self.request('POST', '/api/session/seen', payload)[0].status, 400)
         self.assertEqual(self.request('POST', '/api/session/seen', {'source': self.source, 'updatedAt': 1}, csrf=False)[0].status, 403)
+
+    def test_a_listed_session_is_put_away_from_the_list_and_shown_again(self):
+        response, result = self.request('POST', '/api/session/tidy', {'source': self.source, 'tidied': True})
+        self.assertEqual(response.status, 200)
+        self.assertEqual(type(result['tidiedAt']), int)
+        snapshot = self.request('GET', '/api/snapshot')[1]
+        self.assertEqual(snapshot['hosts'][0]['data']['codex'][0]['tidiedAt'], result['tidiedAt'])
+        self.assertEqual(self.request('POST', '/api/session/tidy', {'source': self.source, 'tidied': False})[1], {'tidiedAt': None})
+        self.assertIsNone(self.request('GET', '/api/snapshot')[1]['hosts'][0]['data']['codex'][0]['tidiedAt'])
+        for payload in ({'source': self.source}, {'source': self.source, 'tidied': 'yes'},
+                        {'source': {**self.source, 'id': str(uuid.uuid4())}, 'tidied': True}):
+            self.assertEqual(self.request('POST', '/api/session/tidy', payload)[0].status, 400)
+        self.assertEqual(self.request('POST', '/api/session/tidy', {'source': self.source, 'tidied': True}, csrf=False)[0].status, 403)
+
+    def test_a_terminal_its_user_closes_puts_its_session_away(self):
+        closed = []
+        linked = {'id': 'a' * 32, 'mode': 'new-session', 'alive': True, 'closed': False, 'linkConfidence': 'estimated',
+                  'nativeSource': {**self.source, 'cwd': '/example/workspace', 'kind': None}}
+        unlisted = {'id': 'b' * 32, 'mode': 'attach', 'alive': True, 'closed': False,
+                    'nativeSource': {**self.source, 'id': str(uuid.uuid4())}}
+        terminals = SimpleNamespace(list=lambda: [linked, unlisted], close=lambda: None,
+                                    close_terminal=lambda tid: closed.append(tid) or {'ok': True})
+        self.httpd.terminals = self.httpd.workflow.terminals = terminals
+        self.assertEqual(self.request('POST', '/api/terminal/%s/close' % ('b' * 32), {})[0].status, 200)
+        self.assertIsNone(self.request('GET', '/api/snapshot')[1]['hosts'][0]['data']['codex'][0]['tidiedAt'])
+        self.assertEqual(self.request('POST', '/api/terminal/%s/close' % ('a' * 32), {})[0].status, 200)
+        self.assertEqual(closed, ['b' * 32, 'a' * 32])
+        self.assertEqual(type(self.request('GET', '/api/snapshot')[1]['hosts'][0]['data']['codex'][0]['tidiedAt']), int)
+
+    def test_a_confirmed_terminate_puts_the_session_away_and_an_interrupt_does_not(self):
+        self.board.state[self.host['name']]['ok'] = True
+        proof = 'proof.' + 'f' * 64
+        with patch.object(self.httpd.workflow.transfers, 'rpc', return_value={'confirmed': True}), \
+                patch.object(self.board, 'request_refresh'):
+            for action in ('interrupt', 'terminate'):
+                response, _ = self.request('POST', '/api/session/action', {'source': self.source, 'action': action,
+                                                                           'requestId': 'request-%s-0001' % action, 'targetProof': proof})
+                self.assertEqual(response.status, 200)
+                tidied = self.request('GET', '/api/snapshot')[1]['hosts'][0]['data']['codex'][0]['tidiedAt']
+                self.assertEqual(tidied is None, action == 'interrupt', action)
 
     def test_auth_csrf_and_origin_are_required(self):
         self.assertEqual(self.save(auth=False)[0].status, 401)

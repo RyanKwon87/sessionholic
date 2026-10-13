@@ -14,6 +14,7 @@ function cut(start, end) {
 }
 const production = cut('function assertAuthEpoch(', '\nfunction allSessions(')
   + cut('function sourceOf(', '\nfunction accountOf(')
+  + cut('// A session put away from the list', '\nconst BADGES')
   + cut('// Original execution controls are separate', '\nfunction focusDetailBack(');
 const source = (extra = {}) => ({ host: 'workstation', hostLabel: '합성 기기', agent: 'codex', home: '.codex-isolated', id: 'synthetic-one', title: '합성 작업', ...extra });
 const preview = (extra = {}) => ({ targetProof: 'synthetic-proof', capabilities: { interrupt: { supported: true }, terminate: { supported: true } }, ...extra });

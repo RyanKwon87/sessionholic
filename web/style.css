@@ -4545,6 +4545,16 @@ body.terminal-docked .pull-refresh {
 body.terminal-docked .terminal-screen:not([hidden]) ~ .toast {
   bottom: calc(24px + env(safe-area-inset-bottom));
 }
+/* Typing with an iPad's on-screen keyboard (app.js renderKeyboardRoom): the board's top
+   bar and the terminal's note fold away; beside a docked terminal, typing on the board
+   leaves the terminal its full height behind the keyboard. */
+body.keyboard-typing .top,
+body.keyboard-typing:not(.keyboard-beside) .terminal-context {
+  display: none;
+}
+body.keyboard-beside .terminal-screen {
+  height: var(--layout-height, 100dvh);
+}
 .terminal-live {
   position: absolute;
   right: 12px;

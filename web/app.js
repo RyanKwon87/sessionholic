@@ -755,7 +755,7 @@ function beginAuthEpoch() {
 const CSRF_RETRY = new Set(["/api/chat/state", "/api/chat/prompt", "/api/plan", "/api/launch",
   "/api/new-session", "/api/app-server", "/api/refresh", "/api/usage/refresh", "/api/hardware/refresh",
   "/api/push/subscribe", "/api/push/unsubscribe", "/api/session/seen", "/api/session/tidy", "/api/session/remove",
-  "/api/session/opened"]);
+  "/api/session/opened", "/api/chat/warm"]);
 // A terminal's size and scrolling; its keys never (sendInput reads the token instead).
 const CSRF_RETRY_TERMINAL = /^\/api\/terminal\/[a-f0-9]{32}\/(resize|scroll|scroll-end)$/;
 function csrfRetryable(path) {
@@ -3822,6 +3822,7 @@ function buildChatComposer(s) {
   input.addEventListener("input", () => {
     dictationTyped(input);
     if (!editorCurrent()) return;
+    if (input.value) warmChat(entry);
     entry.inputCollapsed = false;
     entry.text = input.value;
     // Words landing from the mic keep its "듣는 중" line; typing clears both.
@@ -3945,6 +3946,7 @@ function buildChatComposer(s) {
     }
     if (entry.inputError && entry.error === entry.inputError) entry.error = "";
     entry.inputError = "";
+    warmChat(entry);
     startDictation(input, { report: reportDictation, releaseKeyboard: true,
       active: () => editorCurrent() && chatVisible() });
   });
@@ -5092,8 +5094,22 @@ function openQuickReplies(entry, input, trigger) {
       ? replies.map((text) => ({ label: text, run: () => { insertChatText(entry, input, text); input.focus?.({ preventScroll: true }); } }))
       : [{ label: "설정 › 빠른 답장에서 문구를 추가해 주세요", disabled: true, run() {} }] });
 }
+// A Claude background conversation without a board terminal: its connection opens as its user
+// starts a message (typing, the mic or a quick reply; chat.py warm), so the send then pastes at
+// once instead of waiting for the attach. Once a minute at most; nothing is typed by it.
+const WARM_SPACING_MS = 60000;
+function warmChat(entry) {
+  const s = allSessions().find((session) => chatKey(sourceOf(session)) === chatKey(entry.source));
+  if (s?.agent !== "claude" || s.kind !== "background" || terminalForSession(s)) return;
+  if (Date.now() - (entry.warmedAt || 0) < WARM_SPACING_MS) return;
+  entry.warmedAt = Date.now();
+  api("/api/chat/warm", { method: "POST", body: { source: entry.source } }).catch(() => {
+    // The send opens it then, as before.
+  });
+}
 function insertChatText(entry, input, text) {
   if (!text || !currentChat(entry) || input.disabled || input.readOnly) return;
+  warmChat(entry);
   const start = input.selectionStart ?? input.value.length;
   const end = input.selectionEnd ?? start;
   input.value = input.value.slice(0, start) + text + input.value.slice(end);

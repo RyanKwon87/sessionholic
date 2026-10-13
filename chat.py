@@ -55,6 +55,12 @@ BOX_TAIL = re.compile(r'\s*[─-▟]+$')
 BOX_VERTICAL = frozenset('│┃║╎╏┆┇┊┋▌▐▏▕')
 MULTI_MARKS = ('[ ]', '[x]', '[X]', '[✓]', '[✔]', '☐', '☑', '☒', '◯', '◉')
 MENU_TAIL = 6
+# Claude Code's input line: a prompt with a rule right below it (its box, or the rules around
+# it) within the screen's last rows; a message in the transcript has text below it instead.
+INPUT_TAIL = 6
+# A working session's spinner never lets the attach screen go quiet: its input line then says
+# it is ready, looked for from this long after the first output.
+SETTLE_PROMPT_SECONDS = 1.0
 MENU_GAP = 12
 QUESTION_LINES = 12
 PROMPT_SETTLE = 0.6
@@ -117,6 +123,15 @@ def _screen_lines(screen):
             raw = ' ' * len(lead.group(0)) + raw[lead.end():]
         lines.append(BOX_TAIL.sub('', raw).rstrip())
     return lines
+
+
+def input_ready(screen):
+    """Whether Claude Code's input line shows at the screen's end, with no menu open."""
+    rows = [line for line in _screen_lines(screen) if line is None or line.strip()][-INPUT_TAIL:]
+    for index, line in enumerate(rows[:-1]):
+        if line is not None and INPUT_PROMPT.match(line) and rows[index + 1] is None:
+            return parse_menu(screen) is None
+    return False
 
 
 def _indent(line):
@@ -235,6 +250,8 @@ class Chat:
         self.claude_locks = {}
         # Terminals a send opened that were still loading when it gave up.
         self.unsettled = set()
+        # Conversations whose attach is being opened ahead of a send (warm).
+        self.warming = set()
         self.prompt_results = {}
         # state key -> {request id: monotonic expiry}, oldest first.
         self.waiting = {}
@@ -797,17 +814,71 @@ class Chat:
         return terminal
 
     def _settled(self, terminal_id):
-        """The attach UI redraws while it loads; it is ready once output stops for a moment."""
+        """The attach UI redraws while it loads; it is ready once output stops for a moment, or
+        (a working session's spinner never stops) once its input line shows (input_ready) a
+        moment after the first output. At the limit, what was seen is taken as before."""
         deadline, after, seen, quiet = time.monotonic() + CLAUDE_READY_SECONDS, 0, False, time.monotonic()
+        first = looked = None
         while time.monotonic() < deadline:
             chunk = self.workflow.terminals.read(terminal_id, after, 0.25)
+            now = time.monotonic()
             if chunk['after'] != after:
-                after, seen, quiet = chunk['after'], True, time.monotonic()
-            elif seen and time.monotonic() - quiet >= 0.8:
+                after, seen, quiet = chunk['after'], True, now
+                first = first or now
+            elif seen and now - quiet >= 0.8:
                 return True
+            if seen and now - first >= SETTLE_PROMPT_SECONDS and (looked is None or now - looked >= 0.5):
+                looked = now
+                try:
+                    if input_ready(self.workflow.terminals.capture(terminal_id)):
+                        return True
+                except (RuntimeError, ValueError, KeyError, OSError):
+                    pass
             if not chunk.get('alive', True):
                 break
         return seen
+
+    def warm(self, data):
+        """Its user began a message to a Claude background session with no board terminal: its
+        attach opens now, as the send would, so the send then pastes at once. Nothing is typed;
+        an unused connection closes like any idle one (terminal CLOSE_IDLE). Under the
+        session's input lock, so a send pressed meanwhile waits for it and opens no second one."""
+        if not isinstance(data, dict) or set(data) != {'source'}:
+            raise ValueError('미리 연결할 세션을 확인해 주세요.')
+        ref = data['source']
+        source, host = self.source(ref)
+        if source.get('agent') != 'claude' or source.get('kind') != 'background' or host.get('platform') == 'windows':
+            return {'warming': False}
+        key = json.dumps([source.get('host'), source.get('sessionId') or source.get('id')])
+        with self.lock:
+            if key in self.warming:
+                return {'warming': True}
+            self.warming.add(key)
+
+        def run():
+            turn = self._claude_lock_for(source)
+            if not turn.acquire(blocking=False):
+                with self.lock:
+                    self.warming.discard(key)
+                return  # A send is under way: it opens what it needs.
+            try:
+                if self._board_terminal(source) is not None:
+                    return
+                terminals = self.workflow.terminals
+                live = sum(1 for row in terminals.list() if row.get('alive') and not row.get('closed'))
+                if live >= getattr(terminals, 'max_terminals', 16) - 1:
+                    return  # Never release another connection for a warm-up; a send still can.
+                self._open_claude_terminal(ref, source, 'warm_' + secrets.token_hex(8))
+                self._forget_state(source)
+            except (SendRejected, ValueError, RuntimeError, OSError, KeyError):
+                pass  # The send opens it then, as before.
+            finally:
+                turn.release()
+                with self.lock:
+                    self.warming.discard(key)
+
+        threading.Thread(target=run, name='claude-warm', daemon=True).start()
+        return {'warming': True}
 
     def _claude_record_path(self, source, request_id):
         folder = self.root / 'claude-sends'

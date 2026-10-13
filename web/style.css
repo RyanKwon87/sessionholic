@@ -6794,3 +6794,27 @@ input.switch:focus-visible {
     -webkit-line-clamp: 2;
   }
 }
+
+/* 설정 › 빠른 답장: one phrase per line. */
+.quick-replies {
+  box-sizing: border-box;
+  width: 100%;
+  min-height: 7.5em;
+  padding: 10px 12px;
+  border: 1px solid var(--sep);
+  border-radius: 10px;
+  background: var(--surface);
+  color: var(--label);
+  font: inherit;
+  font-size: max(16px, var(--fs-body));
+  line-height: 1.45;
+  resize: vertical;
+}
+/* A session not looked at since it answered or finished. */
+.card-unread {
+  flex: none;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--accent);
+}

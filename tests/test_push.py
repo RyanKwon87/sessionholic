@@ -1,6 +1,8 @@
 import base64
 import http.client
 import json
+from unittest.mock import patch
+import io
 import os
 from pathlib import Path
 import shutil
@@ -223,6 +225,18 @@ class ServiceTest(unittest.TestCase):
         self.assertEqual(self.service.pending_for(self.service.subscriptions[0]["id"]), {"notifications": []})
         self.service.step()
         self.assertEqual(len(self.sent), 1)
+
+    def test_each_round_of_alerts_is_logged_with_how_many_devices_took_it(self):
+        self.subscribe()
+        self.board.set(row(phase="working"), row("019a0000-0000-7000-8000-000000000002", phase="working"))
+        self.service.step()
+        self.clock.now += push.MIN_WORK
+        self.board.set(row(phase="needs_input", updatedAt=self.clock.now),
+                       row("019a0000-0000-7000-8000-000000000002", phase="done", updatedAt=self.clock.now))
+        with patch("sys.stderr", new_callable=io.StringIO) as log:
+            self.service.step()
+        self.assertEqual(len(self.service.pending_for(self.service.subscriptions[0]["id"])["notifications"]), 2)
+        self.assertIn("알림 2건(답 필요 1) · 기기 1대 중 1대 전달", log.getvalue())
 
     def test_a_claude_row_without_an_id_notifies_under_the_lists_key(self):
         self.subscribe()

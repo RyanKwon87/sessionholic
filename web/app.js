@@ -139,6 +139,8 @@ const state = {
   pollBusy: false,
   pollRun: null, // the list read in flight (poll), shared by callers that wait for it
   manualRun: null, // the manual refresh in flight (manualRefresh), shared by a second press or pull
+  seenLocal: new Map(), // session key -> update time this page marked read (markSeen)
+  seenFailed: new Map(), // session key -> when its last mark failed (markSeen waits SEEN_RETRY_MS)
   updateAvailable: false, // the board serves a newer screen than this page runs (checkWebVersion)
   shownAt: Date.now(), // when the page was last shown (visibilitychange)
   authenticated: false,
@@ -551,6 +553,7 @@ function closeSheet(id, returnFocus = null) {
 function openSettings() {
   applyTheme();
   applyTextSize();
+  if ($("quick-replies")) $("quick-replies").value = quickReplies().join("\n");
   window.SessionholicPush?.render?.();
   sheet("settings-dialog").open();
 }
@@ -623,6 +626,9 @@ async function hardReload() {
 }
 function closeSettings() {
   if (!$("settings-dialog").open) return;
+  // A phrase list edited without leaving the field is kept too.
+  const quick = $("quick-replies");
+  if (quick && quick.value !== quickReplies().join("\n")) quick.value = saveQuickReplies(quick.value).join("\n");
   $("settings-dialog").close();
   $("settings")?.focus?.({ preventScroll: true });
 }
@@ -960,6 +966,10 @@ function render() {
   if (reading && botRequestForNative(sourceOf(reading))) { selectBotRequest(botRequestKey(botRequestForNative(sourceOf(reading)))); return; }
   if (reading && sessionCategoryOf(reading) !== state.sessionCategory) setSessionCategory(sessionCategoryOf(reading), { renderView: false, clearSelection: false });
   renderHosts(now); renderFreshness(now); renderAttention(sessions);
+  // The conversation on screen is read, also when it answers or finishes while shown
+  // (before the list is drawn, so its card never flashes a dot).
+  const shownSession = chatVisible() && sessions.find((s) => s.key === state.selected);
+  if (shownSession && sessionUnread(shownSession, now)) markSeen(shownSession);
   renderSessionList(sessions, now);
   if (state.sessionCategory === "bot") { window.SessionholicGoals?.update?.(sessions); return; }
   const selected = sessions.find((s) => s.key === state.selected);
@@ -1771,11 +1781,15 @@ function card(s) {
   const goals = el("span", "card-goals");
   // A live board terminal of this session (renderTerminalMarks keeps it current).
   const terminal = terminalMark("card-terminal");
-  meta.append(badge, terminal, agent, execution, project, stale, time);
+  // Not looked at since it answered or finished (sessionUnread).
+  const unread = el("span", "card-unread");
+  unread.setAttribute("aria-hidden", "true");
+  unread.hidden = true;
+  meta.append(unread, badge, terminal, agent, execution, project, stale, time);
   const chevron = el("span", "card-chevron");
   chevron.setAttribute("aria-hidden", "true");
   node.append(title, snippet, provenance, goals, meta, chevron);
-  node.cardParts = { title, snippet, badge, terminal, agent, execution, project, stale, time, initiator, host, goals };
+  node.cardParts = { title, snippet, badge, terminal, agent, execution, project, stale, time, initiator, host, goals, unread };
   node.cardRow = row;
   row.append(action, node);
   row.card = node;
@@ -1795,9 +1809,10 @@ function updateCard(node, s, now, folderHint = "") {
   const account = cardLine(s.account);
   const [label, tone] = BADGES[s.runtimeKnown === false ? "unknown" : s.phase] || ["상태 확인 필요", "gray"];
   const time = ago(s.updatedAt, now);
+  const unread = sessionUnread(s, now);
   node.className = `card${state.selected === s.key ? " selected" : ""}`;
   node.setAttribute("aria-pressed", String(state.selected === s.key));
-  node.cardLabel = ["프로젝트: " + project, "작업: " + title,
+  node.cardLabel = [unread ? "읽지 않음" : "", "프로젝트: " + project, "작업: " + title,
     preview ? "대화 미리보기: " + preview : "", folderHint ? "작업 폴더: " + folderHint : "",
     label, agent, "기기: " + host, account ? "계정 설정: " + account : "", time,
     s.stale ? "마지막 확인 기준" : ""].filter(Boolean).join(". ");
@@ -1818,6 +1833,45 @@ function updateCard(node, s, now, folderHint = "") {
   p.goals.hidden = !linkedGoals;
   p.stale.hidden = !s.stale;
   p.stale.title = s.stale ? "기기에 연결되지 않아 마지막으로 확인한 정보입니다." : "";
+  if (p.unread) { p.unread.hidden = !unread; p.unread.title = unread ? "아직 열어 보지 않은 결과" : ""; }
+}
+// ---------- 읽음 표시 ----------
+// A session that answered (답 필요) or just stopped (최근 끝남) after it was last opened on
+// this board is shown unread on every device: the board keeps when each was looked at
+// (snapshot sessionSeen.since and each row's seenAt). Before the board kept any, nothing
+// is unread; a mark from this page counts at once (state.seenLocal) until it is read back.
+function sessionUnread(s, now = state.snapshot?.serverTime || Date.now() / 1000) {
+  const since = state.snapshot?.sessionSeen?.since;
+  if (typeof since !== "number") return false;
+  const group = groupOf(s, now);
+  if (group !== "needs_input" && group !== "finished") return false;
+  const seen = Math.max(Number(s.seenAt) || 0, state.seenLocal.get(s.key) || 0, since);
+  return (Number(s.updatedAt) || 0) > seen;
+}
+// A refused or failed mark brings the dot back and is not tried again for this long.
+const SEEN_RETRY_MS = 60000;
+// The session as the board's read marks name it: a Claude conversation without a worker id
+// by its sessionId (as session_labels.js names it for 제목 수정).
+function seenSource(s) {
+  const source = { ...sourceOf(s) };
+  if (s.agent === "claude") {
+    source.home ||= ".claude";
+    if (!source.id && s.kind === "interactive") source.id = s.sessionId;
+    if (s.sessionId) source.sessionId = s.sessionId;
+  }
+  return source;
+}
+function markSeen(s) {
+  const at = Number(s?.updatedAt) || 0;
+  if (!at || (state.seenLocal.get(s.key) || 0) >= at || (Number(s.seenAt) || 0) >= at) return;
+  if (Date.now() - (state.seenFailed.get(s.key) || 0) < SEEN_RETRY_MS) return;
+  state.seenLocal.set(s.key, at);
+  api("/api/session/seen", { method: "POST", body: { source: seenSource(s), updatedAt: at } }).catch(() => {
+    // Not kept by the board: the dot comes back, and this page waits a minute to try again.
+    if (state.seenLocal.get(s.key) === at) state.seenLocal.delete(s.key);
+    state.seenFailed.set(s.key, Date.now());
+    render();
+  });
 }
 
 // --- Gestures: long press menus and card swipes --------------------------------
@@ -2403,6 +2457,7 @@ function select(key) {
   const target = allSessions().find((session) => session.key === key);
   const bot = target && botRequestForNative(sourceOf(target));
   if (bot) { selectBotRequest(botRequestKey(bot)); return; }
+  if (target && sessionUnread(target)) markSeen(target);
   state.selectedBotRequest = null;
   const listChanged = target && prepareSessionListFor(target);
   if (listChanged && state.selected === key) renderSessionList(allSessions(), state.snapshot?.serverTime || Date.now() / 1000);
@@ -3683,8 +3738,14 @@ function buildChatComposer(s) {
   const toolsActions = el("div", "chat-tools-actions");
   const manage = button("세션 관리", "secondary", (event) => { if (editorCurrent()) { tools.open = false; manageSession(s, event.currentTarget); } });
   manage.id = "chat-manage";
-  toolsActions.append(clipboard, check, native, closeTerm, manage);
-  for (const action of [clipboard, check, native, closeTerm])
+  const quick = button("빠른 답장", "secondary", (event) => {
+    if (!editorCurrent()) return;
+    tools.open = false;
+    openQuickReplies(entry, input, event.currentTarget);
+  });
+  quick.id = "chat-quick";
+  toolsActions.append(quick, clipboard, check, native, closeTerm, manage);
+  for (const action of [quick, clipboard, check, native, closeTerm])
     action.addEventListener("pointerdown", (event) => event.preventDefault());
   tools.append(toolsActions);
   actions.append(attach, expand, terminal, keyHint, tools);
@@ -4720,6 +4781,45 @@ async function uploadChatFiles(entry, files) {
   }
   entry.uploads = 0;
   updateChatComposer(entry);
+}
+// ---------- 빠른 답장 ----------
+// Phrases put into the chat input from 도구 › 빠른 답장, never sent by themselves. This
+// browser keeps its own list (설정 › 빠른 답장); until it is edited, these defaults.
+const QUICK_REPLIES_DEFAULT = ["계속 진행해 줘.", "좋아, 그렇게 해 줘.", "테스트 돌리고 결과 알려 줘.",
+  "커밋하고 푸시해 줘.", "지금까지 한 일을 짧게 정리해 줘."];
+const QUICK_REPLY_LIMIT = 12;
+const QUICK_REPLY_LENGTH = 200;
+function quickRepliesKey() {
+  return INSTANCE.storagePrefix + "quickReplies";
+}
+function quickReplies() {
+  try {
+    const saved = JSON.parse(localStorage.getItem(quickRepliesKey()) || "null");
+    if (Array.isArray(saved))
+      return saved.filter((text) => typeof text === "string" && text.trim())
+        .map((text) => text.trim().slice(0, QUICK_REPLY_LENGTH)).slice(0, QUICK_REPLY_LIMIT);
+  } catch {
+    // Unreadable storage: the defaults.
+  }
+  return QUICK_REPLIES_DEFAULT.slice();
+}
+function saveQuickReplies(text) {
+  const rows = String(text || "").split("\n").map((line) => line.trim().slice(0, QUICK_REPLY_LENGTH))
+    .filter(Boolean).slice(0, QUICK_REPLY_LIMIT);
+  try {
+    localStorage.setItem(quickRepliesKey(), JSON.stringify(rows));
+  } catch {
+    // Not kept in this browser; the list still applies until the page reloads.
+  }
+  return rows;
+}
+function openQuickReplies(entry, input, trigger) {
+  const replies = quickReplies();
+  // Chosen or cancelled, the keyboard goes back to the input, not to the closed tools menu.
+  openActionSheet({ eyebrow: "입력창에 넣기 · 보내지 않음", title: "빠른 답장", trigger: input || trigger,
+    actions: replies.length
+      ? replies.map((text) => ({ label: text, run: () => { insertChatText(entry, input, text); input.focus?.({ preventScroll: true }); } }))
+      : [{ label: "설정 › 빠른 답장에서 문구를 추가해 주세요", disabled: true, run() {} }] });
 }
 function insertChatText(entry, input, text) {
   if (!text || !currentChat(entry) || input.disabled || input.readOnly) return;
@@ -8270,6 +8370,7 @@ window.addEventListener("DOMContentLoaded", () => {
   $("settings-done").addEventListener("click", closeSettings);
   $("hard-reload")?.addEventListener("click", hardReload);
   $("update-banner")?.addEventListener("click", updateBannerPressed);
+  $("quick-replies")?.addEventListener("change", (event) => { event.target.value = saveQuickReplies(event.target.value).join("\n"); });
   $("settings-dialog").addEventListener("cancel", (event) => {
     event.preventDefault();
     closeSettings();

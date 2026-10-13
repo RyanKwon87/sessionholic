@@ -128,7 +128,7 @@ function client(
   vm.runInContext(messageSource, context);
   vm.runInContext(source, context);
   const api = vm.runInContext(
-    "({state,api,sourceOf,accountOf,sendInput,pasteDraft,prepareDraftPaste,startDraftComposition,endDraftComposition,inputDraft,stopTerminalReader,startTerminalReader,closePlan,navigateView,backToList,backFromTerminal,closeTerminal,cancelTerminalClose,confirmTerminalClose,populateAccount,populateRoute,updateContinue,renderPlan,launchPlan,openTerminal,saveDraft,draftKey,refreshTerminals,renderTerminals,renderTerminalReturn,renderFilters,terminalCloseCopy,warnDraftUnload,preparePlan,renderGroups,renderMessages,loadDetail,chatKey,chatEntry,currentChat,chatSupported,chatRecovery,recoverChatSession,openChatTerminal,chatAttachmentsSupported,buildChatComposer,sendChat,loadChatState,applyChatReceipt,uploadChatFiles,pasteChat,scheduleChatPoll,stopChatPolling,openNativeChat,allSessions,buildContinuePanel,chatReceiptCopy,returnToBoard,readChatClipboard,accountDisplay,sessionAccountLabel,closeChatToolsOutside,closeChatToolsEscape,drawDetail,refreshDetail,loadCapabilities,matches,recoverConnection,networkOffline,poll,select,focusDetailBack,restoreSelectedCardFocus,showLogin,lock,beginAuthEpoch,resizeChatInput,updateViewport,draftKeydown,configureTerminalKeyboard,queueTerminalScroll,flushTerminalScroll,terminalScrollEnd,resetTerminalScroll,renderAttention,chatPollDelay,pullRefresh,readingScroll,renderJump,pullDistance,listScroll,setReading,renderPrompt,promptAction,renderUsage,loadUsage,applyTheme,setTheme,updateThemeColor,haptic,navTransition,setDetailShown,chatVisible,sheetRelease,BottomSheet,sheet,openSettings,closeSettings,setTyping,pinchFontSize,setTerminalFontSize,loadXterm,assetUrl,syncEvents,closeEvents,eventsHealthy,renderFreshness,schedule,touchDevice,togglePhaseFilter,renderCounts,createLongPress,swipeIntent,swipeRelease,groupMessageRows,setTextSize,applyTextSize,renderConnectivity,terminalForSession,swipeActionFor,openMessageMenu,openCardMenu,messageActions,outboxShape,outboxMatches,outboxOrigin,settleOutbox,retryOutbox,renderAttachmentTiles,attachmentThumb,sendUpload,openActionSheet,closeActionSheet,setListCollapsed,closeSwipe,settleSwipe,prepareSwipe,runSwipeAction,GESTURE,setChromeVisible,toggleChrome,revealChrome,isChromeTap,snapshotAnnounced,updateChatComposer,capabilitiesRevision,toolKindOf,userMessageParts,formatElapsed,tickWorking,renderTerminalMarks,renderDetailTerminal,terminalsAnnounced,goToSessionTerminal,rememberTerminal,terminalMenu,updateTerminalMenu,chooseTerminalMenu,clearTerminalMenu,renderNewSession,openNewSession,startNewSession,startAppServer,rememberConversationView,restoreConversationView,conversationIdentity,initiatorOf,initiatorLabel,documentKeydown,sessionCategoryOf,setSessionCategory,renderSessionCategories,prepareSessionListFor,sessionCategoryKeydown,render,resetFilters,terminalTitle,renameTerminals,requestedSessionFrom,requestSessionOpen,openRequestedSession,answerOnOpen,hardReload,terminalKeyBytes,terminalKeyFromEvent,pressTerminalKey,toggleTerminalMod,clearTerminalMods,renderTerminalMods,draftBeforeInput,terminalDocumentKey,xtermKeyEvent,renderHardware,loadHardware,startDictation,stopDictation,dictationText,toggleDraftDictation,renderDictation,DICTATION_LISTENING,DICTATION_ERRORS,DICTATION_PREPARING,DICTATION_STALLED,DICTATION_ENDED_AT_ONCE,DICTATION_INTERRUPTED,DICTATION_NOT_STARTED,DICTATION_SILENCE_END,DICTATION_CHANGED,DICTATION_ENDING,bindDraftInput,insertChatText,reloadForUpdate,checkWebVersion,unsavedWork,detailMetaChildren,updateBannerPressed,manualRefresh,listNavigationKeydown,sessionUnread,markSeen,quickReplies,saveQuickReplies,openQuickReplies,terminalEndedCopy,terminalContextCopy,sessionForTerminal,showTerminalEnded,reopenEndedTerminal,csrfRetryable,tidySession,sessionRemoved,removeSession,showSessionAgain,markOpened,groupOf,chatPlaceholder,applyDock,dockWidth,boardCovered,boardKeysBlocked,noteDockSide,toggleDock,redock})",
+    "({state,api,sourceOf,accountOf,sendInput,pasteDraft,prepareDraftPaste,startDraftComposition,endDraftComposition,inputDraft,stopTerminalReader,startTerminalReader,closePlan,navigateView,backToList,backFromTerminal,closeTerminal,cancelTerminalClose,confirmTerminalClose,populateAccount,populateRoute,updateContinue,renderPlan,launchPlan,openTerminal,saveDraft,draftKey,refreshTerminals,renderTerminals,renderTerminalReturn,renderFilters,terminalCloseCopy,warnDraftUnload,preparePlan,renderGroups,renderMessages,loadDetail,chatKey,chatEntry,currentChat,chatSupported,chatRecovery,recoverChatSession,openChatTerminal,chatAttachmentsSupported,buildChatComposer,sendChat,loadChatState,applyChatReceipt,uploadChatFiles,pasteChat,scheduleChatPoll,stopChatPolling,openNativeChat,allSessions,buildContinuePanel,chatReceiptCopy,returnToBoard,readChatClipboard,accountDisplay,sessionAccountLabel,closeChatToolsOutside,closeChatToolsEscape,drawDetail,refreshDetail,loadCapabilities,matches,recoverConnection,networkOffline,poll,select,focusDetailBack,restoreSelectedCardFocus,showLogin,lock,beginAuthEpoch,resizeChatInput,updateViewport,draftKeydown,configureTerminalKeyboard,queueTerminalScroll,flushTerminalScroll,terminalScrollEnd,resetTerminalScroll,renderAttention,chatPollDelay,pullRefresh,readingScroll,renderJump,pullDistance,listScroll,setReading,renderPrompt,promptAction,renderUsage,loadUsage,applyTheme,setTheme,updateThemeColor,haptic,navTransition,setDetailShown,chatVisible,sheetRelease,BottomSheet,sheet,openSettings,closeSettings,setTyping,pinchFontSize,setTerminalFontSize,loadXterm,assetUrl,syncEvents,closeEvents,eventsHealthy,renderFreshness,schedule,touchDevice,togglePhaseFilter,renderCounts,createLongPress,swipeIntent,swipeRelease,groupMessageRows,setTextSize,applyTextSize,renderConnectivity,terminalForSession,swipeActionFor,openMessageMenu,openCardMenu,messageActions,outboxShape,outboxMatches,outboxOrigin,settleOutbox,retryOutbox,renderAttachmentTiles,attachmentThumb,sendUpload,openActionSheet,closeActionSheet,setListCollapsed,closeSwipe,settleSwipe,prepareSwipe,runSwipeAction,GESTURE,setChromeVisible,toggleChrome,revealChrome,isChromeTap,snapshotAnnounced,updateChatComposer,capabilitiesRevision,toolKindOf,userMessageParts,formatElapsed,tickWorking,renderTerminalMarks,renderDetailTerminal,terminalsAnnounced,goToSessionTerminal,rememberTerminal,terminalMenu,updateTerminalMenu,chooseTerminalMenu,clearTerminalMenu,renderNewSession,openNewSession,startNewSession,startAppServer,rememberConversationView,restoreConversationView,conversationIdentity,initiatorOf,initiatorLabel,documentKeydown,sessionCategoryOf,setSessionCategory,renderSessionCategories,prepareSessionListFor,sessionCategoryKeydown,render,resetFilters,terminalTitle,renameTerminals,requestedSessionFrom,requestSessionOpen,openRequestedSession,answerOnOpen,hardReload,terminalKeyBytes,terminalKeyFromEvent,pressTerminalKey,toggleTerminalMod,clearTerminalMods,renderTerminalMods,draftBeforeInput,terminalDocumentKey,xtermKeyEvent,renderHardware,loadHardware,startDictation,stopDictation,dictationText,toggleDraftDictation,renderDictation,DICTATION_LISTENING,DICTATION_ERRORS,DICTATION_PREPARING,DICTATION_STALLED,DICTATION_ENDED_AT_ONCE,DICTATION_INTERRUPTED,DICTATION_NOT_STARTED,DICTATION_SILENCE_END,DICTATION_CHANGED,DICTATION_ENDING,bindDraftInput,insertChatText,reloadForUpdate,checkWebVersion,unsavedWork,detailMetaChildren,updateBannerPressed,manualRefresh,listNavigationKeydown,sessionUnread,markSeen,quickReplies,saveQuickReplies,openQuickReplies,terminalEndedCopy,terminalContextCopy,sessionForTerminal,showTerminalEnded,reopenEndedTerminal,csrfRetryable,tidySession,sessionRemoved,removeSession,showSessionAgain,markOpened,groupOf,chatPlaceholder,applyDock,dockWidth,boardCovered,boardKeysBlocked,noteDockSide,toggleDock,redock,finishTerminalClose})",
     context,
   );
   api.state.csrf = "csrf-test";
@@ -9749,4 +9749,100 @@ test("with the list stepped aside for a docked terminal, back and ⌘K bring the
   assert.equal(c.state.terminalVisible, true);
   assert.equal(c.state.docked, true);
   assert.equal(c.context.window.history.backCount, before2);
+});
+
+test("docked, the board's focus is let go, a phone held sideways never docks, and a pinch decides once", async () => {
+  const { c } = dockClient(1180);
+  // The control that opened the terminal keeps no keys from it.
+  let blurred = 0;
+  const opener = { closest: (selector) => (selector === "#app" ? {} : null), blur() { blurred++; } };
+  c.context.document.activeElement = opener;
+  await c.openTerminal({ id: "focus", mode: "attach" });
+  assert.equal(c.state.docked, true);
+  assert.equal(blurred, 1);
+  // The toggle lets go of its own focus too.
+  let toggleBlurred = 0;
+  c.get("terminal-dock").blur = () => { toggleBlurred++; };
+  c.toggleDock();
+  c.toggleDock();
+  assert.equal(toggleBlurred, 2);
+  // Covering and docking again gives the terminal the keys, whichever side was touched.
+  c.noteDockSide("board");
+  c.context.window.innerWidth = 834;
+  c.updateViewport();
+  c.context.window.innerWidth = 1180;
+  c.updateViewport();
+  assert.equal(c.state.docked, true);
+  assert.equal(c.state.dockSide, "terminal");
+  // A pinch changes the size without moving the terminal; its end decides (A−/A+ at once).
+  c.state.term = { options: {} };
+  const width = c.state.dockWidth;
+  c.setTerminalFontSize(10, { persist: false });
+  assert.equal(c.state.dockWidth, width);
+  c.setTerminalFontSize(10);
+  c.setTerminalFontSize(12);
+  assert.notEqual(c.state.dockWidth, width);
+  c.state.term = null;
+  c.returnToBoard({ selectLaunchedSource: false, animate: false });
+  // A phone held sideways (short) covers the board even when wide.
+  c.context.window.innerWidth = 932;
+  c.context.window.matchMedia = (query) => ({ matches: query === "(max-height: 520px)" });
+  assert.equal(c.dockWidth({ preferred: true }), 0);
+});
+
+test("docked, closing the terminal keeps the conversation, and another session gives the terminal's history entry way", async () => {
+  const chatReads = [];
+  const { c } = dockClient(1180, async (url, options) => {
+    if (url.endsWith("/api/chat/state")) chatReads.push(JSON.parse(options.body).source?.id || JSON.parse(options.body).id);
+    return { ok: true, status: 200, json: async () => ({ terminals: [] }) };
+  });
+  const { s } = selectChat(c);
+  const other = { host: "workstation", agent: "codex", home: ".codex-example", id: "other-session",
+    key: ["workstation", "codex", ".codex-example", "other-session"].join("|") };
+  c.state.snapshot.hosts[0].data.codex.push(other);
+  const own = { id: "own", mode: "attach", nativeSource: c.sourceOf(s) };
+  await c.openTerminal(own);
+  assert.equal(c.context.window.history.state.view, "terminal");
+  // Another conversation: the terminal steps aside, its entry is replaced, the old one is not read again.
+  chatReads.length = 0;
+  c.select(other.key);
+  assert.equal(c.state.terminalVisible, false);
+  assert.equal(c.context.window.history.state.view, "list");
+  assert.equal(chatReads.includes("native-session"), false);
+  // A notification for another session while docked: back returns to the terminal.
+  c.select(s.key);
+  await c.openTerminal(own);
+  c.state.authenticated = true;
+  const pushed = [];
+  const push = c.context.window.history.pushState;
+  c.context.window.history.pushState = function (value) { pushed.push(value.view); return push.call(this, value); };
+  c.requestSessionOpen("/?session=" + encodeURIComponent(other.key));
+  c.openRequestedSession();
+  assert.equal(c.state.terminalVisible, false);
+  assert.equal(c.state.selected, other.key);
+  assert.deepEqual(pushed, ["detail"]);
+  // One for the terminal's own session leaves it beside.
+  c.select(s.key);
+  await c.openTerminal(own);
+  c.requestSessionOpen("/?session=" + encodeURIComponent(s.key));
+  c.openRequestedSession();
+  assert.equal(c.state.docked, true);
+  // Closing a docked terminal leaves the conversation shown and reading.
+  c.state.detailShown = true;
+  c.state.chatPollRun = 7;
+  c.finishTerminalClose({ id: "own", copy: { done: "닫았습니다." } });
+  assert.equal(c.state.terminalVisible, false);
+  assert.equal(c.state.detailShown, true);
+  assert.equal(c.state.chatPollRun, 7);
+});
+
+test("docked with the list aside, Esc on the board side brings the list", async () => {
+  const { c } = dockClient(1180);
+  const { s } = selectChat(c);
+  await c.openTerminal({ id: "esc", mode: "attach", nativeSource: c.sourceOf(s) });
+  c.get("session-layout").hidden = false;
+  c.noteDockSide("board");
+  const backs = c.context.window.history.backCount;
+  assert.equal(c.listNavigationKeydown({ key: "Escape", preventDefault() {}, target: c.context.document.body }), true);
+  assert.equal(c.context.window.history.backCount, backs + 1);
 });

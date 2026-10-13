@@ -4536,7 +4536,9 @@ body.dock-solo .layout {
 body.dock-solo .list-pane {
   display: none;
 }
-body.terminal-docked .toast {
+body.terminal-docked .toast,
+body.terminal-docked .offline-banner,
+body.terminal-docked .pull-refresh {
   left: calc((100% - var(--dock-w)) / 2);
   max-width: calc(100% - var(--dock-w) - 32px);
 }

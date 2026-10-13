@@ -56,6 +56,9 @@ SESSION_ID = re.compile(r"^[0-9A-Za-z-]{8,64}$")
 EXTRA_PATH = ["/opt/homebrew/bin", str(HOME / ".local/bin"), "/usr/local/bin", "/usr/bin", "/bin"]
 TEXT_LIMIT = 4000
 MESSAGE_LIMIT = 80
+# Codex history is read newest-first in pages of this many items, at most this many pages.
+HISTORY_PAGE = 100
+HISTORY_PAGES = 10
 SNIPPET_TAILS = (32 * 1024, 128 * 1024)
 CODEX_THREAD_LIMIT = 25
 # Codex homes listed at once; each uses its own daemon connection.
@@ -1022,6 +1025,84 @@ def codex_turn_rows(turn):
     return out
 
 
+def paging_unsupported(error, method):
+    """True when this thread's history cannot be paged: a daemon that predates `method` names
+    it an unknown variant, and a thread stored in the legacy format answers method-not-found
+    (-32601, "... is not supported yet"). A rejected parameter value is an unknown variant
+    too, and must stay an error."""
+    if getattr(error, "code", None) == -32601:
+        return True
+    variant = getattr(error, "unknown_variant", None)
+    if variant is not None:
+        return variant == method
+    return isinstance(error, RpcReplyError) and error.code == -32600 and ("unknown variant `%s`" % method) in str(error)
+
+
+def codex_recent_thread(server, thread_id, rows=MESSAGE_LIMIT):
+    """`thread/read` result whose thread carries only its latest turns, read page by page.
+
+    `includeTurns` loads the whole rollout, which grows to hundreds of MB after hours of
+    image work, so one conversation read could outlast its deadline. The metadata read is
+    cheap, and items come newest-first until `rows` rows are covered and the turn of the oldest
+    of them reaches its user message. Turns come with their status only; their items are those
+    read, so the oldest turn may be cut short.
+    None when the daemon predates the paged methods or the thread is stored in the legacy
+    format, so the caller reads the thread whole."""
+    result = server.call("thread/read", {"threadId": thread_id, "includeTurns": False})
+    thread = result.get("thread") if isinstance(result, dict) else None
+    if not isinstance(thread, dict) or thread.get("id") != thread_id:
+        return result
+    entries, cursor, method = [], None, "thread/items/list"
+    try:
+        for _ in range(HISTORY_PAGES):
+            params = {"threadId": thread_id, "limit": HISTORY_PAGE, "sortDirection": "desc"}
+            if cursor:
+                params["cursor"] = cursor
+            page = server.call(method, params)
+            data = page.get("data") if isinstance(page, dict) else None
+            if not isinstance(data, list) or any(not isinstance(entry, dict) or not isinstance(entry.get("item"), dict)
+                                                 or not isinstance(entry.get("turnId"), str) for entry in data):
+                raise ValueError("Codex 대화 기록 형식이 올바르지 않습니다.")
+            entries.extend(data)
+            cursor = page.get("nextCursor")
+            if not cursor:
+                break
+            shown = [entry for entry in entries
+                     if entry["item"].get("type") in ("userMessage", "agentMessage") or entry["item"].get("type") in CODEX_TOOL_KINDS]
+            # Enough once the turn of the oldest row shown reaches back to its user message.
+            edge = shown[rows - 1]["turnId"] if len(shown) >= rows else None
+            if edge and any(entry["turnId"] == edge and entry["item"].get("type") == "userMessage" for entry in entries):
+                break
+        wanted = set(entry["turnId"] for entry in entries)
+        turns, cursor, method = [], None, "thread/turns/list"
+        for _ in range(HISTORY_PAGES):
+            params = {"threadId": thread_id, "limit": len(wanted) + 2, "sortDirection": "desc", "itemsView": "notLoaded"}
+            if cursor:
+                params["cursor"] = cursor
+            page = server.call(method, params)
+            data = page.get("data") if isinstance(page, dict) else None
+            if not isinstance(data, list) or any(not isinstance(turn, dict) or not isinstance(turn.get("id"), str) for turn in data):
+                raise ValueError("Codex turn 기록 형식이 올바르지 않습니다.")
+            turns.extend(data)
+            cursor = page.get("nextCursor")
+            if not cursor or wanted <= set(turn["id"] for turn in turns):
+                break
+    except RpcError as error:
+        if paging_unsupported(error, method):
+            return None
+        raise
+    items = {}
+    for entry in reversed(entries):
+        items.setdefault(entry["turnId"], []).append(entry["item"])
+    # Newest first: every turn down to the oldest one with items read (a just-started turn
+    # may have none yet). A turn past the pages read is left out with its items.
+    found = [turn["id"] for turn in turns]
+    last = max((found.index(turn_id) for turn_id in wanted if turn_id in found), default=-1)
+    thread["turns"] = [{**turn, "items": items.get(turn["id"], []), "itemsView": "full"}
+                       for turn in reversed(turns[:last + 1] if wanted else turns[:1])]
+    return {**result, "thread": thread}
+
+
 def codex_messages(turns):
     out = []
     for turn in turns:
@@ -1114,8 +1195,10 @@ def read(agent, session_id, home_key=None):
                     "error": "이 계정의 Codex 앱 서버가 꺼져 있어 대화를 읽지 못했습니다."}
         try:
             with AppServer(HOME / home_key / SOCKET_REL, timeout=30) as server:
-                result = server.call("thread/read", {"threadId": session_id, "includeTurns": True})
-        except (OSError, RpcError) as exc:
+                result = codex_recent_thread(server, session_id)
+                if result is None:
+                    result = server.call("thread/read", {"threadId": session_id, "includeTurns": True})
+        except (OSError, RpcError, ValueError) as exc:
             return {"messages": [], "error": "Codex 대화를 읽지 못했습니다: " + str(exc)}
         thread = result.get("thread") if isinstance(result, dict) else None
         if not isinstance(thread, dict) or thread.get("id") != session_id:

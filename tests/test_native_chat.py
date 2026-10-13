@@ -12,6 +12,32 @@ import native_chat as chat
 
 
 QUEUE_METHODS = ('thread/queue/list', 'thread/queue/add', 'thread/queue/start', 'turn/steer')
+PAGED_READS = ('thread/items/list', 'thread/turns/list')
+
+
+def paged(thread, method, params):
+    """app-server history pages, newest first: items with their turn id, or turns with no items."""
+    turns = thread['turns']
+    if method == 'thread/items/list':
+        rows = [{'item': item, 'turnId': turn['id']} for turn in turns if isinstance(turn, dict) for item in turn.get('items') or []]
+    else:
+        # A malformed turn is passed on as it is, for the reader to reject.
+        rows = [{**turn, 'items': [], 'itemsView': 'notLoaded'} if isinstance(turn, dict) else turn for turn in turns]
+    rows.reverse()
+    start = int(params.get('cursor') or 0)
+    end = start + params['limit']
+    return {'data': rows[start:end], 'nextCursor': str(end) if end < len(rows) else None}
+
+
+def snapshot(thread):
+    """Outcomes answering every read from one fixed snapshot, whatever the client writes later."""
+    return {'thread/read': lambda params: {'thread': thread if params.get('includeTurns') else {**thread, 'turns': []}},
+            **{method: (lambda params, method=method: paged(thread, method, params)) for method in PAGED_READS}}
+
+
+def methods(client):
+    """Calls in order, a metadata read with its history pages counted as one thread/read."""
+    return [method for method, _ in client.calls if method not in PAGED_READS]
 
 
 class FakeClient:
@@ -40,7 +66,11 @@ class FakeClient:
                 return value(params)
             return value
         if method == 'thread/read':
-            return {'thread': self.thread}
+            if params.get('includeTurns'):
+                return {'thread': self.thread}
+            return {'thread': {**self.thread, 'turns': []}}
+        if method in PAGED_READS:
+            return paged(self.thread, method, params)
         if method == 'turn/start':
             item = {'type': 'userMessage', 'id': 'item-' + str(len(self.calls)),
                     'clientId': params['clientUserMessageId'], 'content': params['input']}
@@ -83,7 +113,7 @@ class NativeChatTests(unittest.TestCase):
         return result
 
     def writes(self, client):
-        return [(method, params) for method, params in client.calls if method != 'thread/read']
+        return [(method, params) for method, params in client.calls if method not in ('thread/read',) + PAGED_READS]
 
     def running(self, items=None):
         thread = self.thread('active')
@@ -100,7 +130,7 @@ class NativeChatTests(unittest.TestCase):
         self.assertEqual(result['receipts'][0]['requestId'], self.request)
         self.assertEqual(result['receipts'][0]['delivery'], 'completed')
         self.assertTrue(result['receipts'][0]['readbackConfirmed'])
-        self.assertEqual([method for method, _ in client.calls], ['thread/read'])
+        self.assertEqual(methods(client), ['thread/read'])
         self.assertEqual(self.writes(client), [])
 
     def test_combined_receipt_matches_independent_unknown_rejected_and_acknowledged(self):
@@ -110,7 +140,7 @@ class NativeChatTests(unittest.TestCase):
                 rid = self.request + '-' + str(index)
                 args = {**self.args, 'requestId': rid}
                 # None: native acknowledges turn/start, but its follow-up read still lags.
-                outcomes = {'turn/start': error} if error else {'thread/read': {'thread': self.thread()}}
+                outcomes = {'turn/start': error} if error else snapshot(self.thread())
                 self.handle(FakeClient(self.thread(), outcomes=outcomes), args)
                 clean = FakeClient(self.thread())
                 combined = self.handle(clean, {'action': 'read', 'source': self.source, 'requestId': rid})
@@ -120,7 +150,7 @@ class NativeChatTests(unittest.TestCase):
                     self.assertEqual(receipt.get(key), standalone.get(key))
                 self.assertEqual(receipt['delivery'], ('unknown', 'rejected', 'accepted')[index])
                 self.assertEqual(combined['phase'], 'idle')
-                self.assertEqual([m for m, _ in clean.calls], ['thread/read'])
+                self.assertEqual(methods(clean), ['thread/read'])
                 self.assertEqual(self.writes(clean), [])
                 retry = FakeClient(self.thread())
                 self.handle(retry, args)
@@ -168,7 +198,7 @@ class NativeChatTests(unittest.TestCase):
         self.assertEqual([a['source'] for a in result['messages'][0]['attachments']], ['native', 'native'])
         self.assertNotIn('PRIVATE', json.dumps(result))
         self.assertNotIn('/example/private', json.dumps(result))
-        self.assertEqual([m for m, _ in client.calls], ['thread/read'])
+        self.assertEqual(methods(client), ['thread/read'])
         self.assertFalse((self.home / '.sessionholic').exists())
 
     def test_joined_input_recovers_proven_attachment_metadata_without_loading_files(self):
@@ -200,7 +230,7 @@ class NativeChatTests(unittest.TestCase):
         self.assertNotIn(completed, [m.get('clientId') for m in read['messages']])
         for key in ('queue', 'queuedMessages', 'queueState'):
             self.assertNotIn(key, read)
-        self.assertEqual([m for m, _ in client.calls], ['thread/read'])
+        self.assertEqual(methods(client), ['thread/read'])
         for ids in ([self.request] * 21, ['invalid'], None):
             with patch.object(chat, '_client') as connect:
                 with self.assertRaises(ValueError):
@@ -232,8 +262,8 @@ class NativeChatTests(unittest.TestCase):
         self.assertEqual(read['receipts'][0]['delivery'], 'accepted')
         for key in ('queue', 'queuedMessages', 'queueState'):
             self.assertNotIn(key, read)
-        self.assertEqual([m for m, _ in client.calls], ['thread/read', 'turn/start', 'thread/read'])
-        self.assertEqual([m for m, _ in reader.calls], ['thread/read'])
+        self.assertEqual(methods(client), ['thread/read', 'turn/start', 'thread/read'])
+        self.assertEqual(methods(reader), ['thread/read'])
 
     def test_unknown_turn_status_keeps_conversation_readable_but_locks_input(self):
         thread = self.thread()
@@ -529,7 +559,7 @@ class NativeChatTests(unittest.TestCase):
 
     def test_acknowledged_receipt_survives_native_history_lag_without_retry(self):
         # The follow-up read is a static snapshot that does not yet contain the input.
-        client = FakeClient(self.thread(), outcomes={'thread/read': {'thread': self.thread()}})
+        client = FakeClient(self.thread(), outcomes=snapshot(self.thread()))
         result = self.handle(client)
         self.assertEqual(result['delivery'], 'accepted')
         self.assertTrue(result['acknowledged'])
@@ -753,6 +783,100 @@ class NativeChatTests(unittest.TestCase):
             self.assertEqual(read.get('workingSince'), expected, state)
             self.assertEqual(read.get('workingSinceApprox'), True if expected else None)
             self.assertEqual([m['role'] for m in read['messages']], ['user', 'tool'])
+
+
+class RecentHistoryTests(unittest.TestCase):
+    """A conversation read pages the latest history instead of loading the whole rollout."""
+    def setUp(self):
+        self.source = {'agent': 'codex', 'home': '.codex-isolated', 'id': str(uuid.uuid4()), 'cwd': '/tmp/project'}
+
+    def thread(self, turns, kind='idle'):
+        return {'id': self.source['id'], 'cwd': self.source['cwd'], 'turns': turns,
+                'status': {'type': kind, 'activeFlags': []}, 'canAcceptDirectInput': True,
+                'source': 'cli', 'updatedAt': 1}
+
+    @staticmethod
+    def turn(number, tools, status='completed'):
+        items = [{'type': 'userMessage', 'id': 'u%d' % number, 'clientId': 'request-%04d' % number,
+                  'content': [{'type': 'text', 'text': 'ask %d' % number}]}]
+        items += [{'type': 'commandExecution', 'id': 'c%d-%d' % (number, index), 'command': 'ls'} for index in range(tools)]
+        items.append({'type': 'agentMessage', 'id': 'a%d' % number, 'text': 'answer %d' % number})
+        return {'id': 'turn-%d' % number, 'status': status, 'startedAt': number, 'completedAt': number, 'items': items}
+
+    def read(self, client, **args):
+        with patch.object(chat, '_client', return_value=client):
+            return chat.handle({'action': 'read', 'source': self.source, **args})
+
+    def test_long_conversation_reads_only_its_latest_turns(self):
+        client = FakeClient(self.thread([self.turn(number, 30) for number in range(1, 41)]))
+        result = self.read(client, requestId='request-0040')
+        self.assertNotIn(True, [params.get('includeTurns') for method, params in client.calls if method == 'thread/read'])
+        self.assertEqual(len(result['messages']), collector.MESSAGE_LIMIT)
+        self.assertEqual(result['messages'][-1]['text'], 'answer 40')
+        self.assertEqual(result['receipts'][0]['delivery'], 'completed')
+        # 32 rows per turn: the 80th newest row is in turn 38, whose user message is on page one.
+        self.assertEqual(len([m for m, _ in client.calls if m == 'thread/items/list']), 1)
+        self.assertEqual([turn['id'] for turn in result['turns']], ['turn-37', 'turn-38', 'turn-39', 'turn-40'])
+        self.assertEqual((result['messages'][0]['role'], result['messages'][0]['turnId']), ('tool', 'turn-38'))
+
+    def test_kept_turn_reaches_back_to_its_user_message(self):
+        # One turn longer than a page: its request is still found, its start time kept.
+        client = FakeClient(self.thread([self.turn(1, 5), self.turn(2, 250)]))
+        result = self.read(client, requestId='request-0002')
+        self.assertEqual(result['receipts'][0]['delivery'], 'completed')
+        self.assertEqual([turn['id'] for turn in result['turns']], ['turn-1', 'turn-2'])
+
+    def test_just_started_turn_without_items_is_the_active_one(self):
+        started = {'id': 'turn-3', 'status': 'inProgress', 'startedAt': 3, 'items': []}
+        client = FakeClient(self.thread([self.turn(1, 1), self.turn(2, 1), started], kind='active'))
+        result = self.read(client)
+        self.assertEqual(result['phase'], 'working')
+        self.assertEqual(result['activeTurnId'], 'turn-3')
+        self.assertEqual(result['messages'][-1]['text'], 'answer 2')
+
+    def test_history_pages_are_bounded(self):
+        client = FakeClient(self.thread([self.turn(1, 5000)]))
+        result = self.read(client)
+        self.assertEqual(len([m for m, _ in client.calls if m == 'thread/items/list']), collector.HISTORY_PAGES)
+        self.assertEqual(len(result['messages']), collector.MESSAGE_LIMIT)
+
+    def test_daemon_without_paged_history_is_read_whole(self):
+        unknown = chat.NativeRejected({'code': -32600, 'message': 'Invalid request: unknown variant `thread/items/list`, '
+                                                                  'expected one of `thread/attachment/add`'})
+        self.assertEqual((unknown.category, unknown.unknown_variant), ('unknownVariant', 'thread/items/list'))
+        thread = self.thread([self.turn(1, 1)])
+        client = FakeClient(thread, outcomes={'thread/items/list': unknown})
+        result = self.read(client)
+        self.assertEqual([(m, p.get('includeTurns')) for m, p in client.calls],
+                         [('thread/read', False), ('thread/items/list', None), ('thread/read', True)])
+        self.assertEqual(result['messages'][-1]['text'], 'answer 1')
+        for other in (chat.NativeRejected({'code': -32603, 'message': 'internal error'}),
+                      # A rejected parameter value names its variant too; that is not an older daemon.
+                      chat.NativeRejected({'code': -32600, 'message': 'Invalid request: unknown variant `notloaded`, expected one of `summary`'}),
+                      chat.NativeRejected({'code': -32600, 'message': 'Invalid request: unknown variant `thread/items/list`'})):
+            with self.subTest(error=other.unknown_variant), self.assertRaises(chat.NativeRejected):
+                self.read(FakeClient(thread, outcomes={'thread/turns/list': other}))
+
+    def test_thread_in_the_legacy_format_is_read_whole(self):
+        # codex app-server: ThreadStoreError::Unsupported -> method_not_found("... is not supported yet").
+        thread = self.thread([self.turn(1, 1)])
+        for method in ('thread/items/list', 'thread/turns/list'):
+            with self.subTest(method=method):
+                legacy = chat.NativeRejected({'code': -32601, 'message': method + ' is not supported yet'})
+                client = FakeClient(thread, outcomes={method: legacy})
+                result = self.read(client)
+                self.assertEqual([(m, p.get('includeTurns')) for m, p in client.calls if m == 'thread/read'],
+                                 [('thread/read', False), ('thread/read', True)])
+                self.assertEqual(result['messages'][-1]['text'], 'answer 1')
+        self.assertTrue(collector.paging_unsupported(collector.RpcReplyError('thread/items/list is not supported yet', -32601), 'thread/items/list'))
+
+    def test_collector_fallback_names_an_older_daemon(self):
+        older = collector.RpcReplyError('Invalid request: unknown variant `thread/items/list`, expected one of `x`', -32600)
+        self.assertTrue(collector.paging_unsupported(older, 'thread/items/list'))
+        self.assertFalse(collector.paging_unsupported(older, 'thread/turns/list'))
+        self.assertFalse(collector.paging_unsupported(collector.RpcReplyError('Invalid request: unknown variant `notLoaded`', -32600), 'thread/turns/list'))
+        self.assertFalse(collector.paging_unsupported(collector.RpcReplyError('Invalid request: missing field', -32600), 'thread/items/list'))
+        self.assertFalse(collector.paging_unsupported(collector.RpcReplyError('unknown variant `thread/items/list`', -32603), 'thread/items/list'))
 
 
 if __name__ == '__main__':

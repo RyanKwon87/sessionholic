@@ -179,6 +179,15 @@ class Transfers:
         prepare_ssh_control_dir(self.base_dir)
         return ssh_control_options(self.base_dir)
 
+    @staticmethod
+    def terminal_options():
+        """A terminal holds its own SSH connection that outlasts about two minutes of silence.
+
+        On the shared connection a terminal lived and died with collection's 15 s keepalive:
+        a laptop lid closed for 20 s ended every terminal of that host at once."""
+        return ['-o', 'BatchMode=yes', '-o', 'ConnectTimeout=6', '-o', 'ServerAliveInterval=15',
+                '-o', 'ServerAliveCountMax=8', '-o', 'ControlMaster=no', '-o', 'ControlPath=none']
+
     def command(self, host, args, tty=False):
         if host.get('platform') == 'windows':
             from server import WINDOWS_READ_ONLY
@@ -187,7 +196,9 @@ class Transfers:
         if host.get('local'):
             return [sys.executable] + args
         command = 'exec ' + shlex.join([python] + args)
-        return [shutil.which('ssh') or '/usr/bin/ssh'] + (['-tt'] if tty else []) + ['-o', 'BatchMode=yes', '-o', 'ConnectTimeout=6',
+        if tty:
+            return [shutil.which('ssh') or '/usr/bin/ssh', '-tt'] + self.terminal_options() + ['--', host['ssh'], command]
+        return [shutil.which('ssh') or '/usr/bin/ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=6',
                 '-o', 'ServerAliveInterval=10', '-o', 'ServerAliveCountMax=2'] + self.control_options() + ['--', host['ssh'], command]
 
     def _exchange(self, host, request, timeout, full):
@@ -284,9 +295,7 @@ class Transfers:
         command = windows_encoded_command(script)
         if len(command) > WINDOWS_COMMAND_LIMIT:
             raise ValueError('PC 터미널 명령이 너무 깁니다.')
-        return [shutil.which('ssh') or '/usr/bin/ssh', '-tt', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=6',
-                '-o', 'ServerAliveInterval=10', '-o', 'ServerAliveCountMax=2'] + self.control_options() + [
-                '--', host['ssh'], command]
+        return [shutil.which('ssh') or '/usr/bin/ssh', '-tt'] + self.terminal_options() + ['--', host['ssh'], command]
 
     def windows_launcher(self, host, launcher):
         """A PC's 새 세션 (the host settings' `launcher` choices, `windows_launcher_script`)."""

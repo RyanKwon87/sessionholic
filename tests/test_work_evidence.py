@@ -54,10 +54,22 @@ class WorkEvidenceTest(unittest.TestCase):
             native = Mock()
             native.__enter__ = Mock(return_value=native)
             native.__exit__ = Mock(return_value=False)
-            native.call.return_value = response
+            thread = response.get('thread')
+            def call(method, params):
+                # The metadata read, then history pages newest first, as the app server answers.
+                if method == 'thread/read':
+                    return {**response, 'thread': {**thread, 'turns': []}} if isinstance(thread, dict) else response
+                turns = list(reversed(thread['turns']))
+                if method == 'thread/items/list':
+                    data = [{'item': item, 'turnId': turn['id']} for turn in turns for item in reversed(turn['items'])]
+                else:
+                    data = [{**turn, 'items': [], 'itemsView': 'notLoaded'} for turn in turns]
+                return {'data': data[:params['limit']], 'nextCursor': None}
+            native.call.side_effect = call
             with patch.object(collector, 'HOME', root), patch.object(collector, 'AppServer', return_value=native):
                 result = collector.read('codex', SID, '.codex')
-            native.call.assert_called_once_with('thread/read', {'threadId': SID, 'includeTurns': True})
+            self.assertEqual(native.call.call_args_list[0].args, ('thread/read', {'threadId': SID, 'includeTurns': False}))
+            self.assertNotIn(True, [c.args[1].get('includeTurns') for c in native.call.call_args_list])
             return result
 
     def test_read_rejects_mismatched_or_missing_native_thread_identity(self):

@@ -2426,7 +2426,8 @@ button.host:focus-visible {
   background: var(--t-bg-2);
 }
 /* Full-height hit area; the blue pill is drawn inside it. */
-#terminal-reconnect {
+#terminal-reconnect,
+#terminal-reopen {
   position: relative;
   z-index: 0;
   margin: 0 2px;
@@ -2434,7 +2435,8 @@ button.host:focus-visible {
   color: var(--on-accent);
   font-weight: 600;
 }
-#terminal-reconnect::before {
+#terminal-reconnect::before,
+#terminal-reopen::before {
   content: "";
   position: absolute;
   inset: 50% 0 auto;
@@ -2444,10 +2446,12 @@ button.host:focus-visible {
   background: var(--t-blue);
   transform: translateY(-50%);
 }
-#terminal-reconnect:active:not(:disabled) {
+#terminal-reconnect:active:not(:disabled),
+#terminal-reopen:active:not(:disabled) {
   background: transparent;
 }
-#terminal-reconnect:active:not(:disabled)::before {
+#terminal-reconnect:active:not(:disabled)::before,
+#terminal-reopen:active:not(:disabled)::before {
   background: var(--t-blue-press);
 }
 .font-controls {
@@ -2792,7 +2796,7 @@ button.host:focus-visible {
     background: var(--red-tint);
   }
   .terminal-button:hover:not(:disabled),
-  .terminal-status-row > button:not(#terminal-reconnect):hover {
+  .terminal-status-row > button:not(#terminal-reconnect):not(#terminal-reopen):hover {
     background-color: var(--t-bg-2);
   }
   .font-button:hover:not(:disabled),
@@ -2802,7 +2806,8 @@ button.host:focus-visible {
   .terminal-button.danger-quiet:hover:not(:disabled) {
     background: var(--t-red-hover);
   }
-  #terminal-reconnect:hover::before {
+  #terminal-reconnect:hover::before,
+  #terminal-reopen:hover::before {
     background: var(--t-blue-hover);
   }
   .terminal-keys button:not(.enter-key):hover:not(:disabled) {

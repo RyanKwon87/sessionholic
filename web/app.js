@@ -163,6 +163,8 @@ const state = {
   inputQueue: Promise.resolve(),
   inputEpoch: 0,
   inputFailed: false,
+  inputRefused: false, // an input a restarted board refused; cleared by the next one sent
+  inputRefusedAt: 0, // the refusal, or the latest key dropped after it (INPUT_REFUSED_PAUSE_MS)
   drafts: new Map(),
   composing: false,
   compositionOwner: null,
@@ -211,6 +213,8 @@ const state = {
   // Live updates (/api/events) and the snapshot version they announce.
   events: null,
   eventsRetryAt: 0,
+  reopenOnReturn: null, // a session key to open once back from an ended terminal
+  pageHidden: false, // hidden (or left for the back-forward cache) since last shown
   snapshotVersion: null,
   eventsSnapshotVersion: null,
   // The server process those versions count in: a restart counts from 0 again.
@@ -718,7 +722,12 @@ function beginAuthEpoch() {
 // never is: it waits for a new press (sendChat).
 const CSRF_RETRY = new Set(["/api/chat/state", "/api/chat/prompt", "/api/plan", "/api/launch",
   "/api/new-session", "/api/app-server", "/api/refresh", "/api/usage/refresh", "/api/hardware/refresh",
-  "/api/push/subscribe", "/api/push/unsubscribe"]);
+  "/api/push/subscribe", "/api/push/unsubscribe", "/api/session/seen"]);
+// A terminal's size and scrolling; its keys never (sendInput reads the token instead).
+const CSRF_RETRY_TERMINAL = /^\/api\/terminal\/[a-f0-9]{32}\/(resize|scroll|scroll-end)$/;
+function csrfRetryable(path) {
+  return CSRF_RETRY.has(path) || CSRF_RETRY_TERMINAL.test(path);
+}
 // The screen this page runs: its app.js ?v=, as the board served it. A tab opened
 // before a deploy keeps the old screen until it reloads; the board names the one it
 // serves now (capabilities.webVersion) and checkWebVersion compares the two.
@@ -795,7 +804,7 @@ async function api(path, { method = "GET", body, signal: callerSignal, authEpoch
   const late = apiTimedOut(limit, path);
   if (late) throw late;
   if (!response.ok && response.status === 403 && data.code === "csrf_expired" && csrfRetry &&
-      method !== "GET" && CSRF_RETRY.has(path)) {
+      method !== "GET" && csrfRetryable(path)) {
     let refreshed = false;
     try {
       await loadCapabilities(authEpoch, { refreshView: false });
@@ -6198,6 +6207,65 @@ function terminalCloseCopy(terminal) {
     done: "터미널을 닫았습니다. 작업 상태는 실행 기기에서 확인하세요.",
   };
 }
+// A run started in this terminal on another host lives in that host's connection.
+function terminalContextCopy(terminal, copy = terminalCloseCopy(terminal)) {
+  const mode = terminal?.mode || terminal?.metadata?.mode;
+  const host = capsHost(terminalInfo(terminal).host);
+  if (["new-session", "resume", "handoff", "transfer"].includes(mode) && host && !host.local)
+    return `${copy.context} 단, 실행 기기가 잠들거나 연결이 2분 넘게 끊기면 실행이 끝납니다.`;
+  return copy.context;
+}
+// What an ended terminal says: why, when the board knows (closedReason), and what remains.
+function terminalEndedCopy(terminal) {
+  const copy = terminalCloseCopy(terminal);
+  // Unread for 10 minutes, or for a minute when the board needed room for another terminal.
+  if (terminal?.closedReason === "released")
+    return "한동안 보지 않아 이 보드의 보기 연결만 정리했습니다. 작업은 실행 기기에서 계속됩니다.";
+  const host = capsHost(terminalInfo(terminal).host);
+  // "connection_ended" is any end of the terminal's run: its own exit or a lost host.
+  if (terminal?.closedReason === "connection_ended" && host && !host.local)
+    return `${copy.ended} 실행 기기가 잠들었거나 2분 넘게 연결이 끊겼을 수도 있습니다.`;
+  return copy.ended;
+}
+// The listed session an ended terminal showed: by the run it attached to, else the one it was opened from.
+function sessionForTerminal(terminal) {
+  if (!terminal) return null;
+  const info = terminalInfo(terminal);
+  const keys = [];
+  if (info.nativeSource?.host) keys.push(chatKey(info.nativeSource));
+  try {
+    const source = JSON.parse(info.sourceKey || "null");
+    if (source && typeof source === "object") keys.push(chatKey(source));
+  } catch {
+    /* no source recorded */
+  }
+  const sessions = allSessions();
+  for (const key of keys) {
+    const found = sessions.find((s) => chatKey(sourceOf(s)) === key);
+    if (found) return found;
+  }
+  return null;
+}
+function showTerminalEnded() {
+  terminalStatus(terminalEndedCopy(state.terminal));
+  // A session closed by its user is not resumed from the board (the plan refuses it).
+  const s = state.terminal?.closedReason === "user" ? null : sessionForTerminal(state.terminal);
+  $("terminal-reopen").hidden = !s || sessionOneShot(s) || !!terminalForSession(s);
+}
+// Opening it again is reviewed like any new terminal (the conversation's plan sheet).
+function reopenEndedTerminal() {
+  const s = sessionForTerminal(state.terminal);
+  if (!s || state.launchBusy || !state.authenticated) return;
+  $("terminal-reopen").hidden = true;
+  if (window.history.state?.[INSTANCE.historyKey] && window.history.state.view === "terminal") {
+    // The way back is asynchronous: the board opens it once back (popstate).
+    state.reopenOnReturn = s.key;
+    window.history.back();
+    return;
+  }
+  returnToBoard();
+  openSessionTerminal(s);
+}
 function draftKey(terminal) {
   const info = terminalInfo(terminal);
   return info.sourceKey
@@ -6470,15 +6538,16 @@ async function openTerminal(terminal, { recordHistory = true } = {}) {
   $("terminal-close").setAttribute("aria-label", copy.action);
   $("terminal-close").className = `terminal-button terminal-close${copy.danger ? " danger-quiet" : ""}`;
   $("terminal-close").disabled = !state.terminalAlive;
-  $("terminal-context").textContent = copy.context;
+  $("terminal-context").textContent = terminalContextCopy(terminal, copy);
   $("terminal-draft").value = state.drafts.get(draftKey(terminal)) || "";
   state.composing = false;
   state.draftRevision++;
   $("draft-note").textContent = "";
   terminalError();
   renderTerminalReturn();
+  $("terminal-reopen").hidden = true;
   if (!state.terminalAlive) {
-    terminalStatus(copy.ended);
+    showTerminalEnded();
     return;
   }
   if (!xtermReady()) {
@@ -6563,7 +6632,7 @@ async function startTerminalReader() {
   if (networkOffline()) return;
   if (!state.terminal || !state.terminalVisible || document.hidden) return;
   if (!state.terminalAlive || state.terminal.closed) {
-    terminalStatus(terminalCloseCopy(state.terminal).ended);
+    showTerminalEnded();
     renderTerminalReturn();
     return;
   }
@@ -6623,7 +6692,7 @@ async function startTerminalReader() {
       if (!state.terminalAlive) {
         state.terminal.alive = false;
         $("terminal-close").disabled = true;
-        terminalStatus(terminalCloseCopy(state.terminal).ended);
+        showTerminalEnded();
         renderTerminalReturn();
         refreshTerminals();
         return;
@@ -6658,9 +6727,16 @@ async function startTerminalReader() {
     }
   }
 }
+// After an input a restarted board refused, keys go nowhere until typing pauses this long:
+// the rest of a fast-typed line (and its Enter) must not arrive without its start.
+const INPUT_REFUSED_PAUSE_MS = 1000;
 function sendInput(text) {
   if (networkOffline() || !state.connected || state.inputFailed || !state.terminal)
     return Promise.reject(new Error("터미널에 연결되어 있지 않습니다."));
+  if (state.inputRefused && Date.now() - state.inputRefusedAt < INPUT_REFUSED_PAUSE_MS) {
+    state.inputRefusedAt = Date.now();
+    return Promise.reject(new Error("보드가 다시 시작돼 입력을 보내지 않았습니다."));
+  }
   const epoch = state.inputEpoch;
   const id = state.terminal.id;
   const req = requestId();
@@ -6676,7 +6752,26 @@ function sendInput(text) {
         method: "POST",
         body: { text, requestId: req },
       });
+      if (state.inputRefused) {
+        state.inputRefused = false;
+        terminalError("");
+      }
     } catch (err) {
+      if (err.code === "csrf_expired" && !err.unauthorized && !err.staleAuth && epoch === state.inputEpoch) {
+        // A restarted board refused it before anything ran, so it was surely not sent, and
+        // the reader stays. Keys queued behind it and typed until a pause are dropped too
+        // (never a partial line); the next one waits for the new token.
+        state.inputEpoch++;
+        state.inputRefused = true;
+        state.inputRefusedAt = Date.now();
+        terminalError("보드가 다시 시작돼 이 입력은 보내지 않았습니다. 화면을 확인한 뒤 다시 입력해 주세요.");
+        try {
+          await loadCapabilities(state.authEpoch, { refreshView: false });
+        } catch {
+          /* the next input is refused the same way and tries again */
+        }
+        throw err;
+      }
       if (!err.unauthorized && !err.staleAuth && epoch === state.inputEpoch) {
         state.inputFailed = true;
         state.inputEpoch++;
@@ -7280,7 +7375,7 @@ async function refreshTerminals(authEpoch = state.authEpoch) {
         stopTerminalReader();
         state.inputEpoch++;
         state.terminalAlive = false;
-        terminalStatus(terminalCloseCopy(state.terminal).ended);
+        showTerminalEnded();
         $("terminal-close").disabled = true;
       }
       renderTerminalReturn();
@@ -8310,6 +8405,28 @@ function recoverConnection() {
   const selected = selectedSession();
   if (selected) { updateChatComposer(chatEntry(selected)); loadChatState(selected, true); }
 }
+// The page is on screen again, maybe after hours in the background: once per return,
+// though a browser may fire both visibilitychange and pageshow for it.
+function pageShown() {
+  if (!state.pageHidden) return;
+  state.pageHidden = false;
+  // Live updates that failed while away (or as the network came back) start afresh.
+  state.eventsRetryAt = 0;
+  // A home-screen app in the background can miss the browser's online event, and an
+  // offline page reads nothing; one shown again believes navigator.onLine.
+  if (state.offline && globalThis.navigator?.onLine !== false) {
+    state.shownAt = Date.now();
+    recoverConnection();
+  } else if (state.terminalVisible) {
+    startTerminalReader();
+  } else if (state.authenticated) {
+    state.shownAt = Date.now();
+    if (reloadForUpdate()) return;
+    poll(true);
+    const selected = selectedSession();
+    if (selected) loadChatState(selected, true);
+  } else recoverConnection();
+}
 // Unsent words or files on this page: what leaving or reloading it would lose.
 function unsavedWork() {
   return [...state.drafts.values(), state.terminal ? $("terminal-draft").value : ""].some(Boolean) ||
@@ -8356,14 +8473,25 @@ window.addEventListener("DOMContentLoaded", () => {
     // A browser that already animated its own back swipe gets no second slide.
     const animate = !event.hasUAVisualTransition;
     const fromTerminal = state.terminalVisible;
+    const reopen = fromTerminal ? state.reopenOnReturn : null;
+    state.reopenOnReturn = null;
+    // An ended terminal's 이 세션 다시 열기 (reopenEndedTerminal), once the board is shown.
+    const reopenSession = () => {
+      const target = reopen && allSessions().find((item) => item.key === reopen);
+      if (target) openSessionTerminal(target);
+    };
     // Forward again to a notification's conversation shows it, not the terminal's launch.
     if (fromTerminal) returnToBoard({ animate, selectLaunchedSource: !event.state?.notice });
-    if (window.SessionholicGoals?.handleHistory?.(event)) return;
+    if (window.SessionholicGoals?.handleHistory?.(event)) {
+      reopenSession();
+      return;
+    }
     const detail = view === "detail" && !!(state.selected || state.selectedBotRequest);
     stopChatPolling();
     setDetailShown(detail, { direction: animate && !fromTerminal ? (detail ? "push" : "pop") : null, focus: true });
     const selected = selectedSession();
     if (selected && chatVisible()) loadChatState(selected, true);
+    reopenSession();
   });
   $("settings").addEventListener("click", openSettings);
   $("settings-close").addEventListener("click", closeSettings);
@@ -8507,6 +8635,7 @@ window.addEventListener("DOMContentLoaded", () => {
   $("return-terminal").addEventListener("click", () => {
     if (state.terminal) openTerminal(state.terminal);
   });
+  $("terminal-reopen").addEventListener("click", reopenEndedTerminal);
   $("terminal-reconnect").addEventListener("click", () => {
     state.lastSize = "";
     startTerminalReader();
@@ -8562,6 +8691,7 @@ window.addEventListener("DOMContentLoaded", () => {
     // A hidden page does not keep the microphone open.
     if (document.hidden) stopDictation({ abort: true });
     if (document.hidden) {
+      state.pageHidden = true;
       // Live updates stop with the page; a visible page reconnects after its read.
       closeEvents();
       if (state.terminalVisible) {
@@ -8570,15 +8700,12 @@ window.addEventListener("DOMContentLoaded", () => {
         state.inputEpoch++;
         terminalStatus("화면으로 돌아오면 다시 연결합니다.");
       }
-    } else if (state.terminalVisible) {
-      startTerminalReader();
-    } else if (state.authenticated) {
-      state.shownAt = Date.now();
-      if (reloadForUpdate()) return;
-      poll(true);
-      const selected = selectedSession();
-      if (selected) loadChatState(selected, true);
-    } else recoverConnection();
+    } else pageShown();
+  });
+  // A page restored from the back-forward cache may fire no visibilitychange.
+  window.addEventListener("pagehide", () => { state.pageHidden = true; });
+  window.addEventListener("pageshow", (event) => {
+    if (event.persisted && !document.hidden) pageShown();
   });
   window.addEventListener("offline", () => {
     state.offline = true;

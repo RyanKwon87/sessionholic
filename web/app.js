@@ -164,6 +164,7 @@ const state = {
   inputEpoch: 0,
   inputFailed: false,
   inputRefused: false, // an input a restarted board refused; cleared by the next one sent
+  inputRefusedAt: 0, // the refusal, or the latest key dropped after it (INPUT_REFUSED_PAUSE_MS)
   drafts: new Map(),
   composing: false,
   compositionOwner: null,
@@ -213,6 +214,7 @@ const state = {
   events: null,
   eventsRetryAt: 0,
   reopenOnReturn: null, // a session key to open once back from an ended terminal
+  pageHidden: false, // hidden (or left for the back-forward cache) since last shown
   snapshotVersion: null,
   eventsSnapshotVersion: null,
   // The server process those versions count in: a restart counts from 0 again.
@@ -6216,8 +6218,9 @@ function terminalContextCopy(terminal, copy = terminalCloseCopy(terminal)) {
 // What an ended terminal says: why, when the board knows (closedReason), and what remains.
 function terminalEndedCopy(terminal) {
   const copy = terminalCloseCopy(terminal);
+  // Unread for 10 minutes, or for a minute when the board needed room for another terminal.
   if (terminal?.closedReason === "released")
-    return "10분 넘게 보지 않아 이 보드의 보기 연결만 정리했습니다. 작업은 실행 기기에서 계속됩니다.";
+    return "한동안 보지 않아 이 보드의 보기 연결만 정리했습니다. 작업은 실행 기기에서 계속됩니다.";
   const host = capsHost(terminalInfo(terminal).host);
   // "connection_ended" is any end of the terminal's run: its own exit or a lost host.
   if (terminal?.closedReason === "connection_ended" && host && !host.local)
@@ -6245,7 +6248,8 @@ function sessionForTerminal(terminal) {
 }
 function showTerminalEnded() {
   terminalStatus(terminalEndedCopy(state.terminal));
-  const s = sessionForTerminal(state.terminal);
+  // A session closed by its user is not resumed from the board (the plan refuses it).
+  const s = state.terminal?.closedReason === "user" ? null : sessionForTerminal(state.terminal);
   $("terminal-reopen").hidden = !s || sessionOneShot(s) || !!terminalForSession(s);
 }
 // Opening it again is reviewed like any new terminal (the conversation's plan sheet).
@@ -6723,9 +6727,16 @@ async function startTerminalReader() {
     }
   }
 }
+// After an input a restarted board refused, keys go nowhere until typing pauses this long:
+// the rest of a fast-typed line (and its Enter) must not arrive without its start.
+const INPUT_REFUSED_PAUSE_MS = 1000;
 function sendInput(text) {
   if (networkOffline() || !state.connected || state.inputFailed || !state.terminal)
     return Promise.reject(new Error("터미널에 연결되어 있지 않습니다."));
+  if (state.inputRefused && Date.now() - state.inputRefusedAt < INPUT_REFUSED_PAUSE_MS) {
+    state.inputRefusedAt = Date.now();
+    return Promise.reject(new Error("보드가 다시 시작돼 입력을 보내지 않았습니다."));
+  }
   const epoch = state.inputEpoch;
   const id = state.terminal.id;
   const req = requestId();
@@ -6748,10 +6759,11 @@ function sendInput(text) {
     } catch (err) {
       if (err.code === "csrf_expired" && !err.unauthorized && !err.staleAuth && epoch === state.inputEpoch) {
         // A restarted board refused it before anything ran, so it was surely not sent, and
-        // the reader stays. Keys queued behind it are dropped too (never a partial line);
-        // the next one waits for the new token.
+        // the reader stays. Keys queued behind it and typed until a pause are dropped too
+        // (never a partial line); the next one waits for the new token.
         state.inputEpoch++;
         state.inputRefused = true;
+        state.inputRefusedAt = Date.now();
         terminalError("보드가 다시 시작돼 이 입력은 보내지 않았습니다. 화면을 확인한 뒤 다시 입력해 주세요.");
         try {
           await loadCapabilities(state.authEpoch, { refreshView: false });
@@ -8393,8 +8405,11 @@ function recoverConnection() {
   const selected = selectedSession();
   if (selected) { updateChatComposer(chatEntry(selected)); loadChatState(selected, true); }
 }
-// The page is on screen again, maybe after hours in the background.
+// The page is on screen again, maybe after hours in the background: once per return,
+// though a browser may fire both visibilitychange and pageshow for it.
 function pageShown() {
+  if (!state.pageHidden) return;
+  state.pageHidden = false;
   // Live updates that failed while away (or as the network came back) start afresh.
   state.eventsRetryAt = 0;
   // A home-screen app in the background can miss the browser's online event, and an
@@ -8460,17 +8475,23 @@ window.addEventListener("DOMContentLoaded", () => {
     const fromTerminal = state.terminalVisible;
     const reopen = fromTerminal ? state.reopenOnReturn : null;
     state.reopenOnReturn = null;
+    // An ended terminal's 이 세션 다시 열기 (reopenEndedTerminal), once the board is shown.
+    const reopenSession = () => {
+      const target = reopen && allSessions().find((item) => item.key === reopen);
+      if (target) openSessionTerminal(target);
+    };
     // Forward again to a notification's conversation shows it, not the terminal's launch.
     if (fromTerminal) returnToBoard({ animate, selectLaunchedSource: !event.state?.notice });
-    if (window.SessionholicGoals?.handleHistory?.(event)) return;
+    if (window.SessionholicGoals?.handleHistory?.(event)) {
+      reopenSession();
+      return;
+    }
     const detail = view === "detail" && !!(state.selected || state.selectedBotRequest);
     stopChatPolling();
     setDetailShown(detail, { direction: animate && !fromTerminal ? (detail ? "push" : "pop") : null, focus: true });
     const selected = selectedSession();
     if (selected && chatVisible()) loadChatState(selected, true);
-    // An ended terminal's 이 세션 다시 열기 (reopenEndedTerminal), now that the board is shown.
-    const target = reopen && allSessions().find((item) => item.key === reopen);
-    if (target) openSessionTerminal(target);
+    reopenSession();
   });
   $("settings").addEventListener("click", openSettings);
   $("settings-close").addEventListener("click", closeSettings);
@@ -8670,6 +8691,7 @@ window.addEventListener("DOMContentLoaded", () => {
     // A hidden page does not keep the microphone open.
     if (document.hidden) stopDictation({ abort: true });
     if (document.hidden) {
+      state.pageHidden = true;
       // Live updates stop with the page; a visible page reconnects after its read.
       closeEvents();
       if (state.terminalVisible) {
@@ -8680,7 +8702,8 @@ window.addEventListener("DOMContentLoaded", () => {
       }
     } else pageShown();
   });
-  // A page restored from the back-forward cache fires no visibilitychange.
+  // A page restored from the back-forward cache may fire no visibilitychange.
+  window.addEventListener("pagehide", () => { state.pageHidden = true; });
   window.addEventListener("pageshow", (event) => {
     if (event.persisted && !document.hidden) pageShown();
   });

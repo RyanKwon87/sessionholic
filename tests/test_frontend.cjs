@@ -353,16 +353,23 @@ test("input refused by a restarted board is not resent, drops its queue, and the
   assert.equal(c.state.inputFailed, false);
   assert.equal(c.state.csrf, "fresh-csrf");
   assert.match(c.get("terminal-error").textContent, /보내지 않았습니다/);
+  // Typing on right away (the token read included) still sends nothing: never a line's tail.
+  await assert.rejects(c.sendInput(" push"));
+  assert.deepEqual(sent, []);
+  // After a pause, the next input goes with the new token and clears the notice.
+  c.state.inputRefusedAt = Date.now() - 1000;
   await c.sendInput("ls");
   assert.deepEqual(sent, ["ls"]);
   assert.equal(c.get("terminal-error").hidden, true);
+  await c.sendInput("x");
+  assert.deepEqual(sent, ["ls", "x"]);
 });
 
 test("an ended terminal says why: a released view keeps its run, a remote end may be a sleeping host", () => {
   const c = client(undefined, noChatTimers);
   c.state.capabilities = { hosts: [{ name: "workstation", label: "W" }, { name: "board", label: "B", local: true }] };
   const attach = { id: "a".repeat(32), mode: "attach", host: "workstation", closed: true };
-  assert.match(c.terminalEndedCopy({ ...attach, closedReason: "released" }), /10분.*보기 연결만.*계속됩니다/);
+  assert.match(c.terminalEndedCopy({ ...attach, closedReason: "released" }), /보지 않아.*보기 연결만.*계속됩니다/);
   assert.match(c.terminalEndedCopy({ ...attach, closedReason: "connection_ended" }), /잠들었거나 2분/);
   assert.doesNotMatch(c.terminalEndedCopy({ ...attach, host: "board", closedReason: "connection_ended" }), /잠들었/);
   assert.equal(c.terminalEndedCopy({ ...attach, closedReason: "user" }), c.terminalCloseCopy(attach).ended);
@@ -389,6 +396,10 @@ test("an ended terminal offers its listed session again, through the plan sheet 
   c.state.terminal = { ...ended, nativeSource: { ...c.sourceOf(s), id: "gone-session" } };
   c.showTerminalEnded();
   assert.equal(c.get("terminal-reopen").hidden, true);
+  // One its user closed is not resumed from the board.
+  c.state.terminal = { ...ended, closedReason: "user" };
+  c.showTerminalEnded();
+  assert.equal(c.get("terminal-reopen").hidden, true);
   // A live terminal of the session is opened instead of offering a second one.
   c.state.terminals = [ended, { id: "d".repeat(32), mode: "attach", nativeSource: c.sourceOf(s) }];
   c.state.terminal = ended;
@@ -410,6 +421,13 @@ test("an ended terminal offers its listed session again, through the plan sheet 
   assert.equal(c.state.reopenOnReturn, null);
   assert.equal(opened, 1);
   assert.equal(c.state.selected, s.key);
+  // The same from a terminal opened on the goals screen, whose history the goals view handles.
+  c.context.window.SessionholicGoals = { handleHistory: () => true };
+  c.state.terminal = ended; c.state.terminalVisible = true; c.state.terminalAlive = false;
+  c.context.window.history.state = { sessionholic: true, view: "terminal" };
+  c.reopenEndedTerminal();
+  c.windowEvents.popstate({ state: { sessionholic: true, view: "goals" } });
+  assert.equal(opened, 2);
 });
 
 test("input captures terminal ownership and cannot leak into a switched terminal", async () => {
@@ -2037,12 +2055,23 @@ test('a page shown again after a missed online event reads again, and live updat
   assert.equal(c.get('offline-text').textContent, '');
   // A page restored from the back-forward cache does the same; a fresh load does not.
   c.windowEvents.offline(); requests.length = 0;
+  c.windowEvents.pagehide();
   c.windowEvents.pageshow({ persisted: false });
   assert.equal(c.state.offline, true);
   c.windowEvents.pageshow({ persisted: true });
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(c.state.offline, false);
   assert.ok(requests.includes('/api/snapshot'));
+  // One return announced twice (pageshow, then visibilitychange) is handled once.
+  const reads = requests.length;
+  c.context.document.hidden = false; c.documentEvents.visibilitychange();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(requests.length, reads);
+  // A quick switch away and back is a new return.
+  c.context.document.hidden = true; c.documentEvents.visibilitychange();
+  c.context.document.hidden = false; c.documentEvents.visibilitychange();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.ok(requests.length > reads);
 });
 
 test('online recovery reads one selected state and snapshot without resending unknown work or terminal input', async () => {

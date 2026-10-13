@@ -1025,9 +1025,13 @@ def codex_turn_rows(turn):
     return out
 
 
-def unknown_method(error, method):
-    """True when the daemon predates `method`: it names that method an unknown variant. A
-    rejected parameter value is an unknown variant too, and must stay an error."""
+def paging_unsupported(error, method):
+    """True when this thread's history cannot be paged: a daemon that predates `method` names
+    it an unknown variant, and a thread stored in the legacy format answers method-not-found
+    (-32601, "... is not supported yet"). A rejected parameter value is an unknown variant
+    too, and must stay an error."""
+    if getattr(error, "code", None) == -32601:
+        return True
     variant = getattr(error, "unknown_variant", None)
     if variant is not None:
         return variant == method
@@ -1042,7 +1046,8 @@ def codex_recent_thread(server, thread_id, rows=MESSAGE_LIMIT):
     cheap, and items come newest-first until `rows` rows are covered and the turn of the oldest
     of them reaches its user message. Turns come with their status only; their items are those
     read, so the oldest turn may be cut short.
-    None when the daemon predates the paged methods, so the caller reads the thread whole."""
+    None when the daemon predates the paged methods or the thread is stored in the legacy
+    format, so the caller reads the thread whole."""
     result = server.call("thread/read", {"threadId": thread_id, "includeTurns": False})
     thread = result.get("thread") if isinstance(result, dict) else None
     if not isinstance(thread, dict) or thread.get("id") != thread_id:
@@ -1083,7 +1088,7 @@ def codex_recent_thread(server, thread_id, rows=MESSAGE_LIMIT):
             if not cursor or wanted <= set(turn["id"] for turn in turns):
                 break
     except RpcError as error:
-        if unknown_method(error, method):
+        if paging_unsupported(error, method):
             return None
         raise
     items = {}

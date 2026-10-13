@@ -857,13 +857,26 @@ class RecentHistoryTests(unittest.TestCase):
             with self.subTest(error=other.unknown_variant), self.assertRaises(chat.NativeRejected):
                 self.read(FakeClient(thread, outcomes={'thread/turns/list': other}))
 
+    def test_thread_in_the_legacy_format_is_read_whole(self):
+        # codex app-server: ThreadStoreError::Unsupported -> method_not_found("... is not supported yet").
+        thread = self.thread([self.turn(1, 1)])
+        for method in ('thread/items/list', 'thread/turns/list'):
+            with self.subTest(method=method):
+                legacy = chat.NativeRejected({'code': -32601, 'message': method + ' is not supported yet'})
+                client = FakeClient(thread, outcomes={method: legacy})
+                result = self.read(client)
+                self.assertEqual([(m, p.get('includeTurns')) for m, p in client.calls if m == 'thread/read'],
+                                 [('thread/read', False), ('thread/read', True)])
+                self.assertEqual(result['messages'][-1]['text'], 'answer 1')
+        self.assertTrue(collector.paging_unsupported(collector.RpcReplyError('thread/items/list is not supported yet', -32601), 'thread/items/list'))
+
     def test_collector_fallback_names_an_older_daemon(self):
         older = collector.RpcReplyError('Invalid request: unknown variant `thread/items/list`, expected one of `x`', -32600)
-        self.assertTrue(collector.unknown_method(older, 'thread/items/list'))
-        self.assertFalse(collector.unknown_method(older, 'thread/turns/list'))
-        self.assertFalse(collector.unknown_method(collector.RpcReplyError('Invalid request: unknown variant `notLoaded`', -32600), 'thread/turns/list'))
-        self.assertFalse(collector.unknown_method(collector.RpcReplyError('Invalid request: missing field', -32600), 'thread/items/list'))
-        self.assertFalse(collector.unknown_method(collector.RpcReplyError('unknown variant `thread/items/list`', -32603), 'thread/items/list'))
+        self.assertTrue(collector.paging_unsupported(older, 'thread/items/list'))
+        self.assertFalse(collector.paging_unsupported(older, 'thread/turns/list'))
+        self.assertFalse(collector.paging_unsupported(collector.RpcReplyError('Invalid request: unknown variant `notLoaded`', -32600), 'thread/turns/list'))
+        self.assertFalse(collector.paging_unsupported(collector.RpcReplyError('Invalid request: missing field', -32600), 'thread/items/list'))
+        self.assertFalse(collector.paging_unsupported(collector.RpcReplyError('unknown variant `thread/items/list`', -32603), 'thread/items/list'))
 
 
 if __name__ == '__main__':

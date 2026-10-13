@@ -49,7 +49,7 @@ python3 scripts/sessionholic.py service-file
 launchctl bootout gui/$(id -u)/io.github.sessionholic
 ```
 
-기록은 `~/.local/state/sessionholic/service.stdout.log`와 `service.stderr.log`에 저장합니다. 문제를 제보할 때 원본 기록이나 대화를 그대로 올리지 말고 필요한 오류만 익명화하세요. 서버 재시작은 보드의 tmux 접속 클라이언트를 분리하며, 유지 중인 실행을 종료하는 명령을 보내지 않습니다.
+기록은 `~/.local/state/sessionholic/service.stdout.log`와 `service.stderr.log`에 저장합니다. 요청마다 경로·상태 코드·응답까지 걸린 시간(조회 문자열 제외)이 한 줄씩 남고, 기기 수집이 실패하기 시작하거나 실패 이유가 바뀌거나 복구될 때 한 줄씩 남습니다. 서버가 이 두 파일을 20MB마다 `.1`로 옮기고 비우므로 계속 커지지 않습니다. 닫힌 터미널 기록은 직접 닫은 것 최근 200개, 그 밖 최근 40개만 남깁니다. 문제를 제보할 때 원본 기록이나 대화를 그대로 올리지 말고 필요한 오류만 익명화하세요. 서버 재시작은 보드의 tmux 접속 클라이언트를 분리하며, 유지 중인 실행을 종료하는 명령을 보내지 않습니다.
 
 ## Tailscale로 모바일 접속
 

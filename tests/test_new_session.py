@@ -677,6 +677,20 @@ class HoldLoopTest(unittest.TestCase):
                                            clock=iter(range(0, 10**6, 3600)).__next__, out=io.StringIO())
             self.assertEqual(code, 130)
             self.assertTrue(mark.with_name(mark.name + '.ended').exists())
+            # ... and while attaching again (SSH still connecting, so Ctrl+C reaches the loop).
+            mark.with_name(mark.name + '.ended').unlink()
+            calls = []
+
+            def interrupted(argv):
+                calls.append(argv[1])
+                if argv[1] == 'again':
+                    raise KeyboardInterrupt
+                return 255
+            with patch.object(terminal.termios, 'tcflush'):
+                code = terminal._hold_loop(spec, run=interrupted, sleep=lambda s: None,
+                                           clock=iter(range(0, 10**6, 3600)).__next__, out=io.StringIO())
+            self.assertEqual((code, calls), (130, ['first', 'again']))
+            self.assertTrue(mark.with_name(mark.name + '.ended').exists())
 
     def test_other_ends_are_the_terminals_end(self):
         for codes, durations, expected in (([0], [100], 0), ([1], [100], 1), ([-15], [100], 1),

@@ -1050,7 +1050,7 @@ def _launch(path):
 
 
 HOLD_RETRY = (2, 5, 10, 20, 30)
-HOLD_BACK = 5  # attached again this long: the board takes sends again
+HOLD_BACK = 8  # attached again this long (past SSH's 6 s connect wait): the board takes sends again
 HOLD_SETTLED = 60  # a connection that lasted this long starts the waits over
 HOLD_FIRST_GRACE = 15  # an SSH that fails this soon after opening never ran the step
 
@@ -1119,7 +1119,14 @@ def _hold_loop(spec, run=subprocess.call, sleep=time.sleep, clock=time.monotonic
                 back = timer(HOLD_BACK, _hold_waiting, (wait_path, False))
                 back.daemon = True
                 back.start()
-            code = run(argv)
+            try:
+                code = run(argv)
+            except KeyboardInterrupt:
+                # Ctrl+C while attaching again (the terminal is not raw yet): as while waiting.
+                if back is not None:
+                    back.cancel()
+                    _hold_ended(wait_path)
+                return 130
             if back is not None:
                 back.cancel()
             if code != 255:

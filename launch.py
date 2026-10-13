@@ -289,13 +289,15 @@ def start_app_server(key, home=None):
     return {"started": ensure_app_server({"argv": [binary], "env": env}, profile, home)}
 
 
-# 새 세션 presets: a model and an effort for whichever agent the launcher then starts, handed
+# 새 세션 presets: a model and an effort for Claude Code if the launcher then starts it, handed
 # to it as one JSON variable (PRESET_ENV); the launcher checks them again and ignores what it
-# does not know. Permissions are not part of a preset (the launcher keeps its own).
+# does not know. Permissions are not part of a preset (the launcher keeps its own), and Codex
+# keeps its own settings: a Codex launched with a config override leaves the shared app-server,
+# which the board reads and sends through.
 PRESET_ENV = "SESSIONHOLIC_LAUNCH_PRESET"
 LAUNCH_PRESETS = {
-    "fast": {"label": "빠르게", "preset": {"claude": {"model": "sonnet", "effort": "medium"}, "codex": {"effort": "low"}}},
-    "max": {"label": "최대", "preset": {"claude": {"model": "opus", "effort": "max"}, "codex": {"effort": "xhigh"}}},
+    "fast": {"label": "빠르게", "preset": {"claude": {"model": "sonnet", "effort": "medium"}}},
+    "max": {"label": "최대", "preset": {"claude": {"model": "opus", "effort": "max"}}},
 }
 
 

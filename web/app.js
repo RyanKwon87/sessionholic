@@ -7835,8 +7835,8 @@ async function startAppServer(s, trigger) {
 // sent; this browser remembers it (prefs).
 const NEW_SESSION_PRESETS = [
   { id: "", label: "기본", note: "기기에 설정된 모델과 수준 그대로 시작합니다." },
-  { id: "fast", label: "빠르게", note: "Claude는 Sonnet·보통, Codex는 낮은 추론으로 시작합니다(실행 명령이 지원할 때)." },
-  { id: "max", label: "최대", note: "Claude는 Opus·최대, Codex는 가장 높은 추론으로 시작합니다(실행 명령이 지원할 때)." },
+  { id: "fast", label: "빠르게", note: "Claude는 Sonnet·보통으로 시작합니다(실행 명령이 지원할 때). Codex는 기기 설정 그대로입니다." },
+  { id: "max", label: "최대", note: "Claude는 Opus·최대로 시작합니다(실행 명령이 지원할 때). Codex는 기기 설정 그대로입니다." },
 ];
 function newSessionPreset() {
   const id = state.newSessionPreset ?? prefs.get("newSessionPreset", "");

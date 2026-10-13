@@ -122,8 +122,8 @@ class WorkerNewSessionTest(TempHome):
         with self.remote_home() as (execve, _), patch.object(sys, 'argv', ['worker.pyz', 'new-session', '--preset', 'fast']):
             transfer_worker._main()
         env = execve.call_args.args[2]
-        self.assertEqual(json.loads(env['SESSIONHOLIC_LAUNCH_PRESET']),
-                         {'claude': {'model': 'sonnet', 'effort': 'medium'}, 'codex': {'effort': 'low'}})
+        # Claude only: a Codex config override would leave the shared app-server the board uses.
+        self.assertEqual(json.loads(env['SESSIONHOLIC_LAUNCH_PRESET']), {'claude': {'model': 'sonnet', 'effort': 'medium'}})
         # Without one, the launcher gets none; an unknown one runs nothing.
         with self.remote_home() as (execve, _):
             transfer_worker._main()

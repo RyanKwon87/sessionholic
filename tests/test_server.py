@@ -1025,7 +1025,7 @@ class BoardCollectionTest(unittest.TestCase):
             return {"claude": [], "codex": []}
         board = self.board(runner, hosts=HOSTS)
         self.assertFalse(board.poll(HOSTS[0]))
-        for delay in (120, 300, 900, 900):
+        for delay in (90, 180, 300, 300):
             failed_at = self.now[0]
             self.now[0] = failed_at + 61
             self.assertFalse(board.request_refresh(), "no repeated SSH right after a failure")
@@ -1045,7 +1045,7 @@ class BoardCollectionTest(unittest.TestCase):
         # A later failure starts again from the shortest delay.
         outcome["fail"] = True
         self.assertFalse(board.poll(HOSTS[0]))
-        self.assertEqual(board.backoff["remote"], (1, self.now[0] + 120))
+        self.assertEqual(board.backoff["remote"], (1, self.now[0] + 90))
 
 
 class FakeWatcher:

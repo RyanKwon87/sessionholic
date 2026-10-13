@@ -2614,7 +2614,10 @@ function drawDetail(s) {
   list.lastScrollTop = 0;
   observeMessages(list);
   list.setAttribute("aria-label", "최근 대화 읽기");
-  list.append(el("p", "group-empty", "대화를 불러오고 있습니다…"));
+  const loading = progress("대화를 불러오고 있습니다…");
+  loading.classList?.add?.("conversation-loading");
+  loading.setAttribute?.("role", "status");
+  list.append(loading);
   const sync = el("p", "conversation-sync-notice");
   sync.id = "conversation-sync-notice";
   sync.hidden = true;
@@ -3808,7 +3811,48 @@ function documentKeydown(event) {
     return;
   }
   noteHardwareKey(event);
+  if (listNavigationKeydown(event)) return;
   promptKeydown(event);
+}
+// A hardware keyboard (an iPad's) moves through the list: ↓ (or Enter) from the search
+// field goes to (or opens) the first card, ↑↓ move between cards, and in a conversation
+// Esc or ⌘[ goes back: to the list on a phone layout, to its card beside the conversation.
+// Typing, an input method's composition, a terminal or an open sheet keep their keys.
+function listNavigationKeydown(event) {
+  // A key something else already took (closing the tools menu with Esc) is not taken again.
+  if (event.defaultPrevented || state.terminalVisible || event.isComposing || event.keyCode === 229 ||
+      event.altKey || event.shiftKey) return false;
+  const target = event.target;
+  if (target?.closest?.("dialog")) return false;
+  const key = TERMINAL_KEY_ALIASES[event.key] || event.key;
+  const cards = () => [...($("groups")?.querySelectorAll?.(".card") || [])];
+  const plain = !event.metaKey && !event.ctrlKey;
+  // A touch screen's own keyboard has a Return (search) key that only closes it: Enter
+  // opens the first session only from a hardware keyboard.
+  const enter = key === "Enter" && keyboardPresent();
+  if (target?.id === "search" && plain && (key === "ArrowDown" || enter)) {
+    const first = cards()[0];
+    if (!first) return false;
+    event.preventDefault();
+    if (enter) first.click();
+    else first.focus();
+    return true;
+  }
+  if (target?.classList?.contains?.("card") && plain && (key === "ArrowDown" || key === "ArrowUp")) {
+    const all = cards();
+    const next = all[all.indexOf(target) + (key === "ArrowDown" ? 1 : -1)];
+    event.preventDefault();
+    if (next) next.focus();
+    else if (key === "ArrowUp") $("search")?.focus();
+    return true;
+  }
+  const editing = target?.closest?.("input, textarea, select, [contenteditable='true']");
+  const back = (key === "Escape" && plain && !editing) || (event.metaKey && key === "[");
+  if (!back || !state.selected || !$("session-layout") || $("session-layout").hidden) return false;
+  event.preventDefault();
+  if (phoneLayout() && state.detailShown) backToList();
+  else restoreSelectedCardFocus();
+  return true;
 }
 function chatReceiptCopy(receipt) {
   if (receipt?.dispatchState === "not_started")
@@ -4283,6 +4327,8 @@ const OUTBOX_MAX_MS = 15 * 60 * 1000;
 const OUTBOX_CLOCK_SLACK_MS = 30 * 1000;
 // Settled messages remembered per conversation (the server shows 80 at most).
 const OUTBOX_CLAIM_LIMIT = 80;
+// How many conversation items (messages and tool records) a read returns at most, newest last.
+const CONVERSATION_WINDOW = 80;
 const OUTBOX_ATTACHMENT_LINE = /^첨부 파일:/;
 const OUTBOX_ATTACHMENT_ONLY = new Set(["[이미지 첨부]", "[파일 첨부]"]);
 // Claude Code records a pasted image path as "[Image #1]" in the prompt (before,
@@ -4840,7 +4886,7 @@ function openChatTerminal(s) {
     openTerminal(state.terminal);
     return;
   }
-  if (s.nativeSource) { toast("이 실행의 터미널이 종료됐습니다. 새로고침 후 실제 작업 목록에서 선택해 주세요."); return; }
+  if (s.nativeSource) { toast("이 실행의 터미널이 종료됐습니다. 새로고침 후 세션 목록에서 선택해 주세요."); return; }
   state.route = { host: s.host, agent: s.agent, account: accountOf(s) };
   populateRoute(s);
   preparePlan();
@@ -5180,6 +5226,12 @@ function renderMessages(s, messages, error = "", fresh = false) {
       list.conversationEmpty ||= el("p", "group-empty", "저장된 대화를 아직 찾지 못했습니다.");
       desired.push(list.conversationEmpty);
     }
+  }
+  // The server sends the newest CONVERSATION_WINDOW items: anything before them is not shown.
+  if (messages.length >= CONVERSATION_WINDOW) {
+    list.conversationWindowNotice ||= el("p", "conversation-window-notice",
+      `최근 ${CONVERSATION_WINDOW}개 항목까지만 보입니다. 그보다 앞의 대화는 여기에 나오지 않습니다.`);
+    desired.unshift(list.conversationWindowNotice);
   }
   desired.push(...tail);
   // While reading back, the first row on screen that stays keeps its place:
@@ -6020,16 +6072,16 @@ function terminalCloseCopy(terminal) {
     action: "실행 종료", title: "이 터미널의 실행을 종료할까요?", danger: true,
     description: "이 보드에서 연 새 세션을 종료합니다. 진행 중인 응답이 중단될 수 있고, 대화 기록은 남습니다.",
     context: "보드에서 새로 연 세션입니다. 보드로 돌아가거나 브라우저를 닫아도 실행은 유지됩니다.",
-    ended: "새 세션의 실행이 종료되었습니다. 대화 기록은 보드의 작업 목록에서 확인하세요.",
-    done: "새 세션의 실행을 종료했습니다. 대화 기록은 보드의 작업 목록에서 확인하세요.",
+    ended: "새 세션의 실행이 종료되었습니다. 대화 기록은 보드의 세션 목록에서 확인하세요.",
+    done: "새 세션의 실행을 종료했습니다. 대화 기록은 보드의 세션 목록에서 확인하세요.",
   };
   // A PC conversation resumed in this terminal runs in it: closing it ends that run.
   if (mode === "resume") return {
     action: "실행 종료", title: "이 터미널의 실행을 종료할까요?", danger: true,
     description: "이 보드에서 다시 연 대화의 실행을 종료합니다. 진행 중인 응답이 중단될 수 있고, 대화 기록은 남습니다.",
     context: "저장된 대화를 이 보드 터미널에서 다시 열었습니다. 보드로 돌아가거나 브라우저를 닫아도 실행은 유지됩니다.",
-    ended: "다시 연 대화의 실행이 종료되었습니다. 대화 기록은 보드의 작업 목록에서 확인하세요.",
-    done: "다시 연 대화의 실행을 종료했습니다. 대화 기록은 보드의 작업 목록에서 확인하세요.",
+    ended: "다시 연 대화의 실행이 종료되었습니다. 대화 기록은 보드의 세션 목록에서 확인하세요.",
+    done: "다시 연 대화의 실행을 종료했습니다. 대화 기록은 보드의 세션 목록에서 확인하세요.",
   };
   if (mode === "handoff" || mode === "transfer") return {
     action: "실행 종료", title: "이 터미널의 실행을 종료할까요?", danger: true,
@@ -6196,7 +6248,8 @@ function fitTerminal() {
       );
       state.lastSize = size;
     } catch (err) {
-      if (!err.unauthorized && !err.staleAuth)
+      // An ended terminal has nothing to fit: its own end notice stays.
+      if (!err.unauthorized && !err.staleAuth && state.terminalAlive !== false)
         terminalError("터미널 크기를 맞추지 못했습니다. 다시 연결해 주세요.");
     }
   }, 180);

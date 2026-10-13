@@ -916,7 +916,9 @@ class Board:
     prints a full snapshot whenever something changes; those snapshots take the same
     `changed()` path. The watchers stop a grace period after the last stream closes.
     """
-    RETRY_BACKOFF = (120, 300, 900)
+    # A host that failed is tried again after these (seconds): a reconnected laptop shows as
+    # connected within five minutes at most, while one that stays away costs one ssh attempt.
+    RETRY_BACKOFF = (90, 180, 300)
     # Resident watcher restarts, apart from the one-shot collection backoff above.
     STREAM_BACKOFF = (5, 30, 120, 600)
     # Three failed watchers in a row, each within STREAM_HEALTHY of its start: pause it this long.
@@ -968,6 +970,8 @@ class Board:
                 pass
         # `version` rises within this process only when the published host state changes.
         self.version, self.listeners = 0, []
+        # The newest version a change other than a resident watcher's made (changed).
+        self.urgent_version = 0
         self.signature = self.state_signature()
 
     def state_signature(self):
@@ -983,14 +987,18 @@ class Board:
         with self.lock:
             self.listeners.remove(callback)
 
-    def changed(self, force=False):
-        """Announce host changes, or a committed board-only display change."""
+    def changed(self, force=False, live=False):
+        """Announce host changes, or a committed board-only display change. A resident
+        watcher's snapshot (live) may wait to be announced with the next ones; any other
+        change (a collection that finished, a refresh, a label) is announced at once."""
         with self.lock:
             signature = self.state_signature()
             if signature == self.signature and not force:
                 return
             self.signature = signature
             self.version += 1
+            if not live:
+                self.urgent_version = self.version
             for callback in list(self.listeners):
                 try:
                     callback(self.version)
@@ -1247,7 +1255,7 @@ class Board:
                 self.backoff.pop(stream.name, None)
                 # A failure logged by a one-shot collection is over: the watcher delivers.
                 self.log_collection(stream.name, {"ok": True, "durationMs": 0})
-                self.changed()
+                self.changed(live=True)
             moment = time.monotonic()
             if moment - self.live_saved.get(stream.name, moment - 30) >= 30:
                 self.live_saved[stream.name] = moment

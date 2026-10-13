@@ -128,7 +128,7 @@ function client(
   vm.runInContext(messageSource, context);
   vm.runInContext(source, context);
   const api = vm.runInContext(
-    "({state,api,sourceOf,accountOf,sendInput,pasteDraft,prepareDraftPaste,startDraftComposition,endDraftComposition,inputDraft,stopTerminalReader,startTerminalReader,closePlan,navigateView,backToList,backFromTerminal,closeTerminal,cancelTerminalClose,confirmTerminalClose,populateAccount,populateRoute,updateContinue,renderPlan,launchPlan,openTerminal,saveDraft,draftKey,refreshTerminals,renderTerminals,renderTerminalReturn,renderFilters,terminalCloseCopy,warnDraftUnload,preparePlan,renderGroups,renderMessages,loadDetail,chatKey,chatEntry,currentChat,chatSupported,chatRecovery,recoverChatSession,openChatTerminal,chatAttachmentsSupported,buildChatComposer,sendChat,loadChatState,applyChatReceipt,uploadChatFiles,pasteChat,scheduleChatPoll,stopChatPolling,openNativeChat,allSessions,buildContinuePanel,chatReceiptCopy,returnToBoard,readChatClipboard,accountDisplay,sessionAccountLabel,closeChatToolsOutside,closeChatToolsEscape,drawDetail,refreshDetail,loadCapabilities,matches,recoverConnection,networkOffline,poll,select,focusDetailBack,restoreSelectedCardFocus,showLogin,lock,beginAuthEpoch,resizeChatInput,updateViewport,draftKeydown,configureTerminalKeyboard,queueTerminalScroll,flushTerminalScroll,terminalScrollEnd,resetTerminalScroll,renderAttention,chatPollDelay,pullRefresh,readingScroll,renderJump,pullDistance,listScroll,setReading,renderPrompt,promptAction,renderUsage,loadUsage,applyTheme,setTheme,updateThemeColor,haptic,navTransition,setDetailShown,chatVisible,sheetRelease,BottomSheet,sheet,openSettings,closeSettings,setTyping,pinchFontSize,setTerminalFontSize,loadXterm,assetUrl,syncEvents,closeEvents,eventsHealthy,renderFreshness,schedule,touchDevice,togglePhaseFilter,renderCounts,createLongPress,swipeIntent,swipeRelease,groupMessageRows,setTextSize,applyTextSize,renderConnectivity,terminalForSession,swipeActionFor,openMessageMenu,openCardMenu,messageActions,outboxShape,outboxMatches,outboxOrigin,settleOutbox,retryOutbox,renderAttachmentTiles,attachmentThumb,sendUpload,openActionSheet,closeActionSheet,setListCollapsed,closeSwipe,settleSwipe,prepareSwipe,runSwipeAction,GESTURE,setChromeVisible,toggleChrome,revealChrome,isChromeTap,snapshotAnnounced,updateChatComposer,capabilitiesRevision,toolKindOf,userMessageParts,formatElapsed,tickWorking,renderTerminalMarks,renderDetailTerminal,terminalsAnnounced,goToSessionTerminal,rememberTerminal,terminalMenu,updateTerminalMenu,chooseTerminalMenu,clearTerminalMenu,renderNewSession,openNewSession,startNewSession,startAppServer,rememberConversationView,restoreConversationView,conversationIdentity,initiatorOf,initiatorLabel,documentKeydown,sessionCategoryOf,setSessionCategory,renderSessionCategories,prepareSessionListFor,sessionCategoryKeydown,render,resetFilters,terminalTitle,renameTerminals,requestedSessionFrom,requestSessionOpen,openRequestedSession,answerOnOpen,hardReload,terminalKeyBytes,terminalKeyFromEvent,pressTerminalKey,toggleTerminalMod,clearTerminalMods,renderTerminalMods,draftBeforeInput,terminalDocumentKey,xtermKeyEvent,renderHardware,loadHardware,startDictation,stopDictation,dictationText,toggleDraftDictation,renderDictation,DICTATION_LISTENING,DICTATION_ERRORS,DICTATION_PREPARING,DICTATION_STALLED,DICTATION_ENDED_AT_ONCE,DICTATION_INTERRUPTED,DICTATION_NOT_STARTED,DICTATION_SILENCE_END,bindDraftInput,insertChatText,reloadForUpdate,checkWebVersion,unsavedWork,detailMetaChildren,updateBannerPressed,manualRefresh})",
+    "({state,api,sourceOf,accountOf,sendInput,pasteDraft,prepareDraftPaste,startDraftComposition,endDraftComposition,inputDraft,stopTerminalReader,startTerminalReader,closePlan,navigateView,backToList,backFromTerminal,closeTerminal,cancelTerminalClose,confirmTerminalClose,populateAccount,populateRoute,updateContinue,renderPlan,launchPlan,openTerminal,saveDraft,draftKey,refreshTerminals,renderTerminals,renderTerminalReturn,renderFilters,terminalCloseCopy,warnDraftUnload,preparePlan,renderGroups,renderMessages,loadDetail,chatKey,chatEntry,currentChat,chatSupported,chatRecovery,recoverChatSession,openChatTerminal,chatAttachmentsSupported,buildChatComposer,sendChat,loadChatState,applyChatReceipt,uploadChatFiles,pasteChat,scheduleChatPoll,stopChatPolling,openNativeChat,allSessions,buildContinuePanel,chatReceiptCopy,returnToBoard,readChatClipboard,accountDisplay,sessionAccountLabel,closeChatToolsOutside,closeChatToolsEscape,drawDetail,refreshDetail,loadCapabilities,matches,recoverConnection,networkOffline,poll,select,focusDetailBack,restoreSelectedCardFocus,showLogin,lock,beginAuthEpoch,resizeChatInput,updateViewport,draftKeydown,configureTerminalKeyboard,queueTerminalScroll,flushTerminalScroll,terminalScrollEnd,resetTerminalScroll,renderAttention,chatPollDelay,pullRefresh,readingScroll,renderJump,pullDistance,listScroll,setReading,renderPrompt,promptAction,renderUsage,loadUsage,applyTheme,setTheme,updateThemeColor,haptic,navTransition,setDetailShown,chatVisible,sheetRelease,BottomSheet,sheet,openSettings,closeSettings,setTyping,pinchFontSize,setTerminalFontSize,loadXterm,assetUrl,syncEvents,closeEvents,eventsHealthy,renderFreshness,schedule,touchDevice,togglePhaseFilter,renderCounts,createLongPress,swipeIntent,swipeRelease,groupMessageRows,setTextSize,applyTextSize,renderConnectivity,terminalForSession,swipeActionFor,openMessageMenu,openCardMenu,messageActions,outboxShape,outboxMatches,outboxOrigin,settleOutbox,retryOutbox,renderAttachmentTiles,attachmentThumb,sendUpload,openActionSheet,closeActionSheet,setListCollapsed,closeSwipe,settleSwipe,prepareSwipe,runSwipeAction,GESTURE,setChromeVisible,toggleChrome,revealChrome,isChromeTap,snapshotAnnounced,updateChatComposer,capabilitiesRevision,toolKindOf,userMessageParts,formatElapsed,tickWorking,renderTerminalMarks,renderDetailTerminal,terminalsAnnounced,goToSessionTerminal,rememberTerminal,terminalMenu,updateTerminalMenu,chooseTerminalMenu,clearTerminalMenu,renderNewSession,openNewSession,startNewSession,startAppServer,rememberConversationView,restoreConversationView,conversationIdentity,initiatorOf,initiatorLabel,documentKeydown,sessionCategoryOf,setSessionCategory,renderSessionCategories,prepareSessionListFor,sessionCategoryKeydown,render,resetFilters,terminalTitle,renameTerminals,requestedSessionFrom,requestSessionOpen,openRequestedSession,answerOnOpen,hardReload,terminalKeyBytes,terminalKeyFromEvent,pressTerminalKey,toggleTerminalMod,clearTerminalMods,renderTerminalMods,draftBeforeInput,terminalDocumentKey,xtermKeyEvent,renderHardware,loadHardware,startDictation,stopDictation,dictationText,toggleDraftDictation,renderDictation,DICTATION_LISTENING,DICTATION_ERRORS,DICTATION_PREPARING,DICTATION_STALLED,DICTATION_ENDED_AT_ONCE,DICTATION_INTERRUPTED,DICTATION_NOT_STARTED,DICTATION_SILENCE_END,bindDraftInput,insertChatText,reloadForUpdate,checkWebVersion,unsavedWork,detailMetaChildren,updateBannerPressed,manualRefresh,listNavigationKeydown})",
     context,
   );
   api.state.csrf = "csrf-test";
@@ -3834,6 +3834,63 @@ test('pulling while a refresh runs shares it instead of calling it failed', asyn
   assert.equal(await c.manualRefresh(), null);
   await c.pullRefresh();
   assert.ok(seen.some((value) => /잠시 뒤 다시 당겨/.test(value)));
+});
+
+test('a hardware keyboard goes from the search field into the list, between cards, and back from a conversation', () => {
+  const c = client(undefined, noChatTimers);
+  const focused = [], clicked = [];
+  const cards = [0, 1, 2].map((index) => ({ index, dataset: { sessionKey: 'card-' + index }, classList: { contains: (name) => name === 'card' }, closest: () => null,
+    focus() { focused.push(index); }, click() { clicked.push(index); } }));
+  c.get('groups').querySelectorAll = (selector) => (selector === '.card' ? cards : []);
+  const search = { id: 'search', closest: () => null };
+  const press = (target, key, extra = {}) => {
+    const event = { key, target, preventDefault() { this.prevented = true; }, ...extra };
+    return [c.listNavigationKeydown(event), !!event.prevented];
+  };
+  assert.deepEqual(press(search, 'ArrowDown'), [true, true]); assert.deepEqual(focused, [0]);
+  assert.deepEqual(press(search, 'Enter'), [true, true]); assert.deepEqual(clicked, [0]);
+  assert.deepEqual(press(cards[0], 'ArrowDown'), [true, true]); assert.deepEqual(focused, [0, 1]);
+  assert.deepEqual(press(cards[1], 'ArrowUp'), [true, true]); assert.deepEqual(focused, [0, 1, 0]);
+  // Composition, a modifier or a terminal keep their keys.
+  assert.deepEqual(press(search, 'Enter', { isComposing: true }), [false, false]);
+  assert.deepEqual(press(cards[0], 'ArrowDown', { shiftKey: true }), [false, false]);
+  c.state.terminalVisible = true;
+  assert.deepEqual(press(search, 'ArrowDown'), [false, false]);
+  c.state.terminalVisible = false;
+  // Back from a conversation: Esc outside a field, or ⌘[; never Esc while typing.
+  c.state.selected = 'workstation|codex|.codex|fixture';
+  const typing = { closest: (selector) => (selector.includes('textarea') ? {} : null) };
+  assert.deepEqual(press(typing, 'Escape'), [false, false]);
+  assert.deepEqual(press({ closest: () => null }, 'Escape'), [true, true]);
+  assert.deepEqual(press(typing, '[', { metaKey: true }), [true, true]);
+  assert.deepEqual(press({ closest: (selector) => (selector === 'dialog' ? {} : null) }, 'Escape'), [false, false]);
+  // A key already taken (Esc closing the tools menu) or one an input method is composing is left alone.
+  assert.deepEqual(press({ closest: () => null }, 'Escape', { defaultPrevented: true }), [false, false]);
+  assert.deepEqual(press(search, 'ArrowDown', { keyCode: 229 }), [false, false]);
+  // An iPad's key names are understood.
+  focused.length = 0;
+  assert.deepEqual(press(search, 'UIKeyInputDownArrow'), [true, true]); assert.deepEqual(focused, [0]);
+  // On a touch screen without a hardware keyboard, Return from the search field only closes the keyboard.
+  c.context.window.matchMedia = (query) => ({ matches: /coarse/.test(query) });
+  c.state.hardwareKeyboard = false;
+  assert.equal(vm.runInContext('keyboardPresent()', c.context), false);
+  clicked.length = 0;
+  assert.deepEqual(press(search, 'Enter'), [false, false]); assert.deepEqual(clicked, []);
+  // Once a hardware key was seen, Enter opens it again.
+  c.state.hardwareKeyboard = true;
+  assert.deepEqual(press(search, 'Enter'), [true, true]); assert.deepEqual(clicked, [0]);
+});
+
+test('a conversation at the read window says the items before it are not shown', () => {
+  const c = client(undefined, noChatTimers);
+  const { s } = selectChat(c);
+  const items = (count) => Array.from({ length: count }, (unused, index) => ({ role: index % 2 ? 'assistant' : 'user', text: `항목 ${index}`, ts: index + 1 }));
+  const notice = () => c.get('messages').children.find((node) => node.className === 'conversation-window-notice');
+  c.renderMessages(s, items(79));
+  assert.equal(notice(), undefined);
+  c.renderMessages(s, items(80));
+  assert.match(notice().textContent, /최근 80개 항목까지만 보입니다. 그보다 앞의 대화는 여기에 나오지 않습니다/);
+  assert.equal(c.get('messages').children[0], notice(), 'above the conversation');
 });
 
 function classes() {
@@ -8145,7 +8202,7 @@ function assertOneShotHistory(c) {
   assert.equal(notices.length, 1);
   assert.match(textOf(notices[0]), /일회성 실행 · 기록 저장 안 함/);
   assert.ok(textOf(notices[0]).includes(ONE_SHOT_HISTORY));
-  for (const className of ['conversation-read-error', 'group-empty', 'msg-working'])
+  for (const className of ['conversation-read-error', 'group-empty', 'conversation-loading', 'msg-working'])
     assert.equal(byClass(messages, className).length, 0, className);
 }
 

@@ -4219,6 +4219,10 @@ test('Claude 백그라운드 대화에 입력을 시작하면 그 연결을 한 
     metadata: { nativeSource: { host: s.host, agent: s.agent, home: s.home, id: s.id }, mode: 'attach' } }];
   entry.warmedAt -= 61000; type('안녕하세');
   assert.equal(warmed().length, 2);
+  // A finished session is not woken by typing.
+  c.state.terminals = []; c.state.snapshot.hosts[0].data.claude[0].phase = 'done';
+  entry.warmedAt -= 61000; type('안녕하세요');
+  assert.equal(warmed().length, 2);
   // Codex takes input through its own server: never warmed.
   const codex = client(async (url) => { requests.push([url]); return { ok: true, status: 200, json: async () => ({}) }; }, noChatTimers);
   const other = selectChat(codex);

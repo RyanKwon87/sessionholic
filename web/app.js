@@ -5099,9 +5099,10 @@ function openQuickReplies(entry, input, trigger) {
 // once instead of waiting for the attach. Once a minute at most; nothing is typed by it.
 const WARM_SPACING_MS = 60000;
 function warmChat(entry) {
+  if (Date.now() - (entry.warmedAt || 0) < WARM_SPACING_MS || entry.source?.agent !== "claude") return;
   const s = allSessions().find((session) => chatKey(sourceOf(session)) === chatKey(entry.source));
-  if (s?.agent !== "claude" || s.kind !== "background" || terminalForSession(s)) return;
-  if (Date.now() - (entry.warmedAt || 0) < WARM_SPACING_MS) return;
+  // A finished session is not woken by typing; its send opens the connection as before.
+  if (s?.kind !== "background" || s.phase === "done" || terminalForSession(s)) return;
   entry.warmedAt = Date.now();
   api("/api/chat/warm", { method: "POST", body: { source: entry.source } }).catch(() => {
     // The send opens it then, as before.

@@ -126,10 +126,16 @@ def _screen_lines(screen):
 
 
 def input_ready(screen):
-    """Whether Claude Code's input line shows at the screen's end, with no menu open."""
-    rows = [line for line in _screen_lines(screen) if line is None or line.strip()][-INPUT_TAIL:]
-    for index, line in enumerate(rows[:-1]):
-        if line is not None and INPUT_PROMPT.match(line) and rows[index + 1] is None:
+    """Whether Claude Code's input line shows at the screen's end, with no menu open: a prompt
+    between a box or rule line right above it ("───── title ─", "╭───╮", read as drawn) and a
+    rule right below it. A message in the transcript has text around it, not both."""
+    raw = str(screen or '').replace('\r', '').split('\n')
+    rows = [(drawn, line) for drawn, line in zip(raw, _screen_lines(screen))
+            if line is None or line.strip()][-INPUT_TAIL:]
+    for index in range(1, len(rows) - 1):
+        line = rows[index][1]
+        if (line is not None and INPUT_PROMPT.match(line) and rows[index + 1][1] is None
+                and BOX_LEAD.match(rows[index - 1][0])):
             return parse_menu(screen) is None
     return False
 
@@ -250,8 +256,10 @@ class Chat:
         self.claude_locks = {}
         # Terminals a send opened that were still loading when it gave up.
         self.unsettled = set()
-        # Conversations whose attach is being opened ahead of a send (warm).
+        # Conversations whose attach is being opened ahead of a send (warm), one at a time, so
+        # two warm-ups never both pass the room check and push out another connection.
         self.warming = set()
+        self.warm_gate = threading.Lock()
         self.prompt_results = {}
         # state key -> {request id: monotonic expiry}, oldest first.
         self.waiting = {}
@@ -819,6 +827,7 @@ class Chat:
         moment after the first output. At the limit, what was seen is taken as before."""
         deadline, after, seen, quiet = time.monotonic() + CLAUDE_READY_SECONDS, 0, False, time.monotonic()
         first = looked = None
+        shown = False  # The input line on the last look: two looks in a row are needed.
         while time.monotonic() < deadline:
             chunk = self.workflow.terminals.read(terminal_id, after, 0.25)
             now = time.monotonic()
@@ -830,10 +839,13 @@ class Chat:
             if seen and now - first >= SETTLE_PROMPT_SECONDS and (looked is None or now - looked >= 0.5):
                 looked = now
                 try:
-                    if input_ready(self.workflow.terminals.capture(terminal_id)):
-                        return True
+                    ready = input_ready(self.workflow.terminals.capture(terminal_id))
                 except (RuntimeError, ValueError, KeyError, OSError):
-                    pass
+                    ready = False
+                # Two looks half a second apart: a frame drawn halfway is not taken.
+                if ready and shown:
+                    return True
+                shown = ready
             if not chunk.get('alive', True):
                 break
         return seen
@@ -847,9 +859,12 @@ class Chat:
             raise ValueError('미리 연결할 세션을 확인해 주세요.')
         ref = data['source']
         source, host = self.source(ref)
-        if source.get('agent') != 'claude' or source.get('kind') != 'background' or host.get('platform') == 'windows':
+        # A finished session is not woken by typing (its attach would start it again); its send
+        # opens the attach as before.
+        if (source.get('agent') != 'claude' or source.get('kind') != 'background' or host.get('platform') == 'windows'
+                or source.get('phase') == 'done'):
             return {'warming': False}
-        key = json.dumps([source.get('host'), source.get('sessionId') or source.get('id')])
+        key = self._warm_key(source)
         with self.lock:
             if key in self.warming:
                 return {'warming': True}
@@ -857,7 +872,12 @@ class Chat:
 
         def run():
             turn = self._claude_lock_for(source)
+            if not self.warm_gate.acquire(blocking=False):
+                with self.lock:
+                    self.warming.discard(key)
+                return  # Another warm-up is opening one.
             if not turn.acquire(blocking=False):
+                self.warm_gate.release()
                 with self.lock:
                     self.warming.discard(key)
                 return  # A send is under way: it opens what it needs.
@@ -874,11 +894,16 @@ class Chat:
                 pass  # The send opens it then, as before.
             finally:
                 turn.release()
+                self.warm_gate.release()
                 with self.lock:
                     self.warming.discard(key)
 
         threading.Thread(target=run, name='claude-warm', daemon=True).start()
         return {'warming': True}
+
+    @staticmethod
+    def _warm_key(source):
+        return json.dumps([source.get('host'), source.get('sessionId') or source.get('id')])
 
     def _claude_record_path(self, source, request_id):
         folder = self.root / 'claude-sends'
@@ -956,7 +981,10 @@ class Chat:
             raise SendRejected(CLAUDE_WINDOWS, 409)
         turn = self._claude_lock_for(source)
         if not turn.acquire(timeout=30):
-            raise SendRejected('다른 메시지를 전달하고 있습니다. 잠시 뒤 다시 보내 주세요.', 409)
+            with self.lock:
+                warming = self._warm_key(source) in self.warming
+            raise SendRejected('이 세션의 연결을 여는 중입니다. 잠시 뒤 다시 보내 주세요.' if warming else
+                               '다른 메시지를 전달하고 있습니다. 잠시 뒤 다시 보내 주세요.', 409)
         try:
             previous = self._claude_read_record(source, request_id)
             if previous:

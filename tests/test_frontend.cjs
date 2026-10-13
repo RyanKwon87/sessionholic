@@ -329,6 +329,35 @@ test("uncertain input is never retried and queued input is discarded", async () 
   assert.equal(calls, 1);
 });
 
+test("input refused by a restarted board is not resent, drops its queue, and the next input carries the new token", async () => {
+  const sent = [];
+  let token = "fresh-csrf";
+  const c = client(async (url, options) => {
+    if (url === "/api/capabilities")
+      return { ok: true, status: 200, json: async () => ({ hosts: [], csrfToken: token }) };
+    if (options.headers["X-CSRF-Token"] !== token)
+      return { ok: false, status: 403, json: async () => ({ error: "보안 연결을 갱신해 주세요.", code: "csrf_expired" }) };
+    sent.push(JSON.parse(options.body).text);
+    return { ok: true, status: 200, json: async () => ({ ok: true }) };
+  });
+  c.state.authenticated = true;
+  c.state.connected = true;
+  c.state.terminal = { id: "a".repeat(32) };
+  const first = c.sendInput("l");
+  const queued = c.sendInput("s");
+  const results = await Promise.allSettled([first, queued]);
+  assert.deepEqual(results.map((r) => r.status), ["rejected", "rejected"]);
+  // Neither key reached the terminal, the reader stays, and the reason is on screen.
+  assert.deepEqual(sent, []);
+  assert.equal(c.state.connected, true);
+  assert.equal(c.state.inputFailed, false);
+  assert.equal(c.state.csrf, "fresh-csrf");
+  assert.match(c.get("terminal-error").textContent, /보내지 않았습니다/);
+  await c.sendInput("ls");
+  assert.deepEqual(sent, ["ls"]);
+  assert.equal(c.get("terminal-error").hidden, true);
+});
+
 test("input captures terminal ownership and cannot leak into a switched terminal", async () => {
   const calls = [];
   let release;
@@ -1926,6 +1955,40 @@ test('offline drafts remain editable but send, uploads, clipboard reads and term
   assert.equal(requests, 0); assert.equal(reads, 0); assert.equal(entry.pending, null);
   assert.equal(entry.text, '오프라인 초안'); assert.equal(c.get('chat-input').disabled, false);
   assert.equal(c.get('chat-send').disabled, true); assert.match(c.get('chat-status').textContent, /오프라인.*초안/);
+});
+
+test('a page shown again after a missed online event reads again, and live updates get a fresh start', async () => {
+  const requests = [];
+  const c = client(async (url, options) => {
+    requests.push(url);
+    return { ok: true, status: 200, json: async () => url === '/api/snapshot' ? c.state.snapshot :
+      { route: JSON.parse(options.body).source, capability: { supported: true }, phase: 'idle' } };
+  }, noChatTimers);
+  c.context.navigator = { onLine: false }; c.windowEvents.DOMContentLoaded();
+  await new Promise((resolve) => setImmediate(resolve));
+  selectChat(c);
+  c.state.capabilities = {}; c.state.capabilitiesRevision = c.capabilitiesRevision(c.state.snapshot);
+  // Hours in the background: offline was seen, its online event never was.
+  c.windowEvents.offline(); assert.equal(c.state.offline, true);
+  c.context.navigator.onLine = true;
+  c.state.eventsRetryAt = Date.now() + 60000;
+  c.context.document.hidden = true; c.documentEvents.visibilitychange();
+  requests.length = 0;
+  c.context.document.hidden = false; c.documentEvents.visibilitychange();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(c.state.offline, false);
+  assert.equal(c.state.eventsRetryAt, 0);
+  assert.ok(requests.includes('/api/snapshot'));
+  assert.ok(requests.includes('/api/chat/state'));
+  assert.equal(c.get('offline-text').textContent, '');
+  // A page restored from the back-forward cache does the same; a fresh load does not.
+  c.windowEvents.offline(); requests.length = 0;
+  c.windowEvents.pageshow({ persisted: false });
+  assert.equal(c.state.offline, true);
+  c.windowEvents.pageshow({ persisted: true });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(c.state.offline, false);
+  assert.ok(requests.includes('/api/snapshot'));
 });
 
 test('online recovery reads one selected state and snapshot without resending unknown work or terminal input', async () => {
@@ -6974,12 +7037,21 @@ test('H3: a stale CSRF token is refreshed once and a read or a deduplicated requ
   };
   const retried = [['/api/chat/state', { source: {} }], ['/api/chat/prompt', { requestId: 'request-0001' }],
     ['/api/plan', { source: {} }], ['/api/launch', { planId: 'plan', requestId: 'request-0002' }], ['/api/refresh', {}],
-    ['/api/usage/refresh', {}]];
+    ['/api/usage/refresh', {}], ['/api/session/seen', { key: 'k' }],
+    [`/api/terminal/${'a'.repeat(32)}/resize`, { cols: 80, rows: 24 }],
+    [`/api/terminal/${'a'.repeat(32)}/scroll`, { lines: -3 }], [`/api/terminal/${'a'.repeat(32)}/scroll-end`, {}]];
   for (const [path, body] of retried) {
     const { c, requests } = setup();
     assert.deepEqual(await c.api(path, { method: 'POST', body }), { ok: true }, path);
     assert.deepEqual(requests, [[path, 'csrf-test'], ['/api/capabilities', undefined], [path, 'fresh-csrf']], path);
     assert.equal(c.state.csrf, 'fresh-csrf');
+  }
+  // Closing a terminal waits for a new press, like a chat send.
+  {
+    const { c, requests } = setup();
+    const path = `/api/terminal/${'a'.repeat(32)}/close`;
+    await assert.rejects(c.api(path, { method: 'POST', body: {} }), (err) => err.code === 'csrf_expired');
+    assert.deepEqual(requests.map(([url]) => url), [path]);
   }
   // Only once: a second refusal is the caller's error.
   {

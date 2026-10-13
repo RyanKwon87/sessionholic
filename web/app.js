@@ -718,7 +718,12 @@ function beginAuthEpoch() {
 // never is: it waits for a new press (sendChat).
 const CSRF_RETRY = new Set(["/api/chat/state", "/api/chat/prompt", "/api/plan", "/api/launch",
   "/api/new-session", "/api/app-server", "/api/refresh", "/api/usage/refresh", "/api/hardware/refresh",
-  "/api/push/subscribe", "/api/push/unsubscribe"]);
+  "/api/push/subscribe", "/api/push/unsubscribe", "/api/session/seen"]);
+// A terminal's size and scrolling; its keys never (sendInput reads the token instead).
+const CSRF_RETRY_TERMINAL = /^\/api\/terminal\/[a-f0-9]{32}\/(resize|scroll|scroll-end)$/;
+function csrfRetryable(path) {
+  return CSRF_RETRY.has(path) || CSRF_RETRY_TERMINAL.test(path);
+}
 // The screen this page runs: its app.js ?v=, as the board served it. A tab opened
 // before a deploy keeps the old screen until it reloads; the board names the one it
 // serves now (capabilities.webVersion) and checkWebVersion compares the two.
@@ -795,7 +800,7 @@ async function api(path, { method = "GET", body, signal: callerSignal, authEpoch
   const late = apiTimedOut(limit, path);
   if (late) throw late;
   if (!response.ok && response.status === 403 && data.code === "csrf_expired" && csrfRetry &&
-      method !== "GET" && CSRF_RETRY.has(path)) {
+      method !== "GET" && csrfRetryable(path)) {
     let refreshed = false;
     try {
       await loadCapabilities(authEpoch, { refreshView: false });
@@ -6676,7 +6681,25 @@ function sendInput(text) {
         method: "POST",
         body: { text, requestId: req },
       });
+      if (state.inputRefused) {
+        state.inputRefused = false;
+        terminalError("");
+      }
     } catch (err) {
+      if (err.code === "csrf_expired" && !err.unauthorized && !err.staleAuth && epoch === state.inputEpoch) {
+        // A restarted board refused it before anything ran, so it was surely not sent, and
+        // the reader stays. Keys queued behind it are dropped too (never a partial line);
+        // the next one waits for the new token.
+        state.inputEpoch++;
+        state.inputRefused = true;
+        terminalError("보드가 다시 시작돼 이 입력은 보내지 않았습니다. 화면을 확인한 뒤 다시 입력해 주세요.");
+        try {
+          await loadCapabilities(state.authEpoch, { refreshView: false });
+        } catch {
+          /* the next input is refused the same way and tries again */
+        }
+        throw err;
+      }
       if (!err.unauthorized && !err.staleAuth && epoch === state.inputEpoch) {
         state.inputFailed = true;
         state.inputEpoch++;
@@ -8310,6 +8333,25 @@ function recoverConnection() {
   const selected = selectedSession();
   if (selected) { updateChatComposer(chatEntry(selected)); loadChatState(selected, true); }
 }
+// The page is on screen again, maybe after hours in the background.
+function pageShown() {
+  // Live updates that failed while away (or as the network came back) start afresh.
+  state.eventsRetryAt = 0;
+  // A home-screen app in the background can miss the browser's online event, and an
+  // offline page reads nothing; one shown again believes navigator.onLine.
+  if (state.offline && globalThis.navigator?.onLine !== false) {
+    state.shownAt = Date.now();
+    recoverConnection();
+  } else if (state.terminalVisible) {
+    startTerminalReader();
+  } else if (state.authenticated) {
+    state.shownAt = Date.now();
+    if (reloadForUpdate()) return;
+    poll(true);
+    const selected = selectedSession();
+    if (selected) loadChatState(selected, true);
+  } else recoverConnection();
+}
 // Unsent words or files on this page: what leaving or reloading it would lose.
 function unsavedWork() {
   return [...state.drafts.values(), state.terminal ? $("terminal-draft").value : ""].some(Boolean) ||
@@ -8570,15 +8612,11 @@ window.addEventListener("DOMContentLoaded", () => {
         state.inputEpoch++;
         terminalStatus("화면으로 돌아오면 다시 연결합니다.");
       }
-    } else if (state.terminalVisible) {
-      startTerminalReader();
-    } else if (state.authenticated) {
-      state.shownAt = Date.now();
-      if (reloadForUpdate()) return;
-      poll(true);
-      const selected = selectedSession();
-      if (selected) loadChatState(selected, true);
-    } else recoverConnection();
+    } else pageShown();
+  });
+  // A page restored from the back-forward cache fires no visibilitychange.
+  window.addEventListener("pageshow", (event) => {
+    if (event.persisted && !document.hidden) pageShown();
   });
   window.addEventListener("offline", () => {
     state.offline = true;

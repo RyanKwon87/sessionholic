@@ -2456,6 +2456,10 @@ class Handler(BaseHTTPRequestHandler):
 
     # ---------- routes ----------
     def observe_work(self, source, conversation):
+        # No work list on this board (it answers 410): nothing reads what would be observed,
+        # and each read would rewrite the whole work file.
+        if not getattr(self.server, "work_list", True):
+            return
         if not isinstance(source, dict) or not all(source.get(k) for k in ("host", "agent", "id")):
             return
         try:

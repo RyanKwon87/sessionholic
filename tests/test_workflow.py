@@ -634,6 +634,6 @@ class ContinuityTest(unittest.TestCase):
         restored.state['local']['paused'] = True
         result = restored.read('local', 'codex', SOURCE['id'], '.codex')
         self.assertTrue(result['stale'])
-        self.assertNotIn('example.com', result['messages'][0]['text'])
+        self.assertIn('name@example.com', result['messages'][0]['text'], 'an email address is not a secret')
         self.assertNotIn('sk-proj', result['messages'][0]['text'])
         self.assertEqual((Path(self.temp.name) / 'conversations.json').stat().st_mode & 0o777, 0o600)

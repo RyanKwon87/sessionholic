@@ -479,7 +479,7 @@ class TransferredLaunchTest(unittest.TestCase):
         self.messages = [{"role": "user", "text": "contact fixture@example.test and sk-proj-" + "x" * 30}]
         self.metadata["note"] = "Bearer fixture-token-123456"
         text = Path(self.build()["handoffPath"]).read_text()
-        self.assertNotIn("fixture@example.test", text)
+        self.assertIn("fixture@example.test", text, "an email address is not a secret")
         self.assertNotIn("fixture-token-123456", text)
         self.assertNotIn("sk-proj-", text)
 

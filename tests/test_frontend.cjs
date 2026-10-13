@@ -10074,3 +10074,62 @@ test('a menu whose taps iPadOS kept for its own selection still works once the o
   assert.equal(dialog.open, false);
   assert.deepEqual(ran, ['복사']);
 });
+
+test('on an iPad a press within ten seconds of the last end waits it out, saying so, then listens', async () => {
+  const ipad = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/27.0 Safari/605.1.15';
+  const { c, recognitions, FakeRecognition, result, settle, timeouts, tick } = dictationClient();
+  c.context.webkitSpeechRecognition = FakeRecognition;
+  c.context.navigator = { userAgent: ipad, onLine: true };
+  c.context.window.matchMedia = (query) => ({ matches: query === '(pointer: coarse)' });
+  const { s } = selectChat(c);
+  const composer = c.buildChatComposer(s);
+  const input = findId(composer, 'chat-input');
+  const mic = findId(composer, 'chat-mic');
+  // The first listening starts at once.
+  mic.events.click();
+  const [first] = recognitions;
+  assert.equal(first.started, 1);
+  first.onstart();
+  first.onresult(result('첫 말'));
+  mic.events.click();
+  await settle();
+  assert.equal(c.state.dictation, null);
+  // Pressed again right away: it waits, says how long, and starts once the time is up.
+  mic.events.click();
+  const second = recognitions.at(-1);
+  assert.notEqual(second, first);
+  assert.equal(second.started, 0);
+  assert.match(c.get('chat-status').textContent, /앞의 받아쓰기를 정리하고 있습니다 · 1[12]초 뒤 듣기 시작/);
+  assert.equal(mic.attributes['aria-pressed'], 'true', 'the mic shows it is on its way');
+  tick(3);
+  assert.equal(c.state.dictation?.recognition, second, 'waiting does not count as not starting');
+  const wait = timeouts.filter((timer) => timer.ms > 10000 && timer.ms <= 12000).at(-1);
+  assert.ok(wait);
+  wait.callback();
+  assert.equal(second.started, 1);
+  assert.equal(c.get('chat-status').textContent, c.DICTATION_PREPARING);
+  second.onstart();
+  second.onresult(result('둘째 말'));
+  assert.equal(input.value, '첫 말 둘째 말');
+  // Pressed during the wait, it simply does not start.
+  c.stopDictation({ abort: true });
+  await settle();
+  c.state.dictationEndedAt = Date.now();
+  mic.events.click();
+  const third = recognitions.at(-1);
+  mic.events.click();
+  assert.equal(c.state.dictation, null);
+  timeouts.filter((timer) => timer.ms > 10000 && timer.ms <= 12000).at(-1).callback();
+  assert.equal(third.started, 0);
+  assert.equal(c.get('chat-status').textContent, '');
+  // Not on Android or a mouse device: no wait.
+  for (const [agent, coarse] of [['Mozilla/5.0 (Linux; Android 15) AppleWebKit/537.36 Chrome/141', true], [ipad, false]]) {
+    c.context.navigator = { userAgent: agent, onLine: true };
+    c.context.window.matchMedia = (query) => ({ matches: coarse && query === '(pointer: coarse)' });
+    c.state.dictationEndedAt = Date.now();
+    mic.events.click();
+    assert.equal(recognitions.at(-1).started, 1, agent);
+    c.stopDictation({ abort: true });
+    await settle();
+  }
+});

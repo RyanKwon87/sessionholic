@@ -3483,6 +3483,23 @@ const DICTATION_LANG = "ko-KR";
 const DICTATION_PREPARING = "마이크 준비 중…";
 const DICTATION_LISTENING = "듣는 중 · 끝내려면 마이크를 다시 누르세요";
 const DICTATION_ENDING = "받아쓴 글을 마무리하고 있습니다…";
+// iPadOS (WebKit) gives a listening started within about ten seconds of the last one's end no
+// sound: it starts and hears nothing (traced on an iPad: pressed 1-8 s after an end, nothing
+// heard; 11.6 s and later, heard at once). There a press waits out the rest, saying so.
+const DICTATION_COOLDOWN_MS = 12000;
+const DICTATION_WAITING = "마이크 준비 중… iPad가 앞의 받아쓰기를 정리하고 있습니다 ·";
+function dictationWaitingText(ms) {
+  return `${DICTATION_WAITING} ${Math.max(1, Math.ceil(ms / 1000))}초 뒤 듣기 시작`;
+}
+function dictationCooldown() {
+  const agent = String(globalThis.navigator?.userAgent || "");
+  if (!touchDevice() || !/AppleWebKit/.test(agent) || /Android/i.test(agent)) return 0;
+  return Math.max(0, (state.dictationEndedAt || 0) + DICTATION_COOLDOWN_MS - Date.now());
+}
+// The status words that last only while a listening runs (the field's own note clears them).
+function dictationTransient(text) {
+  return [DICTATION_PREPARING, DICTATION_LISTENING, DICTATION_ENDING].includes(text) || String(text || "").startsWith(DICTATION_WAITING);
+}
 const DICTATION_STALLED = "음성 인식이 응답하지 않아 멈췄습니다. 들은 글은 남겨 두었습니다. 다시 누르거나 키보드의 받아쓰기를 써 주세요.";
 const DICTATION_NOT_STARTED = "음성 인식이 시작되지 않아 멈췄습니다. 권한 창이 떴다면 허용한 뒤 마이크를 다시 누르거나, 키보드의 받아쓰기를 써 주세요.";
 const DICTATION_SILENCE_END = "말이 없어 듣기를 끝냈습니다. 이어서 말하려면 마이크를 다시 누르세요.";
@@ -3582,6 +3599,7 @@ function dictationReportCode(text) {
     [DICTATION_STALLED, "stalled"], [DICTATION_NOT_STARTED, "not-started"], [DICTATION_SILENCE_END, "silence"],
     [DICTATION_CHANGED, "changed"]];
   for (const [message, code] of known) if (text === message) return code;
+  if (text.startsWith(DICTATION_WAITING)) return "waiting";
   const detail = /\(([a-z-]+)\)$/.exec(text)?.[1] || "";
   if (text.startsWith(DICTATION_ENDED_AT_ONCE)) return `ended-at-once:${detail}`;
   if (text.startsWith(DICTATION_INTERRUPTED)) return `interrupted:${detail}`;
@@ -3712,6 +3730,7 @@ function startDictation(field, { report, active, releaseKeyboard = false }) {
     if (state.dictation === session) session.error = String(event?.error || "unknown");
   };
   recognition.onend = () => {
+    state.dictationEndedAt = Date.now();
     dictationTrace(session, "end", { cur: state.dictation === session, heard: session.heard, idle: session.idle });
     if (state.dictation === session && dictationResumable(session)) {
       // What it wrote stays; the next round's words follow it.
@@ -3742,6 +3761,10 @@ function startDictation(field, { report, active, releaseKeyboard = false }) {
       stopDictation({ abort: true, message: dictationOutcome(session) });
       return;
     }
+    if (session.waiting) {
+      session.report(dictationWaitingText(session.waitUntil - Date.now()));
+      return;
+    }
     session.ticks++;
     session.idle++;
     if (!session.started && session.ticks >= DICTATION_START_TICKS) stopDictation({ abort: true, message: DICTATION_NOT_STARTED });
@@ -3751,14 +3774,35 @@ function startDictation(field, { report, active, releaseKeyboard = false }) {
     }
   }, 1000);
   dictationTrace(session, "press");
+  const begin = () => {
+    try {
+      recognition.start();
+      return true;
+    } catch {
+      dictationTrace(session, "error", { code: "start-threw" });
+      session.error = "start";
+      finishDictation(session);
+      return false;
+    }
+  };
+  const wait = dictationCooldown();
+  if (wait > 0) {
+    Object.assign(session, { waiting: true, waitUntil: Date.now() + wait });
+    dictationTrace(session, "wait", { ms: wait });
+    session.report(dictationWaitingText(wait));
+    renderDictation();
+    session.waitTimer = setTimeout(() => {
+      if (state.dictation !== session) return;
+      session.waiting = false;
+      dictationTrace(session, "waited");
+      session.report(DICTATION_PREPARING);
+      begin();
+    }, wait);
+    return true;
+  }
   session.report(DICTATION_PREPARING);
   renderDictation();
-  try {
-    recognition.start();
-  } catch {
-    dictationTrace(session, "error", { code: "start-threw" });
-    session.error = "start";
-    finishDictation(session);
+  if (!begin()) {
     return false;
   }
   return true;
@@ -3807,6 +3851,7 @@ function finishDictation(session) {
   state.dictation = null;
   clearInterval(session.timer);
   clearTimeout(session.stopTimer);
+  clearTimeout(session.waitTimer);
   const outcome = dictationOutcome(session);
   session.report(outcome);
   renderDictation();
@@ -3817,6 +3862,8 @@ function finishDictation(session) {
 function stopDictation({ abort = false, field = null, message = "" } = {}) {
   const session = state.dictation;
   if (!session || (field && session.field !== field)) return;
+  // Still waiting to start: nothing to finish, it just does not start.
+  if (session.waiting) abort = true;
   if (!abort && session.stopping) return;
   dictationTrace(session, "stop", { abort, why: dictationReportCode(message) });
   if (!abort && !session.stopping) {
@@ -3838,6 +3885,7 @@ function stopDictation({ abort = false, field = null, message = "" } = {}) {
   state.dictation = null;
   clearInterval(session.timer);
   clearTimeout(session.stopTimer);
+  clearTimeout(session.waitTimer);
   try {
     session.recognition.abort();
   } catch {
@@ -3877,7 +3925,7 @@ function rebaseDictation(session) {
 }
 function draftDictationNote(text) {
   const note = $("draft-note");
-  if (text || [DICTATION_PREPARING, DICTATION_LISTENING, DICTATION_ENDING].includes(note.textContent)) note.textContent = text;
+  if (text || dictationTransient(note.textContent)) note.textContent = text;
 }
 function toggleDraftDictation() {
   const field = $("terminal-draft");

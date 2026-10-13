@@ -3548,18 +3548,53 @@ function renderDictation() {
     setClass(node, "is-listening", listening);
   }
 }
+// The mic's trace: what the device's recognition did and what the board made of it, sent to
+// the board a moment after each listening (event names, timings, counts, lengths and codes;
+// never what was said). It tells a platform that hears nothing from words the board set aside.
+const DICTATION_TRACE_EVENTS = 300;
+const DICTATION_TRACE_DELAY_MS = 2500;
+function dictationTrace(session, e, fields = {}) {
+  const trace = session?.trace;
+  if (!trace || trace.events.length >= DICTATION_TRACE_EVENTS) return;
+  trace.events.push({ t: Date.now() - trace.t0, e, ...fields });
+}
+// The status line's words as a code: which of them the user saw.
+function dictationReportCode(text) {
+  if (!text) return "";
+  const known = [[DICTATION_PREPARING, "preparing"], [DICTATION_LISTENING, "listening"], [DICTATION_ENDING, "ending"],
+    [DICTATION_STALLED, "stalled"], [DICTATION_NOT_STARTED, "not-started"], [DICTATION_SILENCE_END, "silence"],
+    [DICTATION_CHANGED, "changed"]];
+  for (const [message, code] of known) if (text === message) return code;
+  const detail = /\(([a-z-]+)\)$/.exec(text)?.[1] || "";
+  if (text.startsWith(DICTATION_ENDED_AT_ONCE)) return `ended-at-once:${detail}`;
+  if (text.startsWith(DICTATION_INTERRUPTED)) return `interrupted:${detail}`;
+  return detail ? `error:${detail}` : "other";
+}
+function sendDictationTrace(session, outcome) {
+  const trace = session.trace;
+  if (!trace || trace.sent) return;
+  trace.sent = true;
+  // A recognition that still starts or answers after the end belongs to it too.
+  setTimeout(() => {
+    api("/api/diagnostics/dictation", { method: "POST",
+      body: { env: trace.env, outcome: dictationReportCode(outcome), events: trace.events } }).catch(() => {});
+  }, DICTATION_TRACE_DELAY_MS);
+}
 // report(text): the field's own status line ("" clears what this said); active(): whether
 // the field is still the one on screen.
 function startDictation(field, { report, active, releaseKeyboard = false }) {
   const Recognition = speechRecognitionClass();
   if (!Recognition || !field || field.disabled || field.readOnly) return false;
   stopDictation({ abort: true });
+  const focusedAtPress = document.activeElement === field;
   // Android keyboards (Samsung's among them) rewrite or commit again a focused field's text
   // they did not type, which reads as the user's own typing and ends the listening. There the
   // chat input's keyboard lets go while it listens; elsewhere it stays open. (The terminal's
   // input line keeps its focus: without it, keys would go straight to the CLI.) It lets go
   // before the field is read: letting go may write the words it held once more.
-  if (releaseKeyboard && touchDevice() && dictationCumulative() && document.activeElement === field) field.blur?.();
+  const letGo = releaseKeyboard && touchDevice() && dictationCumulative() && focusedAtPress;
+  const valueAtPress = String(field.value || "").length;
+  if (letGo) field.blur?.();
   let recognition;
   try {
     recognition = new Recognition();
@@ -3576,11 +3611,21 @@ function startDictation(field, { report, active, releaseKeyboard = false }) {
   const end = Number.isInteger(field.selectionEnd) ? Math.min(Math.max(start, field.selectionEnd), value.length) : start;
   const session = { field, recognition, report, active, prefix: value.slice(0, start), suffix: value.slice(end),
     written: value, wrote: false, results: [], finals: [], finalText: "", restarts: 0, heard: false, started: false, silent: false, error: "", applying: false, stopping: false,
-    ticks: 0, idle: 0, timer: null, stopTimer: null };
+    ticks: 0, idle: 0, timer: null, stopTimer: null,
+    trace: { t0: Date.now(), sent: false, events: [], env: {
+      api: globalThis.SpeechRecognition ? "standard" : "webkit", field: String(field.id || ""),
+      standalone: !!window.matchMedia?.("(display-mode: standalone)")?.matches, touch: touchDevice(),
+      cumulative: dictationCumulative(), visibility: String(document.visibilityState || ""),
+      focused: focusedAtPress, letGo, pressValue: valueAtPress, value: value.length, start, end } } };
+  session.report = (text) => {
+    dictationTrace(session, "say", { why: dictationReportCode(text) });
+    report(text);
+  };
   // A recognition whose listening already ended (aborted before the platform started it) does
   // not keep the microphone: its first sign of life stops it.
   const orphaned = () => {
     if (state.dictation === session) return false;
+    dictationTrace(session, "orphan");
     try {
       recognition.abort();
     } catch {
@@ -3594,16 +3639,27 @@ function startDictation(field, { report, active, releaseKeyboard = false }) {
     session.idle = 0;
     session.report(DICTATION_LISTENING);
   };
-  recognition.onstart = listening;
-  recognition.onaudiostart = listening;
+  for (const name of ["start", "audiostart"]) {
+    recognition["on" + name] = () => {
+      dictationTrace(session, name, { cur: state.dictation === session });
+      listening();
+    };
+  }
+  for (const name of ["soundstart", "speechstart", "speechend", "soundend", "audioend", "nomatch"])
+    recognition["on" + name] = () => dictationTrace(session, name, { cur: state.dictation === session });
   recognition.onresult = (event) => {
+    const heard = Array.from(event?.results || []);
+    dictationTrace(session, "result", { cur: state.dictation === session, n: heard.length, idx: event?.resultIndex ?? null,
+      fin: heard.filter((result) => result?.isFinal).length, last: !!heard.at(-1)?.isFinal, len: dictationText(heard).length });
     if (orphaned()) return;
     // Off screen, or the text changed by other means (a paste, a restored message): those win.
     if (!session.active()) {
+      dictationTrace(session, "inactive", { chat: chatVisible(), hidden: !!document.hidden });
       stopDictation({ abort: true });
       return;
     }
     if (field.value !== session.written && !rebaseDictation(session)) {
+      dictationTrace(session, "changed", { value: String(field.value || "").length, written: session.written.length });
       stopDictation({ abort: true, message: DICTATION_CHANGED });
       return;
     }
@@ -3633,9 +3689,11 @@ function startDictation(field, { report, active, releaseKeyboard = false }) {
     applyDictation(session);
   };
   recognition.onerror = (event) => {
+    dictationTrace(session, "error", { code: String(event?.error || "unknown").slice(0, 40), cur: state.dictation === session });
     if (state.dictation === session) session.error = String(event?.error || "unknown");
   };
   recognition.onend = () => {
+    dictationTrace(session, "end", { cur: state.dictation === session, heard: session.heard, idle: session.idle });
     if (state.dictation === session && dictationResumable(session)) {
       // What it wrote stays; the next round's words follow it.
       const text = dictationText(session.results);
@@ -3643,9 +3701,11 @@ function startDictation(field, { report, active, releaseKeyboard = false }) {
       Object.assign(session, { results: [], finals: [], finalText: "", error: "", restarts: session.restarts + 1 });
       try {
         recognition.start();
+        dictationTrace(session, "restart", { ok: true, round: session.restarts });
         return;
       } catch {
         // Not startable again: it ends as before.
+        dictationTrace(session, "restart", { ok: false, round: session.restarts });
       }
     }
     finishDictation(session);
@@ -3671,11 +3731,13 @@ function startDictation(field, { report, active, releaseKeyboard = false }) {
       stopDictation();
     }
   }, 1000);
-  report(DICTATION_PREPARING);
+  dictationTrace(session, "press");
+  session.report(DICTATION_PREPARING);
   renderDictation();
   try {
     recognition.start();
   } catch {
+    dictationTrace(session, "error", { code: "start-threw" });
     session.error = "start";
     finishDictation(session);
     return false;
@@ -3691,6 +3753,7 @@ function applyDictation(session) {
   field.value = before + trail + session.suffix;
   session.written = field.value;
   if (text) session.wrote = true;
+  dictationTrace(session, "apply", { len: text.length, value: field.value.length, focused: document.activeElement === field });
   if (document.activeElement === field) field.setSelectionRange?.(before.length, before.length);
   // The field's own input handling (draft saving, sizing) runs as for typing.
   session.applying = true;
@@ -3725,8 +3788,10 @@ function finishDictation(session) {
   state.dictation = null;
   clearInterval(session.timer);
   clearTimeout(session.stopTimer);
-  session.report(dictationOutcome(session));
+  const outcome = dictationOutcome(session);
+  session.report(outcome);
   renderDictation();
+  sendDictationTrace(session, outcome);
 }
 // stop: the last words still arrive (onend finishes); pressed again while it ends, or not
 // ended in time (the recognition stopped answering), it is aborted. abort: nothing more lands.
@@ -3734,6 +3799,7 @@ function stopDictation({ abort = false, field = null, message = "" } = {}) {
   const session = state.dictation;
   if (!session || (field && session.field !== field)) return;
   if (!abort && session.stopping) return;
+  dictationTrace(session, "stop", { abort, why: dictationReportCode(message) });
   if (!abort && !session.stopping) {
     session.stopping = true;
     // Its last words may still come; a press now would not be taken.
@@ -3760,13 +3826,23 @@ function stopDictation({ abort = false, field = null, message = "" } = {}) {
   }
   session.report(message);
   renderDictation();
+  sendDictationTrace(session, message);
 }
 // The text changed by the user (typed, or an input method's word): their words win. An
 // input method only re-marking the words that landed changes nothing and stops nothing.
-function dictationTyped(field) {
+function dictationTyped(field, event = null) {
   const session = state.dictation;
-  if (session?.field === field && !session.applying && field.value !== session.written && !rebaseDictation(session))
-    stopDictation({ abort: true });
+  if (session?.field !== field || session.applying) return;
+  dictationTrace(session, "input", { type: String(event?.inputType || "").slice(0, 40), comp: !!event?.isComposing,
+    value: String(field.value || "").length, written: session.written.length, focused: document.activeElement === field,
+    wrote: session.wrote });
+  if (field.value === session.written) return;
+  if (rebaseDictation(session)) dictationTrace(session, "rebase");
+  else stopDictation({ abort: true });
+}
+// The field's own focus and input-method events while it listens, for the trace.
+function dictationFieldEvent(field, e) {
+  if (state.dictation?.field === field) dictationTrace(state.dictation, e, { value: String(field.value || "").length });
 }
 // Before any words landed, a change while the field has no focus is the keyboard letting go
 // (committing or writing again the words it held, a moment later on Android): the field's
@@ -3855,8 +3931,8 @@ function buildChatComposer(s) {
   input.placeholder = chatPlaceholder(false);
   input.setAttribute("aria-label", "메시지");
   input.value = entry.text;
-  input.addEventListener("input", () => {
-    dictationTyped(input);
+  input.addEventListener("input", (event) => {
+    dictationTyped(input, event);
     if (!editorCurrent()) return;
     if (input.value) warmChat(entry);
     entry.inputCollapsed = false;
@@ -3874,18 +3950,22 @@ function buildChatComposer(s) {
   // A tablet folds them only once its on-screen keyboard takes the space
   // (syncChromeMode on the viewport's resize); a hardware keyboard never does.
   input.addEventListener("focus", () => {
+    dictationFieldEvent(input, "focus");
     setTyping(compactChrome());
   });
   input.addEventListener("blur", () => {
+    dictationFieldEvent(input, "blur");
     setTyping(false);
     if (!state.chromeVisible) setReading(true, { stickBottom: messagesAtEnd($("messages")) });
   });
   input.addEventListener("compositionstart", () => {
+    dictationFieldEvent(input, "compstart");
     if (!editorCurrent()) return;
     entry.composing = true;
     updateChatComposer(entry);
   });
   input.addEventListener("compositionend", () => {
+    dictationFieldEvent(input, "compend");
     if (!editorCurrent()) return;
     entry.composing = false;
     entry.compositionEndedAt = Date.now();
@@ -6690,7 +6770,7 @@ function prepareDraftPaste(event) {
 }
 function bindDraftInput(node) {
   node.addEventListener("input", (event) => {
-    dictationTyped(node);
+    dictationTyped(node, event);
     inputDraft(event);
     resizeDraft();
   });

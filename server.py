@@ -1367,6 +1367,60 @@ class Board:
         return {**result, "fetchedAt": int(fetched), "stale": False}
 
 
+class DictationTraces:
+    """The board's mic as the device that used it saw it: one JSON line per listening with
+    event names, timings, counts, lengths and codes, never what was said (strings are short
+    ASCII codes only). Kept to about 1 MB plus the previous file, owner-only."""
+    LIMIT = 1_000_000
+    EVENTS = 400
+    CODE = re.compile(r"[A-Za-z0-9_.:+-]{0,48}")
+
+    def __init__(self, state_dir):
+        self.path = Path(state_dir).expanduser().absolute() / "dictation-trace.jsonl"
+        self.lock = threading.Lock()
+
+    @classmethod
+    def scalar(cls, value):
+        if value is None or isinstance(value, bool):
+            return value
+        if isinstance(value, int) and -10**9 <= value <= 10**9:
+            return value
+        if isinstance(value, str) and cls.CODE.fullmatch(value):
+            return value
+        raise ValueError("음성 입력 기록 형식이 올바르지 않습니다.")
+
+    @classmethod
+    def fields(cls, value, limit=24):
+        if not isinstance(value, dict) or len(value) > limit:
+            raise ValueError("음성 입력 기록 형식이 올바르지 않습니다.")
+        clean = {}
+        for key, item in value.items():
+            if not isinstance(key, str) or not re.fullmatch(r"[A-Za-z]{1,16}", key):
+                raise ValueError("음성 입력 기록 형식이 올바르지 않습니다.")
+            clean[key] = cls.scalar(item)
+        return clean
+
+    def record(self, data, agent=""):
+        if not isinstance(data, dict) or not set(data) <= {"env", "events", "outcome"} or \
+                not isinstance(data.get("events"), list) or len(data["events"]) > self.EVENTS:
+            raise ValueError("음성 입력 기록 형식이 올바르지 않습니다.")
+        line = {"at": int(time.time()), "agent": re.sub(r"[^\x20-\x7e]", "", str(agent or ""))[:240],
+                "env": self.fields(data.get("env") or {}), "outcome": self.scalar(data.get("outcome")),
+                "events": [self.fields(event, 12) for event in data["events"]]}
+        text = json.dumps(line, ensure_ascii=True, separators=(",", ":")) + "\n"
+        with self.lock:
+            directory = self.path.parent
+            if directory.is_symlink() or self.path.is_symlink():
+                raise ValueError("상태 경로는 심볼릭 링크를 사용할 수 없습니다.")
+            directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+            if self.path.exists() and self.path.stat().st_size + len(text) > self.LIMIT:
+                os.replace(self.path, self.path.with_name(self.path.name + ".1"))
+            fd = os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+            with os.fdopen(fd, "a", encoding="ascii") as stream:
+                stream.write(text)
+        return {"ok": True}
+
+
 def private_json(path, value):
     path = Path(path)
     if path.parent.is_symlink() or path.is_symlink():
@@ -2914,6 +2968,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_json(200, self.session_remove(data))
             if path == "/api/session/opened":
                 return self.send_json(200, self.session_opened(data))
+            if path == "/api/diagnostics/dictation":
+                return self.send_json(200, self.server.dictation_traces.record(data, self.headers.get("User-Agent", "")))
             if path == "/api/goals":
                 return self.send_json(201, self.server.goals.save(data))
             goal_match = re.fullmatch(r"/api/goals/([a-f0-9]{32})", path)
@@ -3104,6 +3160,7 @@ def make_server(bind, port, board, token, terminals=None, workflow=None, state_d
     server.session_tidied = SessionTidied(state_dir)
     server.session_removed = SessionRemoved(state_dir)
     server.session_opened = SessionOpened(state_dir)
+    server.dictation_traces = DictationTraces(state_dir)
     server.cookie_name = COOKIE + "_" + str(server.server_address[1])
     server.once, server.once_lock = ("", 0), threading.Lock()
     server.sessions, server.auth_lock = {}, threading.Lock()

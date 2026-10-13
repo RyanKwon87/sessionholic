@@ -323,6 +323,33 @@ class SessionLabelsHTTPTest(unittest.TestCase):
             self.assertEqual(self.request('POST', '/api/session/remove', payload)[0].status, 400)
         self.assertEqual(self.request('POST', '/api/session/remove', {'source': self.source, 'removed': True}, csrf=False)[0].status, 403)
 
+    def test_a_mic_trace_is_kept_as_codes_only_owner_only_and_bounded(self):
+        trace = {'env': {'api': 'webkit', 'field': 'chat-input', 'touch': True, 'value': 3},
+                 'outcome': 'error:no-speech',
+                 'events': [{'t': 0, 'e': 'press'}, {'t': 120, 'e': 'result', 'n': 1, 'len': 5, 'last': False},
+                            {'t': 130, 'e': 'input', 'type': 'insertCompositionText', 'comp': True, 'idx': None}]}
+        response, result = self.request('POST', '/api/diagnostics/dictation', trace, extra={'User-Agent': 'Mozilla/5.0 (Linux; Android 15) \u00e9'})
+        self.assertEqual((response.status, result), (200, {'ok': True}))
+        path = Path(self.temp.name) / 'dictation-trace.jsonl'
+        self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+        line = json.loads(path.read_text().splitlines()[-1])
+        self.assertEqual(line['events'], trace['events'])
+        self.assertEqual(line['env'], trace['env'])
+        self.assertEqual(line['agent'], 'Mozilla/5.0 (Linux; Android 15) ')
+        # Words never pass: strings are short ASCII codes only; shapes and sizes are fixed.
+        for bad in ({**trace, 'events': [{'t': 1, 'e': 'result', 'text': '안녕하세요'}]},
+                    {**trace, 'outcome': 'said hello'}, {**trace, 'words': 'x'},
+                    {**trace, 'events': [{'t': 1, 'e': 'x', 'nested': {'a': 1}}]},
+                    {**trace, 'events': [{'t': 1, 'e': 'x'}] * 401}, {**trace, 'env': {'not a key': 1}}):
+            self.assertEqual(self.request('POST', '/api/diagnostics/dictation', bad)[0].status, 400)
+        self.assertEqual(self.request('POST', '/api/diagnostics/dictation', trace, csrf=False)[0].status, 403)
+        # About 1 MB, then the previous file takes the old lines.
+        with patch.object(server.DictationTraces, 'LIMIT', 600):
+            for _ in range(3):
+                self.request('POST', '/api/diagnostics/dictation', trace)
+        self.assertTrue((Path(self.temp.name) / 'dictation-trace.jsonl.1').exists())
+        self.assertLessEqual(path.stat().st_size, 600)
+
     def test_opening_a_listed_session_is_kept_with_its_time(self):
         response, result = self.request('POST', '/api/session/opened', {'source': self.source})
         self.assertEqual(response.status, 200)

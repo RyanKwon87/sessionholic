@@ -9023,7 +9023,7 @@ function dictationClient() {
   const settle = () => new Promise((resolve) => setImmediate(resolve));
   const tick = (times = 1) => { for (let i = 0; i < times; i++) for (const callback of [...intervals.values()]) callback(); };
   const stopTimer = () => timeouts.filter((timer) => timer.ms === 8000).at(-1);
-  return { c, calls, intervals, tick, recognitions, FakeRecognition, result, settle, stopTimer };
+  return { c, calls, intervals, tick, recognitions, FakeRecognition, result, settle, stopTimer, timeouts };
 }
 
 test('a browser without speech recognition shows no mic', () => {
@@ -9944,4 +9944,44 @@ test('a recognition left behind by an ended listening is stopped when it starts 
   old.onresult(result('늦은 말'));
   assert.equal(old.aborted, aborted + 2);
   assert.equal(input.value, '');
+});
+
+test('a listening is traced to the board after it ends, with codes and lengths but never the words', async () => {
+  const { c, recognitions, FakeRecognition, result, settle, timeouts } = dictationClient();
+  const posts = [];
+  c.context.fetch = async (url, opts) => {
+    if (String(url).includes('/api/diagnostics/dictation')) posts.push(JSON.parse(opts.body));
+    return { ok: true, status: 200, json: async () => ({ ok: true }) };
+  };
+  c.context.webkitSpeechRecognition = FakeRecognition;
+  const { s } = selectChat(c);
+  const composer = c.buildChatComposer(s);
+  const input = findId(composer, 'chat-input');
+  findId(composer, 'chat-mic').events.click();
+  const [rec] = recognitions;
+  rec.onstart(); rec.onaudiostart(); rec.onspeechstart();
+  rec.onresult(result('안녕하세요'));
+  input.events.input({ inputType: 'insertCompositionText', isComposing: true });
+  await settle();
+  assert.equal(posts.length, 0, 'not while it listens');
+  findId(composer, 'chat-mic').events.click();
+  await settle();
+  // A moment after the end, so a recognition that still answers is in it too.
+  const send = timeouts.filter((timer) => timer.ms === 2500).at(-1);
+  assert.ok(send);
+  send.callback();
+  await settle();
+  assert.equal(posts.length, 1);
+  const [trace] = posts;
+  assert.deepEqual(trace.events.map((event) => event.e), ['press', 'say', 'start', 'say', 'audiostart', 'speechstart',
+    'result', 'apply', 'input', 'stop', 'say', 'end', 'say']);
+  assert.deepEqual(trace.events.filter((event) => event.e === 'say').map((event) => event.why), ['preparing', 'listening', 'ending', '']);
+  assert.equal(trace.outcome, '');
+  const typed = trace.events.find((event) => event.e === 'input');
+  assert.deepEqual([typed.type, typed.comp, typed.value], ['insertCompositionText', true, 5]);
+  assert.equal(trace.env.field, 'chat-input');
+  assert.equal(trace.env.api, 'webkit');
+  const result0 = trace.events.find((event) => event.e === 'result');
+  assert.deepEqual([result0.n, result0.len, result0.cur], [1, 5, true]);
+  assert.doesNotMatch(JSON.stringify(trace), /[가-힣]/, 'no words, only lengths and codes');
 });

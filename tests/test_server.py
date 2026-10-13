@@ -245,8 +245,9 @@ class ServerTest(unittest.TestCase):
             self.assertEqual(int(res.getheader("Content-Length")), len(data))
             body = json.loads(gzip.decompress(data))
             self.assertEqual((body["sessionSeen"]["ok"], type(body["sessionSeen"]["since"])), (True, int))
+            self.assertEqual((body["sessionTidied"]["ok"], type(body["sessionTidied"]["since"])), (True, int))
             served = {**large, "sessionLabels": {"ok": True, "revision": 0}, "sessionSeen": body["sessionSeen"],
-                      "bootId": self.httpd.boot_id}
+                      "sessionTidied": body["sessionTidied"], "bootId": self.httpd.boot_id}
             self.assertEqual(body, served)
             for header in ({}, {"Accept-Encoding": "gzip;q=0"}, {"Accept-Encoding": "identity"}):
                 res, data = self.request("GET", "/api/snapshot", headers={"Authorization": "Bearer " + TOKEN, **header})

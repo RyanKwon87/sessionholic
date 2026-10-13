@@ -148,15 +148,17 @@ class SessionSeen(Goals):
     """The private-file, flock and atomic-write contract of the goal store, for one small
     file. `since` is when this board started keeping it: a session that last changed
     before then is not called unread (its first deploy lights nothing up)."""
+    NAME, ROW_FIELD, SNAPSHOT_FIELD, CODE = 'session-seen', 'seenAt', 'sessionSeen', 'session_seen'
+    WHAT = '읽음 기록'
+
     def __init__(self, state_dir, clock=time.time):
         super().__init__(state_dir)
-        self.path = self.directory / 'session-seen.json'
-        self.lock_path = self.directory / 'session-seen.lock'
+        self.path = self.directory / (self.NAME + '.json')
+        self.lock_path = self.directory / (self.NAME + '.lock')
         self.clock = clock
 
-    @staticmethod
-    def _unavailable():
-        return GoalError('읽음 기록을 안전하게 읽거나 저장하지 못했습니다.', 'session_seen_unavailable', 503)
+    def _unavailable(self):
+        return GoalError(self.WHAT + '을 안전하게 읽거나 저장하지 못했습니다.', self.CODE + '_unavailable', 503)
 
     def _read(self):
         settings.safe_path(self.path, private=True, allow_missing=True)
@@ -188,7 +190,7 @@ class SessionSeen(Goals):
         """The session was looked at as of its update time `at` (never moves back).
         Returns ({'seenAt'}, whether anything was written)."""
         if type(at) is not int or at < 0:
-            raise GoalError('읽은 시점이 올바르지 않습니다.', 'invalid_session_seen')
+            raise GoalError('기록할 시점이 올바르지 않습니다.', 'invalid_' + self.CODE)
         identity = _identity(source)
         key = _key(identity)
         with self._storage(write=True):
@@ -203,6 +205,17 @@ class SessionSeen(Goals):
                     del data['seen'][stale]
             self._write(data)
             return {'seenAt': at}, True
+
+    def unmark(self, source):
+        """Forget the session's mark. Returns whether anything was written."""
+        key = _key(_identity(source))
+        with self._storage(write=True):
+            data = self._read()
+            if not data or key not in data['seen']:
+                return False
+            del data['seen'][key]
+            self._write(data)
+            return True
 
     def decorate(self, snapshot):
         """Each row's `seenAt` (None when never looked at here) and the board's `since`."""
@@ -221,15 +234,23 @@ class SessionSeen(Goals):
         except GoalError as exc:
             if not getattr(self, 'warned', False):
                 self.warned = True
-                sys.stderr.write('읽음 기록을 읽지 못했습니다 (%s). 읽음 표시를 끈 채로 둡니다.\n' % exc.payload.get('code'))
-            return {**snapshot, 'sessionSeen': {'ok': False, **exc.payload}}
+                sys.stderr.write('%s을 읽지 못했습니다 (%s). 이 표시를 끈 채로 둡니다.\n' % (self.WHAT, exc.payload.get('code')))
+            return {**snapshot, self.SNAPSHOT_FIELD: {'ok': False, **exc.payload}}
         for host in snapshot.get('hosts', []):
             for agent in ('codex', 'claude'):
                 for row in (host.get('data') or {}).get(agent, []):
                     try:
                         source = {**row, 'host': host['name'], 'agent': agent}
                         found = data['seen'].get(_key(_identity(source)))
-                        row['seenAt'] = found['at'] if found else None
+                        row[self.ROW_FIELD] = found['at'] if found else None
                     except (GoalError, ValueError):
                         continue
-        return {**snapshot, 'sessionSeen': {'ok': True, 'since': data['since']}}
+        return {**snapshot, self.SNAPSHOT_FIELD: {'ok': True, 'since': data['since']}}
+
+
+class SessionTidied(SessionSeen):
+    """When a session was put away from the list: ended from the board, or 목록에서 정리.
+    The list counts it as old until it changes again (the screen allows the shutdown's own
+    writes a short grace). Display only: the native session and its history stay as they are."""
+    NAME, ROW_FIELD, SNAPSHOT_FIELD, CODE = 'session-tidied', 'tidiedAt', 'sessionTidied', 'session_tidied'
+    WHAT = '목록 정리 기록'

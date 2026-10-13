@@ -43,6 +43,12 @@ const GROUPS = [
   { key: "rest", label: "이전", tone: "gray" },
 ];
 const FINISHED_SECONDS = 3 * 3600;
+// A session put away from the list (ended from the board, or 목록에서 정리) stays away until it
+// changes again; changes within this long after are the shutdown's own writes.
+const TIDY_GRACE_SECONDS = 120;
+function sessionTidied(s) {
+  return Number.isInteger(s?.tidiedAt) && (Number(s.updatedAt) || 0) <= s.tidiedAt + TIDY_GRACE_SECONDS;
+}
 const BADGES = {
   needs_input: ["답 필요", "red"],
   working: ["작업 중", "amber"],
@@ -724,7 +730,7 @@ function beginAuthEpoch() {
 // never is: it waits for a new press (sendChat).
 const CSRF_RETRY = new Set(["/api/chat/state", "/api/chat/prompt", "/api/plan", "/api/launch",
   "/api/new-session", "/api/app-server", "/api/refresh", "/api/usage/refresh", "/api/hardware/refresh",
-  "/api/push/subscribe", "/api/push/unsubscribe", "/api/session/seen"]);
+  "/api/push/subscribe", "/api/push/unsubscribe", "/api/session/seen", "/api/session/tidy"]);
 // A terminal's size and scrolling; its keys never (sendInput reads the token instead).
 const CSRF_RETRY_TERMINAL = /^\/api\/terminal\/[a-f0-9]{32}\/(resize|scroll|scroll-end)$/;
 function csrfRetryable(path) {
@@ -914,6 +920,7 @@ function selectedSession() {
 function groupOf(s, now = state.snapshot?.serverTime || Date.now() / 1000) {
   if (s.phase === "needs_input") return "needs_input";
   if (s.phase === "working") return "working";
+  if (sessionTidied(s)) return "rest";
   if (["idle", "done", "closed"].includes(s.phase) && now - (s.updatedAt || 0) <= FINISHED_SECONDS) return "finished";
   return "rest";
 }
@@ -935,7 +942,7 @@ function matches(s, now, { phase = true, category = true, initiator = true } = {
   if (
     !state.showOld &&
     groupOf(s, now) === "rest" &&
-    now - (s.updatedAt || 0) > RECENT_SECONDS
+    (now - (s.updatedAt || 0) > RECENT_SECONDS || (sessionTidied(s) && !state.search))
   )
     return false;
   if (!state.search) return true;
@@ -1528,7 +1535,7 @@ function prepareSessionListFor(session) {
   }
   if (state.phaseFilter && groupOf(session) !== state.phaseFilter) { state.phaseFilter = ""; changed = true; }
   const now = state.snapshot?.serverTime || Date.now() / 1000;
-  if (!state.showOld && groupOf(session) === "rest" && now - (session.updatedAt || 0) > RECENT_SECONDS) {
+  if (!state.showOld && groupOf(session) === "rest" && (now - (session.updatedAt || 0) > RECENT_SECONDS || sessionTidied(session))) {
     state.showOld = true; $("show-old").checked = true; changed = true;
   }
   if (state.search && !matches(session, now)) {
@@ -2343,6 +2350,10 @@ async function manageSession(s, trigger = null) {
   const archive = button("작업 보관", "secondary", () => archiveSessionWork(context, true));
   archive.id = "session-control-archive";
   actions.append(archive, el("p", "muted", "이 세션의 작업 카드를 보관합니다. 실행은 계속됩니다."));
+  const tidied = sessionTidied(s);
+  const tidy = button(tidied ? "목록에 다시 표시" : "목록에서 정리", "secondary", () => tidySession(context, !tidied));
+  tidy.id = "session-control-tidy";
+  actions.append(tidy, el("p", "muted", "실행과 대화 기록은 그대로 두고, 다시 갱신될 때까지 기본 목록에서 내립니다. 검색이나 '오래된 기록 포함'으로 볼 수 있습니다."));
   body.append(actions);
   const confirmation = el("div", "session-control-confirmation"); confirmation.id = "session-control-confirmation"; confirmation.hidden = true;
   body.append(confirmation); dialog.append(top, body);
@@ -2416,6 +2427,25 @@ async function archiveSessionWork(context, archived) {
     const replacement = button(archived ? "보관 되돌리기" : "작업 보관", "secondary", () => archiveSessionWork(context, !archived));
     replacement.id = archive.id; archive.replaceWith(replacement);
     await window.SessionholicGoals?.refresh?.();
+  } catch (err) {
+    if (sessionControl === context && !err.staleAuth && !err.unauthorized) $("session-control-status").textContent = err.message;
+  } finally { if (sessionControl === context) sessionControlBusy(context, false); }
+}
+
+// 목록에서 정리 / 목록에 다시 표시: the board's own record (session-tidied); the run is untouched.
+async function tidySession(context, tidied) {
+  if (sessionControl !== context || context.busy) return;
+  sessionControlBusy(context, true);
+  try {
+    await api("/api/session/tidy", { method: "POST", body: { source: seenSource(context.s), tidied }, authEpoch: context.authEpoch });
+    if (sessionControl !== context) return;
+    $("session-control-status").textContent = tidied
+      ? "목록에서 정리했습니다. 다시 갱신되면 목록에 돌아옵니다."
+      : "목록에 다시 표시합니다.";
+    const tidy = $("session-control-tidy");
+    const replacement = button(tidied ? "목록에 다시 표시" : "목록에서 정리", "secondary", () => tidySession(context, !tidied));
+    replacement.id = tidy.id; tidy.replaceWith(replacement);
+    poll(false);
   } catch (err) {
     if (sessionControl === context && !err.staleAuth && !err.unauthorized) $("session-control-status").textContent = err.message;
   } finally { if (sessionControl === context) sessionControlBusy(context, false); }

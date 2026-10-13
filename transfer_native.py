@@ -107,8 +107,52 @@ def _client(identity, home, deadline):
     return _DeadlineAppServer(_socket_path(identity, home), deadline)
 
 
+TURN_PAGE = 100
+TURN_PAGES = 200
+
+
+def _thread_turns(client, thread_id):
+    """`thread/read` result whose thread carries every turn, oldest first, with its status
+    and no items: what a transfer or a control decision compares. The whole-history read
+    loads every item of a rollout that hours of image work grow to hundreds of MB. None when
+    the daemon cannot page this thread (an older daemon, a legacy thread) or it has more
+    turns than the pages read, so the caller reads it whole."""
+    result = client.call("thread/read", {"threadId": thread_id, "includeTurns": False})
+    thread = result.get("thread") if isinstance(result, dict) else None
+    if not isinstance(thread, dict) or thread.get("id") != thread_id:
+        return result
+    turns, cursor, method = [], None, "thread/turns/list"
+    try:
+        for _ in range(TURN_PAGES):
+            params = {"threadId": thread_id, "limit": TURN_PAGE, "sortDirection": "desc", "itemsView": "notLoaded"}
+            if cursor:
+                params["cursor"] = cursor
+            page = client.call(method, params)
+            data = page.get("data") if isinstance(page, dict) else None
+            if not isinstance(data, list):
+                # Malformed: the caller's turn checks refuse it.
+                return {**result, "thread": {**thread, "turns": None}}
+            turns.extend(data)
+            cursor = page.get("nextCursor")
+            if not cursor:
+                break
+        else:
+            return None
+    except collector.RpcError as error:
+        if collector.paging_unsupported(error, method):
+            return None
+        raise
+    status = thread.get("status") if isinstance(thread.get("status"), dict) else {}
+    if status.get("type") != "active" and any(isinstance(turn, dict) and turn.get("status") == "inProgress" for turn in turns):
+        # A turn listed as running in a thread that is not: confirm from the whole history.
+        return None
+    return {**result, "thread": {**thread, "turns": list(reversed(turns))}}
+
+
 def _codex_state(client, identity):
-    result = client.call("thread/read", {"threadId": identity["id"], "includeTurns": True})
+    result = _thread_turns(client, identity["id"])
+    if result is None:
+        result = client.call("thread/read", {"threadId": identity["id"], "includeTurns": True})
     thread = result.get("thread") if isinstance(result, dict) else None
     if not isinstance(thread, dict) or thread.get("id") != identity["id"]:
         return _unknown(identity, "원본 Codex 세션을 정확히 확인하지 못했습니다.")

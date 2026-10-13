@@ -123,6 +123,13 @@ test('a pipe table draws as a table that scrolls on its own, and copies as it wa
   assert.equal(byTag(root, 'strong').length, 1); assert.equal(byTag(root, 'a').length, 1);
   assert.equal(visibleText(byTag(root, 'p')[0]), '비교 결과입니다.', 'the paragraph before it stays a paragraph');
   assert.equal(format.plainText(text), text, 'a table copies as the Markdown it was');
+  // A `<br>` in a cell breaks its line there; inside a code span it stays text.
+  const broken = '| 항목 | 설명 |\n|---|---|\n| 첫째<br>둘째<BR/>셋째 | `x<br>y` |';
+  format.render(root, broken);
+  const [first, second] = byTag(root, 'td');
+  assert.equal(byTag(first, 'br').length, 2); assert.equal(visibleText(first), '첫째\n둘째\n셋째');
+  assert.equal(byTag(second, 'br').length, 0); assert.equal(visibleText(second), 'x<br>y');
+  assert.equal(format.plainText(broken), broken);
   // Not a table: no delimiter row, a column count that differs, inside a code block.
   for (const plain of ['a | b\nc | d', '| a | b |\n| --- |\n| c | d |', '```\n| a | b |\n|---|---|\n```']) {
     format.render(root, plain);

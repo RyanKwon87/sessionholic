@@ -1,7 +1,7 @@
 "use strict";
 
 // Deliberately small Markdown subset (pipe tables, rules, task items, ~~strike~~ and bare or
-// <angle> web addresses included). HTML, images, reference links and multiline inline
+// <angle> web addresses included). HTML (except a `<br>` in a table cell), images, reference links and multiline inline
 // delimiters stay text. Unclosed fences stay readable as code.
 // Limits bound parsing and DOM work; fallback always retains the complete text.
 const MessageFormat = (() => {
@@ -294,6 +294,22 @@ const MessageFormat = (() => {
     out.push(cell.trim());
     return out;
   }
+  // A cell's lines: answers break a line inside a cell with `<br>`, which outside code
+  // spans is a line break, not text.
+  function cellLines(text, budget) {
+    const parts = []; let start = 0;
+    for (let index = 0; index < text.length; index++) {
+      if (text[index] === "`") {
+        let run = 1; while (text[index + run] === "`") run++;
+        const end = text.indexOf("`".repeat(run), index + run);
+        index = (end < 0 ? index : end) + run - 1; continue;
+      }
+      const br = text[index] === "<" ? text.slice(index, index + 6).match(/^<br ?\/?>/i) : null;
+      if (br) { parts.push(text.slice(start, index)); start = index + br[0].length; index = start - 1; }
+    }
+    parts.push(text.slice(start));
+    return parts.map((part) => inline(part.trim(), budget));
+  }
   function delimiterRow(line) {
     if (!line.includes("-") || !/^ {0,3}\|?[ \t]*:?-+:?[ \t]*(\|[ \t]*:?-+:?[ \t]*)*\|?[ \t]*$/.test(line)) return null;
     return cells(line).map((cell) => cell.startsWith(":") && cell.endsWith(":") ? "center"
@@ -418,9 +434,9 @@ const MessageFormat = (() => {
         while (index < lines.length && lines[index].text.includes("|") && !interrupts(lines[index].text)) {
           spend(budget, "work");
           const row = cells(lines[index].text);
-          rows.push(table.align.map((_, column) => inline(row[column] || "", budget))); index++;
+          rows.push(table.align.map((_, column) => cellLines(row[column] || "", budget))); index++;
         }
-        out.push(make(budget, "table", { align: table.align, head: table.head.map((cell) => inline(cell, budget)), rows,
+        out.push(make(budget, "table", { align: table.align, head: table.head.map((cell) => cellLines(cell, budget)), rows,
           text: lineText(lines.slice(start, index)) }));
         continue;
       }
@@ -546,7 +562,8 @@ const MessageFormat = (() => {
           const tr = element("tr");
           cellsOf.forEach((cell, column) => {
             const td = element(tag); if (value.align[column]) td.setAttribute("data-align", value.align[column]);
-            appendInline(td, cell); tr.append(td);
+            cell.forEach((line, index) => { if (index) td.append(element("br")); appendInline(td, line); });
+            tr.append(td);
           });
           return tr;
         };

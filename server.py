@@ -39,7 +39,7 @@ import instance
 import settings
 from goals import GoalError, Goals
 from work_service import WorkService
-from session_labels import SessionLabels, reference as label_reference
+from session_labels import SessionLabels, SessionSeen, reference as label_reference
 
 HERE = Path(__file__).resolve().parent
 WEB = HERE / "web"
@@ -2400,11 +2400,33 @@ class Handler(BaseHTTPRequestHandler):
             self.server.board.request_refresh(host["name"], force=False)
         return result
 
+    def session_seen(self, data):
+        """A listed session was looked at as of its update time: every device then shows it read."""
+        if not isinstance(data, dict) or set(data) != {'source', 'updatedAt'} or type(data['updatedAt']) is not int:
+            raise ValueError('읽은 세션과 시점을 확인해 주세요.')
+        source = self.listed_source(data['source'])
+        # Never ahead of what the board lists: a later change stays unread.
+        at = min(data['updatedAt'], int(source.get('updatedAt') or 0))
+        result, changed = self.server.session_seen.mark(source, at)
+        if changed:
+            self.server.board.changed(force=True)
+        return result
+
     def session_label(self, data):
         if set(data) != {'source', 'title'}:
             raise ValueError('세션과 보드 표시 제목을 확인해 주세요.')
-        if isinstance(data['source'], dict) and data['source'].get('agent') == 'codex' and not data['source'].get('home'):
+        source = self.listed_source(data['source'])
+        self.server.workflow.ensure_direct_session(source)
+        result = self.server.session_labels.set(source, data['title'])
+        self.server.board.changed(force=True)
+        return result
+
+    def listed_source(self, given):
+        """The one listed row a browser's session reference names (a Claude conversation by
+        its sessionId when it has no worker id), refusing a changed or ambiguous one."""
+        if isinstance(given, dict) and given.get('agent') == 'codex' and not given.get('home'):
             raise ValueError('Codex 세션의 계정 홈을 확인해 주세요.')
+        data = {'source': given}
         ref = label_reference(data['source'])
         board = self.server.board
         with board.lock:
@@ -2423,10 +2445,7 @@ class Handler(BaseHTTPRequestHandler):
             source = {**matches[0], **ref, 'hostLabel': host['label'], 'online': host['ok'], 'fetchedAt': host['fetchedAt']}
             if ref['agent'] == 'claude' and (data['source'].get('sessionId') or None) != (source.get('sessionId') or None):
                 raise ValueError('Claude 세션의 대화 식별자가 바뀌었습니다. 목록에서 다시 선택해 주세요.')
-        self.server.workflow.ensure_direct_session(source)
-        result = self.server.session_labels.set(source, data['title'])
-        board.changed(force=True)
-        return result
+        return source
 
     def do_HEAD(self):
         self.do_GET()
@@ -2534,6 +2553,7 @@ class Handler(BaseHTTPRequestHandler):
         # A "새 세션" terminal's session may have appeared in this snapshot.
         self.server.workflow.link_new_sessions()
         snapshot = self.server.session_labels.decorate(self.server.board.snapshot())
+        snapshot = self.server.session_seen.decorate(snapshot)
         return {**snapshot, "bootId": self.server.boot_id}
 
     def stream_events(self, query):
@@ -2685,6 +2705,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_json(200, self.session_control(path, data))
             if path == "/api/session/label":
                 return self.send_json(200, self.session_label(data))
+            if path == "/api/session/seen":
+                return self.send_json(200, self.session_seen(data))
             if path == "/api/goals":
                 return self.send_json(201, self.server.goals.save(data))
             goal_match = re.fullmatch(r"/api/goals/([a-f0-9]{32})", path)
@@ -2859,6 +2881,7 @@ def make_server(bind, port, board, token, terminals=None, workflow=None, state_d
     server.hardware = hardware
     server.goals = Goals(state_dir)
     server.session_labels = SessionLabels(state_dir)
+    server.session_seen = SessionSeen(state_dir)
     server.cookie_name = COOKIE + "_" + str(server.server_address[1])
     server.once, server.once_lock = ("", 0), threading.Lock()
     server.sessions, server.auth_lock = {}, threading.Lock()

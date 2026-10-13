@@ -1,9 +1,11 @@
-"""Private board display names. Native titles and session identities never change."""
+"""Private board display names and read marks. Native titles and session identities never change."""
 import copy
 import hashlib
 import json
 import os
 import re
+import sys
+import time
 import unicodedata
 
 from goals import GoalError, Goals, MAX_BYTES, _sessions
@@ -136,3 +138,98 @@ class SessionLabels(Goals):
                     except (GoalError, ValueError):
                         continue  # Unidentifiable rows stay visible, without an alias.
         return {**snapshot, 'sessionLabels': {'ok': True, 'revision': data['revision']}}
+
+
+# ---------- read marks ----------
+MAX_SEEN = 2000
+
+
+class SessionSeen(Goals):
+    """The private-file, flock and atomic-write contract of the goal store, for one small
+    file. `since` is when this board started keeping it: a session that last changed
+    before then is not called unread (its first deploy lights nothing up)."""
+    def __init__(self, state_dir, clock=time.time):
+        super().__init__(state_dir)
+        self.path = self.directory / 'session-seen.json'
+        self.lock_path = self.directory / 'session-seen.lock'
+        self.clock = clock
+
+    @staticmethod
+    def _unavailable():
+        return GoalError('읽음 기록을 안전하게 읽거나 저장하지 못했습니다.', 'session_seen_unavailable', 503)
+
+    def _read(self):
+        settings.safe_path(self.path, private=True, allow_missing=True)
+        try:
+            fd = os.open(str(self.path), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        except FileNotFoundError:
+            return None
+        try:
+            with os.fdopen(fd, 'rb') as stream:
+                if self._private_file(stream.fileno()).st_size > MAX_BYTES:
+                    raise ValueError('file size')
+                raw = stream.read(MAX_BYTES + 1)
+                if len(raw) > MAX_BYTES:
+                    raise ValueError('file size')
+            data = json.loads(raw)
+            if (not isinstance(data, dict) or set(data) != {'version', 'since', 'seen'}
+                    or data['version'] != 1 or type(data['since']) is not int
+                    or not isinstance(data['seen'], dict) or len(data['seen']) > MAX_SEEN):
+                raise ValueError('store')
+            for key, row in data['seen'].items():
+                if (not isinstance(row, dict) or set(row) != {'source', 'at'} or type(row['at']) is not int
+                        or _identity(row['source']) != row['source'] or _key(row['source']) != key):
+                    raise ValueError('row')
+            return data
+        except (GoalError, ValueError, TypeError, KeyError, UnicodeError, OverflowError, RecursionError):
+            raise self._unavailable() from None
+
+    def mark(self, source, at):
+        """The session was looked at as of its update time `at` (never moves back).
+        Returns ({'seenAt'}, whether anything was written)."""
+        if type(at) is not int or at < 0:
+            raise GoalError('읽은 시점이 올바르지 않습니다.', 'invalid_session_seen')
+        identity = _identity(source)
+        key = _key(identity)
+        with self._storage(write=True):
+            data = self._read() or {'version': 1, 'since': int(self.clock()), 'seen': {}}
+            row = data['seen'].get(key)
+            if row and row['at'] >= at:
+                return {'seenAt': row['at']}, False
+            data['seen'][key] = {'source': identity, 'at': at}
+            if len(data['seen']) > MAX_SEEN:
+                oldest = sorted(data['seen'], key=lambda item: data['seen'][item]['at'])
+                for stale in oldest[:len(data['seen']) - MAX_SEEN]:
+                    del data['seen'][stale]
+            self._write(data)
+            return {'seenAt': at}, True
+
+    def decorate(self, snapshot):
+        """Each row's `seenAt` (None when never looked at here) and the board's `since`."""
+        snapshot = copy.deepcopy(snapshot)
+        try:
+            with self._storage():
+                data = self._read()
+            if data is None:
+                # The first read starts the record: what changed before now counts as read.
+                with self._storage(write=True):
+                    data = self._read()
+                    if data is None:
+                        data = {'version': 1, 'since': int(self.clock()), 'seen': {}}
+                        self._write(data)
+            self.warned = False
+        except GoalError as exc:
+            if not getattr(self, 'warned', False):
+                self.warned = True
+                sys.stderr.write('읽음 기록을 읽지 못했습니다 (%s). 읽음 표시를 끈 채로 둡니다.\n' % exc.payload.get('code'))
+            return {**snapshot, 'sessionSeen': {'ok': False, **exc.payload}}
+        for host in snapshot.get('hosts', []):
+            for agent in ('codex', 'claude'):
+                for row in (host.get('data') or {}).get(agent, []):
+                    try:
+                        source = {**row, 'host': host['name'], 'agent': agent}
+                        found = data['seen'].get(_key(_identity(source)))
+                        row['seenAt'] = found['at'] if found else None
+                    except (GoalError, ValueError):
+                        continue
+        return {**snapshot, 'sessionSeen': {'ok': True, 'since': data['since']}}

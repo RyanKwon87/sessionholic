@@ -15,7 +15,7 @@ import uuid
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from goals import GoalError
-from session_labels import SessionLabels, reference
+from session_labels import SessionLabels, SessionSeen, reference
 import server
 
 
@@ -168,6 +168,57 @@ class SessionLabelsTest(unittest.TestCase):
         self.assertEqual(reference(source), {'host': 'example', 'agent': 'claude', 'home': '.claude', 'id': source['sessionId']})
 
 
+class SessionSeenTest(unittest.TestCase):
+    """When each session was last looked at: shared, never moving back, never lighting up
+    what existed before the board kept it."""
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.now = [5000]
+        self.seen = SessionSeen(Path(self.temp.name), clock=lambda: self.now[0])
+        self.source = {'host': 'example-mini', 'agent': 'codex', 'id': str(uuid.uuid4()), 'home': '.codex',
+                       'title': 'Native title', 'updatedAt': 4000}
+
+    def snapshot(self, *rows):
+        return {'version': 1, 'hosts': [{'name': 'example-mini', 'data': {'codex': [dict(row) for row in rows or [self.source]], 'claude': []}}]}
+
+    def test_the_first_read_starts_the_record_then_marks_are_shared_and_kept(self):
+        saved = Path(self.temp.name) / 'session-seen.json'
+        self.assertFalse(saved.exists())
+        before = self.seen.decorate(self.snapshot())
+        # Started by the first read (a fresh board lights nothing up, yet marks can begin).
+        self.assertEqual(before['sessionSeen'], {'ok': True, 'since': 5000})
+        self.assertIsNone(before['hosts'][0]['data']['codex'][0]['seenAt'])
+        self.assertTrue(saved.exists())
+        self.now[0] = 6000
+        self.assertEqual(self.seen.decorate(self.snapshot())['sessionSeen']['since'], 5000, 'kept, not restarted')
+        self.assertEqual(self.seen.mark(self.source, 4000), ({'seenAt': 4000}, True))
+        other = {**self.source, 'id': str(uuid.uuid4())}
+        after = self.seen.decorate(self.snapshot(self.source, other))
+        rows = after['hosts'][0]['data']['codex']
+        self.assertEqual([row['seenAt'] for row in rows], [4000, None])
+        # Never moves back (and writes nothing); a later look moves it on.
+        self.assertEqual(self.seen.mark(self.source, 3000), ({'seenAt': 4000}, False))
+        self.assertEqual(self.seen.mark(self.source, 4100), ({'seenAt': 4100}, True))
+        self.assertEqual(stat.S_IMODE(saved.stat().st_mode), 0o600)
+        self.assertEqual(json.loads(saved.read_text())['since'], 5000)
+        self.assertNotIn('Native title', saved.read_text(), 'no title is kept')
+
+    def test_a_damaged_store_leaves_the_list_as_it_is_and_refuses_a_mark(self):
+        self.seen.mark(self.source, 4000)
+        (Path(self.temp.name) / 'session-seen.json').write_text('{"version": 9}')
+        with patch('sys.stderr', new_callable=__import__('io').StringIO) as log:
+            decorated = self.seen.decorate(self.snapshot())
+            self.seen.decorate(self.snapshot())
+        self.assertEqual(log.getvalue().count('읽음 기록을 읽지 못했습니다'), 1, 'said once')
+        self.assertFalse(decorated['sessionSeen']['ok'])
+        self.assertNotIn('seenAt', decorated['hosts'][0]['data']['codex'][0])
+        with self.assertRaises(GoalError):
+            self.seen.mark(self.source, 4200)
+        with self.assertRaises(GoalError):
+            SessionSeen(Path(self.temp.name)).mark(self.source, -1)
+
+
 class SessionLabelsHTTPTest(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -207,6 +258,18 @@ class SessionLabelsHTTPTest(unittest.TestCase):
 
     def save(self, title='Board name', source=None, **options):
         return self.request('POST', '/api/session/label', {'source': source or self.source, 'title': title}, **options)
+
+    def test_a_listed_session_is_marked_read_no_later_than_the_board_lists_it(self):
+        self.native['updatedAt'] = 4000
+        response, result = self.request('POST', '/api/session/seen', {'source': self.source, 'updatedAt': 9999})
+        self.assertEqual((response.status, result), (200, {'seenAt': 4000}))
+        response, snapshot = self.request('GET', '/api/snapshot')
+        self.assertEqual(snapshot['hosts'][0]['data']['codex'][0]['seenAt'], 4000)
+        self.assertEqual(type(snapshot['sessionSeen']['since']), int)
+        for payload in ({'source': self.source}, {'source': self.source, 'updatedAt': '4000'},
+                        {'source': {**self.source, 'id': str(uuid.uuid4())}, 'updatedAt': 1}):
+            self.assertEqual(self.request('POST', '/api/session/seen', payload)[0].status, 400)
+        self.assertEqual(self.request('POST', '/api/session/seen', {'source': self.source, 'updatedAt': 1}, csrf=False)[0].status, 403)
 
     def test_auth_csrf_and_origin_are_required(self):
         self.assertEqual(self.save(auth=False)[0].status, 401)

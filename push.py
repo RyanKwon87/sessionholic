@@ -470,14 +470,18 @@ class PushService:
 
     def notify(self, events):
         """Queue every alert of one round, then wake each browser once: its service worker
-        reads them all, so a second push never finds an empty queue."""
+        reads them all, so a second push never finds an empty queue. Each round is logged."""
         with self.lock:
             targets = list(self.subscriptions)
         for event in events:
             self._queue(targets, self.notice(event))
         urgent = any(event["kind"] == "needs_input" for event in events)
-        for target in targets:
-            self._send(target, ttl=86400 if urgent else 3600, urgency="high" if urgent else "normal")
+        statuses = [self._send(target, ttl=86400 if urgent else 3600, urgency="high" if urgent else "normal")
+                    for target in targets] if events else []
+        delivered = sum(status in (200, 201, 202) for status in statuses)
+        sys.stderr.write("%s: 알림 %d건(답 필요 %d) · 기기 %d대 중 %d대 전달\n" % (
+            self.log_prefix, len(events), sum(event["kind"] == "needs_input" for event in events),
+            len(targets), delivered))
 
     def _queue(self, targets, notice):
         with self.lock:

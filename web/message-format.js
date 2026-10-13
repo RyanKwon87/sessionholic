@@ -46,15 +46,22 @@ const MessageFormat = (() => {
   // A bare web address ends at the first character an address cannot hold (a Korean particle
   // right after it stays text), then loses the punctuation that ends its sentence and a ")"
   // or "]" it did not open.
+  // Particles (and copulas) a sentence puts right after an address.
+  const PARTICLES = new Set(("을 를 이 가 은 는 의 에 에서 에게 께 한테 로 으로 와 과 도 만 까지 부터 처럼 보다 이나 나 " +
+    "이랑 랑 하고 에는 에도 에서는 에서도 으로는 로는 으로도 로도 이다 입니다 이에요 예요 이고 이며").split(" "));
   function bareAddress(text) {
     const head = text.slice(0, 2048);
     let url = head.match(/^https?:\/\/[A-Za-z0-9\-._~:/?#[\]@!$&'()*+,;=%]*/i)?.[0] || "";
-    // Letters of another script continue it only where a part begins (a host, a path segment
-    // or a query value: `/경로`, `?q=한글`); right after ASCII (`/12에서`) they are the
-    // sentence's particle. A part that begins with them keeps them all.
-    while (url.length < head.length && /[/=?&#]$/.test(url) && /[^\x00-\x7f]/.test(head[url.length])) {
-      const run = head.slice(url.length).match(/^[\p{L}\p{N}\p{M}]+/u)?.[0];
+    // Hangul continues it only where a part begins (a host, a path segment or a query value:
+    // `/경로`, `?q=한글`); right after ASCII (`/12에서`) it is the sentence's particle, and so
+    // is a particle alone after a part's start (`8447/에서 확인`). A part that begins with
+    // other Hangul keeps it all (`/경로에서` too: a particle there cannot be told apart).
+    while (url.length < head.length && /[/=?&#]$/.test(url)) {
+      const run = head.slice(url.length).match(/^\p{Script=Hangul}+/u)?.[0];
       if (!run) break;
+      const after = head[url.length + run.length] || "";
+      // A particle ends the address unless the address goes on after it (sentence marks do not).
+      if (PARTICLES.has(run) && !/[A-Za-z0-9\-_~/#[@$&(+=%]/.test(after)) break;
       url += run;
       url += head.slice(url.length).match(/^[A-Za-z0-9\-._~:/?#[\]@!$&'()*+,;=%]*/)[0];
     }

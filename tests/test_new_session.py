@@ -774,6 +774,10 @@ class BoardHoldTest(unittest.TestCase):
             '106 1 999999 3-00:00:00 %s app-server' % daemon,  # another user's
             '107 1 %s 3-00:00:00 %s exec run' % (uid, daemon),
             '108 1 %s 3-00:00:00 /usr/bin/python3 %s app-server' % (uid, daemon),
+            # Not a Codex home right inside a temporary folder a test made.
+            '109 1 %s 3-00:00:00 %s/tmpab12cd/work/.codex/packages/app-server-daemon/r/bin/codex app-server' % (uid, temp),
+            '110 1 %s 3-00:00:00 %s/cache/.codex/packages/app-server-daemon/r/bin/codex app-server' % (uid, temp),
+            '111 1 %s 3-00:00:00 %s/tmpab12cd/home/packages/app-server-daemon/r/bin/codex app-server' % (uid, temp),
             'garbage line'])
         ended = []
         folder = Path(tempfile.mkdtemp(dir='/tmp'))

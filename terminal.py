@@ -301,6 +301,8 @@ class TerminalManager:
             return None
         try:
             paths = [path for path in self.socket_dir.iterdir() if path.name != self.socket_name]
+        except FileNotFoundError:
+            return False  # No socket folder: no tmux server of this user runs.
         except OSError:
             return None
         for path in paths:
@@ -311,11 +313,16 @@ class TerminalManager:
                 if not socket_live(path):
                     continue
                 found = subprocess.run([self.tmux, "-L", path.name, "has-session", "-t", "=" + name],
-                                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
+                                       stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=5)
+            except FileNotFoundError:
+                continue  # Its socket went meanwhile.
             except (OSError, subprocess.SubprocessError):
                 return None
             if found.returncode == 0:
                 return True
+            said = found.stderr.decode("utf-8", "replace")
+            if "can't find session" not in said and "no server running" not in said:
+                return None  # Not an answer about the session (another tmux version, an error).
         return False
 
     def _unrecorded_message(self):
@@ -865,8 +872,11 @@ class TerminalManager:
                         terminal.record["socket"] = self.socket_name
                         adopted.append(terminal)
                     elif terminal.record["id"] not in self._looked:
-                        self._looked.add(terminal.record["id"])
-                        if self._elsewhere(terminal) is False:
+                        found = self._elsewhere(terminal)
+                        # Not told (None): looked for again on the next listing.
+                        if found is not None:
+                            self._looked.add(terminal.record["id"])
+                        if found is False:
                             terminal.record["socket"] = self.socket_name
                             terminal.record["closed"] = True
                             terminal.record["closedReason"] = "connection_ended"

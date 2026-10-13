@@ -672,10 +672,12 @@ class SocketRecordTest(unittest.TestCase):
         probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); probe.bind(str(dead)); probe.close()
         asked = []
         real = subprocess.run
+        answers = {"=sb-" + "a" * 32: (1, b"can't find session: sb-a"), "=sb-" + "b" * 32: (0, b"")}
         def run(argv, **kwargs):
             if argv[1:3] == ["-L", "sb-fixture-live"]:
                 asked.append(argv[-1])
-                return subprocess.CompletedProcess(argv, 1 if argv[-1] == "=sb-" + "a" * 32 else 0)
+                code, said = answers[argv[-1]]
+                return subprocess.CompletedProcess(argv, code, stderr=said)
             return real(argv, **kwargs)
         with patch.object(terminal.subprocess, "run", side_effect=run):
             listed = manager.list()
@@ -686,12 +688,22 @@ class SocketRecordTest(unittest.TestCase):
         saved = {row["id"][0]: row for row in self.saved()}
         self.assertEqual((saved["a"]["closedReason"], saved["a"]["socket"]), ("connection_ended", "sb-fixture-current"))
         self.assertNotIn("socket", saved["b"], "found on the live server: left as it was")
-        # Nothing could be told (no socket folder): nothing is closed.
+        # An answer that is not about the session (another tmux version): nothing is told, and
+        # it is looked for again on the next listing.
         manager.close()
         (self.state / "sessions.json").write_text(json.dumps(self.rows()))
         other = self.manager()
+        other.socket_dir = socket_dir
+        asked.clear()
+        answers["=sb-" + "a" * 32] = (1, b"protocol version mismatch")
+        answers["=sb-" + "b" * 32] = (1, b"protocol version mismatch")
+        with patch.object(terminal.subprocess, "run", side_effect=run):
+            self.assertEqual([row["closed"] for row in other.list()], [False, False])
+            other.list()
+        self.assertEqual(len(asked), 4)
+        # No socket folder at all: no tmux server of this user runs, so it ended.
         other.socket_dir = Path(self.directory.name) / "missing"
-        self.assertEqual([row["closed"] for row in other.list()], [False, False])
+        self.assertEqual([row["closed"] for row in other.list()], [True, True])
 
     def test_rows_of_another_socket_are_not_closed_by_listing_closing_or_reopening(self):
         (self.state / "sessions.json").write_text(json.dumps(self.rows(socket="sb-fixture-old")))

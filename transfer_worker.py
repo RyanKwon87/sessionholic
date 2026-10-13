@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import re
 import secrets
+import errno
 import shutil
 import signal
 import socket
@@ -38,7 +39,7 @@ HOLD_OPTIONS = (('status', 'off'), ('prefix', 'None'), ('prefix2', 'None'), ('mo
 HOLD_TIMEOUT = 10
 HOLD_STALE_ENVELOPE = 600  # an envelope this old was never run (hold-run removes it first)
 # What tests leave on a host (sweep_leftovers): tmux socket files of these names, and Codex
-# app-server daemons a test's Codex home under this user's temporary folder started.
+# app-server daemons a test's Codex home (`<temporary folder>/tmp…/.codex…`) started.
 TEST_SOCKET_PREFIXES = ('sb-test-', 'sb-browser-', 'sb-validation-')
 LEFTOVER_PROCESS_AGE = 3600
 LEFTOVER_SOCKET_AGE = 86400
@@ -634,11 +635,12 @@ def _elapsed(text):
 
 
 def sweep_leftovers(listing=None, temp=None, sockets=None, now=None, kill=os.kill):
-    """End what tests left on this host and say how much: Codex app-server daemons a test's
-    Codex home under this user's temporary folder started, orphaned for an hour or more, and
-    socket files of ended test tmux servers (tmux keeps them) a day old. Nothing else matches:
-    a user's own Codex homes are not under the temporary folder, and the board's and the
-    user's tmux servers have other names."""
+    """End what tests left on this host and say how much: Codex app-server daemons (a daemon
+    has no parent process, whoever started it) running for an hour or more from a Codex home
+    right inside a temporary folder a test made (`<this user's temporary folder>/tmp…/.codex…`),
+    and socket files of ended test tmux servers (tmux keeps them) a day old. Nothing else
+    matches: a user's own Codex homes are not in the temporary folder, and the board's and
+    the user's tmux servers have other names."""
     ended = removed = 0
     temp = _user_temp() if temp is None else temp
     if temp:
@@ -653,7 +655,9 @@ def sweep_leftovers(listing=None, temp=None, sockets=None, now=None, kill=os.kil
             if len(fields) < 6:
                 continue
             pid, ppid, uid, elapsed, program, rest = fields
-            if (not pid.isdigit() or ppid != '1' or uid != str(os.getuid()) or not program.startswith(temp + '/tmp')
+            home = program[len(temp) + 1:].split('/packages/app-server-daemon/', 1)[0].split('/')
+            if (not pid.isdigit() or ppid != '1' or uid != str(os.getuid()) or not program.startswith(temp + '/')
+                    or len(home) != 2 or not home[0].startswith('tmp') or not home[1].startswith('.codex')
                     or '/packages/app-server-daemon/' not in program or not program.endswith('/bin/codex')
                     or rest.split(' ', 1)[0] != 'app-server'):
                 continue
@@ -681,8 +685,9 @@ def sweep_leftovers(listing=None, temp=None, sockets=None, now=None, kill=os.kil
             try:
                 probe.connect(str(path))
                 continue  # A server still answers there: not left over.
-            except OSError:
-                pass
+            except OSError as exc:
+                if exc.errno != errno.ECONNREFUSED:
+                    continue  # Only a refused connection says no server is there.
             finally:
                 probe.close()
             path.unlink()

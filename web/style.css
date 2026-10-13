@@ -1527,6 +1527,13 @@ button.host:focus-visible {
   font-size: var(--fs-cap);
   white-space: nowrap;
 }
+/* A session removed from the list, shown only by search or 오래된 기록 포함. */
+.removed-tag {
+  flex: none;
+  color: var(--label-3);
+  font-size: var(--fs-cap);
+  white-space: nowrap;
+}
 .card-snippet {
   display: block;
   overflow: hidden;

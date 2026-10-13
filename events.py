@@ -38,6 +38,10 @@ IDLE_INTERVALS = (5.0, 10.0, 20.0, 30.0)
 ERROR_INTERVAL = 10.0
 # How often an idle stream checks whether its client went away.
 PEER_CHECK = 1.0
+# Snapshot announcements to one stream are at least this far apart: a resident collector
+# can change the board every second, and each announcement makes the page read the
+# whole snapshot again. Changes in between are one announcement of the newest version.
+SNAPSHOT_GAP = 3.0
 # Seconds between terminal list reads while at least one stream is open (at most four
 # board terminals, so a read is a few tmux calls); after a failed read, the longer one.
 TERMINAL_INTERVAL = 5.0
@@ -112,7 +116,8 @@ class EventHub:
                  fast=FAST_INTERVAL, idle=IDLE_INTERVALS, error=ERROR_INTERVAL,
                  peer_check=PEER_CHECK, clock=time.monotonic, max_watchers=MAX_WATCHERS,
                  room_wait=ROOM_WAIT, boot_id=None, terminals=None,
-                 terminal_interval=TERMINAL_INTERVAL, terminal_error=TERMINAL_ERROR_INTERVAL):
+                 terminal_interval=TERMINAL_INTERVAL, terminal_error=TERMINAL_ERROR_INTERVAL,
+                 snapshot_gap=SNAPSHOT_GAP):
         self.board, self.chat = board, chat
         # The server process's bootId, sent with hello: snapshot versions restart with it.
         self.boot_id = boot_id
@@ -120,6 +125,7 @@ class EventHub:
         self.max_watchers, self.room_wait = max_watchers, room_wait
         self.fast, self.idle, self.error = fast, tuple(idle), error
         self.peer_check, self.clock = peer_check, clock
+        self.snapshot_gap = snapshot_gap
         # Lock order: the board lock or the terminal manager's lock may be held when
         # snapshot_changed or terminals_changed takes this lock; nothing here calls into
         # the board, the terminals or a conversation while holding it.
@@ -322,8 +328,13 @@ class EventHub:
             sent_version, sent_digest = stream.hello, stream.sent_digest
             sent_terminals = stream.hello_terminals
             next_ping = self.clock() + self.heartbeat
+            # When the last snapshot announcement went out, and whether a newer version waits.
+            announced, held = None, False
             while True:
-                stream.ready.wait(max(0.0, min(self.peer_check, next_ping - self.clock())))
+                wake = min(self.peer_check, next_ping - self.clock())
+                if held:
+                    wake = min(wake, announced + self.snapshot_gap - self.clock())
+                stream.ready.wait(max(0.0, wake))
                 with self.lock:
                     stream.ready.clear()
                     version, digest, closed = stream.version, stream.digest, self.closed
@@ -331,9 +342,14 @@ class EventHub:
                 if closed:
                     return
                 out = b""
+                held = False
                 if version is not None and version > sent_version:
-                    out += encode_event("snapshot", {"version": version})
-                    sent_version = version
+                    now = self.clock()
+                    if announced is None or now - announced >= self.snapshot_gap:
+                        out += encode_event("snapshot", {"version": version})
+                        sent_version, announced = version, now
+                    else:
+                        held = True
                 if digest is not None and digest != sent_digest:
                     out += encode_event("chat", {"digest": digest})
                     sent_digest = digest

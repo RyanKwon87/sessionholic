@@ -916,7 +916,9 @@ class Board:
     prints a full snapshot whenever something changes; those snapshots take the same
     `changed()` path. The watchers stop a grace period after the last stream closes.
     """
-    RETRY_BACKOFF = (120, 300, 900)
+    # A host that failed is tried again after these (seconds): a reconnected laptop shows as
+    # connected within five minutes at most, while one that stays away costs one ssh attempt.
+    RETRY_BACKOFF = (90, 180, 300)
     # Resident watcher restarts, apart from the one-shot collection backoff above.
     STREAM_BACKOFF = (5, 30, 120, 600)
     # Three failed watchers in a row, each within STREAM_HEALTHY of its start: pause it this long.

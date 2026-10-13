@@ -248,10 +248,11 @@ class WorkServiceTest(unittest.TestCase):
         board.clock = self.clock
         board.start_polls = lambda queued, full=False: [board.poll(h, full) for h in queued]
         self.assertFalse(board.poll(machine))
-        self.assertEqual(board.backoff['air'], (1, 1120.0))
+        self.assertEqual(board.backoff['air'], (1, 1090.0))
         self.service = WorkService(board, self.goals, self.directory, clock=self.clock)
         self.service.step()
         reachable['value'] = True
+        # The board would retry after 90 seconds; this service asks every 120.
         self.clock.advance(119)
         self.service.step()
         self.assertEqual(len(calls), 1, 'offline host must not be repeatedly retried before its backoff')

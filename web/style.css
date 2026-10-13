@@ -5174,6 +5174,23 @@ button.host:focus-visible {
   scrollbar-width: none;
   overscroll-behavior-x: contain;
 }
+@media (pointer: coarse) {
+  /* The 답 필요·작업 중 chips: a 44px tap target; the row keeps its place. */
+  .list-chips {
+    margin-top: -7px;
+    margin-bottom: 5px;
+    padding-top: 8px;
+    padding-bottom: 9px;
+  }
+  .list-chips .count {
+    position: relative;
+  }
+  .list-chips .count::after {
+    content: "";
+    position: absolute;
+    inset: -8px -3px;
+  }
+}
 .list-chips::-webkit-scrollbar {
   display: none;
 }
@@ -6247,6 +6264,10 @@ input.switch:focus-visible {
   background: transparent;
   box-shadow: none;
 }
+/* 44px to touch around the 30px icon. */
+.message-code-head .message-block-copy::after {
+  inset: -7px;
+}
 @media (hover: hover) and (pointer: fine) {
   .message-block-copy {
     min-height: 0;
@@ -6772,8 +6793,17 @@ input.switch:focus-visible {
 
 /* Non-persistent runs have an execution state, without a saved conversation. */
 .card-execution, .detail-execution { color: var(--label-2); font-size: var(--fs-cap); }
+.conversation-window-notice { margin: 8px 16px 4px; color: var(--label-2); font-size: var(--fs-cap); text-align: center; }
 .detail-runtime { flex-basis: 100%; color: var(--label-2); font-size: var(--fs-cap); }
 .card-execution { flex: none; white-space: nowrap; }
 .conversation-history-notice { padding: 20px; border-radius: 12px; background: var(--fill-soft); color: var(--label); line-height: 1.65; overflow-wrap: anywhere; }
 .conversation-history-notice strong { font-size: var(--fs-body); }
 .conversation-history-notice p { margin: 8px 0 0; color: var(--label-2); font-size: var(--fs-sub); }
+
+/* A narrow list beside the conversation on a touch screen (an iPad): titles may take
+   two lines (after the one-line rule for phones and touch screens above). */
+@media (pointer: coarse) and (min-width: 701px) {
+  .card-title {
+    -webkit-line-clamp: 2;
+  }
+}

@@ -48,6 +48,8 @@ RELEASE_IDLE = 60
 # Unused this long, a Claude connection is closed even with room to spare; sending to the
 # session (or 질문 불러오기) attaches it again.
 CLOSE_IDLE = 600
+# After a look on other tmux servers told nothing (_elsewhere), the next one waits this long.
+LOOK_AGAIN_SECONDS = 600
 # Closed rows kept, the oldest forgotten first. The user's own closes are kept longer:
 # they stop an automatic resume of that session. Any other close is history only.
 CLOSED_KEEP = 40
@@ -225,8 +227,11 @@ class TerminalManager:
         self.reservations = set()
         self._closed = False
         self._warned = set()
-        # Unrecorded rows looked for on this user's other tmux servers (_elsewhere), once each.
+        # Unrecorded rows looked for on this user's other tmux servers (_elsewhere), once each,
+        # and when to look again after a look that told nothing (a server that does not answer
+        # holds the listing for its timeout, so not on every listing).
         self._looked = set()
+        self._look_again = 0.0
         self.socket_dir = socket_dir()
         # One list-sessions answer for the _exists calls of a listing (_listing), as
         # (thread ident, names): only the listing thread uses it.
@@ -308,14 +313,17 @@ class TerminalManager:
         for path in paths:
             try:
                 info = path.lstat()
-                if not stat.S_ISSOCK(info.st_mode) or info.st_uid != os.getuid() or not SOCKET.fullmatch(path.name):
-                    continue
-                if not socket_live(path):
-                    continue
-                found = subprocess.run([self.tmux, "-L", path.name, "has-session", "-t", "=" + name],
-                                       stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=5)
             except FileNotFoundError:
                 continue  # Its socket went meanwhile.
+            except OSError:
+                return None
+            if not stat.S_ISSOCK(info.st_mode) or info.st_uid != os.getuid() or not SOCKET.fullmatch(path.name):
+                continue
+            if not socket_live(path):
+                continue
+            try:
+                found = subprocess.run([self.tmux, "-L", path.name, "has-session", "-t", "=" + name],
+                                       stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=3)
             except (OSError, subprocess.SubprocessError):
                 return None
             if found.returncode == 0:
@@ -871,10 +879,11 @@ class TerminalManager:
                     if terminal.alive:
                         terminal.record["socket"] = self.socket_name
                         adopted.append(terminal)
-                    elif terminal.record["id"] not in self._looked:
+                    elif terminal.record["id"] not in self._looked and now >= self._look_again:
                         found = self._elsewhere(terminal)
-                        # Not told (None): looked for again on the next listing.
-                        if found is not None:
+                        if found is None:
+                            self._look_again = now + LOOK_AGAIN_SECONDS  # Every row waits.
+                        else:
                             self._looked.add(terminal.record["id"])
                         if found is False:
                             terminal.record["socket"] = self.socket_name

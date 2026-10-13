@@ -689,7 +689,8 @@ class SocketRecordTest(unittest.TestCase):
         self.assertEqual((saved["a"]["closedReason"], saved["a"]["socket"]), ("connection_ended", "sb-fixture-current"))
         self.assertNotIn("socket", saved["b"], "found on the live server: left as it was")
         # An answer that is not about the session (another tmux version): nothing is told, and
-        # it is looked for again on the next listing.
+        # no row is looked for again until LOOK_AGAIN_SECONDS passed (a server that does not
+        # answer holds the listing for its timeout).
         manager.close()
         (self.state / "sessions.json").write_text(json.dumps(self.rows()))
         other = self.manager()
@@ -697,13 +698,29 @@ class SocketRecordTest(unittest.TestCase):
         asked.clear()
         answers["=sb-" + "a" * 32] = (1, b"protocol version mismatch")
         answers["=sb-" + "b" * 32] = (1, b"protocol version mismatch")
-        with patch.object(terminal.subprocess, "run", side_effect=run):
+        clock = [1000.0]
+        with patch.object(terminal.subprocess, "run", side_effect=run), \
+                patch.object(terminal.time, "monotonic", side_effect=lambda: clock[0]):
             self.assertEqual([row["closed"] for row in other.list()], [False, False])
             other.list()
-        self.assertEqual(len(asked), 4)
+            self.assertEqual(len(asked), 1)
+            clock[0] += terminal.LOOK_AGAIN_SECONDS
+            other.list()
+            self.assertEqual(len(asked), 2)
+        # A tmux program gone between the listing and the look tells nothing either.
+        clock[0] += terminal.LOOK_AGAIN_SECONDS
+        def gone(argv, **kwargs):
+            if argv[1:3] == ["-L", "sb-fixture-live"]:
+                raise FileNotFoundError(argv[0])
+            return real(argv, **kwargs)
+        with patch.object(terminal.subprocess, "run", side_effect=gone), \
+                patch.object(terminal.time, "monotonic", side_effect=lambda: clock[0]):
+            self.assertEqual([row["closed"] for row in other.list()], [False, False])
         # No socket folder at all: no tmux server of this user runs, so it ended.
+        clock[0] += terminal.LOOK_AGAIN_SECONDS
         other.socket_dir = Path(self.directory.name) / "missing"
-        self.assertEqual([row["closed"] for row in other.list()], [True, True])
+        with patch.object(terminal.time, "monotonic", side_effect=lambda: clock[0]):
+            self.assertEqual([row["closed"] for row in other.list()], [True, True])
 
     def test_rows_of_another_socket_are_not_closed_by_listing_closing_or_reopening(self):
         (self.state / "sessions.json").write_text(json.dumps(self.rows(socket="sb-fixture-old")))

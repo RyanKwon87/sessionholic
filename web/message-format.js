@@ -48,7 +48,9 @@ const MessageFormat = (() => {
   // or "]" it did not open.
   // Particles (and copulas) a sentence puts right after an address.
   const PARTICLES = new Set(("을 를 이 가 은 는 의 에 에서 에게 께 한테 로 으로 와 과 도 만 까지 부터 처럼 보다 이나 나 " +
-    "이랑 랑 하고 에는 에도 에서는 에서도 으로는 로는 으로도 로도 이다 입니다 이에요 예요 이고 이며").split(" "));
+    "이랑 랑 하고 에는 에도 에서는 에서도 으로는 로는 으로도 로도 이다 입니다 이에요 예요 이고 이며 " +
+    "을요 를요 은요 는요 에서요 에선 엔 에서의 으로의 로의 에서부터 부터는 까지는 이라는 라는 이라고 라고 " +
+    "인데 이면 이지만 에게서 한테서").split(" "));
   function bareAddress(text) {
     const head = text.slice(0, 2048);
     let url = head.match(/^https?:\/\/[A-Za-z0-9\-._~:/?#[\]@!$&'()*+,;=%]*/i)?.[0] || "";

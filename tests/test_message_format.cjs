@@ -164,9 +164,9 @@ test('web addresses become links, without trailing punctuation or the particle a
     ['https://ko.wikipedia.org/wiki/대한민국', 'https://a.test/경로/b?q=한글&x=1', 'https://c.test/12']);
   assert.equal(byTag(root, 'a')[0].attributes.href, 'https://ko.wikipedia.org/wiki/%EB%8C%80%ED%95%9C%EB%AF%BC%EA%B5%AD');
   // A particle alone after a part's start is the sentence's; other scripts are not taken in.
-  format.render(root, 'http://localhost:8447/에서 확인, https://d.test/repo/를 열고 https://e.test/?y=에서. https://f.test/путь 끝');
+  format.render(root, 'http://localhost:8447/에서 확인, https://d.test/repo/를 열고 https://e.test/?y=에서. https://f.test/путь 끝 https://g.test/에서요 https://h.test/로그인 화면');
   assert.deepEqual(byTag(root, 'a').map(visibleText),
-    ['http://localhost:8447/', 'https://d.test/repo/', 'https://e.test/?y=', 'https://f.test/']);
+    ['http://localhost:8447/', 'https://d.test/repo/', 'https://e.test/?y=', 'https://f.test/', 'https://g.test/', 'https://h.test/로그인']);
 });
 
 test('rules, task items and struck text draw as such and copy as written', () => {

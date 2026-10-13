@@ -32,6 +32,12 @@ SID = re.compile(r'[0-9A-Za-z-]{8,64}\Z')
 CAPABILITIES = {'readOnly': True, 'canRead': True, 'canSend': False, 'canLaunch': False, 'canControl': False}
 CODEX_SOURCES = ['cli', 'vscode', 'exec', 'appServer', 'subAgent', 'unknown']
 CLAUDE_PROBE_LIMIT = 16
+# Codex thread writer locks looked at per snapshot (the newest), and for how long.
+WRITER_LOCK_LIMIT = 64
+WRITER_LOCK_SECONDS = 3
+SERVER_DOWN = '이 프로젝트의 Codex 서버가 PC에서 꺼져 있어 실행 상태를 확인하지 못했습니다.'
+# A stopped server is mentioned only for projects used this recently.
+SERVER_DOWN_RECENT_SECONDS = 7 * 86400
 CLAUDE_PROBE_SECONDS = 2
 ANCESTRY_LIMIT = 6
 NOT_PERSISTED = {'code': 'not_persisted', 'message': '대화 기록을 저장하지 않는 일회성 실행입니다. 실행 상태를 확인하고 결과는 요청한 에이전트에서 확인해 주세요.'}
@@ -189,6 +195,42 @@ def _process(pid):
         return _process_identity(kernel, handle, pid)
     finally:
         kernel.CloseHandle(handle)
+
+
+def _lock_owners(path):
+    """The processes ({'pid', 'start'}) holding one file open, read with the Windows Restart
+    Manager: nothing is opened or locked. None when that cannot be read or is not exact."""
+    if os.name != 'nt':
+        return None
+    try:
+        manager = ctypes.WinDLL('rstrtmgr')
+    except OSError:
+        return None
+
+    class Unique(ctypes.Structure):
+        _fields_ = [('pid', wintypes.DWORD), ('start', wintypes.FILETIME)]
+
+    class Info(ctypes.Structure):
+        _fields_ = [('process', Unique), ('app', wintypes.WCHAR * 256), ('service', wintypes.WCHAR * 64),
+                    ('kind', ctypes.c_int), ('status', wintypes.ULONG), ('session', wintypes.DWORD),
+                    ('restartable', wintypes.BOOL)]
+    session, key = wintypes.DWORD(), ctypes.create_unicode_buffer(33)
+    if manager.RmStartSession(ctypes.byref(session), 0, key) != 0:
+        return None
+    try:
+        files = (wintypes.LPCWSTR * 1)(str(path))
+        if manager.RmRegisterResources(session, 1, files, 0, None, 0, None) != 0:
+            return None
+        needed, count, reasons = wintypes.UINT(), wintypes.UINT(8), wintypes.DWORD()
+        infos = (Info * 8)()
+        # ERROR_MORE_DATA (more than eight holders) is not exact either.
+        if manager.RmGetList(session, ctypes.byref(needed), ctypes.byref(count), infos, ctypes.byref(reasons)) != 0:
+            return None
+        return [{'pid': int(infos[i].process.pid),
+                 'start': str((infos[i].process.start.dwHighDateTime << 32) | infos[i].process.start.dwLowDateTime)}
+                for i in range(count.value)]
+    finally:
+        manager.RmEndSession(session)
 
 
 def _parents(deadline):
@@ -499,13 +541,18 @@ def _open_read_only(database, immutable=False):
 
 class WindowsCollector:
     def __init__(self, home=None, proxy_factory=Proxy, process_reader=_process, hostname=None,
-                 parent_reader=_parents, flags_reader=_claude_flags):
+                 parent_reader=_parents, flags_reader=_claude_flags, owner_reader=_lock_owners):
         self.home = Path(home) if home is not None else Path.home()
         self.codex_home = self.home / '.codex'
         self.claude_home = self.home / '.claude'
         self.binary = self.home / 'AppData/Local/Programs/OpenAI/Codex/bin/codex.exe'
         self.proxy_factory, self.process_reader = proxy_factory, process_reader
         self.parent_reader, self.flags_reader = parent_reader, flags_reader
+        self.owner_reader = owner_reader
+        # Project servers that ran here and are gone, every server name and every server
+        # process recorded (endpoints fills them on each snapshot).
+        self.down, self.servers, self.server_pids = [], [], set()
+        self.warnings = []
         self.hostname = hostname or socket.gethostname()
 
     def project(self, cwd):
@@ -590,15 +637,81 @@ class WindowsCollector:
 
     def endpoints(self):
         root = self.codex_home / 'agents-servers'
-        found = []
+        found, self.down, self.servers, self.server_pids = [], [], [], set()
         # Only existing, bounded server-state files belonging to this home are considered.
         for state in sorted(root.glob('*/server-state.json'))[:ENDPOINT_LIMIT]:
+            self.servers.append(state.parent.name)
             path = self.endpoint(state.parent.name)
             if path is not None:
                 found.append(path)
+            elif self._server_down(state.parent.name):
+                # Its pid may already belong to another process (a codex exec): not a server's.
+                self.down.append(state.parent.name)
+                continue
+            try:
+                recorded = _json(state, self.codex_home)
+                if isinstance(recorded, dict) and type(recorded.get('server_pid')) is int:
+                    self.server_pids.add(recorded['server_pid'])
+            except (OSError, ValueError):
+                pass
         return found
 
-    def _row(self, raw, live=None):
+    def _server_down(self, project):
+        """A project server that ran here and is gone: its state names this project and an
+        exit code, or a process that no longer runs. (A server this board cannot verify for
+        another reason, such as an elevated one, is not called down.)"""
+        try:
+            state = _json(self.codex_home / 'agents-servers' / project / 'server-state.json', self.codex_home)
+        except (OSError, ValueError):
+            return False
+        if not isinstance(state, dict) or state.get('project') != project:
+            return False
+        return state.get('exit_code') is not None or not self.process_reader(state.get('server_pid'))
+
+    def project_server(self, cwd, names):
+        """The project server a stored session under ~/Projects belongs to, among `names`: the
+        one named after its Projects folder (any case), else the only `<folder>-…` server no
+        Projects folder of its own name owns (windows_runtime._project_endpoint's rule)."""
+        root = _windows_path(self.home / 'Projects').rstrip('/') + '/'
+        path = _windows_path(cwd or '').rstrip('/')
+        if not path.casefold().startswith(root.casefold()):
+            return None
+        folder = path[len(root):].split('/')[0].casefold()
+        named = [name for name in names if name.casefold() == folder]
+        if not named:
+            named = [name for name in names if name.casefold().startswith(folder + '-')
+                     and not (self.home / 'Projects' / name).exists()]
+        return named[0] if len(named) == 1 else None
+
+    def writer_owners(self, ids):
+        """{thread id: process} for the given stored threads whose writer lock exactly one live
+        Codex process holds (a `codex exec`, or a CLI outside the project server)."""
+        found = {}
+        root = self.codex_home / 'thread-writer-locks'
+        try:
+            locks = sorted((path for path in root.glob('*.lock') if path.stem in ids and not path.is_symlink()),
+                           key=lambda path: path.stat().st_mtime, reverse=True)[:WRITER_LOCK_LIMIT]
+        except OSError:
+            return found
+        deadline = time.monotonic() + WRITER_LOCK_SECONDS
+        for path in locks:
+            if time.monotonic() >= deadline:
+                break
+            try:
+                owners = self.owner_reader(path)
+            except Exception:
+                continue
+            # A project server holds the locks of the threads it has loaded: not a writer outside it.
+            if (not isinstance(owners, list) or len(owners) != 1 or not isinstance(owners[0], dict)
+                    or owners[0].get('pid') in self.server_pids):
+                continue
+            process = self.process_reader(owners[0].get('pid'))
+            if (isinstance(process, dict) and isinstance(owners[0].get('start'), str)
+                    and process.get('start') == owners[0]['start'] and self._codex_executable(process.get('exe'))):
+                found[path.stem] = process
+        return found
+
+    def _row(self, raw, live=None, held=False, down=False):
         sid = str(raw.get('id') or '')
         status = live.get('status') if live else None
         project = self.project(raw.get('cwd'))
@@ -613,7 +726,20 @@ class WindowsCollector:
                 'startedAt': _epoch(raw.get('created_at')), 'updatedAt': _epoch(raw.get('updated_at')),
                 'snippet': preview if name else '', 'readOnly': True, 'canRead': True,
                 'runtimeReason': None if live else '저장된 기록입니다. 현재 실행 상태는 확인되지 않았습니다.',
-                **_origin({**raw, **(live or {})})}
+                **_origin({**raw, **(live or {})}), **self._held(raw, live, held, down)}
+
+    @staticmethod
+    def _held(raw, live, held, down):
+        """What a stored thread outside any server shows: a `codex exec` that holds its writer
+        lock runs (until it ends); another holder is an open CLI whose state is its own."""
+        if live:
+            return {}
+        if held and raw.get('source') == 'exec':
+            return {'state': 'active', 'phase': 'working', 'status': '', 'runtimeKnown': True,
+                    'runtimeReason': 'codex exec로 실행 중입니다. 끝나면 저장된 기록으로 돌아갑니다.'}
+        if held:
+            return {'runtimeReason': '서버 밖의 Codex가 이 기록을 열고 있습니다. 실행 상태는 그 터미널에서 확인해 주세요.'}
+        return {'runtimeReason': SERVER_DOWN} if down else {}
 
     def codex_rows(self, errors):
         rows = self.database_rows()
@@ -643,12 +769,24 @@ class WindowsCollector:
             except (OSError, ValueError, TimeoutError, subprocess.SubprocessError):
                 errors.append('PC 프로젝트 서버 상태를 읽지 못했습니다. 저장된 기록을 표시합니다.')
                 # A failed endpoint is never retried during this collection.
+        # A stopped server is a warning (not a collection error) for projects used lately.
+        servers = {row['id']: self.project_server(row.get('cwd'), self.servers) for row in rows}
+        recent = time.time() - SERVER_DOWN_RECENT_SECONDS
+        down = [name for name in self.down if any(server == name and (_epoch(row.get('updated_at')) or 0) >= recent
+                                                 for row in rows for server in [servers[row['id']]])]
+        if down:
+            self.warnings.append('PC 프로젝트 Codex 서버가 꺼져 있어 그 프로젝트의 실행 상태를 확인하지 못했습니다: '
+                                 + ', '.join(down[:6]) + '. PC에서 그 프로젝트를 열면 서버가 켜집니다.')
+        try:
+            held = self.writer_owners({row['id'] for row in rows if row['id'] not in live or row['id'] in ambiguous})
+        except Exception:
+            held = {}
         output = []
         for row in rows:
             observed = None if row['id'] in ambiguous else live.get(row['id'])
             if observed and _norm(observed.get('cwd')) != _norm(row.get('cwd')):
                 observed = None
-            output.append(self._row(row, observed))
+            output.append(self._row(row, observed, held=row['id'] in held, down=servers[row['id']] in self.down))
         return output
 
     def _transcripts(self):
@@ -828,6 +966,8 @@ class WindowsCollector:
 
     def snapshot(self):
         errors = []
+        # Something to check on this PC that is not a failed collection (a stopped server).
+        self.warnings = []
         try:
             codex = self.codex_rows(errors)
         except (OSError, ValueError, sqlite3.Error):
@@ -839,7 +979,7 @@ class WindowsCollector:
             claude = []
             errors.append('PC Claude 저장 목록을 읽지 못했습니다.')
         return {'collectedAt': int(time.time()), 'codex': codex, 'claude': claude, 'tmux': [],
-                'errors': errors, 'capabilities': dict(CAPABILITIES), 'platform': 'windows'}
+                'errors': errors, 'warnings': list(self.warnings), 'capabilities': dict(CAPABILITIES), 'platform': 'windows'}
 
     def read(self, agent, sid, home=None):
         if not SID.fullmatch(sid or '') or agent not in ('codex', 'claude'):

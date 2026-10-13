@@ -9,6 +9,8 @@ from __future__ import annotations
 import argparse
 import base64
 import copy
+import errno
+import fcntl
 import gzip
 import hashlib
 import html
@@ -329,7 +331,8 @@ def watch_command(host, board_id, state_dir=None):
 
 
 def start_watch(host, board_id, state_dir=None):
-    """(process, bytes to write first) of one host's watcher; stderr is discarded.
+    """(process, bytes to write first) of one host's watcher; its stderr is forwarded to
+    this log in a few lines (HostStream, forward_watch_errors).
 
     A remote watcher's program is read before ssh starts: a file that cannot be read
     leaves no ssh process behind."""
@@ -338,8 +341,37 @@ def start_watch(host, board_id, state_dir=None):
     if not host["local"]:
         program = remote_program()
         preface = str(len(program)).encode() + b"\n" + program
-    process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     return process, preface
+
+
+WATCH_ERROR_LINES = 20
+WATCH_ERROR_WINDOW = 600
+
+
+def forward_watch_errors(name, stream):
+    """A watcher's stderr (watch_log lines: an error's type and first line, or ssh's own
+    words) into this log, at most WATCH_ERROR_LINES per WATCH_ERROR_WINDOW seconds; the
+    rest is read and dropped so the pipe never fills."""
+    from launch import scrub_text
+    sent = []
+    try:
+        for raw in iter(lambda: stream.readline(4096), b""):
+            now = time.monotonic()
+            sent = [moment for moment in sent if now - moment < WATCH_ERROR_WINDOW]
+            if len(sent) >= WATCH_ERROR_LINES:
+                continue
+            text = scrub_text(raw.decode("utf-8", "replace").strip())[:300]
+            if text:
+                sent.append(now)
+                sys.stderr.write(f"{LOG_PREFIX}: 상주 수집기 {name}: {text}\n")
+    except (OSError, ValueError):
+        pass
+    finally:
+        try:
+            stream.close()
+        except OSError:
+            pass
 
 
 def run_collector(host, args, timeout, state_dir=None):
@@ -355,7 +387,12 @@ def run_collector(host, args, timeout, state_dir=None):
     except OSError:
         raise RuntimeError("수집기를 실행하지 못했습니다") from None
     if done.returncode != 0:
-        raise RuntimeError("SSH 연결 실패" if done.returncode == 255 else f"수집기 오류 (exit {done.returncode})")
+        error = RuntimeError("SSH 연결 실패" if done.returncode == 255 else f"수집기 오류 (exit {done.returncode})")
+        # For the log only (Board.poll), scrubbed and cut: the last thing the collector or ssh said.
+        from launch import scrub_text
+        tail = (done.stderr or b"").decode("utf-8", "replace").strip().splitlines()
+        error.detail = scrub_text(tail[-1])[:300] if tail else ""
+        raise error
     try:
         result = json.loads(done.stdout)
     except ValueError:
@@ -399,6 +436,80 @@ def scrub_payload(value):
         return {key: scrub_text(item) if key in ("text", "title", "snippet", "account", "error") and isinstance(item, str)
                 else scrub_payload(item) for key, item in value.items()}
     return value
+
+
+# A write to a client that already left.
+CLIENT_GONE = (BrokenPipeError, ConnectionResetError)
+# launchd appends this server's stdout and stderr to files it never rotates (every request
+# writes a line); past this size such a file is rotated (rotate_own_logs), checked this often.
+LOG_ROTATE_BYTES = 20 * 1024 * 1024
+LOG_ROTATE_SECONDS = 1800
+# What <name>.1 keeps of a rotated log: its end.
+LOG_KEEP_BYTES = 5 * 1024 * 1024
+
+
+def rotate_own_logs(state_dir, limit=LOG_ROTATE_BYTES):
+    """A *.log file in the state folder that is this process's stdout or stderr (same file),
+    opened for append and over `limit`, keeps its last LOG_KEEP_BYTES in <name>.1 (replacing
+    the previous copy) and is emptied in place: an append-only writer simply goes on at the
+    new end. A copy that fails (a full disk) is removed and the log is emptied anyway, so
+    the rotation frees space rather than taking more. Returns the names rotated; anything
+    unclear (another file, no append mode) is left alone."""
+    rotated = []
+    try:
+        candidates = [path for path in Path(state_dir).glob("*.log") if path.is_file() and not path.is_symlink()]
+    except OSError:
+        return rotated
+    for fd, stream in ((1, sys.stdout), (2, sys.stderr)):
+        try:
+            info = os.fstat(fd)
+            append = fcntl.fcntl(fd, fcntl.F_GETFL) & os.O_APPEND
+        except OSError:
+            continue
+        if not stat.S_ISREG(info.st_mode) or not append or info.st_size <= limit:
+            continue
+        for path in candidates:
+            try:
+                same = os.path.samestat(os.stat(path), info)
+            except OSError:
+                continue
+            if not same:
+                continue
+            kept = path.with_name(path.name + ".1")
+            try:
+                stream.flush()
+            except (OSError, ValueError):
+                pass
+            try:
+                with open(path, "rb") as source, open(kept, "wb") as target:
+                    source.seek(max(0, info.st_size - LOG_KEEP_BYTES))
+                    shutil.copyfileobj(source, target)
+            except OSError:
+                try:
+                    kept.unlink()
+                except OSError:
+                    pass
+            try:
+                os.ftruncate(fd, 0)
+                rotated.append(path.name)
+            except OSError:
+                pass
+            break
+    return rotated
+
+
+def unavailable_message(exc, usual="실행 연결을 준비하지 못했어요. 설정을 확인해 주세요."):
+    """What a 503 says: a full disk by name (state writes fail with it), else the usual."""
+    if isinstance(exc, OSError) and exc.errno == errno.ENOSPC:
+        return "보드 기기의 디스크가 가득 차 상태를 저장하지 못했어요. 디스크 공간을 확보해 주세요."
+    return usual
+
+
+def rotate_logs_forever(state_dir, every=LOG_ROTATE_SECONDS):
+    while True:
+        for name in rotate_own_logs(state_dir):
+            sys.stderr.write(f"{LOG_PREFIX}: 로그 {name}이 {LOG_ROTATE_BYTES // (1024 * 1024)}MB를 넘어 {name}.1로 옮기고 비웠습니다.\n")
+        time.sleep(every)
 
 
 def log_failure(context, exc):
@@ -693,6 +804,10 @@ class HostStream:
             process, preface = self.board.streamer(self.host)
             with self.write_lock:
                 self.process = process
+            errors = getattr(process, "stderr", None)
+            if errors is not None:
+                threading.Thread(target=forward_watch_errors, args=(self.name, errors), daemon=True,
+                                 name=THREAD_PREFIX + "-live-err-" + self.name).start()
             if self.stopping:
                 return
             if preface:
@@ -892,6 +1007,7 @@ class Board:
         with self.host_locks[name]:
             started = self.clock()
             update = {"ok": False, "paused": True, "error": "수집 결과를 처리하지 못했습니다."}
+            detail = ""
             try:
                 with self.lock:
                     self.state[name]["refreshing"] = True
@@ -902,6 +1018,7 @@ class Board:
                           "fetchedAt": int(self.clock())}
             except RuntimeError as exc:
                 update = {"ok": False, "paused": True, "error": str(exc)}
+                detail = getattr(exc, "detail", "")
             except Exception as exc:
                 log_failure("기기 수집", exc)
             finally:
@@ -915,6 +1032,7 @@ class Board:
                         self.state[name].update(durationMs=update["durationMs"], refreshing=False)
                     else:
                         self.state[name].update(update)
+                        self.log_collection(name, update, detail)
                         if update["ok"]:
                             self.backoff.pop(name, None)
                         else:
@@ -924,6 +1042,23 @@ class Board:
                     self.changed()
             self.persist("snapshot.json", self.snapshot)
             return update["ok"]
+
+    def log_collection(self, name, update, detail=""):
+        """One line when a host's collection starts failing, fails differently or recovers;
+        the caller holds self.lock. Repeats of the same failure are not written again."""
+        logged = getattr(self, "logged_errors", None)
+        if logged is None:
+            logged = self.logged_errors = {}
+        error = None if update.get("ok") else str(update.get("error") or "")
+        if error == logged.get(name):
+            return
+        if error is None:
+            sys.stderr.write(f"{LOG_PREFIX}: 기기 수집 복구 {name} ({update.get('durationMs', 0)}ms)\n")
+            logged.pop(name, None)
+            return
+        logged[name] = error
+        sys.stderr.write(f"{LOG_PREFIX}: 기기 수집 실패 {name} ({update.get('durationMs', 0)}ms): {error}"
+                         + (f" — {detail}" if detail else "") + "\n")
 
     def persist(self, filename, build):
         """State files are only a cache; a failed write never changes a collection result."""
@@ -1109,6 +1244,8 @@ class Board:
             if not (same and row["ok"] and row["live"] and not row["paused"] and row["error"] is None):
                 row.update(data=data, ok=True, paused=False, error=None, fetchedAt=int(now), live=True)
                 self.backoff.pop(stream.name, None)
+                # A failure logged by a one-shot collection is over: the watcher delivers.
+                self.log_collection(stream.name, {"ok": True, "durationMs": 0})
                 self.changed()
             moment = time.monotonic()
             if moment - self.live_saved.get(stream.name, moment - 30) >= 30:
@@ -1132,6 +1269,8 @@ class Board:
                 self.changed()
             now = time.monotonic()
             if not stream.stopping and not self.live_closed:
+                sys.stderr.write(f"{LOG_PREFIX}: 상주 수집기 종료 {stream.name} ({reason}, "
+                                 f"{int(now - stream.began)}초 실행, 전달 {'있음' if stream.delivered else '없음'})\n")
                 failures = self.stream_backoff.get(stream.name, (0, 0.0))[0]
                 failures = 1 if stream.delivered and now - stream.began >= self.STREAM_HEALTHY else failures + 1
                 delay = self.STREAM_BACKOFF[min(failures, len(self.STREAM_BACKOFF)) - 1]
@@ -1965,6 +2104,12 @@ class Handler(BaseHTTPRequestHandler):
         self.responded = False
         try:
             route()
+        except CLIENT_GONE as exc:
+            # Once the answer has started, a broken connection is the client leaving (a closed
+            # tab, a phone asleep), not this route's failure; before it, it is logged as usual.
+            if not self.responded:
+                log_failure(f"{self.command} {urlparse(self.path).path} 처리", exc)
+            self.close_connection = True
         except Exception as exc:
             log_failure(f"{self.command} {urlparse(self.path).path} 처리", exc)
             if self.responded:
@@ -1974,6 +2119,18 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(500, {"error": INTERNAL_ERROR})
             except OSError:
                 self.close_connection = True
+
+    def parse_request(self):
+        self.started = time.monotonic()
+        return super().parse_request()
+
+    def log_request(self, code="-", size="-"):
+        # The path, the status and the time to the answer; never the query string, which
+        # may carry a one-time login code.
+        took = int((time.monotonic() - getattr(self, "started", time.monotonic())) * 1000)
+        sys.stderr.write("%s %s %s %s %dms\n" % (self.log_date_time_string(), getattr(self, "command", None) or "-",
+                                                 urlparse(getattr(self, "path", "") or "").path,
+                                                 getattr(code, "value", code), took))
 
     def log_message(self, fmt, *args):
         # Log the path only; query strings may carry a one-time login code.
@@ -1989,14 +2146,19 @@ class Handler(BaseHTTPRequestHandler):
             if len(body) >= GZIP_MIN and self.accepts_gzip():
                 body = gzip.compress(body, compresslevel=6, mtime=0)
                 headers["Content-Encoding"] = "gzip"
-        self.send_response(code)
-        for key, value in headers.items():
-            self.send_header(key, value)
-        self.send_header("Content-Type", content_type)
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        if self.command != "HEAD":
-            self.wfile.write(body)
+        try:
+            self.send_response(code)
+            for key, value in headers.items():
+                self.send_header(key, value)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            if self.command != "HEAD":
+                self.wfile.write(body)
+        except CLIENT_GONE:
+            # The client left before the answer: nothing more can reach it, and the route
+            # did its work (a write error is never taken for the route's own failure).
+            self.close_connection = True
 
     def send_json(self, code, data, extra=None):
         body = json.dumps(data, ensure_ascii=False).encode()
@@ -2004,10 +2166,13 @@ class Handler(BaseHTTPRequestHandler):
                        compress=True)
 
     def send_not_modified(self, extra):
-        self.send_response(304)
-        for key, value in {**SECURITY_HEADERS, **extra}.items():
-            self.send_header(key, value)
-        self.end_headers()
+        try:
+            self.send_response(304)
+            for key, value in {**SECURITY_HEADERS, **extra}.items():
+                self.send_header(key, value)
+            self.end_headers()
+        except CLIENT_GONE:
+            self.close_connection = True
 
     def tailscale_authorized(self):
         """Trust identity headers only from the opted-in loopback HTTPS Serve route.
@@ -2208,6 +2373,10 @@ class Handler(BaseHTTPRequestHandler):
                 if url.path == "/api/goals":
                     return self.send_json(200, self.server.goals.snapshot())
                 if url.path == "/api/work":
+                    if not getattr(self.server, "work_list", True):
+                        # Only a screen from before the work tab was retired asks for this: it is
+                        # told to reload instead of being sent the list (and the store read for it).
+                        return self.send_json(410, {"error": "작업 탭은 없어졌습니다. 화면을 새로고침해 주세요.", "code": "retired"})
                     return self.send_json(200, self.server.work.snapshot())
                 if url.path == "/api/bot-requests":
                     return self.send_json(200, scrub_payload(self.server.bot_requests.snapshot()))
@@ -2240,7 +2409,9 @@ class Handler(BaseHTTPRequestHandler):
                 if url.path == "/api/capabilities":
                     result = self.server.workflow.capabilities()
                     return self.send_json(200, {**result, "csrfToken": self.server.csrf,
-                                               "authMode": "tailscale" if self.tailscale_authorized() else "token"})
+                                               "authMode": "tailscale" if self.tailscale_authorized() else "token",
+                                               # The screen served now: an older open page offers a reload.
+                                               "webVersion": self.server.assets.manifest().get("/app.js")})
                 if url.path == "/api/terminals":
                     # Read before the list: a change in between is announced with a newer
                     # version, so the client reads again rather than missing it.
@@ -2249,9 +2420,14 @@ class Handler(BaseHTTPRequestHandler):
                     version = self.server.events.terminals_version
                     records = self.server.terminals.list()
                     result = {"terminals": records, "version": version}
+                    # Rows the terminal list forgot (old closes) still may have receipts.
+                    take = getattr(self.server.terminals, "take_forgotten", None)
+                    forgotten = take() if take else []
                     try:
-                        self.server.terminal_inputs.prune_all_closed(records)
+                        self.server.terminal_inputs.prune_all_closed(records + forgotten)
                     except (ValueError, RuntimeError, OSError):
+                        if forgotten:
+                            self.server.terminals.restore_forgotten(forgotten)
                         result["inputCleanupPending"] = True
                     return self.send_json(200, result)
                 match = re.fullmatch(r"/api/terminal/([a-f0-9]{32})/events", url.path)
@@ -2268,8 +2444,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_json(400, {"error": str(exc) if isinstance(exc, ValueError) else "터미널을 찾지 못했어요."})
             except RuntimeError as exc:
                 return self.send_json(409, {"error": str(exc)})
-            except (OSError, ImportError):
-                return self.send_json(503, {"error": "실행 연결을 준비하지 못했어요. 설정을 확인해 주세요."})
+            except (OSError, ImportError) as exc:
+                return self.send_json(503, {"error": unavailable_message(exc)})
             return self.send_json(404, {"error": "없는 경로입니다."})
         return self.static(url.path, url.query)
 
@@ -2518,8 +2694,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_json(400, {"error": str(exc) if isinstance(exc, ValueError) else "터미널을 찾지 못했어요."})
         except RuntimeError as exc:
             return self.send_json(409, {"error": str(exc)})
-        except (OSError, ImportError):
-            return self.send_json(503, {"error": "실행 연결을 준비하지 못했어요. 원래 작업은 유지됩니다."})
+        except (OSError, ImportError) as exc:
+            return self.send_json(503, {"error": unavailable_message(exc, "실행 연결을 준비하지 못했어요. 원래 작업은 유지됩니다.")})
         return self.send_json(404, {"error": "없는 경로입니다."})
 
     def login_once(self, code):
@@ -2587,8 +2763,9 @@ class BoardHTTPServer(ThreadingHTTPServer):
 
 
 def make_server(bind, port, board, token, terminals=None, workflow=None, state_dir=STATE_DIR, max_terminals=None,
-                tailscale_user=None, usage=None, automatic_work=False, push=True, hardware=None):
-    """`usage` (usage.UsageMeter) serves /api/usage; without it the routes stay 404."""
+                tailscale_user=None, usage=None, automatic_work=False, push=True, hardware=None, work_list=True):
+    """`usage` (usage.UsageMeter) serves /api/usage; without it the routes stay 404.
+    `work_list` False answers GET /api/work as retired (the screen no longer has the tab)."""
     if bind not in ("127.0.0.1", "::1"):
         raise ValueError("서버는 loopback에서만 실행할 수 있습니다.")
     if tailscale_user is not None and (not isinstance(tailscale_user, str) or not tailscale_user
@@ -2621,6 +2798,7 @@ def make_server(bind, port, board, token, terminals=None, workflow=None, state_d
     server.workflow = workflow if workflow is not None else Workflow(board, server.terminals, state_dir)
     server.workflow.goals = server.goals
     server.work = WorkService(board, server.goals, state_dir)
+    server.work_list = work_list
     server.workflow.work = server.work
     from bot_requests import BotRequests
     server.bot_requests = BotRequests(board.hosts, CONFIG_DIR / "bot-sources.json", state_dir)
@@ -2713,13 +2891,17 @@ def main(argv=None):
                                    manual_interval=config["hardware"]["manualIntervalSeconds"])
     httpd = make_server(args.bind, args.port, board, token, state_dir=args.state_dir,
                         max_terminals=args.max_terminals, tailscale_user=tailscale_user, usage=meter, hardware=hardware,
-                        automatic_work=args.auto_work and not args.no_auto_work, push=not args.no_push)
+                        automatic_work=args.auto_work and not args.no_auto_work, push=not args.no_push,
+                        work_list=args.auto_work and not args.no_auto_work)
     collecting = "화면을 열 때와 알림을 받는 기기가 있을 때 수집합니다." if not args.no_push else "화면을 열 때만 수집합니다."
     print(f"{LOG_PREFIX}: http://127.0.0.1:{args.port}/ · {collecting}", file=sys.stderr)
     if args.open:
         print(issue_login_link(httpd), flush=True)
         print(f"표준 출력의 일회용 로그인 링크를 {ONCE_TTL // 60}분 안에 개인 브라우저에서 여세요. 한 번만 사용할 수 있습니다.",
               file=sys.stderr)
+    if args.state_dir:
+        threading.Thread(target=rotate_logs_forever, args=(args.state_dir,), daemon=True,
+                         name=THREAD_PREFIX + "-logs").start()
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:

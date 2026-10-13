@@ -48,7 +48,7 @@ function client(
     json: async () => ({ ok: true }),
   }),
   timers = { setTimeout, clearTimeout },
-  { instanceMeta } = {},
+  { instanceMeta, currentScript } = {},
 ) {
   const nodes = new Map();
   const frames = [];
@@ -79,6 +79,7 @@ function client(
     },
   };
   // The server fills <meta name="sessionholic-instance">; app.js reads it once at load.
+  if (currentScript !== undefined) document.currentScript = currentScript;
   if (instanceMeta !== undefined) {
     document.querySelector = (selector) => (selector === 'meta[name="sessionholic-instance"]'
       ? { getAttribute: (name) => (name === 'content' ? instanceMeta : null) } : null);
@@ -127,7 +128,7 @@ function client(
   vm.runInContext(messageSource, context);
   vm.runInContext(source, context);
   const api = vm.runInContext(
-    "({state,api,sourceOf,accountOf,sendInput,pasteDraft,prepareDraftPaste,startDraftComposition,endDraftComposition,inputDraft,stopTerminalReader,startTerminalReader,closePlan,navigateView,backToList,backFromTerminal,closeTerminal,cancelTerminalClose,confirmTerminalClose,populateAccount,populateRoute,updateContinue,renderPlan,launchPlan,openTerminal,saveDraft,draftKey,refreshTerminals,renderTerminals,renderTerminalReturn,renderFilters,terminalCloseCopy,warnDraftUnload,preparePlan,renderGroups,renderMessages,loadDetail,chatKey,chatEntry,currentChat,chatSupported,chatRecovery,recoverChatSession,openChatTerminal,chatAttachmentsSupported,buildChatComposer,sendChat,loadChatState,applyChatReceipt,uploadChatFiles,pasteChat,scheduleChatPoll,stopChatPolling,openNativeChat,allSessions,buildContinuePanel,chatReceiptCopy,returnToBoard,readChatClipboard,accountDisplay,sessionAccountLabel,closeChatToolsOutside,closeChatToolsEscape,drawDetail,refreshDetail,loadCapabilities,matches,recoverConnection,networkOffline,poll,select,focusDetailBack,restoreSelectedCardFocus,showLogin,lock,beginAuthEpoch,resizeChatInput,updateViewport,draftKeydown,configureTerminalKeyboard,queueTerminalScroll,flushTerminalScroll,terminalScrollEnd,resetTerminalScroll,renderAttention,chatPollDelay,pullRefresh,readingScroll,renderJump,pullDistance,listScroll,setReading,renderPrompt,promptAction,renderUsage,loadUsage,applyTheme,setTheme,updateThemeColor,haptic,navTransition,setDetailShown,chatVisible,sheetRelease,BottomSheet,sheet,openSettings,closeSettings,setTyping,pinchFontSize,setTerminalFontSize,loadXterm,assetUrl,syncEvents,closeEvents,eventsHealthy,renderFreshness,schedule,touchDevice,togglePhaseFilter,renderCounts,createLongPress,swipeIntent,swipeRelease,groupMessageRows,setTextSize,applyTextSize,renderConnectivity,terminalForSession,swipeActionFor,openMessageMenu,openCardMenu,messageActions,outboxShape,outboxMatches,outboxOrigin,settleOutbox,retryOutbox,renderAttachmentTiles,attachmentThumb,sendUpload,openActionSheet,closeActionSheet,setListCollapsed,closeSwipe,settleSwipe,prepareSwipe,runSwipeAction,GESTURE,setChromeVisible,toggleChrome,revealChrome,isChromeTap,snapshotAnnounced,updateChatComposer,capabilitiesRevision,toolKindOf,userMessageParts,formatElapsed,tickWorking,renderTerminalMarks,renderDetailTerminal,terminalsAnnounced,goToSessionTerminal,rememberTerminal,terminalMenu,updateTerminalMenu,chooseTerminalMenu,clearTerminalMenu,renderNewSession,openNewSession,startNewSession,startAppServer,rememberConversationView,restoreConversationView,conversationIdentity,initiatorOf,initiatorLabel,documentKeydown,sessionCategoryOf,setSessionCategory,renderSessionCategories,prepareSessionListFor,sessionCategoryKeydown,render,resetFilters,terminalTitle,renameTerminals,requestedSessionFrom,requestSessionOpen,openRequestedSession,answerOnOpen,hardReload,terminalKeyBytes,terminalKeyFromEvent,pressTerminalKey,toggleTerminalMod,clearTerminalMods,renderTerminalMods,draftBeforeInput,terminalDocumentKey,xtermKeyEvent,renderHardware,loadHardware,startDictation,stopDictation,dictationText,toggleDraftDictation,renderDictation,DICTATION_LISTENING,DICTATION_ERRORS,DICTATION_PREPARING,DICTATION_STALLED,DICTATION_ENDED_AT_ONCE,DICTATION_INTERRUPTED,DICTATION_NOT_STARTED,DICTATION_SILENCE_END,bindDraftInput,insertChatText})",
+    "({state,api,sourceOf,accountOf,sendInput,pasteDraft,prepareDraftPaste,startDraftComposition,endDraftComposition,inputDraft,stopTerminalReader,startTerminalReader,closePlan,navigateView,backToList,backFromTerminal,closeTerminal,cancelTerminalClose,confirmTerminalClose,populateAccount,populateRoute,updateContinue,renderPlan,launchPlan,openTerminal,saveDraft,draftKey,refreshTerminals,renderTerminals,renderTerminalReturn,renderFilters,terminalCloseCopy,warnDraftUnload,preparePlan,renderGroups,renderMessages,loadDetail,chatKey,chatEntry,currentChat,chatSupported,chatRecovery,recoverChatSession,openChatTerminal,chatAttachmentsSupported,buildChatComposer,sendChat,loadChatState,applyChatReceipt,uploadChatFiles,pasteChat,scheduleChatPoll,stopChatPolling,openNativeChat,allSessions,buildContinuePanel,chatReceiptCopy,returnToBoard,readChatClipboard,accountDisplay,sessionAccountLabel,closeChatToolsOutside,closeChatToolsEscape,drawDetail,refreshDetail,loadCapabilities,matches,recoverConnection,networkOffline,poll,select,focusDetailBack,restoreSelectedCardFocus,showLogin,lock,beginAuthEpoch,resizeChatInput,updateViewport,draftKeydown,configureTerminalKeyboard,queueTerminalScroll,flushTerminalScroll,terminalScrollEnd,resetTerminalScroll,renderAttention,chatPollDelay,pullRefresh,readingScroll,renderJump,pullDistance,listScroll,setReading,renderPrompt,promptAction,renderUsage,loadUsage,applyTheme,setTheme,updateThemeColor,haptic,navTransition,setDetailShown,chatVisible,sheetRelease,BottomSheet,sheet,openSettings,closeSettings,setTyping,pinchFontSize,setTerminalFontSize,loadXterm,assetUrl,syncEvents,closeEvents,eventsHealthy,renderFreshness,schedule,touchDevice,togglePhaseFilter,renderCounts,createLongPress,swipeIntent,swipeRelease,groupMessageRows,setTextSize,applyTextSize,renderConnectivity,terminalForSession,swipeActionFor,openMessageMenu,openCardMenu,messageActions,outboxShape,outboxMatches,outboxOrigin,settleOutbox,retryOutbox,renderAttachmentTiles,attachmentThumb,sendUpload,openActionSheet,closeActionSheet,setListCollapsed,closeSwipe,settleSwipe,prepareSwipe,runSwipeAction,GESTURE,setChromeVisible,toggleChrome,revealChrome,isChromeTap,snapshotAnnounced,updateChatComposer,capabilitiesRevision,toolKindOf,userMessageParts,formatElapsed,tickWorking,renderTerminalMarks,renderDetailTerminal,terminalsAnnounced,goToSessionTerminal,rememberTerminal,terminalMenu,updateTerminalMenu,chooseTerminalMenu,clearTerminalMenu,renderNewSession,openNewSession,startNewSession,startAppServer,rememberConversationView,restoreConversationView,conversationIdentity,initiatorOf,initiatorLabel,documentKeydown,sessionCategoryOf,setSessionCategory,renderSessionCategories,prepareSessionListFor,sessionCategoryKeydown,render,resetFilters,terminalTitle,renameTerminals,requestedSessionFrom,requestSessionOpen,openRequestedSession,answerOnOpen,hardReload,terminalKeyBytes,terminalKeyFromEvent,pressTerminalKey,toggleTerminalMod,clearTerminalMods,renderTerminalMods,draftBeforeInput,terminalDocumentKey,xtermKeyEvent,renderHardware,loadHardware,startDictation,stopDictation,dictationText,toggleDraftDictation,renderDictation,DICTATION_LISTENING,DICTATION_ERRORS,DICTATION_PREPARING,DICTATION_STALLED,DICTATION_ENDED_AT_ONCE,DICTATION_INTERRUPTED,DICTATION_NOT_STARTED,DICTATION_SILENCE_END,bindDraftInput,insertChatText,reloadForUpdate,checkWebVersion,unsavedWork,detailMetaChildren,updateBannerPressed,manualRefresh})",
     context,
   );
   api.state.csrf = "csrf-test";
@@ -3169,7 +3170,7 @@ test('recent card updates retain mounted buttons, selection, keyboard focus and 
   c.state.selected = first.key;
   c.renderGroups([first, second], 1100);
   const cards = byClass(c.get('groups'), 'card'); const selected = cards.find((card) => card.dataset.sessionKey === first.key);
-  assert.equal(cards[0].dataset.sessionKey, second.key); // Existing recent sort is unchanged.
+  assert.equal(cards[0].dataset.sessionKey, first.key); // The same title: the session key keeps the order.
   selected.focus = function () { this.focusCount = (this.focusCount || 0) + 1; c.context.document.activeElement = this; };
   c.context.document.activeElement = selected;
   const pane = c.get('task-list-pane'); pane.scrollTop = 55;
@@ -3221,7 +3222,7 @@ test('changing list filters removes hidden cards without changing the selected s
   const first = recentSession('preview-a', { title: '설정 점검', snippet: '이전에 확인한 대화의 본문', project: 'First project' });
   const second = recentSession('preview-b', { project: 'Second project' });
   c.state.selected = first.key; c.renderGroups([first, second], 1100);
-  const original = byClass(c.get('groups'), 'card')[0];
+  const original = byClass(c.get('groups'), 'card').find((card) => card.dataset.sessionKey === first.key);
   assert.equal(byClass(original, 'card-snippet')[0].textContent, '이전에 확인한 대화의 본문');
   assert.match(original.attributes['aria-label'], /대화 미리보기: 이전에 확인한 대화의 본문/);
   c.state.filters.project = 'Second project'; c.renderGroups([second], 1100);
@@ -3650,6 +3651,189 @@ test('pull to refresh reloads the board once and never overlaps a running refres
   await Promise.all([first, second]);
   assert.equal(c.state.pullRefreshing, false);
   assert.equal(requests[0], '/api/refresh');
+});
+
+test('a request with no answer within its limit fails as a timeout, so a held read never blocks the next; sends and launches wait longer', async () => {
+  const limits = [];
+  const c = client((path, options) => new Promise((resolve, reject) => {
+    options.signal.addEventListener('abort', () => reject(Object.assign(new Error('The operation was aborted.'), { name: 'AbortError' })));
+  }), noChatTimers);
+  c.context.AbortSignal = { timeout(ms) { const controller = new AbortController(); limits.push({ ms, controller }); return controller.signal; } };
+  const read = c.api('/api/snapshot');
+  assert.equal(limits[0].ms, 30000);
+  limits[0].controller.abort();
+  await assert.rejects(read, (err) => err.timeout === true && /응답이 늦어 기다리기를 멈췄습니다/.test(err.message));
+  const send = c.api('/api/chat/send', { method: 'POST', body: {} }).catch((err) => err);
+  const launch = c.api('/api/launch', { method: 'POST', body: {} }).catch((err) => err);
+  const remoteRead = c.api('/api/read?host=pc&agent=codex&id=fixture').catch((err) => err);
+  assert.deepEqual(limits.slice(1).map((item) => item.ms), [90000, 660000, 45000], 'a query string does not hide the route');
+  // The caller's own abort still ends the request, and is not called a timeout.
+  const caller = new AbortController();
+  const own = c.api('/api/terminals', { signal: caller.signal });
+  caller.abort();
+  await assert.rejects(own, (err) => err.name === 'AbortError' && !err.timeout);
+  for (const item of limits) item.controller.abort();
+  assert.equal((await send).timeout, true); assert.equal((await remoteRead).timeout, true);
+  const late = await launch;
+  assert.equal(late.timeout, true);
+  assert.match(late.message, /이미 시작됐거나 전달됐을 수 있으니 목록과 터미널을 확인/, 'a launch may have started: no blind retry');
+});
+
+test('pull to refresh waits for a list read in flight, then says it could not refresh when the read fails', async () => {
+  const requests = [];
+  let release = null;
+  const c = client(async (url) => {
+    requests.push(url);
+    if (url.startsWith('/api/snapshot')) {
+      if (!release) await new Promise((resolve) => { release = resolve; });
+      throw new TypeError('Load failed');
+    }
+    return { ok: true, status: 200, json: async () => ({ ok: true, hosts: [], terminals: [] }) };
+  }, { setTimeout: (callback, delay) => (delay === 700 ? setImmediate(callback) : 1), clearTimeout() {} });
+  c.state.authenticated = true;
+  const label = c.get('pull-refresh-label'); const seen = []; let text = '';
+  Object.defineProperty(label, 'textContent', { get: () => text, set: (value) => { text = value; seen.push(value); } });
+  const inFlight = c.poll(false);
+  await new Promise((resolve) => setImmediate(resolve));
+  const pulled = c.pullRefresh();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(requests.includes('/api/refresh'), false); // The read in flight is waited for first.
+  release();
+  assert.equal(await inFlight, false);
+  await pulled;
+  assert.ok(requests.indexOf('/api/refresh') > requests.indexOf('/api/snapshot'));
+  assert.equal(requests.filter((url) => url.startsWith('/api/snapshot')).length, 2);
+  assert.ok(seen.includes('새로고침하지 못했습니다'));
+  assert.ok(!seen.includes('업데이트됨'));
+  assert.ok(c.state.pollFailures >= 2);
+});
+
+test('a page older than the screen the board serves offers a reload, and reloads on coming back when nothing would be lost', async () => {
+  const capabilities = { csrfToken: 'csrf-test', webVersion: 'bbbb2222' };
+  const c = client(async () => ({ ok: true, status: 200, json: async () => capabilities }), noChatTimers,
+    { currentScript: { src: 'https://board.test/app.js?v=aaaa1111' } });
+  let reloaded = 0;
+  c.context.window.location = { reload: () => { reloaded += 1; } };
+  c.state.authenticated = true; c.state.snapshot = { hosts: [] };
+  c.state.shownAt = 0; // Not just back on the page: the banner offers it.
+  await c.loadCapabilities(c.state.authEpoch, { refreshView: false });
+  assert.equal(c.state.updateAvailable, true);
+  assert.equal(c.get('update-banner').hidden, false);
+  assert.equal(reloaded, 0);
+  // Something unsent in a composer, or a terminal on screen: coming back still only offers it.
+  c.state.chats.set('draft', { text: '보내지 않은 말', attachments: [] });
+  assert.equal(c.unsavedWork(), true);
+  assert.equal(c.reloadForUpdate(), false);
+  c.state.chats.clear();
+  c.state.terminalVisible = true;
+  assert.equal(c.reloadForUpdate(), false);
+  c.state.terminalVisible = false;
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(reloaded, 0);
+  // Offline, or with a sheet open, it waits too.
+  c.context.navigator = { onLine: false };
+  assert.equal(c.networkOffline(), true);
+  assert.equal(c.reloadForUpdate(), false);
+  c.context.navigator = { onLine: true };
+  c.context.document.querySelector = (selector) => (selector === 'dialog[open]' ? {} : null);
+  assert.equal(c.reloadForUpdate(), false);
+  c.context.document.querySelector = () => null;
+  // The banner's tap keeps unsent words too.
+  c.state.chats.set('draft', { text: '보내지 않은 말', attachments: [] });
+  c.updateBannerPressed();
+  assert.match(c.get('toast').textContent, /보내지 않은 글이나 첨부가 있어 새로고침하지 않았습니다/);
+  c.state.chats.clear();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(reloaded, 0);
+  // Nothing would be lost: coming back loads the newer screen.
+  assert.equal(c.reloadForUpdate(), true);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(reloaded, 1);
+  // Found right after coming back, it loads at once.
+  const back = client(async () => ({ ok: true, status: 200, json: async () => capabilities }), noChatTimers,
+    { currentScript: { src: 'https://board.test/app.js?v=aaaa1111' } });
+  let again = 0;
+  back.context.window.location = { reload: () => { again += 1; } };
+  back.state.shownAt = Date.now();
+  await back.loadCapabilities(back.state.authEpoch, { refreshView: false });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(again, 1);
+  // The same screen, or a page that cannot tell its own, offers nothing.
+  const same = client(async () => ({ ok: true, status: 200, json: async () => ({ csrfToken: 'x', webVersion: 'aaaa1111' }) }),
+    noChatTimers, { currentScript: { src: 'https://board.test/app.js?v=aaaa1111' } });
+  await same.loadCapabilities(same.state.authEpoch, { refreshView: false });
+  assert.equal(same.state.updateAvailable, false);
+  const unknown = client(async () => ({ ok: true, status: 200, json: async () => capabilities }), noChatTimers);
+  await unknown.loadCapabilities(unknown.state.authEpoch, { refreshView: false });
+  assert.equal(unknown.state.updateAvailable, false);
+});
+
+test('a device that lost its connection comes first among the header chips, and a tap says each one\'s state', () => {
+  const c = client(undefined, noChatTimers);
+  c.state.snapshot = { serverTime: 1000, hosts: [
+    { name: 'studio', label: '작업 컴퓨터', ok: true, fetchedAt: 990 },
+    { name: 'laptop', label: '노트북', ok: true, refreshing: true, fetchedAt: 900 },
+    { name: 'pc', label: 'PC', ok: false, error: 'SSH 연결 실패', fetchedAt: 600 },
+  ] };
+  c.render();
+  const chips = c.get('hosts').children;
+  // A collection in progress only pulses its dot: it does not move ahead.
+  assert.deepEqual(chips.map((chip) => chip.children[1].textContent), ['PC', '작업 컴퓨터', '노트북']);
+  assert.deepEqual(chips.map((chip) => chip.className), ['host bad', 'host ok', 'host checking']);
+  assert.equal(chips[0].tagName, 'BUTTON');
+  chips[0].events.click();
+  assert.match(c.get('toast').textContent, /^PC · SSH 연결 실패 · 마지막 확인/);
+  // A lost device being checked again keeps its place in front.
+  c.state.snapshot.hosts[2].refreshing = true; c.render();
+  assert.equal(c.get('hosts').children[0].children[1].textContent, 'PC');
+  c.state.snapshot.hosts[2].refreshing = false;
+  // A warning (a PC project server off) puts a reachable device right after a lost one; a
+  // collector's informational errors do not, though a tap still says them.
+  c.state.snapshot.hosts[0].data = { warnings: ['PC 프로젝트 Codex 서버가 꺼져 있어 그 프로젝트의 실행 상태를 확인하지 못했습니다: fixture.'] };
+  c.state.snapshot.hosts[1].data = { errors: ['일부 작업을 아직 읽지 못했습니다.'] };
+  c.render();
+  const again = c.get('hosts').children;
+  assert.deepEqual(again.map((chip) => chip.className), ['host bad', 'host warn', 'host checking']);
+  again[1].events.click();
+  assert.match(c.get('toast').textContent, /^작업 컴퓨터 · .* 확인 · PC 프로젝트 Codex 서버가 꺼져/);
+});
+
+test('a PC record says why its state is what it is under the conversation title', () => {
+  const c = client(undefined, noChatTimers);
+  const base = { agent: 'codex', hostLabel: 'PC', account: '기기 Codex', updatedAt: 100, phase: 'unknown', runtimeKnown: false };
+  const reason = '이 프로젝트의 Codex 서버가 PC에서 꺼져 있어 실행 상태를 확인하지 못했습니다.';
+  const parts = c.detailMetaChildren({ ...base, runtimeReason: reason });
+  assert.equal(parts[0].textContent, '실행 확인 전');
+  assert.equal(parts.at(-1).className, 'detail-runtime'); assert.equal(parts.at(-1).textContent, reason);
+  assert.ok(!c.detailMetaChildren(base).some((part) => part.className === 'detail-runtime'));
+});
+
+test('pulling while a refresh runs shares it instead of calling it failed', async () => {
+  const requests = [];
+  let release;
+  const c = client(async (url) => {
+    requests.push(url);
+    if (url === '/api/refresh') await new Promise((resolve) => { release = resolve; });
+    return { ok: true, status: 200, json: async () => ({ ok: true, hosts: [], terminals: [] }) };
+  }, { setTimeout: (callback, delay) => (delay === 700 ? setImmediate(callback) : 1), clearTimeout() {} });
+  c.state.authenticated = true;
+  const label = c.get('pull-refresh-label'); const seen = []; let text = '';
+  Object.defineProperty(label, 'textContent', { get: () => text, set: (value) => { text = value; seen.push(value); } });
+  const pressed = c.manualRefresh();
+  await new Promise((resolve) => setImmediate(resolve));
+  const pulled = c.pullRefresh();
+  await new Promise((resolve) => setImmediate(resolve));
+  release();
+  assert.equal(await pressed, true);
+  await pulled;
+  assert.equal(requests.filter((url) => url === '/api/refresh').length, 1);
+  assert.ok(seen.includes('업데이트됨')); assert.ok(!seen.includes('새로고침하지 못했습니다'));
+  // While a launch is prepared nothing is tried, and the pull says so.
+  c.state.launchBusy = true;
+  seen.length = 0;
+  assert.equal(await c.manualRefresh(), null);
+  await c.pullRefresh();
+  assert.ok(seen.some((value) => /잠시 뒤 다시 당겨/.test(value)));
 });
 
 function classes() {
@@ -7061,9 +7245,25 @@ test('the session list groups what needs an answer, what runs, what stopped in t
   const sections = c.get('groups').children.filter((node) => node.dataset?.groupKey);
   assert.deepEqual(sections.map((section) => section.cardHeading.textContent), ['답 필요', '작업 중', '최근 끝남', '이전']);
   const ids = (section) => section.children.filter((node) => node.dataset?.sessionKey).map((node) => node.dataset.sessionKey.split('|').pop());
-  assert.deepEqual(sections.map(ids), [['old-question'], ['running'], ['just-done', 'just-idle'], ['unknown', 'earlier']]);
+  // One title throughout: within a group the session key decides, never the update time.
+  assert.deepEqual(sections.map(ids), [['old-question'], ['running'], ['just-done', 'just-idle'], ['earlier', 'unknown']]);
   assert.equal(sections[2].cardHeading.className, 'group-head green');
   assert.ok(!shown.some((s) => s.id === 'ancient'), 'only the 이전 group drops sessions older than three days');
+});
+
+test('each list group keeps its sessions in title order (가나다, numbers by value) however often they update; a rename moves one', () => {
+  const c = client(undefined, noChatTimers);
+  const now = 2_000_000;
+  const at = (id, title, updatedAt) => recentSession(id, { phase: 'working', title, updatedAt });
+  const titles = () => byClass(c.get('groups'), 'card').map((card) => byClass(card, 'card-title')[0].textContent);
+  c.renderGroups([at('a', '작업 10', now - 1), at('b', '나 정리', now - 50), at('c', '작업 2', now - 9), at('d', '가 검토', now - 30)], now);
+  assert.deepEqual(titles(), ['가 검토', '나 정리', '작업 2', '작업 10']);
+  // Every session updates (in another order): the list does not move.
+  c.renderGroups([at('a', '작업 10', now - 40), at('b', '나 정리', now), at('c', '작업 2', now - 70), at('d', '가 검토', now - 2)], now);
+  assert.deepEqual(titles(), ['가 검토', '나 정리', '작업 2', '작업 10']);
+  // A 제목 수정 is how one is moved.
+  c.renderGroups([at('a', '0 먼저 볼 작업', now), at('b', '나 정리', now), at('c', '작업 2', now), at('d', '가 검토', now)], now);
+  assert.deepEqual(titles(), ['0 먼저 볼 작업', '가 검토', '나 정리', '작업 2']);
 });
 
 // The board's own clock format; ICU data differs between Node versions (오후 / PM),

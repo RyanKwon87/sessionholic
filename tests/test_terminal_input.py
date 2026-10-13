@@ -29,6 +29,20 @@ class TerminalInputTest(unittest.TestCase):
         with sqlite3.connect(str(self.ledger.path)) as db:
             return db.execute('SELECT count FROM totals').fetchone()[0]
 
+    def test_a_failed_write_on_a_nearly_full_disk_says_so(self):
+        import shutil as shutil_module
+        from collections import namedtuple
+        usage = namedtuple("usage", "total used free")
+        with patch.object(sqlite3, "connect", side_effect=sqlite3.OperationalError("database or disk is full")), \
+                patch.object(shutil_module, "disk_usage", return_value=usage(10, 10, 1024)):
+            with self.assertRaisesRegex(RuntimeError, "디스크가 거의 가득"):
+                self.ledger.submit(TID, RID, 'fixture-input', self.write)
+        with patch.object(sqlite3, "connect", side_effect=sqlite3.OperationalError("disk I/O error")), \
+                patch.object(shutil_module, "disk_usage", return_value=usage(10, 1, 10 ** 10)):
+            with self.assertRaisesRegex(RuntimeError, "안전하게 저장하지 못했습니다"):
+                self.ledger.submit(TID, RID, 'fixture-input', self.write)
+        self.assertEqual(self.writes, [])
+
     def test_success_receipt_survives_restart_and_replay_never_writes(self):
         first = self.ledger.submit(TID, RID, 'fixture-input', self.write)
         restarted = TerminalInputs(self.root)

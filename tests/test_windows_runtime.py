@@ -46,6 +46,9 @@ class FakeReader:
     def endpoints(self):
         return self.paths
 
+    def writer_owners(self, ids):
+        return {sid: self.processes[12] for sid in ids if sid in getattr(self, 'held', ())}
+
     def project(self, cwd):
         relative = Path(cwd).relative_to(self.home / 'Projects') if str(cwd).startswith(str(self.home / 'Projects')) else Path(cwd)
         return relative.parts[0] if relative.parts else '기타'
@@ -422,6 +425,12 @@ class WindowsRuntimeTest(unittest.TestCase):
         self.reader.paths = []
         with self.assertRaisesRegex(ValueError, '꺼져'):
             self.runtime.terminal_plan(self.source)
+        # A thread another Codex process writes (a codex exec) is never resumed alongside it.
+        self.reader.paths = [self.reader.path]
+        self.reader.held = {self.reader.sid}
+        with self.assertRaisesRegex(ValueError, '다른 Codex 실행'):
+            self.runtime.terminal_plan(self.source)
+        self.reader.held = set()
         self.reader.row['archived'] = 1
         with self.assertRaises(ValueError):
             self.runtime.terminal_plan(self.source)

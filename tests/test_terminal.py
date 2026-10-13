@@ -471,6 +471,118 @@ class ValidationTest(unittest.TestCase):
         self.assertFalse(stream.attached_fresh)
 
 
+class ListingTest(unittest.TestCase):
+    """A listing asks tmux once, not once per terminal while the lock is held, and closed
+    rows neither keep their output nor pile up for good."""
+
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.manager = terminal.TerminalManager(state_dir=self.directory.name, socket_name="sb-fixture-listing")
+
+    def tearDown(self):
+        self.manager.close()
+        self.directory.cleanup()
+
+    def add(self, letter, closed=False, reason=None, closed_at=float("-inf"), output=b""):
+        row = {"id": letter * 32, "name": "sb-" + letter * 32, "key": "fixture-" + letter, "metadata": {},
+               "socket": self.manager.socket_name}
+        if closed:
+            row.update(closed=True, closedReason=reason)
+        instance = terminal._Terminal(row, 1024)
+        if closed:
+            instance.closed_at = closed_at
+        instance.output = bytearray(output)
+        self.manager.terminals[row["id"]] = instance
+        return instance
+
+    def test_a_listing_asks_tmux_once_for_every_terminal(self):
+        for letter in "abc":
+            self.add(letter)
+        with patch.object(self.manager, "_live_names", return_value={"sb-" + "a" * 32}) as names, \
+                patch.object(self.manager, "_run") as run:
+            rows = {row["id"][0]: (row["alive"], row["closed"]) for row in self.manager.list()}
+        names.assert_called_once()
+        run.assert_not_called()
+        self.assertEqual(rows, {"a": (True, False), "b": (False, True), "c": (False, True)})
+
+    def test_an_unclear_tmux_answer_asks_each_terminal_as_before(self):
+        for letter in "ab":
+            self.add(letter)
+        ok = Mock(returncode=0)
+        with patch.object(self.manager, "_live_names", return_value=None), \
+                patch.object(self.manager, "_run", return_value=ok) as run:
+            self.assertEqual([row["alive"] for row in self.manager.list()], [True, True])
+        self.assertEqual([call.args[0] for call in run.call_args_list], ["has-session", "has-session"])
+
+    def test_nothing_to_check_asks_tmux_nothing(self):
+        self.add("a", closed=True, reason="user")
+        with patch.object(self.manager, "_live_names") as names:
+            self.manager.list()
+        names.assert_not_called()
+
+    def test_live_names_reads_one_list_and_no_server_is_no_sessions(self):
+        done = lambda code, out=b"", err=b"": subprocess.CompletedProcess([], code, out, err)
+        with patch.object(terminal.subprocess, "run", return_value=done(0, b"sb-one\nsb-two\n")) as run:
+            self.assertEqual(self.manager._live_names(), {"sb-one", "sb-two"})
+        self.assertIn("list-sessions", run.call_args.args[0])
+        with patch.object(terminal.subprocess, "run", return_value=done(1, err=b"no server running on /tmp/x")):
+            self.assertEqual(self.manager._live_names(), set())
+        with patch.object(terminal.subprocess, "run", return_value=done(1, err=b"error connecting to /tmp/x (No such file or directory)")):
+            self.assertEqual(self.manager._live_names(), set())
+        with patch.object(terminal.subprocess, "run", return_value=done(1, err=b"protocol version mismatch")):
+            self.assertIsNone(self.manager._live_names())
+        with patch.object(terminal.subprocess, "run", side_effect=subprocess.TimeoutExpired("tmux", 10)):
+            self.assertIsNone(self.manager._live_names())
+
+    def test_closed_rows_free_their_output_and_only_the_newest_are_kept(self):
+        self.add("f")
+        for letter in "abcd":
+            self.add(letter, closed=True, reason="connection_ended", output=b"old screen")
+        for letter in "12":
+            self.add(letter, closed=True, reason="user", output=b"closed by hand")
+        recent = self.add("e", closed=True, reason="released", closed_at=time.monotonic(), output=b"just closed")
+        with patch.object(terminal, "CLOSED_KEEP", 2), patch.object(terminal, "USER_CLOSED_KEEP", 1), \
+                patch.object(self.manager, "_live_names", return_value={"sb-" + "f" * 32}):
+            ids = [row["id"][0] for row in self.manager.list()]
+        # The open row, the two newest other closes, the newest own close and the one closed moments ago.
+        self.assertEqual(ids, ["f", "c", "d", "2", "e"])
+        self.assertEqual([row["id"][0] for row in json.loads(self.manager.state_path.read_text())], ids)
+        self.assertEqual(bytes(self.manager.terminals["c" * 32].output), b"")
+        self.assertEqual(self.manager.terminals["c" * 32].read(0, 0)["data"], "")
+        self.assertEqual(bytes(recent.output), b"just closed", "still readable right after closing")
+
+    def test_another_thread_never_reads_a_listings_answer(self):
+        row = self.add("a")
+        seen = []
+        def names():
+            # While this listing holds its answer, a reader thread asks on its own.
+            other = threading.Thread(target=lambda: seen.append(self.manager._exists(row)))
+            other.start(); other.join()
+            return {"sb-" + "a" * 32}
+        with patch.object(self.manager, "_live_names", side_effect=names), \
+                patch.object(self.manager, "_run", return_value=Mock(returncode=1)) as run:
+            self.assertTrue(self.manager.list()[0]["alive"])
+        self.assertEqual(seen, [False], "the other thread got tmux's own answer")
+        self.assertEqual(run.call_args.args[0], "has-session")
+
+    def test_the_oldest_closes_are_forgotten_first_whatever_order_they_were_opened(self):
+        for letter, closed_at in (("a", 300), ("b", 100), ("c", 200)):
+            self.add(letter, closed=True, reason="user").record["closedAt"] = closed_at
+        with patch.object(terminal, "USER_CLOSED_KEEP", 2):
+            self.assertEqual([row["id"][0] for row in self.manager.list()], ["a", "c"])
+        self.assertEqual(self.manager.take_forgotten(), [{"id": "b" * 32, "closed": True}])
+        self.assertEqual(self.manager.take_forgotten(), [])
+        self.manager.restore_forgotten([{"id": "b" * 32, "closed": True}])
+        self.assertEqual([row["id"] for row in self.manager.take_forgotten()], ["b" * 32])
+
+    def test_rows_not_saved_as_forgotten_are_kept(self):
+        for letter in "abc":
+            self.add(letter, closed=True, reason="connection_ended")
+        with patch.object(terminal, "CLOSED_KEEP", 1), \
+                patch.object(self.manager, "_save", side_effect=OSError("fixture full disk")):
+            self.assertEqual([row["id"][0] for row in self.manager.list()], ["a", "b", "c"])
+
+
 class SocketRecordTest(unittest.TestCase):
     """A board started on another tmux socket must never tombstone live sessions (R1)."""
 
@@ -906,7 +1018,8 @@ class TmuxFixtureTest(unittest.TestCase):
         saved = json.loads((Path(self.directory.name) / "sessions.json").read_text())
         closed = next(row for row in saved if row["id"] == first["id"])
         self.assertTrue(closed["closed"])
-        self.assertEqual(set(closed), {"id", "name", "key", "metadata", "closed", "closedReason", "socket"})
+        self.assertEqual(set(closed), {"id", "name", "key", "metadata", "closed", "closedReason", "closedAt", "socket"})
+        self.assertIs(type(closed["closedAt"]), int)
         self.assertEqual(closed["closedReason"], "user")
         self.assertEqual(closed["socket"], self.socket)
         self.assertNotIn("FIXTURE_READY", json.dumps(saved))

@@ -389,6 +389,101 @@ class WindowsCollectorTest(unittest.TestCase):
         self.assertEqual(self.calls[1][1]['sourceKinds'], wc.CODEX_SOURCES)
         self.assertEqual(row['project'], 'fixture-project')
 
+    def exec_row(self, source='exec'):
+        sid = str(uuid.uuid4())
+        connection = sqlite3.connect(self.db)
+        connection.execute('INSERT INTO threads (id, cwd, title, created_at, updated_at, archived, source) VALUES (?,?,?,?,?,?,?)',
+                           (sid, self.cwd, '봇 실행', 300, 400, 0, source))
+        connection.commit(); connection.close()
+        locks = self.reader.codex_home / 'thread-writer-locks'
+        locks.mkdir(exist_ok=True)
+        (locks / (sid + '.lock')).touch()
+        (locks / '.coordination.lock').touch()
+        return sid
+
+    def test_a_project_server_that_is_gone_is_said_on_the_board_and_on_its_records(self):
+        self.reader.binary.parent.mkdir(parents=True, exist_ok=True)
+        self.endpoint('fixture-project', exit_code=1)
+        connection = sqlite3.connect(self.db)
+        connection.execute('UPDATE threads SET updated_at=?', (int(time.time()) - 3600,))
+        connection.commit(); connection.close()
+        result = self.reader.snapshot()
+        self.assertEqual(result['errors'], [], 'a stopped server is a warning, not a failed collection')
+        self.assertEqual(len(result['warnings']), 1)
+        self.assertIn('PC 프로젝트 Codex 서버가 꺼져 있어', result['warnings'][0])
+        self.assertIn('fixture-project', result['warnings'][0])
+        row = result['codex'][0]
+        self.assertEqual((row['phase'], row['runtimeReason']), ('unknown', wc.SERVER_DOWN))
+        # Its process gone is the same; an elevated server is unverifiable, not down.
+        self.endpoint('fixture-project')
+        with patch.object(self.reader, 'process_reader', return_value=None):
+            self.assertIn('fixture-project', self.reader.snapshot()['warnings'][0])
+        self.endpoint('fixture-project', elevated=True)
+        self.assertEqual(self.reader.snapshot()['warnings'], [])
+        # A project not used for a week is not warned about (its records still say why).
+        self.endpoint('fixture-project', exit_code=1)
+        connection = sqlite3.connect(self.db)
+        connection.execute('UPDATE threads SET updated_at=?', (int(time.time()) - 8 * 86400,))
+        connection.commit(); connection.close()
+        result = self.reader.snapshot()
+        self.assertEqual(result['warnings'], [])
+        self.assertEqual(result['codex'][0]['runtimeReason'], wc.SERVER_DOWN)
+        self.assertEqual(self.calls, [])
+
+    def test_a_running_project_server_of_the_folder_wins_over_a_stopped_look_alike(self):
+        self.reader.binary.parent.mkdir(parents=True, exist_ok=True)
+        self.endpoint('fixture-project')
+        self.endpoint('fixture-project-old', exit_code=1)
+        self.live = {**self.live, 'id': 'not-this-thread'}
+        row = self.reader.snapshot()['codex'][0]
+        self.assertNotEqual(row.get('runtimeReason'), wc.SERVER_DOWN)
+
+    def test_a_project_server_holding_its_loaded_threads_lock_is_not_a_writer_outside_it(self):
+        sid = self.exec_row()
+        self.endpoint('fixture-server', elevated=True, server_pid=4242)
+        self.reader.owner_reader = lambda path: [{'pid': 4242, 'start': '123456'}] if path.stem == sid else None
+        row = next(row for row in self.reader.snapshot()['codex'] if row['id'] == sid)
+        self.assertEqual((row['phase'], row['runtimeKnown']), ('unknown', False))
+        self.assertNotIn('서버 밖', row.get('runtimeReason') or '')
+        # A stopped server's pid, given again to a codex exec, is that exec's.
+        self.endpoint('fixture-server', exit_code=1, server_pid=4242)
+        row = next(row for row in self.reader.snapshot()['codex'] if row['id'] == sid)
+        self.assertEqual(row['phase'], 'working')
+        # A failing Restart Manager call never fails the collection.
+        self.reader.owner_reader = lambda path: (_ for _ in ()).throw(AttributeError('fixture'))
+        self.assertEqual(len(self.reader.snapshot()['codex']), 2)
+
+    def test_a_codex_exec_that_holds_its_writer_lock_shows_as_working(self):
+        sid = self.exec_row()
+        owners = {sid + '.lock': [{'pid': 77, 'start': '123456'}]}
+        self.reader.owner_reader = lambda path: owners.get(path.name)
+        self.reader.binary.parent.mkdir(parents=True, exist_ok=True)
+        self.reader.binary.touch()
+        rows = {row['id']: row for row in self.reader.snapshot()['codex']}
+        self.assertEqual((rows[sid]['phase'], rows[sid]['runtimeKnown'], rows[sid]['loaded']), ('working', True, False))
+        self.assertIn('codex exec', rows[sid]['runtimeReason'])
+        self.assertEqual(rows[self.sid]['phase'], 'unknown', 'a record without a held lock is unchanged')
+        # Another start time (a reused pid), two holders, an unreadable list or another program: not running.
+        for found, process in ((owners, {'pid': 77, 'start': '999999', 'exe': str(self.reader.binary)}),
+                               ({sid + '.lock': [{'pid': 77, 'start': '123456'}, {'pid': 78, 'start': '123456'}]}, None),
+                               ({sid + '.lock': None}, None),
+                               (owners, {'pid': 77, 'start': '123456', 'exe': 'C:/Windows/notepad.exe'})):
+            with self.subTest(found=found, process=process):
+                self.reader.owner_reader = lambda path, found=found: found.get(path.name)
+                with patch.object(self.reader, 'process_reader',
+                                  side_effect=(lambda pid: process) if process else self.reader.process_reader):
+                    row = next(row for row in self.reader.snapshot()['codex'] if row['id'] == sid)
+                self.assertEqual((row['phase'], row['runtimeKnown']), ('unknown', False))
+
+    def test_a_cli_outside_the_server_holding_a_record_is_said_but_not_guessed(self):
+        sid = self.exec_row(source='cli')
+        self.reader.owner_reader = lambda path: [{'pid': 77, 'start': '123456'}] if path.stem == sid else None
+        self.reader.binary.parent.mkdir(parents=True, exist_ok=True)
+        self.reader.binary.touch()
+        row = next(row for row in self.reader.snapshot()['codex'] if row['id'] == sid)
+        self.assertEqual((row['phase'], row['runtimeKnown']), ('unknown', False))
+        self.assertIn('서버 밖의 Codex', row['runtimeReason'])
+
     def test_elevated_or_wrong_endpoint_process_or_project_does_not_connect(self):
         for changes in ({'elevated': True}, {'project': 'other'}, {'endpoint': 'unix://C:/other/app.sock'}, {'exit_code': 1}):
             with self.subTest(changes=changes):

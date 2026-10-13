@@ -46,6 +46,15 @@ RELEASE_IDLE = 60
 # Unused this long, a Claude connection is closed even with room to spare; sending to the
 # session (or 질문 불러오기) attaches it again.
 CLOSE_IDLE = 600
+# Closed rows kept, the oldest forgotten first. The user's own closes are kept longer:
+# they stop an automatic resume of that session. Any other close is history only.
+CLOSED_KEEP = 40
+USER_CLOSED_KEEP = 200
+# A closed terminal's last output stays readable this long; then its buffer is freed,
+# and only rows closed at least this long are forgotten.
+CLOSED_OUTPUT_SECONDS = 1800
+# Ids of forgotten rows kept for their input receipts to be pruned (take_forgotten).
+FORGOTTEN_LIMIT = 1000
 HISTORY_LIMIT = 20000
 SCROLL_LIMIT = 200
 WHEEL_LIMIT = 40
@@ -140,6 +149,8 @@ class _Terminal:
         self.fd = None
         self.generation = 0
         self.alive = not record.get("closed", False)
+        # When this process saw it close (monotonic); a row loaded closed closed long ago.
+        self.closed_at = None if self.alive else float("-inf")
         self.epoch = secrets.token_hex(16)
         self.scrolled = False
         # Set when a new attach client starts: the first input then also leaves any
@@ -193,6 +204,11 @@ class TerminalManager:
         self.reservations = set()
         self._closed = False
         self._warned = set()
+        # One list-sessions answer for the _exists calls of a listing (_listing), as
+        # (thread ident, names): only the listing thread uses it.
+        self._live = None
+        # Rows _trim_closed forgot whose input receipts may remain (take_forgotten).
+        self._forgotten = []
         # Told (without arguments) when a terminal is created, closed, attached or
         # detached. They may run under self.lock: a listener never calls back in here.
         self._listeners = []
@@ -271,7 +287,42 @@ class TerminalManager:
     def _exists(self, terminal):
         if terminal.record.get("closed", False) or self._foreign(terminal):
             return False
+        live = self._live
+        if live is not None and live[0] == threading.get_ident():
+            return terminal.record["name"] in live[1]
         return self._run("has-session", "-t", "=" + terminal.record["name"]).returncode == 0
+
+    def _live_names(self):
+        """The session names on this board's tmux socket, in one call. None when the answer
+        is unclear: each terminal is then asked on its own (has-session), as before."""
+        try:
+            done = subprocess.run(self._command("list-sessions", "-F", "#{session_name}"),
+                                  stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                  stderr=subprocess.PIPE, timeout=10)
+        except (OSError, RuntimeError, subprocess.TimeoutExpired):
+            return None
+        if done.returncode == 0:
+            return set(done.stdout.decode("utf-8", "replace").split())
+        message = done.stderr.decode("utf-8", "replace")
+        # No server on the socket (or no socket yet) is no sessions.
+        if "no server running" in message or "No such file or directory" in message:
+            return set()
+        return None
+
+    @contextmanager
+    def _listing(self):
+        """Answer the _exists calls inside from one list-sessions call instead of one tmux
+        process per terminal, all while self.lock is held; the caller holds self.lock."""
+        if self._live is not None or not any(not t.record.get("closed", False) and not self._foreign(t)
+                                             for t in self.terminals.values()):
+            yield
+            return
+        names = self._live_names()
+        self._live = None if names is None else (threading.get_ident(), names)
+        try:
+            yield
+        finally:
+            self._live = None
 
     def _load(self):
         if not self.state_path.exists():
@@ -291,6 +342,7 @@ class TerminalManager:
                     or not isinstance(row.get("metadata"), dict)
                     or ("closed" in row and not isinstance(row["closed"], bool))
                     or ("closedReason" in row and row["closedReason"] not in ("user", "connection_ended", "released"))
+                    or ("closedAt" in row and type(row["closedAt"]) is not int)
                     or ("socket" in row and (not isinstance(row["socket"], str)
                                              or not SOCKET.fullmatch(row["socket"])))):
                 raise RuntimeError("터미널 상태 파일 형식이 올바르지 않습니다.")
@@ -732,9 +784,10 @@ class TerminalManager:
         return True
 
     def list(self):
-        with self.lock:
+        with self.lock, self._listing():
             result = []
-            changed, adopted, released = [], [], False
+            changed, adopted = [], []
+            released = self._trim_closed()
             now = time.monotonic()
             for terminal in self.terminals.values():
                 terminal.alive = self._exists(terminal)
@@ -762,6 +815,8 @@ class TerminalManager:
                     # this ID. Persist that fact before input receipts are pruned.
                     terminal.record["closed"] = True
                     terminal.record["closedReason"] = "connection_ended"
+                    terminal.record["closedAt"] = int(time.time())
+                    terminal.closed_at = now
                     changed.append(terminal)
                 result.append(self._public(terminal))
             if changed or adopted:
@@ -771,6 +826,7 @@ class TerminalManager:
                     for terminal in changed:
                         terminal.record.pop("closed", None)
                         terminal.record.pop("closedReason", None)
+                        terminal.record.pop("closedAt", None)
                     for terminal in adopted:
                         terminal.record.pop("socket", None)
                     raise
@@ -852,6 +908,8 @@ class TerminalManager:
                     raise RuntimeError(self._unrecorded_message())
                 terminal.record["closed"] = True
                 terminal.record["closedReason"] = reason
+                terminal.record["closedAt"] = int(time.time())
+                terminal.closed_at = time.monotonic()
                 if unrecorded:
                     terminal.record["socket"] = self.socket_name
                 try:
@@ -859,6 +917,7 @@ class TerminalManager:
                 except (ValueError, RuntimeError, OSError):
                     terminal.record.pop("closed", None)
                     terminal.record.pop("closedReason", None)
+                    terminal.record.pop("closedAt", None)
                     if unrecorded:
                         terminal.record.pop("socket", None)
                     raise
@@ -880,12 +939,58 @@ class TerminalManager:
     def _make_room(self, reserved, keep):
         """Whether one more terminal fits, releasing idle connections to existing sessions
         for it; the caller holds self.lock."""
-        live = sum(self._exists(t) for t in self.terminals.values())
+        with self._listing():
+            live = sum(self._exists(t) for t in self.terminals.values())
+        # Releasing asks tmux itself: a session may have ended since the count.
         while live + reserved >= self.max_terminals:
             if not self._release_idle(keep):
                 return False
             live -= 1
         return True
+
+    def _trim_closed(self):
+        """Free the output of rows closed CLOSED_OUTPUT_SECONDS ago and forget the oldest of
+        them past CLOSED_KEEP (USER_CLOSED_KEEP for the user's own closes); the caller holds
+        self.lock. Whether a row was forgotten (the list changed)."""
+        now = time.monotonic()
+        settled = []
+        for terminal in self.terminals.values():
+            if (not terminal.record.get("closed", False) or terminal.closed_at is None
+                    or now - terminal.closed_at < CLOSED_OUTPUT_SECONDS):
+                continue
+            if terminal.output:
+                with terminal.condition:
+                    terminal.output = bytearray()
+            settled.append(terminal)
+        # Oldest close first; a row saved before close times were kept counts as oldest.
+        settled.sort(key=lambda t: t.record.get("closedAt", 0))
+        user = [t for t in settled if t.record.get("closedReason") == "user"]
+        other = [t for t in settled if t.record.get("closedReason") != "user"]
+        forget = user[:max(0, len(user) - USER_CLOSED_KEEP)] + other[:max(0, len(other) - CLOSED_KEEP)]
+        if not forget:
+            return False
+        before = dict(self.terminals)
+        for terminal in forget:
+            del self.terminals[terminal.record["id"]]
+        try:
+            self._save()
+        except (ValueError, RuntimeError, OSError):
+            # Not saved: kept as they were until a later listing saves.
+            self.terminals = before
+            return False
+        self._forgotten = (self._forgotten + [t.record["id"] for t in forget])[-FORGOTTEN_LIMIT:]
+        return True
+
+    def take_forgotten(self):
+        """Closed rows (as {"id", "closed"}) forgotten since the last call, for their input
+        receipts to be pruned; give them back (restore_forgotten) when that fails."""
+        with self.lock:
+            taken, self._forgotten = self._forgotten, []
+        return [{"id": terminal_id, "closed": True} for terminal_id in taken]
+
+    def restore_forgotten(self, rows):
+        with self.lock:
+            self._forgotten = ([row["id"] for row in rows] + self._forgotten)[-FORGOTTEN_LIMIT:]
 
     def _releasable(self, terminal):
         """A board connection to an existing session ("attach"), not one being launched."""

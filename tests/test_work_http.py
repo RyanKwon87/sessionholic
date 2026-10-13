@@ -24,6 +24,14 @@ class WorkHTTPTest(unittest.TestCase):
         self.assertEqual(response.status, 200, result)
         return result
 
+    def test_a_board_without_the_work_tab_tells_an_old_screen_to_reload(self):
+        self.httpd.work_list = False
+        with patch.object(self.httpd.work, 'snapshot') as snapshot:
+            response, result = self.request('GET', '/api/work')
+        self.assertEqual((response.status, result['code']), (410, 'retired'))
+        self.assertIn('새로고침', result['error'])
+        snapshot.assert_not_called()
+
     def test_authentication_csrf_and_cross_origin_are_required(self):
         response, _ = self.request('GET', '/api/work', authenticated=False)
         self.assertEqual(response.status, 401)

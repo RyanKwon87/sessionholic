@@ -35,7 +35,7 @@ const INSTANCE = (() => {
   return Object.freeze(names);
 })();
 // The list reads top to bottom as what needs you, what is running, what just
-// stopped (FINISHED_SECONDS) and everything else.
+// stopped (FINISHED_SECONDS) and everything else; each group by title (titleOrder).
 const GROUPS = [
   { key: "needs_input", label: "답 필요", tone: "red" },
   { key: "working", label: "작업 중", tone: "amber" },
@@ -137,6 +137,10 @@ const state = {
   launchBusy: false,
   pollTimer: null,
   pollBusy: false,
+  pollRun: null, // the list read in flight (poll), shared by callers that wait for it
+  manualRun: null, // the manual refresh in flight (manualRefresh), shared by a second press or pull
+  updateAvailable: false, // the board serves a newer screen than this page runs (checkWebVersion)
+  shownAt: Date.now(), // when the page was last shown (visibilitychange)
   authenticated: false,
   authEpoch: 0,
   loginBusy: false,
@@ -697,6 +701,8 @@ function assertAuthEpoch(epoch) {
 function beginAuthEpoch() {
   state.authEpoch++;
   state.pollBusy = false;
+  state.pollRun = null;
+  state.manualRun = null;
   state.terminalsRefreshing = false;
   return state.authEpoch;
 }
@@ -707,18 +713,69 @@ function beginAuthEpoch() {
 const CSRF_RETRY = new Set(["/api/chat/state", "/api/chat/prompt", "/api/plan", "/api/launch",
   "/api/new-session", "/api/app-server", "/api/refresh", "/api/usage/refresh", "/api/hardware/refresh",
   "/api/push/subscribe", "/api/push/unsubscribe"]);
-async function api(path, { method = "GET", body, signal, authEpoch = state.authEpoch, csrfRetry = true } = {}) {
+// The screen this page runs: its app.js ?v=, as the board served it. A tab opened
+// before a deploy keeps the old screen until it reloads; the board names the one it
+// serves now (capabilities.webVersion) and checkWebVersion compares the two.
+const APP_VERSION = (() => {
+  try { return new URL(document.currentScript?.src || "").searchParams.get("v") || ""; } catch { return ""; }
+})();
+// Back on the page this recently, a newer screen loads at once when nothing would be lost.
+const UPDATE_RETURN_MS = 15000;
+// How long a request waits for its answer. A phone back from sleep or between
+// networks can hold one open forever, and a held read blocks every later one
+// (poll, refresh, chat state); one that runs out fails like a lost connection.
+// Paths the server answers only after remote work (a send, a launch) wait longer.
+const API_TIMEOUT_MS = { GET: 30000, POST: 45000 };
+// Each is longer than the server's own bound for that route.
+const API_PATH_TIMEOUT_MS = {
+  "/api/capabilities": 90000, "/api/read": 45000, "/api/chat/send": 90000, "/api/chat/prompt": 60000,
+  "/api/plan": 120000, "/api/new-session": 120000, "/api/app-server": 200000, "/api/launch": 660000,
+};
+const API_TIMEOUT_MESSAGE = "응답이 늦어 기다리기를 멈췄습니다. 연결을 확인한 뒤 다시 시도해 주세요.";
+// Where the server may already have acted: say so instead of inviting a blind retry.
+const API_TIMEOUT_STARTED = "응답이 늦어 기다리기를 멈췄습니다. 이미 시작됐거나 전달됐을 수 있으니 목록과 터미널을 확인한 뒤 다시 시도해 주세요.";
+const API_STARTED_PATHS = new Set(["/api/launch", "/api/new-session", "/api/app-server", "/api/chat/prompt"]);
+function apiPathname(path) {
+  return String(path).split("?")[0];
+}
+function apiTimeout(path, method) {
+  return API_PATH_TIMEOUT_MS[apiPathname(path)] ?? API_TIMEOUT_MS[method] ?? API_TIMEOUT_MS.POST;
+}
+// The caller's signal and the time limit, as one. A browser without
+// AbortSignal.timeout keeps the old behaviour (no limit).
+function apiSignal(signal, timeout) {
+  const limit = timeout > 0 && typeof AbortSignal !== "undefined" && typeof AbortSignal.timeout === "function"
+    ? AbortSignal.timeout(timeout) : null;
+  if (!limit) return { signal, limit: null };
+  if (!signal) return { signal: limit, limit };
+  const controller = new AbortController();
+  const abort = () => controller.abort();
+  for (const source of [signal, limit]) {
+    if (source.aborted) abort();
+    else source.addEventListener("abort", abort, { once: true });
+  }
+  return { signal: controller.signal, limit };
+}
+function apiTimedOut(limit, path = "") {
+  if (!limit?.aborted) return null;
+  const err = new Error(API_STARTED_PATHS.has(apiPathname(path)) ? API_TIMEOUT_STARTED : API_TIMEOUT_MESSAGE);
+  err.timeout = true;
+  return err;
+}
+async function api(path, { method = "GET", body, signal: callerSignal, authEpoch = state.authEpoch, csrfRetry = true,
+  timeout = apiTimeout(path, method) } = {}) {
   assertAuthEpoch(authEpoch);
   const headers = {};
   if (body !== undefined) headers["Content-Type"] = "application/json";
   if (method !== "GET" && state.csrf) headers["X-CSRF-Token"] = state.csrf;
+  const { signal, limit } = apiSignal(callerSignal, timeout);
   let response;
   try {
     response = await fetch(path, {
       method, headers, body: body === undefined ? undefined : JSON.stringify(body),
       credentials: "same-origin", cache: "no-store", signal,
     });
-  } catch (err) { assertAuthEpoch(authEpoch); throw err; }
+  } catch (err) { assertAuthEpoch(authEpoch); throw apiTimedOut(limit, path) || err; }
   assertAuthEpoch(authEpoch);
   if (response.status === 401) {
     showLogin();
@@ -728,6 +785,9 @@ async function api(path, { method = "GET", body, signal, authEpoch = state.authE
   }
   const data = await response.json().catch(() => ({}));
   assertAuthEpoch(authEpoch);
+  // A body cut off by the limit is not an empty answer.
+  const late = apiTimedOut(limit, path);
+  if (late) throw late;
   if (!response.ok && response.status === 403 && data.code === "csrf_expired" && csrfRetry &&
       method !== "GET" && CSRF_RETRY.has(path)) {
     let refreshed = false;
@@ -738,7 +798,7 @@ async function api(path, { method = "GET", body, signal, authEpoch = state.authE
       if (err.unauthorized || err.staleAuth) throw err;
     }
     assertAuthEpoch(authEpoch);
-    if (refreshed) return api(path, { method, body, signal, authEpoch, csrfRetry: false });
+    if (refreshed) return api(path, { method, body, signal: callerSignal, authEpoch, csrfRetry: false, timeout });
   }
   if (!response.ok) {
     const err = new Error(
@@ -938,22 +998,46 @@ function render() {
     } else syncEvents();
   }
 }
+// A lost connection comes first: on a phone the chips scroll sideways and only the
+// first fit, so a device that is down is never the one pushed out of sight. A tap
+// says what each one's dot means (a touch has no hover title).
+// A device that answers but warns of something to check (a PC project server that is
+// off, data.warnings) is "warn". The order follows what was last known (a lost device,
+// one with a warning, the rest as configured): a collection in progress only pulses the
+// dot, so chips never trade places every minute.
+const HOST_ORDER = { bad: 0, warn: 1, ok: 2 };
+function hostNotes(host, key) {
+  return (Array.isArray(host.data?.[key]) ? host.data[key] : []).filter((text) => typeof text === "string" && text);
+}
+function hostRank(host) {
+  return !host.ok ? "bad" : hostNotes(host, "warnings").length ? "warn" : "ok";
+}
+function hostTone(host) {
+  return host.refreshing ? "checking" : hostRank(host);
+}
 function renderHosts(now) {
   const box = $("hosts");
+  // Rebuilt on every snapshot: a chip that had the keyboard keeps it.
+  const focused = box.contains?.(document.activeElement) ? document.activeElement.dataset?.host : null;
   box.replaceChildren();
-  for (const host of state.snapshot.hosts) {
-    const chip = el(
-      "span",
-      `host ${host.refreshing ? "checking" : host.ok ? "ok" : "bad"}`,
-    );
+  const hosts = state.snapshot.hosts.map((host, index) => ({ host, index }))
+    .sort((a, b) => HOST_ORDER[hostRank(a.host)] - HOST_ORDER[hostRank(b.host)] || a.index - b.index);
+  for (const { host } of hosts) {
+    const chip = el("button", `host ${hostTone(host)}`);
+    chip.type = "button";
+    chip.dataset.host = host.name;
     chip.append(el("span", "dot"), el("span", null, host.label));
+    const notes = [...hostNotes(host, "warnings"), ...hostNotes(host, "errors")];
+    const problems = notes.length ? ` · ${notes[0]}${notes.length > 1 ? ` 외 ${notes.length - 1}건` : ""}` : "";
     chip.title = host.refreshing
       ? `${host.label} · 작업 확인 중`
       : host.ok
-        ? `${host.label} · ${ago(host.fetchedAt, now)} 확인`
+        ? `${host.label} · ${ago(host.fetchedAt, now)} 확인${problems}`
         : `${host.label} · ${host.error || "연결 확인 필요"}${host.fetchedAt ? ` · 마지막 확인 ${ago(host.fetchedAt, now)}` : ""}`;
     chip.setAttribute("aria-label", chip.title);
+    chip.addEventListener("click", () => toast(chip.title));
     box.append(chip);
+    if (focused && host.name === focused) chip.focus?.({ preventScroll: true });
   }
 }
 // While hosts are still collecting, say how old the list on screen is; the
@@ -1517,6 +1601,13 @@ function cardFolderHints(shown) {
   }
   return hints;
 }
+// Within a group the list keeps one order, by the title it shows (가나다, numbers
+// by value), so a session that updates every few seconds stays where it is.
+// Renaming a session (제목 수정) is how it is moved.
+const TITLE_ORDER = new Intl.Collator("ko", { numeric: true, sensitivity: "base" });
+function titleOrder(a, b) {
+  return TITLE_ORDER.compare(cardTitle(a), cardTitle(b)) || (String(a.key) < String(b.key) ? -1 : String(a.key) > String(b.key) ? 1 : 0);
+}
 function placeChildren(parent, desired) {
   for (const child of [...parent.children]) if (!desired.includes(child)) parent.removeChild(child);
   for (let index = 0; index < desired.length; index++)
@@ -1540,9 +1631,7 @@ function renderGroups(shown, now) {
   const desired = [];
   const visible = new Set();
   for (const group of GROUPS) {
-    const items = shown
-      .filter((s) => groupOf(s, now) === group.key)
-      .sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+    const items = shown.filter((s) => groupOf(s, now) === group.key).sort(titleOrder);
     if (!items.length) continue;
     let section = sections.get(group.key);
     if (!section) {
@@ -2374,7 +2463,9 @@ function detailMetaChildren(s) {
   const [label, tone] = BADGES[s.runtimeKnown === false ? "unknown" : s.phase] || ["상태 확인 필요", "gray"];
   return [el("span", `badge ${tone}`, label),
     el("span", null, [AGENTS[s.agent], s.account, s.hostLabel].filter(Boolean).join(" · ")),
-    el("span", null, initiatorLabel(s)), ...(sessionOneShot(s) ? [el("span", "detail-execution", "일회성 실행")] : []), el("span", null, clock(s.updatedAt))];
+    el("span", null, initiatorLabel(s)), ...(sessionOneShot(s) ? [el("span", "detail-execution", "일회성 실행")] : []), el("span", null, clock(s.updatedAt)),
+    // Why a PC record's state is what it is (its project server off, a codex exec running).
+    ...(typeof s.runtimeReason === "string" && s.runtimeReason ? [el("span", "detail-runtime", s.runtimeReason)] : [])];
 }
 function patchDetailMetadata(s) {
   const pane = $("detail");
@@ -6338,12 +6429,11 @@ async function startTerminalReader() {
     !document.hidden
   ) {
     try {
-      // A silently dropped connection (Wi-Fi to LTE) must not hold the long poll forever.
-      const signal = globalThis.AbortSignal?.any && AbortSignal.timeout
-        ? AbortSignal.any([controller.signal, AbortSignal.timeout(35000)]) : controller.signal;
+      // A silently dropped connection (Wi-Fi to LTE) must not hold the long poll forever:
+      // the server answers within 20 seconds, so 35 without one is a lost connection.
       const result = await api(
         `/api/terminal/${encodeURIComponent(id)}/events?after=${state.terminalAfter}&wait=20${state.terminalEpoch ? `&epoch=${encodeURIComponent(state.terminalEpoch)}` : ""}`,
-        { signal },
+        { signal: controller.signal, timeout: 35000 },
       );
       if (run !== state.terminalRun) return;
       // A malformed reply counts as a failed read, so it can never spin this loop.
@@ -7610,6 +7700,7 @@ async function loadCapabilities(authEpoch = state.authEpoch, { refreshView = tru
   assertAuthEpoch(authEpoch);
   state.capabilities = capabilities;
   state.csrf = state.capabilities.csrfToken || "";
+  checkWebVersion();
   renderNewSession();
   $("logout").hidden = state.capabilities.authMode === "tailscale";
   if ($("settings-lock")) $("settings-lock").hidden = $("logout").hidden;
@@ -7646,8 +7737,19 @@ function serverBooted(bootId) {
 }
 // capabilities: false (a read announced by a snapshot event) reads the
 // snapshot only; the next regular read catches the capabilities up.
-async function poll(refresh = false, { capabilities = true } = {}) {
-  if (networkOffline() || state.loginBusy || state.pollBusy || document.hidden || state.terminalVisible) return;
+// Resolves true when the list was read, false when it was not (or not tried);
+// a read already in flight is shared (state.pollRun), not skipped as if done.
+function poll(refresh = false, options = {}) {
+  if (state.pollBusy) return state.pollRun || Promise.resolve(false);
+  const run = pollOnce(refresh, options);
+  if (state.pollBusy) {
+    state.pollRun = run;
+    run.finally(() => { if (state.pollRun === run) state.pollRun = null; });
+  }
+  return run;
+}
+async function pollOnce(refresh = false, { capabilities = true } = {}) {
+  if (networkOffline() || state.loginBusy || state.pollBusy || document.hidden || state.terminalVisible) return false;
   const authEpoch = state.authEpoch;
   state.pollBusy = true;
   if (refresh) state.refreshDeadline = Date.now() + 60000;
@@ -7692,6 +7794,7 @@ async function poll(refresh = false, { capabilities = true } = {}) {
       refreshTerminals(authEpoch);
     schedule();
     syncEvents();
+    return true;
   } catch (err) {
     if (!err.unauthorized && !err.staleAuth) {
       // A transient failure (server restart, network blip) must not stop the
@@ -7708,6 +7811,7 @@ async function poll(refresh = false, { capabilities = true } = {}) {
           "서버에 연결할 수 없습니다. 연결을 확인한 뒤 다시 열어 주세요.";
       }
     }
+    return false;
   } finally {
     if (authEpoch === state.authEpoch) {
       state.pollBusy = false;
@@ -7720,12 +7824,25 @@ async function poll(refresh = false, { capabilities = true } = {}) {
     }
   }
 }
-async function manualRefresh() {
+// Resolves true when the list was read again, false when it was not, null when it
+// was not tried (a launch is being prepared). A read already in flight is waited for
+// (each one is time-limited) and then followed by this one, never reported as a
+// refresh that did not happen; a refresh in flight is shared by a second press or pull.
+function manualRefresh() {
   if (state.sessionCategory === "bot" && !$("session-layout").hidden) return loadBotRequests({ refresh: true });
-  if (state.pollBusy || state.launchBusy) return;
+  if (state.manualRun) return state.manualRun;
+  if (state.launchBusy) return Promise.resolve(null);
+  const run = manualRefreshOnce();
+  state.manualRun = run;
+  run.finally(() => { if (state.manualRun === run) state.manualRun = null; });
+  return run;
+}
+async function manualRefreshOnce() {
   const authEpoch = state.authEpoch;
   $("refresh").disabled = true;
   try {
+    if (state.pollRun) await state.pollRun;
+    assertAuthEpoch(authEpoch);
     if (!state.csrf) await loadCapabilities(authEpoch);
     assertAuthEpoch(authEpoch);
     state.refreshDeadline = Date.now() + 60000;
@@ -7734,10 +7851,14 @@ async function manualRefresh() {
     state.detailUpdatedAt = null;
     await loadCapabilities(authEpoch);
     assertAuthEpoch(authEpoch);
-    await poll(false);
+    if (state.pollRun) await state.pollRun;
+    const read = await poll(false);
     if (authEpoch === state.authEpoch) refreshTerminals(authEpoch);
+    if (!read && state.pollFailures && authEpoch === state.authEpoch) notice("목록을 새로 읽지 못했습니다. 연결을 확인한 뒤 다시 시도해 주세요.");
+    return read;
   } catch (err) {
     if (!err.unauthorized && !err.staleAuth) notice(err.message);
+    return false;
   } finally {
     if (authEpoch === state.authEpoch) $("refresh").disabled = false;
   }
@@ -7793,10 +7914,12 @@ async function pullRefresh() {
   $("pull-refresh")?.classList?.add("is-loading");
   let label = "업데이트됨";
   try {
-    await manualRefresh();
+    const read = await manualRefresh();
     const selected = selectedSession();
     if (selected && chatVisible()) await loadChatState(selected, true);
     if (networkOffline()) label = "오프라인입니다";
+    else if (read === false) label = "새로고침하지 못했습니다";
+    else if (read === null) label = "실행을 준비하는 중이라 잠시 뒤 다시 당겨 주세요";
   } catch {
     label = "새로고침하지 못했습니다";
   } finally {
@@ -7964,7 +8087,33 @@ function updateViewport() {
 // "오프라인 · 다시 연결 중" at the top while the browser is offline or the
 // board failed to answer twice in a row; it goes away by itself once a read
 // succeeds. The terminal shows its own connection state instead.
+function checkWebVersion() {
+  const served = state.capabilities?.webVersion;
+  const behind = !!APP_VERSION && typeof served === "string" && !!served && served !== APP_VERSION;
+  const found = behind && !state.updateAvailable;
+  state.updateAvailable = behind;
+  if (found && Date.now() - (state.shownAt || 0) < UPDATE_RETURN_MS && reloadForUpdate()) return;
+  renderConnectivity();
+}
+// A newer screen loads now unless a reload would lose something (what warnDraftUnload
+// guards), interrupt a terminal or close an open sheet; the banner offers it then.
+// A plain reload is enough: the page is read from the network and assets carry ?v=.
+function reloadForUpdate() {
+  if (!state.updateAvailable || networkOffline() || state.terminalVisible || unsavedWork() ||
+      document.querySelector?.("dialog[open]")) return false;
+  window.location.reload();
+  return true;
+}
+// The banner's tap: never at the cost of unsent words (a home-screen app shows no leave prompt).
+function updateBannerPressed() {
+  if (unsavedWork()) {
+    toast("보내지 않은 글이나 첨부가 있어 새로고침하지 않았습니다. 보내거나 지운 뒤 다시 눌러 주세요.");
+    return;
+  }
+  window.location.reload();
+}
 function renderConnectivity() {
+  const update = $("update-banner");
   const box = $("offline-banner");
   if (!box) return;
   const offline = networkOffline();
@@ -7976,6 +8125,8 @@ function renderConnectivity() {
   if ($("offline-text").textContent !== text) $("offline-text").textContent = text;
   box.dataset.kind = offline ? "offline" : failing ? "retrying" : "";
   box.hidden = !text || state.terminalVisible;
+  // A connection problem is said first; the newer screen waits for it.
+  if (update) update.hidden = !state.updateAvailable || !!text || state.terminalVisible;
 }
 function showOfflineStart() {
   if (state.snapshot || state.terminalVisible) return;
@@ -8006,9 +8157,13 @@ function recoverConnection() {
   const selected = selectedSession();
   if (selected) { updateChatComposer(chatEntry(selected)); loadChatState(selected, true); }
 }
+// Unsent words or files on this page: what leaving or reloading it would lose.
+function unsavedWork() {
+  return [...state.drafts.values(), state.terminal ? $("terminal-draft").value : ""].some(Boolean) ||
+    [...state.chats.values()].some((entry) => entry.text || entry.attachments.length || entry.pending || entry.uploads);
+}
 function warnDraftUnload(event) {
-  if (![...state.drafts.values(), state.terminal ? $("terminal-draft").value : ""].some(Boolean) &&
-      ![...state.chats.values()].some((entry) => entry.text || entry.attachments.length || entry.pending || entry.uploads)) return;
+  if (!unsavedWork()) return;
   event.preventDefault();
   event.returnValue = "";
 }
@@ -8061,6 +8216,7 @@ window.addEventListener("DOMContentLoaded", () => {
   $("settings-close").addEventListener("click", closeSettings);
   $("settings-done").addEventListener("click", closeSettings);
   $("hard-reload")?.addEventListener("click", hardReload);
+  $("update-banner")?.addEventListener("click", updateBannerPressed);
   $("settings-dialog").addEventListener("cancel", (event) => {
     event.preventDefault();
     closeSettings();
@@ -8263,6 +8419,8 @@ window.addEventListener("DOMContentLoaded", () => {
     } else if (state.terminalVisible) {
       startTerminalReader();
     } else if (state.authenticated) {
+      state.shownAt = Date.now();
+      if (reloadForUpdate()) return;
       poll(true);
       const selected = selectedSession();
       if (selected) loadChatState(selected, true);

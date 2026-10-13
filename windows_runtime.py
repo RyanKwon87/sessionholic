@@ -324,6 +324,9 @@ class WindowsRuntime:
         cwd = rows[0]['cwd']
         if not isinstance(cwd, str) or not Path(wc._windows_path(cwd)).is_dir() or not self.reader.binary.is_file():
             raise ValueError('PC 원본 작업 폴더나 Codex 실행 파일을 확인하지 못했습니다.')
+        # Two writers on one thread would interleave its record.
+        if self.reader.writer_owners({identity['id']}):
+            raise ValueError('이 기록은 PC에서 다른 Codex 실행(codex exec 등)이 쓰고 있습니다. 그 실행이 끝난 뒤 이어가 주세요.')
         endpoint = self._project_endpoint(cwd)
         if endpoint is None:
             # An SSH session is elevated: without its project's own (non-elevated) server, Codex

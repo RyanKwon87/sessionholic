@@ -150,6 +150,15 @@ class ServerTest(unittest.TestCase):
         res, _ = self.request("GET", "/api/snapshot", headers={"Cookie": cookie})
         self.assertEqual(res.status, 200)
 
+    def test_capabilities_name_the_screen_served_now(self):
+        cookie = self.login_cookie()
+        res, data = self.request("GET", "/api/capabilities", headers={"Cookie": cookie})
+        self.assertEqual(res.status, 200)
+        version = json.loads(data)["webVersion"]
+        self.assertEqual(version, self.httpd.assets.manifest()["/app.js"])
+        res, page = self.request("GET", "/", headers={"Cookie": cookie})
+        self.assertIn(('/app.js?v=%s"' % version).encode(), page, "the page loads the same app.js it names")
+
     def test_snapshots_name_the_server_process_and_a_restart_names_another(self):
         # H3: a client that sees another bootId reads /api/capabilities (its CSRF token) again.
         cookie, csrf = self.csrf_session()
@@ -1119,6 +1128,137 @@ class Watchers:
 def live_data(title="정산", collected=1):
     return {"host": "remote", "collectedAt": collected, "claude": [{"id": "a1b2c3d4", "title": title}],
             "codex": [], "tmux": [], "errors": []}
+
+
+class OperationsLogTest(unittest.TestCase):
+    """What the log says: a client that left is not a failure, a host's collection failing,
+    failing differently or recovering is one line each, a watcher's stderr is a few lines,
+    and the server's own log files do not grow for good."""
+
+    def test_a_client_that_left_mid_answer_is_not_logged_as_a_route_failure(self):
+        handler = server.Handler.__new__(server.Handler)
+        handler.command, handler.path, handler.request_version = "GET", "/api/snapshot", "HTTP/1.1"
+        handler.requestline, handler.started = "GET /api/snapshot HTTP/1.1", time.monotonic()
+        handler.close_connection = False
+        class Gone:
+            def write(self, data):
+                raise BrokenPipeError("fixture: client left")
+            def flush(self):
+                pass
+        handler.wfile = Gone()
+        handler.headers = {}
+        handler._headers_buffer = []
+        def answered_then_reset():
+            handler.responded = True
+            raise ConnectionResetError("fixture: client left mid-answer")
+        with patch("sys.stderr", new_callable=io.StringIO) as log:
+            handler.send_json(200, {"ok": True})
+            self.assertTrue(handler.close_connection)
+            handler.guarded(answered_then_reset)
+        self.assertNotIn("예상하지 못한 오류", log.getvalue())
+        # Before any answer a broken pipe is not known to be the client's: logged as before.
+        with patch("sys.stderr", new_callable=io.StringIO) as log:
+            handler.guarded(lambda: (_ for _ in ()).throw(BrokenPipeError("fixture: a helper's pipe")))
+        self.assertIn("예상하지 못한 오류 (BrokenPipeError)", log.getvalue())
+
+    def test_a_request_line_says_the_status_and_time_but_never_the_query(self):
+        handler = server.Handler.__new__(server.Handler)
+        handler.command, handler.path = "GET", "/login?once=fixture-secret"
+        handler.started = time.monotonic() - 0.25
+        with patch("sys.stderr", new_callable=io.StringIO) as log:
+            handler.log_request(302)
+        line = log.getvalue()
+        self.assertRegex(line, r" GET /login 302 2\d\dms\n$")
+        self.assertNotIn("fixture-secret", line)
+
+    def test_collection_failures_are_logged_when_they_change_and_recovery_once(self):
+        outcomes = [RuntimeError("SSH 연결 실패"), RuntimeError("SSH 연결 실패"), RuntimeError("응답 시간 초과"), None]
+        def runner(host, args, timeout):
+            outcome = outcomes.pop(0)
+            if outcome is None:
+                return {"claude": [], "codex": [], "tmux": [], "errors": []}
+            outcome.detail = "ssh: connect to host fixture port 22: Operation timed out"
+            raise outcome
+        board = server.Board(HOSTS, 60, runner=runner)
+        with patch("sys.stderr", new_callable=io.StringIO) as log:
+            for _ in range(4):
+                board.poll(HOSTS[0])
+        lines = [line for line in log.getvalue().splitlines() if "기기 수집" in line]
+        self.assertEqual(len(lines), 3, lines)
+        self.assertIn("기기 수집 실패 remote", lines[0]); self.assertIn("SSH 연결 실패 — ssh: connect", lines[0])
+        self.assertIn("응답 시간 초과", lines[1])
+        self.assertIn("기기 수집 복구 remote", lines[2])
+
+    def test_a_collector_that_fails_keeps_the_last_thing_it_said_for_the_log(self):
+        done = subprocess.CompletedProcess([], 1, b"", b"warming up\nTraceback ...\nPermissionError: fixture denied\n")
+        with patch.object(server.subprocess, "run", return_value=done):
+            with self.assertRaises(RuntimeError) as caught:
+                server.run_collector({"name": "local", "local": True}, ["snapshot"], 5)
+        self.assertEqual(str(caught.exception), "수집기 오류 (exit 1)")
+        self.assertEqual(caught.exception.detail, "PermissionError: fixture denied")
+
+    def test_a_watchers_stderr_is_forwarded_in_a_few_lines(self):
+        stream = io.BytesIO(b"".join(b"watch codex: TimeoutError: fixture %d\n" % index for index in range(30)))
+        with patch("sys.stderr", new_callable=io.StringIO) as log:
+            server.forward_watch_errors("remote", stream)
+        lines = log.getvalue().splitlines()
+        self.assertEqual(len(lines), server.WATCH_ERROR_LINES)
+        self.assertIn("상주 수집기 remote: watch codex: TimeoutError: fixture 0", lines[0])
+        self.assertTrue(stream.closed)
+
+    def test_the_servers_own_log_file_is_rotated_in_place_past_its_limit(self):
+        state = Path(tempfile.mkdtemp()); self.addCleanup(shutil.rmtree, state)
+        log = state / "service.stderr.log"
+        fd = os.open(str(log), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        os.write(fd, b"x" * 4096)
+        saved = os.dup(2)
+        try:
+            os.dup2(fd, 2)
+            other = state / "other.log"; other.write_bytes(b"y" * 8192)
+            self.assertEqual(server.rotate_own_logs(state, limit=1024), ["service.stderr.log"])
+            os.write(2, b"after\n")
+        finally:
+            os.dup2(saved, 2); os.close(saved); os.close(fd)
+        self.assertEqual((state / "service.stderr.log.1").read_bytes(), b"x" * 4096)  # under LOG_KEEP_BYTES: all of it
+        self.assertEqual(log.read_bytes(), b"after\n", "an append-only writer goes on at the new end")
+        self.assertEqual(other.read_bytes(), b"y" * 8192, "a file that is not this process's log is left alone")
+        self.assertEqual(server.rotate_own_logs(state, limit=1024), [], "under the limit nothing is rotated")
+
+    def test_a_rotation_keeps_only_the_end_and_still_empties_the_log_when_the_copy_fails(self):
+        state = Path(tempfile.mkdtemp()); self.addCleanup(shutil.rmtree, state)
+        log = state / "stderr.log"
+        fd = os.open(str(log), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        os.write(fd, b"a" * 3000 + b"b" * 1000)
+        saved = os.dup(2)
+        try:
+            os.dup2(fd, 2)
+            with patch.object(server, "LOG_KEEP_BYTES", 1000):
+                self.assertEqual(server.rotate_own_logs(state, limit=1024), ["stderr.log"])
+            self.assertEqual((state / "stderr.log.1").read_bytes(), b"b" * 1000)
+            os.write(2, b"c" * 2000)
+            with patch.object(server.shutil, "copyfileobj", side_effect=OSError(28, "No space left on device")):
+                self.assertEqual(server.rotate_own_logs(state, limit=1024), ["stderr.log"])
+        finally:
+            os.dup2(saved, 2); os.close(saved); os.close(fd)
+        self.assertEqual(log.read_bytes(), b"", "a full disk still gets the space back")
+        self.assertFalse((state / "stderr.log.1").exists(), "no half-written copy is left behind")
+
+    def test_a_watcher_delivering_ends_a_logged_failure(self):
+        board = server.Board(HOSTS, 60, runner=lambda host, args, timeout: (_ for _ in ()).throw(RuntimeError("SSH 연결 실패")))
+        stream = server.HostStream(board, HOSTS[0])
+        with patch("sys.stderr", new_callable=io.StringIO) as log:
+            board.poll(HOSTS[0])
+            board.streams[HOSTS[0]["name"]] = stream
+            board.apply_live(stream, {"claude": [], "codex": [], "tmux": [], "errors": []})
+        lines = [line for line in log.getvalue().splitlines() if "기기 수집" in line]
+        self.assertEqual(len(lines), 2, lines)
+        self.assertIn("기기 수집 복구 remote", lines[1])
+
+    def test_a_full_disk_is_named_in_an_unavailable_answer(self):
+        import errno
+        self.assertIn("디스크가 가득", server.unavailable_message(OSError(errno.ENOSPC, "No space left on device")))
+        self.assertEqual(server.unavailable_message(OSError(errno.EIO, "fixture")),
+                         "실행 연결을 준비하지 못했어요. 설정을 확인해 주세요.")
 
 
 class BoardLiveTest(unittest.TestCase):

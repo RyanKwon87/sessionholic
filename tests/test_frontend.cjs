@@ -2074,6 +2074,22 @@ test('a page shown again after a missed online event reads again, and live updat
   assert.ok(requests.length > reads);
 });
 
+test('a page loaded in the background reads once it is first shown', async () => {
+  const requests = [];
+  const c = client(async (url) => {
+    requests.push(url);
+    return { ok: true, status: 200, json: async () => url === '/api/snapshot' ? { hosts: [] } : url === '/api/capabilities' ? { hosts: [], csrfToken: 'csrf-test' } : {} };
+  }, noChatTimers);
+  c.context.navigator = { onLine: true };
+  // Opened in a background tab (or restored hidden): nothing is read while hidden.
+  c.context.document.hidden = true; c.windowEvents.DOMContentLoaded();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(requests.includes('/api/snapshot'), false);
+  c.context.document.hidden = false; c.documentEvents.visibilitychange();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.ok(requests.includes('/api/snapshot'));
+});
+
 test('online recovery reads one selected state and snapshot without resending unknown work or terminal input', async () => {
   const requests = [];
   let snapshot;

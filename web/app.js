@@ -214,7 +214,9 @@ const state = {
   events: null,
   eventsRetryAt: 0,
   reopenOnReturn: null, // a session key to open once back from an ended terminal
-  pageHidden: false, // hidden (or left for the back-forward cache) since last shown
+  // Hidden (or left for the back-forward cache) since last shown. True at first: a page
+  // can load hidden (a background tab, a restored session), and nothing reads until shown.
+  pageHidden: true,
   snapshotVersion: null,
   eventsSnapshotVersion: null,
   // The server process those versions count in: a restart counts from 0 again.

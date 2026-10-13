@@ -319,6 +319,58 @@ class SessionLabelsHTTPTest(unittest.TestCase):
         self.assertEqual(closed, ['b' * 32, 'a' * 32])
         self.assertEqual(type(self.request('GET', '/api/snapshot')[1]['hosts'][0]['data']['codex'][0]['tidiedAt']), int)
 
+    def claude_row(self, phase='done'):
+        sid = str(uuid.uuid4())
+        row = {'id': 'abcd1234', 'sessionId': sid, 'kind': 'background', 'cwd': '/example/workspace',
+               'title': 'Claude job', 'phase': phase}
+        self.board.state[self.host['name']]['data']['claude'] = [row]
+        return row
+
+    def claude_tidied(self):
+        return self.request('GET', '/api/snapshot')[1]['hosts'][0]['data']['claude'][0]['tidiedAt']
+
+    def test_claude_sessions_are_put_away_by_their_exact_conversation(self):
+        row = self.claude_row()
+        native = self.httpd.workflow.native_of({**row, 'host': self.host['name'], 'agent': 'claude', 'home': '.claude'})
+        self.assertEqual(native['sessionId'], row['sessionId'])
+        self.assertNotIn('sessionId', self.httpd.workflow.native_of({**self.native, 'host': self.host['name'], 'agent': 'codex', 'sessionId': 'x' * 10}))
+        closed = []
+        terminal = {'id': 'c' * 32, 'mode': 'attach', 'alive': True, 'closed': False, 'nativeSource': native}
+        self.httpd.terminals = self.httpd.workflow.terminals = SimpleNamespace(
+            list=lambda: [terminal], close=lambda: None, close_terminal=lambda tid: closed.append(tid) or {'ok': True})
+        self.assertEqual(self.request('POST', '/api/terminal/%s/close' % ('c' * 32), {})[0].status, 200)
+        self.assertEqual(type(self.claude_tidied()), int)
+        # 실행 종료 from 세션 관리 names the row the board resolved, sessionId included.
+        self.claude_row()
+        self.board.state[self.host['name']]['ok'] = True
+        proof = 'proof.' + 'f' * 64
+        with patch.object(self.httpd.workflow.transfers, 'rpc', return_value={'confirmed': True}), \
+                patch.object(self.board, 'request_refresh'):
+            response, _ = self.request('POST', '/api/session/action', {
+                'source': {'host': self.host['name'], 'agent': 'claude', 'id': 'abcd1234'}, 'action': 'terminate',
+                'requestId': 'request-claude-0001', 'targetProof': proof})
+        self.assertEqual(response.status, 200)
+        self.assertEqual(type(self.claude_tidied()), int)
+
+    def test_a_view_closed_while_its_run_goes_on_or_an_ended_terminal_puts_nothing_away(self):
+        for phase, mode, alive in (('working', 'attach', True), ('needs_input', 'attach', True), ('done', 'new-session', False)):
+            with self.subTest(phase=phase, mode=mode):
+                row = self.claude_row(phase)
+                native = self.httpd.workflow.native_of({**row, 'host': self.host['name'], 'agent': 'claude', 'home': '.claude'})
+                terminal = {'id': 'd' * 32, 'mode': mode, 'alive': alive, 'closed': not alive, 'nativeSource': native}
+                self.httpd.terminals = self.httpd.workflow.terminals = SimpleNamespace(
+                    list=lambda: [terminal], close=lambda: None, close_terminal=lambda tid: {'ok': True})
+                self.assertEqual(self.request('POST', '/api/terminal/%s/close' % ('d' * 32), {})[0].status, 200)
+                self.assertIsNone(self.claude_tidied())
+        # A run the board ends (not just a view) is put away even while it was working.
+        row = self.claude_row('working')
+        native = self.httpd.workflow.native_of({**row, 'host': self.host['name'], 'agent': 'claude', 'home': '.claude'})
+        terminal = {'id': 'e' * 32, 'mode': 'resume', 'alive': True, 'closed': False, 'nativeSource': native}
+        self.httpd.terminals = self.httpd.workflow.terminals = SimpleNamespace(
+            list=lambda: [terminal], close=lambda: None, close_terminal=lambda tid: {'ok': True})
+        self.request('POST', '/api/terminal/%s/close' % ('e' * 32), {})
+        self.assertEqual(type(self.claude_tidied()), int)
+
     def test_a_confirmed_terminate_puts_the_session_away_and_an_interrupt_does_not(self):
         self.board.state[self.host['name']]['ok'] = True
         proof = 'proof.' + 'f' * 64

@@ -7537,7 +7537,7 @@ test('a session put away from the list leaves 최근 끝남 until it changes aga
   const c = client(undefined, noChatTimers);
   const now = 2_000_000;
   const sessions = [
-    recentSession('ended-here', { phase: 'done', updatedAt: now - 300, tidiedAt: now - 400 }),
+    recentSession('ended-here', { phase: 'done', updatedAt: now - 300, tidiedAt: now - 400, title: '정리한 작업' }),
     // Its own shutdown wrote within the grace: still put away.
     recentSession('shutdown-write', { phase: 'closed', updatedAt: now - 300, tidiedAt: now - 410 }),
     // Changed again after the grace: back in 최근 끝남.
@@ -7554,7 +7554,10 @@ test('a session put away from the list leaves 최근 끝남 until it changes aga
     ['rest', 'rest', 'finished', 'working', 'needs_input', 'finished']);
   const shown = Array.from(c.allSessions().filter((s) => c.matches(s, now)), (s) => s.id).sort();
   assert.deepEqual(shown, ['changed-again', 'plain-done', 'question', 'running']);
-  // Shown again with old records included (and so by search too).
+  // Found by search, and shown with old records included.
+  c.state.search = '정리한';
+  assert.ok(c.allSessions().filter((s) => c.matches(s, now)).some((s) => s.id === 'ended-here'));
+  c.state.search = '';
   c.state.showOld = true;
   assert.ok(c.allSessions().filter((s) => c.matches(s, now)).some((s) => s.id === 'ended-here'));
 });

@@ -43,12 +43,17 @@ class FakeAppServer:
             return {"data": list(reversed(turns)) if isinstance(turns, list) else turns, "nextCursor": None}
         if method != "thread/read":
             raise AssertionError("unexpected native command: " + method)
+        if params.get("includeTurns") and getattr(self, "paged", False):
+            # The whole-history fallback of the same state read sees the same snapshot.
+            self.paged = False
+            return self.current
         response = next(self.reads)
         if isinstance(response, Exception):
             raise response
         self.current = response
         thread = response.get("thread") if isinstance(response, dict) else None
         if isinstance(thread, dict) and not params.get("includeTurns"):
+            self.paged = True
             return {**response, "thread": {**thread, "turns": []}}
         return response
 
@@ -302,6 +307,14 @@ class PagedTurnsTest(unittest.TestCase):
         rejected = collector.RpcReplyError("Invalid request: unknown variant `notloaded`", -32600)
         with self.assertRaises(collector.RpcReplyError):
             native._thread_turns(self.Pages(self.turns(2), errors={"thread/turns/list": rejected}), "t-1")
+
+    def test_a_running_turn_in_a_thread_that_is_not_active_is_confirmed_whole(self):
+        turns = [{"id": "turn-0", "status": "completed"}, {"id": "turn-1", "status": "inProgress"}]
+        client = self.Pages(turns)
+        self.assertIsNone(native._thread_turns(client, "t-1"))
+        state = native._codex_state(client, {"agent": "codex", "id": "t-1", "home": ".codex"})
+        self.assertIn(("thread/read", {"threadId": "t-1", "includeTurns": True}), client.calls)
+        self.assertFalse(state["confirmed"])
 
     def test_more_turns_than_pages_are_read_whole_and_a_malformed_page_is_refused(self):
         with patch.object(native, "TURN_PAGES", 2):

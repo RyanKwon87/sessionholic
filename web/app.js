@@ -942,7 +942,7 @@ function matches(s, now, { phase = true, category = true, initiator = true } = {
   if (
     !state.showOld &&
     groupOf(s, now) === "rest" &&
-    (now - (s.updatedAt || 0) > RECENT_SECONDS || sessionTidied(s))
+    (now - (s.updatedAt || 0) > RECENT_SECONDS || (sessionTidied(s) && !state.search))
   )
     return false;
   if (!state.search) return true;

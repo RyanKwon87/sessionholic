@@ -1738,6 +1738,16 @@ class Workflow:
     def identity(row):
         return {k: row.get(k) for k in ("host", "agent", "id", "home")}
 
+    @classmethod
+    def native_of(cls, source):
+        """A terminal's nativeSource; a Claude row also names its conversation (sessionId), so
+        the board can match the listed row exactly (a worker id can be reused)."""
+        native = {**cls.identity(source), "cwd": source.get("cwd"), "kind": source.get("kind")}
+        session_id = source.get("sessionId")
+        if source.get("agent") == "claude" and isinstance(session_id, str) and re.fullmatch(r"[0-9A-Za-z-]{8,64}", session_id):
+            native["sessionId"] = session_id
+        return native
+
     def bot_request(self, source):
         service = getattr(self, "bot_requests", None)
         if service is None:
@@ -2014,7 +2024,7 @@ class Workflow:
                     metadata.update(mode=spec["connectionMode"], launchMode=plan["mode"])
                 native_source = spec.get("nativeSource")
                 if plan["mode"] in ("attach", "resume"):
-                    native_source = {**self.identity(source), "cwd": source.get("cwd"), "kind": source.get("kind")}
+                    native_source = self.native_of(source)
                 if native_source:
                     metadata["nativeSource"] = native_source
                 if spec.get("transferId"):
@@ -2105,7 +2115,7 @@ class Workflow:
             import collector
             return {"argv": self.transfers.windows_terminal(host, spec), "cwd": str(Path.home()),
                     "env": collector.tool_env(), "connectionMode": spec.get("connectionMode") or "attach",
-                    "nativeSource": {**self.identity(source), "cwd": source.get("cwd"), "kind": source.get("kind")}}
+                    "nativeSource": self.native_of(source)}
         profiles = self.transfers.profiles(host, refresh=True)
         identity = "claude:default" if source["agent"] == "claude" else "codex:" + source["home"]
         profile = next((p for p in profiles if p.get("id") == identity and p.get("available")), None)
@@ -2400,7 +2410,8 @@ class Handler(BaseHTTPRequestHandler):
         if action and result.get("confirmed"):
             self.server.chat._forget_state(source)
             if data.get("action") == "terminate":
-                self.tidy_after_close(ref)
+                # The listed row the board resolved (a Claude row carries its sessionId).
+                self.tidy_after_close(source)
             self.server.board.request_refresh(host["name"], force=False)
         return result
 
@@ -2430,14 +2441,18 @@ class Handler(BaseHTTPRequestHandler):
             self.server.board.changed(force=True)
         return {'tidiedAt': result['seenAt']}
 
-    def tidy_after_close(self, native):
+    def tidy_after_close(self, native, ended=True):
         """A session the board just ended (or whose terminal its user closed) leaves 최근 끝남.
-        Best effort: the close itself already succeeded, and an unlisted session has no card."""
+        `ended` False is a view closed while its run goes on: a running or waiting session is
+        then left as it is, so its finish still shows. Best effort: the close itself already
+        succeeded, and an unlisted session has no card."""
         if not isinstance(native, dict):
             return
         try:
             source = self.listed_source({key: native.get(key) for key in ('host', 'agent', 'id', 'home', 'kind', 'sessionId')
                                          if native.get(key) is not None})
+            if not ended and source.get('phase') in ('working', 'needs_input'):
+                return
             _result, changed = self.server.session_tidied.mark(source, int(time.time()))
         except (GoalError, ValueError, KeyError, RuntimeError, OSError):
             return
@@ -2807,8 +2822,11 @@ class Handler(BaseHTTPRequestHandler):
                 elif action == "close":
                     row = next((t for t in self.server.terminals.list() if t.get("id") == tid), None)
                     self.server.terminals.close_terminal(tid)
-                    if row is not None:
-                        self.tidy_after_close(row.get("nativeSource") or (row.get("metadata") or {}).get("nativeSource"))
+                    # Only a terminal still running when closed: one that already ended (a host
+                    # that went to sleep) was not ended from the board.
+                    if row is not None and row.get("alive") and not row.get("closed"):
+                        self.tidy_after_close(row.get("nativeSource") or (row.get("metadata") or {}).get("nativeSource"),
+                                              ended=(row.get("mode") or (row.get("metadata") or {}).get("mode")) != "attach")
                     try:
                         self.server.terminal_inputs.prune_closed(tid, self.server.terminals.list())
                     except (ValueError, RuntimeError, OSError):

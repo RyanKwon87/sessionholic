@@ -142,6 +142,10 @@ def _thread_turns(client, thread_id):
         if collector.paging_unsupported(error, method):
             return None
         raise
+    status = thread.get("status") if isinstance(thread.get("status"), dict) else {}
+    if status.get("type") != "active" and any(isinstance(turn, dict) and turn.get("status") == "inProgress" for turn in turns):
+        # A turn listed as running in a thread that is not: confirm from the whole history.
+        return None
     return {**result, "thread": {**thread, "turns": list(reversed(turns))}}
 
 

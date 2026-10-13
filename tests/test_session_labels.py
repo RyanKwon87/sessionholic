@@ -313,7 +313,10 @@ class SessionLabelsHTTPTest(unittest.TestCase):
         # A later change does not undo it (unlike a tidy): the screen keeps it away.
         self.native['updatedAt'] = result['removedAt'] + 9999
         self.assertEqual(self.request('GET', '/api/snapshot')[1]['hosts'][0]['data']['codex'][0]['removedAt'], result['removedAt'])
-        self.assertEqual(self.request('POST', '/api/session/remove', {'source': self.source, 'removed': False})[1], {'removedAt': None})
+        shown = self.request('POST', '/api/session/remove', {'source': self.source, 'removed': False})[1]
+        self.assertEqual(shown['removedAt'], None)
+        # The snapshot version that carries it: a screen keeps its own choice until then.
+        self.assertEqual(shown['version'], self.request('GET', '/api/snapshot')[1]['version'])
         self.assertIsNone(self.request('GET', '/api/snapshot')[1]['hosts'][0]['data']['codex'][0]['removedAt'])
         for payload in ({'source': self.source}, {'source': self.source, 'removed': 1},
                         {'source': {**self.source, 'id': str(uuid.uuid4())}, 'removed': True}):

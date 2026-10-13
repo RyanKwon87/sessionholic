@@ -720,9 +720,19 @@ select:disabled {
   background: var(--surface);
   box-shadow: inset 0 0 0 1px var(--sep);
 }
+.top-status .top-chip {
+  position: relative;
+}
+/* A 44px tall tap target around the 30px chip, as the device chips have. */
+.top-status .top-chip::before {
+  content: "";
+  position: absolute;
+  inset: -7px 0;
+}
 .top-status .top-chip:focus-visible {
   outline-offset: -3px;
 }
+
 .host {
   display: inline-flex;
   align-items: center;
@@ -2944,6 +2954,12 @@ li[data-task] {
     --fs-sub: 0.875rem;
     --detail-pad: 16px;
     --sheet-pad: 16px;
+  }
+  /* The top scroller fades at its end, so chips past it read as more to see. */
+  .top-status {
+    -webkit-mask-image: linear-gradient(to right, currentColor calc(100% - 18px), transparent);
+    mask-image: linear-gradient(to right, currentColor calc(100% - 18px), transparent);
+    padding-right: 14px;
   }
   .login {
     background: var(--surface);

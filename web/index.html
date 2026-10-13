@@ -67,9 +67,9 @@
         </button>
         <!-- Phones: the small title that replaces the large one once it scrolls away. -->
         <button id="nav-title" class="nav-title" type="button" aria-label="세션 목록 맨 위로">세션</button>
-        <!-- Devices, their hardware and the agents' usage, above every view (not in the list). -->
+        <!-- The devices' hardware, the agents' usage and the device chips, above every view (not in
+             the list); the first two lead, so a phone shows them without scrolling. -->
         <div class="top-status">
-          <div id="hosts" class="hosts" aria-label="기기 연결 상태"></div>
           <button
             id="hardware"
             class="list-chip usage-chip hardware-chip top-chip"
@@ -84,6 +84,7 @@
             aria-haspopup="dialog"
             hidden
           ><span id="usage-summary" class="usage-summary"></span></button>
+          <div id="hosts" class="hosts" aria-label="기기 연결 상태"></div>
         </div>
         <button
           id="refresh"

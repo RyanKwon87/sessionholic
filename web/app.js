@@ -56,7 +56,11 @@ function sessionRemoved(s) {
   if (!s) return false;
   const local = state.removedLocal?.get(s.key);
   if (local) {
-    if (local.after && state.snapshot !== local.after) state.removedLocal.delete(s.key);
+    // The board answers with its version: a snapshot from before it (a read already on its
+    // way) does not undo this page's choice; one at or after it says the same or later.
+    const read = local.version != null ? (Number(state.snapshot?.version) || 0) >= local.version
+      : local.after && state.snapshot !== local.after;
+    if (read) state.removedLocal.delete(s.key);
     else return local.removed;
   }
   return Number.isInteger(s.removedAt);
@@ -1007,7 +1011,7 @@ function render() {
   const sessions = allSessions();
   const reading = state.detailShown && sessions.find((session) => session.key === state.selected);
   if (reading && botRequestForNative(sourceOf(reading))) { selectBotRequest(botRequestKey(botRequestForNative(sourceOf(reading)))); return; }
-  if (reading && sessionCategoryOf(reading) !== state.sessionCategory) setSessionCategory(sessionCategoryOf(reading), { renderView: false, clearSelection: false });
+  if (reading && !botFilter() && sessionCategoryOf(reading) !== state.sessionCategory) setSessionCategory(sessionCategoryOf(reading), { renderView: false, clearSelection: false });
   renderHosts(now); renderFreshness(now); renderAttention(sessions);
   // The conversation on screen is read, also when it answers or finishes while shown
   // (before the list is drawn, so its card never flashes a dot).
@@ -1370,8 +1374,8 @@ function initiatorLabel(s) {
   if (bot) return `${bot} 시작`;
   return INITIATOR_LABELS[initiatorOf(s)] + (s?.initiatorName ? ` · ${s.initiatorName}` : "");
 }
-// The bot that opened a session: a bot request's source (홀릭이, 뷰링이; "홀릭이 · Slack" is
-// 홀릭이) or Codex's originator (헤르메스). 시작 주체 can pick one (value BOT_FILTER_PREFIX + name).
+// The bot that opened a session: a bot request's source by its name ("Name · Slack" is Name)
+// or Codex's originator (헤르메스). 시작 주체 can pick one (value BOT_FILTER_PREFIX + name).
 const BOT_FILTER_PREFIX = "bot:";
 const ORIGINATOR_BOTS = { hermes: "헤르메스" };
 function botNameOf(s) {
@@ -1536,7 +1540,7 @@ function setSessionCategory(category, { renderView = true, clearSelection = true
   state.sessionCategory = category;
   if (changed && !state.selected && !state.selectedBotRequest) $("detail").replaceChildren();
   const origin = state.filters.initiator;
-  if (category !== "bot" && origin && (origin === "agent" ? "agent" : "general") !== category) state.filters.initiator = "";
+  if (category !== "bot" && origin && !botFilter() && (origin === "agent" ? "agent" : "general") !== category) state.filters.initiator = "";
   if (renderView) { render(); if (changed) $("task-list-pane").scrollTop = 0; }
   if (category === "bot" && renderView) loadBotRequests();
   return changed;
@@ -1556,7 +1560,7 @@ function renderSessionCategories(sessions, now) {
     $(`session-category-${category}-count`).textContent = counts[category] === null ? "-" : String(counts[category]);
   }
   $("groups").setAttribute("aria-labelledby", `session-category-${state.sessionCategory}`);
-  $("session-category-note").hidden = state.sessionCategory !== "general" || state.filters.initiator === "human";
+  $("session-category-note").hidden = state.sessionCategory !== "general" || state.filters.initiator === "human" || !!botFilter();
   const others = Object.keys(SESSION_CATEGORIES).filter((category) => category !== state.sessionCategory && counts[category] > 0);
   const other = others[0];
   $("session-category-search").hidden = !state.search.trim() || !other;
@@ -1571,7 +1575,8 @@ function sessionCategoryKeydown(event) {
   setSessionCategory(category); $(`session-category-${category}`).focus();
 }
 function prepareSessionListFor(session) {
-  let changed = setSessionCategory(sessionCategoryOf(session), { renderView: false, clearSelection: false });
+  // A picked bot lists its sessions in any tab: opening one keeps the tab (and the bot).
+  let changed = botFilter() ? false : setSessionCategory(sessionCategoryOf(session), { renderView: false, clearSelection: false });
   for (const key of Object.keys(state.filters)) {
     const value = key === "initiator" ? (botFilter() ? BOT_FILTER_PREFIX + botNameOf(session) : initiatorOf(session)) : session[key];
     const excluded = key === "account" && state.filters.account && state.accountFilterRoutes
@@ -1626,8 +1631,11 @@ function renderFilters(sessions) {
       String(a[1]).localeCompare(String(b[1]), "ko"),
     ))
       select.append(new Option(text, value));
-    if (state.filters[key] && !options.has(state.filters[key]))
-      select.append(new Option(`${state.filters[key]} · 마지막 선택`, state.filters[key]));
+    if (state.filters[key] && !options.has(state.filters[key])) {
+      const last = state.filters[key];
+      const name = key === "initiator" && last.startsWith(BOT_FILTER_PREFIX) ? `봇 · ${last.slice(BOT_FILTER_PREFIX.length)}` : last;
+      select.append(new Option(`${name} · 마지막 선택`, last));
+    }
     select.value = state.filters[key];
     select.addEventListener("change", () => {
       state.filters[key] = select.value;
@@ -1953,7 +1961,8 @@ const OPENED_SPACING_SECONDS = 60;
 function markOpened(s) {
   const now = Math.floor(Date.now() / 1000);
   const before = Math.max(Number(s.openedAt) || 0, state.openedLocal?.get(s.key) || 0);
-  if (state.openedHeld?.key !== s.key) state.openedHeld = { key: s.key, at: before };
+  // Opened again after going back (or from another): its place is taken afresh.
+  if (state.openedHeld?.key !== s.key || !state.detailShown) state.openedHeld = { key: s.key, at: before };
   if (now - before < OPENED_SPACING_SECONDS) return;
   (state.openedLocal ||= new Map()).set(s.key, now);
   api("/api/session/opened", { method: "POST", body: { source: seenSource(s) } }).catch(() => {
@@ -2277,7 +2286,8 @@ async function removeSession(s, removed, { quiet = false } = {}) {
   (state.removedLocal ||= new Map()).set(key, mark);
   render();
   try {
-    await api("/api/session/remove", { method: "POST", body: { source: seenSource(s), removed } });
+    const result = await api("/api/session/remove", { method: "POST", body: { source: seenSource(s), removed } });
+    if (Number.isInteger(result?.version)) mark.version = result.version;
     mark.after = state.snapshot;
     if (!quiet) toast(removed ? REMOVED_NOTE : "목록에 다시 표시합니다.");
     poll(false);
@@ -2566,8 +2576,9 @@ async function tidySession(context, away) {
     const source = seenSource(context.s);
     if (!away)
       await api("/api/session/tidy", { method: "POST", body: { source, tidied: false }, authEpoch: context.authEpoch });
-    await api("/api/session/remove", { method: "POST", body: { source, removed: away }, authEpoch: context.authEpoch });
-    (state.removedLocal ||= new Map()).set(context.s.key, { removed: away, after: state.snapshot });
+    const result = await api("/api/session/remove", { method: "POST", body: { source, removed: away }, authEpoch: context.authEpoch });
+    (state.removedLocal ||= new Map()).set(context.s.key, { removed: away, after: state.snapshot,
+      version: Number.isInteger(result?.version) ? result.version : null });
     if (sessionControl !== context) return;
     $("session-control-status").textContent = away ? REMOVED_NOTE : "목록에 다시 표시합니다.";
     const tidy = $("session-control-tidy");
@@ -3154,12 +3165,19 @@ function setMessagesScroll(list, top) {
 }
 // The class mirror of state.chromeVisible (and of the input's focus):
 // "is-reading" folds the header and the composer tools.
+// 집중 모드 adds 빠른 답장 to the input's row: a short hint keeps it on one line on a phone.
+function chatPlaceholder(oneShot) {
+  if (oneShot) return "후속 메시지 없음";
+  return $("detail")?.classList?.contains?.("is-reading") ? "메시지…" : "이 세션에 보낼 메시지…";
+}
 function setReading(reading, { stickBottom = false } = {}) {
   const pane = $("detail");
   if (!pane?.classList || pane.classList.contains?.("is-reading") === reading) return;
   const list = $("messages");
   const before = list?.getBoundingClientRect?.().top;
   pane.classList.toggle?.("is-reading", reading);
+  const chatInput = $("chat-input");
+  if (chatInput && chatInput.placeholder !== "후속 메시지 없음") chatInput.placeholder = chatPlaceholder(false);
   if (list && typeof before === "number") {
     if (stickBottom) list.scrollTop = list.scrollHeight;
     else {
@@ -3796,7 +3814,7 @@ function buildChatComposer(s) {
   const input = el("textarea", "chat-input");
   input.id = "chat-input";
   input.rows = entry.expanded ? 3 : 1;
-  input.placeholder = "이 세션에 보낼 메시지…";
+  input.placeholder = chatPlaceholder(false);
   input.setAttribute("aria-label", "메시지");
   input.value = entry.text;
   input.addEventListener("input", () => {
@@ -3995,6 +4013,7 @@ function buildChatComposer(s) {
   quickInline.id = "chat-quick-inline";
   quickInline.innerHTML = QUICK_ICON;
   quickInline.setAttribute("aria-label", "빠른 답장");
+  quickInline.setAttribute("aria-haspopup", "dialog");
   quickInline.title = "빠른 답장";
   quickInline.addEventListener("pointerdown", (event) => event.preventDefault());
   const main = el("div", "chat-main");
@@ -4221,7 +4240,7 @@ function updateChatComposer(entry) {
   // disabled field would drop the focus, and with it the keyboard and the
   // next ⌘↩. sendChat itself refuses a second send meanwhile.
   const input = $("chat-input");
-  input.placeholder = oneShot ? "후속 메시지 없음" : "이 세션에 보낼 메시지…";
+  input.placeholder = chatPlaceholder(oneShot);
   input.disabled = !supported && !gateOn && recovery?.action !== "resume_session";
   input.readOnly = !input.disabled && (entry.sending || !!entry.pending);
   input.setAttribute("aria-disabled", String(input.disabled || input.readOnly));

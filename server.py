@@ -1702,6 +1702,9 @@ class Workflow:
             return False
         if terminal is not None and terminal.get("closedReason") in ("user", "released"):
             return True
+        # Its user pressed Ctrl+C while it waited to attach again (terminal.py _hold_ended).
+        if (Path(self.transfers.hold_waiting) / (item["name"] + ".ended")).exists():
+            return True
         if terminal is not None and isinstance(terminal.get("closedAt"), int):
             return time.time() - terminal["closedAt"] >= self.HOLD_KEEP_SECONDS
         return item["age"] >= self.HOLD_KEEP_SECONDS
@@ -1731,6 +1734,10 @@ class Workflow:
                     sys.stderr.write("남은 실행 보관을 정리했습니다: %s %s\n" % (host["name"], item["name"]))
                 except (RuntimeError, OSError, ValueError):
                     continue
+                try:
+                    (Path(self.transfers.hold_waiting) / (item["name"] + ".ended")).unlink(missing_ok=True)
+                except OSError:
+                    pass
 
     def start_hold_sweep(self):
         def run():

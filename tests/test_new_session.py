@@ -10,6 +10,7 @@ import json
 import os
 from pathlib import Path
 import stat
+import subprocess
 import sys
 import tempfile
 import threading
@@ -568,7 +569,12 @@ class TransfersTerminalTest(unittest.TestCase):
         spec = json.loads(argv[4])
         self.assertEqual(spec['first'][-1], 'exec /usr/bin/python3 -I %s hold %s new-session' % (RUNTIME, name))
         # Attaching again needs only the host's tmux, never the helper file of the day it opened.
-        self.assertEqual(spec['again'][-1], 'exec /opt/homebrew/bin/tmux -L sessionholic-hold -f /dev/null attach-session -t =' + name)
+        self.assertEqual(spec['again'][-1], "exec /opt/homebrew/bin/tmux -L sessionholic-hold -f /dev/null attach-session -t '=" + name + "'")
+        # A Mac's login shell (zsh) reads a bare "=word" as a command path: the target reaches tmux as written.
+        if os.path.exists('/bin/zsh'):
+            words = subprocess.run(['/bin/zsh', '-c', spec['again'][-1].replace('exec /opt/homebrew/bin/tmux', "printf '%s\\n'", 1)],
+                                   capture_output=True, text=True, check=True).stdout.split()
+            self.assertEqual(words, ['-L', 'sessionholic-hold', '-f', '/dev/null', 'attach-session', '-t', '=' + name])
         self.assertNotIn(RUNTIME, spec['again'][-1])
         self.assertEqual(spec['wait'], str(self.flow.hold_waiting / name))
         for command in (spec['first'], spec['again']):
@@ -635,11 +641,42 @@ class HoldLoopTest(unittest.TestCase):
             with patch.object(terminal.termios, 'tcflush'):
                 terminal._hold_loop(spec, run=run, sleep=lambda s: seen.append(('sleep', mark.exists())),
                                     clock=lambda: now[0], out=out)
-            # Marked only while waiting; gone before it attaches again and after the loop.
-            self.assertEqual(seen, [('first', False), ('sleep', True), ('again', False)])
+            # Marked while waiting and while it attaches again (a send then could be split or
+            # dropped); gone after the loop.
+            self.assertEqual(seen, [('first', False), ('sleep', True), ('again', True)])
             self.assertFalse(mark.exists())
             self.assertTrue(out.getvalue().startswith(terminal.HOLD_RESET), 'mouse and paste modes off first')
             self.assertIn('그 기기의 실행도 끝냅니다', out.getvalue())
+            # Attached again for a moment, the mark goes and the board takes sends again.
+            started = []
+
+            class Timer:
+                def __init__(self, delay, callback, args):
+                    started.append(delay)
+                    self.fire = lambda: callback(*args)
+                def start(self):
+                    pass
+                def cancel(self):
+                    pass
+            marks, codes, now[0] = [], [255, 0], 0.0
+
+            def run(argv):
+                if argv[1] == 'again':
+                    timers[-1].fire()
+                    marks.append(mark.exists())
+                now[0] += 3600
+                return codes.pop(0)
+            timers = []
+            with patch.object(terminal.termios, 'tcflush'):
+                terminal._hold_loop(spec, run=run, sleep=lambda s: None, clock=lambda: now[0], out=io.StringIO(),
+                                    timer=lambda *a: timers.append(Timer(*a)) or timers[-1])
+            self.assertEqual((started, marks), ([terminal.HOLD_BACK], [False]))
+            # Ctrl+C while waiting: no attaching again, and the board will end the run there.
+            with patch.object(terminal.termios, 'tcflush'):
+                code = terminal._hold_loop(spec, run=lambda argv: 255, sleep=lambda s: (_ for _ in ()).throw(KeyboardInterrupt()),
+                                           clock=iter(range(0, 10**6, 3600)).__next__, out=io.StringIO())
+            self.assertEqual(code, 130)
+            self.assertTrue(mark.with_name(mark.name + '.ended').exists())
 
     def test_other_ends_are_the_terminals_end(self):
         for codes, durations, expected in (([0], [100], 0), ([1], [100], 1), ([-15], [100], 1),
@@ -660,8 +697,11 @@ class BoardHoldTest(unittest.TestCase):
         def rpc(host, op, args, timeout=30):
             calls.append((host['name'], op, args))
             return {'holds': list(holds)} if op == 'hold_list' else {'killed': True}
+        waiting = Path(tempfile.mkdtemp(dir='/tmp', prefix='sh-hold-ended-'))
+        self.addCleanup(lambda: [f.unlink() for f in waiting.iterdir()] and None or waiting.rmdir())
         transfers = SimpleNamespace(lock=threading.RLock(), hold_support={'remote': support, 'local': '/usr/bin/tmux'}, rpc=rpc,
-                                    holds_mine=lambda name: isinstance(name, str) and name.startswith('sh-' + self.TAG))
+                                    holds_mine=lambda name: isinstance(name, str) and name.startswith('sh-' + self.TAG),
+                                    hold_waiting=waiting)
         board = SimpleNamespace(hosts=[LOCAL, REMOTE, PC], state={'local': {'ok': True}, 'remote': {'ok': online}, 'pc': {'ok': True}})
         flow = SimpleNamespace(board=board, transfers=transfers, terminals=SimpleNamespace(list=lambda: list(terminals)),
                                HOLD_GRACE_SECONDS=server.Workflow.HOLD_GRACE_SECONDS,
@@ -691,6 +731,14 @@ class BoardHoldTest(unittest.TestCase):
             server.Workflow.sweep_holds(flow)
         self.assertEqual([call[2]['name'] for call in calls if call[1] == 'hold_kill'],
                          [self.name('b'), self.name('c'), self.name('e'), self.name('9')])
+        # A terminal its user stopped with Ctrl+C while waiting: ended once its host is back.
+        flow, calls = self.flow(rows[3:4], [{'name': self.name('d'), 'age': 9999}])
+        ended = flow.transfers.hold_waiting / (self.name('d') + '.ended')
+        ended.touch()
+        with patch('sys.stderr', new_callable=io.StringIO), patch.object(server.time, 'time', return_value=now):
+            server.Workflow.sweep_holds(flow)
+        self.assertEqual([call[2]['name'] for call in calls if call[1] == 'hold_kill'], [self.name('d')])
+        self.assertFalse(ended.exists(), 'its mark goes with it')
         holds = [{'name': self.name('d'), 'age': 600}]
         for offline, support in ((False, '/usr/bin/tmux'), (True, None)):
             flow, calls = self.flow([], holds, online=offline, support=support)

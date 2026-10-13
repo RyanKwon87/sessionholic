@@ -1050,6 +1050,7 @@ def _launch(path):
 
 
 HOLD_RETRY = (2, 5, 10, 20, 30)
+HOLD_BACK = 5  # attached again this long: the board takes sends again
 HOLD_SETTLED = 60  # a connection that lasted this long starts the waits over
 HOLD_FIRST_GRACE = 15  # an SSH that fails this soon after opening never ran the step
 
@@ -1090,16 +1091,37 @@ def _hold_quiet(quiet, saved=None):
     return None
 
 
-def _hold_loop(spec, run=subprocess.call, sleep=time.sleep, clock=time.monotonic, out=None):
+def _hold_ended(path):
+    """Its user stopped this terminal reconnecting (Ctrl+C): the board's sweep ends the run on
+    that host once the host is back, as for a terminal closed from the board."""
+    if not path:
+        return
+    try:
+        Path(path).parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        Path(path).with_name(Path(path).name + ".ended").touch(mode=0o600)
+    except OSError:
+        pass
+
+
+def _hold_loop(spec, run=subprocess.call, sleep=time.sleep, clock=time.monotonic, out=None, timer=threading.Timer):
     """A board terminal whose run another host keeps in its own tmux: reconnect after a
     dropped connection (SSH exit 255) by attaching again, never starting anything. Any other
     exit (the run ended, Ctrl+C, a refusal) ends the terminal with that code."""
     out = out or sys.stdout
+    wait_path = spec.get("wait")
     argv, attempt, opened = spec["first"], 0, clock()
     try:
         while True:
-            started = clock()
+            started, back = clock(), None
+            if argv is not spec["first"]:
+                # Still marked while connecting and a moment after: a send then could be
+                # split or dropped. Attached that long, the board takes sends again.
+                back = timer(HOLD_BACK, _hold_waiting, (wait_path, False))
+                back.daemon = True
+                back.start()
             code = run(argv)
+            if back is not None:
+                back.cancel()
             if code != 255:
                 return code if code >= 0 else 1
             if argv is spec["first"] and clock() - opened < HOLD_FIRST_GRACE:
@@ -1108,18 +1130,20 @@ def _hold_loop(spec, run=subprocess.call, sleep=time.sleep, clock=time.monotonic
                 attempt = 0
             wait = HOLD_RETRY[min(attempt, len(HOLD_RETRY) - 1)]
             attempt += 1
-            _hold_waiting(spec.get("wait"), True)
+            _hold_waiting(wait_path, True)
             try:
                 termios.tcflush(0, termios.TCIFLUSH)
             except (termios.error, OSError, ValueError):
                 pass
             out.write(HOLD_RESET + "\r\n[하던 일] 기기 연결이 끊겼습니다. 실행은 그 기기에서 계속되고, "
-                      "%d초 뒤 다시 연결합니다… (Ctrl+C를 누르면 다시 연결하지 않고 그 기기의 실행도 끝냅니다)\r\n" % wait)
+                      "%d초 뒤 다시 연결합니다… (Ctrl+C를 누르면 다시 연결하지 않고, 기기가 연결되면 그 기기의 "
+                      "실행도 끝냅니다)\r\n" % wait)
             out.flush()
             saved = _hold_quiet(True)
             try:
                 sleep(wait)
             except KeyboardInterrupt:
+                _hold_ended(wait_path)
                 return 130
             finally:
                 _hold_quiet(False, saved)
@@ -1128,10 +1152,9 @@ def _hold_loop(spec, run=subprocess.call, sleep=time.sleep, clock=time.monotonic
                 termios.tcflush(0, termios.TCIFLUSH)
             except (termios.error, OSError, ValueError):
                 pass
-            _hold_waiting(spec.get("wait"), False)
             argv = spec["again"]
     finally:
-        _hold_waiting(spec.get("wait"), False)
+        _hold_waiting(wait_path, False)
 
 
 if __name__ == "__main__":

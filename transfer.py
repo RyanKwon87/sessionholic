@@ -226,8 +226,10 @@ class Transfers:
         name = 'sh-' + self.hold_tag + secrets.token_hex(4)
         first = self.command(host, ['-I', args[1], 'hold', name] + list(args[2:]), tty=True)
         # Attaching again needs only that host's tmux: never a helper file a later deploy removes.
+        # The exact target is quoted by hand: shlex leaves "=name" bare, and zsh (a Mac's login
+        # shell) reads a word starting with "=" as a command path.
         again = self._ssh_tty(host, 'exec ' + shlex.join([tmux, '-L', HOLD_SOCKET, '-f', '/dev/null',
-                                                          'attach-session', '-t', '=' + name]))
+                                                          'attach-session', '-t']) + " '=" + name + "'")
         loop = [sys.executable, '-I', str(Path(__file__).resolve().with_name('terminal.py')), '--hold-loop',
                 json.dumps({'first': first, 'again': again, 'wait': str(self.hold_waiting / name)})]
         return loop, name

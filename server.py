@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import base64
 import copy
+from contextlib import contextmanager
 import errno
 import fcntl
 import gzip
@@ -1388,11 +1389,65 @@ class Workflow:
         self.board, self.terminals, self.state_dir = board, terminals, Path(state_dir)
         self.goals = Goals(state_dir)
         self.plans, self.requests = {}, {}
+        # self.lock guards these dictionaries only; remote work runs outside it. A request id
+        # in flight (inflight: id -> (signature, Event)) is run once and waited for by repeats,
+        # and one route's launch at a time (route_locks) keeps its terminal reused, not doubled.
         self.lock = threading.RLock()
+        self.inflight, self.route_locks = {}, {}
         from transfer import Transfers
         self.transfers = Transfers(board.hosts, state_dir)
         # What 새 세션 terminals run, read from their host at most once a minute.
         self.program_lock, self.program_busy, self.program_asked = threading.Lock(), set(), {}
+
+    # How long a repeat of a request id waits for the same request still running.
+    REQUEST_WAIT = 660
+
+    def _begin(self, request_id, signature):
+        """(True, result) for a request id already answered (its signature must match);
+        otherwise this call owns the request (False, None) until _finish. A repeat while it
+        runs waits for it rather than running a second launch."""
+        while True:
+            with self.lock:
+                if request_id in self.requests:
+                    previous, result = self.requests[request_id]
+                    if previous != signature:
+                        raise ValueError("이미 사용한 요청입니다.")
+                    return True, result
+                running = self.inflight.get(request_id)
+                if running is None:
+                    self.inflight[request_id] = (signature, threading.Event())
+                    return False, None
+                if running[0] != signature:
+                    raise ValueError("이미 사용한 요청입니다.")
+            if not running[1].wait(self.REQUEST_WAIT):
+                raise RuntimeError("같은 실행 요청을 아직 처리하고 있어요. 잠시 뒤 터미널 목록을 확인해 주세요.")
+
+    def _finish(self, request_id, signature, result=None, record=True):
+        """Settle an owned request: its result is kept for repeats (record), or it is
+        released unanswered (a refusal before anything ran may be tried again)."""
+        with self.lock:
+            if record:
+                self.requests[request_id] = (signature, result)
+                if len(self.requests) > 256:
+                    self.requests.pop(next(iter(self.requests)))
+            running = self.inflight.pop(request_id, None)
+        if running is not None:
+            running[1].set()
+
+    @contextmanager
+    def _route(self, key):
+        """One launch per route (source and target) at a time; other routes run alongside."""
+        with self.lock:
+            entry = self.route_locks.setdefault(key, [threading.Lock(), 0])
+            entry[1] += 1
+        try:
+            with entry[0]:
+                yield
+        finally:
+            with self.lock:
+                entry[1] -= 1
+                if not entry[1] and self.route_locks.get(key) is entry:
+                    del self.route_locks[key]
 
     PROGRAM_REFRESH = 60   # seconds between launcher reads on one host
     PROGRAM_STALE = 300    # a named program is read again after this long (the launcher may switch)
@@ -1558,12 +1613,12 @@ class Workflow:
             raise ValueError("새 세션을 열 기기를 선택해 주세요.")
         if host.get("platform") == "windows" and not host.get("launcher"):
             raise ValueError("이 PC의 새 세션 선택지가 기기 설정에 없습니다.")
-        with self.lock:
-            if request_id in self.requests:
-                previous, result = self.requests[request_id]
-                if previous != ("new-session", host["name"]):
-                    raise ValueError("이미 사용한 요청입니다.")
-                return result
+        signature = ("new-session", host["name"])
+        done, result = self._begin(request_id, signature)
+        if done:
+            return result
+        settled = False
+        try:
             if not host["local"] and not self.board.state[host["name"]]["ok"]:
                 raise RuntimeError("기기에 연결할 수 없어 새 세션을 열지 않았어요.")
             key = "new-session:" + request_id
@@ -1591,10 +1646,12 @@ class Workflow:
                                                  {"title": label, "host": host["name"], "mode": "new-session",
                                                   "createdAt": int(time.time())})
             result = {"terminal": terminal, "mode": "new-session"}
-            self.requests[request_id] = (("new-session", host["name"]), result)
-            if len(self.requests) > 256:
-                self.requests.pop(next(iter(self.requests)))
+            self._finish(request_id, signature, result)
+            settled = True
             return result
+        finally:
+            if not settled:
+                self._finish(request_id, signature, record=False)
 
     LINK_WINDOW = 1800  # a launcher's first session counts within 30 minutes of its terminal
 
@@ -1857,27 +1914,44 @@ class Workflow:
     def launch(self, plan_id, request_id):
         if not isinstance(request_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{8,100}", request_id):
             raise ValueError("실행 요청 식별자가 필요합니다.")
+        done, result = self._begin(request_id, plan_id)
+        if done:
+            if isinstance(result, LaunchFailure):
+                raise result
+            return self._link_handoff_goals(result)
+        settled = False
+        try:
+            result = self._launch(plan_id, request_id)
+            settled = True
+            return result
+        except LaunchFailure:
+            settled = True
+            raise
+        finally:
+            if not settled:
+                self._finish(request_id, plan_id, record=False)
+
+    def _launch(self, plan_id, request_id):
+        """One owned launch request; its result (or LaunchFailure) is settled with _finish."""
         with self.lock:
-            if request_id in self.requests:
-                previous_plan, result = self.requests[request_id]
-                if previous_plan != plan_id:
-                    raise ValueError("이미 사용한 요청입니다.")
-                if isinstance(result, LaunchFailure):
-                    raise result
-                return self._link_handoff_goals(result)
             saved = self.plans.get(plan_id)
-            if not saved or saved[0]["expiresAt"] <= time.time():
+        if not saved or saved[0]["expiresAt"] <= time.time():
+            raise ValueError("선택이 만료됐어요. 실행 설정을 다시 확인해 주세요.")
+        plan, source, profile = saved
+        if not plan["allowed"]:
+            raise ValueError(plan["reason"])
+        key_base = hashlib.sha256(json.dumps([plan["source"], plan["target"]], sort_keys=True).encode()).hexdigest()
+        with self._route(key_base):
+            # The route may have been busy for a while: the plan is checked again.
+            if plan["expiresAt"] <= time.time():
                 raise ValueError("선택이 만료됐어요. 실행 설정을 다시 확인해 주세요.")
-            plan, source, profile = saved
-            if not plan["allowed"]:
-                raise ValueError(plan["reason"])
-            key_base = hashlib.sha256(json.dumps([plan["source"], plan["target"]], sort_keys=True).encode()).hexdigest()
             previous = [item for item in self.terminals.list() if item.get("key", "").split(":")[0] == key_base]
             live = next((item for item in reversed(previous) if item.get("alive")), None)
             if live:
-                result = {"terminal": live, "mode": plan["mode"], "reused": True}
-                self.requests[request_id] = (plan_id, result)
-                return self._link_handoff_goals(result)
+                # Settled once linked: a waiting repeat never changes it while it is answered.
+                result = self._link_handoff_goals({"terminal": live, "mode": plan["mode"], "reused": True})
+                self._finish(request_id, plan_id, result)
+                return result
             if plan["mode"] == "reconnect":
                 raise RuntimeError("열어 둔 터미널이 종료됐어요. 실행 설정을 다시 확인해 주세요.")
             # A new explicit launch after a completed CLI is separate from reconnect.
@@ -1956,13 +2030,11 @@ class Workflow:
                     if opened:
                         recovery["terminal"] = opened
                     failure = LaunchFailure(recovery)
-                    self.requests[request_id] = (plan_id, failure)
+                    self._finish(request_id, plan_id, failure)
                     raise failure from exc
-                result = {"terminal": terminal, "mode": plan["mode"]}
-                self.requests[request_id] = (plan_id, result)
-                if len(self.requests) > 256:
-                    self.requests.pop(next(iter(self.requests)))
-                return self._link_handoff_goals(result)
+                result = self._link_handoff_goals({"terminal": terminal, "mode": plan["mode"]})
+                self._finish(request_id, plan_id, result)
+                return result
 
     def remote_handoff(self, host, source, target, profile, request_id, route_key, messages):
         """Another agent or account on the same remote host, prepared and run by that host.

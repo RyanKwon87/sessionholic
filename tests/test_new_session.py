@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import sys
 import tempfile
+import threading
 import unittest
 from unittest.mock import patch
 
@@ -192,6 +193,27 @@ class WorkflowNewSessionTest(unittest.TestCase):
             with self.assertRaises(ValueError):
                 self.flow.new_session(payload)
         self.assertEqual(len(self.terms.created), 1)
+
+    def test_a_new_session_request_repeated_while_it_opens_waits_and_opens_once(self):
+        started, release = threading.Event(), threading.Event()
+        local = {'argv': ['/bin/sh'], 'cwd': '/tmp', 'env': {'HOME': '/tmp'}, 'label': '런처'}
+        def slow():
+            started.set()
+            release.wait(5)
+            return dict(local)
+        results = []
+        with patch('launch.new_session', side_effect=slow):
+            first = threading.Thread(target=lambda: results.append(self.flow.new_session({'host': 'local', 'requestId': 'request-0009'})))
+            first.start()
+            self.assertTrue(started.wait(5))
+            second = threading.Thread(target=lambda: results.append(self.flow.new_session({'host': 'local', 'requestId': 'request-0009'})))
+            second.start()
+            second.join(0.2)
+            self.assertTrue(second.is_alive())
+            release.set()
+            first.join(5); second.join(5)
+        self.assertEqual(len(self.terms.created), 1)
+        self.assertEqual(results[0], results[1])
 
     def test_remote_new_session_runs_the_hosts_own_step_over_ssh(self):
         result = self.flow.new_session({'host': 'remote', 'requestId': 'request-0003'})

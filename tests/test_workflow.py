@@ -168,6 +168,137 @@ class WorkflowTest(unittest.TestCase):
         self.assertEqual((Path(self.temp.name) / 'snapshot.json').stat().st_mode & 0o777, 0o600)
 
 
+class ConcurrencyTest(unittest.TestCase):
+    """Remote work runs outside the workflow lock: a repeat of a request waits for it, one
+    route launches once at a time, and a slow route never holds up another."""
+    setUp = WorkflowTest.setUp
+    tearDown = WorkflowTest.tearDown
+    plan = WorkflowTest.plan
+
+    def blocking_build(self, block):
+        started, release = threading.Event(), threading.Event()
+        built = []
+        def build(source, profile, messages, state_dir):
+            built.append(profile['id'])
+            if block(profile):
+                started.set()
+                release.wait(5)
+            return {'argv': ['/bin/cat'], 'cwd': '/tmp', 'env': {}}
+        return build, started, release, built
+
+    def test_a_request_repeated_while_it_runs_waits_for_it_and_launches_once(self):
+        plan = self.plan()
+        build, started, release, built = self.blocking_build(lambda profile: True)
+        results = []
+        with patch('launch.build_launch', side_effect=build):
+            first = threading.Thread(target=lambda: results.append(self.flow.launch(plan['id'], 'request-0001')))
+            first.start()
+            self.assertTrue(started.wait(5))
+            second = threading.Thread(target=lambda: results.append(self.flow.launch(plan['id'], 'request-0001')))
+            second.start()
+            second.join(0.2)
+            self.assertTrue(second.is_alive(), 'the repeat waits for the request in flight')
+            release.set()
+            first.join(5); second.join(5)
+        self.assertEqual(built, [PROFILE['id']])
+        self.assertEqual(len(self.terms.calls), 1)
+        self.assertEqual(results[0], results[1])
+        self.assertEqual(self.flow.inflight, {})
+
+    def test_a_slow_launch_never_holds_up_another_route(self):
+        attach, handoff = self.plan(), self.plan(OTHER)
+        build, started, release, built = self.blocking_build(lambda profile: profile['id'] == OTHER['id'])
+        with patch('launch.build_launch', side_effect=build):
+            slow = threading.Thread(target=self.flow.launch, args=(handoff['id'], 'request-slow'))
+            slow.start()
+            self.assertTrue(started.wait(5))
+            began = time.monotonic()
+            quick = self.flow.launch(attach['id'], 'request-quick')
+            self.assertLess(time.monotonic() - began, 2)
+            self.assertTrue(slow.is_alive(), 'the other route is still preparing')
+            release.set()
+            slow.join(5)
+        self.assertEqual(quick['mode'], 'attach')
+        self.assertEqual(len(self.terms.calls), 2)
+        self.assertEqual(self.flow.route_locks, {})
+
+    def test_the_same_route_launched_twice_at_once_opens_one_terminal(self):
+        first_plan, second_plan = self.plan(), self.plan()
+        build, started, release, built = self.blocking_build(lambda profile: True)
+        results = {}
+        with patch('launch.build_launch', side_effect=build):
+            first = threading.Thread(target=lambda: results.update(a=self.flow.launch(first_plan['id'], 'request-a')))
+            first.start()
+            self.assertTrue(started.wait(5))
+            second = threading.Thread(target=lambda: results.update(b=self.flow.launch(second_plan['id'], 'request-b')))
+            second.start()
+            second.join(0.2)
+            self.assertTrue(second.is_alive(), 'the same route waits for the launch in progress')
+            release.set()
+            first.join(5); second.join(5)
+        self.assertEqual(len(built), 1)
+        self.assertEqual(len(self.terms.calls), 1)
+        self.assertTrue(results['b'].get('reused'))
+        self.assertEqual(results['a']['terminal']['id'], results['b']['terminal']['id'])
+
+    def test_a_waiting_repeat_runs_the_request_itself_when_the_first_ends_unanswered(self):
+        plan = self.plan()
+        started, release = threading.Event(), threading.Event()
+        calls = []
+        def build(source, profile, messages, state_dir):
+            calls.append(1)
+            if len(calls) == 1:
+                started.set()
+                release.wait(5)
+                raise ValueError('fixture: refused before anything ran')
+            return {'argv': ['/bin/cat'], 'cwd': '/tmp', 'env': {}}
+        outcomes = {}
+        def run(name):
+            try:
+                outcomes[name] = self.flow.launch(plan['id'], 'request-0003')
+            except ValueError as exc:
+                outcomes[name] = exc
+        with patch('launch.build_launch', side_effect=build):
+            first = threading.Thread(target=run, args=('first',))
+            first.start()
+            self.assertTrue(started.wait(5))
+            second = threading.Thread(target=run, args=('second',))
+            second.start()
+            second.join(0.2)
+            release.set()
+            first.join(5); second.join(5)
+        self.assertIsInstance(outcomes['first'], ValueError)
+        self.assertEqual(outcomes['second']['mode'], 'attach')
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(len(self.terms.calls), 1)
+
+    def test_a_plan_that_expired_while_its_route_was_busy_is_not_launched(self):
+        plan = self.plan()
+        saved = self.flow.plans[plan['id']][0]
+        with patch.object(self.flow, '_route', side_effect=self._expire_then_route(saved)):
+            with self.assertRaisesRegex(ValueError, '만료'):
+                self.flow.launch(plan['id'], 'request-0004')
+        self.assertFalse(self.terms.calls)
+
+    @staticmethod
+    def _expire_then_route(saved):
+        @contextmanager
+        def route(key):
+            saved['expiresAt'] = 0
+            yield
+        return route
+
+    def test_a_refused_request_can_be_tried_again(self):
+        plan = self.plan(OTHER)
+        self.rows[0]['phase'] = 'working'
+        with self.assertRaises(ValueError):
+            self.flow.launch(plan['id'], 'request-0001')
+        self.assertEqual(self.flow.inflight, {})
+        self.rows[0]['phase'] = 'idle'
+        with patch('launch.build_launch', return_value={'argv': ['/bin/cat'], 'cwd': '/tmp', 'env': {}}):
+            self.assertEqual(self.flow.launch(plan['id'], 'request-0001')['mode'], 'handoff')
+
+
 class SecurityTest(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()

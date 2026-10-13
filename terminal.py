@@ -19,6 +19,8 @@ import secrets
 import select
 import shutil
 import signal
+import socket
+import stat
 import struct
 import subprocess
 import sys
@@ -46,6 +48,8 @@ RELEASE_IDLE = 60
 # Unused this long, a Claude connection is closed even with room to spare; sending to the
 # session (or 질문 불러오기) attaches it again.
 CLOSE_IDLE = 600
+# After a look on other tmux servers told nothing (_elsewhere), the next one waits this long.
+LOOK_AGAIN_SECONDS = 600
 # Closed rows kept, the oldest forgotten first. The user's own closes are kept longer:
 # they stop an automatic resume of that session. Any other close is history only.
 CLOSED_KEEP = 40
@@ -65,6 +69,25 @@ KEY_LIMIT = 40
 PANE_FORMAT = ("#{alternate_on}|#{mouse_any_flag}|#{mouse_sgr_flag}|#{pane_width}|#{pane_height}"
                "|#{pane_in_mode}|#{scroll_position}|#{history_size}")
 PANE_FIELDS = ("alternate", "mouse", "sgr", "width", "height", "inMode", "position", "history")
+def socket_dir():
+    """Where tmux keeps this user's server sockets (`-L name`). A socket file stays after its
+    server ends (tmux 3.7): whoever ends a server it started removes the file too."""
+    return Path(os.environ.get("TMUX_TMPDIR") or "/tmp") / ("tmux-%d" % os.getuid())
+
+
+def socket_live(path):
+    """Whether a tmux server answers on the socket file `path` (a refused connection: none)."""
+    probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    probe.settimeout(0.5)
+    try:
+        probe.connect(str(path))
+        return True
+    except OSError:
+        return False
+    finally:
+        probe.close()
+
+
 DEFAULT_STATE = instance.path("stateDir") / "terminals" if instance is not None else None
 # The board's own tmux server (`tmux -L <name>`); each saved row records the socket it was
 # created on, so a renamed socket never turns live sessions into closed records.
@@ -204,6 +227,12 @@ class TerminalManager:
         self.reservations = set()
         self._closed = False
         self._warned = set()
+        # Unrecorded rows looked for on this user's other tmux servers (_elsewhere), once each,
+        # and when to look again after a look that told nothing (a server that does not answer
+        # holds the listing for its timeout, so not on every listing).
+        self._looked = set()
+        self._look_again = 0.0
+        self.socket_dir = socket_dir()
         # One list-sessions answer for the _exists calls of a listing (_listing), as
         # (thread ident, names): only the listing thread uses it.
         self._live = None
@@ -268,6 +297,41 @@ class TerminalManager:
         """A row saved before sockets were recorded: its socket is not known yet. It is
         looked up on this board's socket and joins it only once found there."""
         return "socket" not in terminal.record
+
+    def _elsewhere(self, terminal):
+        """Whether an unrecorded row's tmux session runs on another live tmux server of this
+        user (an earlier socket name): True, False, or None when that cannot be told."""
+        name = terminal.record.get("name")
+        if not self.tmux or not isinstance(name, str) or not name:
+            return None
+        try:
+            paths = [path for path in self.socket_dir.iterdir() if path.name != self.socket_name]
+        except FileNotFoundError:
+            return False  # No socket folder: no tmux server of this user runs.
+        except OSError:
+            return None
+        for path in paths:
+            try:
+                info = path.lstat()
+            except FileNotFoundError:
+                continue  # Its socket went meanwhile.
+            except OSError:
+                return None
+            if not stat.S_ISSOCK(info.st_mode) or info.st_uid != os.getuid() or not SOCKET.fullmatch(path.name):
+                continue
+            if not socket_live(path):
+                continue
+            try:
+                found = subprocess.run([self.tmux, "-L", path.name, "has-session", "-t", "=" + name],
+                                       stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=3)
+            except (OSError, subprocess.SubprocessError):
+                return None
+            if found.returncode == 0:
+                return True
+            said = found.stderr.decode("utf-8", "replace")
+            if "can't find session" not in said and "no server running" not in said:
+                return None  # Not an answer about the session (another tmux version, an error).
+        return False
 
     def _unrecorded_message(self):
         return ("이 터미널은 소켓 기록 없이 저장됐고 현재 tmux 소켓(%s)에서 찾지 못했습니다. "
@@ -809,10 +873,26 @@ class TerminalManager:
                     self._warn_foreign(terminal)
                 elif self._unrecorded(terminal):
                     # Found on this socket, the row joins it. Not found, it may still run on
-                    # the socket of an earlier name: neither a socket nor a tombstone.
+                    # the socket of an earlier name: neither a socket nor a tombstone, unless
+                    # no other live tmux server of this user has it either (looked once per
+                    # start): then it ended, and is closed here like any ended terminal.
                     if terminal.alive:
                         terminal.record["socket"] = self.socket_name
                         adopted.append(terminal)
+                    elif terminal.record["id"] not in self._looked and now >= self._look_again:
+                        found = self._elsewhere(terminal)
+                        if found is None:
+                            self._look_again = now + LOOK_AGAIN_SECONDS  # Every row waits.
+                        else:
+                            self._looked.add(terminal.record["id"])
+                        if found is False:
+                            terminal.record["socket"] = self.socket_name
+                            terminal.record["closed"] = True
+                            terminal.record["closedReason"] = "connection_ended"
+                            terminal.record["closedAt"] = int(time.time())
+                            terminal.closed_at = now
+                            changed.append(terminal)
+                            adopted.append(terminal)
                 elif not terminal.alive and not terminal.record.get("closed", False):
                     # A generated tmux session that ended is never restarted by
                     # this ID. Persist that fact before input receipts are pruned.
@@ -832,6 +912,7 @@ class TerminalManager:
                         terminal.record.pop("closedAt", None)
                     for terminal in adopted:
                         terminal.record.pop("socket", None)
+                        self._looked.discard(terminal.record["id"])
                     raise
             if released:
                 self._changed()

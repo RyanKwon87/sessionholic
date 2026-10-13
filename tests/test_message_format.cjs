@@ -123,6 +123,9 @@ test('a pipe table draws as a table that scrolls on its own, and copies as it wa
   assert.equal(byTag(root, 'strong').length, 1); assert.equal(byTag(root, 'a').length, 1);
   assert.equal(visibleText(byTag(root, 'p')[0]), '비교 결과입니다.', 'the paragraph before it stays a paragraph');
   assert.equal(format.plainText(text), text, 'a table copies as the Markdown it was');
+  // An unpaired backtick in a cell is text: the cells after it stay apart.
+  format.render(root, "| a | b | c |\n|---|---|---|\n| it`s | 둘 | 셋 |\n| 넷 | `x|y` | 다섯 |");
+  assert.deepEqual(byTag(root, 'td').map(visibleText), ['it`s', '둘', '셋', '넷', 'x|y', '다섯']);
   // A `<br>` in a cell breaks its line there; inside a code span it stays text.
   const broken = '| 항목 | 설명 |\n|---|---|\n| 첫째<br>둘째<BR/>셋째 | `x<br>y` |';
   format.render(root, broken);
@@ -155,6 +158,15 @@ test('web addresses become links, without trailing punctuation or the particle a
   // Not inside a code span, a link label or an image; never a javascript: address.
   format.render(root, '`https://code.test/x` [https://label.test](https://dest.test) ![그림](https://img.test/a.png) javascript:alert(1)');
   assert.deepEqual(byTag(root, 'a').map((node) => node.attributes.href), ['https://dest.test/']);
+  // Korean where a part of the address begins is the address; right after ASCII it is the particle.
+  format.render(root, 'https://ko.wikipedia.org/wiki/대한민국 문서, https://a.test/경로/b?q=한글&x=1 그리고 https://c.test/12에서 끝.');
+  assert.deepEqual(byTag(root, 'a').map(visibleText),
+    ['https://ko.wikipedia.org/wiki/대한민국', 'https://a.test/경로/b?q=한글&x=1', 'https://c.test/12']);
+  assert.equal(byTag(root, 'a')[0].attributes.href, 'https://ko.wikipedia.org/wiki/%EB%8C%80%ED%95%9C%EB%AF%BC%EA%B5%AD');
+  // A particle alone after a part's start is the sentence's; other scripts are not taken in.
+  format.render(root, 'http://localhost:8447/에서 확인, https://d.test/repo/를 열고 https://e.test/?y=에서. https://f.test/путь 끝 https://g.test/에서요 https://h.test/로그인 화면');
+  assert.deepEqual(byTag(root, 'a').map(visibleText),
+    ['http://localhost:8447/', 'https://d.test/repo/', 'https://e.test/?y=', 'https://f.test/', 'https://g.test/', 'https://h.test/로그인']);
 });
 
 test('rules, task items and struck text draw as such and copy as written', () => {
@@ -167,6 +179,10 @@ test('rules, task items and struck text draw as such and copy as written', () =>
   assert.deepEqual(byTag(root, 'del').map(visibleText), ['취소']);
   assert.match(visibleText(root), /~ 물결 ~/);
   assert.equal(format.plainText('~~취소~~'), '취소');
+  // A "~~" inside code does not end the strike.
+  format.render(root, '~~`a~~b` 전체~~ 뒤');
+  assert.deepEqual(byTag(root, 'del').map(visibleText), ['a~~b 전체']);
+  assert.deepEqual(byTag(root, 'code').map(visibleText), ['a~~b']);
   assert.equal(format.plainText('위\n---\n아래'), '위\n---\n아래');
 });
 

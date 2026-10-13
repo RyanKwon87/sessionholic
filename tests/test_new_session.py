@@ -759,6 +759,70 @@ class BoardHoldTest(unittest.TestCase):
             server.Workflow.sweep_holds(flow)
             self.assertEqual(calls, [], 'an offline or non-holding host is left alone')
 
+    def test_what_tests_left_is_ended_and_nothing_else(self):
+        # Seen: 17 orphaned Codex daemons from test homes (461MB) and thousands of test tmux
+        # socket files (tmux keeps them after kill-server) piled up on the Macs.
+        temp = '/private/var/folders/xx/yy/T'
+        daemon = temp + '/tmpab12cd/.codex-isolated/packages/app-server-daemon/releases/0.1/bin/codex'
+        uid = str(os.getuid())
+        listing = '\n'.join([
+            '101 1 %s 2-07:56:02 %s app-server --listen unix:// --managed-daemon %s/tmpab12cd' % (uid, daemon, temp),
+            '102 1 %s 1:00:00 %s app-server --listen unix://' % (uid, daemon),
+            '103 1 %s 59:59 %s app-server' % (uid, daemon),  # younger than an hour
+            '104 555 %s 3-00:00:00 %s app-server' % (uid, daemon),  # still has its parent
+            '105 1 %s 3-00:00:00 /Users/u/.codex/packages/app-server-daemon/releases/0.1/bin/codex app-server' % uid,
+            '106 1 999999 3-00:00:00 %s app-server' % daemon,  # another user's
+            '107 1 %s 3-00:00:00 %s exec run' % (uid, daemon),
+            '108 1 %s 3-00:00:00 /usr/bin/python3 %s app-server' % (uid, daemon),
+            # Not a Codex home right inside a temporary folder a test made.
+            '109 1 %s 3-00:00:00 %s/tmpab12cd/work/.codex/packages/app-server-daemon/r/bin/codex app-server' % (uid, temp),
+            '110 1 %s 3-00:00:00 %s/cache/.codex/packages/app-server-daemon/r/bin/codex app-server' % (uid, temp),
+            '111 1 %s 3-00:00:00 %s/tmpab12cd/home/packages/app-server-daemon/r/bin/codex app-server' % (uid, temp),
+            'garbage line'])
+        ended = []
+        folder = Path(tempfile.mkdtemp(dir='/tmp'))
+        self.addCleanup(lambda: [path.unlink() for path in folder.iterdir()] and None or folder.rmdir())
+        def socket_file(name, age, live=False):
+            import socket as sockets
+            server_socket = sockets.socket(sockets.AF_UNIX, sockets.SOCK_STREAM)
+            server_socket.bind(str(folder / name))
+            if live:
+                server_socket.listen(4)
+                self.addCleanup(server_socket.close)
+            else:
+                server_socket.close()
+            os.utime(folder / name, (now - age, now - age))
+        now = 2_000_000_000
+        socket_file('sb-test-old', 2 * 86400)
+        socket_file('sb-browser-old', 2 * 86400)
+        socket_file('sb-test-young', 3600)
+        socket_file('sb-test-live', 2 * 86400, live=True)
+        socket_file('session-board', 9 * 86400)
+        socket_file('default', 9 * 86400)
+        (folder / 'sb-test-file').write_text('not a socket'); os.utime(folder / 'sb-test-file', (0, 0))
+        result = transfer_worker.sweep_leftovers(listing=listing, temp=temp, sockets=folder, now=now,
+                                                 kill=lambda pid, sig: ended.append((pid, sig)))
+        self.assertEqual(ended, [(101, transfer_worker.signal.SIGTERM), (102, transfer_worker.signal.SIGTERM)])
+        self.assertEqual(result, {'processes': 2, 'sockets': 2})
+        self.assertEqual(sorted(path.name for path in folder.iterdir()),
+                         ['default', 'sb-test-file', 'sb-test-live', 'sb-test-young', 'session-board'])
+        # The board asks each Mac it reaches (itself directly), never a PC or an offline host.
+        asked = []
+        board = SimpleNamespace(hosts=[LOCAL, REMOTE, PC], state={'local': {'ok': False}, 'remote': {'ok': True}, 'pc': {'ok': True}})
+        flow = SimpleNamespace(board=board, transfers=SimpleNamespace(
+            rpc=lambda host, op, args, timeout: asked.append((host['name'], op)) or {'processes': 1, 'sockets': 0}))
+        with patch.object(transfer_worker, 'sweep_leftovers', return_value={'processes': 0, 'sockets': 3}), \
+                patch('sys.stderr', new_callable=io.StringIO) as log:
+            server.Workflow.sweep_leftovers(flow)
+        self.assertEqual(asked, [('remote', 'leftovers')])
+        self.assertIn('실행 0개와 tmux 소켓 파일 3개를 정리했습니다: local', log.getvalue())
+        self.assertIn('실행 1개와 tmux 소켓 파일 0개를 정리했습니다: remote', log.getvalue())
+        board.state['remote']['ok'] = False
+        asked.clear()
+        with patch.object(transfer_worker, 'sweep_leftovers', return_value={'processes': 0, 'sockets': 0}):
+            server.Workflow.sweep_leftovers(flow)
+        self.assertEqual(asked, [])
+
     def test_a_terminal_list_failure_ends_nothing(self):
         flow, calls = self.flow([], [{'name': self.name('d'), 'age': 9 * 86400}])
         flow.terminals = SimpleNamespace(list=lambda: (_ for _ in ()).throw(RuntimeError('tmux')))

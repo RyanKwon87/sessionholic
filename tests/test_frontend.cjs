@@ -7596,6 +7596,28 @@ test('목록에서 지우기 in 세션 관리 asks the board to keep the session
   assert.equal(c.sessionRemoved(s), true, 'counted at once, before the board reads back');
 });
 
+test('세션 관리에서 지운 뒤 목록이 갱신돼도 목록에 다시 표시가 보드에 전해진다', async () => {
+  const requests = [];
+  const c = client(async (url, options) => {
+    requests.push([url, options?.body && JSON.parse(options.body)]);
+    return { ok: true, status: 200, json: async () => ({ removedAt: 1, tidiedAt: null, hosts: [] }) };
+  }, noChatTimers);
+  const { s } = selectChat(c);
+  const context = { source: c.sourceOf(s), s, authEpoch: c.state.authEpoch, busy: false };
+  vm.runInContext('sessionControl = globalThis.__context', Object.assign(c.context, { __context: context }));
+  c.get('session-control-tidy').replaceWith = (node) => { c.context.__replaced = node; };
+  await c.tidySession(context, true);
+  // A newer snapshot carries the board's record: this page's own mark gives way to it.
+  c.state.snapshot = { ...c.state.snapshot, hosts: [{ ...c.state.snapshot.hosts[0],
+    data: { codex: [{ ...s, removedAt: 1 }] } }] };
+  assert.equal(c.sessionRemoved(c.allSessions()[0]), true);
+  context.busy = false;
+  await c.tidySession(context, false);
+  assert.deepEqual(requests.filter(([url]) => url === '/api/session/remove').map(([, body]) => body.removed), [true, false]);
+  assert.equal(requests.filter(([url]) => url === '/api/session/tidy').length, 1, 'a tidy is cleared too');
+  assert.equal(c.sessionRemoved(c.allSessions()[0]), false, 'shown again on this page until a newer snapshot says');
+});
+
 test('a removed session leaves the list for good, but comes back to answer or work; search and old records show it marked', async () => {
   const requests = [];
   const c = client(async (url, options) => {
@@ -7629,6 +7651,32 @@ test('a removed session leaves the list for good, but comes back to answer or wo
   assert.equal(requests.filter(([url]) => url === '/api/session/remove').at(-1)[1].removed, true);
   await c.showSessionAgain(c.allSessions().find((s) => s.id === 'gone'));
   assert.equal(requests.filter(([url]) => url === '/api/session/remove').at(-1)[1].removed, false);
+});
+
+test('목록 옆에 띄운 대화는 보는 동안 이전 묶음의 자리를 지키고, 다른 대화를 열면 맨 위로 간다', () => {
+  const c = client(async () => ({ ok: true, status: 200, json: async () => ({ openedAt: 1, hosts: [] }) }), noChatTimers);
+  const now = 2_000_000;
+  const old = (id, extra) => recentSession(id, { phase: 'idle', updatedAt: now - 5 * 3600, ...extra });
+  const sessions = [old('a', { openedAt: now - 100 }), old('b', { openedAt: now - 200 }), old('c', { openedAt: now - 300 })];
+  c.state.snapshot = { serverTime: now, hosts: [{ name: 'workstation', label: 'Workstation', ok: true, data: { codex: sessions, claude: [] } }] };
+  c.state.authenticated = true;
+  c.context.Date = { now: () => now * 1000 };
+  c.context.matchMedia = () => ({ matches: false });
+  const order = () => {
+    c.renderGroups(c.allSessions().filter((s) => c.matches(s, now)), now);
+    const section = c.get('groups').children.find((node) => node.dataset?.groupKey === 'rest');
+    return section.children.filter((node) => node.dataset?.sessionKey).map((node) => node.dataset.sessionKey.split('|').pop());
+  };
+  const open = (id) => {
+    const target = c.allSessions().find((s) => s.id === id);
+    c.state.selected = target.key; c.state.detailShown = true; c.markOpened(target);
+  };
+  open('c');
+  assert.deepEqual(order(), ['a', 'b', 'c'], 'shown beside the list: it keeps its place');
+  open('b');
+  assert.deepEqual(order(), ['c', 'a', 'b'], 'another opened: the first moves up, the open one stays');
+  c.state.detailShown = false;
+  assert.deepEqual(order(), ['b', 'c', 'a'], 'the list alone: both by when they were opened');
 });
 
 test('닫고 지우기 removes the session from the list only after its board terminal closed', async () => {

@@ -2577,13 +2577,12 @@ class Handler(BaseHTTPRequestHandler):
 
     def session_opened(self, data):
         """A listed session's conversation was opened now: the list orders older sessions by
-        it. Announced with the next change (the opening screen already knows)."""
+        it. Not announced (the opening screen already knows): other devices see it with their
+        next snapshot, rather than every device reading one again for each opening."""
         if not isinstance(data, dict) or set(data) != {'source'}:
             raise ValueError('연 세션을 확인해 주세요.')
         source = self.listed_source(data['source'])
-        result, changed = self.server.session_opened.mark(source, int(time.time()))
-        if changed:
-            self.server.board.changed(force=True, live=True)
+        result, _changed = self.server.session_opened.mark(source, int(time.time()))
         return {'openedAt': result['seenAt']}
 
     def tidy_after_close(self, native, ended=True):

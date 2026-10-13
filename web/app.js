@@ -1534,7 +1534,7 @@ function setSessionCategory(category, { renderView = true, clearSelection = true
   const selected = selectedSession();
   // With a bot picked, every tab but 봇 요청 lists its sessions: the open one stays open.
   const kept = botFilter() && category !== "bot";
-  if (clearSelection && !kept && ((selected && sessionCategoryOf(selected) !== category) || (state.selectedBotRequest && category !== "bot"))) {
+  if (clearSelection && ((selected && !kept && sessionCategoryOf(selected) !== category) || (state.selectedBotRequest && category !== "bot"))) {
     rememberConversationView(); stopChatPolling();
     state.selected = null; state.selectedBotRequest = null; state.detailFor = null; state.detailRevision = null; state.detailRun += 1;
     $("detail").replaceChildren(); $("detail").dataset.key = ""; setDetailShown(false); navigateView("list", true);

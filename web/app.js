@@ -3840,7 +3840,7 @@ function resizeChatInput(entry) {
   const padding = (parseFloat(style?.paddingTop) || 10) + (parseFloat(style?.paddingBottom) || 10);
   const border = (parseFloat(style?.borderTopWidth) || 1) + (parseFloat(style?.borderBottomWidth) || 1);
   const base = Math.max(44, line + padding + border);
-  const viewport = window.visualViewport?.height || window.innerHeight || 800;
+  const viewport = viewportHeight();
   const cap = entry.inputCollapsed || sentDraftHidden(entry) ? base : Math.max(base,
     Math.min(line * (entry.expanded ? 11 : 6) + padding + border, viewport * 0.34, viewport - 200));
   const minimum = Math.min(cap, entry.expanded ? 3 * line + padding + border : base);
@@ -8388,15 +8388,19 @@ async function lock() {
       toast("잠금 요청을 완료하지 못했습니다. 연결을 확인해 주세요.");
   }
 }
-function updateViewport() {
+// The height the app has: the visual viewport (an on-screen keyboard takes its space), except
+// that without a focused text field no keyboard takes space, so a visual viewport shorter than
+// the window is stale: iPadOS reports one for a moment when the app comes back from the
+// background or a minimized window, with no resize after it. Not when pinch-zoomed (the
+// visual viewport is then meant to be smaller).
+function viewportHeight() {
   const viewport = window.visualViewport;
-  let height = viewport?.height || window.innerHeight;
-  // Without a focused text field no on-screen keyboard takes space, so a visual viewport
-  // shorter than the window is stale: iPadOS reports one for a moment when the app comes
-  // back from the background or a minimized window, with no resize after it. Not when
-  // pinch-zoomed (the visual viewport is then meant to be smaller).
-  if (!editingText() && (viewport?.scale || 1) <= 1.01 && window.innerHeight > height) height = window.innerHeight;
-  height = Math.round(height);
+  const height = viewport?.height || window.innerHeight || 800;
+  if (!editingText() && (viewport?.scale || 1) <= 1.01 && window.innerHeight > height) return window.innerHeight;
+  return height;
+}
+function updateViewport() {
+  const height = Math.round(viewportHeight());
   document.documentElement.style.setProperty("--app-height", `${height}px`);
   syncChromeMode();
   const selected = selectedSession();

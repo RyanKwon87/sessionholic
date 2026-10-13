@@ -478,16 +478,22 @@ class LaunchTest(unittest.TestCase):
                    "sk-ant-api03-" + "b" * 48, "ghp_" + "c" * 40,
                    "github_pat_" + "d" * 50, "AKIA" + "A" * 16,
                    "Bearer " + "e" * 30, "aws_secret_access_key=" + "f" * 40,
-                   "-----BEGIN OPENSSH " + "PRIVATE KEY-----\nfixture-body\n-----END OPENSSH PRIVATE KEY-----"]
-        messages = [{"role": "user", "text": "확인할 원문: " + "\n".join(secrets)}]
+                   "-----BEGIN OPENSSH " + "PRIVATE KEY-----\nfixture-body\n-----END OPENSSH PRIVATE KEY-----",
+                   "Sup3rS3cretPw", "glpat-fixtureToken123", "MyRedisPass99", "P@ssw0rd.example"]
+        secrets_in_text = secrets[:-4] + ["postgresql://postgres.ref:Sup3rS3cretPw@db.example.invalid:6543/postgres",
+                                          "https://oauth2:glpat-fixtureToken123@gitlab.example.invalid/group/repo.git",
+                                          "redis://:MyRedisPass99@cache.example.invalid", "password=P@ssw0rd.example"]
+        messages = [{"role": "user", "text": "확인할 원문: " + "\n".join(secrets_in_text)}]
         result = self.build(self.profile("claude", ".claude"), messages=messages)
         text = Path(result["handoffPath"]).read_text()
         for secret in secrets:
             self.assertNotIn(secret, text)
         self.assertIn("[redacted]", text)
         kept = self.build(self.profile("claude", ".claude"),
-                          messages=[{"role": "user", "text": "person@example.invalid 에 보낼 메일"}])
-        self.assertIn("person@example.invalid", Path(kept["handoffPath"]).read_text())
+                          messages=[{"role": "user", "text": "person@example.invalid 에 보낼 메일, ssh://git@github.com/o/r.git"}])
+        kept_text = Path(kept["handoffPath"]).read_text()
+        self.assertIn("person@example.invalid", kept_text)
+        self.assertIn("ssh://git@github.com/o/r.git", kept_text, "a user name alone is no secret")
         self.assertIn('"redacted": true', text)
         self.assertIn('"redactedFields": 1', text)
 

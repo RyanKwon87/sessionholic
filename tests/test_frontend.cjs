@@ -128,7 +128,7 @@ function client(
   vm.runInContext(messageSource, context);
   vm.runInContext(source, context);
   const api = vm.runInContext(
-    "({state,api,sourceOf,accountOf,sendInput,pasteDraft,prepareDraftPaste,startDraftComposition,endDraftComposition,inputDraft,stopTerminalReader,startTerminalReader,closePlan,navigateView,backToList,backFromTerminal,closeTerminal,cancelTerminalClose,confirmTerminalClose,populateAccount,populateRoute,updateContinue,renderPlan,launchPlan,openTerminal,saveDraft,draftKey,refreshTerminals,renderTerminals,renderTerminalReturn,renderFilters,terminalCloseCopy,warnDraftUnload,preparePlan,renderGroups,renderMessages,loadDetail,chatKey,chatEntry,currentChat,chatSupported,chatRecovery,recoverChatSession,openChatTerminal,chatAttachmentsSupported,buildChatComposer,sendChat,loadChatState,applyChatReceipt,uploadChatFiles,pasteChat,scheduleChatPoll,stopChatPolling,openNativeChat,allSessions,buildContinuePanel,chatReceiptCopy,returnToBoard,readChatClipboard,accountDisplay,sessionAccountLabel,closeChatToolsOutside,closeChatToolsEscape,drawDetail,refreshDetail,loadCapabilities,matches,recoverConnection,networkOffline,poll,select,focusDetailBack,restoreSelectedCardFocus,showLogin,lock,beginAuthEpoch,resizeChatInput,updateViewport,draftKeydown,configureTerminalKeyboard,queueTerminalScroll,flushTerminalScroll,terminalScrollEnd,resetTerminalScroll,renderAttention,chatPollDelay,pullRefresh,readingScroll,renderJump,pullDistance,listScroll,setReading,renderPrompt,promptAction,renderUsage,loadUsage,applyTheme,setTheme,updateThemeColor,haptic,navTransition,setDetailShown,chatVisible,sheetRelease,BottomSheet,sheet,openSettings,closeSettings,setTyping,pinchFontSize,setTerminalFontSize,loadXterm,assetUrl,syncEvents,closeEvents,eventsHealthy,renderFreshness,schedule,touchDevice,togglePhaseFilter,renderCounts,createLongPress,swipeIntent,swipeRelease,groupMessageRows,setTextSize,applyTextSize,renderConnectivity,terminalForSession,swipeActionFor,openMessageMenu,openCardMenu,messageActions,outboxShape,outboxMatches,outboxOrigin,settleOutbox,retryOutbox,renderAttachmentTiles,attachmentThumb,sendUpload,openActionSheet,closeActionSheet,setListCollapsed,closeSwipe,settleSwipe,prepareSwipe,runSwipeAction,GESTURE,setChromeVisible,toggleChrome,revealChrome,isChromeTap,snapshotAnnounced,updateChatComposer,capabilitiesRevision,toolKindOf,userMessageParts,formatElapsed,tickWorking,renderTerminalMarks,renderDetailTerminal,terminalsAnnounced,goToSessionTerminal,rememberTerminal,terminalMenu,updateTerminalMenu,chooseTerminalMenu,clearTerminalMenu,renderNewSession,openNewSession,startNewSession,startAppServer,rememberConversationView,restoreConversationView,conversationIdentity,initiatorOf,initiatorLabel,documentKeydown,sessionCategoryOf,setSessionCategory,renderSessionCategories,prepareSessionListFor,sessionCategoryKeydown,render,resetFilters,terminalTitle,renameTerminals,requestedSessionFrom,requestSessionOpen,openRequestedSession,answerOnOpen,hardReload,terminalKeyBytes,terminalKeyFromEvent,pressTerminalKey,toggleTerminalMod,clearTerminalMods,renderTerminalMods,draftBeforeInput,terminalDocumentKey,xtermKeyEvent,renderHardware,loadHardware,startDictation,stopDictation,dictationText,toggleDraftDictation,renderDictation,DICTATION_LISTENING,DICTATION_ERRORS,DICTATION_PREPARING,DICTATION_STALLED,DICTATION_ENDED_AT_ONCE,DICTATION_INTERRUPTED,DICTATION_NOT_STARTED,DICTATION_SILENCE_END,DICTATION_CHANGED,DICTATION_ENDING,bindDraftInput,insertChatText,reloadForUpdate,checkWebVersion,unsavedWork,detailMetaChildren,updateBannerPressed,manualRefresh,listNavigationKeydown,sessionUnread,markSeen,quickReplies,saveQuickReplies,openQuickReplies,terminalEndedCopy,terminalContextCopy,sessionForTerminal,showTerminalEnded,reopenEndedTerminal,csrfRetryable,tidySession,sessionRemoved,removeSession,showSessionAgain,markOpened,groupOf})",
+    "({state,api,sourceOf,accountOf,sendInput,pasteDraft,prepareDraftPaste,startDraftComposition,endDraftComposition,inputDraft,stopTerminalReader,startTerminalReader,closePlan,navigateView,backToList,backFromTerminal,closeTerminal,cancelTerminalClose,confirmTerminalClose,populateAccount,populateRoute,updateContinue,renderPlan,launchPlan,openTerminal,saveDraft,draftKey,refreshTerminals,renderTerminals,renderTerminalReturn,renderFilters,terminalCloseCopy,warnDraftUnload,preparePlan,renderGroups,renderMessages,loadDetail,chatKey,chatEntry,currentChat,chatSupported,chatRecovery,recoverChatSession,openChatTerminal,chatAttachmentsSupported,buildChatComposer,sendChat,loadChatState,applyChatReceipt,uploadChatFiles,pasteChat,scheduleChatPoll,stopChatPolling,openNativeChat,allSessions,buildContinuePanel,chatReceiptCopy,returnToBoard,readChatClipboard,accountDisplay,sessionAccountLabel,closeChatToolsOutside,closeChatToolsEscape,drawDetail,refreshDetail,loadCapabilities,matches,recoverConnection,networkOffline,poll,select,focusDetailBack,restoreSelectedCardFocus,showLogin,lock,beginAuthEpoch,resizeChatInput,updateViewport,draftKeydown,configureTerminalKeyboard,queueTerminalScroll,flushTerminalScroll,terminalScrollEnd,resetTerminalScroll,renderAttention,chatPollDelay,pullRefresh,readingScroll,renderJump,pullDistance,listScroll,setReading,renderPrompt,promptAction,renderUsage,loadUsage,applyTheme,setTheme,updateThemeColor,haptic,navTransition,setDetailShown,chatVisible,sheetRelease,BottomSheet,sheet,openSettings,closeSettings,setTyping,pinchFontSize,setTerminalFontSize,loadXterm,assetUrl,syncEvents,closeEvents,eventsHealthy,renderFreshness,schedule,touchDevice,togglePhaseFilter,renderCounts,createLongPress,swipeIntent,swipeRelease,groupMessageRows,setTextSize,applyTextSize,renderConnectivity,terminalForSession,swipeActionFor,openMessageMenu,openCardMenu,messageActions,outboxShape,outboxMatches,outboxOrigin,settleOutbox,retryOutbox,renderAttachmentTiles,attachmentThumb,sendUpload,openActionSheet,closeActionSheet,setListCollapsed,closeSwipe,settleSwipe,prepareSwipe,runSwipeAction,GESTURE,setChromeVisible,toggleChrome,revealChrome,isChromeTap,snapshotAnnounced,updateChatComposer,capabilitiesRevision,toolKindOf,userMessageParts,formatElapsed,tickWorking,renderTerminalMarks,renderDetailTerminal,terminalsAnnounced,goToSessionTerminal,rememberTerminal,terminalMenu,updateTerminalMenu,chooseTerminalMenu,clearTerminalMenu,renderNewSession,openNewSession,startNewSession,startAppServer,rememberConversationView,restoreConversationView,conversationIdentity,initiatorOf,initiatorLabel,documentKeydown,sessionCategoryOf,setSessionCategory,renderSessionCategories,prepareSessionListFor,sessionCategoryKeydown,render,resetFilters,terminalTitle,renameTerminals,requestedSessionFrom,requestSessionOpen,openRequestedSession,answerOnOpen,hardReload,terminalKeyBytes,terminalKeyFromEvent,pressTerminalKey,toggleTerminalMod,clearTerminalMods,renderTerminalMods,draftBeforeInput,terminalDocumentKey,xtermKeyEvent,renderHardware,loadHardware,startDictation,stopDictation,dictationText,toggleDraftDictation,renderDictation,DICTATION_LISTENING,DICTATION_ERRORS,DICTATION_PREPARING,DICTATION_STALLED,DICTATION_ENDED_AT_ONCE,DICTATION_INTERRUPTED,DICTATION_NOT_STARTED,DICTATION_SILENCE_END,DICTATION_CHANGED,DICTATION_ENDING,bindDraftInput,insertChatText,reloadForUpdate,checkWebVersion,unsavedWork,detailMetaChildren,updateBannerPressed,manualRefresh,listNavigationKeydown,sessionUnread,markSeen,quickReplies,saveQuickReplies,openQuickReplies,terminalEndedCopy,terminalContextCopy,sessionForTerminal,showTerminalEnded,reopenEndedTerminal,csrfRetryable,tidySession,sessionRemoved,removeSession,showSessionAgain,markOpened,groupOf,chatPlaceholder})",
     context,
   );
   api.state.csrf = "csrf-test";
@@ -4148,6 +4148,55 @@ test('quick replies come from this browser\'s list (the defaults until edited) a
   assert.equal(c.get('action-list').children[0].disabled, true);
 });
 
+test('집중 모드에서는 보내기 옆 빠른 답장 버튼이 같은 문구 목록을 열고, 입력이 막히면 비활성이다', () => {
+  const c = client(undefined, noChatTimers);
+  const { s, entry } = selectChat(c);
+  const composer = c.buildChatComposer(s);
+  const main = byClass(composer, 'chat-main')[0];
+  assert.deepEqual(main.children.map((child) => child.id), ['chat-input', 'chat-mic', 'chat-quick-inline', 'chat-send']);
+  const quick = findId(composer, 'chat-quick-inline');
+  assert.equal(quick.attributes['aria-label'], '빠른 답장');
+  quick.events.click({ currentTarget: quick });
+  assert.match(c.get('action-eyebrow').textContent, /보내지 않음/);
+  assert.equal(c.get('action-list').children[0].textContent, c.quickReplies()[0]);
+  c.closeActionSheet();
+  // Shown only while the bars are folded (집중 모드), where 도구 › 빠른 답장 is out of sight.
+  const css = fs.readFileSync(path.join(__dirname, '../web/style.css'), 'utf8');
+  const hide = css.lastIndexOf('.chat-composer .chat-main > #chat-quick-inline {\n  display: none;');
+  const shared = css.indexOf('.chat-composer .chat-main > #chat-quick-inline,');
+  assert.ok(hide > shared && shared > 0, 'hidden by default after the shared button style');
+  assert.match(css, /\.detail-pane\.is-reading \.chat-composer \.chat-main > #chat-quick-inline \{\n  display: inline-flex;/);
+  // A short hint keeps one line beside four controls while the bars are folded.
+  const pane = c.get('detail'); pane.classList = classes();
+  c.get('chat-input').placeholder = c.chatPlaceholder(false);
+  c.setReading(true);
+  assert.equal(c.get('chat-input').placeholder, '메시지…');
+  c.setReading(false);
+  assert.equal(c.get('chat-input').placeholder, '이 세션에 보낼 메시지…');
+  // While the input cannot take text, it is off too.
+  // A send whose result is not known yet locks the input (read-only).
+  entry.pending = { requestId: 'request-0001', revision: entry.revision };
+  c.updateChatComposer(entry);
+  assert.equal(findId(composer, 'chat-input').readOnly, true);
+  assert.equal(quick.disabled, true);
+});
+
+test('기기 상태와 사용량은 목록이 아니라 맨 위 헤더의 기기 칩 옆에 있다', () => {
+  const html = fs.readFileSync(path.join(__dirname, '../web/index.html'), 'utf8');
+  const header = html.slice(html.indexOf('<header class="top">'), html.indexOf('</header>'));
+  const list = html.slice(html.indexOf('<aside id="task-list-pane"'), html.indexOf('</aside>'));
+  for (const id of ['hosts', 'hardware', 'usage']) assert.ok(header.includes(`id="${id}"`), id + ' in the header');
+  for (const id of ['hardware', 'usage']) assert.ok(!list.includes(`id="${id}"`), id + ' not in the list');
+  // Usage leads the scroller, then hardware: a phone shows them without scrolling.
+  assert.ok(header.indexOf('class="top-status"') < header.indexOf('id="usage"'));
+  assert.ok(header.indexOf('id="usage"') < header.indexOf('id="hardware"'));
+  assert.ok(header.indexOf('id="hardware"') < header.indexOf('id="hosts"'));
+  // A phone's header gives the brand label's room to them.
+  const phone = cssBlock(fs.readFileSync(path.join(__dirname, '../web/style.css'), 'utf8'), '@media (max-width: 700px)');
+  assert.equal(phone['display'], undefined);
+  assert.match(fs.readFileSync(path.join(__dirname, '../web/style.css'), 'utf8'), /\.top \.home-label \{\n    display: none;/);
+});
+
 function classes() {
   const set = new Set();
   return { set, add: (name) => set.add(name), remove: (name) => set.delete(name), contains: (name) => set.has(name),
@@ -7618,6 +7667,25 @@ test('세션 관리에서 지운 뒤 목록이 갱신돼도 목록에 다시 표
   assert.equal(c.sessionRemoved(c.allSessions()[0]), false, 'shown again on this page until a newer snapshot says');
 });
 
+test('지우기 전에 출발한 목록 읽기가 늦게 와도 이 페이지의 지움이 풀리지 않는다', async () => {
+  const c = client(async (url) => ({ ok: true, status: 200,
+    json: async () => (url === '/api/session/remove' ? { removedAt: 1, version: 7 } : { hosts: [] }) }), noChatTimers);
+  const now = 2_000_000;
+  const s = recentSession('late', { phase: 'done', updatedAt: now - 60 });
+  const snapshot = (version, extra = {}) => ({ serverTime: now, version, hosts: [{ name: 'workstation', label: 'Workstation', ok: true,
+    data: { codex: [{ ...s, ...extra }], claude: [] } }] });
+  c.state.snapshot = snapshot(5); c.state.authenticated = true;
+  await c.removeSession(c.allSessions()[0], true);
+  // A read the board answered before the removal (version 6) arrives late: still away here.
+  c.state.snapshot = snapshot(6);
+  assert.equal(c.sessionRemoved(c.allSessions()[0]), true);
+  // The board's own record (version 7 on): it decides from here.
+  c.state.snapshot = snapshot(7, { removedAt: 1 });
+  assert.equal(c.sessionRemoved(c.allSessions()[0]), true);
+  c.state.snapshot = snapshot(9);
+  assert.equal(c.sessionRemoved(c.allSessions()[0]), false, 'shown again elsewhere: this page follows');
+});
+
 test('a removed session leaves the list for good, but comes back to answer or work; search and old records show it marked', async () => {
   const requests = [];
   const c = client(async (url, options) => {
@@ -7669,7 +7737,8 @@ test('목록 옆에 띄운 대화는 보는 동안 이전 묶음의 자리를 �
   };
   const open = (id) => {
     const target = c.allSessions().find((s) => s.id === id);
-    c.state.selected = target.key; c.state.detailShown = true; c.markOpened(target);
+    // As select() does: the opening is kept before the conversation is shown.
+    c.markOpened(target); c.state.selected = target.key; c.state.detailShown = true;
   };
   open('c');
   assert.deepEqual(order(), ['a', 'b', 'c'], 'shown beside the list: it keeps its place');
@@ -7677,6 +7746,10 @@ test('목록 옆에 띄운 대화는 보는 동안 이전 묶음의 자리를 �
   assert.deepEqual(order(), ['c', 'a', 'b'], 'another opened: the first moves up, the open one stays');
   c.state.detailShown = false;
   assert.deepEqual(order(), ['b', 'c', 'a'], 'the list alone: both by when they were opened');
+  // Opened again after going back: it keeps the top place it has now.
+  c.context.Date = { now: () => (now + 30) * 1000 };
+  open('b');
+  assert.deepEqual(order(), ['b', 'c', 'a']);
 });
 
 test('닫고 지우기 removes the session from the list only after its board terminal closed', async () => {
@@ -8524,6 +8597,53 @@ test('시작 주체 필터와 분류를 동기화하고 초기화는 현재 분�
   assert.ok(c.get('session-category-general').focusCount > 0);
   c.sessionCategoryKeydown({ key: 'ArrowRight', preventDefault() {} });
   assert.equal(c.state.sessionCategory, 'agent'); assert.equal(c.get('session-category-agent').attributes['aria-selected'], 'true');
+});
+
+test('시작 주체에서 봇을 고르면 그 봇이 연 세션만 보이고, 봇 요청에 묶인 세션도 지금 탭에 나오며 열어도 탭과 필터가 그대로다', () => {
+  const c = client(undefined, noChatTimers);
+  const hermes = recentSession('by-hermes', { originator: 'hermes', title: '헤르메스 작업' });
+  // A worker it started (an agent session) is listed under the picked bot too.
+  const worker = recentSession('by-hermes-worker', { originator: 'hermes', initiator: 'agent', title: '헤르메스 하위 작업' });
+  const first = recentSession('by-first', { title: '요청봇 작업' });
+  const second = recentSession('by-second', { title: '안내봇 작업' });
+  const mine = recentSession('mine', { initiator: 'human', title: '직접 연 작업' });
+  const rows = [hermes, worker, first, second, mine];
+  setRecentSnapshot(c, rows);
+  c.state.botRequests = { requests: [
+    { id: 'r1', sourceId: 'first-gateway', host: first.host, nativeRef: { agent: first.agent, id: first.id, home: first.home } },
+    { id: 'r2', sourceId: 'second', host: second.host, nativeRef: { agent: second.agent, id: second.id, home: second.home } }],
+    sources: [{ id: 'first', label: '요청봇' }, { id: 'first-gateway', label: '요청봇 · Slack' }, { id: 'second', label: '안내봇' }],
+    loaded: true, busy: false, error: '', readAt: 0, fetchedAt: null, promise: null };
+  const titles = () => byClass(c.get('groups'), 'card').map((card) => byClass(card, 'card-title')[0].textContent).sort();
+  c.render();
+  // Without a bot picked, a session a bot request carries stays in 봇 요청.
+  assert.deepEqual(titles(), ['직접 연 작업', '헤르메스 작업'].sort());
+  const options = c.get('filter-initiator').children.map((option) => [option.value, option.textContent]);
+  for (const name of ['헤르메스', '요청봇', '안내봇']) assert.ok(options.some(([value, text]) => value === 'bot:' + name && text === '봇 · ' + name), name);
+  const pick = (value) => { const control = c.get('filter-initiator'); control.value = value; control.events.change(); };
+  pick('bot:요청봇');
+  assert.equal(c.state.sessionCategory, 'general');
+  assert.deepEqual(titles(), ['요청봇 작업']);
+  assert.equal(c.get('session-category-general-count').textContent, '1');
+  assert.equal(c.get('session-category-note').hidden, true, 'no 출처 미확인 note for a bot');
+  pick('bot:헤르메스'); assert.deepEqual(titles(), ['헤르메스 작업', '헤르메스 하위 작업'].sort());
+  // Opening its agent session keeps this tab and the bot.
+  c.select(worker.key);
+  assert.equal(c.state.sessionCategory, 'general'); assert.equal(c.state.filters.initiator, 'bot:헤르메스');
+  vm.runInContext('render()', c.context);
+  assert.equal(c.state.sessionCategory, 'general'); assert.equal(c.state.filters.initiator, 'bot:헤르메스');
+  // Another session tab lists the same sessions, with the same count, and the open one stays.
+  c.setSessionCategory('agent');
+  assert.equal(c.state.selected, worker.key);
+  assert.equal(c.get('session-category-agent-count').textContent, c.get('session-category-general-count').textContent);
+  c.setSessionCategory('general');
+  assert.equal(c.state.selected, worker.key);
+  pick('bot:안내봇'); assert.deepEqual(titles(), ['안내봇 작업']);
+  // The card says which bot started it.
+  assert.equal(c.initiatorLabel(second), '안내봇 시작');
+  assert.equal(c.initiatorLabel(mine), '직접 시작');
+  // No bot: the list follows the open conversation's own tab again (its worker is an agent session).
+  pick(''); assert.equal(c.state.sessionCategory, 'agent'); assert.deepEqual(titles(), ['헤르메스 하위 작업']);
 });
 
 test('작업에서 대화를 직접 열면 대상 분류와 목록 조건을 맞추고 분류 전환은 초안과 보기 기록을 보존한다', () => {

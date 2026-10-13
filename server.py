@@ -2573,7 +2573,8 @@ class Handler(BaseHTTPRequestHandler):
             result = {'seenAt': None}
         if changed:
             self.server.board.changed(force=True)
-        return {'removedAt': result['seenAt']}
+        # The snapshot version that carries this (a screen keeps its own choice until then).
+        return {'removedAt': result['seenAt'], 'version': self.server.board.version}
 
     def session_opened(self, data):
         """A listed session's conversation was opened now: the list orders older sessions by

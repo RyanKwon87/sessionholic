@@ -473,8 +473,8 @@ class LaunchTest(unittest.TestCase):
         result = self.build(self.profile("codex", ".codex-isolated-beta"), source)
         self.assertIn("GH_CONFIG_DIR", result["env"])
 
-    def test_handoff_scrubs_email_tokens_and_private_keys(self):
-        secrets = ["person@example.invalid", "sk-proj-" + "a" * 48,
+    def test_handoff_scrubs_tokens_and_private_keys_and_keeps_email_addresses(self):
+        secrets = ["sk-proj-" + "a" * 48,
                    "sk-ant-api03-" + "b" * 48, "ghp_" + "c" * 40,
                    "github_pat_" + "d" * 50, "AKIA" + "A" * 16,
                    "Bearer " + "e" * 30, "aws_secret_access_key=" + "f" * 40,
@@ -485,6 +485,9 @@ class LaunchTest(unittest.TestCase):
         for secret in secrets:
             self.assertNotIn(secret, text)
         self.assertIn("[redacted]", text)
+        kept = self.build(self.profile("claude", ".claude"),
+                          messages=[{"role": "user", "text": "person@example.invalid 에 보낼 메일"}])
+        self.assertIn("person@example.invalid", Path(kept["handoffPath"]).read_text())
         self.assertIn('"redacted": true', text)
         self.assertIn('"redactedFields": 1', text)
 

@@ -135,6 +135,14 @@ class WorkerNewSessionTest(TempHome):
                 transfer_worker._main()
         execve.assert_not_called()
         self.assertIn('실행 설정이 올바르지 않습니다', error.getvalue())
+        # Any other shape of the step is refused in its own branch.
+        error = io.StringIO()
+        with self.remote_home() as (execve, _), redirect_stderr(error), \
+                patch.object(sys, 'argv', ['worker.pyz', 'new-session', '--preset']):
+            with self.assertRaises(SystemExit):
+                transfer_worker._main()
+        execve.assert_not_called()
+        self.assertIn('실행 요청 형식', error.getvalue())
 
     def test_new_session_step_refusal_prints_the_reason_and_runs_nothing(self):
         self.write()

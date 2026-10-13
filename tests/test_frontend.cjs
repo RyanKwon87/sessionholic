@@ -8325,7 +8325,8 @@ test('새 세션의 실행 설정은 이 브라우저에 기억되고 요청에 
   // 빠르게: remembered, named on each Mac row, and noted as not reaching the PC.
   const fast = options()[1].children[0];
   fast.checked = true; fast.events.change();
-  assert.ok([...store.values()].includes('fast'));
+  assert.ok([...store.values()].includes('"fast"'));
+  assert.equal(c.get('new-session-presets').children[1].children[0], fast, 'the same radios: a keyboard choice keeps its focus');
   const rows = c.get('new-session-hosts').children;
   assert.match(textOf(rows[0]), /launcher 실행 · 빠르게/);
   assert.doesNotMatch(textOf(rows.at(-1)), /빠르게/);
@@ -8335,16 +8336,31 @@ test('새 세션의 실행 설정은 이 브라우저에 기억되고 요청에 
   let posts = calls.filter((call) => call.url === '/api/new-session');
   assert.equal(posts[0].body.preset, 'fast');
   assert.equal(posts[0].body.requestId, posts[1].body.requestId, 'a retry with the same preset is the same request');
-  // Another preset: another request. 기본 sends none.
+  // Another preset: another request. 기본 sends none; going back to 빠르게 is its earlier request.
   options()[0].children[0].checked = true; options()[0].children[0].events.change();
   await c.startNewSession('mini');
   posts = calls.filter((call) => call.url === '/api/new-session');
   assert.notEqual(posts[2].body.requestId, posts[1].body.requestId);
   assert.equal('preset' in posts[2].body, false);
+  fast.checked = true; fast.events.change();
+  await c.startNewSession('mini');
+  posts = calls.filter((call) => call.url === '/api/new-session');
+  assert.equal(posts[3].body.requestId, posts[0].body.requestId);
+  // A PC row never sends one.
+  await c.startNewSession('pc');
+  assert.equal('preset' in calls.filter((call) => call.url === '/api/new-session').at(-1).body, false);
   // Reopened, the sheet keeps this browser's choice.
   options()[2].children[0].checked = true; options()[2].children[0].events.change();
   c.openNewSession();
   assert.equal(options()[2].children[0].checked, true);
+  // Storage blocked: the page's choice still holds and is sent.
+  c.context.localStorage = { getItem() { throw new Error('blocked'); }, setItem() { throw new Error('blocked'); } };
+  options()[1].children[0].checked = true; options()[1].children[0].events.change();
+  assert.equal(options()[1].children[0].checked, true);
+  // Only a PC can open one: nothing to choose.
+  c.state.capabilities = { hosts: [{ name: 'pc', label: 'PC', online: true, platform: 'windows', newSession: { available: true, label: 'PC 메뉴' } }] };
+  c.openNewSession();
+  assert.equal(c.get('new-session-presets').hidden, true);
 });
 
 test('opening a new session posts once per host and request, then opens its terminal', async () => {

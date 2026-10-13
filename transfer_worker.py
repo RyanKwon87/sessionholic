@@ -731,10 +731,13 @@ def _main():
         return hold_attach(sys.argv[2])
     if len(sys.argv) >= 3 and sys.argv[1] == 'handoff':
         return handoff_main(sys.argv[2:])
-    if len(sys.argv) == 2 and sys.argv[1] == 'new-session':
-        return new_session_main()
-    if len(sys.argv) == 4 and sys.argv[1] == 'new-session' and sys.argv[2] == '--preset':
-        return new_session_main(sys.argv[3])
+    if len(sys.argv) >= 2 and sys.argv[1] == 'new-session':
+        if len(sys.argv) == 2:
+            return new_session_main()
+        if len(sys.argv) == 4 and sys.argv[2] == '--preset':
+            return new_session_main(sys.argv[3])
+        print('새 세션을 열지 못했습니다. 실행 요청 형식이 올바르지 않습니다.', file=sys.stderr)
+        raise SystemExit(1)
     if len(sys.argv) == 3 and sys.argv[1] == 'attach':
         try:
             attach(json.loads(sys.argv[2]))

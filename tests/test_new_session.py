@@ -4,19 +4,23 @@ HOME is a temporary folder and the launcher is a fixture script that is never ru
 os.execve is replaced, SSH is never started and no agent or model is involved.
 """
 from contextlib import contextmanager, redirect_stderr
+import http.client
 import io
 import json
 import os
 from pathlib import Path
+import stat
 import sys
 import tempfile
 import threading
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
 import launch
 import server
 import settings
+import terminal
 from transfer import Transfers
 import transfer_worker
 
@@ -226,6 +230,14 @@ class WorkflowNewSessionTest(unittest.TestCase):
         self.assertNotIn('HOME=', ' '.join(argv))
         self.assertEqual(result['terminal']['mode'], 'new-session')
 
+    def test_a_remote_that_holds_runs_opens_the_reconnect_loop_and_names_its_hold(self):
+        self.flow.transfers.hold_support['remote'] = True
+        self.flow.new_session({'host': 'remote', 'requestId': 'request-0013'})
+        created = self.terms.created[0]
+        self.assertEqual(created['argv'][3], '--hold-loop')
+        self.assertRegex(created['metadata']['holdName'], r'^sh-[0-9a-f]{16}$')
+        self.assertIn(' hold %s new-session' % created['metadata']['holdName'], json.loads(created['argv'][4])['first'][-1])
+
     def test_unavailable_or_offline_remote_is_refused_without_a_terminal(self):
         self.remote_status = {'available': False, 'label': None, 'reason': '이 기기에는 새 세션 실행 명령이 설정되지 않았습니다.'}
         with self.assertRaisesRegex(ValueError, '설정되지 않았습니다'):
@@ -338,6 +350,314 @@ class LinkNewSessionTest(unittest.TestCase):
         self.assertEqual(self.link(), [])
         self.terminal.update(alive=True, createdAt=None)
         self.assertEqual(self.link(), [])
+
+
+# ---------- runs held in the host's own tmux (`hold`) and the board's reconnect loop ----------
+# tmux, SSH and every exec are replaced; no agent runs.
+HOLD = 'sh-0123456789abcdef'
+HOLD_TMUX = '/opt/fixture/bin/tmux'
+PC = {'name': 'pc', 'label': 'PC', 'local': False, 'ssh': 'pc', 'platform': 'windows'}
+
+
+class Ran:
+    """subprocess.run stand-in: answers by tmux subcommand, records every call."""
+    def __init__(self, alive=False, started=0, listed=''):
+        self.alive, self.started, self.listed, self.calls = alive, started, listed, []
+
+    def __call__(self, argv, **kwargs):
+        self.calls.append(argv)
+        step = argv[5]
+        code = {'has-session': 0 if self.alive else 1, 'new-session': self.started,
+                'list-sessions': 0, 'kill-session': 0}.get(step, 0)
+        return SimpleNamespace(returncode=code, stdout=self.listed if step == 'list-sessions' else '')
+
+
+class WorkerHoldTest(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(dir='/tmp', prefix='sh-hold-')
+        self.addCleanup(self.temp.cleanup)
+        self.home = Path(self.temp.name).resolve()
+        self.cwd = self.home / 'project'
+        self.cwd.mkdir()
+        # A step execs from its own folder; each test starts there and leaves it after.
+        previous = os.getcwd()
+        os.chdir(self.cwd)
+        self.addCleanup(os.chdir, previous)
+
+    @contextmanager
+    def remote(self, tmux=HOLD_TMUX, ran=None):
+        ran = ran or Ran()
+        with patch.dict(os.environ, {'HOME': str(self.home), 'TERM': 'xterm-256color', 'TMUX': '/ignored'}, clear=True), \
+                patch.object(transfer_worker, '_tmux', return_value=tmux), \
+                patch.object(transfer_worker.subprocess, 'run', side_effect=ran), \
+                patch('os.execve', side_effect=SystemExit('exec')) as execve, \
+                patch('os.get_terminal_size', return_value=os.terminal_size((120, 40))):
+            yield ran, execve
+
+    def holds(self):
+        return transfer_worker.root() / 'holds'
+
+    def test_a_held_step_starts_in_its_own_tmux_session_and_attaches_to_it(self):
+        with self.remote() as (ran, execve), patch.object(transfer_worker, '_hold', HOLD):
+            with self.assertRaises(SystemExit):
+                transfer_worker._execve(['/usr/bin/agent', '--flag'], {'HOME': str(self.home), 'SECRET_FREE': '1'})
+            envelope = self.holds() / (HOLD + '.json')
+            self.assertEqual(stat.S_IMODE(envelope.stat().st_mode), 0o600)
+            self.assertEqual(json.loads(envelope.read_text()),
+                             {'argv': ['/usr/bin/agent', '--flag'], 'env': {'HOME': str(self.home), 'SECRET_FREE': '1'},
+                              'cwd': str(self.cwd)})
+        start = next(argv for argv in ran.calls if argv[5] == 'new-session')
+        self.assertEqual(start[:5], [HOLD_TMUX, '-L', 'sessionholic-hold', '-f', '/dev/null'])
+        self.assertEqual(start[6:12], ['-d', '-s', HOLD, '-x', '120', '-y'])
+        self.assertIn('hold-run', start)
+        self.assertNotIn('/usr/bin/agent', start, 'argv and environment never ride on tmux argv')
+        for option in (['status', 'off'], ['prefix', 'None'], ['prefix2', 'None'], ['mouse', 'off'], ['escape-time', '10']):
+            self.assertIn(';', start)
+            self.assertTrue(any(start[i:i + 4] == ['set-option', '-g'] + option for i in range(len(start))), option)
+        program, argv, env = execve.call_args.args
+        self.assertEqual((program, argv), (HOLD_TMUX, [HOLD_TMUX, '-L', 'sessionholic-hold', '-f', '/dev/null',
+                                                   'attach-session', '-t', '=' + HOLD]))
+        self.assertNotIn('TMUX', env)
+        self.assertEqual(env['TERM'], 'xterm-256color')
+
+    def test_without_tmux_or_when_tmux_refuses_the_step_runs_here_as_before(self):
+        for tmux, ran in ((None, Ran()), (HOLD_TMUX, Ran(started=1))):
+            with self.subTest(tmux=tmux), self.remote(tmux=tmux, ran=ran) as (_, execve), \
+                    patch.object(transfer_worker, '_hold', HOLD):
+                with self.assertRaises(SystemExit):
+                    transfer_worker._execve(['/usr/bin/agent'], {'HOME': str(self.home)})
+                self.assertEqual(execve.call_args.args[:2], ('/usr/bin/agent', ['/usr/bin/agent']))
+                self.assertFalse((self.holds() / (HOLD + '.json')).exists())
+
+    def test_an_existing_hold_is_attached_without_starting_anything(self):
+        with self.remote(ran=Ran(alive=True)) as (ran, execve), patch.object(transfer_worker, '_hold', HOLD):
+            with self.assertRaises(SystemExit):
+                transfer_worker._execve(['/usr/bin/agent'], {})
+        self.assertFalse(any(argv[5] == 'new-session' for argv in ran.calls))
+        self.assertEqual(execve.call_args.args[1][-3:], ['attach-session', '-t', '=' + HOLD])
+
+    def test_no_hold_requested_execs_directly(self):
+        with self.remote() as (ran, execve):
+            with self.assertRaises(SystemExit):
+                transfer_worker._execve(['/usr/bin/agent'], {'A': '1'})
+        self.assertEqual(ran.calls, [])
+        self.assertEqual(execve.call_args.args, ('/usr/bin/agent', ['/usr/bin/agent'], {'A': '1'}))
+
+    def test_hold_run_execs_the_envelope_once_on_the_panes_terminal(self):
+        with self.remote() as (_, execve):
+            folder = transfer_worker.private_dir(self.holds())
+            envelope = folder / (HOLD + '.json')
+            transfer_worker.save(envelope, {'argv': ['/usr/bin/agent'], 'cwd': str(self.cwd),
+                                            'env': {'TERM': 'xterm-256color', 'TMUX': 'x', 'TMUX_PANE': '%1', 'KEEP': 'y'}})
+            os.environ['TERM'] = 'tmux-256color'
+            with self.assertRaises(SystemExit):
+                transfer_worker.hold_run(str(envelope))
+            self.assertFalse(envelope.exists(), 'one use')
+            program, argv, env = execve.call_args.args
+            self.assertEqual((program, argv), ('/usr/bin/agent', ['/usr/bin/agent']))
+            self.assertEqual(env, {'TERM': 'tmux-256color', 'KEEP': 'y'})
+            for path in (str(self.home / 'elsewhere.json'), str(folder / 'not-a-hold.json')):
+                with self.assertRaises(ValueError):
+                    transfer_worker.hold_run(path)
+
+    def test_reattach_only_attaches_and_never_starts_a_step(self):
+        refused = AssertionError('reattach must never start anything')
+        with patch('launch.new_session', side_effect=refused), patch.object(transfer_worker, 'run_handoff', side_effect=refused), \
+                patch.object(transfer_worker, 'attach', side_effect=refused):
+            with self.remote(ran=Ran(alive=False)) as (ran, execve), patch.object(sys, 'argv', ['w.pyz', 'reattach', HOLD]), \
+                    patch('sys.stdout', new_callable=io.StringIO) as out:
+                with self.assertRaises(SystemExit) as stopped:
+                    transfer_worker.main()
+            self.assertEqual(stopped.exception.code, 0)
+            self.assertIn('이미 끝났습니다', out.getvalue())
+            execve.assert_not_called()
+            with self.remote(ran=Ran(alive=True)) as (ran, execve), patch.object(sys, 'argv', ['w.pyz', 'reattach', HOLD]):
+                with self.assertRaises(SystemExit):
+                    transfer_worker.main()
+            self.assertEqual(execve.call_args.args[1][-3:], ['attach-session', '-t', '=' + HOLD])
+            self.assertEqual([argv[5] for argv in ran.calls], ['has-session'])
+            with patch.object(sys, 'argv', ['w.pyz', 'reattach', 'other-name']), self.assertRaises(ValueError):
+                transfer_worker.main()
+
+    def test_a_hold_prefix_runs_the_step_with_its_final_exec_held(self):
+        seen = []
+        with patch.object(transfer_worker, 'new_session_main', side_effect=lambda: seen.append(transfer_worker._hold)), \
+                patch.object(sys, 'argv', ['w.pyz', 'hold', HOLD, 'new-session']):
+            transfer_worker.main()
+        self.assertEqual(seen, [HOLD])
+        transfer_worker._hold = None
+        with patch.object(sys, 'argv', ['w.pyz', 'hold', 'bad', 'new-session']), self.assertRaises(ValueError):
+            transfer_worker.main()
+
+    def test_holds_are_listed_by_age_and_ended_by_name(self):
+        now = 2_000_000_000
+        listed = 'sh-0123456789abcdef %d\nsomeone-else %d\nsh-fedcba9876543210 %d\n' % (now - 300, now, now - 5)
+        with self.remote(ran=Ran(alive=True, listed=listed)) as (ran, _), patch.object(transfer_worker.time, 'time', return_value=now):
+            self.assertEqual(transfer_worker._rpc({'op': 'hold_list', 'args': {}}),
+                             {'holds': [{'name': HOLD, 'age': 300}, {'name': 'sh-fedcba9876543210', 'age': 5}]})
+            self.assertEqual(transfer_worker._rpc({'op': 'hold_kill', 'args': {'name': HOLD}}), {'killed': True})
+            self.assertEqual(ran.calls[-1][5:], ['kill-session', '-t', '=' + HOLD])
+            with self.assertRaises(ValueError):
+                transfer_worker._rpc({'op': 'hold_kill', 'args': {'name': 'other'}})
+        with self.remote(tmux=None):
+            self.assertEqual(transfer_worker.hold_list(), {'holds': []})
+            self.assertEqual(transfer_worker.hold_kill(HOLD), {'killed': False})
+
+    def test_profiles_say_whether_this_host_can_hold_runs(self):
+        for tmux, expected in ((HOLD_TMUX, True), (None, False)):
+            with self.subTest(tmux=tmux), patch.dict(os.environ, {'HOME': str(self.home)}), \
+                    patch('transfer_native.profiles', return_value=[]), patch.object(transfer_worker, '_tmux', return_value=tmux):
+                self.assertIs(transfer_worker._rpc({'op': 'profiles'})['holds'], expected)
+
+
+class TransfersTerminalTest(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(dir='/tmp', prefix='sh-hold-tr-')
+        self.addCleanup(self.temp.cleanup)
+        self.flow = Transfers([LOCAL, REMOTE, PC], self.temp.name)
+
+    def test_a_host_that_holds_runs_gets_the_reconnect_loop(self):
+        with patch.object(self.flow, 'rpc', return_value={'profiles': [], 'holds': True}):
+            self.flow.profiles(REMOTE, refresh=True)
+        argv, name = self.flow.terminal(REMOTE, ['-I', RUNTIME, 'new-session'])
+        self.assertRegex(name, r'^sh-[0-9a-f]{16}$')
+        self.assertEqual(argv[:4], [sys.executable, '-I', str(Path(terminal.__file__).resolve()), '--hold-loop'])
+        spec = json.loads(argv[4])
+        self.assertEqual(spec['first'][-1], 'exec /usr/bin/python3 -I %s hold %s new-session' % (RUNTIME, name))
+        self.assertEqual(spec['again'][-1], 'exec /usr/bin/python3 -I %s reattach %s' % (RUNTIME, name))
+        for command in (spec['first'], spec['again']):
+            self.assertIn('ControlPath=none', command)
+            self.assertEqual(command[1], '-tt')
+        self.assertNotEqual(self.flow.terminal(REMOTE, ['-I', RUNTIME, 'new-session'])[1], name, 'a new name each time')
+
+    def test_elsewhere_the_plain_command_and_no_name(self):
+        with patch.object(self.flow, 'rpc', return_value={'profiles': [], 'holds': False}):
+            self.flow.profiles(REMOTE, refresh=True)
+        argv, name = self.flow.terminal(REMOTE, ['-I', RUNTIME, 'new-session'])
+        self.assertIsNone(name)
+        self.assertEqual(argv, self.flow.command(REMOTE, ['-I', RUNTIME, 'new-session'], tty=True))
+        self.flow.hold_support.update(local=True, pc=True)
+        self.assertIsNone(self.flow.terminal(LOCAL, ['-I', RUNTIME, 'new-session'])[1])
+
+
+class HoldLoopTest(unittest.TestCase):
+    SPEC = {'first': ['ssh', 'first'], 'again': ['ssh', 'again']}
+
+    def loop(self, codes, durations, sleeps=None):
+        ran, slept, now = [], [], [0.0]
+        codes, durations = list(codes), list(durations)
+
+        def run(argv):
+            ran.append(argv[1])
+            now[0] += durations.pop(0)
+            return codes.pop(0)
+
+        def sleep(seconds):
+            slept.append(seconds)
+            if sleeps:
+                raise sleeps
+        out = io.StringIO()
+        with patch.object(terminal.termios, 'tcflush') as flush:
+            code = terminal._hold_loop(self.SPEC, run=run, sleep=sleep, clock=lambda: now[0], out=out)
+        return code, ran, slept, out.getvalue(), flush
+
+    def test_a_dropped_connection_attaches_again_until_the_run_ends(self):
+        code, ran, slept, out, flush = self.loop([255, 255, 255, 0], [3600, 5, 70, 10])
+        self.assertEqual(code, 0)
+        self.assertEqual(ran, ['first', 'again', 'again', 'again'])
+        # Waits grow while reconnecting fails, and start over after a connection that lasted.
+        self.assertEqual(slept, [2, 5, 2])
+        self.assertIn('기기 연결이 끊겼습니다', out)
+        self.assertGreaterEqual(flush.call_count, 6, 'keys typed while away are dropped')
+
+    def test_other_ends_are_the_terminals_end(self):
+        for codes, durations, expected in (([0], [100], 0), ([1], [100], 1), ([-15], [100], 1),
+                                           ([255], [3], 255)):
+            with self.subTest(codes=codes):
+                code, ran, slept, _, _ = self.loop(codes, durations)
+                self.assertEqual((code, ran, slept), (expected, ['first'], []))
+        code, ran, slept, _, _ = self.loop([255], [600], sleeps=KeyboardInterrupt())
+        self.assertEqual((code, ran), (130, ['first']))
+
+
+class BoardHoldTest(unittest.TestCase):
+    def flow(self, terminals=(), holds=(), online=True, support=True):
+        calls = []
+
+        def rpc(host, op, args, timeout=30):
+            calls.append((host['name'], op, args))
+            return {'holds': list(holds)} if op == 'hold_list' else {'killed': True}
+        transfers = SimpleNamespace(lock=threading.RLock(), hold_support={'remote': support, 'local': True}, rpc=rpc)
+        board = SimpleNamespace(hosts=[LOCAL, REMOTE, PC], state={'local': {'ok': True}, 'remote': {'ok': online}, 'pc': {'ok': True}})
+        flow = SimpleNamespace(board=board, transfers=transfers, terminals=SimpleNamespace(list=lambda: list(terminals)),
+                               HOLD_GRACE_SECONDS=server.Workflow.HOLD_GRACE_SECONDS)
+        return flow, calls
+
+    def test_the_sweep_ends_only_old_holds_no_open_terminal_names(self):
+        open_one = {'id': 'a' * 32, 'host': 'remote', 'holdName': 'sh-000000000000000a', 'closed': False}
+        closed = {'id': 'b' * 32, 'host': 'remote', 'metadata': {'holdName': 'sh-000000000000000b'}, 'closed': True}
+        holds = [{'name': 'sh-000000000000000a', 'age': 9999}, {'name': 'sh-000000000000000b', 'age': 9999},
+                 {'name': 'sh-000000000000000c', 'age': 10}, {'name': 'sh-000000000000000d', 'age': 600}]
+        flow, calls = self.flow([open_one, closed], holds)
+        with patch('sys.stderr', new_callable=io.StringIO):
+            server.Workflow.sweep_holds(flow)
+        self.assertEqual([call for call in calls if call[1] == 'hold_kill'],
+                         [('remote', 'hold_kill', {'name': 'sh-000000000000000b'}),
+                          ('remote', 'hold_kill', {'name': 'sh-000000000000000d'})])
+        for offline, support in ((False, True), (True, False)):
+            flow, calls = self.flow([], holds, online=offline, support=support)
+            server.Workflow.sweep_holds(flow)
+            self.assertEqual(calls, [], 'an offline or non-holding host is left alone')
+
+    def test_a_terminal_list_failure_ends_nothing(self):
+        flow, calls = self.flow([], [{'name': 'sh-000000000000000d', 'age': 600}])
+        flow.terminals = SimpleNamespace(list=lambda: (_ for _ in ()).throw(RuntimeError('tmux')))
+        server.Workflow.sweep_holds(flow)
+        self.assertEqual(calls, [])
+
+    def test_a_closed_terminal_ends_its_hold_now_or_says_it_will(self):
+        row = {'id': 'a' * 32, 'host': 'remote', 'holdName': 'sh-000000000000000a'}
+        flow, calls = self.flow()
+        done = threading.Event()
+        original = flow.transfers.rpc
+        flow.transfers.rpc = lambda *a, **k: (original(*a, **k), done.set())[0]
+        self.assertFalse(server.Workflow.end_hold(flow, row))
+        self.assertTrue(done.wait(5))
+        self.assertEqual(calls, [('remote', 'hold_kill', {'name': 'sh-000000000000000a'})])
+        flow, calls = self.flow(online=False)
+        self.assertTrue(server.Workflow.end_hold(flow, row))
+        self.assertEqual(calls, [])
+        self.assertFalse(server.Workflow.end_hold(flow, {'id': 'b' * 32, 'host': 'remote'}), 'nothing held')
+
+    def test_closing_a_held_terminal_while_its_host_is_away_says_so(self):
+        temp = tempfile.TemporaryDirectory(dir='/tmp', prefix='sh-hold-http-')
+        self.addCleanup(temp.cleanup)
+        board = server.Board([LOCAL, REMOTE], 60, runner=lambda *a: self.fail('collection'), live=False)
+        board.state['remote'].update(ok=False, data={'codex': [], 'claude': []})
+        row = {'id': 'c' * 32, 'host': 'remote', 'mode': 'new-session', 'alive': True, 'closed': False,
+               'holdName': 'sh-000000000000000c'}
+        terminals = SimpleNamespace(list=lambda: [row], close=lambda: None, close_terminal=lambda tid: {'ok': True})
+        httpd = server.make_server('127.0.0.1', 0, board, 'example-token', state_dir=temp.name, terminals=terminals)
+        httpd.workflow.bot_requests = SimpleNamespace(snapshot=lambda: {'requests': []})
+        thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(lambda: (httpd.shutdown(), thread.join(2), httpd.server_close()))
+
+        def request(path, body, cookie=None, csrf=None):
+            client = http.client.HTTPConnection('127.0.0.1', httpd.server_address[1], timeout=5)
+            headers = {'Content-Type': 'application/json'}
+            if cookie:
+                headers.update({'Cookie': cookie, 'X-CSRF-Token': csrf})
+            client.request('POST', path, body=json.dumps(body), headers=headers)
+            response = client.getresponse()
+            result = json.loads(response.read())
+            client.close()
+            return response, result
+        response, login = request('/login', {'token': 'example-token'})
+        cookie = response.getheader('Set-Cookie').split(';', 1)[0]
+        with patch('sys.stderr', new_callable=io.StringIO):
+            response, result = request('/api/terminal/%s/close' % ('c' * 32), {}, cookie, login['csrfToken'])
+        self.assertEqual((response.status, result.get('remoteCleanupPending')), (200, True))
 
 
 if __name__ == '__main__':

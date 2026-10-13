@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import re
+import secrets
 import shlex
 import shutil
 import subprocess
@@ -149,6 +150,8 @@ class Transfers:
         self.runtime_installed = {}
         self.profile_cache = {}
         self.launcher_cache = {}
+        # host name -> whether its helper keeps runs in its own tmux (reported with profiles)
+        self.hold_support = {}
         self.profile_failures = {}
         self.lock = threading.RLock()
         self._runtime = None
@@ -200,6 +203,27 @@ class Transfers:
             return [shutil.which('ssh') or '/usr/bin/ssh', '-tt'] + self.terminal_options() + ['--', host['ssh'], command]
         return [shutil.which('ssh') or '/usr/bin/ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=6',
                 '-o', 'ServerAliveInterval=10', '-o', 'ServerAliveCountMax=2'] + self.control_options() + ['--', host['ssh'], command]
+
+    def terminal(self, host, args):
+        """A board terminal's command for `args` (['-I', helper, step...]) and its hold name.
+
+        On a Mac whose helper keeps runs in its own tmux, the step runs there under a new
+        name (`hold`), and the command is this board's reconnect loop (terminal.py
+        --hold-loop): a dropped connection or a sleeping host does not end the run, and the
+        board attaches again (`reattach`, which never starts anything). Elsewhere it is the
+        plain SSH command and no name."""
+        with self.lock:
+            held = self.hold_support.get(host['name']) is True
+        if host.get('local') or host.get('platform') == 'windows' or not held:
+            return self.command(host, args, tty=True), None
+        if len(args) < 3 or args[0] != '-I':
+            raise ValueError('기기 도우미 명령이 올바르지 않습니다.')
+        name = 'sh-' + secrets.token_hex(8)
+        first = self.command(host, ['-I', args[1], 'hold', name] + list(args[2:]), tty=True)
+        again = self.command(host, ['-I', args[1], 'reattach', name], tty=True)
+        loop = [sys.executable, '-I', str(Path(__file__).resolve().with_name('terminal.py')), '--hold-loop',
+                json.dumps({'first': first, 'again': again})]
+        return loop, name
 
     def _exchange(self, host, request, timeout, full):
         """One bootstrap run; `full` adds the helper archive, otherwise only its SHA-256 goes."""
@@ -350,6 +374,7 @@ class Transfers:
         with self.lock:
             self.profile_cache[host['name']] = (time.monotonic(), result)
             self.launcher_cache[host['name']] = data.get('launcher') if isinstance(data.get('launcher'), dict) else None
+            self.hold_support[host['name']] = data.get('holds') is True
             self.profile_failures.pop(host['name'], None)
         return result
 
@@ -524,7 +549,8 @@ class Transfers:
             status('ready')
             self._cleanup_record(record, folder / 'transfer.json')
             import collector
-            return {'argv':self.command(target_host, ['-I', self.runtime_paths[target_host['name']], 'exec', transfer_id], tty=True),
+            argv, hold = self.terminal(target_host, ['-I', self.runtime_paths[target_host['name']], 'exec', transfer_id])
+            return {'argv':argv, 'holdName':hold,
                     'cwd':str(Path.home()), 'env':collector.tool_env(), 'transferId':transfer_id,
                     'destinationCwd':prepared['cwd'], 'nativeSource':prepared.get('nativeSource'), 'connectionMode':prepared.get('connectionMode'), 'warnings':prepared.get('warnings',[])}
         except Exception as exc:

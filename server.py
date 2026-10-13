@@ -1649,12 +1649,12 @@ class Workflow:
                         raise ValueError(status["reason"] or "이 기기에는 새 세션 실행 명령이 설정되지 않았습니다.")
                     import collector
                     label = status["label"] or "새 세션"
-                    spec = {"argv": self.transfers.command(host, ["-I", self.transfers.runtime_paths[host["name"]],
-                                                                 "new-session"], tty=True),
-                            "cwd": str(Path.home()), "env": collector.tool_env()}
-                terminal = self.terminals.create(key, spec["argv"], spec["cwd"], spec["env"],
-                                                 {"title": label, "host": host["name"], "mode": "new-session",
-                                                  "createdAt": int(time.time())})
+                    argv, hold = self.transfers.terminal(host, ["-I", self.transfers.runtime_paths[host["name"]], "new-session"])
+                    spec = {"argv": argv, "holdName": hold, "cwd": str(Path.home()), "env": collector.tool_env()}
+                metadata = {"title": label, "host": host["name"], "mode": "new-session", "createdAt": int(time.time())}
+                if spec.get("holdName"):
+                    metadata["holdName"] = spec["holdName"]
+                terminal = self.terminals.create(key, spec["argv"], spec["cwd"], spec["env"], metadata)
             result = {"terminal": terminal, "mode": "new-session"}
             self._finish(request_id, signature, result)
             settled = True
@@ -1662,6 +1662,70 @@ class Workflow:
         finally:
             if not settled:
                 self._finish(request_id, signature, record=False)
+
+    HOLD_SWEEP_SECONDS = 300
+    HOLD_SWEEP_FIRST = 180  # after a start; a deploy canary is done by then
+    HOLD_GRACE_SECONDS = 120  # a hold younger than this may belong to a terminal being created
+
+    def end_hold(self, terminal):
+        """The run a closed terminal kept on its host ends too, in the background (a remote
+        call never runs under a lock). Returns True when its host is offline now: the sweep
+        ends it once the host is back."""
+        hold = terminal.get("holdName") or (terminal.get("metadata") or {}).get("holdName")
+        host = next((h for h in self.board.hosts if h["name"] == terminal.get("host")), None)
+        if not hold or host is None or host.get("local"):
+            return False
+        if not self.board.state[host["name"]]["ok"]:
+            return True
+        def end():
+            try:
+                self.transfers.rpc(host, "hold_kill", {"name": hold}, timeout=12)
+            except (RuntimeError, OSError, ValueError):
+                pass  # The sweep ends it later.
+        threading.Thread(target=end, daemon=True).start()
+        return False
+
+    def sweep_holds(self):
+        """End held runs that no open board terminal names (closed while their host was away,
+        released by the board, or left by a terminal record that is gone)."""
+        try:
+            terminals = self.terminals.list()
+        except (RuntimeError, OSError, ValueError):
+            return
+        live = {}
+        for terminal in terminals:
+            hold = terminal.get("holdName") or (terminal.get("metadata") or {}).get("holdName")
+            if hold and not terminal.get("closed"):
+                live.setdefault(terminal.get("host"), set()).add(hold)
+        for host in self.board.hosts:
+            with self.transfers.lock:
+                held = self.transfers.hold_support.get(host["name"]) is True
+            if host.get("local") or host.get("platform") == "windows" or not held or not self.board.state[host["name"]]["ok"]:
+                continue
+            try:
+                holds = self.transfers.rpc(host, "hold_list", {}, timeout=12).get("holds", [])
+            except (RuntimeError, OSError, ValueError, AttributeError):
+                continue
+            for item in holds if isinstance(holds, list) else []:
+                if (not isinstance(item, dict) or item.get("name") in live.get(host["name"], set())
+                        or not isinstance(item.get("age"), int) or item["age"] < self.HOLD_GRACE_SECONDS):
+                    continue
+                try:
+                    self.transfers.rpc(host, "hold_kill", {"name": item["name"]}, timeout=12)
+                    sys.stderr.write("남은 실행 보관을 정리했습니다: %s %s\n" % (host["name"], item["name"]))
+                except (RuntimeError, OSError, ValueError):
+                    continue
+
+    def start_hold_sweep(self):
+        def run():
+            time.sleep(self.HOLD_SWEEP_FIRST)
+            while True:
+                try:
+                    self.sweep_holds()
+                except Exception as exc:  # The sweep never stops the board.
+                    sys.stderr.write("실행 보관 정리에 실패했습니다: %s\n" % type(exc).__name__)
+                time.sleep(self.HOLD_SWEEP_SECONDS)
+        threading.Thread(target=run, name="hold-sweep", daemon=True).start()
 
     LINK_WINDOW = 1800  # a launcher's first session counts within 30 minutes of its terminal
 
@@ -2027,6 +2091,8 @@ class Workflow:
                     native_source = self.native_of(source)
                 if native_source:
                     metadata["nativeSource"] = native_source
+                if spec.get("holdName"):
+                    metadata["holdName"] = spec["holdName"]
                 if spec.get("transferId"):
                     metadata.update(transferId=spec["transferId"], destinationCwd=spec["destinationCwd"], sourceHost=source["host"])
                 try:
@@ -2101,8 +2167,8 @@ class Workflow:
         record.update(status="prepared", updatedAt=int(time.time()))
         private_json(marker, record)
         import collector
-        return {"argv": self.transfers.command(host, ["-I", self.transfers.runtime_paths[host["name"]],
-                "handoff", token], tty=True),
+        argv, hold = self.transfers.terminal(host, ["-I", self.transfers.runtime_paths[host["name"]], "handoff", token])
+        return {"argv": argv, "holdName": hold,
                 "cwd": str(Path.home()), "env": collector.tool_env(), "destinationCwd": prepared["cwd"],
                 "nativeSource": native,
                 "connectionMode": "attach" if prepared.get("connectionMode") == "attach" else None}
@@ -2123,9 +2189,9 @@ class Workflow:
             raise ValueError("원격 기기의 원본 실행 프로필을 확인하지 못했습니다.")
         selector = {key: source.get(key) for key in ("host", "agent", "id", "home", "cwd", "kind", "sessionId", "phase", "resume")}
         import collector
-        return {"argv": self.transfers.command(host, ["-I", self.transfers.runtime_paths[host["name"]],
-                "attach", json.dumps(selector, ensure_ascii=False)], tty=True),
-                "cwd": str(Path.home()), "env": collector.tool_env()}
+        argv, hold = self.transfers.terminal(host, ["-I", self.transfers.runtime_paths[host["name"]],
+                                                    "attach", json.dumps(selector, ensure_ascii=False)])
+        return {"argv": argv, "holdName": hold, "cwd": str(Path.home()), "env": collector.tool_env()}
 
 
 def collector_path():
@@ -2822,6 +2888,7 @@ class Handler(BaseHTTPRequestHandler):
                 elif action == "close":
                     row = next((t for t in self.server.terminals.list() if t.get("id") == tid), None)
                     self.server.terminals.close_terminal(tid)
+                    hold_pending = bool(row) and self.server.workflow.end_hold(row)
                     # Only a terminal still running when closed: one that already ended (a host
                     # that went to sleep) was not ended from the board.
                     if row is not None and row.get("alive") and not row.get("closed"):
@@ -2831,7 +2898,10 @@ class Handler(BaseHTTPRequestHandler):
                         self.server.terminal_inputs.prune_closed(tid, self.server.terminals.list())
                     except (ValueError, RuntimeError, OSError):
                         # Closing the CLI succeeded even if optional receipt cleanup failed.
-                        return self.send_json(200, {"ok": True, "inputCleanupPending": True})
+                        return self.send_json(200, {"ok": True, "inputCleanupPending": True,
+                                                    **({"remoteCleanupPending": True} if hold_pending else {})})
+                    if hold_pending:
+                        return self.send_json(200, {"ok": True, "remoteCleanupPending": True})
                 else:
                     self.server.terminals.detach(tid)
                 return self.send_json(200, {"ok": True})
@@ -3062,6 +3132,7 @@ def main(argv=None):
     if args.state_dir:
         threading.Thread(target=rotate_logs_forever, args=(args.state_dir,), daemon=True,
                          name=THREAD_PREFIX + "-logs").start()
+    httpd.workflow.start_hold_sweep()
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:

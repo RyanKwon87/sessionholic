@@ -1046,7 +1046,61 @@ def _launch(path):
     os.execve(data["argv"][0], data["argv"], data["env"])
 
 
+HOLD_RETRY = (2, 5, 10, 20, 30)
+HOLD_SETTLED = 60  # a connection that lasted this long starts the waits over
+HOLD_FIRST_GRACE = 15  # an SSH that fails this soon after opening never ran the step
+
+
+def _hold_loop(spec, run=subprocess.call, sleep=time.sleep, clock=time.monotonic, out=None):
+    """A board terminal whose run another host keeps in its own tmux: reconnect after a
+    dropped connection (SSH exit 255) by attaching again, never starting anything. Any other
+    exit (the run ended, Ctrl+C, a refusal) ends the terminal with that code."""
+    out = out or sys.stdout
+    argv, attempt, opened = spec["first"], 0, clock()
+    while True:
+        started = clock()
+        code = run(argv)
+        if code != 255:
+            return code if code >= 0 else 1
+        if argv is spec["first"] and clock() - opened < HOLD_FIRST_GRACE:
+            return 255  # The connection never came up: report it, no loop.
+        if clock() - started >= HOLD_SETTLED:
+            attempt = 0
+        wait = HOLD_RETRY[min(attempt, len(HOLD_RETRY) - 1)]
+        attempt += 1
+        try:
+            termios.tcflush(0, termios.TCIFLUSH)
+        except (termios.error, OSError, ValueError):
+            pass
+        out.write("\r\n[하던 일] 기기 연결이 끊겼습니다. 실행은 그 기기에서 계속됩니다. "
+                  "%d초 뒤 다시 연결합니다… (그만두려면 Ctrl+C)\r\n" % wait)
+        out.flush()
+        try:
+            sleep(wait)
+        except KeyboardInterrupt:
+            return 130
+        try:
+            # Keys typed while away never reach the run.
+            termios.tcflush(0, termios.TCIFLUSH)
+        except (termios.error, OSError, ValueError):
+            pass
+        argv = spec["again"]
+
+
 if __name__ == "__main__":
+    if len(sys.argv) == 3 and sys.argv[1] == "--hold-loop":
+        try:
+            spec = json.loads(sys.argv[2])
+            if not (isinstance(spec, dict) and all(isinstance(spec.get(k), list) and spec[k]
+                                                   and all(isinstance(a, str) for a in spec[k]) for k in ("first", "again"))):
+                raise ValueError("hold loop")
+        except ValueError:
+            print("터미널 명령을 시작하지 못했습니다.", file=sys.stderr)
+            sys.exit(1)
+        try:
+            sys.exit(_hold_loop(spec))
+        except KeyboardInterrupt:
+            sys.exit(130)
     if len(sys.argv) == 3 and sys.argv[1] == "--launch":
         try:
             _launch(sys.argv[2])

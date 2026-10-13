@@ -10,6 +10,7 @@ import sys
 import tempfile
 import threading
 import time
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 from urllib.parse import urlparse
@@ -885,6 +886,7 @@ class HelperTest(unittest.TestCase):
             server_address = ("127.0.0.1", 8799)
             def __init__(self):
                 self.once, self.once_lock = ("", 0), threading.Lock()
+                self.workflow = SimpleNamespace(start_hold_sweep=lambda: None)
             def serve_forever(self):
                 raise KeyboardInterrupt
             def server_close(self):

@@ -380,6 +380,17 @@ test("an ended terminal says why: a released view keeps its run, a remote end ma
   assert.doesNotMatch(c.terminalContextCopy({ ...attach, mode: "new-session", host: "board" }), /실행이 끝납니다/);
 });
 
+test("a run its host keeps in tmux says it outlasts a dropped connection, and its end is its own", () => {
+  const c = client(undefined, noChatTimers);
+  c.state.capabilities = { hosts: [{ name: "workstation", label: "W" }] };
+  const held = { id: "a".repeat(32), mode: "new-session", host: "workstation", holdName: "sh-0123456789abcdef" };
+  assert.match(c.terminalContextCopy(held), /잠들거나 연결이 끊겨도 실행은 그 기기에서 계속되고/);
+  assert.doesNotMatch(c.terminalContextCopy(held), /실행이 끝납니다/);
+  assert.doesNotMatch(c.terminalEndedCopy({ ...held, closed: true, closedReason: "connection_ended" }), /잠들었거나/);
+  // Without a hold (no tmux there) the old caution stays.
+  assert.match(c.terminalContextCopy({ ...held, holdName: undefined }), /실행이 끝납니다/);
+});
+
 test("an ended terminal offers its listed session again, through the plan sheet once back on the board", () => {
   const c = client(undefined, noChatTimers);
   const { s } = selectChat(c);

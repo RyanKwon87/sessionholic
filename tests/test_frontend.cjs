@@ -8821,6 +8821,46 @@ test('a listening mic can always end it, and says it is finishing', async () => 
   assert.equal(mic.disabled, true, 'not listening: a locked input keeps its mic off');
 });
 
+test('an iPad app back from the background takes its full height again, with no resize to wait for', async () => {
+  const timers = [];
+  const c = client(undefined, { setTimeout: (callback, ms) => { timers.push({ callback, ms }); return timers.length; }, clearTimeout() {} });
+  const heights = [];
+  c.context.document.documentElement.style.setProperty = (name, value) => { if (name === '--app-height') heights.push(value); };
+  c.context.navigator = { onLine: false };
+  c.windowEvents.DOMContentLoaded();
+  const last = () => heights.at(-1);
+  // Minimized with the keyboard up (or mid Stage Manager animation): the short size is what stayed.
+  Object.assign(c.context.window, { innerWidth: 1194, innerHeight: 834, visualViewport: { height: 434, scale: 1 } });
+  c.context.document.activeElement = null;
+  c.context.document.hidden = true; c.documentEvents.visibilitychange();
+  heights.length = 0; timers.length = 0;
+  c.context.document.hidden = false; c.documentEvents.visibilitychange();
+  assert.equal(last(), '834px', 'no text field has the focus, so no keyboard takes the space');
+  assert.deepEqual(timers.filter((t) => t.ms === 250 || t.ms === 1000).map((t) => t.ms), [250, 1000], 'and read again a little later');
+  // The sizes settle later with no event: the later reads take them.
+  c.context.window.innerHeight = 1024; c.context.window.visualViewport = { height: 1024, scale: 1 };
+  for (const timer of timers) timer.callback();
+  assert.equal(last(), '1024px');
+  // While typing, an on-screen keyboard still takes its space.
+  c.context.document.activeElement = { tagName: 'TEXTAREA' };
+  c.context.window.visualViewport = { height: 624, scale: 1 };
+  c.updateViewport();
+  assert.equal(last(), '624px');
+  // Pinch zoom keeps the visual viewport it reports.
+  c.context.document.activeElement = null;
+  c.context.window.visualViewport = { height: 512, scale: 2 };
+  c.updateViewport();
+  assert.equal(last(), '512px');
+  // A page restored from the back-forward cache, or a window focused again, reads it too.
+  c.context.window.visualViewport = { height: 300, scale: 1 };
+  heights.length = 0;
+  c.windowEvents.pageshow({ persisted: false });
+  assert.equal(last(), '1024px');
+  heights.length = 0;
+  c.windowEvents.focus();
+  assert.equal(last(), '1024px');
+});
+
 test('only an Android keyboard lets go of the field while it listens', async () => {
   for (const [agent, coarse, blurred] of [['Mozilla/5.0 (Linux; Android 15; SM-F741N)', true, 1],
     ['Mozilla/5.0 (iPad; CPU OS 26_6 like Mac OS X)', true, 0], ['Mozilla/5.0 (Linux; Android 15)', false, 0]]) {

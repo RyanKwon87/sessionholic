@@ -33,7 +33,12 @@ class NativeRejected(collector.RpcError):
         message = str(error.get("message") or "").lower()
         data = json.dumps(error.get("data"), default=str) if error.get("data") is not None else ""
         self.code = error.get("code") if isinstance(error.get("code"), int) else None
-        self.category = ("notSteerable" if "activeTurnNotSteerable" in data or "not steerable" in message else
+        # An older daemon names a newer method an unknown variant (and lists every method it
+        # knows); only the name is kept, never the rest of the message.
+        variant = re.match(r"invalid request: unknown variant `([a-z/]{1,64})`", message) if self.code == -32600 else None
+        self.unknown_variant = variant.group(1) if variant else None
+        self.category = ("unknownVariant" if self.unknown_variant else
+                         "notSteerable" if "activeTurnNotSteerable" in data or "not steerable" in message else
                          "attachment" if "attachment" in message else
                          "inputTooLarge" if "input" in message and "large" in message else
                          "nativeRejected")
@@ -75,7 +80,10 @@ def _client(identity, home, deadline):
 
 
 def _thread(client, identity):
-    result = client.call("thread/read", {"threadId": identity["id"], "includeTurns": True})
+    # Only the latest turns: a whole-history read of a long session can outlast the deadline.
+    result = collector.codex_recent_thread(client, identity["id"])
+    if result is None:
+        result = client.call("thread/read", {"threadId": identity["id"], "includeTurns": True})
     thread = result.get("thread") if isinstance(result, dict) else None
     if not isinstance(thread, dict) or thread.get("id") != identity["id"]:
         raise ValueError("정확한 원본 Codex 세션을 확인하지 못했습니다.")

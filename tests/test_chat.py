@@ -1539,7 +1539,11 @@ class ChatClaudeTest(unittest.TestCase):
         lock.release()
         # One session's input lock only: another session's is its own.
         self.assertIs(self.chat._claude_lock_for(source), lock)
-        self.assertIsNot(self.chat._claude_lock_for({**source, 'id': 'another-session'}), lock)
+        self.assertIsNot(self.chat._claude_lock_for({**source, 'id': 'another-session', 'sessionId': None}), lock)
+        # The same conversation named by a launched terminal's source (id = sessionId) shares it.
+        conversation = {'host': 'h', 'agent': 'claude', 'id': 'agent-1234', 'sessionId': 'conversation-0001'}
+        launched = {'host': 'h', 'agent': 'claude', 'home': '.claude', 'id': 'conversation-0001', 'sessionId': 'conversation-0001'}
+        self.assertIs(self.chat._claude_lock_for(conversation), self.chat._claude_lock_for(launched))
         # A paste or another answer in progress on this session holds its terminal input lock.
         busy = Mock(acquire=Mock(return_value=False))
         with patch.object(self.chat, '_claude_lock_for', return_value=busy):

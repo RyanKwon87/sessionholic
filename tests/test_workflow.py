@@ -241,6 +241,53 @@ class ConcurrencyTest(unittest.TestCase):
         self.assertTrue(results['b'].get('reused'))
         self.assertEqual(results['a']['terminal']['id'], results['b']['terminal']['id'])
 
+    def test_a_waiting_repeat_runs_the_request_itself_when_the_first_ends_unanswered(self):
+        plan = self.plan()
+        started, release = threading.Event(), threading.Event()
+        calls = []
+        def build(source, profile, messages, state_dir):
+            calls.append(1)
+            if len(calls) == 1:
+                started.set()
+                release.wait(5)
+                raise ValueError('fixture: refused before anything ran')
+            return {'argv': ['/bin/cat'], 'cwd': '/tmp', 'env': {}}
+        outcomes = {}
+        def run(name):
+            try:
+                outcomes[name] = self.flow.launch(plan['id'], 'request-0003')
+            except ValueError as exc:
+                outcomes[name] = exc
+        with patch('launch.build_launch', side_effect=build):
+            first = threading.Thread(target=run, args=('first',))
+            first.start()
+            self.assertTrue(started.wait(5))
+            second = threading.Thread(target=run, args=('second',))
+            second.start()
+            second.join(0.2)
+            release.set()
+            first.join(5); second.join(5)
+        self.assertIsInstance(outcomes['first'], ValueError)
+        self.assertEqual(outcomes['second']['mode'], 'attach')
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(len(self.terms.calls), 1)
+
+    def test_a_plan_that_expired_while_its_route_was_busy_is_not_launched(self):
+        plan = self.plan()
+        saved = self.flow.plans[plan['id']][0]
+        with patch.object(self.flow, '_route', side_effect=self._expire_then_route(saved)):
+            with self.assertRaisesRegex(ValueError, '만료'):
+                self.flow.launch(plan['id'], 'request-0004')
+        self.assertFalse(self.terms.calls)
+
+    @staticmethod
+    def _expire_then_route(saved):
+        @contextmanager
+        def route(key):
+            saved['expiresAt'] = 0
+            yield
+        return route
+
     def test_a_refused_request_can_be_tried_again(self):
         plan = self.plan(OTHER)
         self.rows[0]['phase'] = 'working'

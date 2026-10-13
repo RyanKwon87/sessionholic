@@ -10,6 +10,8 @@ import uuid
 
 APP_SERVER_START_SECONDS = 60
 APP_SERVER_WAIT_SECONDS = 10
+# A failed start waits this long for a daemon another launch is starting.
+APP_SERVER_RACE_SECONDS = 5
 APP_SERVER_FAILED = ('이 기기에서 대상 Codex 계정의 앱 서버를 시작하지 못했습니다. '
                      '그 계정으로 Codex를 한 번 실행한 뒤 다시 시도해 주세요.')
 
@@ -77,8 +79,11 @@ def ensure_app_server(spec, profile, home=None):
     except (OSError, subprocess.TimeoutExpired):
         result = None
     deadline = time.monotonic() + APP_SERVER_WAIT_SECONDS
+    if result is not None and result.returncode != 0:
+        # Another launch may be starting the same account's daemon: its socket, if it comes.
+        deadline = min(deadline, time.monotonic() + APP_SERVER_RACE_SECONDS)
     while not app_server_running(profile, home):
-        if result is None or result.returncode != 0 or time.monotonic() >= deadline:
+        if result is None or time.monotonic() >= deadline:
             raise ValueError(APP_SERVER_FAILED)
         time.sleep(0.2)
     return True

@@ -630,8 +630,10 @@ class Chat:
         return self._answer_prompt(source, request_id, fingerprint, number)
 
     def _claude_lock_for(self, source):
-        """The input lock of one session (its identity), made on first use."""
-        key = json.dumps(self.identity(source), sort_keys=True)
+        """The input lock of one conversation, made on first use. A listed row (agent id and
+        sessionId) and a launched terminal's source (id = sessionId) of the same conversation
+        share it, as they share its terminal (_same_native)."""
+        key = json.dumps([source.get('host'), 'claude', source.get('sessionId') or source.get('id')])
         with self.lock:
             return self.claude_locks.setdefault(key, threading.Lock())
 

@@ -215,6 +215,19 @@ class StartAppServerTest(unittest.TestCase):
         self.assertEqual((private['CODEX_HOME'], private['GIT_CONFIG_NOSYSTEM']), (str(self.home / '.codex-private'), '1'))
         self.assertNotIn('SSH_AUTH_SOCK', private)
 
+    def test_a_daemon_another_launch_starts_is_taken_though_this_start_failed(self):
+        checks = []
+        def running(profile, home=None):
+            checks.append(1)
+            return len(checks) > 3
+
+        class Lost:
+            returncode = 1
+        with patch.object(launch, '_binary', return_value=str(self.binary)), \
+                patch('managed_launch.subprocess.run', return_value=Lost()), \
+                patch('managed_launch.app_server_running', side_effect=running):
+            self.assertEqual(launch.start_app_server('.codex', self.home), {'started': True})
+
     def test_unknown_account_or_failed_start_is_refused(self):
         with self.daemon(started=False):
             for key in ('.codex-none', '../x', None):

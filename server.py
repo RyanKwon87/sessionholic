@@ -1923,7 +1923,7 @@ class Workflow:
         try:
             result = self._launch(plan_id, request_id)
             settled = True
-            return self._link_handoff_goals(result)
+            return result
         except LaunchFailure:
             settled = True
             raise
@@ -1942,10 +1942,14 @@ class Workflow:
             raise ValueError(plan["reason"])
         key_base = hashlib.sha256(json.dumps([plan["source"], plan["target"]], sort_keys=True).encode()).hexdigest()
         with self._route(key_base):
+            # The route may have been busy for a while: the plan is checked again.
+            if plan["expiresAt"] <= time.time():
+                raise ValueError("선택이 만료됐어요. 실행 설정을 다시 확인해 주세요.")
             previous = [item for item in self.terminals.list() if item.get("key", "").split(":")[0] == key_base]
             live = next((item for item in reversed(previous) if item.get("alive")), None)
             if live:
-                result = {"terminal": live, "mode": plan["mode"], "reused": True}
+                # Settled once linked: a waiting repeat never changes it while it is answered.
+                result = self._link_handoff_goals({"terminal": live, "mode": plan["mode"], "reused": True})
                 self._finish(request_id, plan_id, result)
                 return result
             if plan["mode"] == "reconnect":
@@ -2028,7 +2032,7 @@ class Workflow:
                     failure = LaunchFailure(recovery)
                     self._finish(request_id, plan_id, failure)
                     raise failure from exc
-                result = {"terminal": terminal, "mode": plan["mode"]}
+                result = self._link_handoff_goals({"terminal": terminal, "mode": plan["mode"]})
                 self._finish(request_id, plan_id, result)
                 return result
 

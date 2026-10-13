@@ -128,7 +128,7 @@ function client(
   vm.runInContext(messageSource, context);
   vm.runInContext(source, context);
   const api = vm.runInContext(
-    "({state,api,sourceOf,accountOf,sendInput,pasteDraft,prepareDraftPaste,startDraftComposition,endDraftComposition,inputDraft,stopTerminalReader,startTerminalReader,closePlan,navigateView,backToList,backFromTerminal,closeTerminal,cancelTerminalClose,confirmTerminalClose,populateAccount,populateRoute,updateContinue,renderPlan,launchPlan,openTerminal,saveDraft,draftKey,refreshTerminals,renderTerminals,renderTerminalReturn,renderFilters,terminalCloseCopy,warnDraftUnload,preparePlan,renderGroups,renderMessages,loadDetail,chatKey,chatEntry,currentChat,chatSupported,chatRecovery,recoverChatSession,openChatTerminal,chatAttachmentsSupported,buildChatComposer,sendChat,loadChatState,applyChatReceipt,uploadChatFiles,pasteChat,scheduleChatPoll,stopChatPolling,openNativeChat,allSessions,buildContinuePanel,chatReceiptCopy,returnToBoard,readChatClipboard,accountDisplay,sessionAccountLabel,closeChatToolsOutside,closeChatToolsEscape,drawDetail,refreshDetail,loadCapabilities,matches,recoverConnection,networkOffline,poll,select,focusDetailBack,restoreSelectedCardFocus,showLogin,lock,beginAuthEpoch,resizeChatInput,updateViewport,draftKeydown,configureTerminalKeyboard,queueTerminalScroll,flushTerminalScroll,terminalScrollEnd,resetTerminalScroll,renderAttention,chatPollDelay,pullRefresh,readingScroll,renderJump,pullDistance,listScroll,setReading,renderPrompt,promptAction,renderUsage,loadUsage,applyTheme,setTheme,updateThemeColor,haptic,navTransition,setDetailShown,chatVisible,sheetRelease,BottomSheet,sheet,openSettings,closeSettings,setTyping,pinchFontSize,setTerminalFontSize,loadXterm,assetUrl,syncEvents,closeEvents,eventsHealthy,renderFreshness,schedule,touchDevice,togglePhaseFilter,renderCounts,createLongPress,swipeIntent,swipeRelease,groupMessageRows,setTextSize,applyTextSize,renderConnectivity,terminalForSession,swipeActionFor,openMessageMenu,openCardMenu,messageActions,outboxShape,outboxMatches,outboxOrigin,settleOutbox,retryOutbox,renderAttachmentTiles,attachmentThumb,sendUpload,openActionSheet,closeActionSheet,setListCollapsed,closeSwipe,settleSwipe,prepareSwipe,runSwipeAction,GESTURE,setChromeVisible,toggleChrome,revealChrome,isChromeTap,snapshotAnnounced,updateChatComposer,capabilitiesRevision,toolKindOf,userMessageParts,formatElapsed,tickWorking,renderTerminalMarks,renderDetailTerminal,terminalsAnnounced,goToSessionTerminal,rememberTerminal,terminalMenu,updateTerminalMenu,chooseTerminalMenu,clearTerminalMenu,renderNewSession,openNewSession,startNewSession,startAppServer,rememberConversationView,restoreConversationView,conversationIdentity,initiatorOf,initiatorLabel,documentKeydown,sessionCategoryOf,setSessionCategory,renderSessionCategories,prepareSessionListFor,sessionCategoryKeydown,render,resetFilters,terminalTitle,renameTerminals,requestedSessionFrom,requestSessionOpen,openRequestedSession,answerOnOpen,hardReload,terminalKeyBytes,terminalKeyFromEvent,pressTerminalKey,toggleTerminalMod,clearTerminalMods,renderTerminalMods,draftBeforeInput,terminalDocumentKey,xtermKeyEvent,renderHardware,loadHardware,startDictation,stopDictation,dictationText,toggleDraftDictation,renderDictation,DICTATION_LISTENING,DICTATION_ERRORS,DICTATION_PREPARING,DICTATION_STALLED,DICTATION_ENDED_AT_ONCE,DICTATION_INTERRUPTED,DICTATION_NOT_STARTED,DICTATION_SILENCE_END,bindDraftInput,insertChatText,reloadForUpdate,checkWebVersion,unsavedWork,detailMetaChildren,updateBannerPressed,manualRefresh,listNavigationKeydown,sessionUnread,markSeen,quickReplies,saveQuickReplies,openQuickReplies})",
+    "({state,api,sourceOf,accountOf,sendInput,pasteDraft,prepareDraftPaste,startDraftComposition,endDraftComposition,inputDraft,stopTerminalReader,startTerminalReader,closePlan,navigateView,backToList,backFromTerminal,closeTerminal,cancelTerminalClose,confirmTerminalClose,populateAccount,populateRoute,updateContinue,renderPlan,launchPlan,openTerminal,saveDraft,draftKey,refreshTerminals,renderTerminals,renderTerminalReturn,renderFilters,terminalCloseCopy,warnDraftUnload,preparePlan,renderGroups,renderMessages,loadDetail,chatKey,chatEntry,currentChat,chatSupported,chatRecovery,recoverChatSession,openChatTerminal,chatAttachmentsSupported,buildChatComposer,sendChat,loadChatState,applyChatReceipt,uploadChatFiles,pasteChat,scheduleChatPoll,stopChatPolling,openNativeChat,allSessions,buildContinuePanel,chatReceiptCopy,returnToBoard,readChatClipboard,accountDisplay,sessionAccountLabel,closeChatToolsOutside,closeChatToolsEscape,drawDetail,refreshDetail,loadCapabilities,matches,recoverConnection,networkOffline,poll,select,focusDetailBack,restoreSelectedCardFocus,showLogin,lock,beginAuthEpoch,resizeChatInput,updateViewport,draftKeydown,configureTerminalKeyboard,queueTerminalScroll,flushTerminalScroll,terminalScrollEnd,resetTerminalScroll,renderAttention,chatPollDelay,pullRefresh,readingScroll,renderJump,pullDistance,listScroll,setReading,renderPrompt,promptAction,renderUsage,loadUsage,applyTheme,setTheme,updateThemeColor,haptic,navTransition,setDetailShown,chatVisible,sheetRelease,BottomSheet,sheet,openSettings,closeSettings,setTyping,pinchFontSize,setTerminalFontSize,loadXterm,assetUrl,syncEvents,closeEvents,eventsHealthy,renderFreshness,schedule,touchDevice,togglePhaseFilter,renderCounts,createLongPress,swipeIntent,swipeRelease,groupMessageRows,setTextSize,applyTextSize,renderConnectivity,terminalForSession,swipeActionFor,openMessageMenu,openCardMenu,messageActions,outboxShape,outboxMatches,outboxOrigin,settleOutbox,retryOutbox,renderAttachmentTiles,attachmentThumb,sendUpload,openActionSheet,closeActionSheet,setListCollapsed,closeSwipe,settleSwipe,prepareSwipe,runSwipeAction,GESTURE,setChromeVisible,toggleChrome,revealChrome,isChromeTap,snapshotAnnounced,updateChatComposer,capabilitiesRevision,toolKindOf,userMessageParts,formatElapsed,tickWorking,renderTerminalMarks,renderDetailTerminal,terminalsAnnounced,goToSessionTerminal,rememberTerminal,terminalMenu,updateTerminalMenu,chooseTerminalMenu,clearTerminalMenu,renderNewSession,openNewSession,startNewSession,startAppServer,rememberConversationView,restoreConversationView,conversationIdentity,initiatorOf,initiatorLabel,documentKeydown,sessionCategoryOf,setSessionCategory,renderSessionCategories,prepareSessionListFor,sessionCategoryKeydown,render,resetFilters,terminalTitle,renameTerminals,requestedSessionFrom,requestSessionOpen,openRequestedSession,answerOnOpen,hardReload,terminalKeyBytes,terminalKeyFromEvent,pressTerminalKey,toggleTerminalMod,clearTerminalMods,renderTerminalMods,draftBeforeInput,terminalDocumentKey,xtermKeyEvent,renderHardware,loadHardware,startDictation,stopDictation,dictationText,toggleDraftDictation,renderDictation,DICTATION_LISTENING,DICTATION_ERRORS,DICTATION_PREPARING,DICTATION_STALLED,DICTATION_ENDED_AT_ONCE,DICTATION_INTERRUPTED,DICTATION_NOT_STARTED,DICTATION_SILENCE_END,bindDraftInput,insertChatText,reloadForUpdate,checkWebVersion,unsavedWork,detailMetaChildren,updateBannerPressed,manualRefresh,listNavigationKeydown,sessionUnread,markSeen,quickReplies,saveQuickReplies,openQuickReplies,terminalEndedCopy,terminalContextCopy,sessionForTerminal,showTerminalEnded,reopenEndedTerminal,csrfRetryable})",
     context,
   );
   api.state.csrf = "csrf-test";
@@ -356,6 +356,60 @@ test("input refused by a restarted board is not resent, drops its queue, and the
   await c.sendInput("ls");
   assert.deepEqual(sent, ["ls"]);
   assert.equal(c.get("terminal-error").hidden, true);
+});
+
+test("an ended terminal says why: a released view keeps its run, a remote end may be a sleeping host", () => {
+  const c = client(undefined, noChatTimers);
+  c.state.capabilities = { hosts: [{ name: "workstation", label: "W" }, { name: "board", label: "B", local: true }] };
+  const attach = { id: "a".repeat(32), mode: "attach", host: "workstation", closed: true };
+  assert.match(c.terminalEndedCopy({ ...attach, closedReason: "released" }), /10분.*보기 연결만.*계속됩니다/);
+  assert.match(c.terminalEndedCopy({ ...attach, closedReason: "connection_ended" }), /잠들었거나 2분/);
+  assert.doesNotMatch(c.terminalEndedCopy({ ...attach, host: "board", closedReason: "connection_ended" }), /잠들었/);
+  assert.equal(c.terminalEndedCopy({ ...attach, closedReason: "user" }), c.terminalCloseCopy(attach).ended);
+  // A run started in a remote terminal lives in its connection; an attached run does not.
+  assert.match(c.terminalContextCopy({ ...attach, mode: "new-session" }), /잠들거나.*실행이 끝납니다/);
+  assert.match(c.terminalContextCopy({ ...attach, metadata: { mode: "resume" }, mode: undefined }), /실행이 끝납니다/);
+  assert.doesNotMatch(c.terminalContextCopy(attach), /실행이 끝납니다/);
+  assert.doesNotMatch(c.terminalContextCopy({ ...attach, mode: "new-session", host: "board" }), /실행이 끝납니다/);
+});
+
+test("an ended terminal offers its listed session again, through the plan sheet once back on the board", () => {
+  const c = client(undefined, noChatTimers);
+  const { s } = selectChat(c);
+  c.state.capabilities = { hosts: [{ name: "workstation", label: "W", agents: [] }] };
+  const ended = { id: "b".repeat(32), mode: "attach", host: "workstation", closed: true, closedReason: "released",
+    nativeSource: c.sourceOf(s) };
+  c.state.terminal = ended; c.state.terminals = [ended]; c.state.terminalAlive = false;
+  c.showTerminalEnded();
+  assert.equal(c.sessionForTerminal(ended).key, s.key);
+  assert.equal(c.get("terminal-reopen").hidden, false);
+  assert.match(c.get("terminal-status").textContent, /보기 연결만/);
+  // A terminal opened from a session (sourceKey) finds it too; one no longer listed offers nothing.
+  assert.equal(c.sessionForTerminal({ id: "c".repeat(32), sourceKey: JSON.stringify(c.sourceOf(s)) }).key, s.key);
+  c.state.terminal = { ...ended, nativeSource: { ...c.sourceOf(s), id: "gone-session" } };
+  c.showTerminalEnded();
+  assert.equal(c.get("terminal-reopen").hidden, true);
+  // A live terminal of the session is opened instead of offering a second one.
+  c.state.terminals = [ended, { id: "d".repeat(32), mode: "attach", nativeSource: c.sourceOf(s) }];
+  c.state.terminal = ended;
+  c.showTerminalEnded();
+  assert.equal(c.get("terminal-reopen").hidden, true);
+  // Pressed: back first; the session is opened when the board is shown (popstate).
+  c.state.terminals = [ended];
+  let opened = 0;
+  c.context.preparePlan = () => { opened++; };
+  vm.runInContext("preparePlan = globalThis.preparePlan", c.context);
+  c.state.terminalVisible = true;
+  c.context.window.history.state = { sessionholic: true, view: "terminal" };
+  c.reopenEndedTerminal();
+  assert.equal(c.context.window.history.backCount, 1);
+  assert.equal(c.state.reopenOnReturn, s.key);
+  assert.equal(opened, 0);
+  c.context.navigator = { onLine: false }; c.windowEvents.DOMContentLoaded();
+  c.windowEvents.popstate({ state: { sessionholic: true, view: "detail" } });
+  assert.equal(c.state.reopenOnReturn, null);
+  assert.equal(opened, 1);
+  assert.equal(c.state.selected, s.key);
 });
 
 test("input captures terminal ownership and cannot leak into a switched terminal", async () => {

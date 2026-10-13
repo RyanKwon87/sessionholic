@@ -1550,6 +1550,8 @@ class Workflow:
             hosts.append({"name": host["name"], "label": host["label"], "online": status["ok"],
                 # The terminal's keys follow the host (⌘ and ⌥ mean Windows keys there).
                 **({"platform": "windows"} if host.get("platform") == "windows" else {}),
+                # The board's own host: its terminals never depend on a connection to another.
+                **({"local": True} if host["local"] else {}),
                 "newSession": self.new_session_status(host, status["ok"]),
                 "agents": [{"id": agent, "label": "Claude Code" if agent == "claude" else "Codex",
                     "accounts": [{k: p.get(k) for k in ("id", "label", "available", "reason", "home",

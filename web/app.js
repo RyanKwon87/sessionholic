@@ -163,6 +163,7 @@ const state = {
   inputQueue: Promise.resolve(),
   inputEpoch: 0,
   inputFailed: false,
+  inputRefused: false, // an input a restarted board refused; cleared by the next one sent
   drafts: new Map(),
   composing: false,
   compositionOwner: null,
@@ -211,6 +212,7 @@ const state = {
   // Live updates (/api/events) and the snapshot version they announce.
   events: null,
   eventsRetryAt: 0,
+  reopenOnReturn: null, // a session key to open once back from an ended terminal
   snapshotVersion: null,
   eventsSnapshotVersion: null,
   // The server process those versions count in: a restart counts from 0 again.
@@ -6203,6 +6205,63 @@ function terminalCloseCopy(terminal) {
     done: "터미널을 닫았습니다. 작업 상태는 실행 기기에서 확인하세요.",
   };
 }
+// A run started in this terminal on another host lives in that host's connection.
+function terminalContextCopy(terminal, copy = terminalCloseCopy(terminal)) {
+  const mode = terminal?.mode || terminal?.metadata?.mode;
+  const host = capsHost(terminalInfo(terminal).host);
+  if (["new-session", "resume", "handoff", "transfer"].includes(mode) && host && !host.local)
+    return `${copy.context} 단, 실행 기기가 잠들거나 연결이 2분 넘게 끊기면 실행이 끝납니다.`;
+  return copy.context;
+}
+// What an ended terminal says: why, when the board knows (closedReason), and what remains.
+function terminalEndedCopy(terminal) {
+  const copy = terminalCloseCopy(terminal);
+  if (terminal?.closedReason === "released")
+    return "10분 넘게 보지 않아 이 보드의 보기 연결만 정리했습니다. 작업은 실행 기기에서 계속됩니다.";
+  const host = capsHost(terminalInfo(terminal).host);
+  // "connection_ended" is any end of the terminal's run: its own exit or a lost host.
+  if (terminal?.closedReason === "connection_ended" && host && !host.local)
+    return `${copy.ended} 실행 기기가 잠들었거나 2분 넘게 연결이 끊겼을 수도 있습니다.`;
+  return copy.ended;
+}
+// The listed session an ended terminal showed: by the run it attached to, else the one it was opened from.
+function sessionForTerminal(terminal) {
+  if (!terminal) return null;
+  const info = terminalInfo(terminal);
+  const keys = [];
+  if (info.nativeSource?.host) keys.push(chatKey(info.nativeSource));
+  try {
+    const source = JSON.parse(info.sourceKey || "null");
+    if (source && typeof source === "object") keys.push(chatKey(source));
+  } catch {
+    /* no source recorded */
+  }
+  const sessions = allSessions();
+  for (const key of keys) {
+    const found = sessions.find((s) => chatKey(sourceOf(s)) === key);
+    if (found) return found;
+  }
+  return null;
+}
+function showTerminalEnded() {
+  terminalStatus(terminalEndedCopy(state.terminal));
+  const s = sessionForTerminal(state.terminal);
+  $("terminal-reopen").hidden = !s || sessionOneShot(s) || !!terminalForSession(s);
+}
+// Opening it again is reviewed like any new terminal (the conversation's plan sheet).
+function reopenEndedTerminal() {
+  const s = sessionForTerminal(state.terminal);
+  if (!s || state.launchBusy || !state.authenticated) return;
+  $("terminal-reopen").hidden = true;
+  if (window.history.state?.[INSTANCE.historyKey] && window.history.state.view === "terminal") {
+    // The way back is asynchronous: the board opens it once back (popstate).
+    state.reopenOnReturn = s.key;
+    window.history.back();
+    return;
+  }
+  returnToBoard();
+  openSessionTerminal(s);
+}
 function draftKey(terminal) {
   const info = terminalInfo(terminal);
   return info.sourceKey
@@ -6475,15 +6534,16 @@ async function openTerminal(terminal, { recordHistory = true } = {}) {
   $("terminal-close").setAttribute("aria-label", copy.action);
   $("terminal-close").className = `terminal-button terminal-close${copy.danger ? " danger-quiet" : ""}`;
   $("terminal-close").disabled = !state.terminalAlive;
-  $("terminal-context").textContent = copy.context;
+  $("terminal-context").textContent = terminalContextCopy(terminal, copy);
   $("terminal-draft").value = state.drafts.get(draftKey(terminal)) || "";
   state.composing = false;
   state.draftRevision++;
   $("draft-note").textContent = "";
   terminalError();
   renderTerminalReturn();
+  $("terminal-reopen").hidden = true;
   if (!state.terminalAlive) {
-    terminalStatus(copy.ended);
+    showTerminalEnded();
     return;
   }
   if (!xtermReady()) {
@@ -6568,7 +6628,7 @@ async function startTerminalReader() {
   if (networkOffline()) return;
   if (!state.terminal || !state.terminalVisible || document.hidden) return;
   if (!state.terminalAlive || state.terminal.closed) {
-    terminalStatus(terminalCloseCopy(state.terminal).ended);
+    showTerminalEnded();
     renderTerminalReturn();
     return;
   }
@@ -6628,7 +6688,7 @@ async function startTerminalReader() {
       if (!state.terminalAlive) {
         state.terminal.alive = false;
         $("terminal-close").disabled = true;
-        terminalStatus(terminalCloseCopy(state.terminal).ended);
+        showTerminalEnded();
         renderTerminalReturn();
         refreshTerminals();
         return;
@@ -7303,7 +7363,7 @@ async function refreshTerminals(authEpoch = state.authEpoch) {
         stopTerminalReader();
         state.inputEpoch++;
         state.terminalAlive = false;
-        terminalStatus(terminalCloseCopy(state.terminal).ended);
+        showTerminalEnded();
         $("terminal-close").disabled = true;
       }
       renderTerminalReturn();
@@ -8398,6 +8458,8 @@ window.addEventListener("DOMContentLoaded", () => {
     // A browser that already animated its own back swipe gets no second slide.
     const animate = !event.hasUAVisualTransition;
     const fromTerminal = state.terminalVisible;
+    const reopen = fromTerminal ? state.reopenOnReturn : null;
+    state.reopenOnReturn = null;
     // Forward again to a notification's conversation shows it, not the terminal's launch.
     if (fromTerminal) returnToBoard({ animate, selectLaunchedSource: !event.state?.notice });
     if (window.SessionholicGoals?.handleHistory?.(event)) return;
@@ -8406,6 +8468,9 @@ window.addEventListener("DOMContentLoaded", () => {
     setDetailShown(detail, { direction: animate && !fromTerminal ? (detail ? "push" : "pop") : null, focus: true });
     const selected = selectedSession();
     if (selected && chatVisible()) loadChatState(selected, true);
+    // An ended terminal's 이 세션 다시 열기 (reopenEndedTerminal), now that the board is shown.
+    const target = reopen && allSessions().find((item) => item.key === reopen);
+    if (target) openSessionTerminal(target);
   });
   $("settings").addEventListener("click", openSettings);
   $("settings-close").addEventListener("click", closeSettings);
@@ -8549,6 +8614,7 @@ window.addEventListener("DOMContentLoaded", () => {
   $("return-terminal").addEventListener("click", () => {
     if (state.terminal) openTerminal(state.terminal);
   });
+  $("terminal-reopen").addEventListener("click", reopenEndedTerminal);
   $("terminal-reconnect").addEventListener("click", () => {
     state.lastSize = "";
     startTerminalReader();

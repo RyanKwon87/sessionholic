@@ -7,6 +7,7 @@ import hashlib
 import os
 from pathlib import Path
 import re
+import shutil
 import sqlite3
 from contextlib import contextmanager
 
@@ -17,6 +18,9 @@ REQUEST = re.compile(r'[A-Za-z0-9_-]{8,100}\Z')
 SHA = re.compile(r'[a-f0-9]{64}\Z')
 MAX_RECORDS = 250000
 MAX_DATABASE_BYTES = 64 * 1024 * 1024
+# Below this much free space a failed write is taken for a full disk and said so.
+DISK_LOW_BYTES = 64 * 1024 * 1024
+DISK_FULL = '이 기기의 디스크가 거의 가득 차 터미널 입력을 기록하지 못했습니다. 디스크 공간을 확보한 뒤 다시 보내 주세요.'
 UNCERTAIN = '입력이 일부 또는 전부 반영되었을 수 있어 같은 요청을 다시 보내지 않습니다. 터미널 내용을 확인해 주세요.'
 
 
@@ -60,6 +64,12 @@ class TerminalInputs:
             connection.execute('PRAGMA user_version=1')
             connection.execute('COMMIT')
 
+    def _disk_low(self):
+        try:
+            return shutil.disk_usage(str(self.path.parent)).free < DISK_LOW_BYTES
+        except OSError:
+            return False
+
     @contextmanager
     def _connection(self):
         connection = None
@@ -75,6 +85,8 @@ class TerminalInputs:
             connection.execute('PRAGMA max_page_count=' + str(MAX_DATABASE_BYTES // page_size))
             yield connection
         except sqlite3.Error:
+            if self._disk_low():
+                raise RuntimeError(DISK_FULL) from None
             raise RuntimeError('터미널 입력 기록을 안전하게 저장하지 못했습니다. 새 입력을 보내지 않습니다.') from None
         finally:
             if connection is not None:

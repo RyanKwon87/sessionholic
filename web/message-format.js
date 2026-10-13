@@ -1,7 +1,8 @@
 "use strict";
 
-// Deliberately small Markdown subset. HTML, images, reference links, tables and
-// multiline inline delimiters stay text. Unclosed fences stay readable as code.
+// Deliberately small Markdown subset (pipe tables, rules, task items, ~~strike~~ and bare or
+// <angle> web addresses included). HTML, images, reference links and multiline inline
+// delimiters stay text. Unclosed fences stay readable as code.
 // Limits bound parsing and DOM work; fallback always retains the complete text.
 const MessageFormat = (() => {
   const MAX_CHARS = 65536;
@@ -42,7 +43,17 @@ const MessageFormat = (() => {
       return ["http:", "https:"].includes(url.protocol) ? url.href : "";
     } catch { return ""; }
   }
-  function inline(text, budget, depth = 0) {
+  // A bare web address ends at the first character an address cannot hold (a Korean particle
+  // right after it stays text), then loses the punctuation that ends its sentence and a ")"
+  // or "]" it did not open.
+  function bareAddress(text) {
+    let url = text.slice(0, 2048).match(/^https?:\/\/[A-Za-z0-9\-._~:/?#[\]@!$&'()*+,;=%]+/i)?.[0] || "";
+    const count = (char) => url.split(char).length - 1;
+    while (url && (/[.,;:!?'*]$/.test(url) || (url.endsWith(")") && count("(") < count(")")) ||
+                   (url.endsWith("]") && count("[") < count("]")))) url = url.slice(0, -1);
+    return /^https?:\/\/[^/?#]/i.test(url) ? url : "";
+  }
+  function inline(text, budget, depth = 0, links = true) {
     if (depth > MAX_DEPTH) return [make(budget, "text", { text })];
     const out = [];
     let buffer = "";
@@ -124,6 +135,36 @@ const MessageFormat = (() => {
       if (char === "\\" && /[\\`*_[\]{}()#+.!>~-]/.test(text[index + 1] || "")) {
         buffer += text[index + 1]; index += 2; continue;
       }
+      if (char === "<" && links) {
+        const angle = text.slice(index, index + 2050).match(/^<(https?:\/\/[^\s<>]+)>/i);
+        const href = angle ? safeHref(angle[1]) : "";
+        if (href) {
+          spend(budget, "work", angle[0].length);
+          flush(); out.push(make(budget, "link", { children: [make(budget, "text", { text: angle[1] })],
+            destination: angle[1], href, auto: true }));
+          index += angle[0].length; continue;
+        }
+      }
+      // Not the destination of a link or image left as text ("![그림](https://…)").
+      if ((char === "h" || char === "H") && links && !/[\p{L}\p{N}_/]/u.test(text[index - 1] || "") &&
+          !text.startsWith("](", index - 2)) {
+        const url = bareAddress(text.slice(index));
+        const href = url ? safeHref(url) : "";
+        if (href) {
+          spend(budget, "work", url.length);
+          flush(); out.push(make(budget, "link", { children: [make(budget, "text", { text: url })],
+            destination: url, href, auto: true }));
+          index += url.length; continue;
+        }
+      }
+      if (char === "~" && text.startsWith("~~", index) && !/\s/.test(text[index + 2] || " ")) {
+        const end = find("~~", index + 2);
+        if (end > index + 2 && !/\s/.test(text[end - 1])) {
+          flush(); out.push(make(budget, "del", { children: inline(text.slice(index + 2, end), budget, depth + 1, links) }));
+          index = end + 2; continue;
+        }
+        buffer += "~~"; index += 2; continue;
+      }
       if (char === "<" && (text.startsWith("<!--", index) || /^<\/?[A-Za-z]/.test(text.slice(index)))) {
         const comment = text.startsWith("<!--", index);
         const end = find(comment ? "-->" : ">", index + (comment ? 4 : 1));
@@ -155,7 +196,8 @@ const MessageFormat = (() => {
           if (!nesting) {
             const destination = text.slice(close + 2, cursor - 1);
             flush(); out.push(make(budget, "link", {
-              children: inline(text.slice(index + 1, close), budget, depth + 1),
+              // No link inside a link's own label.
+              children: inline(text.slice(index + 1, close), budget, depth + 1, false),
               destination, href: safeHref(destination),
             }));
             index = cursor; continue;
@@ -172,7 +214,7 @@ const MessageFormat = (() => {
         const end = markedEnd(run, index + run.length);
         if (end > index + run.length) {
           flush(); out.push(make(budget, run.length === 1 ? "em" : run.length === 2 ? "strong" : "strongEm", {
-            children: inline(text.slice(index + run.length, end), budget, depth + 1),
+            children: inline(text.slice(index + run.length, end), budget, depth + 1, links),
           }));
           index = end + run.length; continue;
         }
@@ -232,8 +274,45 @@ const MessageFormat = (() => {
   // Whether a line ends the paragraph above it. As in CommonMark, only a list
   // starting at 1 (or a bullet) interrupts a paragraph: "…\n2026. 10. 10." and
   // "…\n1000. 항목" stay text.
+  // GFM pipe tables: a header row, then a delimiter row with as many cells (`---`, `:--`,
+  // `--:`, `:-:`). Pipes inside code spans and escaped pipes (\|) stay in their cell.
+  function cells(line) {
+    let text = line.trim();
+    if (text.startsWith("|")) text = text.slice(1);
+    if (text.endsWith("|") && !text.endsWith("\\|")) text = text.slice(0, -1);
+    const out = []; let cell = ""; let ticks = 0;
+    for (let index = 0; index < text.length; index++) {
+      const char = text[index];
+      if (char === "\\" && text[index + 1] === "|") { cell += "|"; index++; continue; }
+      if (char === "`") {
+        let run = 1; while (text[index + run] === "`") run++;
+        ticks = ticks === run ? 0 : ticks || run; cell += text.slice(index, index + run); index += run - 1; continue;
+      }
+      if (char === "|" && !ticks) { out.push(cell.trim()); cell = ""; continue; }
+      cell += char;
+    }
+    out.push(cell.trim());
+    return out;
+  }
+  function delimiterRow(line) {
+    if (!line.includes("-") || !/^ {0,3}\|?[ \t]*:?-+:?[ \t]*(\|[ \t]*:?-+:?[ \t]*)*\|?[ \t]*$/.test(line)) return null;
+    return cells(line).map((cell) => cell.startsWith(":") && cell.endsWith(":") ? "center"
+      : cell.endsWith(":") ? "right" : cell.startsWith(":") ? "left" : "");
+  }
+  function tableAt(lines, index) {
+    const header = lines[index]?.text; const next = lines[index + 1]?.text;
+    if (!header || next == null || !header.includes("|") || leadWidth(header) > 3) return null;
+    const align = delimiterRow(next);
+    if (!align || (!header.trim().startsWith("|") && !next.includes("|") && align.length < 2)) return null;
+    const head = cells(header);
+    return head.length === align.length ? { head, align } : null;
+  }
+  // A thematic break: three or more of one of - * _ alone on a line (spaces between allowed).
+  function rule(line) {
+    return /^ {0,3}(?:(?:-[ \t]*){3,}|(?:\*[ \t]*){3,}|(?:_[ \t]*){3,})$/.test(line);
+  }
   function interrupts(line) {
-    if (!line.trim() || fence(line) || quote(line) || heading(line)) return true;
+    if (!line.trim() || fence(line) || quote(line) || heading(line) || rule(line)) return true;
     const item = listItem(line);
     return !!item && !!item.text.trim() && (!item.ordered || item.number === 1);
   }
@@ -323,6 +402,7 @@ const MessageFormat = (() => {
         }
         out.push(make(budget, "quote", { children: blocks(quoted, budget, depth + 1) })); continue;
       }
+      if (rule(line.text)) { out.push(make(budget, "rule", { text: line.text + line.eol })); index++; continue; }
       const title = heading(line.text);
       if (title) {
         out.push(make(budget, "heading", { level: title[1].length,
@@ -331,10 +411,23 @@ const MessageFormat = (() => {
       if (listItem(line.text)) {
         const list = parseList(lines, index, budget, depth); out.push(list.node); index = list.next; continue;
       }
+      const table = tableAt(lines, index);
+      if (table) {
+        const start = index; const rows = [];
+        index += 2;
+        while (index < lines.length && lines[index].text.includes("|") && !interrupts(lines[index].text)) {
+          spend(budget, "work");
+          const row = cells(lines[index].text);
+          rows.push(table.align.map((_, column) => inline(row[column] || "", budget))); index++;
+        }
+        out.push(make(budget, "table", { align: table.align, head: table.head.map((cell) => inline(cell, budget)), rows,
+          text: lineText(lines.slice(start, index)) }));
+        continue;
+      }
       const paragraph = [];
       do {
         paragraph.push({ children: inline(lines[index].text, budget), eol: lines[index].eol }); index++;
-      } while (index < lines.length && !interrupts(lines[index].text));
+      } while (index < lines.length && !interrupts(lines[index].text) && !tableAt(lines, index));
       out.push(make(budget, "paragraph", { lines: paragraph }));
     }
     return out;
@@ -348,12 +441,12 @@ const MessageFormat = (() => {
     catch { return [{ kind: "fallback", text }]; }
   }
   function inlinePlain(nodes) {
-    return nodes.map((node) => node.kind === "link" ? `${inlinePlain(node.children)} (${node.destination})`
+    return nodes.map((node) => node.kind === "link" ? (node.auto ? node.destination : `${inlinePlain(node.children)} (${node.destination})`)
       : node.children ? inlinePlain(node.children) : node.text).join("");
   }
   function blockPlain(nodes) {
     return nodes.map((node) => {
-      if (["blank", "fence", "fallback"].includes(node.kind)) return node.text;
+      if (["blank", "fence", "fallback", "table", "rule"].includes(node.kind)) return node.text;
       if (node.kind === "heading") return inlinePlain(node.children) + node.eol;
       if (node.kind === "paragraph") return node.lines.map((line) => inlinePlain(line.children) + line.eol).join("");
       if (node.kind === "quote") return blockPlain(node.children);
@@ -425,6 +518,7 @@ const MessageFormat = (() => {
   function appendBlocks(container, nodes, options) {
     for (const value of nodes) {
       if (value.kind === "blank") continue;
+      if (value.kind === "rule") { container.append(element("hr", "message-rule")); continue; }
       if (value.kind === "fallback") { container.append(element("div", "message-format-fallback", value.text)); continue; }
       if (value.kind === "fence") {
         const lines = lineCount(value.text);
@@ -445,6 +539,21 @@ const MessageFormat = (() => {
         if (foldable) foldToggle(block, lines);
         container.append(block); continue;
       }
+      if (value.kind === "table") {
+        // Wider than the bubble, it scrolls sideways on its own (style.css .message-table-wrap).
+        const wrap = element("div", "message-table-wrap"); const table = element("table", "message-table");
+        const row = (cellsOf, tag) => {
+          const tr = element("tr");
+          cellsOf.forEach((cell, column) => {
+            const td = element(tag); if (value.align[column]) td.setAttribute("data-align", value.align[column]);
+            appendInline(td, cell); tr.append(td);
+          });
+          return tr;
+        };
+        const head = element("thead"); head.append(row(value.head, "th"));
+        const body = element("tbody"); for (const cellsOf of value.rows) body.append(row(cellsOf, "td"));
+        table.append(head, body); wrap.append(table); container.append(wrap); continue;
+      }
       if (value.kind === "quote") {
         const block = element("div", "message-quote-block"); const quoted = element("blockquote", "message-quote");
         appendBlocks(quoted, value.children, options); block.append(quoted);
@@ -460,7 +569,20 @@ const MessageFormat = (() => {
         }
         for (const item of value.items) {
           const li = element("li"); if (value.ordered) li.setAttribute("value", String(item.number));
-          item.lines.forEach((line, index) => { if (index) li.append(element("br")); appendInline(li, line.children); });
+          item.lines.forEach((line, index) => {
+            if (index) li.append(element("br"));
+            let children = line.children;
+            // A task item ("- [ ] 할 일", "- [x] 완료"): a check mark instead of the brackets.
+            const task = !index && children[0]?.kind === "text" ? children[0].text.match(/^\[([ xX])\][ \t]+/) : null;
+            if (task) {
+              const done = task[1] !== " ";
+              const box = element("span", `message-task${done ? " is-done" : ""}`, done ? "☑" : "☐");
+              box.setAttribute("role", "img"); box.setAttribute("aria-label", done ? "완료" : "할 일");
+              li.setAttribute("data-task", done ? "done" : "open"); li.append(box);
+              children = [{ ...children[0], text: children[0].text.slice(task[0].length) }, ...children.slice(1)];
+            }
+            appendInline(li, children);
+          });
           appendBlocks(li, item.nested, options); list.append(li);
         }
         container.append(list); continue;

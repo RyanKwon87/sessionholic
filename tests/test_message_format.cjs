@@ -110,6 +110,52 @@ test('raw HTML, scripts, SVG, handlers and images remain inert text rather than 
   assert.equal(source.includes('innerHTML'), false);
 });
 
+test('a pipe table draws as a table that scrolls on its own, and copies as it was written', () => {
+  const format = formatter(); const root = element();
+  const text = '비교 결과입니다.\n| 상품 | 쿠팡 **정가** | `a|b` |\n|:---|---:|:-:|\n| 앰플 | 32,000 | 링크 [여기](https://example.test/a) |\n| 크림 | 18,500 |\n\n끝.';
+  format.render(root, text);
+  const [wrap] = nodes(root).filter((node) => node.className === 'message-table-wrap');
+  assert.ok(wrap, 'a table wrapper scrolls sideways');
+  assert.equal(byTag(root, 'table').length, 1);
+  assert.deepEqual(byTag(root, 'th').map(visibleText), ['상품', '쿠팡 정가', 'a|b']);
+  assert.deepEqual(byTag(root, 'th').map((node) => node.attributes['data-align']), ['left', 'right', 'center']);
+  assert.deepEqual(byTag(root, 'td').map(visibleText), ['앰플', '32,000', '링크 여기', '크림', '18,500', '']);
+  assert.equal(byTag(root, 'strong').length, 1); assert.equal(byTag(root, 'a').length, 1);
+  assert.equal(visibleText(byTag(root, 'p')[0]), '비교 결과입니다.', 'the paragraph before it stays a paragraph');
+  assert.equal(format.plainText(text), text, 'a table copies as the Markdown it was');
+  // Not a table: no delimiter row, a column count that differs, inside a code block.
+  for (const plain of ['a | b\nc | d', '| a | b |\n| --- |\n| c | d |', '```\n| a | b |\n|---|---|\n```']) {
+    format.render(root, plain);
+    assert.equal(byTag(root, 'table').length, 0, plain);
+  }
+});
+
+test('web addresses become links, without trailing punctuation or the particle after them', () => {
+  const format = formatter(); const root = element();
+  const text = '배포 주소: https://example.test/path?q=1 입니다. PR은 https://github.com/o/r/pull/12에서, (https://a.test/x) 그리고 <https://b.test/y>.';
+  format.render(root, text);
+  assert.deepEqual(byTag(root, 'a').map((node) => node.attributes.href),
+    ['https://example.test/path?q=1', 'https://github.com/o/r/pull/12', 'https://a.test/x', 'https://b.test/y']);
+  assert.ok(byTag(root, 'a').every((node) => node.attributes.target === '_blank' && /noopener/.test(node.attributes.rel)));
+  assert.equal(format.plainText(text), text.replace('<https://b.test/y>', 'https://b.test/y'), 'copied once, as written');
+  // Not inside a code span, a link label or an image; never a javascript: address.
+  format.render(root, '`https://code.test/x` [https://label.test](https://dest.test) ![그림](https://img.test/a.png) javascript:alert(1)');
+  assert.deepEqual(byTag(root, 'a').map((node) => node.attributes.href), ['https://dest.test/']);
+});
+
+test('rules, task items and struck text draw as such and copy as written', () => {
+  const format = formatter(); const root = element();
+  const text = '위\n---\n- [ ] 할 일\n- [x] 끝난 일\n- 보통 항목\n\n~~취소~~ 그리고 ~ 물결 ~';
+  format.render(root, text);
+  assert.equal(byTag(root, 'hr').length, 1);
+  assert.deepEqual(byTag(root, 'li').map((node) => node.attributes['data-task'] || ''), ['open', 'done', '']);
+  assert.deepEqual(nodes(root).filter((node) => /message-task/.test(node.className || '')).map(visibleText), ['☐', '☑']);
+  assert.deepEqual(byTag(root, 'del').map(visibleText), ['취소']);
+  assert.match(visibleText(root), /~ 물결 ~/);
+  assert.equal(format.plainText('~~취소~~'), '취소');
+  assert.equal(format.plainText('위\n---\n아래'), '위\n---\n아래');
+});
+
 test('unfinished delimiters, escaped syntax and unsupported tables stay readable with no dropped content', () => {
   const format = formatter(); const root = element();
   const text = '**미완성\n[링크](미완성\n| a | b |\n| --- | --- |\n';

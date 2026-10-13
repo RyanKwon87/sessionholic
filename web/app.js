@@ -3840,7 +3840,7 @@ function resizeChatInput(entry) {
   const padding = (parseFloat(style?.paddingTop) || 10) + (parseFloat(style?.paddingBottom) || 10);
   const border = (parseFloat(style?.borderTopWidth) || 1) + (parseFloat(style?.borderBottomWidth) || 1);
   const base = Math.max(44, line + padding + border);
-  const viewport = window.visualViewport?.height || window.innerHeight || 800;
+  const viewport = viewportHeight();
   const cap = entry.inputCollapsed || sentDraftHidden(entry) ? base : Math.max(base,
     Math.min(line * (entry.expanded ? 11 : 6) + padding + border, viewport * 0.34, viewport - 200));
   const minimum = Math.min(cap, entry.expanded ? 3 * line + padding + border : base);
@@ -8388,15 +8388,32 @@ async function lock() {
       toast("잠금 요청을 완료하지 못했습니다. 연결을 확인해 주세요.");
   }
 }
+// The height the app has: the visual viewport (an on-screen keyboard takes its space), except
+// that without a focused text field no keyboard takes space, so a visual viewport shorter than
+// the window is stale: iPadOS reports one for a moment when the app comes back from the
+// background or a minimized window, with no resize after it. Not when pinch-zoomed (the
+// visual viewport is then meant to be smaller).
+function viewportHeight() {
+  const viewport = window.visualViewport;
+  const height = viewport?.height || window.innerHeight || 800;
+  if (!editingText() && (viewport?.scale || 1) <= 1.01 && window.innerHeight > height) return window.innerHeight;
+  return height;
+}
 function updateViewport() {
-  const height = Math.round(
-    window.visualViewport?.height || window.innerHeight,
-  );
+  const height = Math.round(viewportHeight());
   document.documentElement.style.setProperty("--app-height", `${height}px`);
   syncChromeMode();
   const selected = selectedSession();
   if (selected) resizeChatInput(chatEntry(selected));
   fitTerminal();
+}
+// Back on screen (from the background, a minimized window or the app switcher): the
+// sizes WebKit reports settle a moment later and may come with no resize event, so the
+// height is read again now and a little after.
+function settleViewport() {
+  updateViewport();
+  window.requestAnimationFrame?.(() => updateViewport());
+  for (const delay of [250, 1000]) setTimeout(updateViewport, delay);
 }
 // "오프라인 · 다시 연결 중" at the top while the browser is offline or the
 // board failed to answer twice in a row; it goes away by itself once a read
@@ -8766,13 +8783,18 @@ window.addEventListener("DOMContentLoaded", () => {
         state.inputEpoch++;
         terminalStatus("화면으로 돌아오면 다시 연결합니다.");
       }
-    } else pageShown();
+    } else {
+      settleViewport();
+      pageShown();
+    }
   });
   // A page restored from the back-forward cache may fire no visibilitychange.
   window.addEventListener("pagehide", () => { state.pageHidden = true; });
   window.addEventListener("pageshow", (event) => {
+    settleViewport();
     if (event.persisted && !document.hidden) pageShown();
   });
+  window.addEventListener("focus", settleViewport);
   window.addEventListener("offline", () => {
     state.offline = true;
     closeEvents();

@@ -364,12 +364,15 @@ class ChatTest(unittest.TestCase):
         self.assertEqual(read(workingSince='1791334800'),(None,False))
         result.pop('workingSince'); self.assertEqual(read(),(None,False))
     def test_message_attachment_names_are_scrubbed_and_raw_native_fields_stay_metadata(self):
-        result={'phase':'idle','capabilities':{'canSend':True},'messages':[{'role':'user','text':'본문',
-                'attachments':[{'source':'native','kind':'image','name':'owner@example.com 사진.png','id':None}]}]}
+        token='ghp_'+'c'*40
+        result={'phase':'idle','capabilities':{'canSend':True},'messages':[{'role':'user','text':'owner@example.com 에게',
+                'attachments':[{'source':'native','kind':'image','name':token+' 사진.png','id':None}]}]}
         self.flow.transfers.rpc=lambda *a,**k:result
         state=self.chat.state({'source':REF})
         self.assertEqual(state['messages'][0]['attachments'][0]['name'],'[redacted] 사진.png')
-        self.assertNotIn('owner@example.com',json.dumps(state))
+        self.assertNotIn(token,json.dumps(state))
+        # An email address is not a secret: it stays readable.
+        self.assertEqual(state['messages'][0]['text'],'owner@example.com 에게')
     def test_state_is_exact_cached_and_offline_stops(self):
         first=self.chat.state({'source':REF})
         second=self.chat.state({'source':REF})

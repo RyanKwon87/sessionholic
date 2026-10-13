@@ -5100,6 +5100,9 @@ function openQuickReplies(entry, input, trigger) {
 const WARM_SPACING_MS = 60000;
 function warmChat(entry) {
   if (Date.now() - (entry.warmedAt || 0) < WARM_SPACING_MS || entry.source?.agent !== "claude") return;
+  // Not more than every few seconds while typing (a terminal already open is the usual answer).
+  if (Date.now() - (entry.warmCheckedAt || 0) < 5000) return;
+  entry.warmCheckedAt = Date.now();
   const s = allSessions().find((session) => chatKey(sourceOf(session)) === chatKey(entry.source));
   // A finished session is not woken by typing; its send opens the connection as before.
   if (s?.kind !== "background" || s.phase === "done" || terminalForSession(s)) return;

@@ -991,14 +991,21 @@ function render() {
     } else syncEvents();
   }
 }
+// A lost connection comes first: on a phone the chips scroll sideways and only the
+// first fit, so a device that is down is never the one pushed out of sight. A tap
+// says what each one's dot means (a touch has no hover title).
+const HOST_ORDER = { bad: 0, checking: 1, ok: 2 };
+function hostTone(host) {
+  return host.refreshing ? "checking" : host.ok ? "ok" : "bad";
+}
 function renderHosts(now) {
   const box = $("hosts");
   box.replaceChildren();
-  for (const host of state.snapshot.hosts) {
-    const chip = el(
-      "span",
-      `host ${host.refreshing ? "checking" : host.ok ? "ok" : "bad"}`,
-    );
+  const hosts = state.snapshot.hosts.map((host, index) => ({ host, index }))
+    .sort((a, b) => HOST_ORDER[hostTone(a.host)] - HOST_ORDER[hostTone(b.host)] || a.index - b.index);
+  for (const { host } of hosts) {
+    const chip = el("button", `host ${hostTone(host)}`);
+    chip.type = "button";
     chip.append(el("span", "dot"), el("span", null, host.label));
     chip.title = host.refreshing
       ? `${host.label} · 작업 확인 중`
@@ -1006,6 +1013,7 @@ function renderHosts(now) {
         ? `${host.label} · ${ago(host.fetchedAt, now)} 확인`
         : `${host.label} · ${host.error || "연결 확인 필요"}${host.fetchedAt ? ` · 마지막 확인 ${ago(host.fetchedAt, now)}` : ""}`;
     chip.setAttribute("aria-label", chip.title);
+    chip.addEventListener("click", () => toast(chip.title));
     box.append(chip);
   }
 }

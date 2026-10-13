@@ -3749,6 +3749,22 @@ test('a page older than the screen the board serves offers a reload, and reloads
   assert.equal(unknown.state.updateAvailable, false);
 });
 
+test('a device that lost its connection comes first among the header chips, and a tap says each one\'s state', () => {
+  const c = client(undefined, noChatTimers);
+  c.state.snapshot = { serverTime: 1000, hosts: [
+    { name: 'studio', label: '작업 컴퓨터', ok: true, fetchedAt: 990 },
+    { name: 'laptop', label: '노트북', ok: true, refreshing: true, fetchedAt: 900 },
+    { name: 'pc', label: 'PC', ok: false, error: 'SSH 연결 실패', fetchedAt: 600 },
+  ] };
+  c.render();
+  const chips = c.get('hosts').children;
+  assert.deepEqual(chips.map((chip) => chip.children[1].textContent), ['PC', '노트북', '작업 컴퓨터']);
+  assert.deepEqual(chips.map((chip) => chip.className), ['host bad', 'host checking', 'host ok']);
+  assert.equal(chips[0].tagName, 'BUTTON');
+  chips[0].events.click();
+  assert.match(c.get('toast').textContent, /^PC · SSH 연결 실패 · 마지막 확인/);
+});
+
 function classes() {
   const set = new Set();
   return { set, add: (name) => set.add(name), remove: (name) => set.delete(name), contains: (name) => set.has(name),

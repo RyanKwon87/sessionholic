@@ -714,6 +714,12 @@ select:disabled {
   font-size: var(--fs-sub);
   white-space: nowrap;
 }
+button.host {
+  border: 0;
+  color: inherit;
+  font-family: inherit;
+  cursor: pointer;
+}
 .host > span:last-child {
   max-width: 140px;
   overflow: hidden;

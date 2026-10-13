@@ -47,11 +47,18 @@ const MessageFormat = (() => {
   // right after it stays text), then loses the punctuation that ends its sentence and a ")"
   // or "]" it did not open.
   function bareAddress(text) {
-    let url = text.slice(0, 2048).match(/^https?:\/\/[A-Za-z0-9\-._~:/?#[\]@!$&'()*+,;=%]+/i)?.[0] || "";
-    const count = (char) => url.split(char).length - 1;
-    while (url && (/[.,;:!?'*]$/.test(url) || (url.endsWith(")") && count("(") < count(")")) ||
-                   (url.endsWith("]") && count("[") < count("]")))) url = url.slice(0, -1);
-    return /^https?:\/\/[^/?#]/i.test(url) ? url : "";
+    const url = text.slice(0, 2048).match(/^https?:\/\/[A-Za-z0-9\-._~:/?#[\]@!$&'()*+,;=%]+/i)?.[0] || "";
+    const open = { ")": 0, "]": 0 }; const close = { ")": 0, "]": 0 };
+    for (const char of url) {
+      if (char === "(") open[")"]++; else if (char === "[") open["]"]++; else if (char in close) close[char]++;
+    }
+    let end = url.length;
+    for (; end; end--) {
+      const char = url[end - 1];
+      if (char in close && open[char] < close[char]) close[char]--;
+      else if (!".,;:!?'*".includes(char)) break;
+    }
+    return /^https?:\/\/[^/?#]/i.test(url.slice(0, end)) ? url.slice(0, end) : "";
   }
   function inline(text, budget, depth = 0, links = true) {
     if (depth > MAX_DEPTH) return [make(budget, "text", { text })];
@@ -311,8 +318,12 @@ const MessageFormat = (() => {
     return parts.map((part) => inline(part.trim(), budget));
   }
   function delimiterRow(line) {
-    if (!line.includes("-") || !/^ {0,3}\|?[ \t]*:?-+:?[ \t]*(\|[ \t]*:?-+:?[ \t]*)*\|?[ \t]*$/.test(line)) return null;
-    return cells(line).map((cell) => cell.startsWith(":") && cell.endsWith(":") ? "center"
+    // Cell by cell, in one pass over the line (a pattern over the whole line backtracks on
+    // long runs of spaces).
+    if (!line.includes("-") || leadWidth(line) > 3 || /[^ \t|:-]/.test(line)) return null;
+    const parts = cells(line);
+    if (!parts.every((cell) => /^:?-+:?$/.test(cell))) return null;
+    return parts.map((cell) => cell.startsWith(":") && cell.endsWith(":") ? "center"
       : cell.endsWith(":") ? "right" : cell.startsWith(":") ? "left" : "");
   }
   function tableAt(lines, index) {

@@ -130,6 +130,13 @@ test('a pipe table draws as a table that scrolls on its own, and copies as it wa
   assert.equal(byTag(first, 'br').length, 2); assert.equal(visibleText(first), '첫째\n둘째\n셋째');
   assert.equal(byTag(second, 'br').length, 0); assert.equal(visibleText(second), 'x<br>y');
   assert.equal(format.plainText(broken), broken);
+  // Long runs a pattern would backtrack on are read in one pass.
+  const started = Date.now();
+  format.render(root, 'a|b\n---' + ' '.repeat(60000) + 'x');
+  assert.equal(byTag(root, 'table').length, 0);
+  format.render(root, Array.from({ length: 31 }, () => 'http://a.test' + ')'.repeat(2030)).join(' '));
+  assert.equal(byTag(root, 'a')[0].attributes.href, 'http://a.test/');
+  assert.ok(Date.now() - started < 1000, 'linear');
   // Not a table: no delimiter row, a column count that differs, inside a code block.
   for (const plain of ['a | b\nc | d', '| a | b |\n| --- |\n| c | d |', '```\n| a | b |\n|---|---|\n```']) {
     format.render(root, plain);

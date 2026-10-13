@@ -1887,6 +1887,9 @@ li[data-task] {
   -webkit-overflow-scrolling: touch;
 }
 .message-table {
+  /* Columns as wide as their content up to the cell cap below; a wider table scrolls in its
+     wrapper instead of squeezing every column to its longest word. */
+  width: max-content;
   border-collapse: collapse;
   font-size: 0.95em;
   line-height: 1.4;
@@ -1897,8 +1900,13 @@ li[data-task] {
   border: 1px solid var(--sep-strong);
   text-align: left;
   vertical-align: top;
+  max-width: 16em;
   word-break: keep-all;
-  overflow-wrap: anywhere;
+  /* Not `anywhere` (inherited from the bubble): words are not split letter by letter. */
+  overflow-wrap: break-word;
+}
+.message-table a {
+  overflow-wrap: anywhere; /* A long address alone may break anywhere. */
 }
 .message-table th {
   background: var(--surface);

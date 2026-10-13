@@ -385,16 +385,20 @@ class Chat:
     def _read_state(self, source, host, identity, key, request_ids, kwargs, sequence, epoch):
         """One remote read with the receipts of `request_ids`, cached unless a send or a newer
         read came in meanwhile."""
-        with self.lock:
-            known = key in self.last_good
-        if known and not self.board.state[host['name']]['ok']:
-            return self._stale(key, request_ids)
+        if not self.board.state[host['name']]['ok']:
+            stale = self._stale(key, source, request_ids)
+            if stale is not None:
+                return stale
         try:
             result = self.rpc(host, 'read', source, **kwargs)
-        except (RuntimeError, OSError, ValueError):
+        except (RuntimeError, OSError, ValueError) as exc:
             if source.get('agent') != 'codex' or source.get('phase') not in ('closed', 'notLoaded'):
-                if known:
-                    return self._stale(key, request_ids)
+                from transfer import WorkerError
+                # Only a host that could not be reached shows its last read; a failure the
+                # host reported, or a request refused here, is shown as it is.
+                stale = None if isinstance(exc, (ValueError, WorkerError)) else self._stale(key, source, request_ids)
+                if stale is not None:
+                    return stale
                 raise
             # A disconnected daemon does not erase the saved conversation.
             try:
@@ -513,23 +517,32 @@ class Chat:
                     self.cache.pop(next(iter(self.cache)))
                 self.cache[key] = (time.monotonic(), response, sequence, source.get('cwd'),
                                    frozenset(request_ids))
-            if key not in self.last_good and len(self.last_good) >= 64:
+            # Newest read last: the least recently read conversation leaves first.
+            self.last_good.pop(key, None)
+            if len(self.last_good) >= 64:
                 self.last_good.pop(next(iter(self.last_good)))
-            self.last_good[key] = (time.time(), response)
+            self.last_good[key] = (time.time(), response, source.get('cwd'), source.get('sessionId'))
         return response
 
-    def _stale(self, key, request_ids):
-        """The conversation as last read, read-only, while its host cannot be reached: never
-        cached, so the next read asks the host again."""
+    def _stale(self, key, source, request_ids):
+        """The conversation as last read, read-only, while its host cannot be reached, or None
+        when none was read for this exact session (a reused Claude id or a moved folder is
+        another conversation). Never cached, so the next read asks the host again; its state
+        then is unknown, so nothing of the last read's work or actions carries over."""
         with self.lock:
-            at, last = self.last_good[key]
+            entry = self.last_good.get(key)
+        if entry is None or entry[2:] != (source.get('cwd'), source.get('sessionId')):
+            return None
+        at, last = entry[:2]
         known = {receipt['requestId']: receipt for receipt in last.get('receipts', [])}
         receipts = [known.get(request_id) or self.receipt(
             {'delivery': 'unknown', 'reason': '기기에 연결되지 않아 전송 결과를 확인하지 못했습니다.'}, request_id)
             for request_id in request_ids]
-        capability = {**last.get('capability', {}), 'supported': False, 'attachments': False,
-                      'reason': '기기에 연결되지 않아 마지막으로 읽은 대화를 보여 줍니다. 연결되면 다시 읽습니다.'}
+        capability = {name: value for name, value in last.get('capability', {}).items() if name != 'action'}
+        capability.update(supported=False, attachments=False,
+                          reason='기기에 연결되지 않아 마지막으로 읽은 대화를 보여 줍니다. 연결되면 다시 읽습니다.')
         return {**last, 'receipts': receipts, 'capability': capability, 'stale': True, 'staleSince': int(at),
+                'phase': 'unavailable', 'workingSince': None, 'recovery': None,
                 'readOnly': True, 'prompt': None, 'promptOpenable': False}
 
     @staticmethod

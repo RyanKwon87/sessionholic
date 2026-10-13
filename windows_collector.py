@@ -1080,7 +1080,10 @@ def _claude_label(path):
     title = next((entry[key] for kind, key in CLAUDE_TITLES for entry in reversed(entries)
                   if entry.get('type') == kind and _metadata(entry.get(key))), '')
     if not title:
-        title = next((message['text'] for message in _claude_messages(_head(path))
+        # Expanded skills, compaction summaries and side threads are not the request.
+        asked = [entry for entry in _head(path)
+                 if not any(entry.get(flag) for flag in ('isMeta', 'isCompactSummary', 'isSidechain'))]
+        title = next((message['text'] for message in _claude_messages(asked)
                       if message['role'] == 'user' and not message['text'].lstrip().startswith('<')), '')
         title = _one_line(title, 60)
     answer = next((message['text'] for message in reversed(_claude_messages(entries)) if message['role'] == 'assistant'), '')

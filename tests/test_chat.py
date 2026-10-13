@@ -399,6 +399,32 @@ class ChatTest(unittest.TestCase):
         self.chat.last_good.clear()
         self.flow.transfers.rpc=lambda *a,**k:(_ for _ in ()).throw(RuntimeError('fixture: unreachable'))
         with self.assertRaises(RuntimeError): self.chat.state({'source':REF})
+    def test_stale_read_is_only_for_an_unreachable_host_and_the_same_session(self):
+        from transfer import WorkerError
+        working={'cwd':str(self.project),'phase':'working','workingSince':1791334800,'capabilities':{'canSend':True},
+                 'messages':[{'role':'assistant','text':'진행 중'}]}
+        self.flow.transfers.rpc=lambda *a,**k:working
+        first=self.chat.state({'source':REF})
+        self.assertEqual(first['phase'],'working')
+        fail=lambda exc:(lambda *a,**k:(_ for _ in ()).throw(exc))
+        # Unreachable: the last read, with nothing of its work or actions carried over.
+        self.chat.cache.clear()
+        self.flow.transfers.rpc=fail(RuntimeError('fixture: unreachable'))
+        stale=self.chat.state({'source':REF})
+        self.assertEqual((stale['stale'],stale['phase'],stale['workingSince'],stale['recovery']),(True,'unavailable',None,None))
+        self.assertNotIn('action',stale['capability'])
+        self.assertEqual(stale['messages'],first['messages'])
+        # A failure the host reported is shown as it is.
+        self.chat.cache.clear()
+        self.flow.transfers.rpc=fail(WorkerError('fixture: reported'))
+        with self.assertRaises(WorkerError): self.chat.state({'source':REF})
+        # The same id in another folder is another conversation: it has no last read.
+        self.chat.cache.clear()
+        self.flow.transfers.rpc=fail(RuntimeError('fixture: unreachable'))
+        moved=self.root/'moved'; moved.mkdir()
+        self.source['cwd']=str(moved); self.board.poll(HOST)
+        with self.assertRaises(RuntimeError) as caught: self.chat.state({'source':REF})
+        self.assertEqual(str(caught.exception),'fixture: unreachable')
     def test_receipt_lookup_answers_plain_reads_from_cache_without_receipts(self):
         receipt=self.chat.state({'source':REF,'requestId':'request-0001'})
         self.assertEqual(receipt['receipts'][0]['requestId'],'request-0001')

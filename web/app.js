@@ -3318,8 +3318,9 @@ const DICTATION_STOP_WAIT_MS = 8000;
 const DICTATION_START_TICKS = 15;
 const DICTATION_SILENCE_TICKS = 10;
 // Android's recognizer service may end a session after an utterance though Chrome asked it for
-// continuous dictation; the board starts it again (this many times at most) unless the user
-// ended it, it left the screen, it was refused, or nothing was said for the silence above.
+// continuous dictation; the board starts it again (this many times in a row with nothing heard
+// between) unless the user ended it, it left the screen, it was refused, or nothing was said
+// for the silence above.
 const DICTATION_RESTARTS = 30;
 const DICTATION_HARD_ERRORS = new Set(["not-allowed", "service-not-allowed", "audio-capture", "network", "language-not-supported"]);
 const DICTATION_ERRORS = {
@@ -3427,6 +3428,7 @@ function startDictation(field, { report, active, releaseKeyboard = false }) {
     }
     listening();
     session.idle = 0;
+    session.restarts = 0;  // Heard: a long dictation restarts once per phrase without limit.
     // Final results never change and keep their places while the list grows (results still
     // changing may merge or drop). A list whose earlier finals are gone or say something
     // else started over (WebKit after a pause): the words those finals wrote stay, and the

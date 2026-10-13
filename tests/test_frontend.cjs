@@ -8919,7 +8919,12 @@ test('on Android a recognition that ends by itself listens on, and what it heard
   t.rec.onend();
   assert.equal(t.rec.started, 2);
   assert.equal(t.c.state.dictation?.recognition, t.rec);
-  // Bounded: after the last allowed round it ends.
+  // A long dictation, one phrase per round, listens on past the bound: what it hears resets it.
+  t = run(android);
+  for (let round = 0; round < 40; round++) { t.rec.onresult(t.result('말' + round)); t.rec.onend(); }
+  assert.equal(t.rec.started, 41);
+  assert.equal(t.c.state.dictation?.recognition, t.rec);
+  // Bounded: rounds in a row with nothing heard end it.
   t = run(android);
   t.c.state.dictation.restarts = 1e6;
   t.rec.onend();

@@ -614,6 +614,7 @@ class WindowsCollectorTest(unittest.TestCase):
         self.assertEqual((row['title'], row['snippet']), ('합성 Claude 요청', '합성 Claude 결과'))
         filler = {'type': 'progress', 'data': 'x' * 1000}
         entries = [{'type': 'user', 'cwd': self.cwd, 'message': {'content': '<command-name>/clear</command-name>'}},
+                   {'type': 'user', 'isMeta': True, 'message': {'content': '펼친 스킬 본문'}},
                    {'type': 'user', 'message': {'content': '첫  요청\n둘째 줄'}},
                    {'type': 'ai-title', 'aiTitle': '오래된 제목', 'sessionId': sid},
                    {'type': 'custom-title', 'customTitle': '처음 바꾼 이름', 'sessionId': sid},

@@ -3864,6 +3864,21 @@ test('a hardware keyboard goes from the search field into the list, between card
   assert.deepEqual(press({ closest: () => null }, 'Escape'), [true, true]);
   assert.deepEqual(press(typing, '[', { metaKey: true }), [true, true]);
   assert.deepEqual(press({ closest: (selector) => (selector === 'dialog' ? {} : null) }, 'Escape'), [false, false]);
+  // A key already taken (Esc closing the tools menu) or one an input method is composing is left alone.
+  assert.deepEqual(press({ closest: () => null }, 'Escape', { defaultPrevented: true }), [false, false]);
+  assert.deepEqual(press(search, 'ArrowDown', { keyCode: 229 }), [false, false]);
+  // An iPad's key names are understood.
+  focused.length = 0;
+  assert.deepEqual(press(search, 'UIKeyInputDownArrow'), [true, true]); assert.deepEqual(focused, [0]);
+  // On a touch screen without a hardware keyboard, Return from the search field only closes the keyboard.
+  c.context.window.matchMedia = (query) => ({ matches: /coarse/.test(query) });
+  c.state.hardwareKeyboard = false;
+  assert.equal(vm.runInContext('keyboardPresent()', c.context), false);
+  clicked.length = 0;
+  assert.deepEqual(press(search, 'Enter'), [false, false]); assert.deepEqual(clicked, []);
+  // Once a hardware key was seen, Enter opens it again.
+  c.state.hardwareKeyboard = true;
+  assert.deepEqual(press(search, 'Enter'), [true, true]); assert.deepEqual(clicked, [0]);
 });
 
 test('a conversation at the read window says the items before it are not shown', () => {
@@ -3874,7 +3889,7 @@ test('a conversation at the read window says the items before it are not shown',
   c.renderMessages(s, items(79));
   assert.equal(notice(), undefined);
   c.renderMessages(s, items(80));
-  assert.match(notice().textContent, /최근 80개 항목만 보입니다. 앞의 대화는 터미널에서 볼 수 있습니다/);
+  assert.match(notice().textContent, /최근 80개 항목까지만 보입니다. 그보다 앞의 대화는 여기에 나오지 않습니다/);
   assert.equal(c.get('messages').children[0], notice(), 'above the conversation');
 });
 
@@ -8187,7 +8202,7 @@ function assertOneShotHistory(c) {
   assert.equal(notices.length, 1);
   assert.match(textOf(notices[0]), /일회성 실행 · 기록 저장 안 함/);
   assert.ok(textOf(notices[0]).includes(ONE_SHOT_HISTORY));
-  for (const className of ['conversation-read-error', 'group-empty', 'msg-working'])
+  for (const className of ['conversation-read-error', 'group-empty', 'conversation-loading', 'msg-working'])
     assert.equal(byClass(messages, className).length, 0, className);
 }
 

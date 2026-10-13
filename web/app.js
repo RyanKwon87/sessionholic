@@ -2614,7 +2614,10 @@ function drawDetail(s) {
   list.lastScrollTop = 0;
   observeMessages(list);
   list.setAttribute("aria-label", "최근 대화 읽기");
-  list.append(progress("대화를 불러오고 있습니다…"));
+  const loading = progress("대화를 불러오고 있습니다…");
+  loading.classList?.add?.("conversation-loading");
+  loading.setAttribute?.("role", "status");
+  list.append(loading);
   const sync = el("p", "conversation-sync-notice");
   sync.id = "conversation-sync-notice";
   sync.hidden = true;
@@ -3816,29 +3819,35 @@ function documentKeydown(event) {
 // Esc or ⌘[ goes back: to the list on a phone layout, to its card beside the conversation.
 // Typing, an input method's composition, a terminal or an open sheet keep their keys.
 function listNavigationKeydown(event) {
-  if (state.terminalVisible || event.isComposing || event.altKey || event.shiftKey) return false;
+  // A key something else already took (closing the tools menu with Esc) is not taken again.
+  if (event.defaultPrevented || state.terminalVisible || event.isComposing || event.keyCode === 229 ||
+      event.altKey || event.shiftKey) return false;
   const target = event.target;
   if (target?.closest?.("dialog")) return false;
+  const key = TERMINAL_KEY_ALIASES[event.key] || event.key;
   const cards = () => [...($("groups")?.querySelectorAll?.(".card") || [])];
   const plain = !event.metaKey && !event.ctrlKey;
-  if (target?.id === "search" && plain && (event.key === "ArrowDown" || event.key === "Enter")) {
+  // A touch screen's own keyboard has a Return (search) key that only closes it: Enter
+  // opens the first session only from a hardware keyboard.
+  const enter = key === "Enter" && keyboardPresent();
+  if (target?.id === "search" && plain && (key === "ArrowDown" || enter)) {
     const first = cards()[0];
     if (!first) return false;
     event.preventDefault();
-    if (event.key === "Enter") first.click();
+    if (enter) first.click();
     else first.focus();
     return true;
   }
-  if (target?.classList?.contains?.("card") && plain && (event.key === "ArrowDown" || event.key === "ArrowUp")) {
+  if (target?.classList?.contains?.("card") && plain && (key === "ArrowDown" || key === "ArrowUp")) {
     const all = cards();
-    const next = all[all.indexOf(target) + (event.key === "ArrowDown" ? 1 : -1)];
+    const next = all[all.indexOf(target) + (key === "ArrowDown" ? 1 : -1)];
     event.preventDefault();
     if (next) next.focus();
-    else if (event.key === "ArrowUp") $("search")?.focus();
+    else if (key === "ArrowUp") $("search")?.focus();
     return true;
   }
   const editing = target?.closest?.("input, textarea, select, [contenteditable='true']");
-  const back = (event.key === "Escape" && plain && !editing) || (event.metaKey && event.key === "[");
+  const back = (key === "Escape" && plain && !editing) || (event.metaKey && key === "[");
   if (!back || !state.selected || !$("session-layout") || $("session-layout").hidden) return false;
   event.preventDefault();
   if (phoneLayout() && state.detailShown) backToList();
@@ -5221,7 +5230,7 @@ function renderMessages(s, messages, error = "", fresh = false) {
   // The server sends the newest CONVERSATION_WINDOW items: anything before them is not shown.
   if (messages.length >= CONVERSATION_WINDOW) {
     list.conversationWindowNotice ||= el("p", "conversation-window-notice",
-      `최근 ${CONVERSATION_WINDOW}개 항목만 보입니다. 앞의 대화는 터미널에서 볼 수 있습니다.`);
+      `최근 ${CONVERSATION_WINDOW}개 항목까지만 보입니다. 그보다 앞의 대화는 여기에 나오지 않습니다.`);
     desired.unshift(list.conversationWindowNotice);
   }
   desired.push(...tail);

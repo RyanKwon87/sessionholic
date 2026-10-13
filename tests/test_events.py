@@ -148,6 +148,20 @@ class EventHubTest(unittest.TestCase):
         self.assertGreaterEqual(time.monotonic() - first, 0.35)
         self.assertEqual(reader.events("snapshot"), [{"version": 2}, {"version": 7}], "one announcement of the newest")
 
+    def test_a_change_other_than_a_watchers_is_announced_without_waiting(self):
+        hub = events.EventHub(self.board, self.chat, heartbeat=5, peer_check=0.02, snapshot_gap=30)
+        self.addCleanup(hub.close)
+        self.board.version = 1
+        reader = Reader(hub, hub.open())
+        wait_for(lambda: reader.events("hello"))
+        self.board.change()
+        wait_for(lambda: reader.events("snapshot"))
+        # A collection that finished (or a refresh) right after: out at once, not in 30 seconds.
+        self.board.change()
+        self.board.urgent_version = self.board.version
+        wait_for(lambda: len(reader.events("snapshot")) >= 2, timeout=2)
+        self.assertEqual(reader.events("snapshot")[-1], {"version": self.board.version})
+
     def test_capacity_and_closed_hub(self):
         self.hub.max_streams = 2
         first, second = self.hub.open(), self.hub.open()

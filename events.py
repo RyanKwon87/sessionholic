@@ -38,9 +38,10 @@ IDLE_INTERVALS = (5.0, 10.0, 20.0, 30.0)
 ERROR_INTERVAL = 10.0
 # How often an idle stream checks whether its client went away.
 PEER_CHECK = 1.0
-# Snapshot announcements to one stream are at least this far apart: a resident collector
-# can change the board every second, and each announcement makes the page read the
-# whole snapshot again. Changes in between are one announcement of the newest version.
+# Snapshot announcements of a resident collector's changes to one stream are at least
+# this far apart: it can change the board every second, and each announcement makes the
+# page read the whole snapshot again. Changes in between are one announcement of the
+# newest version; any other change (Board.urgent_version) goes out at once.
 SNAPSHOT_GAP = 3.0
 # Seconds between terminal list reads while at least one stream is open (at most four
 # board terminals, so a read is a few tmux calls); after a failed read, the longer one.
@@ -345,7 +346,10 @@ class EventHub:
                 held = False
                 if version is not None and version > sent_version:
                     now = self.clock()
-                    if announced is None or now - announced >= self.snapshot_gap:
+                    # Only a resident watcher's changes wait for the gap: a collection that
+                    # finished, a refresh or a label is announced at once.
+                    urgent = getattr(self.board, "urgent_version", 0) or 0
+                    if announced is None or now - announced >= self.snapshot_gap or urgent > sent_version:
                         out += encode_event("snapshot", {"version": version})
                         sent_version, announced = version, now
                     else:

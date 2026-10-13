@@ -9,6 +9,7 @@ import secrets
 import shutil
 import sys
 import stat
+import subprocess
 import tempfile
 import time
 from contextlib import contextmanager
@@ -23,6 +24,19 @@ HOST = re.compile(r'[A-Za-z0-9_.-]{1,40}\Z')
 # The source fields a staged handoff keeps; the same selector a remote attach sends.
 SELECTOR = ('host', 'agent', 'id', 'home', 'cwd', 'kind', 'sessionId', 'phase')
 CHECK_MESSAGES = [{'role': 'user', 'text': '점검용 인계 메시지입니다. 실제 대화를 읽지 않았습니다.'}]
+# A board terminal's run kept in this host's own tmux server (never the user's), so a dropped
+# connection or a sleeping host does not end it; the board attaches again by its name.
+HOLD_SOCKET = 'sessionholic-hold'
+HOLD_NAME = re.compile(r'sh-[0-9a-f]{16}\Z')
+HOLD_OPTIONS = (('status', 'off'), ('prefix', 'None'), ('prefix2', 'None'), ('mouse', 'off'), ('escape-time', '10'),
+                # The attached client draws on the board terminal's own screen, not an alternate
+                # one: a run's last output stays there when it ends, and plain output scrolls
+                # into the board's history. Mouse modes still pass to a run that asks for them.
+                ('terminal-overrides', '*:smcup@:rmcup@'))
+HOLD_TIMEOUT = 10
+HOLD_STALE_ENVELOPE = 600  # an envelope this old was never run (hold-run removes it first)
+# Set by `hold <name>` before a terminal step: its final exec then runs in that session.
+_hold = None
 
 
 def private_dir(path):
@@ -343,7 +357,7 @@ def run_handoff(token, check=False):
         from managed_launch import mark_attached
         mark_attached(spec, 'handoff-' + token)
     os.chdir(spec['cwd'])
-    os.execve(spec['argv'][0], spec['argv'], spec['env'])
+    _execve(spec['argv'], spec['env'])
 
 
 def handoff_main(args):
@@ -388,13 +402,21 @@ def _rpc(request):
         return control.execute(args['source'], args['action'], args.get('targetProof'), args.get('requestId'))
     if op == 'profiles':
         from launch import new_session_status
-        return {'profiles': profiles(), 'home': str(Path.home()), 'launcher': new_session_status()}
+        tmux = _tmux()
+        # The board attaches again with this tmux directly, never through a helper file
+        # that a later deploy may remove.
+        return {'profiles': profiles(), 'home': str(Path.home()), 'launcher': new_session_status(),
+                'holds': bool(tmux), 'holdTmux': tmux or None}
     if op == 'resume_preview':
         from launch import resume_preview
         return resume_preview(args['source'])
     if op == 'launcher_programs':
         from launcher_programs import launcher_programs
         return launcher_programs(args)
+    if op == 'hold_list':
+        return hold_list()
+    if op == 'hold_kill':
+        return hold_kill(args.get('name'))
     if op == 'state': return source_state(args['source'])
     if op == 'interrupt': return interrupt_source(args['source'])
     if op == 'inspect':
@@ -451,7 +473,144 @@ def attach(source):
     if spec['mode'] not in ('attach', 'resume'):
         raise ValueError('원격 기존 세션 연결만 지원합니다.')
     os.chdir(spec['cwd'])
-    os.execve(spec['argv'][0], spec['argv'], spec['env'])
+    _execve(spec['argv'], spec['env'])
+
+
+# ---------- runs kept in this host's tmux ----------
+
+def _tmux():
+    import collector
+    return collector.which('tmux')
+
+
+def _hold_command(tmux, *args):
+    return [tmux, '-L', HOLD_SOCKET, '-f', '/dev/null', *args]
+
+
+def _hold_name(name):
+    if not isinstance(name, str) or not HOLD_NAME.fullmatch(name):
+        raise ValueError('실행 보관 이름이 올바르지 않습니다.')
+    return name
+
+
+def _client_env():
+    """The attaching client's environment: this SSH session's own, never a tmux pane's."""
+    return {key: value for key, value in os.environ.items() if key not in ('TMUX', 'TMUX_PANE')}
+
+
+def _hold_run(tmux, *args, **kwargs):
+    """One call to the hold server, bounded; a call that does not answer counts as failed."""
+    try:
+        return subprocess.run(_hold_command(tmux, *args), timeout=HOLD_TIMEOUT, **kwargs)
+    except subprocess.TimeoutExpired:
+        return subprocess.CompletedProcess(args, 1, '', '')
+
+
+def _hold_alive(tmux, name):
+    return _hold_run(tmux, 'has-session', '-t', '=' + name,
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+
+
+def _hold_server(tmux):
+    return _hold_run(tmux, 'list-sessions', stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+
+
+def _execve(argv, env):
+    """A terminal step's final exec: inside its hold session when the board asked for one and
+    this host has tmux, else in this SSH session as before."""
+    tmux = _tmux() if _hold is not None else None
+    if tmux:
+        hold_start(tmux, _hold, argv, env)
+    os.execve(argv[0], argv, env)
+
+
+def hold_start(tmux, name, argv, env):
+    """Start the run in a detached session of the hold server (argv and environment through a
+    private one-use envelope, never tmux's argv), then attach this SSH session to it."""
+    name = _hold_name(name)
+    if not _hold_alive(tmux, name):
+        envelope = private_dir(root() / 'holds') / (name + '.json')
+        save(envelope, {'argv': list(argv), 'env': dict(env), 'cwd': os.getcwd()})
+        try:
+            columns, rows = os.get_terminal_size(sys.stdout.fileno())
+        except OSError:
+            columns, rows = 80, 24
+        options = []
+        if not _hold_server(tmux):
+            # Server options, set once by the session that starts the server.
+            for option, value in HOLD_OPTIONS:
+                options += [';', 'set-option', '-g', option, value]
+            options += [';', 'set-option', '-ga', 'terminal-features', ',xterm-256color:RGB']
+        started = _hold_run(tmux, 'new-session', '-d', '-s', name, '-x', str(columns), '-y', str(rows),
+                            sys.executable, '-I', sys.argv[0], 'hold-run', str(envelope), *options,
+                            env=_client_env(), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if started.returncode != 0 and not _hold_alive(tmux, name):
+            if envelope.exists():
+                # The run never started there: run it here as before rather than not at all.
+                envelope.unlink()
+                os.execve(argv[0], argv, env)
+            # It started there (its envelope is used) and already ended: never a second run.
+            print('[하던 일] 실행이 바로 끝났습니다.', flush=True)
+            raise SystemExit(1)
+    os.execve(tmux, _hold_command(tmux, 'attach-session', '-t', '=' + name), _client_env())
+
+
+def hold_run(path):
+    """Inside the hold session: the run itself, from its envelope (removed before it starts)."""
+    path = Path(path)
+    if path.parent != root() / 'holds' or not HOLD_NAME.fullmatch(path.stem):
+        raise ValueError('실행 보관 경로가 올바르지 않습니다.')
+    data = read_private(path)
+    path.unlink()
+    os.chdir(data['cwd'])
+    env = {key: value for key, value in data['env'].items() if key not in ('TMUX', 'TMUX_PANE')}
+    # The terminal the run now draws on is this tmux pane.
+    if os.environ.get('TERM'):
+        env['TERM'] = os.environ['TERM']
+    os.execve(data['argv'][0], data['argv'], env)
+
+
+def hold_attach(name):
+    """Attach again after a dropped connection: never starts anything."""
+    name = _hold_name(name)
+    tmux = _tmux()
+    if not tmux or not _hold_alive(tmux, name):
+        print('[하던 일] 이 실행은 이미 끝났습니다.', flush=True)
+        raise SystemExit(0)
+    os.execve(tmux, _hold_command(tmux, 'attach-session', '-t', '=' + name), _client_env())
+
+
+def hold_list():
+    """The hold sessions on this host, by name and age in seconds (this host's clock)."""
+    tmux = _tmux()
+    if not tmux:
+        return {'holds': []}
+    # An envelope left behind (its run never started) holds an environment: removed when old.
+    folder = root() / 'holds'
+    for envelope in folder.glob('*.json') if folder.is_dir() else []:
+        try:
+            if time.time() - envelope.lstat().st_mtime > HOLD_STALE_ENVELOPE:
+                envelope.unlink()
+        except OSError:
+            continue
+    listed = _hold_run(tmux, 'list-sessions', '-F', '#{session_name} #{session_created}', capture_output=True, text=True)
+    if listed.returncode != 0:
+        return {'holds': []}  # No hold server running.
+    now, holds = int(time.time()), []
+    for line in listed.stdout.splitlines():
+        name, _, created = line.partition(' ')
+        if HOLD_NAME.fullmatch(name) and created.isdigit():
+            holds.append({'name': name, 'age': max(0, now - int(created))})
+    return {'holds': holds}
+
+
+def hold_kill(name):
+    name = _hold_name(name)
+    tmux = _tmux()
+    if not tmux or not _hold_alive(tmux, name):
+        return {'killed': False}
+    done = _hold_run(tmux, 'kill-session', '-t', '=' + name, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return {'killed': done.returncode == 0}
 
 
 def new_session_main():
@@ -460,7 +619,7 @@ def new_session_main():
     try:
         spec = new_session()
         os.chdir(spec['cwd'])
-        os.execve(spec['argv'][0], spec['argv'], spec['env'])
+        _execve(spec['argv'], spec['env'])
     except (ValueError, OSError) as exc:
         message = str(exc) if isinstance(exc, ValueError) else '실행 명령을 시작하지 못했습니다.'
         print('새 세션을 열지 못했습니다. ' + message, file=sys.stderr)
@@ -468,6 +627,14 @@ def new_session_main():
 
 
 def _main():
+    if len(sys.argv) == 3 and sys.argv[1] == 'hold-run':
+        try:
+            hold_run(sys.argv[2])
+        except (ValueError, OSError, KeyError):
+            print('보관한 실행을 시작하지 못했습니다.', file=sys.stderr)
+            raise SystemExit(1)
+    if len(sys.argv) == 3 and sys.argv[1] == 'reattach':
+        return hold_attach(sys.argv[2])
     if len(sys.argv) >= 3 and sys.argv[1] == 'handoff':
         return handoff_main(sys.argv[2:])
     if len(sys.argv) == 2 and sys.argv[1] == 'new-session':
@@ -524,7 +691,7 @@ def _main():
             from managed_launch import mark_attached
             mark_attached(spec, 'transfer-' + transfer_id)
             os.chdir(spec['cwd'])
-            os.execve(spec['argv'][0], spec['argv'], spec['env'])
+            _execve(spec['argv'], spec['env'])
         raise ValueError('지원하지 않는 이전 명령입니다.')
     try:
         request = json.loads(sys.stdin.buffer.read(30 * 1024 * 1024 + 1))
@@ -539,6 +706,11 @@ def _main():
 
 
 def main():
+    global _hold
+    if len(sys.argv) > 3 and sys.argv[1] == 'hold':
+        # `hold <name> <terminal step...>`: the step runs as usual, its final exec in that session.
+        _hold = _hold_name(sys.argv[2])
+        sys.argv = [sys.argv[0]] + sys.argv[3:]
     if len(sys.argv) > 2 and sys.argv[1] in ('send', 'receive', 'exec'):
         with job_operation(sys.argv[2]):
             return _main()

@@ -1074,6 +1074,19 @@ class ChatClaudeTest(unittest.TestCase):
         self.assertEqual(self.send()['status'], 'accepted')
         self.assertEqual(len(self.terms.pastes), 1)
 
+    def test_a_held_terminal_attaching_again_takes_no_send_until_it_is_back(self):
+        row = self.terminal()
+        row['holdName'] = 'sh-0123456789abcdef'
+        waiting = Path(self.flow.transfers.hold_waiting) / row['holdName']
+        waiting.parent.mkdir(parents=True)
+        waiting.touch()
+        self.assertIn('다시 연결하는 중', self.rejected())
+        self.assertEqual(self.terms.pastes, [])
+        self.assertEqual(self.records(), [], 'nothing reserved: the same request goes once it is back')
+        waiting.unlink()
+        self.assertEqual(self.send()['status'], 'accepted')
+        self.assertEqual(len(self.terms.pastes), 1)
+
     def test_a_windows_claude_background_session_says_it_cannot_take_input(self):
         self.board.hosts[0]['platform'] = 'windows'
         try:

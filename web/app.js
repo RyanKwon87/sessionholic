@@ -6273,10 +6273,16 @@ function terminalCloseCopy(terminal) {
     done: "터미널을 닫았습니다. 작업 상태는 실행 기기에서 확인하세요.",
   };
 }
-// A run started in this terminal on another host lives in that host's connection.
+// A run on another host: kept in that host's tmux (holdName), it outlasts a dropped connection;
+// otherwise it lives in the connection itself.
+function terminalHeld(terminal) {
+  return !!terminalInfo(terminal).holdName;
+}
 function terminalContextCopy(terminal, copy = terminalCloseCopy(terminal)) {
   const mode = terminal?.mode || terminal?.metadata?.mode;
   const host = capsHost(terminalInfo(terminal).host);
+  if (terminalHeld(terminal))
+    return `${copy.context} 실행 기기가 잠들거나 연결이 끊겨도 실행은 그 기기에서 계속되고, 다시 연결되면 이어서 보입니다.`;
   if (["new-session", "resume", "handoff", "transfer"].includes(mode) && host && !host.local)
     return `${copy.context} 단, 실행 기기가 잠들거나 연결이 2분 넘게 끊기면 실행이 끝납니다.`;
   return copy.context;
@@ -6288,8 +6294,9 @@ function terminalEndedCopy(terminal) {
   if (terminal?.closedReason === "released")
     return "한동안 보지 않아 이 보드의 보기 연결만 정리했습니다. 작업은 실행 기기에서 계속됩니다.";
   const host = capsHost(terminalInfo(terminal).host);
-  // "connection_ended" is any end of the terminal's run: its own exit or a lost host.
-  if (terminal?.closedReason === "connection_ended" && host && !host.local)
+  // "connection_ended" is any end of the terminal's run: its own exit or a lost host. A held
+  // run outlasts a lost host, so its end is its own.
+  if (terminal?.closedReason === "connection_ended" && host && !host.local && !terminalHeld(terminal))
     return `${copy.ended} 실행 기기가 잠들었거나 2분 넘게 연결이 끊겼을 수도 있습니다.`;
   return copy.ended;
 }
@@ -7838,6 +7845,8 @@ async function confirmTerminalClose() {
     assertAuthEpoch(authEpoch);
     finishTerminalClose(closing);
     updateInputCleanupNotice(result.inputCleanupPending === true);
+    // The run its host keeps ends once that host is back (the board's sweep).
+    if (result.remoteCleanupPending === true) toast("실행 기기에 연결되면 그 기기의 실행도 종료합니다.");
   } catch (err) {
     if (!err.unauthorized && !err.staleAuth) {
       closing.uncertain = true;

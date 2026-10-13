@@ -361,7 +361,8 @@ class TerminalManager:
     def _public(terminal):
         return {**copy.deepcopy(terminal.record["metadata"]), "id": terminal.record["id"], "key": terminal.record["key"],
                 "metadata": copy.deepcopy(terminal.record["metadata"]), "alive": terminal.alive,
-                "closed": terminal.record.get("closed", False), "closedReason": terminal.record.get("closedReason")}
+                "closed": terminal.record.get("closed", False), "closedReason": terminal.record.get("closedReason"),
+                "closedAt": terminal.record.get("closedAt")}
 
     def _get(self, terminal_id):
         if self._closed:
@@ -639,7 +640,9 @@ class TerminalManager:
         if terminal.record.get("closed", False) or not terminal.alive:
             raise RuntimeError("터미널 연결이 종료되었습니다.")
         pane = self._pane(terminal)
-        if pane["alternate"] and pane["mouse"]:
+        # A held run's client draws on the main screen (no alternate one), so its mouse modes
+        # alone say a full-screen app wants the wheel.
+        if pane["mouse"] and (pane["alternate"] or terminal.record["metadata"].get("holdName")):
             return self._wheel(terminal, pane, lines)
         name = terminal.record["name"]
         if lines < 0:
@@ -1046,7 +1049,138 @@ def _launch(path):
     os.execve(data["argv"][0], data["argv"], data["env"])
 
 
+HOLD_RETRY = (2, 5, 10, 20, 30)
+HOLD_BACK = 8  # attached again this long (past SSH's 6 s connect wait): the board takes sends again
+HOLD_SETTLED = 60  # a connection that lasted this long starts the waits over
+HOLD_FIRST_GRACE = 15  # an SSH that fails this soon after opening never ran the step
+
+
+# Modes a run turned on through the dropped connection (mouse reports, bracketed paste) are
+# off while the board terminal waits, so a wheel or a paste does not print escape codes.
+HOLD_RESET = "\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?2004l\x1b[?25h"
+
+
+def _hold_waiting(path, waiting):
+    """The mark the board reads while this terminal reconnects (a Claude send waits for it)."""
+    if not path:
+        return
+    path = Path(path)
+    try:
+        if waiting:
+            path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            path.touch(mode=0o600)
+        else:
+            path.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _hold_quiet(quiet, saved=None):
+    """No echo while waiting (keys typed then are dropped anyway); the saved modes back after."""
+    try:
+        if quiet:
+            saved = termios.tcgetattr(0)
+            modes = list(saved)
+            modes[3] &= ~termios.ECHO
+            termios.tcsetattr(0, termios.TCSANOW, modes)
+            return saved
+        if saved is not None:
+            termios.tcsetattr(0, termios.TCSANOW, saved)
+    except (termios.error, OSError, ValueError):
+        pass
+    return None
+
+
+def _hold_ended(path):
+    """Its user stopped this terminal reconnecting (Ctrl+C): the board's sweep ends the run on
+    that host once the host is back, as for a terminal closed from the board."""
+    if not path:
+        return
+    try:
+        Path(path).parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        Path(path).with_name(Path(path).name + ".ended").touch(mode=0o600)
+    except OSError:
+        pass
+
+
+def _hold_loop(spec, run=subprocess.call, sleep=time.sleep, clock=time.monotonic, out=None, timer=threading.Timer):
+    """A board terminal whose run another host keeps in its own tmux: reconnect after a
+    dropped connection (SSH exit 255) by attaching again, never starting anything. Any other
+    exit (the run ended, Ctrl+C, a refusal) ends the terminal with that code."""
+    out = out or sys.stdout
+    wait_path = spec.get("wait")
+    argv, attempt, opened = spec["first"], 0, clock()
+    try:
+        while True:
+            started, back = clock(), None
+            if argv is not spec["first"]:
+                # Still marked while connecting and a moment after: a send then could be
+                # split or dropped. Attached that long, the board takes sends again.
+                back = timer(HOLD_BACK, _hold_waiting, (wait_path, False))
+                back.daemon = True
+                back.start()
+            try:
+                code = run(argv)
+            except KeyboardInterrupt:
+                # Ctrl+C while attaching again (the terminal is not raw yet): as while waiting.
+                if back is not None:
+                    back.cancel()
+                    _hold_ended(wait_path)
+                return 130
+            if back is not None:
+                back.cancel()
+            if code != 255:
+                return code if code >= 0 else 1
+            if argv is spec["first"] and clock() - opened < HOLD_FIRST_GRACE:
+                return 255  # The connection never came up: report it, no loop.
+            if clock() - started >= HOLD_SETTLED:
+                attempt = 0
+            wait = HOLD_RETRY[min(attempt, len(HOLD_RETRY) - 1)]
+            attempt += 1
+            _hold_waiting(wait_path, True)
+            try:
+                termios.tcflush(0, termios.TCIFLUSH)
+            except (termios.error, OSError, ValueError):
+                pass
+            out.write(HOLD_RESET + "\r\n[하던 일] 기기 연결이 끊겼습니다. 실행은 그 기기에서 계속되고, "
+                      "%d초 뒤 다시 연결합니다… (Ctrl+C를 누르면 다시 연결하지 않고, 기기가 연결되면 그 기기의 "
+                      "실행도 끝냅니다)\r\n" % wait)
+            out.flush()
+            saved = _hold_quiet(True)
+            try:
+                sleep(wait)
+            except KeyboardInterrupt:
+                _hold_ended(wait_path)
+                return 130
+            finally:
+                _hold_quiet(False, saved)
+            try:
+                # Keys typed while away never reach the run.
+                termios.tcflush(0, termios.TCIFLUSH)
+            except (termios.error, OSError, ValueError):
+                pass
+            argv = spec["again"]
+    finally:
+        _hold_waiting(wait_path, False)
+
+
 if __name__ == "__main__":
+    if len(sys.argv) == 3 and sys.argv[1] == "--hold-loop":
+        try:
+            spec = json.loads(sys.argv[2])
+            if not (isinstance(spec, dict) and all(isinstance(spec.get(k), list) and spec[k]
+                                                   and all(isinstance(a, str) for a in spec[k]) for k in ("first", "again"))
+                    and isinstance(spec.get("wait", ""), str)):
+                raise ValueError("hold loop")
+            # A stopped (Ctrl+Z) loop would leave the terminal frozen; SSH keeps its own keys.
+            signal.signal(signal.SIGTSTP, signal.SIG_IGN)
+        except ValueError:
+            print("터미널 명령을 시작하지 못했습니다.", file=sys.stderr)
+            sys.exit(1)
+        try:
+            sys.exit(_hold_loop(spec))
+        except KeyboardInterrupt:
+            sys.exit(130)
     if len(sys.argv) == 3 and sys.argv[1] == "--launch":
         try:
             _launch(sys.argv[2])

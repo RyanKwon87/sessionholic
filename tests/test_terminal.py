@@ -376,6 +376,13 @@ class ValidationTest(unittest.TestCase):
         self.assertEqual([call.args for call in run.call_args_list],
                          [("send-keys", "-t", name, "-X", "cancel"), ("send-keys", "-t", name, "-l", "\x1b[<64;60;15M")])
         self.assertFalse(stream.scrolled)
+        # A held run's client draws on the main screen: its mouse modes alone mean the wheel.
+        stream.record["metadata"] = {"holdName": "sh-0123456789abcdef"}
+        with patch.object(self.manager, "_run", return_value=ok) as run, \
+                patch.object(self.manager, "_pane", return_value=self.pane(alternate=0, mouse=1, sgr=1)):
+            self.assertEqual(self.manager.scroll(tid, -3), app)
+        self.assertEqual(run.call_args.args, ("send-keys", "-t", name, "-l", "\x1b[<64;60;15M"))
+        stream.record["metadata"] = {}
         # The alternate screen without mouse reporting keeps the tmux history path.
         with patch.object(self.manager, "_run", return_value=ok) as run, \
                 patch.object(self.manager, "_pane", side_effect=[self.pane(alternate=1), self.pane(inMode=1, position=3)]):

@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import re
+import secrets
 import shlex
 import shutil
 import subprocess
@@ -149,6 +150,12 @@ class Transfers:
         self.runtime_installed = {}
         self.profile_cache = {}
         self.launcher_cache = {}
+        # host name -> the tmux its helper keeps runs in (reported with profiles), or None
+        self.hold_support = {}
+        # This board's mark in the names of the runs it holds, so its sweep never takes another
+        # board's (a development board, a canary) on the same host.
+        self.hold_tag = hashlib.sha256(str(self.base_dir.resolve()).encode()).hexdigest()[:8]
+        self.hold_waiting = self.base_dir / 'hold-waiting'
         self.profile_failures = {}
         self.lock = threading.RLock()
         self._runtime = None
@@ -197,9 +204,42 @@ class Transfers:
             return [sys.executable] + args
         command = 'exec ' + shlex.join([python] + args)
         if tty:
-            return [shutil.which('ssh') or '/usr/bin/ssh', '-tt'] + self.terminal_options() + ['--', host['ssh'], command]
+            return self._ssh_tty(host, command)
         return [shutil.which('ssh') or '/usr/bin/ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=6',
                 '-o', 'ServerAliveInterval=10', '-o', 'ServerAliveCountMax=2'] + self.control_options() + ['--', host['ssh'], command]
+
+    def terminal(self, host, args):
+        """A board terminal's command for `args` (['-I', helper, step...]) and its hold name.
+
+        On a Mac whose helper keeps runs in its own tmux, the step runs there under a new
+        name (`hold`), and the command is this board's reconnect loop (terminal.py
+        --hold-loop): a dropped connection or a sleeping host does not end the run, and the
+        board attaches again (`reattach`, which never starts anything). Elsewhere it is the
+        plain SSH command and no name."""
+        from transfer_worker import HOLD_SOCKET
+        with self.lock:
+            tmux = self.hold_support.get(host['name'])
+        if host.get('local') or host.get('platform') == 'windows' or not tmux:
+            return self.command(host, args, tty=True), None
+        if len(args) < 3 or args[0] != '-I':
+            raise ValueError('기기 도우미 명령이 올바르지 않습니다.')
+        name = 'sh-' + self.hold_tag + secrets.token_hex(4)
+        first = self.command(host, ['-I', args[1], 'hold', name] + list(args[2:]), tty=True)
+        # Attaching again needs only that host's tmux: never a helper file a later deploy removes.
+        # The exact target is quoted by hand: shlex leaves "=name" bare, and zsh (a Mac's login
+        # shell) reads a word starting with "=" as a command path.
+        again = self._ssh_tty(host, 'exec ' + shlex.join([tmux, '-L', HOLD_SOCKET, '-f', '/dev/null',
+                                                          'attach-session', '-t']) + " '=" + name + "'")
+        loop = [sys.executable, '-I', str(Path(__file__).resolve().with_name('terminal.py')), '--hold-loop',
+                json.dumps({'first': first, 'again': again, 'wait': str(self.hold_waiting / name)})]
+        return loop, name
+
+    def holds_mine(self, name):
+        """Whether a hold on a host is one this board made (its sweep ends no other's)."""
+        return isinstance(name, str) and name.startswith('sh-' + self.hold_tag)
+
+    def _ssh_tty(self, host, remote):
+        return [shutil.which('ssh') or '/usr/bin/ssh', '-tt'] + self.terminal_options() + ['--', host['ssh'], remote]
 
     def _exchange(self, host, request, timeout, full):
         """One bootstrap run; `full` adds the helper archive, otherwise only its SHA-256 goes."""
@@ -350,6 +390,10 @@ class Transfers:
         with self.lock:
             self.profile_cache[host['name']] = (time.monotonic(), result)
             self.launcher_cache[host['name']] = data.get('launcher') if isinstance(data.get('launcher'), dict) else None
+            tmux = data.get('holdTmux')
+            held = (data.get('holds') is True and isinstance(tmux, str) and tmux.startswith('/') and len(tmux) < 512
+                    and not any(c.isspace() or ord(c) < 32 for c in tmux))
+            self.hold_support[host['name']] = tmux if held else None
             self.profile_failures.pop(host['name'], None)
         return result
 
@@ -524,7 +568,8 @@ class Transfers:
             status('ready')
             self._cleanup_record(record, folder / 'transfer.json')
             import collector
-            return {'argv':self.command(target_host, ['-I', self.runtime_paths[target_host['name']], 'exec', transfer_id], tty=True),
+            argv, hold = self.terminal(target_host, ['-I', self.runtime_paths[target_host['name']], 'exec', transfer_id])
+            return {'argv':argv, 'holdName':hold,
                     'cwd':str(Path.home()), 'env':collector.tool_env(), 'transferId':transfer_id,
                     'destinationCwd':prepared['cwd'], 'nativeSource':prepared.get('nativeSource'), 'connectionMode':prepared.get('connectionMode'), 'warnings':prepared.get('warnings',[])}
         except Exception as exc:

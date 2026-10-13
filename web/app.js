@@ -3310,7 +3310,8 @@ const DICTATION_NOT_STARTED = "음성 인식이 시작되지 않아 멈췄습니
 const DICTATION_SILENCE_END = "말이 없어 듣기를 끝냈습니다. 이어서 말하려면 마이크를 다시 누르세요.";
 const DICTATION_ENDED_AT_ONCE = "음성 인식이 바로 끝났습니다. 이 화면(홈 화면 앱 등)에서 막혀 있을 수 있습니다. 브라우저에서 열거나 키보드의 받아쓰기를 써 주세요.";
 const DICTATION_INTERRUPTED = "음성 인식이 중간에 끝났습니다. 들은 글은 남겨 두었습니다. 다시 눌러 이어서 말해 주세요.";
-const DICTATION_STOP_WAIT_MS = 3000;
+const DICTATION_CHANGED = "입력창의 글이 바뀌어 음성 입력을 멈췄습니다. 다시 누르면 이어서 받아씁니다.";
+const DICTATION_STOP_WAIT_MS = 8000;
 // Checked once a second: no start within this many seconds (a permission prompt included),
 // or nothing heard for this many after it, ends the listening.
 const DICTATION_START_TICKS = 15;
@@ -3397,7 +3398,7 @@ function startDictation(field, { report, active }) {
   const start = Number.isInteger(field.selectionStart) ? Math.min(field.selectionStart, value.length) : value.length;
   const end = Number.isInteger(field.selectionEnd) ? Math.min(Math.max(start, field.selectionEnd), value.length) : start;
   const session = { field, recognition, report, active, prefix: value.slice(0, start), suffix: value.slice(end),
-    written: value, results: [], heard: false, started: false, silent: false, error: "", applying: false, stopping: false,
+    written: value, results: [], finals: [], text: "", heard: false, started: false, silent: false, error: "", applying: false, stopping: false,
     ticks: 0, idle: 0, timer: null, stopTimer: null };
   const listening = () => {
     if (state.dictation !== session || session.started) return;
@@ -3410,12 +3411,26 @@ function startDictation(field, { report, active }) {
   recognition.onresult = (event) => {
     if (state.dictation !== session) return;
     // Off screen, or the text changed by other means (a paste, a restored message): those win.
-    if (!session.active() || field.value !== session.written) {
+    if (!session.active()) {
       stopDictation({ abort: true });
+      return;
+    }
+    if (field.value !== session.written) {
+      stopDictation({ abort: true, message: DICTATION_CHANGED });
       return;
     }
     listening();
     session.idle = 0;
+    // A final result never changes, and the list only grows: one that starts over (seen in
+    // WebKit after a pause) keeps the words already written and adds after them.
+    const list = Array.from(event.results || []);
+    const restarted = list.length < session.finals.length ||
+      session.finals.some((text, i) => text !== undefined && String(list[i]?.[0]?.transcript || "") !== text);
+    if (restarted && session.text) {
+      session.prefix = session.prefix + (session.prefix && !/\s$/.test(session.prefix) ? " " : "") + session.text;
+      session.finals = [];
+    }
+    session.finals = list.map((result, i) => (result?.isFinal ? String(result?.[0]?.transcript || "") : session.finals[i]));
     session.results = event.results;
     session.heard = true;
     applyDictation(session);
@@ -3444,6 +3459,10 @@ function startDictation(field, { report, active }) {
       stopDictation();
     }
   }, 1000);
+  // Android keyboards (Samsung's among them) rewrite or commit again a focused field's text
+  // they did not type, which reads as the user's own typing and ends the listening. There the
+  // keyboard lets go of the field while it listens; elsewhere it stays open.
+  if (touchDevice() && dictationCumulative() && document.activeElement === field) field.blur?.();
   report(DICTATION_PREPARING);
   renderDictation();
   try {
@@ -3458,6 +3477,7 @@ function startDictation(field, { report, active }) {
 function applyDictation(session) {
   const { field } = session;
   const text = dictationText(session.results);
+  session.text = text;
   const lead = text && session.prefix && !/\s$/.test(session.prefix) ? " " : "";
   const trail = text && session.suffix && !/^\s/.test(session.suffix) ? " " : "";
   const before = session.prefix + lead + text;
@@ -3498,11 +3518,13 @@ function finishDictation(session) {
 function stopDictation({ abort = false, field = null, message = "" } = {}) {
   const session = state.dictation;
   if (!session || (field && session.field !== field)) return;
+  if (!abort && session.stopping) return;
   if (!abort && !session.stopping) {
     session.stopping = true;
     session.stopTimer = setTimeout(() => {
       if (state.dictation === session) stopDictation({ abort: true, message: !session.active() ? ""
-        : session.error ? dictationOutcome(session) : session.heard ? DICTATION_STALLED : DICTATION_NOT_STARTED });
+        : session.error ? dictationOutcome(session) : session.heard ? DICTATION_STALLED
+        : session.started ? DICTATION_ERRORS["no-speech"] : DICTATION_NOT_STARTED });
     }, DICTATION_STOP_WAIT_MS);
     try {
       session.recognition.stop();
@@ -3730,7 +3752,7 @@ function buildChatComposer(s) {
     if (entry.inputError && entry.error === entry.inputError) entry.error = "";
     entry.inputError = "";
     startDictation(input, { report: reportDictation,
-      active: () => editorCurrent() && chatVisible() && !input.disabled && !input.readOnly });
+      active: () => editorCurrent() && chatVisible() });
   });
   mic.id = "chat-mic";
   mic.innerHTML = MIC_ICON;

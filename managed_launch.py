@@ -42,11 +42,12 @@ def _resume(spec, identity, socket, receipt_path):
 
 
 def app_server_running(profile, home=None):
-    """Whether this Codex home's app-server control socket is there and safe to use."""
+    """A safe endpoint confirmed closed no longer blocks starting this account's daemon."""
     from transfer_native import _socket_path
+    from collector import daemon_socket_state
     try:
-        _socket_path({'home': profile['home']}, home)
-        return True
+        path = _socket_path({'home': profile['home']}, home)
+        return daemon_socket_state(path) != 'closed'
     except ValueError:
         return False
 

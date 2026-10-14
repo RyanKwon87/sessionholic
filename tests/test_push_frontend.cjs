@@ -14,14 +14,15 @@ const pushSource = fs.readFileSync(path.join(__dirname, "../web/push.js"), "utf8
 const settle = () => new Promise(setImmediate);
 const plain = (value) => JSON.parse(JSON.stringify(value));
 
-function worker({ pending = [], fetchFails = false, shown = [], windows = [], subscribed = true } = {}) {
+function worker({ pending = [], fetchFails = false, shown = [], windows = [], subscribed = true,
+  csrfToken, failTags = [], ackFails = false } = {}) {
   const listeners = {}, notifications = [], fetches = [], opened = [];
   const self = {
     location: { origin: "https://board.example" },
     addEventListener: (type, handler) => { listeners[type] = handler; },
     registration: {
       pushManager: { getSubscription: async () => (subscribed ? { endpoint: ENDPOINT } : null) },
-      showNotification: async (title, options) => { notifications.push({ title, ...options }); },
+      showNotification: async (title, options) => { if (failTags.includes(options.tag)) throw new Error('fixture: display failed'); notifications.push({ title, ...options }); },
       getNotifications: async () => shown,
     },
     clients: {
@@ -35,8 +36,12 @@ function worker({ pending = [], fetchFails = false, shown = [], windows = [], su
     caches: { keys: async () => [], open: async () => ({ match: async () => null, put: async () => {}, keys: async () => [] }) },
     fetch: async (url, options) => {
       fetches.push({ url, options });
+      if (url === '/api/push/ack') {
+        if (ackFails) throw new Error('fixture: ACK lost');
+        return { ok: true, json: async () => ({ ok: true }) };
+      }
       if (fetchFails) throw new Error("offline");
-      return { ok: true, json: async () => ({ notifications: pending }) };
+      return { ok: true, json: async () => ({ notifications: pending, csrfToken }) };
     },
   });
   async function fire(type, event = {}) {
@@ -56,13 +61,33 @@ test("a push shows each queued notice with a safe board link, read with the boar
   await w.fire("push");
   const id = crypto.createHash("sha256").update(ENDPOINT).digest("hex").slice(0, 32);
   assert.equal(w.fetches.length, 1);
-  assert.equal(w.fetches[0].url, `/api/push/pending?id=${id}`);
+  assert.equal(w.fetches[0].url, `/api/push/pending?id=${id}&v=2`);
   assert.equal(w.fetches[0].options.headers["X-Board-Push"], "1");
   assert.equal(w.fetches[0].options.credentials, "same-origin");
   assert.deepEqual(w.notifications.map((item) => [item.title, item.tag, item.data.url, item.renotify]), [
     ["정산 자동화", "session:a|codex||1", "/?session=a%7Ccodex%7C%7C1", true],
     ["외부 링크", "session:b", "/", true],
   ]);
+});
+
+test('only displayed notice versions are acknowledged and an ACK failure keeps display retry idempotent', async () => {
+  const first = { title: 'first', tag: 'first', noticeId: 'a'.repeat(32), url: '/?session=first' };
+  const second = { title: 'second', tag: 'second', noticeId: 'b'.repeat(32), url: '/?session=second' };
+  const w = worker({ pending: [first, second], csrfToken: 'fixture-csrf', failTags: ['second'] });
+  await w.fire('push');
+  assert.equal(w.notifications.length, 1);
+  const ack = w.fetches.find((item) => item.url === '/api/push/ack');
+  assert.deepEqual(JSON.parse(ack.options.body).notices, [first.noticeId]);
+  assert.equal(ack.options.headers['X-CSRF-Token'], 'fixture-csrf');
+  assert.equal(ack.options.headers['X-Board-Push'], '1');
+  const failed = worker({ pending: [second], csrfToken: 'fixture-csrf', failTags: ['second'] });
+  await assert.rejects(failed.fire('push'), /display failed/);
+  assert.equal(failed.fetches.some((item) => item.url === '/api/push/ack'), false);
+  const repeat = worker({ pending: [first], csrfToken: 'fixture-csrf', ackFails: true,
+    shown: [{ tag: first.tag, data: { noticeId: first.noticeId, url: first.url } }] });
+  await repeat.fire('push');
+  assert.equal(repeat.notifications.length, 0, 'a displayed version is not sounded again');
+  assert.equal(repeat.fetches.filter((item) => item.url === '/api/push/ack').length, 1);
 });
 
 test("with nothing queued a push shows the latest notice again quietly, or a generic one, never nothing", async () => {

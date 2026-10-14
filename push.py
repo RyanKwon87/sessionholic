@@ -44,6 +44,7 @@ MAX_PENDING = 20
 MIN_WORK = 120            # seconds of work (until the row's last update) before a stop counts as finished
 RETRY = 60                # a device whose last wake-up failed for a passing reason is tried again,
 RETRY_LIMIT = 6           # ... with doubling waits (1, 2, 4 ... minutes), this many times at most
+ACK_RETRY = 120           # a successful wake-up whose notice was not acknowledged
 PENDING_TTL = 3600        # a notice nobody read for an hour is dropped, not shown late
 FRESH = 30 * 60           # a row last updated longer ago never notifies
 SEEN_LIMIT = 4000
@@ -88,6 +89,8 @@ def write_private(path, value):
     try:
         with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
             json.dump(value, stream, ensure_ascii=False)
+            stream.flush()
+            os.fsync(stream.fileno())
         os.replace(str(temporary), str(path))
     except BaseException:
         temporary.unlink(missing_ok=True)
@@ -232,8 +235,17 @@ class PushService:
                               if isinstance(row, dict) and valid_endpoint(row.get("endpoint"))
                               and row.get("id") == subscription_id(row["endpoint"])][:MAX_SUBSCRIPTIONS]
         seen = read_private(self.directory / "seen.json", {})
-        self.seen = seen if isinstance(seen, dict) else {}
-        self.pending, self.retry_after, self.reported, self.failed = {}, {}, set(), {}
+        saved = seen if isinstance(seen, dict) and seen.get("version") == 2 else {}
+        self.seen = saved.get("seen", {}) if saved else seen if isinstance(seen, dict) else {}
+        if not isinstance(self.seen, dict):
+            self.seen = {}
+        registered = {row["id"] for row in self.subscriptions}
+        pending = saved.get("pending", {})
+        self.pending = {key: self._fresh(value) for key, value in pending.items()
+                        if key in registered and isinstance(value, list)} if isinstance(pending, dict) else {}
+        wake = saved.get("wake", {})
+        self.last_wake = {key: value for key, value in wake.items() if key in registered and isinstance(value, (int, float))} if isinstance(wake, dict) else {}
+        self.retry_after, self.reported, self.failed = {}, set(), {}
         # Hosts looked at by this process: a session first seen on one of them is new.
         self.observed_hosts = set()
         self.last_poll = -1e9
@@ -285,17 +297,41 @@ class PushService:
             if len(rows) != len(self.subscriptions):
                 self._save_subscriptions(rows)
             self.pending.pop(identifier, None)
+            self.last_wake.pop(identifier, None)
+            self._save_seen(int(self.clock()))
         return {"ok": True, "subscriptions": len(rows)}
 
     def _save_subscriptions(self, rows):
         write_private(self.directory / "subscriptions.json", rows)
         self.subscriptions = rows
 
-    def pending_for(self, identifier):
+    def pending_for(self, identifier, retain=False):
         if not isinstance(identifier, str) or not re.fullmatch(r"[a-f0-9]{32}", identifier):
             raise ValueError("알림 기기 정보가 올바르지 않습니다.")
         with self.lock:
-            return {"notifications": self._fresh(self.pending.pop(identifier, []))}
+            notices = self._fresh(self.pending.get(identifier, []))
+            if not retain:
+                self.pending.pop(identifier, None)  # Compatibility with workers deployed before ACK support.
+                self._save_seen(int(self.clock()))
+            return {"notifications": [dict(item) for item in notices]}
+
+    def acknowledge(self, data):
+        if (not isinstance(data, dict) or set(data) != {"id", "notices"}
+                or not isinstance(data["id"], str) or not re.fullmatch(r"[a-f0-9]{32}", data["id"])
+                or not isinstance(data["notices"], list) or len(data["notices"]) > MAX_PENDING
+                or any(not isinstance(value, str) or not re.fullmatch(r"[a-f0-9]{32}", value) for value in data["notices"])):
+            raise ValueError("확인할 알림 정보가 올바르지 않습니다.")
+        identifier, acknowledged = data["id"], set(data["notices"])
+        with self.lock:
+            before = self.pending.get(identifier, [])
+            remaining = [item for item in before if item.get("noticeId") not in acknowledged]
+            self.pending[identifier] = remaining
+            try:
+                self._save_seen(int(self.clock()), required=True)
+            except OSError:
+                self.pending[identifier] = before
+                raise
+            return {"ok": True, "acknowledged": len(before) - len(remaining)}
 
     def test(self, data):
         if not self.enabled:
@@ -356,9 +392,16 @@ class PushService:
                 self.board.request_refresh()
             except (ValueError, RuntimeError):
                 pass
-        events = self.observe(self.labels(self.board.snapshot()))
+        snapshot = self.labels(self.board.snapshot())
+        with self.lock:
+            events = self.observe(snapshot, persist=False)
+            targets = list(self.subscriptions)
+            for event in events:
+                self._queue(targets, self.notice(event), persist=False)
+            if events or self.observation_changed:
+                self._save_seen(int(self.clock()))
         if events:
-            self.notify(events)
+            self.notify(events, queued=True, targets=targets)
         self.retry()
         return events
 
@@ -372,7 +415,13 @@ class PushService:
             due = []
             for target in self.subscriptions:
                 failed = self.failed.get(target["id"])
-                if not self.pending.get(target["id"]) or not failed or not failed[1] or failed[2] > RETRY_LIMIT:
+                if not self.pending.get(target["id"]):
+                    continue
+                if not failed:
+                    if self.clock() - self.last_wake.get(target["id"], 0) >= ACK_RETRY:
+                        due.append(target)
+                    continue
+                if not failed[1] or failed[2] > RETRY_LIMIT:
                     continue
                 if now >= max(self.retry_after.get(target["id"], 0), failed[0] + RETRY * 2 ** (failed[2] - 1)):
                     due.append(target)
@@ -382,7 +431,7 @@ class PushService:
             self._send(target, ttl=86400 if urgent[target["id"]] else 3600,
                        urgency="high" if urgent[target["id"]] else "normal")
 
-    def observe(self, snapshot):
+    def observe(self, snapshot, persist=True):
         """Phase transitions worth an alert since the last look; records every row seen."""
         now = int(self.clock())
         events, changed = [], False
@@ -441,20 +490,26 @@ class PushService:
                         continue
                     events.append({"kind": kind, "key": key, "host": host, "row": {**row, "agent": agent}})
             self.observed_hosts.add(host["name"])
-        if changed or len(self.seen) > SEEN_LIMIT:
+        self.observation_changed = changed
+        if persist and (changed or len(self.seen) > SEEN_LIMIT):
             self._save_seen(now)
         return events
 
-    def _save_seen(self, now):
+    def _save_seen(self, now, required=False):
         rows = {key: value for key, value in self.seen.items()
                 if isinstance(value, dict) and now - (value.get("seenAt") or 0) <= SEEN_TTL}
         if len(rows) > SEEN_LIMIT:
             rows = dict(sorted(rows.items(), key=lambda item: item[1].get("seenAt") or 0)[-SEEN_LIMIT:])
         self.seen = rows
+        registered = {item["id"] for item in self.subscriptions}
+        self.pending = {key: self._fresh(value) for key, value in self.pending.items() if key in registered and self._fresh(value)}
+        self.last_wake = {key: value for key, value in self.last_wake.items() if key in self.pending}
         try:
-            write_private(self.directory / "seen.json", rows)
+            write_private(self.directory / "seen.json", {"version": 2, "seen": rows, "pending": self.pending, "wake": self.last_wake})
         except OSError:
             sys.stderr.write("%s: 알림 상태 기록 저장 실패\n" % self.log_prefix)
+            if required:
+                raise
 
     # ---------- sending ----------
     def notice(self, event):
@@ -468,13 +523,15 @@ class PushService:
                 "url": "/?session=" + quote(event["key"], safe=""), "kind": event["kind"],
                 "createdAt": int(self.clock())}
 
-    def notify(self, events):
+    def notify(self, events, queued=False, targets=None):
         """Queue every alert of one round, then wake each browser once: its service worker
         reads them all, so a second push never finds an empty queue. Each round is logged."""
-        with self.lock:
-            targets = list(self.subscriptions)
-        for event in events:
-            self._queue(targets, self.notice(event))
+        if not queued:
+            with self.lock:
+                targets = list(self.subscriptions)
+                for event in events:
+                    self._queue(targets, self.notice(event), persist=False)
+                self._save_seen(int(self.clock()))
         urgent = any(event["kind"] == "needs_input" for event in events)
         statuses = [self._send(target, ttl=86400 if urgent else 3600, urgency="high" if urgent else "normal")
                     for target in targets] if events else []
@@ -483,22 +540,31 @@ class PushService:
             self.log_prefix, len(events), sum(event["kind"] == "needs_input" for event in events),
             len(targets), delivered))
 
-    def _queue(self, targets, notice):
+    def _queue(self, targets, notice, persist=True):
+        notice = {**notice, "noticeId": secrets.token_hex(16), "createdAt": notice.get("createdAt", int(self.clock()))}
         with self.lock:
             for target in targets:
                 queue = self.pending.setdefault(target["id"], [])
                 queue[:] = [item for item in self._fresh(queue) if item.get("tag") != notice["tag"]][-(MAX_PENDING - 1):]
                 queue.append(dict(notice))
+            if persist:
+                self._save_seen(int(self.clock()))
 
     def _fresh(self, items):
         now = int(self.clock())
-        return [item for item in items if now - (item.get("createdAt") or now) <= PENDING_TTL]
+        return [item for item in items if isinstance(item, dict) and isinstance(item.get("createdAt"), (int, float))
+                and 0 <= now - item["createdAt"] <= PENDING_TTL and isinstance(item.get("title"), str)
+                and isinstance(item.get("tag"), str) and isinstance(item.get("noticeId"), str)
+                and re.fullmatch(r"[a-f0-9]{32}", item["noticeId"])]
 
     def _send(self, target, ttl, urgency):
         """One device's wake-up; whatever goes wrong stays with this device."""
         identifier = target["id"]
         if self.retry_after.get(identifier, 0) > self.monotonic():
             return 429
+        with self.lock:
+            self.last_wake[identifier] = int(self.clock())
+            self._save_seen(int(self.clock()))
         try:
             headers = {"TTL": str(ttl), "Urgency": urgency, "Content-Length": "0",
                        "Authorization": self.vapid.authorization(target["endpoint"])}

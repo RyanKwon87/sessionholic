@@ -2755,7 +2755,11 @@ class Handler(BaseHTTPRequestHandler):
                     if self.command != "GET":
                         # HEAD runs this route too; it would clear the queue without a body to show.
                         return self.send_json(405, {"error": "알림 내용은 GET으로만 읽을 수 있습니다."})
-                    return self.send_json(200, self.server.push.pending_for(query.get("id")))
+                    if query.get("v") not in (None, "2"):
+                        raise ValueError("알림 읽기 버전이 올바르지 않습니다.")
+                    retain = query.get("v") == "2"
+                    result = self.server.push.pending_for(query.get("id"), retain=retain)
+                    return self.send_json(200, {**result, **({"csrfToken": self.server.csrf} if retain else {})})
                 goal_match = re.fullmatch(r"/api/goals/([a-f0-9]{32})", url.path)
                 if goal_match:
                     return self.send_json(200, self.server.goals.get(goal_match[1]))
@@ -2967,6 +2971,10 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_json(200, self.server.push.unsubscribe(data))
             if path == "/api/push/test":
                 return self.send_json(200, self.server.push.test(data))
+            if path == "/api/push/ack":
+                if self.headers.get("X-Board-Push") != "1":
+                    return self.send_json(403, {"error": "이 보드의 알림에서만 확인할 수 있습니다."})
+                return self.send_json(200, self.server.push.acknowledge(data))
             work_match = re.fullmatch(r"/api/work/([a-f0-9]{32})", path)
             if work_match:
                 return self.send_json(200, self.server.work.update(work_match[1], data))
@@ -3209,13 +3217,14 @@ def make_server(bind, port, board, token, terminals=None, workflow=None, state_d
 
     def push_category(host, row):
         """The list's 일반/에이전트/봇 split: only 일반 sessions notify."""
+        import collector
         source = {"host": host.get("name"), "agent": row.get("agent"), "id": row.get("id"), "home": row.get("home")}
         try:
             if server.workflow.bot_request(source):
                 return "bot"
         except (RuntimeError, OSError, ValueError):
             return "unknown"
-        return "agent" if row.get("initiator") == "agent" else "general"
+        return collector.session_category(row)
     server.push = PushService(board, state_dir, classify=push_category, labels=server.session_labels.decorate,
                               log_prefix=LOG_PREFIX, enabled=push)
     if push:

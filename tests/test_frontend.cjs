@@ -1143,12 +1143,13 @@ test("service worker refuses session, login, terminal, and query-bearing cache r
   assert.equal(intercepted, 1);
 });
 
-test("browser history contains only the view, and Android back returns one screen", () => {
+test("browser history keeps only navigation metadata, and Android back returns one screen", () => {
   const c = client();
   c.navigateView("list", true);
   c.navigateView("detail");
   assert.equal(c.context.window.history.state.view, "detail");
   assert.deepEqual(Object.keys(c.context.window.history.state).sort(), [
+    "listDepth", "navigationId", "parentDetailId",
     "sessionholic",
     "view",
   ]);
@@ -7099,7 +7100,7 @@ test('the installation meta names preferences, titles, history and attachment fo
   c.renderAttention([]);
   assert.equal(c.context.document.title, '데모 보드');
   c.navigateView('detail');
-  assert.deepEqual(Object.keys(c.context.window.history.state).sort(), ['demoBoard', 'view']);
+  assert.deepEqual(Object.keys(c.context.window.history.state).sort(), ['demoBoard', 'listDepth', 'navigationId', 'parentDetailId', 'view']);
   c.backToList();
   assert.equal(c.context.window.history.backCount, 1);
   c.context.window.history.state = { sessionholic: true, view: 'detail' };
@@ -7126,7 +7127,7 @@ test('a missing, broken or invalid installation meta keeps the public names', ()
     c.renderAttention([]);
     assert.equal(c.context.document.title, '세션홀릭 - 에이전트 세션 매니저');
     c.navigateView('detail');
-    assert.deepEqual(Object.keys(c.context.window.history.state).sort(), ['sessionholic', 'view']);
+    assert.deepEqual(Object.keys(c.context.window.history.state).sort(), ['listDepth', 'navigationId', 'parentDetailId', 'sessionholic', 'view']);
   }
   // One valid key is used even when another is not.
   const c = client(undefined, noChatTimers, { instanceMeta: JSON.stringify({ storagePrefix: 'db:', historyKey: '1bad' }) });
@@ -7135,7 +7136,7 @@ test('a missing, broken or invalid installation meta keeps the public names', ()
   vm.runInContext('prefs.set("fontSize", 15)', c.context);
   assert.deepEqual(writes, [['db:ui:fontSize', '15']]);
   c.navigateView('detail');
-  assert.deepEqual(Object.keys(c.context.window.history.state).sort(), ['sessionholic', 'view']);
+  assert.deepEqual(Object.keys(c.context.window.history.state).sort(), ['listDepth', 'navigationId', 'parentDetailId', 'sessionholic', 'view']);
 });
 
 test('theme-init reads the preference prefix from the installation meta above it', () => {
@@ -10440,4 +10441,123 @@ test('leaving the typing layout puts the reader back exactly where they were, wh
   assert.equal(list.scrollTop, 0, 'the shift into the typing layout was cut short at the top');
   vm.runInContext('setTyping', c.context)(false);
   assert.equal(list.scrollTop, 82);
+});
+
+function navigationStack(c) {
+  const entries = []; let position = -1; const history = c.context.window.history;
+  history.pushState = (value) => { entries.splice(position + 1); entries.push(value); history.state = value; position++; };
+  history.replaceState = (value) => { if (position < 0) { entries.push(value); position = 0; } else entries[position] = value; history.state = value; };
+  history.go = (delta) => { position += delta; assert.ok(position >= 0 && position < entries.length); history.state = entries[position]; c.windowEvents.popstate?.({ state: history.state }); };
+  history.back = () => history.go(-1);
+  return entries;
+}
+
+test('restoring old removed sessions keeps them visible from both the card and management sheet; failures keep filters', async () => {
+  for (const manage of [false, true]) {
+    const c = client(async () => ({ ok: true, status: 200, json: async () => ({ removedAt: null, version: 8 }) }), noChatTimers);
+    const now = 2_000_000;
+    const row = recentSession('old-restored', { phase: 'done', updatedAt: now - 10 * 86400, removedAt: now - 30, tidiedAt: now - 20 });
+    c.state.snapshot = { serverTime: now, version: 7, hosts: [{ name: 'workstation', label: 'Workstation', ok: true, data: { codex: [row], claude: [] } }] };
+    c.state.authenticated = true; c.state.showRemoved = true; c.state.pollBusy = true;
+    const s = c.allSessions()[0];
+    if (manage) {
+      const context = { s, source: c.sourceOf(s), authEpoch: c.state.authEpoch, busy: false };
+      vm.runInContext('sessionControl = globalThis.__context', Object.assign(c.context, { __context: context }));
+      c.get('session-control-tidy').replaceWith = () => {};
+      await c.tidySession(context, false);
+    } else await c.showSessionAgain(s);
+    assert.equal(c.state.showOld, true);
+    assert.equal(c.get('show-old').checked, true);
+    assert.equal(c.sessionRemoved(c.allSessions()[0]), false);
+    assert.equal(c.matches(c.allSessions()[0], now), true);
+  }
+  const c = client(async () => ({ ok: false, status: 503, json: async () => ({ error: 'fixture: unavailable' }) }), noChatTimers);
+  const row = recentSession('failed-restored', { phase: 'done', updatedAt: 1, removedAt: 2 });
+  setRecentSnapshot(c, [row]); c.state.showRemoved = true;
+  await c.showSessionAgain(c.allSessions()[0]);
+  assert.equal(c.state.showOld, false); assert.equal(c.sessionRemoved(c.allSessions()[0]), true);
+});
+
+test('late terminal resize success and failure belong to the terminal they were sent to', async () => {
+  for (const failed of [false, true]) {
+    const timers = [], requests = []; let complete;
+    const c = client((url) => {
+      requests.push(url);
+      if (requests.length === 1) return new Promise((resolve) => { complete = () => resolve({ ok: !failed, status: failed ? 409 : 200, json: async () => ({ error: 'fixture: old resize failed' }) }); });
+      return Promise.resolve({ ok: true, status: 200, json: async () => ({}) });
+    }, { setTimeout: (callback, ms) => { timers.push({ callback, ms }); return timers.length; }, clearTimeout() {} });
+    c.state.authenticated = true; c.state.terminalVisible = true; c.state.connected = true; c.state.terminalAlive = true;
+    c.state.terminal = { id: 'first' }; c.state.term = { cols: 101, rows: 31 }; c.state.fit = { fit() {} };
+    vm.runInContext('fitTerminal()', c.context);
+    const old = timers.find((item) => item.ms === 180).callback();
+    c.state.terminal = { id: 'second' }; c.state.lastSize = '';
+    vm.runInContext('fitTerminal()', c.context);
+    complete(); await old;
+    assert.equal(c.state.lastSize, ''); assert.equal(c.get('terminal-error').textContent, '');
+    await timers.filter((item) => item.ms === 180).at(-1).callback();
+    assert.deepEqual(requests, ['/api/terminal/first/resize', '/api/terminal/second/resize']);
+    assert.equal(c.state.lastSize, '101x31');
+  }
+});
+
+test('closing a covering terminal consumes its board history and forward cannot reopen the closed views', () => {
+  const c = client(undefined, noChatTimers); c.context.navigator = { onLine: false }; c.windowEvents.DOMContentLoaded();
+  const { s } = selectChat(c); const entries = navigationStack(c);
+  c.navigateView('list', true); c.navigateView('detail'); c.navigateView('terminal');
+  c.state.selected = s.key; c.state.detailShown = true; c.state.terminal = { id: 'closed' }; c.state.terminalVisible = true;
+  c.finishTerminalClose({ id: 'closed', copy: { done: 'closed' } });
+  assert.equal(c.context.window.history.state.view, 'list'); assert.equal(c.state.detailShown, false);
+  c.context.window.history.go(1); assert.equal(c.state.detailShown, false); assert.equal(c.context.window.history.state.view, 'list');
+  c.context.window.history.go(1); assert.equal(c.state.detailShown, false); assert.equal(c.state.terminalVisible, false);
+  assert.ok(entries.every((entry) => entry.view === 'list'));
+});
+
+test('repeated dock openings and card selections reuse the list history entry', async () => {
+  const { c } = dockClient(1440);
+  const { s } = selectChat(c); const other = { ...s, id: 'other-docked', key: s.key.replace(s.id, 'other-docked') };
+  c.state.snapshot.hosts[0].data.codex.push(other);
+  const entries = navigationStack(c); c.navigateView('list', true);
+  for (let index = 0; index < 3; index++) {
+    const current = c.allSessions().find((item) => item.key === c.state.selected) || s;
+    await c.openTerminal({ id: 'side', mode: 'attach', nativeSource: c.sourceOf(current) });
+    c.select(current.key === s.key ? other.key : s.key);
+  }
+  assert.equal(entries.length, 1); assert.equal(entries[0].view, 'list');
+});
+
+test('touch quick replies keep the input focus, insert without sending, and close on cancel or Escape', () => {
+  const requests = [];
+  const c = client(async (url) => { requests.push(url); return { ok: true, status: 200, json: async () => ({}) }; }, noChatTimers);
+  c.context.window.matchMedia = (query) => ({ matches: query === '(pointer: coarse)' });
+  const { entry } = selectChat(c); const input = c.get('chat-input');
+  const composer = node(); composer.append = function (panel) { this.children.push(panel); panel.remove = () => { this.children = this.children.filter((item) => item !== panel); }; };
+  input.closest = () => composer; c.context.document.activeElement = input;
+  const trigger = node(); let focused = 0; input.focus = () => { focused++; };
+  c.openQuickReplies(entry, input, trigger);
+  const panel = c.state.quickRepliesOpen.panel;
+  assert.notEqual(c.get('action-sheet').open, true); assert.equal(c.context.document.activeElement, input);
+  let prevented = false; panel.children[0].events.pointerdown({ preventDefault() { prevented = true; } });
+  assert.equal(prevented, true); panel.children[0].events.click();
+  assert.equal(entry.text, c.quickReplies()[0]); assert.equal(focused, 0); assert.equal(composer.children.length, 0);
+  assert.ok(!requests.includes('/api/chat/send'));
+  c.openQuickReplies(entry, input, trigger); c.state.quickRepliesOpen.panel.children.at(-1).events.click();
+  assert.equal(c.state.quickRepliesOpen, null); assert.equal(focused, 0);
+  c.openQuickReplies(entry, input, trigger);
+  c.closeChatToolsEscape({ key: 'Escape', preventDefault() {} });
+  assert.equal(c.state.quickRepliesOpen, null); assert.equal(focused, 0); assert.equal(trigger.attributes['aria-expanded'], 'false');
+});
+
+test('header device chips include hardware-only devices with their actual status and no duplicates', () => {
+  const c = client(undefined, noChatTimers); setRecentSnapshot(c, []);
+  c.state.snapshot.hosts.push({ name: 'second', label: 'Second', ok: true }, { name: 'third', label: 'Third', ok: true });
+  for (const status of ['ready', 'offline', 'stale', 'pending']) {
+    c.state.hardware = { hosts: [{ name: 'workstation', label: 'Duplicate', status: 'ready' }, { name: 'spare', label: 'Spare laptop', status, fetchedAt: 1090 }] };
+    c.render();
+    const chips = c.get('hosts').children;
+    assert.equal(chips.length, 4); assert.equal(chips.filter((chip) => chip.dataset.host === 'workstation').length, 1);
+    const spare = chips.find((chip) => chip.dataset.host === 'spare');
+    assert.match(spare.title, /Spare laptop/);
+    assert.match(spare.className, status === 'ready' ? /\bok\b/ : /\bbad\b/);
+    if (status === 'stale') assert.match(spare.title, /이전 기기 정보/);
+  }
 });

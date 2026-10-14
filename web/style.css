@@ -2134,6 +2134,30 @@ li[data-task] {
 }
 
 /* 8. Dialogs, progress, toast -------------------------------------------- */
+.chat-quick-options {
+  position: absolute;
+  z-index: 40;
+  bottom: calc(100% + 8px);
+  left: 0;
+  right: 0;
+  max-height: min(240px, 35vh);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: 8px;
+  border: 1px solid var(--sep);
+  border-radius: 14px;
+  background: var(--surface);
+  box-shadow: var(--shadow-toast);
+}
+.chat-quick-options .action-item {
+  display: block;
+  width: 100%;
+  min-height: 44px;
+  text-align: left;
+}
+.chat-composer:has(.chat-quick-options) {
+  position: relative;
+}
 /* Title and actions stay put; only .dialog-body scrolls. The dialog's own
    overflow is a fallback for screens too short even for the fixed parts. */
 .plan-dialog {

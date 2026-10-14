@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import sqlite3
+import socket
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -53,6 +54,40 @@ class OfflineHomeTest(unittest.TestCase):
         socket_path.write_text('')
         state_db(self.home / '.codex-router/0123456789abcdef', [
             ('019a0000-0000-7000-8000-000000000005', 100, 300, 'cli', '/old', '옛 작업', 0, '', '', None)])
+
+    def test_stale_safe_socket_falls_back_to_recorded_rows_and_no_longer_blocks_a_launch(self):
+        import managed_launch
+        path = self.home / '.codex' / collector.SOCKET_REL
+        path.parent.mkdir(mode=0o700)
+        with socket.socket(socket.AF_UNIX) as listener:
+            listener.bind(str(path)); listener.listen(5); path.chmod(0o600)
+            self.assertEqual(collector.daemon_socket_state(path), 'ready')
+            self.assertTrue(managed_launch.app_server_running({'home': '.codex'}, self.home))
+        self.assertEqual(collector.daemon_socket_state(path), 'closed')
+        self.assertFalse(managed_launch.app_server_running({'home': '.codex'}, self.home))
+        errors = []
+        rows = collector.codex_threads(errors, [])
+        recorded = [row for row in rows if row['home'] == '.codex']
+        self.assertEqual(len(recorded), 3)
+        self.assertTrue(all(row.get('appServer') == 'off' and row['phase'] == 'closed' for row in recorded))
+        self.assertEqual(len(errors), 1, 'the unrelated invalid socket remains an error, not a fallback')
+        target = self.home / 'runtime'
+        target.mkdir(mode=0o700)
+        endpoint = target / 'daemon.sock'
+        path.unlink()
+        path.symlink_to(endpoint)
+        with socket.socket(socket.AF_UNIX) as listener:
+            listener.bind(str(endpoint)); listener.listen(5)
+            self.assertEqual(collector.daemon_socket_state(path), 'ready')
+        self.assertEqual(collector.daemon_socket_state(path), 'closed')
+        self.assertFalse(managed_launch.app_server_running({'home': '.codex'}, self.home))
+        target.chmod(0o777)
+        self.assertEqual(collector.daemon_socket_state(path), 'unsafe')
+        target.chmod(0o700)
+        path.parent.chmod(0o777)
+        self.assertEqual(collector.daemon_socket_state(path), 'unsafe')
+        self.assertEqual(collector.codex_home_threads(path.parent.parent)[2], 'connect')
+        path.parent.chmod(0o700)
 
     def test_homes_without_a_daemon_are_listed_from_the_state_db_read_only(self):
         self.assertEqual([key for key, _ in collector.codex_homes()], ['.codex-live'])

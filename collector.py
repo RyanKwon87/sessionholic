@@ -8,6 +8,7 @@ Standard library only and Python 3.9 compatible because POSIX host's /usr/bin/py
 from __future__ import annotations
 
 import base64
+import errno
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 import glob
@@ -555,6 +556,26 @@ def session_origin(row):
             "originator": _metadata_text(row.get("originator"))}
 
 
+def session_category(row, bot=False):
+    """The board's general/agent/bot policy, also used by notification delivery."""
+    if (bot or row.get("originator") == "hermes" or
+            re.search(r"[\\/]workspaces[\\/]slack(?:[\\/]|$)|[\\/]\.hermes(?:[\\/]|$)", str(row.get("cwd") or ""), re.I)):
+        return "bot"
+    if row.get("initiator") == "agent" or row.get("parentSessionId") or row.get("agentRole"):
+        return "agent"
+    if row.get("initiator") == "human":
+        return "general"
+    if row.get("agent") == "codex":
+        if row.get("source") in ("cli", "vscode"):
+            return "general"
+        if row.get("source") == "exec":
+            return "agent"
+        return "general" if row.get("originator") in ("codex-tui", "session-board") else "agent"
+    if row.get("agent") == "claude" and row.get("kind") in ("interactive", "background"):
+        return "general"
+    return "agent"
+
+
 def claude_row(row, transcripts, projects):
     if not isinstance(row, dict):
         raise TypeError("Claude 세션 행 형식이 올바르지 않습니다.")
@@ -879,11 +900,48 @@ def codex_home_threads(path, full=False):
         with AppServer(path / SOCKET_REL) as server:
             listed, _ = list_threads(server, quick=not full)
             loaded = loaded_threads(server)
-    except (OSError, RpcError):
+    except OSError as error:
+        if error.errno in (errno.ENOENT, errno.ECONNREFUSED) and daemon_socket_state(path / SOCKET_REL) == "closed":
+            return None, None, "stale"
+        return None, None, "connect"
+    except RpcError:
         return None, None, "connect"
     except Exception:
         return None, None, "read"
     return listed, loaded, None
+
+
+def daemon_socket_state(path, timeout=0.5):
+    """A safe control socket accepts a connection, is confirmed closed, or is unknown.
+    Refused/missing endpoints alone mean closed; a timeout or permission error never does.
+    No RPC, command, socket deletion or session input is performed."""
+    path = Path(path)
+    try:
+        if path.parent.resolve() != path.parent.absolute():
+            return "unsafe"
+        parent = path.parent.stat()
+        if parent.st_uid != os.getuid() or parent.st_mode & 0o022:
+            return "unsafe"
+        link = path.lstat()
+        resolved = path.resolve()
+        target_parent = resolved.parent.stat()
+        if (link.st_uid != os.getuid() or target_parent.st_uid != os.getuid()
+                or target_parent.st_mode & 0o022):
+            return "unsafe"
+        info = resolved.stat()
+        if info.st_uid != os.getuid() or not stat.S_ISSOCK(info.st_mode):
+            return "unsafe"
+    except FileNotFoundError:
+        return "closed"
+    except (OSError, RuntimeError):
+        return "unknown"
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as probe:
+            probe.settimeout(timeout)
+            probe.connect(str(path))
+        return "ready"
+    except OSError as error:
+        return "closed" if error.errno in (errno.ENOENT, errno.ECONNREFUSED) else "unknown"
 
 
 def codex_labels(homes):
@@ -943,8 +1001,11 @@ def codex_threads(errors, projects, full=False):
             replies = list(pool.map(lambda path: codex_home_threads(path, full), paths))
     else:
         replies = [codex_home_threads(path, full) for path in paths]
-    for (key, _), (project_id, account), reply in zip(homes, labels, replies):
-        rows, failures = codex_home_rows(key, project_id, account, reply, projects)
+    for (key, path), (project_id, account), reply in zip(homes, labels, replies):
+        fallback = reply[2] == "stale" and not key.startswith(".codex-router/")
+        if fallback:
+            reply = codex_db_threads(path)
+        rows, failures = codex_home_rows(key, project_id, account, reply, projects, offline=fallback)
         out.extend(rows)
         errors.extend(failures)
     for (key, path), (project_id, account) in zip(offline, codex_labels(offline)):

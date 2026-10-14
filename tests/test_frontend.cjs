@@ -9242,7 +9242,7 @@ test('the chat mic writes what the device hears at the cursor in Korean, live, a
   assert.equal(rec.started, 1);
   assert.deepEqual([rec.lang, rec.continuous, rec.interimResults], ['ko-KR', true, true]);
   assert.equal(mic.attributes['aria-pressed'], 'true');
-  assert.equal(mic.attributes['aria-label'], '음성 입력', 'the label stays; aria-pressed says it listens');
+  assert.equal(mic.attributes['aria-label'], '음성 입력 중지', 'a second press ends this listening');
   assert.equal(c.get('chat-status').textContent, c.DICTATION_PREPARING, 'until the recognition says it started');
   rec.onstart();
   assert.equal(c.get('chat-status').textContent, c.DICTATION_LISTENING);
@@ -9645,16 +9645,17 @@ test('typing, a paste, sending, an error or the input leaving the screen ends th
   assert.equal(rec.aborted, 1);
   assert.equal(entry.dictationNotice, c.DICTATION_STALLED);
   assert.match(input.value, /말하다/, 'what it heard stays');
-  // Pressed again while it ends: still ending, so a late last result is kept; the wait ends it.
+  // Pressed again while it ends: abort now; a late last result cannot change the draft.
   rec = begin();
   rec.stop = function () { this.stopped++; };
   mic.events.click();
   mic.events.click();
-  assert.deepEqual([rec.stopped, rec.aborted], [1, 0]);
+  assert.deepEqual([rec.stopped, rec.aborted], [1, 1]);
+  const writtenBeforeAbort = input.value;
   rec.onresult(result('늦게 온 마지막 말'));
-  assert.match(input.value, /늦게 온 마지막 말/);
+  assert.equal(input.value, writtenBeforeAbort);
   stopTimer().callback();
-  assert.equal(rec.aborted, 1);
+  assert.equal(rec.aborted, 2, 'a late orphan result stops its engine again');
   assert.equal(c.state.dictation, null);
   // The conversation leaves the screen (a terminal opens over it): the mic closes, quietly.
   rec = begin();
@@ -9919,11 +9920,12 @@ test("with the list stepped aside for a docked terminal, back and ⌘K bring the
   const { s } = selectChat(c);
   await c.openTerminal({ id: "solo", mode: "attach", nativeSource: c.sourceOf(s) });
   assert.equal(c.state.dockSolo, true);
-  // Back leaves the terminal's history entry (its popstate returns to the board, as 숨기기).
+  // Back hides the pane directly, replacing its entry without needing older history.
   const backs = c.context.window.history.backCount;
   c.backToList();
-  assert.equal(c.context.window.history.backCount, backs + 1);
-  c.returnToBoard({ selectLaunchedSource: false, animate: false });
+  assert.equal(c.context.window.history.backCount, backs);
+  assert.equal(c.state.terminalVisible, false);
+  assert.equal(c.context.window.history.state.view, 'list');
   assert.equal(classes.has("dock-solo"), false);
   assert.equal(c.state.selected, s.key);
   await c.openTerminal({ id: "solo", mode: "attach", nativeSource: c.sourceOf(s) });
@@ -10038,7 +10040,8 @@ test("docked with the list aside, Esc on the board side brings the list", async 
   c.noteDockSide("board");
   const backs = c.context.window.history.backCount;
   assert.equal(c.listNavigationKeydown({ key: "Escape", preventDefault() {}, target: c.context.document.body }), true);
-  assert.equal(c.context.window.history.backCount, backs + 1);
+  assert.equal(c.context.window.history.backCount, backs);
+  assert.equal(c.state.terminalVisible, false);
 });
 
 test("typing with an iPad's on-screen keyboard folds the top bar; beside a docked terminal the terminal keeps its height", async () => {
@@ -10167,7 +10170,7 @@ test('a listening is traced to the board after it ends, with codes and lengths b
   await settle();
   assert.equal(posts.length, 1);
   const [trace] = posts;
-  assert.deepEqual(trace.events.map((event) => event.e), ['press', 'say', 'start', 'say', 'audiostart', 'speechstart',
+  assert.deepEqual(trace.events.map((event) => event.e), ['press', 'say', 'begin', 'start', 'say', 'audiostart', 'speechstart',
     'result', 'apply', 'input', 'stop', 'say', 'end', 'say']);
   assert.deepEqual(trace.events.filter((event) => event.e === 'say').map((event) => event.why), ['preparing', 'listening', 'ending', '']);
   assert.equal(trace.outcome, '');
@@ -10629,6 +10632,168 @@ test('repeated dock openings and card selections reuse the list history entry', 
     c.select(current.key === s.key ? other.key : s.key);
   }
   assert.equal(entries.length, 1); assert.equal(entries[0].view, 'list');
+});
+
+test('the first docked new-session screen can hide with no older browser history entry', async () => {
+  const { c } = dockClient(1180);
+  c.context.navigator = { onLine: false }; c.windowEvents.DOMContentLoaded();
+  const entries = navigationStack(c); c.navigateView('list', true);
+  await c.openTerminal({ id: 'new-ipad-session', mode: 'new-session', host: 'workstation' });
+  assert.equal(entries.length, 1); assert.equal(entries[0].view, 'terminal');
+  c.get('terminal-back').events.click();
+  assert.equal(c.state.terminalVisible, false);
+  assert.equal(c.state.terminal.id, 'new-ipad-session', 'hide keeps the run available');
+  assert.equal(c.get('app').hidden, false);
+  assert.equal(entries.length, 1); assert.equal(entries[0].view, 'list');
+});
+
+test('iPad terminal header taps keep their target steady until hide or the close confirmation takes focus', async () => {
+  const requests = [];
+  const { c } = dockClient(1180, async (url) => {
+    requests.push(url); return { ok: true, status: 200, json: async () => ({ terminals: [] }) };
+  });
+  c.context.navigator = { onLine: false }; c.windowEvents.DOMContentLoaded();
+  c.context.window.matchMedia = (query) => ({ matches: query === '(pointer: coarse)' });
+  c.navigateView('list', true);
+  const own = { id: 'ipad-new', mode: 'new-session', host: 'workstation' };
+  await c.openTerminal(own); requests.length = 0;
+  const draft = c.get('terminal-draft'); draft.tagName = 'TEXTAREA';
+  draft.closest = (selector) => selector === '#terminal-screen' ? c.get('terminal-screen') : null;
+  let blurred = 0;
+  draft.blur = () => { blurred++; c.context.document.activeElement = c.context.document.body; };
+  c.context.document.activeElement = draft;
+  for (const id of ['terminal-back', 'terminal-dock', 'terminal-close']) {
+    for (const type of ['pointerdown', 'mousedown']) {
+      let prevented = false;
+      c.get(id).events[type]({ preventDefault() { prevented = true; } });
+      assert.equal(prevented, true, `${id}: ${type}`);
+    }
+  }
+  assert.equal(blurred, 0, 'the keyboard cannot move the target between press and click');
+  c.get('terminal-close').events.click();
+  assert.equal(blurred, 1); assert.equal(c.get('close-terminal-dialog').open, true);
+  assert.equal(requests.some((url) => url.endsWith('/close')), false, 'opening confirmation does not end the run');
+  assert.equal(c.state.closingTerminal.trigger, c.get('terminal-close'));
+  await c.get('close-terminal-confirm').events.click();
+  assert.equal(requests.filter((url) => url.endsWith('/close')).length, 1);
+  assert.equal(c.state.terminalVisible, false); assert.equal(c.get('close-terminal-dialog').open, false);
+  // Hiding also lets go of the terminal's field, while keeping the terminal available.
+  await c.openTerminal({ ...own, id: 'hide-after-close' });
+  c.context.document.activeElement = draft;
+  c.get('terminal-back').events.click();
+  assert.equal(blurred, 2); assert.equal(c.state.terminalVisible, false);
+});
+
+test('both iPad panes follow a scrolled keyboard viewport through blur until the actual offset returns', async () => {
+  const { c, classes, vars } = dockClient(1180);
+  c.context.window.matchMedia = (query) => ({ matches: query === '(pointer: coarse)' });
+  c.context.window.innerHeight = 788;
+  c.context.window.visualViewport = { height: 788, pageTop: 0, offsetTop: 0, scale: 1 };
+  c.updateViewport(); await c.openTerminal({ id: 'ipad-shift', mode: 'new-session' });
+  const draft = c.get('terminal-draft'); draft.tagName = 'TEXTAREA';
+  c.context.document.activeElement = draft;
+  c.context.window.innerHeight = 366;
+  c.context.window.visualViewport = { height: 366, pageTop: 422, offsetTop: 422, scale: 1 };
+  c.updateViewport(); assert.equal(vars['--app-shift'], '422px');
+  assert.equal(classes.has('app-shifted'), true);
+  // Safari lets go of focus before restoring the viewport; dropping the transform now
+  // would put the input and header above the screen, just as in the physical-device trace.
+  c.context.document.activeElement = null;
+  vm.runInContext('renderAppShift()', c.context);
+  assert.equal(vars['--app-shift'], '422px');
+  c.updateViewport(); assert.equal(vars['--app-shift'], '422px');
+  const css = fs.readFileSync(path.join(__dirname, '../web/style.css'), 'utf8');
+  assert.match(css, /body\.app-shifted \.app,\s*body\.app-shifted \.terminal-screen\s*\{\s*transform: translateY\(var\(--app-shift/);
+  c.context.window.innerHeight = 788;
+  c.context.window.visualViewport = { height: 788, pageTop: 0, offsetTop: 0, scale: 1 };
+  c.updateViewport(); assert.equal(vars['--app-shift'], '0px');
+  assert.equal(classes.has('app-shifted'), false);
+});
+
+test('a second tap can abort a recognizer that did not finish stopping, then another mic can start', () => {
+  const { c, FakeRecognition, recognitions } = dictationClient();
+  c.context.webkitSpeechRecognition = FakeRecognition;
+  const { s } = selectChat(c); const composer = c.buildChatComposer(s);
+  const input = findId(composer, 'chat-input'); const mic = findId(composer, 'chat-mic');
+  mic.events.click(); const first = recognitions.at(-1); first.onstart();
+  first.stop = function () { this.stopped++; };
+  mic.events.click(); assert.equal(first.stopped, 1);
+  mic.events.click(); assert.equal(c.state.dictation, null);
+  assert.equal(input.readOnly, false); assert.equal(input.disabled, false);
+  mic.events.click(); assert.notEqual(recognitions.at(-1), first);
+  assert.equal(recognitions.at(-1).started, 1);
+});
+
+test('an iPad waiting to restart checks focus, the visible conversation and input locks again before starting', () => {
+  for (const changed of ['focused', 'locked', 'offscreen']) {
+    const { c, FakeRecognition, recognitions, timeouts } = dictationClient();
+    c.context.webkitSpeechRecognition = FakeRecognition;
+    c.context.navigator = { userAgent: 'Macintosh AppleWebKit Safari', onLine: true };
+    c.context.window.matchMedia = (query) => ({ matches: query === '(pointer: coarse)' });
+    const { s, entry } = selectChat(c); const composer = c.buildChatComposer(s);
+    const input = findId(composer, 'chat-input'); const mic = findId(composer, 'chat-mic');
+    c.state.dictationEndedAt = Date.now(); mic.events.click();
+    const rec = recognitions.at(-1); assert.equal(rec.started, 0);
+    let blurred = 0;
+    input.blur = () => { blurred++; c.context.document.activeElement = c.context.document.body; };
+    if (changed === 'focused') c.context.document.activeElement = input;
+    if (changed === 'locked') { entry.pending = { requestId: 'locked-during-wait' }; c.updateChatComposer(entry); }
+    if (changed === 'offscreen') c.state.selected = null;
+    timeouts.find((timer) => timer.ms > 10000 && timer.ms <= 12000).callback();
+    assert.equal(rec.started, changed === 'focused' ? 1 : 0, changed);
+    if (changed === 'focused') assert.equal(blurred, 1);
+    else assert.equal(c.state.dictation, null);
+  }
+});
+
+test('cancelling an iPad restart that never opened the mic does not renew the twelve-second cooldown', async () => {
+  const { c, FakeRecognition, recognitions, settle } = dictationClient();
+  c.context.webkitSpeechRecognition = FakeRecognition;
+  c.context.navigator = { userAgent: 'Macintosh AppleWebKit Safari' };
+  c.context.window.matchMedia = (query) => ({ matches: query === '(pointer: coarse)' });
+  const { s } = selectChat(c); const composer = c.buildChatComposer(s);
+  const mic = findId(composer, 'chat-mic');
+  const previousEnd = Date.now() - 5000; c.state.dictationEndedAt = previousEnd;
+  mic.events.click(); assert.equal(recognitions.at(-1).started, 0);
+  mic.events.click(); await settle();
+  assert.equal(c.state.dictationEndedAt, previousEnd, 'no recognition was started or ended by cancelling the wait');
+});
+
+test('an iPad recognizer that never reports end after abort still gets recovery time before reusing the microphone', () => {
+  const { c, FakeRecognition, recognitions } = dictationClient();
+  c.context.webkitSpeechRecognition = FakeRecognition;
+  c.context.navigator = { userAgent: 'Macintosh AppleWebKit Safari' };
+  c.context.window.matchMedia = (query) => ({ matches: query === '(pointer: coarse)' });
+  const { s } = selectChat(c); const composer = c.buildChatComposer(s); const mic = findId(composer, 'chat-mic');
+  mic.events.click(); const first = recognitions.at(-1); first.onstart();
+  first.abort = function () { this.aborted++; };
+  const stoppedAt = Date.now(); c.stopDictation({ abort: true });
+  assert.ok(c.state.dictationEndedAt >= stoppedAt);
+  mic.events.click(); assert.equal(recognitions.at(-1).started, 0);
+  assert.match(mic.attributes['aria-label'], /초 뒤 음성 입력.*취소/);
+});
+
+test('an iPad terminal mic lets go of keyboard focus even after viewport baseline was lost or a trackpad is connected', () => {
+  for (const coarse of [true, false]) {
+    const { c, FakeRecognition, recognitions } = dictationClient();
+    c.context.webkitSpeechRecognition = FakeRecognition;
+    c.context.navigator = { userAgent: 'Macintosh AppleWebKit Safari', maxTouchPoints: 5 };
+    c.context.window.matchMedia = (query) => ({ matches: coarse && query === '(pointer: coarse)' });
+    c.context.window.innerWidth = 1180; c.context.window.innerHeight = 366;
+    c.context.window.visualViewport = { height: 366, pageTop: 422, offsetTop: 422, scale: 1 };
+    c.state.viewportTall = 366;
+    c.state.terminal = { id: 'keyboard-repeated' }; c.state.terminalVisible = true;
+    const draft = c.get('terminal-draft'); draft.tagName = 'TEXTAREA';
+    draft.blur = () => { c.context.document.activeElement = c.context.document.body; };
+    c.context.document.activeElement = draft;
+    c.toggleDraftDictation();
+    assert.equal(c.context.document.activeElement, c.context.document.body);
+    assert.equal(recognitions.at(-1).started, 1);
+    assert.equal(c.state.dictation.trace.env.letGo, true);
+    assert.equal(c.state.dictation.trace.events.find((event) => event.e === 'begin').focused, false);
+    assert.equal(c.terminalDocumentKey({ key: 'a', target: c.context.document.body, preventDefault() {} }), false,
+      'letting go for the microphone must not send hardware typing straight to the CLI');
+  }
 });
 
 test('touch quick replies keep the input focus, insert without sending, and close on cancel or Escape', () => {

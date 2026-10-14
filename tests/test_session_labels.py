@@ -240,6 +240,28 @@ class SessionTidiedTest(unittest.TestCase):
 
 
 class SessionLabelsHTTPTest(unittest.TestCase):
+    def test_pins_are_shared_exact_identity_and_removal_is_independent(self):
+        response, result = self.request('POST', '/api/session/pin', {'source': self.source, 'pinned': True})
+        self.assertEqual(response.status, 200)
+        self.assertIsInstance(result['pinnedAt'], int)
+        snapshot = self.request('GET', '/api/snapshot')[1]
+        row = snapshot['hosts'][0]['data']['codex'][0]
+        self.assertEqual(row['pinnedAt'], result['pinnedAt'])
+        from session_labels import SessionPinned
+        self.assertEqual(SessionPinned(self.temp.name).decorate(self.board.snapshot())['hosts'][0]['data']['codex'][0]['pinnedAt'], result['pinnedAt'])
+        self.request('POST', '/api/session/remove', {'source': self.source, 'removed': True})
+        row = self.request('GET', '/api/snapshot')[1]['hosts'][0]['data']['codex'][0]
+        self.assertEqual(row['pinnedAt'], result['pinnedAt']); self.assertIsNotNone(row['removedAt'])
+        self.assertEqual(self.request('POST', '/api/session/pin', {'source': self.source, 'pinned': False})[0].status, 200)
+        row = self.request('GET', '/api/snapshot')[1]['hosts'][0]['data']['codex'][0]
+        self.assertIsNone(row['pinnedAt']); self.assertIsNotNone(row['removedAt'])
+
+    def test_pin_route_requires_auth_csrf_and_an_exact_listed_source(self):
+        payload = {'source': self.source, 'pinned': True}
+        self.assertEqual(self.request('POST', '/api/session/pin', payload, auth=False)[0].status, 401)
+        self.assertEqual(self.request('POST', '/api/session/pin', payload, csrf=False)[0].status, 403)
+        for changed in ({'pinned': 1}, {'source': {**self.source, 'id': str(uuid.uuid4())}}, {'at': 1}):
+            self.assertEqual(self.request('POST', '/api/session/pin', {**payload, **changed})[0].status, 400)
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.host = {'name': 'example-mini', 'label': 'Example Mini', 'local': True}

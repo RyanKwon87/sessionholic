@@ -176,6 +176,17 @@ def input_ready(screen):
     return False
 
 
+def terminal_model_settings(screen):
+    """Only Claude's footer below its input box, never transcript or typed text."""
+    if not input_ready(screen): return {}
+    rows = str(screen).replace('\r', '').split('\n')[-INPUT_TAIL:]
+    borders = [i for i, row in enumerate(rows) if row.strip() and all('─' <= c <= '▟' or c.isspace() for c in row.strip())]
+    footer = '\n'.join(rows[borders[-1] + 1:]) if borders else ''
+    model = re.search(r'\b(Opus|Sonnet|Haiku)\b', footer, re.I)
+    effort = re.search(r'\b(low|medium|high|xhigh|max)\s+effort\b', footer, re.I)
+    return {**({'model': model[1].lower()} if model else {}), **({'effort': effort[1].lower()} if effort else {})}
+
+
 def _indent(line):
     return len(line) - len(line.lstrip())
 
@@ -276,6 +287,15 @@ def parse_menu(screen):
 
 
 class Chat:
+    @staticmethod
+    def model_settings(value):
+        from native_chat import model_settings
+        if not isinstance(value, dict): return {}
+        result = model_settings({**value, 'reasoningEffort': value.get('effort')})
+        if value.get('observed') in ('last_response', 'runtime'): result['observed'] = value['observed']
+        if isinstance(value.get('next'), dict):
+            result['next'] = model_settings({**value['next'], 'reasoningEffort': value['next'].get('effort')})
+        return result
     def __init__(self, board, workflow, state_dir):
         self.board, self.workflow = board, workflow
         self.root = Path(state_dir) / 'chat'
@@ -504,6 +524,13 @@ class Chat:
             terminal, terminal_failed = self._board_terminal(source), False
         except (RuntimeError, OSError, ValueError):
             terminal, terminal_failed = None, True
+        if claude and terminal:
+            try:
+                live = terminal_model_settings(self.workflow.terminals.capture(terminal['id']))
+                if live:
+                    result['modelSettings'] = {**(result.get('modelSettings') or {}), **live, 'observed': 'runtime'}
+            except (RuntimeError, ValueError, KeyError, OSError):
+                pass
         action = None
         if claude:
             supported, reason, action = self._claude_capability(source, terminal, terminal_failed,
@@ -534,6 +561,7 @@ class Chat:
         response = {'route': identity, 'phase': phase,
                     'capability': capability,
                     'messages': messages,
+                    'modelSettings': self.model_settings(result.get('modelSettings')),
                     'receipts': receipts, 'maxAttachmentBytes': MAX_FILE,
                     'requiresNativeTerminal': phase == 'needs_input' if claude else
                     result.get('requiresNativeTerminal', phase == 'needs_input'),
@@ -1226,3 +1254,100 @@ class Chat:
                 self._remember(self.state_key(source), [request_id], time.monotonic())
         self._forget_state(source)
         return {'status': receipt['status'], 'receipt': receipt}
+
+    def command(self, data):
+        """Finite, authenticated controls; slash text never becomes an agent prompt."""
+        if (not isinstance(data, dict) or set(data) - {'source', 'command', 'value', 'requestId'}
+                or data.get('command') not in ('models', 'model', 'effort', 'compact')):
+            raise ValueError('지원하는 채팅 명령을 선택해 주세요.')
+        source, host = self.source(data.get('source'))
+        self._direct_session(source)
+        command, value = data['command'], data.get('value')
+        if command == 'models':
+            if value is not None: raise ValueError('모델 조회에는 인자를 넣지 않습니다.')
+            if source['agent'] == 'codex': return self.rpc(host, 'command', source, command=command)
+            current = self.state({'source': data['source']}).get('modelSettings') or {}
+            return {'current': current, 'models': [
+                {'model': 'opus', 'label': 'Opus', 'efforts': ['low', 'medium', 'high', 'xhigh', 'max']},
+                {'model': 'sonnet', 'label': 'Sonnet', 'efforts': ['low', 'medium', 'high']},
+                {'model': 'haiku', 'label': 'Haiku', 'efforts': []}], 'next': {}}
+        request_id = data.get('requestId')
+        if not isinstance(request_id, str) or not REQUEST.fullmatch(request_id):
+            raise ValueError('명령 요청 식별자가 올바르지 않습니다.')
+        if source['agent'] == 'codex':
+            result = self.rpc(host, 'command', source, command=command, value=value, requestId=request_id)
+        else:
+            result = self._claude_command(source, host, command, value, request_id, data['source'])
+        self._forget_state(source)
+        self.board.request_refresh(source['host'], force=True)
+        return result
+
+    def _claude_command(self, source, host, command, value, request_id, ref):
+        if command == 'model' and value not in ('opus', 'sonnet', 'haiku'):
+            raise ValueError('Claude 모델 목록에서 골라 주세요.')
+        if command == 'effort' and value not in ('low', 'medium', 'high', 'xhigh', 'max', 'auto'):
+            raise ValueError('지원하는 에포트 레벨을 골라 주세요.')
+        if command == 'compact' and value is not None: raise ValueError('요약에는 인자를 넣지 않습니다.')
+        lock = self._claude_lock_for(source)
+        if not lock.acquire(timeout=1): raise ValueError(PROMPT_BUSY)
+        try:
+            path = self._claude_record_path(source, 'command-' + request_id)
+            digest = hashlib.sha256(json.dumps([command, value]).encode()).hexdigest()
+            previous = self._claude_read_record(source, 'command-' + request_id)
+            if previous:
+                if previous.get('digest') != digest: raise ValueError('같은 명령 ID에 다른 값을 사용할 수 없습니다.')
+                return previous['result']
+            current = self.rpc(host, 'capabilities', source)
+            if current.get('phase') != 'idle': raise ValueError('작업이 끝난 뒤 명령을 실행해 주세요.')
+            terminal = self._board_terminal(source)
+            if terminal is None and source.get('kind') == 'background' and host.get('platform') != 'windows':
+                terminal = self._open_claude_terminal(ref, source, request_id)
+            if terminal is None: raise ValueError(CLAUDE_EXTERNAL)
+            screen = self.workflow.terminals.capture(terminal['id'])
+            if parse_menu(screen): raise ValueError(CLAUDE_BLOCKED)
+            # Refuse a loading, reconnecting or nonempty editor; no keys clear existing input.
+            if not input_ready(screen) or input_text(screen):
+                raise ValueError('Claude 입력창이 비어 있고 준비된 상태에서 다시 시도해 주세요.')
+            hold = terminal.get('holdName')
+            if hold and (Path(self.workflow.transfers.hold_waiting) / hold).exists():
+                raise ValueError('실행 기기에 다시 연결하는 중입니다.')
+            unknown = {'status': 'unknown', 'reason': '명령 결과를 확인하지 못했습니다. 자동으로 재실행하지 않습니다.'}
+            from server import private_json
+            private_json(path, {'digest': digest, 'result': unknown})
+            body = '/' + command + (' ' + value if value else '')
+            from terminal import InputNotSent
+            try:
+                self.workflow.terminals.paste(terminal['id'], body, submit=True)
+            except InputNotSent:
+                path.unlink(missing_ok=True)
+                raise ValueError('명령을 전달하지 못했습니다. 입력창 상태를 다시 확인해 주세요.') from None
+            except (RuntimeError, ValueError, OSError):
+                return unknown
+            result = {'status': 'accepted', 'terminalId': terminal['id'],
+                      'reason': '요약 명령을 전달했습니다.' if command == 'compact' else '명령을 전달했습니다. 적용 상태를 확인하고 있습니다.'}
+            # Native confirmation only. Never infer success merely from a successful paste.
+            for attempt in range(8 if command != 'compact' else 1):
+                try:
+                    time.sleep(SUBMIT_CHECK_SECONDS if attempt == 0 else .2)
+                    after = self.workflow.terminals.capture(terminal['id'])
+                    if parse_menu(after): break
+                    if attempt == 0 and still_typed(after, body):
+                        # Claude sometimes takes the first Enter as a newline. A second
+                        # Enter is allowed only while this exact command remains in its editor.
+                        self.workflow.terminals.send_keys(terminal['id'], ['Enter'])
+                        result['resubmitted'] = True
+                        continue
+                    if command == 'compact': break
+                    marker = (r'set model to[^\n]*\b' + re.escape(value) + r'\b' if command == 'model'
+                              else r'(?:set |changed )?effort(?: level)?(?: to|:)?\s+' + re.escape(value) + r'\b')
+                    live = terminal_model_settings(after)
+                    if live.get(command) == value or re.search(marker, after, re.I) and not re.search(marker, screen, re.I):
+                        result.update(status='confirmed', current={command: live.get(command) or value},
+                                      reason='모델을 변경했습니다.' if command == 'model' else '에포트 레벨을 변경했습니다.')
+                        break
+                except (RuntimeError, ValueError, KeyError, OSError):
+                    return unknown
+            private_json(path, {'digest': digest, 'result': result})
+            return result
+        finally:
+            lock.release()

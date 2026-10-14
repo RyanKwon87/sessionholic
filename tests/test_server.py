@@ -249,7 +249,7 @@ class ServerTest(unittest.TestCase):
             self.assertEqual((body["sessionTidied"]["ok"], type(body["sessionTidied"]["since"])), (True, int))
             served = {**large, "sessionLabels": {"ok": True, "revision": 0}, "sessionSeen": body["sessionSeen"],
                       "sessionTidied": body["sessionTidied"], "sessionRemoved": body["sessionRemoved"],
-                      "sessionOpened": body["sessionOpened"], "bootId": self.httpd.boot_id}
+                      "sessionOpened": body["sessionOpened"], "sessionPinned": body["sessionPinned"], "bootId": self.httpd.boot_id}
             self.assertEqual(body, served)
             for header in ({}, {"Accept-Encoding": "gzip;q=0"}, {"Accept-Encoding": "identity"}):
                 res, data = self.request("GET", "/api/snapshot", headers={"Authorization": "Bearer " + TOKEN, **header})

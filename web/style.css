@@ -2155,7 +2155,7 @@ li[data-task] {
   min-height: 44px;
   text-align: left;
 }
-.chat-composer:has(.chat-quick-options) {
+.chat-composer:has(.chat-quick-options), .chat-composer:has(.chat-slash-options) {
   position: relative;
 }
 /* Title and actions stay put; only .dialog-body scrolls. The dialog's own
@@ -7027,4 +7027,32 @@ input.switch:focus-visible {
   height: 8px;
   border-radius: 50%;
   background: var(--accent);
+}
+
+/* Favorites and native chat controls. */
+.chat-slash-options {
+  position: absolute; bottom: calc(100% + 8px); left: 0; right: 0; z-index: 41;
+  max-height: min(260px, 35vh); overflow-y: auto; padding: 6px;
+  border: 1px solid var(--sep); border-radius: 12px; background: var(--surface);
+  box-shadow: var(--shadow-pop);
+}
+.chat-slash-option { display: block; width: 100%; min-height: 44px; padding: 10px; text-align: left; }
+.chat-slash-option[aria-selected="true"] { background: var(--fill-soft); border-radius: 8px; }
+.chat-model-controls { display: flex; flex-wrap: wrap; gap: 4px; position: relative; margin-top: 4px; }
+.chat-model-control { color: var(--accent-strong); font-size: var(--fs-sub); min-height: 32px; padding: 4px 8px; border: 1px solid var(--sep); border-radius: 8px; }
+.chat-settings-panel { position: absolute; top: 100%; right: 0; z-index: 42; width: min(320px, 85vw); padding: 16px; background: var(--surface); border: 1px solid var(--sep); border-radius: 12px; box-shadow: var(--shadow-pop); }
+.chat-settings-panel label { display: block; margin-bottom: 8px; }
+.chat-settings-panel select { width: 100%; min-height: 44px; color: var(--label); background: var(--fill-soft); border: 1px solid var(--sep); border-radius: 8px; padding: 8px; font: inherit; }
+.chat-settings-panel > button { min-height: 44px; margin-right: 12px; }
+.detail-titles:has(.chat-model-controls) { display: grid; grid-template-columns: minmax(0, 1fr) auto; column-gap: 8px; }
+.detail-titles:has(.chat-model-controls) > .detail-title { grid-column: 1; grid-row: 1; }
+.detail-titles > .chat-model-controls { grid-column: 2; grid-row: 1; align-self: start; }
+.detail-titles:has(.chat-model-controls) > .detail-device,
+.detail-titles:has(.chat-model-controls) > .detail-project,
+.detail-titles:has(.chat-model-controls) > .detail-meta,
+.detail-titles:has(.chat-model-controls) > .detail-terminal { grid-column: 1 / -1; }
+.chat-model-control { max-width: 210px; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+@media (max-width: 700px) {
+  .detail-titles:has(.chat-model-controls) { display: block; }
+  .chat-model-control { max-width: min(180px, 42vw); min-height: 44px; }
 }

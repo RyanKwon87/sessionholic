@@ -65,6 +65,30 @@ function sessionRemoved(s) {
   }
   return Number.isInteger(s.removedAt);
 }
+function sessionPinned(s) {
+  const local = state.pinnedLocal?.get(s?.key);
+  if (local && !(local.version != null && Number(state.snapshot?.version) >= local.version)) return local.pinned;
+  if (local) state.pinnedLocal.delete(s.key);
+  return Number.isInteger(s?.pinnedAt);
+}
+async function pinSession(s) {
+  if (!state.authenticated || state.pinnedLocal?.get(s.key)?.busy) return;
+  const mark = { pinned: !sessionPinned(s), busy: true }, epoch = state.authEpoch;
+  (state.pinnedLocal ||= new Map()).set(s.key, mark);
+  render();
+  try {
+    const result = await api("/api/session/pin", { method: "POST", body: { source: seenSource(s), pinned: mark.pinned } });
+    if (epoch !== state.authEpoch) return;
+    mark.version = result.version; mark.busy = false;
+    render(); poll(false);
+    toast(mark.pinned ? "즐겨찾기에 고정했습니다." : "상단 고정을 해제했습니다.");
+  } catch (error) {
+    if (epoch !== state.authEpoch) return;
+    if (state.pinnedLocal.get(s.key) === mark) state.pinnedLocal.delete(s.key);
+    render();
+    if (!error.unauthorized && !error.staleAuth) toast(error.message);
+  }
+}
 const BADGES = {
   needs_input: ["답 필요", "red"],
   working: ["작업 중", "amber"],
@@ -165,6 +189,7 @@ const state = {
   seenLocal: new Map(), // session key -> update time this page marked read (markSeen)
   seenFailed: new Map(), // session key -> when its last mark failed (markSeen waits SEEN_RETRY_MS)
   removedLocal: new Map(), // session key -> {removed, after} this page chose until a newer snapshot (sessionRemoved)
+  pinnedLocal: new Map(),
   openedLocal: new Map(), // session key -> when this page opened its conversation (markOpened)
   openedHeld: null, // {key, at}: the open conversation's place in 이전 while it is shown beside the list
   updateAvailable: false, // the board serves a newer screen than this page runs (checkWebVersion)
@@ -988,7 +1013,7 @@ function matches(s, now, { phase = true, category = true, initiator = true } = {
   const removed = sessionRemoved(s);
   if (removed && !state.showRemoved) return false;
   if (
-    !state.showOld && !removed &&
+    !state.showOld && !removed && !sessionPinned(s) &&
     groupOf(s, now) === "rest" &&
     (now - (s.updatedAt || 0) > RECENT_SECONDS || (sessionTidied(s) && !state.search))
   )
@@ -1857,8 +1882,9 @@ function renderGroups(shown, now) {
   const folders = cardFolderHints(shown);
   const desired = [];
   const visible = new Set();
-  for (const group of GROUPS) {
-    const items = shown.filter((s) => groupOf(s, now) === group.key).sort(group.key === "rest" ? recentOrder : titleOrder);
+  for (const group of [{ key: "favorites", label: "★ 즐겨찾기", tone: "gray" }, ...GROUPS]) {
+    const items = shown.filter((s) => group.key === "favorites" ? sessionPinned(s) : !sessionPinned(s) && groupOf(s, now) === group.key)
+      .sort(group.key === "rest" ? recentOrder : titleOrder);
     if (!items.length) continue;
     let section = sections.get(group.key);
     if (!section) {
@@ -2036,7 +2062,7 @@ function updateCard(node, s, now, folderHint = "") {
   markCardTerminal(node, s);
   node.title = `${project}\n${title}`;
   const place = folderHint ? `${project} · ${folderHint}` : project;
-  write(p.title, title); p.title.title = title;
+  write(p.title, (sessionPinned(s) ? "★ " : "") + title); p.title.title = title;
   write(p.snippet, preview); p.snippet.hidden = !preview; p.snippet.title = preview;
   write(p.badge, label); p.badge.className = `badge ${tone}`;
   write(p.agent, agent); p.agent.className = `card-agent ${s.agent}`;
@@ -2383,6 +2409,7 @@ function cardActions(s) {
   const terminal = terminalForSession(s);
   const actions = [
     { label: "대화 열기", run: () => select(s.key) },
+    { label: sessionPinned(s) ? "★ 상단 고정 해제" : "☆ 상단 고정 (즐겨찾기)", run: () => pinSession(s) },
     { label: "세션 관리", run: () => manageSession(s) },
   ];
   if (window.SessionholicLabels?.eligible?.(s)) actions.push({ label: "제목 수정", run: () => window.SessionholicLabels.open(s, document.activeElement) });
@@ -2851,6 +2878,8 @@ function patchDetailMetadata(s) {
   const title = pane.querySelector(".detail-title");
   const eyebrow = pane.querySelector(".detail-project");
   if (title) title.textContent = s.title || "제목 없는 작업";
+  const pin = $("detail-pin");
+  if (pin) { pin.textContent = sessionPinned(s) ? "★ 고정 해제" : "☆ 상단 고정"; pin.setAttribute("aria-pressed", String(sessionPinned(s))); }
   if (eyebrow) eyebrow.textContent = s.project || "";
   pane.querySelector(".detail-meta")?.replaceChildren(...detailMetaChildren(s));
   let note = pane.querySelector(".stale-notice");
@@ -2938,6 +2967,14 @@ function drawDetail(s) {
     el("span", "detail-device", s.hostLabel || s.host || "기기 미확인"),
     el("span", "detail-project", s.project || ""),
   );
+  const settings = el("div", "chat-model-controls");
+  for (const kind of ["model", "effort"]) {
+    const control = button(kind === "model" ? "모델 확인 중…" : "에포트 확인 중…", "chat-model-control", () => openChatSettings(chatEntry(s), kind));
+    control.id = `chat-${kind}-control`;
+    control.setAttribute("aria-expanded", "false");
+    settings.append(control);
+  }
+  titles.append(settings);
   const meta = el("div", "detail-meta");
   meta.append(...detailMetaChildren(s));
   // Shown while this session has a live board terminal (renderDetailTerminal);
@@ -2975,6 +3012,9 @@ function drawDetail(s) {
     if (state.authenticated && state.selected === s.key) manageSession(s, event.currentTarget);
   });
   manage.id = "detail-manage-session";
+  const pin = button(sessionPinned(s) ? "★ 고정 해제" : "☆ 상단 고정", "", () => pinSession(selectedSession() || s));
+  pin.id = "detail-pin"; pin.setAttribute("aria-pressed", String(sessionPinned(s)));
+  conversationActions.append(pin);
   if (window.SessionholicLabels?.eligible?.(s)) {
     const editTitle = button("제목 수정", "", (event) => {
       if (state.selected === s.key) window.SessionholicLabels.open(selectedSession() || s, event.currentTarget);
@@ -4072,6 +4112,155 @@ function toggleDraftDictation() {
       && $("terminal-draft") === field,
   });
 }
+const CHAT_COMMANDS = [
+  { name: "model", label: "모델 선택" }, { name: "effort", label: "에포트 레벨 선택" },
+  { name: "compact", label: "현재 대화 요약" }, { name: "clear", label: "새 대화 시작 · 기존 기록 보존" },
+];
+function updateSlashMenu(entry, box = $("chat-composer"), input = $("chat-input")) {
+  const prefix = /^\/([a-z]*)$/.exec(entry.text.trim());
+  const choices = prefix && !entry.composing && entry.slashDismissedText !== entry.text
+    ? CHAT_COMMANDS.filter((item) => item.name.startsWith(prefix[1])) : [];
+  $("chat-slash-options")?.remove?.();
+  input?.removeAttribute?.("aria-activedescendant");
+  input?.setAttribute("aria-expanded", String(!!choices.length));
+  entry.slashChoices = choices;
+  if (!choices.length || !box || !input || !currentChat(entry)) return;
+  entry.slashIndex = Math.min(entry.slashIndex || 0, choices.length - 1);
+  const menu = el("div", "chat-slash-options");
+  menu.id = "chat-slash-options"; menu.setAttribute("role", "listbox"); menu.setAttribute("aria-label", "슬래시 명령");
+  choices.forEach((item, index) => {
+    const option = button(`/${item.name} · ${item.label}`, "chat-slash-option", () => chooseSlash(entry, index, input));
+    option.id = `chat-slash-option-${index}`; option.setAttribute("role", "option");
+    option.setAttribute("aria-selected", String(index === entry.slashIndex));
+    option.addEventListener("pointerdown", (event) => event.preventDefault());
+    menu.append(option);
+  });
+  input.setAttribute("aria-controls", menu.id); input.setAttribute("aria-autocomplete", "list");
+  input.setAttribute("aria-activedescendant", `chat-slash-option-${entry.slashIndex}`);
+  box.append(menu);
+}
+function chooseSlash(entry, index, input) {
+  const item = entry.slashChoices?.[index];
+  if (!item || !currentChat(entry)) return;
+  entry.text = `/${item.name} `; entry.revision++; input.value = entry.text;
+  entry.slashDismissedText = entry.text;
+  updateSlashMenu(entry); updateChatComposer(entry);
+  input.focus({ preventScroll: true });
+}
+function slashKeydown(entry, event, input) {
+  if (event.isComposing || event.keyCode === 229 || entry.composing || !entry.slashChoices?.length) return false;
+  if (!["ArrowDown", "ArrowUp", "Enter", "Tab", "Escape"].includes(event.key) || event.ctrlKey || event.metaKey || event.shiftKey) return false;
+  event.preventDefault();
+  if (event.key === "Escape") { entry.slashDismissedText = entry.text; updateSlashMenu(entry); }
+  else if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+    entry.slashIndex = ((entry.slashIndex || 0) + (event.key === "ArrowDown" ? 1 : -1) + entry.slashChoices.length) % entry.slashChoices.length;
+    updateSlashMenu(entry);
+  } else chooseSlash(entry, entry.slashIndex || 0, input);
+  return true;
+}
+function updateModelControls(entry) {
+  if (!currentChat(entry)) return;
+  const settings = entry.data?.modelSettings || {};
+  const next = settings.next || {};
+  for (const kind of ["model", "effort"]) {
+    const control = $(`chat-${kind}-control`);
+    if (!control) continue;
+    const actual = settings[kind], pending = next[kind] && next[kind] !== actual ? next[kind] : null;
+    control.textContent = `${actual || (kind === "model" ? "모델 미확인" : "에포트 미확인")}${pending ? ` → ${pending}` : ""}`;
+    control.title = pending ? "화살표 뒤 값은 다음 웹 입력부터 적용됩니다." : settings.observed === "last_response" && kind === "model" ? "마지막 응답에서 확인한 모델" : kind === "model" ? "모델 선택" : "에포트 레벨 선택";
+    control.disabled = !chatSupported(entry) || entry.sending || !!entry.pending || !!entry.commandBusy || networkOffline();
+  }
+}
+function closeChatSettings() {
+  $("chat-settings-panel")?.remove?.();
+  for (const kind of ["model", "effort"]) $(`chat-${kind}-control`)?.setAttribute("aria-expanded", "false");
+}
+async function openChatSettings(entry, kind) {
+  if (!currentChat(entry) || entry.commandBusy || entry.sending || entry.pending) return;
+  closeQuickReplies();
+  closeChatSettings();
+  const parent = $(`chat-${kind}-control`)?.parentElement;
+  if (!parent) return;
+  const panel = el("div", "chat-settings-panel"); panel.id = "chat-settings-panel";
+  panel.setAttribute("role", "group"); panel.setAttribute("aria-label", kind === "model" ? "모델 선택" : "에포트 레벨 선택");
+  panel.append(el("p", "muted", "선택지를 확인하고 있습니다…"));
+  parent.append(panel);
+  const control = $(`chat-${kind}-control`); control.setAttribute("aria-expanded", "true");
+  const close = () => { if ($("chat-settings-panel") === panel) closeChatSettings(); };
+  const epoch = state.authEpoch;
+  const draftRevision = entry.revision;
+  try {
+    const data = await api("/api/chat/command", { method: "POST", body: { source: entry.source, command: "models" } });
+    if (epoch !== state.authEpoch || !currentChat(entry) || $("chat-settings-panel") !== panel) return;
+    const current = data.next?.model ? data.next : data.current || {};
+    const model = (data.models || []).find((row) => row.model === current.model || current.model?.toLowerCase().includes(row.model.toLowerCase()));
+    const values = kind === "model" ? (data.models || []).map((row) => ({ value: row.model, label: row.label || row.model }))
+      : (model?.efforts || []).map((value) => ({ value, label: value }));
+    const label = el("label", "", kind === "model" ? "모델" : "에포트 레벨"); label.htmlFor = "chat-setting-choice";
+    const select = el("select"); select.id = "chat-setting-choice";
+    for (const item of values) { const option = el("option", "", item.label); option.value = item.value; select.append(option); }
+    if (values.some((item) => item.value === current[kind])) select.value = current[kind];
+    else if (values.length) select.value = values[0].value;
+    const apply = button("적용", "primary", async () => {
+      if (!select.value || !currentChat(entry) || entry.commandBusy) return;
+      const ok = await executeChatCommand(entry, kind, select.value);
+      if (ok) {
+        close();
+        if (currentChat(entry) && entry.revision === draftRevision && entry.text.trim() === `/${kind}`) {
+          entry.text = ""; entry.revision++; $("chat-input").value = ""; updateSlashMenu(entry); updateChatComposer(entry);
+        }
+      }
+    });
+    apply.disabled = !values.length;
+    panel.replaceChildren(label, select, el("p", "muted", entry.source.agent === "codex" ? "다음 웹 입력부터 적용됩니다. 진행 중인 작업은 현재 설정을 유지합니다." : "Claude의 명령 결과에서 적용 여부를 확인합니다."),
+      ...(!values.length ? [el("p", "", "현재 모델의 선택지를 확인하지 못했습니다. 모델을 먼저 선택해 주세요.")] : []), apply, button("닫기", "quiet", close));
+  } catch (error) {
+    if (epoch === state.authEpoch && currentChat(entry) && $("chat-settings-panel") === panel)
+      panel.replaceChildren(el("p", "", error.message), button("닫기", "quiet", close));
+  }
+}
+async function executeChatCommand(entry, command, value = null) {
+  if (!currentChat(entry) || !chatSupported(entry) || entry.commandBusy || entry.sending || entry.pending || entry.uploads || entry.composing) return false;
+  stopDictation({ abort: true, field: $("chat-input") });
+  closeQuickReplies();
+  entry.stateEpoch++;
+  entry.commandBusy = true; entry.error = entry.inputError = ""; entry.notice = "명령을 적용하고 있습니다…";
+  const epoch = state.authEpoch;
+  updateChatComposer(entry); updateModelControls(entry);
+  try {
+    const result = await api("/api/chat/command", { method: "POST", body: { source: entry.source, command, value, requestId: requestId() } });
+    if (epoch !== state.authEpoch) return false;
+    entry.stateEpoch++;
+    entry.notice = result.reason || "명령을 전달했습니다.";
+    if (entry.data && (result.current || result.next)) entry.data.modelSettings = { ...(entry.data.modelSettings || {}), ...(result.current || {}), ...(result.next ? { next: result.next } : {}) };
+    if (result.terminalId) refreshTerminals();
+    if (result.status === "unknown" || result.status === "rejected") { entry.error = entry.inputError = entry.notice; entry.notice = ""; return false; }
+    if (currentChat(entry)) loadChatState(selectedSession(), true);
+    return true;
+  } catch (error) {
+    if (epoch === state.authEpoch && !error.unauthorized && !error.staleAuth) { entry.error = entry.inputError = error.message; entry.notice = ""; }
+    return false;
+  } finally {
+    if (epoch === state.authEpoch) { entry.commandBusy = false; updateChatComposer(entry); updateModelControls(entry); }
+  }
+}
+async function runSlashCommand(entry, text, attachments) {
+  if (entry.commandBusy || entry.sending || entry.pending || entry.uploads || entry.composing) return;
+  const match = /^\/(model|effort|compact|clear)(?:\s+(\S+))?$/.exec(text);
+  if (!match || attachments.length || ["compact", "clear"].includes(match?.[1]) && match?.[2]) {
+    entry.error = entry.inputError = "지원하는 명령을 첨부 없이 입력해 주세요: /model, /effort, /compact, /clear"; updateChatComposer(entry); return;
+  }
+  const [, command, value] = match;
+  if (["model", "effort"].includes(command) && !value) { openChatSettings(entry, command); return; }
+  const revision = entry.revision;
+  let ok;
+  if (command === "clear") { openNewSession(); ok = true; }
+  else ok = await executeChatCommand(entry, command, value || null);
+  if (ok && currentChat(entry) && entry.revision === revision && entry.text.trim() === text) {
+    entry.text = ""; entry.revision++; $("chat-input").value = "";
+    updateSlashMenu(entry); updateChatComposer(entry);
+  }
+}
 function buildChatComposer(s) {
   const entry = chatEntry(s);
   // Detached editors can still emit Android IME events after a session switch.
@@ -4133,6 +4322,8 @@ function buildChatComposer(s) {
     if (entry.inputError && entry.error === entry.inputError) entry.error = "";
     entry.inputError = "";
     entry.revision++;
+    entry.slashDismissedText = null;
+    updateSlashMenu(entry, box, input);
     updateChatComposer(entry);
   });
   // Phones fold the bars for typing and return to the reader's choice on blur
@@ -4152,6 +4343,7 @@ function buildChatComposer(s) {
     dictationFieldEvent(input, "compstart");
     if (!editorCurrent()) return;
     entry.composing = true;
+    updateSlashMenu(entry, box, input);
     updateChatComposer(entry);
   });
   input.addEventListener("compositionend", () => {
@@ -4162,14 +4354,16 @@ function buildChatComposer(s) {
     entry.inputCollapsed = false;
     entry.text = input.value;
     entry.revision++;
+    updateSlashMenu(entry, box, input);
     updateChatComposer(entry);
   });
   input.addEventListener("keydown", (event) => {
     if (!editorCurrent()) return;
+    if (slashKeydown(entry, event, input)) return;
     // Esc leaves the input (a hardware keyboard's way out); an open tools menu
     // closes first (closeChatToolsEscape), and an IME keeps its own Esc.
     if (event.key === "Escape") {
-      if (event.isComposing || event.keyCode === 229 || entry.composing || tools.open || state.quickRepliesOpen) return;
+      if (event.isComposing || event.keyCode === 229 || entry.composing || tools.open || state.quickRepliesOpen || $("chat-settings-panel")?.isConnected) return;
       event.preventDefault();
       input.blur();
       return;
@@ -4374,6 +4568,8 @@ function sentDraftHidden(entry) {
   return !entry.composing && draftIsPending(entry);
 }
 function closeChatToolsOutside(event) {
+  const settings = $("chat-settings-panel");
+  if (settings?.isConnected && !settings.parentElement?.contains?.(event.target)) closeChatSettings();
   const quick = state.quickRepliesOpen;
   if (quick && !quick.panel.contains?.(event.target) && event.target !== quick.trigger) closeQuickReplies();
   for (const id of ["chat-tools", "terminal-settings"]) {
@@ -4386,6 +4582,7 @@ function closeChatToolsOutside(event) {
 }
 function closeChatToolsEscape(event) {
   if (event.key !== "Escape" || event.isComposing || event.keyCode === 229) return;
+  if ($("chat-settings-panel")?.isConnected) { closeChatSettings(); event.preventDefault(); }
   if (state.quickRepliesOpen) {
     const input = state.quickRepliesOpen.input;
     closeQuickReplies();
@@ -4540,6 +4737,7 @@ function receiptNotice(entry) {
 }
 function updateChatComposer(entry) {
   if (!currentChat(entry) || $("chat-composer")?.dataset.source !== chatKey(entry.source)) return;
+  updateModelControls(entry);
   const supported = chatSupported(entry);
   const oneShot = chatOneShot(entry);
   $("chat-composer").classList.toggle?.("is-busy", entry.data?.phase === "working" || entry.sending || !!entry.uploads);
@@ -4547,7 +4745,7 @@ function updateChatComposer(entry) {
   $("chat-composer").classList.toggle?.("is-unknown", !!entry.pending && !entry.sending);
   setClass($("chat-composer"), "is-sent-draft", sentDraftHidden(entry));
   const offline = networkOffline();
-  const blocked = offline || !supported || entry.sending || !!entry.pending || !!entry.uploads;
+  const blocked = offline || !supported || entry.sending || !!entry.pending || !!entry.uploads || !!entry.commandBusy;
   // No board terminal yet (Claude background): the draft can be written now and
   // sent once the user opened the terminal from the gate.
   const recovery = chatRecovery(entry);
@@ -4566,7 +4764,7 @@ function updateChatComposer(entry) {
   const input = $("chat-input");
   input.placeholder = chatPlaceholder(oneShot);
   input.disabled = !supported && !gateOn && recovery?.action !== "resume_session";
-  input.readOnly = !input.disabled && (entry.sending || !!entry.pending);
+  input.readOnly = !input.disabled && (entry.sending || !!entry.pending || !!entry.commandBusy);
   input.setAttribute("aria-disabled", String(input.disabled || input.readOnly));
   $("chat-attach").disabled = offline || !chatAttachmentsSupported(entry) || entry.sending || !!entry.pending || !!entry.uploads;
   $("chat-clipboard").disabled = $("chat-attach").disabled;
@@ -4889,6 +5087,9 @@ async function sendChat(entry, message = null) {
   if (!message && !dictationListening($("chat-input"))) entry.dictationNotice = "";
   const text = message ? String(message.text || "") : entry.text;
   const attachments = (message ? message.attachments || [] : entry.attachments).slice();
+  if (!message && currentChat(entry) && /^\/[a-z]+(?:\s|$)/.test(text.trim())) {
+    return runSlashCommand(entry, text.trim(), attachments);
+  }
   if (!currentChat(entry) || !chatSupported(entry) || entry.composing || entry.sending || entry.pending || entry.uploads ||
       (!text.trim() && !attachments.length)) return;
   if (new TextEncoder().encode(text).length > 32768 || attachments.length > 8) {
@@ -9151,6 +9352,7 @@ function bindPullToRefresh(root) {
 function showLogin() {
   closeQuickReplies();
   beginAuthEpoch();
+  state.pinnedLocal.clear();
   window.SessionholicLabels?.locked?.();
   closeSessionControl(true);
   state.loginBusy = false;

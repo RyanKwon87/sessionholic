@@ -7069,7 +7069,9 @@ function showDockWaiting() {
   state.detailRun++;
   const waiting = el("div", "welcome dock-waiting");
   waiting.append(el("span", "welcome-mark", "↗"), el("h2", null, "이 터미널의 대화는 아직 목록에 없습니다."),
-    el("p", null, "새 세션이면 첫 대화가 기록되는 대로 여기에 보입니다. 다른 대화는 목록에서 고르세요."));
+    el("p", null, "새 세션이면 첫 대화가 기록되는 대로 여기에 보입니다."));
+  // The list stepped aside for the terminal: a way to it (the terminal steps aside then).
+  if (state.dockSolo) waiting.append(button("목록 보기", "secondary", backFromTerminal));
   $("detail").replaceChildren(waiting);
   render();
 }

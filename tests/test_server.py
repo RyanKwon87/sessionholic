@@ -1377,7 +1377,7 @@ class BoardLiveTest(unittest.TestCase):
 
     def test_a_failed_watcher_falls_back_once_and_restarts_after_its_own_backoff(self):
         board, watchers = self.live_board()
-        board.STREAM_BACKOFF, board.STREAM_TRIP = (0.3, 0.3, 0.3, 0.3), 60
+        board.STREAM_BACKOFF, board.STREAM_TRIP = (60, 60, 60, 60), 60
         board.viewer_joined()
         wait_for(lambda: len(watchers) == 1)
         watchers[0].say({"type": "snapshot", "seq": 1, "data": live_data()})
@@ -1388,11 +1388,23 @@ class BoardLiveTest(unittest.TestCase):
         self.assertEqual(board.stream_backoff["remote"][0], 1)
         # The one-shot backoff is separate and untouched.
         self.assertEqual(board.backoff, {})
-        time.sleep(0.1)
         self.assertEqual(len(watchers), 1)
+        self.assertGreater(board.stream_backoff["remote"][1] - time.monotonic(), 30)
+        # Advance the stored deadline explicitly: a loaded CI runner can resume the test
+        # after a 0.3-second backoff already expired, even after a 0.1-second sleep.
+        with board.lock:
+            failures, _ = board.stream_backoff["remote"]
+            board.stream_backoff["remote"] = (failures, time.monotonic() - 1)
+        board.live_wake.set()
         wait_for(lambda: len(watchers) == 2)
         # A watcher whose board lock is still held by an orphan ends as "busy".
         watchers[1].say({"type": "busy"})
+        wait_for(lambda: board.stream_backoff["remote"][0] == 2)
+        self.assertEqual(len(watchers), 2)
+        with board.lock:
+            failures, _ = board.stream_backoff["remote"]
+            board.stream_backoff["remote"] = (failures, time.monotonic() - 1)
+        board.live_wake.set()
         wait_for(lambda: len(watchers) == 3)
         self.assertEqual(watchers[1].signals, [])
         watchers[2].exit(1)

@@ -673,17 +673,25 @@ function openRequestedSession() {
 function answerOnOpen(s) {
   state.answerOnOpen = { key: s.key, until: Date.now() + 30000 };
 }
-// 설정 › 캐시 지우고 새로고침: this board's shell caches go, and a worker that receives no
+// 상단 / 설정 › 캐시 지우고 새로고침: this board's shell caches go, and a worker that receives no
 // notifications is unregistered (one that does keeps its subscription and only updates).
 // Other applications' caches and every stored preference stay.
-async function hardReload() {
-  const button = $("hard-reload");
+async function hardReload({ discard = false } = {}) {
+  if (state.hardReloadBusy) return;
   if (networkOffline()) {
     // A cleared shell could not load again until the board is reachable.
     toast("오프라인이라 캐시를 지우지 않았습니다. 연결된 뒤 다시 눌러 주세요.");
     return;
   }
-  if (button) button.disabled = true;
+  if (!discard && unsavedWork()) {
+    openActionSheet({ title: "새로고침할까요?", preview: "보내지 않은 초안·첨부와 아직 확인 중인 입력이 있습니다. 새로고침하면 이 화면의 초안은 사라집니다. 대화 기록과 실행 중인 세션은 유지됩니다.",
+      actions: [{ label: "돌아가기", run: () => {} }, { label: "초안을 버리고 새로고침", danger: true, run: () => hardReload({ discard: true }) }],
+      trigger: document.activeElement });
+    return;
+  }
+  state.hardReloadBusy = true;
+  const buttons = [$("hard-reload"), $("quick-reload")].filter(Boolean);
+  for (const button of buttons) button.disabled = true;
   try {
     const keys = (await globalThis.caches?.keys?.()) || [];
     await Promise.all(keys.filter((key) => typeof key === "string" && key.startsWith(INSTANCE.cachePrefix))
@@ -697,9 +705,14 @@ async function hardReload() {
   } catch {
     // Reload anyway: the fresh page reads everything from the board again.
   }
-  window.location.reload();
+  state.discardOnReload = discard;
   // Still here (a draft's leave prompt was declined): the button works again.
-  setTimeout(() => { if (button) button.disabled = false; }, 3000);
+  setTimeout(() => {
+    state.hardReloadBusy = false;
+    state.discardOnReload = false;
+    for (const button of buttons) button.disabled = false;
+  }, 3000);
+  window.location.reload();
 }
 function closeSettings() {
   if (!$("settings-dialog").open) return;
@@ -9695,7 +9708,7 @@ function unsavedWork() {
     [...state.chats.values()].some((entry) => entry.text || entry.attachments.length || entry.pending || entry.uploads);
 }
 function warnDraftUnload(event) {
-  if (!unsavedWork()) return;
+  if (!unsavedWork() || state.discardOnReload) return;
   event.preventDefault();
   event.returnValue = "";
 }
@@ -9765,6 +9778,7 @@ window.addEventListener("DOMContentLoaded", () => {
   $("settings-close").addEventListener("click", closeSettings);
   $("settings-done").addEventListener("click", closeSettings);
   $("hard-reload")?.addEventListener("click", hardReload);
+  $("quick-reload")?.addEventListener("click", hardReload);
   $("update-banner")?.addEventListener("click", updateBannerPressed);
   $("quick-replies")?.addEventListener("change", (event) => { event.target.value = saveQuickReplies(event.target.value).join("\n"); });
   $("settings-dialog").addEventListener("cancel", (event) => {

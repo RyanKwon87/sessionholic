@@ -7184,6 +7184,35 @@ test('clearing the cache removes only this board\'s shells and keeps the worker 
   assert.match(html, /<button id="hard-reload" class="push-button" type="button" aria-describedby="reload-help">캐시 지우고 새로고침<\/button>/);
 });
 
+test('the visible reload button confirms unsaved work and cannot clear twice while reloading', async () => {
+  const timers = [], deleted = []; let reloaded = 0;
+  const c = client(undefined, { setTimeout(callback, ms) { timers.push({ callback, ms }); return timers.length; }, clearTimeout() {} });
+  c.context.navigator = { onLine: false }; c.windowEvents.DOMContentLoaded();
+  c.context.navigator.onLine = true; c.state.offline = false;
+  c.context.window.location = { reload() { reloaded++; } };
+  c.context.caches = { keys: async () => ['sessionholic-shell-old'], delete: async (key) => { deleted.push(key); } };
+  c.state.drafts.set('fixture-draft', 'unsent words');
+  await c.get('quick-reload').events.click();
+  assert.equal(reloaded, 0); assert.equal(deleted.length, 0);
+  assert.equal(c.get('action-sheet').open, true);
+  const cancel = c.get('action-list').children[0]; cancel.events.click({ detail: 0 });
+  assert.equal(c.state.drafts.get('fixture-draft'), 'unsent words');
+  await c.get('quick-reload').events.click();
+  const confirmed = c.get('action-list').children[1]; confirmed.events.click({ detail: 0 });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(reloaded, 1); assert.deepEqual(deleted, ['sessionholic-shell-old']);
+  assert.equal(c.get('quick-reload').disabled, true); assert.equal(c.get('hard-reload').disabled, true);
+  await c.hardReload(); assert.equal(reloaded, 1, 'a double tap cannot run cache clearing twice');
+  let warned = false; c.warnDraftUnload({ preventDefault() { warned = true; } });
+  assert.equal(warned, false, 'the explicit discard confirmation answers the leave prompt once');
+  timers.filter((timer) => timer.ms === 3000).at(-1).callback();
+  assert.equal(c.get('quick-reload').disabled, false);
+  c.warnDraftUnload({ preventDefault() { warned = true; } }); assert.equal(warned, true);
+  const html = indexPage();
+  assert.ok(html.indexOf('id="quick-reload"') > html.indexOf('<header class="top">'));
+  assert.ok(html.indexOf('id="quick-reload"') < html.indexOf('id="session-layout"'));
+});
+
 test('the installation meta names preferences, titles, history and attachment folders', () => {
   const names = JSON.stringify({ title: '데모 보드', shortName: '데모', storagePrefix: 'db:', historyKey: 'demoBoard',
     attachmentsDir: '.demo-board-attachments' });

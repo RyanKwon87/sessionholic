@@ -10159,3 +10159,36 @@ test('docked, a terminal whose conversation is not listed yet shows that, then i
   assert.equal(c.state.docked, false);
   assert.equal(c.state.selected, fresh.key);
 });
+
+test('docked, the conversation beside follows the terminal on docking and for a handoff, and pressing it keeps the terminal', async () => {
+  const { c } = dockClient(1180);
+  const { s } = selectChat(c);
+  const other = { host: 'workstation', agent: 'codex', home: '.codex-example', id: 'other-session',
+    key: ['workstation', 'codex', '.codex-example', 'other-session'].join('|') };
+  c.state.snapshot.hosts[0].data.codex.push(other);
+  // 크게: a terminal of s covers the board; back on the board, another conversation is picked.
+  c.state.terminalDock = false;
+  await c.openTerminal({ id: 'own', mode: 'attach', nativeSource: c.sourceOf(s) });
+  assert.equal(c.state.docked, false);
+  c.returnToBoard({ selectLaunchedSource: false, animate: false });
+  c.select(other.key);
+  await c.openTerminal({ id: 'own', mode: 'attach', nativeSource: c.sourceOf(s) });
+  // 나란히: the terminal's own conversation comes beside it, not the one picked before.
+  c.toggleDock();
+  assert.equal(c.state.docked, true);
+  assert.equal(c.state.selected, s.key);
+  // Pressing the conversation shown beside it does not hide the terminal.
+  c.select(s.key);
+  assert.equal(c.state.terminalVisible, true);
+  // A handoff's new run: its source is not shown beside it while the new run is not listed.
+  c.returnToBoard({ selectLaunchedSource: false, animate: false });
+  const target = { host: 'workstation', agent: 'codex', home: '.codex-other', id: 'handoff-target',
+    key: ['workstation', 'codex', '.codex-other', 'handoff-target'].join('|') };
+  await c.openTerminal({ id: 'handoff', mode: 'handoff', sourceKey: JSON.stringify(c.sourceOf(s)), nativeSource: c.sourceOf(target) });
+  assert.equal(c.state.selected, null);
+  assert.match(textOf(c.get('detail')), /아직 목록에 없습니다/);
+  c.state.snapshot.hosts[0].data.codex.push(target);
+  c.render();
+  assert.equal(c.state.selected, target.key);
+  assert.equal(c.state.terminalVisible, true);
+});

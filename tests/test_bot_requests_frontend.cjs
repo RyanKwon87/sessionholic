@@ -339,25 +339,29 @@ test("nativeRef가 없는 세 봇 요청도 표시하고 미확인 권한·범�
   assert.equal(c.calls.length, 0);
 });
 
-test("연결된 봇의 직접 선택·관리는 메타 상세로 이동하고 남은 채팅 초안도 전송할 수 없다", async () => {
+test("봇 요청에 묶인 세션은 대화를 보기 전용으로 보이고, 보내기·관리·터미널·이어가기는 하지 않는다", async () => {
   const c = client();
   const native = session(); addSessions(c, [native]);
   const row = request({ nativeRef: c.sourceOf(native) }); cache(c, [row]);
+  // Its conversation, to follow: watched, with the request's details in place of the composer.
   c.select(native.key);
-  assert.equal(c.state.selected, null);
+  assert.equal(c.state.selected, native.key);
   assert.equal(c.state.selectedBotRequest, c.botRequestKey(row));
   assert.equal(c.state.sessionCategory, "bot");
+  assert.match(textOf(c.get("detail")), /보기 전용/);
   assert.match(textOf(c.get("detail")), /입력과 실행 관리는 원래 봇/);
+  assert.doesNotMatch(textOf(c.get("detail")), /이 작업에 메시지 보내기/);
+  // Picking the request shows the same conversation.
   c.state.selectedBotRequest = null;
-  await c.manageSession(native);
+  c.selectBotRequest(c.botRequestKey(row));
+  assert.equal(c.state.selected, native.key);
   assert.equal(c.state.selectedBotRequest, c.botRequestKey(row));
+  await c.manageSession(native);
   assert.equal(c.get("session-control-dialog").open, undefined);
   const entry = c.chatEntry(native);
   entry.text = "전송하면 안 되는 초안";
   entry.data = { route: c.sourceOf(native), capability: { supported: true },
     recovery: { supported: true, action: "resume_session" } };
-  // A detached editor can retain the previous selection until the metadata arrives.
-  c.state.selected = native.key;
   assert.equal(c.currentChat(entry), true);
   assert.equal(c.chatSupported(entry), false);
   assert.equal(c.chatRecovery(entry), null);
@@ -366,13 +370,12 @@ test("연결된 봇의 직접 선택·관리는 메타 상세로 이동하고 �
   assert.equal(entry.text, "전송하면 안 되는 초안");
   assert.equal(entry.sending, false);
   c.openChatTerminal(native);
-  assert.equal(c.state.selected, null);
-  c.state.selected = native.key;
   c.state.route = { host: native.host, agent: native.agent, account: `codex:${native.home}` };
   await c.preparePlan();
-  assert.equal(c.state.selected, null);
   assert.equal(c.get("plan-dialog").open, undefined);
-  assert.equal(c.calls.length, 0, "채팅·관리·터미널 API를 호출하지 않는다");
+  // Reading its conversation only: no send, session control, plan, launch or terminal call.
+  const writes = c.calls.filter((call) => /^\/api\/(chat\/(send|upload|warm|prompt)|session\/(preview|action|archive)|plan|launch|terminal|new-session)/.test(call.url));
+  assert.deepEqual(writes, [], "채팅 보내기·관리·실행·터미널 API를 호출하지 않는다");
 });
 
 test("세 분류의 방향키·Home·End와 휴대폰 뒤로·앞으로가 봇 상세 선택을 보존한다", () => {

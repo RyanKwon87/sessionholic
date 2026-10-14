@@ -1027,7 +1027,6 @@ function render() {
   const now = state.snapshot.serverTime || Date.now() / 1000;
   const sessions = allSessions();
   const reading = state.detailShown && sessions.find((session) => session.key === state.selected);
-  if (reading && botRequestForNative(sourceOf(reading))) { selectBotRequest(botRequestKey(botRequestForNative(sourceOf(reading)))); return; }
   if (reading && !botFilter() && sessionCategoryOf(reading) !== state.sessionCategory) setSessionCategory(sessionCategoryOf(reading), { renderView: false, clearSelection: false });
   renderHosts(now); renderFreshness(now); renderAttention(sessions);
   // The conversation on screen is read, also when it answers or finishes while shown
@@ -1035,7 +1034,7 @@ function render() {
   const shownSession = chatVisible() && sessions.find((s) => s.key === state.selected);
   if (shownSession && sessionUnread(shownSession, now)) markSeen(shownSession);
   renderSessionList(sessions, now);
-  if (state.sessionCategory === "bot") { window.SessionholicGoals?.update?.(sessions); return; }
+  if (state.sessionCategory === "bot" && !sessions.some((s) => s.key === state.selected)) { window.SessionholicGoals?.update?.(sessions); return; }
   const selected = sessions.find((s) => s.key === state.selected);
   if (!state.selected && !$("detail").children.length) {
     const welcome = el("div", "welcome");
@@ -1389,8 +1388,39 @@ function renderCounts(sessions) {
   placeChildren(box, chips);
 }
 // The filter sheet's selects; the button that opens it shows how many apply.
-const INITIATOR_LABELS = { human: "직접 시작", agent: "에이전트 시작", unknown: "출처 미확인" };
-function initiatorOf(s) { return ["human", "agent"].includes(s?.initiator) ? s.initiator : "unknown"; }
+const INITIATOR_LABELS = { human: "직접 시작", agent: "에이전트·프로그램 시작", unknown: "출처 미확인" };
+// Codex sessions opened by hand: its own terminal UI and a board launch (with no originator
+// recorded, an interactive source). Codex's other originators and exec runs are programs'.
+const DIRECT_ORIGINATORS = new Set(["codex-tui", "session-board"]);
+const DIRECT_CODEX_SOURCES = new Set(["cli", "vscode"]);
+// Folders bots work in (a Slack bot's workspace, Hermes' home): their sessions are the bot's.
+const BOT_FOLDERS = [[/[\\/]workspaces[\\/]slack(?:[\\/]|$)/i, "Slack"], [/[\\/]\.hermes(?:[\\/]|$)/i, "헤르메스"]];
+function botFolderOf(s) {
+  const cwd = String(s?.cwd || "");
+  return BOT_FOLDERS.find(([folder]) => folder.test(cwd))?.[1] || null;
+}
+// Who opened a session, from what the board sees of it: "bot" (a bot request's, or a bot's own),
+// "agent" (a subagent, or a program's run such as codex exec), "human" (opened by hand in a
+// terminal: Codex's terminal UI or a board launch, Claude's interactive or background session)
+// or "unknown". 일반 세션 lists only "human"; 에이전트 세션 the agents', programs' and unknown.
+function originOf(s) {
+  if (!s) return "unknown";
+  if (botNameOf(s)) return "bot";
+  if (s.initiator === "agent" || s.parentSessionId || s.agentRole) return "agent";
+  if (s.initiator === "human") return "human";
+  if (s.agent === "codex") {
+    if (s.originator) return DIRECT_ORIGINATORS.has(s.originator) ? "human" : "agent";
+    if (DIRECT_CODEX_SOURCES.has(s.source)) return "human";
+    return s.source === "exec" ? "agent" : "unknown";
+  }
+  if (s.agent === "claude" && ["interactive", "background"].includes(s.kind)) return "human";
+  return "unknown";
+}
+// 시작 주체's own values (a bot is picked by its name instead).
+function initiatorOf(s) {
+  const origin = originOf(s);
+  return origin === "bot" ? "unknown" : origin;
+}
 function initiatorLabel(s) {
   const bot = botNameOf(s);
   if (bot) return `${bot} 시작`;
@@ -1406,7 +1436,7 @@ function botNameOf(s) {
     const source = (state.botRequests.sources || []).find((item) => item.id === request.sourceId);
     return String(source?.label || request.botName || "").split(" · ")[0].trim() || null;
   }
-  return ORIGINATOR_BOTS[s?.originator] || null;
+  return ORIGINATOR_BOTS[s?.originator] || botFolderOf(s) || null;
 }
 function botFilter() {
   const value = state.filters?.initiator || "";
@@ -1473,6 +1503,12 @@ async function loadBotRequests({ refresh = false } = {}) {
   render();
   return cache.promise;
 }
+// Sessions bots opened with no request of theirs listed (a Slack bot's, Hermes'): 봇 요청 lists
+// them under the requests, most recent first.
+function botOwnSessions(sessions, now) {
+  return sessions.filter((s) => sessionCategoryOf(s) === "bot" && !botRequestForNative(sourceOf(s)) &&
+    matches(s, now, { category: false, initiator: false, phase: false })).sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+}
 function renderBotRequests() {
   const cache = state.botRequests, box = $("groups");
   const shown = cache.requests.filter(botRequestMatches).sort((a, b) => botTimestamp(b.updatedAt) - botTimestamp(a.updatedAt));
@@ -1503,9 +1539,27 @@ function renderBotRequests() {
       el("span", "bot-request-boundary", `범위 ${botLabel(request.scopeLabel)}`));
     nodes.push(card);
   }
-  if (!shown.length && !cache.busy) nodes.push(emptyState("none", state.search ? "검색에 맞는 봇 요청이 없습니다." : cache.error || cache.sources.some((source) => !source.ok) ? "봇 요청을 확인하지 못했습니다." : "표시할 봇 요청이 없습니다.", "봇에서 접수한 요청과 권한·사용 범위를 이곳에서 확인합니다."));
+  const now = state.snapshot?.serverTime || Date.now() / 1000;
+  const own = botOwnSessions(allSessions(), now);
+  if (own.length) {
+    const section = el("section", "group bot-own-sessions");
+    const head = el("h2", "group-head gray", "봇이 연 세션");
+    const count = el("span", "group-count", String(own.length));
+    head.append(count);
+    const folders = cardFolderHints(own);
+    const rows = own.map((session) => {
+      const row = card(session);
+      updateCard(row.card, session, now, folders.get(session.key));
+      return row;
+    });
+    section.append(head, ...rows);
+    nodes.push(section);
+  }
+  if (!shown.length && !own.length && !cache.busy) nodes.push(emptyState("none", state.search ? "검색에 맞는 봇 요청이 없습니다." : cache.error || cache.sources.some((source) => !source.ok) ? "봇 요청을 확인하지 못했습니다." : "표시할 봇 요청이 없습니다.", "봇에서 접수한 요청과 권한·사용 범위를 이곳에서 확인합니다."));
   box.replaceChildren(...nodes); box.setAttribute("aria-busy", String(cache.busy));
-  $("session-count").textContent = cache.loaded ? `${shown.length}개` : "-";
+  $("session-count").textContent = cache.loaded ? `${shown.length + own.length}개` : own.length ? `${own.length}개` : "-";
+  // A conversation open here (a request's session or a bot's own) draws itself (render).
+  if (allSessions().some((session) => session.key === state.selected)) return;
   const selected = cache.requests.find((request) => botRequestKey(request) === state.selectedBotRequest);
   if (state.selectedBotRequest && !selected) {
     state.selectedBotRequest = null; $("detail").replaceChildren(); setDetailShown(false); navigateView("list", true);
@@ -1516,6 +1570,12 @@ function selectBotRequest(key) {
   if (!state.authenticated || state.launchBusy) return;
   if (state.docked) undock();
   const request = state.botRequests.requests.find((row) => botRequestKey(row) === key); if (!request) return;
+  // Its session listed: its conversation, to follow (watch only), with the request's details.
+  const native = sessionForBotRequest(request);
+  if (native) {
+    select(native.key);
+    return;
+  }
   rememberConversationView(); stopChatPolling();
   state.selected = null; state.detailFor = null; state.detailRevision = null; state.detailRun += 1;
   state.selectedBotRequest = key;
@@ -1526,6 +1586,18 @@ function selectBotRequest(key) {
   const entering = phoneLayout() && !state.detailShown;
   if (entering) navigateView("detail");
   setDetailShown(true, { direction: entering ? "push" : null, focus: phoneLayout() });
+}
+// Under a bot's conversation, in place of the composer: who runs it, and where to answer.
+function botWatchNotice(s) {
+  const request = botRequestForNative(sourceOf(s));
+  const box = el("div", "bot-watch");
+  box.id = "bot-watch";
+  box.append(el("p", "bot-watch-title", [botNameOf(s), "봇이 진행하는 세션 · 보기 전용"].filter(Boolean).join(" · ")));
+  if (request)
+    box.append(el("p", "bot-watch-meta", [`요청자 ${botLabel(request.requesterLabel)}`, `채널 ${botLabel(request.channelLabel)}`,
+      `권한 ${botLabel(request.authorityLabel)}`, `상태 ${BOT_STATUS[request.status] || "상태 미확인"}`].join(" · ")));
+  box.append(el("p", "bot-watch-hint", "대화는 여기서 계속 새로 고쳐집니다. 입력과 실행 관리는 원래 봇에서 해 주세요."));
+  return box;
 }
 function drawBotRequest(request) {
   const pane = $("detail");
@@ -1550,7 +1622,15 @@ function drawBotRequest(request) {
   pane.append(head, detail);
 }
 const SESSION_CATEGORIES = { general: "일반 세션", agent: "에이전트 세션", bot: "봇 요청" };
-function sessionCategoryOf(session) { return botRequestForNative(sourceOf(session)) ? "bot" : initiatorOf(session) === "agent" ? "agent" : "general"; }
+function sessionCategoryOf(session) {
+  const origin = originOf(session);
+  return origin === "bot" ? "bot" : origin === "human" ? "general" : "agent";
+}
+// A bot request's own session, once listed: its conversation is what the request shows.
+function sessionForBotRequest(request) {
+  const ref = request?.nativeRef;
+  return ref ? allSessions().find((s) => s.host === request.host && s.agent === ref.agent && s.id === ref.id && s.home === ref.home) || null : null;
+}
 function setSessionCategory(category, { renderView = true, clearSelection = true } = {}) {
   if (!Object.hasOwn(SESSION_CATEGORIES, category) || state.launchBusy) return false;
   const changed = state.sessionCategory !== category;
@@ -1565,13 +1645,15 @@ function setSessionCategory(category, { renderView = true, clearSelection = true
   state.sessionCategory = category;
   if (changed && !state.selected && !state.selectedBotRequest) $("detail").replaceChildren();
   const origin = state.filters.initiator;
-  if (category !== "bot" && origin && !botFilter() && (origin === "agent" ? "agent" : "general") !== category) state.filters.initiator = "";
+  if (category !== "bot" && origin && !botFilter() && (origin === "human" ? "general" : "agent") !== category) state.filters.initiator = "";
   if (renderView) { render(); if (changed) $("task-list-pane").scrollTop = 0; }
   if (category === "bot" && renderView) loadBotRequests();
   return changed;
 }
 function renderSessionCategories(sessions, now) {
-  const counts = { general: 0, agent: 0, bot: state.botRequests.loaded ? state.botRequests.requests.filter(botRequestMatches).length : null };
+  const botSessions = botOwnSessions(sessions, now).length;
+  const counts = { general: 0, agent: 0,
+    bot: state.botRequests.loaded ? state.botRequests.requests.filter(botRequestMatches).length + botSessions : botSessions || null };
   for (const session of sessions) {
     const category = sessionCategoryOf(session);
     if (category !== "bot" && matches(session, now, { category: false, initiator: category === state.sessionCategory })) counts[category] += 1;
@@ -1585,7 +1667,7 @@ function renderSessionCategories(sessions, now) {
     $(`session-category-${category}-count`).textContent = counts[category] === null ? "-" : String(counts[category]);
   }
   $("groups").setAttribute("aria-labelledby", `session-category-${state.sessionCategory}`);
-  $("session-category-note").hidden = state.sessionCategory !== "general" || state.filters.initiator === "human" || !!botFilter();
+  $("session-category-note").hidden = state.sessionCategory !== "agent" || !!state.filters.initiator || !!botFilter();
   const others = Object.keys(SESSION_CATEGORIES).filter((category) => category !== state.sessionCategory && counts[category] > 0);
   const other = others[0];
   $("session-category-search").hidden = !state.search.trim() || !other;
@@ -1665,7 +1747,8 @@ function renderFilters(sessions) {
     select.addEventListener("change", () => {
       state.filters[key] = select.value;
       if (key === "account") state.accountFilterRoutes = null;
-      if (key === "initiator" && select.value) setSessionCategory(select.value === "agent" ? "agent" : "general", { renderView: false });
+      if (key === "initiator" && select.value && !select.value.startsWith(BOT_FILTER_PREFIX))
+        setSessionCategory(select.value === "human" ? "general" : "agent", { renderView: false });
       render();
     });
     field.append(select);
@@ -2671,10 +2754,9 @@ function select(key) {
   if (state.selected !== key) rememberConversationView();
   const target = allSessions().find((session) => session.key === key);
   const bot = target && botRequestForNative(sourceOf(target));
-  if (bot) { selectBotRequest(botRequestKey(bot)); return; }
   if (target && sessionUnread(target)) markSeen(target);
   if (target) markOpened(target);
-  state.selectedBotRequest = null;
+  state.selectedBotRequest = bot ? botRequestKey(bot) : null;
   const listChanged = target && prepareSessionListFor(target);
   if (listChanged && state.selected === key) renderSessionList(allSessions(), state.snapshot?.serverTime || Date.now() / 1000);
   const mobile = phoneLayout();
@@ -2912,7 +2994,8 @@ function drawDetail(s) {
   prompt.id = "chat-prompt";
   prompt.hidden = true;
   prompt.setAttribute("aria-live", "polite");
-  pane.append(bar, sync, list, jump, hint, prompt, buildChatComposer(s), buildContinuePanel(s));
+  pane.append(bar, sync, list, jump, hint, prompt,
+    ...(sessionCategoryOf(s) === "bot" ? [botWatchNotice(s)] : [buildChatComposer(s), buildContinuePanel(s)]));
   setChromeVisible(state.chromeVisible);
   if (!state.chromeVisible && touchDevice()) showTapHint();
 }

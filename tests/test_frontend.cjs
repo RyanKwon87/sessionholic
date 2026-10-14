@@ -1298,11 +1298,14 @@ test('상단 모델·에포트는 현재 값과 다음 입력 설정을 구분�
   const controls = vm.runInContext('({ updateModelControls })', c.context);
   entry.data.modelSettings = { model: 'example-one', effort: 'low', next: { model: 'example-two', effort: 'high' } };
   controls.updateModelControls(entry);
-  assert.equal(c.get('chat-model-control').textContent, 'example-one → example-two');
-  assert.equal(c.get('chat-effort-control').textContent, 'low → high');
-  assert.ok(c.get('chat-model-control').title.includes('다음 웹 입력'));
-  assert.match(c.get('chat-model-control').title, /example-one → example-two/);
-  assert.match(c.get('chat-effort-control').attributes['aria-label'], /에포트: low → high/);
+  assert.equal(c.get('chat-model-control').textContent, 'example-two');
+  assert.equal(c.get('chat-effort-control').textContent, 'high');
+  assert.ok(c.get('chat-model-control').title.includes('다음 메시지'));
+  assert.match(c.get('chat-model-control').title, /example-two.*세션에서 확인: example-one/);
+  assert.match(c.get('chat-effort-control').attributes['aria-label'], /에포트: high/);
+  assert.equal(c.get('chat-model-selection-note').hidden, false);
+  assert.match(c.get('chat-model-selection-note').textContent, /다음 메시지.*example-one.*low/);
+  assert.equal(entry.data.modelSettings.model, 'example-one', 'selected display never overwrites native observations');
   entry.data.modelSettings = {};
   controls.updateModelControls(entry);
   assert.equal(c.get('chat-model-control').textContent, '미확인');
@@ -10984,8 +10987,8 @@ test('folded header keeps observed model settings and slash selectors open outsi
   entry.data.modelSettings = { model: 'example-one', effort: 'low', next: { model: 'example-two', effort: 'high' } };
   c.context.__entry = entry;
   vm.runInContext('updateModelControls(__entry)', c.context);
-  assert.equal(c.get('chat-model-summary').textContent, 'example-one · low · 다음 example-two · high');
-  assert.match(c.get('chat-model-summary').title, /현재 example-one.*다음 웹 입력: example-two/);
+  assert.equal(c.get('chat-model-summary').textContent, '선택 example-two · high');
+  assert.match(c.get('chat-model-summary').title, /다음 메시지 설정: example-two.*세션에서 확인: example-one/);
   for (const kind of ['model', 'effort']) {
     entry.text = `/${kind}`;
     await c.sendChat(entry);
@@ -11021,4 +11024,59 @@ test('header settings dismiss from title taps and cannot open without their curr
   c.context.__entry = entry; const before = c.get('detail-head').children.length;
   await vm.runInContext('openChatSettings(__entry, "model")', c.context);
   assert.equal(c.get('detail-head').children.length, before); assert.equal(calls, 0);
+});
+
+
+test('saved model selection becomes the primary badge immediately and failed changes preserve it', async () => {
+  let resolveCommand, fail = false, settings;
+  const calls = [];
+  const c = client(async (url, options) => {
+    calls.push(url);
+    if (url === '/api/chat/command') {
+      if (fail) return { ok: false, status: 409, json: async () => ({ error: '설정 변경 실패' }) };
+      return await new Promise((resolve) => { resolveCommand = resolve; });
+    }
+    return { ok: true, status: 200, json: async () => ({ route: c.sourceOf(s), phase: 'working',
+      capability: { supported: true }, modelSettings: settings, messages: [] }) };
+  }, noChatTimers);
+  const { s, entry } = selectChat(c); c.drawDetail(s);
+  settings = { model: 'example-one', effort: 'low' }; entry.data.modelSettings = settings;
+  const controls = vm.runInContext('({ updateModelControls, executeChatCommand })', c.context);
+  controls.updateModelControls(entry); assert.equal(c.get('chat-model-control').textContent, 'example-one');
+  const changing = controls.executeChatCommand(entry, 'model', 'example-two');
+  assert.equal(c.get('chat-model-control').textContent, 'example-one', 'a pending request does not fake a saved choice');
+  settings = { model: 'example-one', effort: 'low', next: { model: 'example-two', effort: 'high' } };
+  resolveCommand({ ok: true, status: 200, json: async () => ({ status: 'configured', current: { model: 'example-one', effort: 'low' }, next: settings.next }) });
+  assert.equal(await changing, true);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(c.get('chat-model-control').textContent, 'example-two');
+  assert.equal(c.get('chat-effort-control').textContent, 'high');
+  assert.equal(entry.data.modelSettings.model, 'example-one');
+  assert.match(c.get('chat-model-selection-note').textContent, /다음 메시지.*세션에서 확인: example-one.*low/);
+  c.drawDetail(s); controls.updateModelControls(entry);
+  assert.equal(c.get('chat-model-control').textContent, 'example-two', 'a recreated header keeps the stored selection');
+  fail = true;
+  assert.equal(await controls.executeChatCommand(entry, 'model', 'example-three'), false);
+  assert.equal(c.get('chat-model-control').textContent, 'example-two');
+  assert.ok(entry.error.includes('설정 변경 실패'));
+  assert.ok(!calls.includes('/api/chat/send'), 'selecting settings never starts another model turn');
+});
+
+
+test('last-response model attribution does not claim observed effort and Claude uses confirmed settings only', () => {
+  const c = client(undefined, noChatTimers); const { entry } = selectChat(c);
+  const controls = vm.runInContext('({ updateModelControls })', c.context);
+  entry.data.modelSettings = { model: 'example-one', effort: 'low', observed: 'last_response', next: { effort: 'high' } };
+  controls.updateModelControls(entry);
+  assert.equal(c.get('chat-effort-control').textContent, 'high');
+  assert.match(c.get('chat-model-selection-note').textContent, /모델\(마지막 응답\): example-one.*에포트\(세션에서 확인\): low/);
+  assert.ok(!c.get('chat-effort-control').title.includes('마지막 응답'));
+  const { entry: claude } = selectChat(c, { agent: 'claude' });
+  claude.data.modelSettings = { model: 'opus', effort: 'high', next: { model: 'sonnet', effort: 'medium' } };
+  controls.updateModelControls(claude);
+  assert.equal(c.get('chat-model-control').textContent, 'opus');
+  assert.equal(c.get('chat-effort-control').textContent, 'high');
+  assert.equal(c.get('chat-model-selection-note').hidden, true);
+  claude.data.modelSettings = { model: 'sonnet', effort: 'medium' }; controls.updateModelControls(claude);
+  assert.equal(c.get('chat-model-control').textContent, 'sonnet');
 });

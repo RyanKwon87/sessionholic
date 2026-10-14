@@ -3009,6 +3009,11 @@ function drawDetail(s) {
     });
     settings.append(control);
   }
+  const selectionNote = el("span", "chat-model-selection-note");
+  selectionNote.id = "chat-model-selection-note";
+  selectionNote.setAttribute("role", "status");
+  selectionNote.hidden = true;
+  settings.append(selectionNote);
   const meta = el("div", "detail-meta");
   meta.append(...detailMetaChildren(s));
   // Shown while this session has a live board terminal (renderDetailTerminal);
@@ -4242,21 +4247,33 @@ function slashKeydown(entry, event, input) {
 function updateModelControls(entry) {
   if (!currentChat(entry)) return;
   const settings = entry.data?.modelSettings || {};
-  const next = settings.next || {};
+  const next = entry.source.agent === "codex" ? settings.next || {} : {};
+  const selected = { model: next.model || settings.model, effort: next.effort || settings.effort };
+  const changed = ["model", "effort"].some((kind) => next[kind] && next[kind] !== settings[kind]);
+  const observedLabel = settings.observed === "last_response" ? "마지막 응답" : "세션에서 확인";
+  const observedValues = [settings.model || "모델 미확인", settings.effort || "에포트 미확인"];
+  const observed = settings.observed === "last_response"
+    ? `모델(마지막 응답): ${observedValues[0]} · 에포트(세션에서 확인): ${observedValues[1]}`
+    : `세션에서 확인: ${observedValues.join(" · ")}`;
+  const note = $("chat-model-selection-note");
+  const noteText = changed ? `다음 메시지에 사용 · ${observed}` : "";
+  if (note) {
+    if (note.textContent !== noteText) note.textContent = noteText;
+    note.hidden = !changed;
+  }
   const summary = $("chat-model-summary");
   if (summary) {
-    const values = [settings.model || "모델 미확인", settings.effort || "에포트 미확인"];
-    const pending = ["model", "effort"].filter((kind) => next[kind] && next[kind] !== settings[kind]);
-    summary.textContent = values.join(" · ") + (pending.length ? ` · 다음 ${pending.map((kind) => next[kind]).join(" · ")}` : "");
-    summary.title = `현재 ${values.join(" · ")}${pending.length ? ` · 다음 웹 입력: ${pending.map((kind) => next[kind]).join(" · ")}` : ""}`;
+    const values = [selected.model || "모델 미확인", selected.effort || "에포트 미확인"].join(" · ");
+    summary.textContent = (changed ? "선택 " : "") + values;
+    summary.title = changed ? `다음 메시지 설정: ${values} · ${observed}` : observed;
   }
   for (const kind of ["model", "effort"]) {
     const control = $(`chat-${kind}-control`);
     if (!control) continue;
     const actual = settings[kind], pending = next[kind] && next[kind] !== actual ? next[kind] : null;
-    control.textContent = `${actual || "미확인"}${pending ? ` → ${pending}` : ""}`;
+    control.textContent = selected[kind] || "미확인";
     const label = kind === "model" ? "모델" : "에포트";
-    const explanation = pending ? "화살표 뒤 값은 다음 웹 입력부터 적용됩니다." : settings.observed === "last_response" && kind === "model" ? "마지막 응답에서 확인한 모델" : `${label} 선택`;
+    const explanation = pending ? `다음 메시지에 사용 · ${kind === "model" ? observedLabel : "세션에서 확인"}: ${actual || "미확인"}` : settings.observed === "last_response" && kind === "model" ? "마지막 응답에서 확인한 모델" : `${label} 선택`;
     control.title = `${label}: ${control.textContent} · ${explanation}`;
     control.setAttribute("aria-label", `${label}: ${control.textContent} · 선택하기`);
     control.disabled = !chatSupported(entry) || entry.sending || !!entry.pending || !!entry.commandBusy || networkOffline();

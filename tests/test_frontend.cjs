@@ -7729,7 +7729,7 @@ test('지우기 전에 출발한 목록 읽기가 늦게 와도 이 페이지의
   assert.equal(c.sessionRemoved(c.allSessions()[0]), false, 'shown again elsewhere: this page follows');
 });
 
-test('a removed session leaves the list for good, but comes back to answer or work; search and old records show it marked', async () => {
+test('a removed session stays hidden across status changes, searches and old records until explicitly included', async () => {
   const requests = [];
   const c = client(async (url, options) => {
     requests.push([url, options?.body && JSON.parse(options.body)]);
@@ -7744,16 +7744,24 @@ test('a removed session leaves the list for good, but comes back to answer or wo
   assert.deepEqual(shown(), ['kept']);
   // A change after it (unlike a tidy) does not bring it back.
   gone.updatedAt = now; assert.deepEqual(shown(), ['kept']);
-  // Searched for, or with old records, it is shown and marked.
-  c.state.search = '지운'; assert.deepEqual(shown(), ['gone']); c.state.search = '';
-  c.state.showOld = true; assert.ok(shown().includes('gone'));
+  // Neither a search nor the age filter overrides an explicit removal.
+  c.state.search = '지운'; assert.deepEqual(shown(), []); c.state.search = '';
+  c.state.showOld = true; assert.deepEqual(shown(), ['kept']);
+  c.state.showOld = false;
+  for (const phase of ['working', 'needs_input', 'idle', 'done', 'closed', 'unknown']) {
+    gone.phase = phase; assert.deepEqual(shown(), ['kept'], phase);
+  }
+  c.state.showRemoved = true;
   c.renderGroups(c.allSessions().filter((s) => c.matches(s, now)), now);
   const card = byClass(c.get('groups'), 'card').find((node) => node.dataset.sessionKey.endsWith('gone'));
   assert.equal(byClass(card, 'removed-tag')[0].hidden, false);
-  c.state.showOld = false;
-  // Waiting for an answer again: back on the list (and in 답 필요).
+  // Explicitly included: its actual state remains visible.
   gone.phase = 'needs_input'; assert.deepEqual(shown().sort(), ['gone', 'kept']);
   assert.equal(c.groupOf(c.allSessions().find((s) => s.id === 'gone'), now), 'needs_input');
+  // The removed filter finds old and tidied records without needing the age filter too.
+  gone.phase = 'done'; gone.updatedAt = now - 10 * 86400; gone.tidiedAt = now - 60;
+  assert.deepEqual(shown().sort(), ['gone', 'kept']);
+  c.state.showRemoved = false;
   // From the card menu: removed at once, then the board is asked; 다시 표시 asks again.
   gone.phase = 'done';
   const keptSession = c.allSessions().find((s) => s.id === 'kept');
@@ -7762,6 +7770,41 @@ test('a removed session leaves the list for good, but comes back to answer or wo
   assert.equal(requests.filter(([url]) => url === '/api/session/remove').at(-1)[1].removed, true);
   await c.showSessionAgain(c.allSessions().find((s) => s.id === 'gone'));
   assert.equal(requests.filter(([url]) => url === '/api/session/remove').at(-1)[1].removed, false);
+});
+
+test('the removed-sessions switch is explicit, counts as a filter, and resets without changing removal records', () => {
+  const c = client(undefined, noChatTimers);
+  c.context.navigator = { onLine: false };
+  c.windowEvents.DOMContentLoaded();
+  const now = 2_000_000;
+  const gone = recentSession('hidden', { phase: 'working', updatedAt: now - 60, removedAt: now - 30 });
+  setRecentSnapshot(c, [gone], now);
+  c.get('show-old').events.change({ target: { checked: true } });
+  assert.equal(byClass(c.get('groups'), 'card').length, 0);
+  c.get('show-removed').events.change({ target: { checked: true } });
+  assert.equal(byClass(c.get('groups'), 'card').length, 1);
+  assert.equal(c.get('filter-count').textContent, '2');
+  c.resetFilters();
+  assert.equal(c.state.showRemoved, false);
+  assert.equal(c.get('show-removed').checked, false);
+  assert.equal(byClass(c.get('groups'), 'card').length, 0);
+  assert.equal(c.sessionRemoved(c.allSessions()[0]), true);
+  c.prepareSessionListFor(c.allSessions()[0]);
+  assert.equal(c.state.showRemoved, false, 'opening a retained conversation does not unhide its card');
+  assert.equal(c.state.showOld, false);
+  assert.match(indexPage(), /id="show-removed" class="switch" type="checkbox" role="switch"/);
+});
+
+test('a failed removal restores a running card even with search and old records enabled', async () => {
+  const c = client(async () => ({ ok: false, status: 503, json: async () => ({ error: 'fixture: cannot save removal' }) }), noChatTimers);
+  const now = 2_000_000;
+  const s = recentSession('retry-remove', { phase: 'working', updatedAt: now - 60, title: '남길 작업' });
+  setRecentSnapshot(c, [s], now);
+  c.state.authenticated = true; c.state.showOld = true; c.state.search = '남길';
+  assert.equal(await c.removeSession(c.allSessions()[0], true), false);
+  assert.equal(c.sessionRemoved(c.allSessions()[0]), false);
+  assert.equal(byClass(c.get('groups'), 'card').length, 1);
+  assert.match(c.get('toast').textContent, /cannot save removal/);
 });
 
 test('목록 옆에 띄운 대화는 보는 동안 이전 묶음의 자리를 지키고, 다른 대화를 열면 맨 위로 간다', () => {

@@ -65,11 +65,6 @@ function sessionRemoved(s) {
   }
   return Number.isInteger(s.removedAt);
 }
-// A removed session is shown while it answers or works (its user would miss it otherwise),
-// and goes away again once it stops.
-function sessionHidden(s) {
-  return sessionRemoved(s) && s.phase !== "needs_input" && s.phase !== "working";
-}
 const BADGES = {
   needs_input: ["답 필요", "red"],
   working: ["작업 중", "amber"],
@@ -154,6 +149,7 @@ const state = {
   accountFilterRoutes: null,
   search: "",
   showOld: false,
+  showRemoved: false,
   detailFor: null,
   detailUpdatedAt: null,
   detailRevision: null,
@@ -988,10 +984,11 @@ function matches(s, now, { phase = true, category = true, initiator = true } = {
     }
     if (state.filters[key] && s[key] !== state.filters[key]) return false;
   }
-  // Removed: away unless old records are asked for or it is searched for (then marked 지움).
-  if (sessionHidden(s) && !state.showOld && !state.search) return false;
+  // An explicit removal takes precedence over status, search and the age filter.
+  const removed = sessionRemoved(s);
+  if (removed && !state.showRemoved) return false;
   if (
-    !state.showOld &&
+    !state.showOld && !removed &&
     groupOf(s, now) === "rest" &&
     (now - (s.updatedAt || 0) > RECENT_SECONDS || (sessionTidied(s) && !state.search))
   )
@@ -1701,8 +1698,8 @@ function prepareSessionListFor(session) {
   }
   if (state.phaseFilter && groupOf(session) !== state.phaseFilter) { state.phaseFilter = ""; changed = true; }
   const now = state.snapshot?.serverTime || Date.now() / 1000;
-  if (!state.showOld && groupOf(session) === "rest" &&
-      (now - (session.updatedAt || 0) > RECENT_SECONDS || sessionTidied(session) || sessionHidden(session))) {
+  if (!sessionRemoved(session) && !state.showOld && groupOf(session) === "rest" &&
+      (now - (session.updatedAt || 0) > RECENT_SECONDS || sessionTidied(session))) {
     state.showOld = true; $("show-old").checked = true; changed = true;
   }
   if (state.search && !matches(session, now)) {
@@ -1712,7 +1709,7 @@ function prepareSessionListFor(session) {
 }
 const FILTER_FIELDS = ["filter-host", "filter-agent", "filter-project", "filter-account", "filter-initiator"];
 function renderFilters(sessions) {
-  const active = Object.values(state.filters).filter(Boolean).length + (state.showOld ? 1 : 0);
+  const active = Object.values(state.filters).filter(Boolean).length + (state.showOld ? 1 : 0) + (state.showRemoved ? 1 : 0);
   $("filter-count").textContent = active ? String(active) : "";
   const open = $("filter-open");
   if (open) {
@@ -1769,6 +1766,8 @@ function resetFilters() {
   state.accountFilterRoutes = null;
   state.showOld = false;
   if ($("show-old")) $("show-old").checked = false;
+  state.showRemoved = false;
+  if ($("show-removed")) $("show-removed").checked = false;
   renderFilters(allSessions());
   render();
 }
@@ -1877,16 +1876,14 @@ function renderGroups(shown, now) {
   let loading = false;
   if (!shown.length) {
     const searching = !!state.search;
-    const filtering = Object.values(state.filters).some(Boolean);
+    const filtering = Object.values(state.filters).some(Boolean) || state.showOld || state.showRemoved;
     const unconfigured = !state.snapshot?.hosts?.length;
     const offline = state.snapshot?.hosts?.length && state.snapshot.hosts.every((host) => !host.ok && !host.refreshing);
     const clearAll = () => {
       state.search = "";
       state.phaseFilter = "";
-      for (const key of Object.keys(state.filters)) state.filters[key] = "";
-      state.accountFilterRoutes = null;
       $("search").value = "";
-      render();
+      resetFilters();
     };
     let empty;
     if (state.phaseFilter && !searching && !filtering) {
@@ -1894,7 +1891,7 @@ function renderGroups(shown, now) {
         "다른 세션은 필터를 해제하면 보입니다.", button("필터 해제", "secondary", () => togglePhaseFilter(state.phaseFilter)));
     } else if (searching || filtering || state.phaseFilter) {
       empty = emptyState("search", "조건에 맞는 세션이 없습니다.",
-        `${searching ? `‘${state.search}’ 검색. ` : ""}${filtering ? "선택한 필터가 적용되어 있습니다. " : ""}${state.showOld ? "오래된 기록도 포함했습니다." : "3일 지난 대화는 제외되어 있습니다. 필터에서 오래된 기록을 포함할 수 있습니다."}`,
+        `${searching ? `‘${state.search}’ 검색. ` : ""}${filtering ? "선택한 필터가 적용되어 있습니다. " : ""}${state.showRemoved ? "지운 세션도 포함했습니다. " : ""}${state.showOld ? "오래된 기록도 포함했습니다." : "3일 지난 대화는 제외되어 있습니다. 필터에서 오래된 기록을 포함할 수 있습니다."}`,
         button("검색·필터 초기화", "secondary", clearAll));
     } else if (unconfigured) {
       empty = emptyState("setup", "연결할 기기가 아직 설정되지 않았습니다.",
@@ -1907,7 +1904,7 @@ function renderGroups(shown, now) {
       empty = skeletonList("기기에서 세션을 확인하고 있습니다…");
     } else {
       empty = emptyState("none", "표시할 최근 세션이 없습니다.",
-        "설정한 기기에서 Claude Code나 Codex로 대화를 시작한 뒤 새로고침해 주세요. 3일 지난 대화는 필터에서 볼 수 있습니다.");
+        "설정한 기기에서 Claude Code나 Codex로 대화를 시작한 뒤 새로고침해 주세요. 지난 대화나 지운 세션은 필터에서 볼 수 있습니다.");
     }
     desired.push(empty);
   }
@@ -1977,7 +1974,7 @@ function card(s) {
   const project = el("span", "card-project");
   const stale = el("span", "stale-tag", "이전 정보");
   const removed = el("span", "removed-tag", "지움");
-  removed.title = "목록에서 지운 세션입니다. 검색이나 '오래된 기록 포함'에서만 보입니다.";
+  removed.title = "목록에서 지운 세션입니다. 필터의 '지운 세션 포함'을 켜면 보입니다.";
   const execution = el("span", "card-execution", "일회성 실행");
   const time = el("span", "card-time");
   const provenance = el("span", "card-provenance");
@@ -2395,7 +2392,7 @@ function cardActions(s) {
   if (removed || sessionTidied(s)) actions.push({ label: "목록에 다시 표시", run: () => showSessionAgain(s) });
   return actions;
 }
-const REMOVED_NOTE = "목록에서 지웠습니다. 답이 필요하거나 작업하는 동안에만 다시 보입니다.";
+const REMOVED_NOTE = "목록에서 지웠습니다. 필터의 '지운 세션 포함'에서 다시 표시할 수 있습니다.";
 // 목록에서 지우기 / 다시 표시: the board's own record (session-removed); the run is untouched.
 async function removeSession(s, removed, { quiet = false } = {}) {
   const key = s.key;
@@ -9541,6 +9538,10 @@ window.addEventListener("DOMContentLoaded", () => {
   });
   $("show-old").addEventListener("change", (event) => {
     state.showOld = event.target.checked;
+    render();
+  });
+  $("show-removed").addEventListener("change", (event) => {
+    state.showRemoved = event.target.checked;
     render();
   });
   $("home").addEventListener("click", () => {

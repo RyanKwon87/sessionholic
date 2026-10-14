@@ -7248,12 +7248,16 @@ test('the device panel closes outside, after an action and on Escape without ste
   c.closeChatToolsEscape({ key: 'Escape', preventDefault() { prevented++; } });
   assert.equal(panel.open, false); assert.equal(prevented, 1); assert.equal(summary.focusCount, 1);
   panel.open = true; c.get('board-status-panel').events.click({ target: action }); assert.equal(panel.open, false);
-  panel.open = true;
+  const { s } = selectChat(c);
   const approvals = c.get('chat-prompt'); approvals.hidden = false; let chosen = 0;
   approvals.chooseNumber = () => { chosen++; return true; };
+  c.context.__approvalKey = { key: '1', target: summary, preventDefault() {} };
+  assert.equal(vm.runInContext('promptKeydown(__approvalKey)', c.context), true);
+  assert.equal(chosen, 1, 'the underlying approval shortcut is active before opening the menu');
+  chosen = 0; panel.open = true;
   c.documentKeydown({ key: '1', target: summary, preventDefault() {} });
   assert.equal(chosen, 0, 'device menu keys cannot answer an underlying chat approval');
-  const { s } = selectChat(c); panel.open = true; c.drawDetail(s); assert.equal(panel.open, false);
+  panel.open = true; c.drawDetail(s); assert.equal(panel.open, false);
   panel.open = true; await c.openTerminal({ id: 'overview-terminal', mode: 'attach' }); assert.equal(panel.open, false);
   panel.open = true; c.showLogin(); assert.equal(panel.open, false);
 });

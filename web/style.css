@@ -4639,6 +4639,7 @@ body.app-shifted .terminal-screen {
 .quick-reload:disabled { opacity: 0.5; cursor: wait; }
 .detail-reload { flex: none; color: var(--label-2); font-size: 24px; }
 body.dock-solo .top #logout { display: none; }
+body.dock-solo .top .home-label { display: none; }
 body.dock-solo .settings-lock { display: flex; }
 .terminal-live {
   position: absolute;

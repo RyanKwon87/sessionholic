@@ -1100,7 +1100,15 @@ function renderHosts(now) {
   // Rebuilt on every snapshot: a chip that had the keyboard keeps it.
   const focused = box.contains?.(document.activeElement) ? document.activeElement.dataset?.host : null;
   box.replaceChildren();
-  const hosts = state.snapshot.hosts.map((host, index) => ({ host, index }))
+  const all = [...(state.snapshot?.hosts || [])];
+  for (const host of state.hardware?.hosts || []) {
+    if (!host?.name || all.some((item) => item.name === host.name)) continue;
+    all.push({ name: host.name, label: host.label || host.name, monitorOnly: true,
+      ok: host.status === "ready", refreshing: host.status === "pending" && !!host.refreshing,
+      fetchedAt: host.fetchedAt, error: host.status === "stale" ? "이전 기기 정보 · 연결 확인 필요"
+        : host.status === "pending" ? "연결 확인 전" : host.error || "연결 안 됨" });
+  }
+  const hosts = all.map((host, index) => ({ host, index }))
     .sort((a, b) => HOST_ORDER[hostRank(a.host)] - HOST_ORDER[hostRank(b.host)] || a.index - b.index);
   for (const { host } of hosts) {
     const chip = el("button", `host ${hostTone(host)}`);
@@ -1110,9 +1118,9 @@ function renderHosts(now) {
     const notes = [...hostNotes(host, "warnings"), ...hostNotes(host, "errors")];
     const problems = notes.length ? ` · ${notes[0]}${notes.length > 1 ? ` 외 ${notes.length - 1}건` : ""}` : "";
     chip.title = host.refreshing
-      ? `${host.label} · 작업 확인 중`
+      ? `${host.label} · ${host.monitorOnly ? "기기" : "작업"} 확인 중`
       : host.ok
-        ? `${host.label} · ${ago(host.fetchedAt, now)} 확인${problems}`
+        ? `${host.label} · ${host.monitorOnly ? "기기 연결됨 · " : ""}${ago(host.fetchedAt, now)} 확인${problems}`
         : `${host.label} · ${host.error || "연결 확인 필요"}${host.fetchedAt ? ` · 마지막 확인 ${ago(host.fetchedAt, now)}` : ""}`;
     chip.setAttribute("aria-label", chip.title);
     chip.addEventListener("click", () => toast(chip.title));
@@ -1331,6 +1339,7 @@ async function loadHardware(force = false) {
     const data = force ? await api("/api/hardware/refresh", { method: "POST", body: {} }) : await api("/api/hardware");
     state.hardware = data;
     renderHardware(data);
+    renderHosts(state.snapshot?.serverTime || Date.now() / 1000);
     // Follow the reads the board is making, a few times.
     if (data?.refreshing && (state.hardwareFollow = (state.hardwareFollow || 0) + 1) <= 10)
       setTimeout(() => loadHardware(false), 3000);
@@ -2403,6 +2412,7 @@ async function removeSession(s, removed, { quiet = false } = {}) {
     const result = await api("/api/session/remove", { method: "POST", body: { source: seenSource(s), removed } });
     if (Number.isInteger(result?.version)) mark.version = result.version;
     mark.after = state.snapshot;
+    if (!removed && state.removedLocal.get(key) === mark) { keepRestoredSession(s); render(); }
     if (!quiet) toast(removed ? REMOVED_NOTE : "목록에 다시 표시합니다.");
     poll(false);
     return true;
@@ -2425,7 +2435,14 @@ async function showSessionAgain(s) {
     }
   }
   if (sessionRemoved(s)) await removeSession(s, false);
-  else { toast("목록에 다시 표시합니다."); poll(false); }
+  else { keepRestoredSession(s); render(); toast("목록에 다시 표시합니다."); poll(false); }
+}
+function keepRestoredSession(s) {
+  const now = state.snapshot?.serverTime || Date.now() / 1000;
+  if (sessionTidied(s) || now - (s.updatedAt || 0) > RECENT_SECONDS) {
+    state.showOld = true;
+    $("show-old").checked = true;
+  }
 }
 function openCardMenu(row, at = null) {
   const s = sessionForRow(row);
@@ -2701,6 +2718,7 @@ async function tidySession(context, away) {
     (state.removedLocal ||= new Map()).set(context.s.key, { removed: away, after: state.snapshot,
       version: Number.isInteger(result?.version) ? result.version : null });
     if (sessionControl !== context) return;
+    if (!away) keepRestoredSession(context.s);
     $("session-control-status").textContent = away ? REMOVED_NOTE : "목록에 다시 표시합니다.";
     const tidy = $("session-control-tidy");
     const replacement = button(away ? "목록에 다시 표시" : "목록에서 지우기", "secondary", () => tidySession(context, !away));
@@ -2758,6 +2776,7 @@ function select(key) {
   // A docked terminal stays beside its own conversation; another one shows without it.
   if (state.docked && key !== state.dockBeside) undock();
   if (state.selected !== key) rememberConversationView();
+  if (state.selected !== key) closeQuickReplies();
   const target = allSessions().find((session) => session.key === key);
   const bot = target && botRequestForNative(sourceOf(target));
   if (target && sessionUnread(target)) markSeen(target);
@@ -4150,7 +4169,7 @@ function buildChatComposer(s) {
     // Esc leaves the input (a hardware keyboard's way out); an open tools menu
     // closes first (closeChatToolsEscape), and an IME keeps its own Esc.
     if (event.key === "Escape") {
-      if (event.isComposing || event.keyCode === 229 || entry.composing || tools.open) return;
+      if (event.isComposing || event.keyCode === 229 || entry.composing || tools.open || state.quickRepliesOpen) return;
       event.preventDefault();
       input.blur();
       return;
@@ -4355,6 +4374,8 @@ function sentDraftHidden(entry) {
   return !entry.composing && draftIsPending(entry);
 }
 function closeChatToolsOutside(event) {
+  const quick = state.quickRepliesOpen;
+  if (quick && !quick.panel.contains?.(event.target) && event.target !== quick.trigger) closeQuickReplies();
   for (const id of ["chat-tools", "terminal-settings"]) {
     const tools = $(id);
     if (tools?.open && !tools.contains(event.target)) tools.open = false;
@@ -4365,6 +4386,12 @@ function closeChatToolsOutside(event) {
 }
 function closeChatToolsEscape(event) {
   if (event.key !== "Escape" || event.isComposing || event.keyCode === 229) return;
+  if (state.quickRepliesOpen) {
+    const input = state.quickRepliesOpen.input;
+    closeQuickReplies();
+    if (document.activeElement !== input) input.focus?.({ preventScroll: true });
+    event.preventDefault();
+  }
   for (const id of ["chat-tools", "terminal-settings"]) {
     const tools = $(id);
     if (!tools?.open) continue;
@@ -4420,6 +4447,7 @@ function documentKeydown(event) {
     return;
   }
   closeChatToolsEscape(event);
+  if (event.defaultPrevented) return;
   if (terminalDocumentKey(event)) {
     noteHardwareKey(event);
     return;
@@ -4869,6 +4897,7 @@ async function sendChat(entry, message = null) {
     return;
   }
   // The draft is what is sent: words still being heard never land after it.
+  closeQuickReplies();
   if (!message) stopDictation({ abort: true, field: $("chat-input") });
   // Keep the exact source and idempotency key even if selection changes during transport.
   const authEpoch = state.authEpoch;
@@ -5384,11 +5413,47 @@ function saveQuickReplies(text) {
 }
 function openQuickReplies(entry, input, trigger) {
   const replies = quickReplies();
+  const composer = touchDevice() && document.activeElement === input ? input.closest?.(".chat-composer") : null;
+  if (composer) {
+    const same = state.quickRepliesOpen?.input === input;
+    closeQuickReplies();
+    if (same) return;
+    const panel = el("div", "chat-quick-options");
+    panel.id = "chat-quick-options";
+    panel.setAttribute("role", "group");
+    panel.setAttribute("aria-label", "빠른 답장 · 입력창에 넣기, 보내지 않음");
+    const add = (text, run) => {
+      const item = button(text, "action-item", run);
+      item.addEventListener("pointerdown", (event) => event.preventDefault());
+      panel.append(item);
+      return item;
+    };
+    for (const text of replies) add(text, () => {
+      closeQuickReplies();
+      insertChatText(entry, input, text);
+      if (currentChat(entry) && document.activeElement !== input) input.focus?.({ preventScroll: true });
+    });
+    if (!replies.length) add("설정 › 빠른 답장에서 문구를 추가해 주세요", () => {}).disabled = true;
+    add("닫기", closeQuickReplies);
+    trigger?.setAttribute?.("aria-expanded", "true");
+    trigger?.setAttribute?.("aria-haspopup", "false");
+    trigger?.setAttribute?.("aria-controls", panel.id);
+    state.quickRepliesOpen = { panel, input, trigger };
+    composer.append(panel);
+    return;
+  }
   // Chosen or cancelled, the keyboard goes back to the input, not to the closed tools menu.
+  trigger?.setAttribute?.("aria-haspopup", "dialog");
   openActionSheet({ eyebrow: "입력창에 넣기 · 보내지 않음", title: "빠른 답장", trigger: input || trigger,
     actions: replies.length
       ? replies.map((text) => ({ label: text, run: () => { insertChatText(entry, input, text); input.focus?.({ preventScroll: true }); } }))
       : [{ label: "설정 › 빠른 답장에서 문구를 추가해 주세요", disabled: true, run() {} }] });
+}
+function closeQuickReplies() {
+  const opened = state.quickRepliesOpen;
+  state.quickRepliesOpen = null;
+  opened?.panel.remove?.();
+  opened?.trigger?.setAttribute?.("aria-expanded", "false");
 }
 // A Claude background conversation without a board terminal: its connection opens as its user
 // starts a message (typing, the mic or a quick reply; chat.py warm), so the send then pastes at
@@ -6136,8 +6201,12 @@ function navigateView(view, replace = false, extra = {}) {
   if (!replace && current?.[INSTANCE.historyKey] && current.view === view) return;
   // `notice` belongs to the one entry a notification opened.
   const { notice, ...kept } = current || {};
+  const depth = view === "list" ? 0 : replace ? (current?.listDepth || 0)
+    : current?.[INSTANCE.historyKey] && Number.isInteger(current.listDepth) ? current.listDepth + 1 : 0;
+  const navigationId = replace && current?.[INSTANCE.historyKey] && current.navigationId ? current.navigationId : requestId();
+  const parentDetailId = view === "terminal" && current?.[INSTANCE.historyKey] && current.view === "detail" ? current.navigationId : null;
   window.history[replace ? "replaceState" : "pushState"](
-    { ...kept, ...extra, [INSTANCE.historyKey]: true, view },
+    { ...kept, ...extra, [INSTANCE.historyKey]: true, view, listDepth: depth, navigationId, parentDetailId },
     "",
   );
 }
@@ -7004,22 +7073,24 @@ function fitTerminal() {
     return;
   }
   clearTimeout(state.resizeTimer);
+  const terminal = state.terminal, openRun = state.terminalOpenRun;
+  const current = () => state.terminal === terminal && state.terminalOpenRun === openRun && state.terminalVisible;
   state.resizeTimer = setTimeout(async () => {
-    if (!state.connected || !state.terminal) return;
+    if (!current() || !state.connected || !terminal || !state.term) return;
     const size = `${state.term.cols}x${state.term.rows}`;
     if (size === state.lastSize) return;
     try {
       await api(
-        `/api/terminal/${encodeURIComponent(state.terminal.id)}/resize`,
+        `/api/terminal/${encodeURIComponent(terminal.id)}/resize`,
         {
           method: "POST",
           body: { cols: state.term.cols, rows: state.term.rows },
         },
       );
-      state.lastSize = size;
+      if (current()) state.lastSize = size;
     } catch (err) {
       // An ended terminal has nothing to fit: its own end notice stays.
-      if (!err.unauthorized && !err.staleAuth && state.terminalAlive !== false)
+      if (current() && !err.unauthorized && !err.staleAuth && state.terminalAlive !== false)
         terminalError("터미널 크기를 맞추지 못했습니다. 다시 연결해 주세요.");
     }
   }, 180);
@@ -7259,7 +7330,7 @@ function loadXterm() {
 async function openTerminal(terminal, { recordHistory = true } = {}) {
   const docking = dockWidth() > 0;
   if (!docking) stopChatPolling();
-  if (recordHistory) navigateView("terminal");
+  if (recordHistory) navigateView("terminal", docking && window.history.state?.[INSTANCE.historyKey] && window.history.state.view === "list");
   const presenting = !state.terminalVisible;
   const openRun = ++state.terminalOpenRun;
   const current = () => openRun === state.terminalOpenRun && state.terminal?.id === terminal.id && state.terminalVisible;
@@ -8569,7 +8640,16 @@ function finishTerminalClose(closing) {
     showTerminalScreen(false);
     updateThemeColor();
     renderTerminalReturn();
-    if (wasVisible) navigateView("list", true);
+    if (wasVisible) {
+      const history = window.history;
+      const closed = state.closedHistory ||= new Set();
+      for (const key of [history.state?.navigationId, !wasDocked && history.state?.parentDetailId]) if (key) closed.add(key);
+      const depth = history.state?.[INSTANCE.historyKey] && history.state.view === "terminal" ? history.state.listDepth : 0;
+      if (!wasDocked && Number.isInteger(depth) && depth > 0 && depth <= 2 && typeof history.go === "function") {
+        state.closedTerminalNavigation = true;
+        history.go(-depth);
+      } else navigateView("list", true);
+    }
     // A covering terminal returns to the list; beside the conversation, that stays.
     if (wasVisible && !wasDocked) {
       stopChatPolling();
@@ -9069,6 +9149,7 @@ function bindPullToRefresh(root) {
   root.addEventListener("touchcancel", () => { start = null; distance = 0; if (!state.pullRefreshing) showPull(0); }, { passive: true });
 }
 function showLogin() {
+  closeQuickReplies();
   beginAuthEpoch();
   window.SessionholicLabels?.locked?.();
   closeSessionControl(true);
@@ -9132,6 +9213,8 @@ function showLogin() {
   state.terminalsError = "";
   state.compositionOwner = null;
   state.closingTerminal = null;
+  state.closedTerminalNavigation = false;
+  state.closedHistory?.clear?.();
   if ($("close-terminal-dialog").open) $("close-terminal-dialog").close();
   $("terminal-draft").value = "";
   $("terminal-viewport").replaceChildren();
@@ -9391,7 +9474,13 @@ window.addEventListener("DOMContentLoaded", () => {
   document.addEventListener("pointerdown", closeChatToolsOutside);
   document.addEventListener("keydown", documentKeydown);
   window.addEventListener("popstate", (event) => {
-    const view = event.state?.[INSTANCE.historyKey] ? event.state.view : "list";
+    let view = event.state?.[INSTANCE.historyKey] ? event.state.view : "list";
+    if (state.closedTerminalNavigation || state.closedHistory?.has(event.state?.navigationId) || view === "terminal" && !state.terminal) {
+      state.closedTerminalNavigation = false;
+      view = "list";
+      navigateView("list", true);
+      event = { ...event, state: window.history.state };
+    }
     if (!state.authenticated) {
       navigateView("list", true);
       return;

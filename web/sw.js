@@ -158,27 +158,43 @@ async function pushId() {
 async function pendingNotifications() {
   const id = await pushId();
   if (!id) return null;
-  const response = await fetch(`/api/push/pending?id=${id}`, {
+  const response = await fetch(`/api/push/pending?id=${id}&v=2`, {
     credentials: "same-origin", cache: "no-store", headers: { "X-Board-Push": "1" },
   });
   if (!response.ok) return null;
   const data = await response.json();
-  return (Array.isArray(data?.notifications) ? data.notifications : [])
+  const items = (Array.isArray(data?.notifications) ? data.notifications : [])
     .filter((item) => item && typeof item.title === "string" && typeof item.tag === "string")
     .slice(-20);
+  return { items, id, csrfToken: data.csrfToken };
 }
 async function showPushed() {
-  let items = null;
+  let pending = null;
   try {
-    items = await pendingNotifications();
+    pending = await pendingNotifications();
   } catch {
-    items = null;
+    pending = null;
   }
+  const items = pending?.items ?? null;
   if (items?.length) {
-    await Promise.all(items.map((item) => self.registration.showNotification(item.title.slice(0, 120), {
-      body: String(item.body || "").slice(0, 300), tag: item.tag.slice(0, 700), renotify: true,
-      icon: "/icon-192.png", data: { url: pushUrl(item.url) },
-    })));
+    const shown = await self.registration.getNotifications().catch(() => []);
+    const results = await Promise.allSettled(items.map(async (item) => {
+      if (!item.noticeId || !shown.some((old) => old.tag === item.tag && old.data?.noticeId === item.noticeId))
+        await self.registration.showNotification(item.title.slice(0, 120), {
+          body: String(item.body || "").slice(0, 300), tag: item.tag.slice(0, 700), renotify: true,
+          icon: "/icon-192.png", data: { url: pushUrl(item.url), ...(item.noticeId ? { noticeId: item.noticeId } : {}) },
+        });
+      return item.noticeId;
+    }));
+    const confirmed = results.filter((result) => result.status === "fulfilled" && typeof result.value === "string" && /^[a-f0-9]{32}$/.test(result.value)).map((result) => result.value);
+    if (confirmed.length && typeof pending.csrfToken === "string") {
+      try {
+        await fetch("/api/push/ack", { method: "POST", credentials: "same-origin", cache: "no-store",
+          headers: { "Content-Type": "application/json", "X-Board-Push": "1", "X-CSRF-Token": pending.csrfToken },
+          body: JSON.stringify({ id: pending.id, notices: confirmed }) });
+      } catch { /* An unconfirmed notice stays queued for the next wake-up. */ }
+    }
+    if (results.every((result) => result.status === "rejected")) throw results[0].reason;
     return;
   }
   // Read, but nothing new (another wake-up already showed it): the latest notice again, quietly.

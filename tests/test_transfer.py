@@ -91,6 +91,7 @@ class CoordinatorTest(unittest.TestCase):
                 'cwd':str(destination),'root':str(destination)}))
             stack.enter_context(patch('launch.build_transferred_launch',return_value=spec))
             stack.enter_context(patch('transfer_native._socket_path',return_value=home/'fixture.sock'))
+            stack.enter_context(patch('collector.daemon_socket_state',return_value='ready'))
             stack.enter_context(patch('native_chat._client',return_value=Native()))
             stack.enter_context(patch.object(self.flow,'rpc',side_effect=rpc))
             yield calls
@@ -984,6 +985,9 @@ class RemoteHandoffHome(unittest.TestCase):
                         patch.object(collector, 'HOME', self.home),
                         patch.object(launch, '_binary', side_effect=fixture),
                         self.socket,
+                        # The native client and daemon are fixtures here. The real
+                        # listening/refused socket distinction is tested in test_offline_codex.
+                        patch('collector.daemon_socket_state', return_value='ready'),
                         patch('native_chat._client', side_effect=lambda *a: Native())):
             patcher.start()
             self.addCleanup(patcher.stop)

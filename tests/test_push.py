@@ -341,9 +341,12 @@ class ServiceTest(unittest.TestCase):
         self.clock.now += push.RETRY
         self.service.step()
         self.assertEqual(calls, [FCM, APPLE, FCM], "the failed device is woken again while its notice waits")
+        for target in self.service.subscriptions:
+            notices = self.service.pending_for(target['id'], retain=True)['notifications']
+            self.service.acknowledge({'id': target['id'], 'notices': [item['noticeId'] for item in notices]})
         self.clock.now += push.RETRY
         self.service.step()
-        self.assertEqual(len(calls), 3, "a delivered wake-up is not repeated")
+        self.assertEqual(len(calls), 3, "an acknowledged wake-up is not repeated")
 
     def test_retries_back_off_stop_after_a_limit_and_old_notices_expire(self):
         self.subscribe()
@@ -449,6 +452,48 @@ class ServiceTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "403"):
             self.service.test({"endpoint": APPLE})
 
+    def test_pending_survives_restart_and_only_displayed_notice_ids_are_removed(self):
+        self.subscribe()
+        self.board.set(row(phase='working')); self.service.step()
+        self.board.set(row(phase='needs_input', updatedAt=self.clock.now)); self.service.step()
+        identifier = self.service.subscriptions[0]['id']
+        old = self.service.pending_for(identifier, retain=True)['notifications']
+        self.assertEqual(len(old), 1)
+        restarted = self.make()
+        self.assertEqual(restarted.step(), [])
+        self.assertEqual(restarted.pending_for(identifier, retain=True)['notifications'], old)
+        self.clock.now += push.ACK_RETRY
+        before = len(self.sent); restarted.retry()
+        self.assertEqual(len(self.sent), before + 1, 'an undisplayed notice gets another wake-up after restart')
+        restarted._queue(restarted.subscriptions, {**old[0], 'title': 'new version'})
+        newer = restarted.pending_for(identifier, retain=True)['notifications'][0]
+        self.assertNotEqual(newer['noticeId'], old[0]['noticeId'])
+        self.assertEqual(restarted.acknowledge({'id': identifier, 'notices': [old[0]['noticeId']]})['acknowledged'], 0)
+        self.assertEqual(len(restarted.pending_for(identifier, retain=True)['notifications']), 1)
+        with patch.object(push, 'write_private', side_effect=OSError('fixture: disk unavailable')):
+            with self.assertRaises(OSError):
+                restarted.acknowledge({'id': identifier, 'notices': [newer['noticeId']]})
+        self.assertEqual(len(restarted.pending_for(identifier, retain=True)['notifications']), 1)
+        self.assertEqual(restarted.acknowledge({'id': identifier, 'notices': [newer['noticeId']]})['acknowledged'], 1)
+        self.assertEqual(self.make().pending_for(identifier, retain=True)['notifications'], [])
+
+    def test_legacy_phase_store_is_migrated_and_pending_creation_is_one_atomic_store(self):
+        self.subscribe(); self.board.set(row(phase='working')); self.service.step()
+        path = Path(self.temp.name) / 'push/seen.json'
+        current = json.loads(path.read_text()); path.write_text(json.dumps(current['seen']))
+        restarted = self.make(); self.assertEqual(restarted.step(), [])
+        self.board.set(row(phase='needs_input', updatedAt=self.clock.now))
+        writes = []
+        original = push.write_private
+        def write(path, value):
+            if path.name == 'seen.json': writes.append(json.loads(json.dumps(value)))
+            original(path, value)
+        with patch.object(push, 'write_private', side_effect=write): restarted.step()
+        self.assertTrue(writes)
+        self.assertTrue(all(value['pending'] for value in writes), 'no committed waiting phase before its notice is queued')
+        for payload in ({'id': 'bad', 'notices': []}, {'id': restarted.subscriptions[0]['id'], 'notices': ['bad']}):
+            with self.assertRaises(ValueError): restarted.acknowledge(payload)
+
     def test_pending_queue_is_bounded_per_device_and_replaces_a_tag(self):
         self.subscribe()
         target = self.service.subscriptions
@@ -515,6 +560,19 @@ class RouteTest(unittest.TestCase):
         finally:
             self.httpd.push.enabled = True
 
+    def test_the_actual_server_classifier_matches_direct_agent_and_bot_origins(self):
+        base = {**row(), 'agent': 'codex', 'initiator': 'unknown'}
+        cases = [({'source': 'cli', 'originator': 'reader'}, 'general'),
+                 ({'source': 'vscode'}, 'general'), ({'source': 'exec', 'originator': 'codex-tui'}, 'agent'),
+                 ({'originator': 'hermes', 'source': 'cli'}, 'bot'), ({'originator': 'other'}, 'agent'),
+                 ({'source': 'cli', 'parentSessionId': 'parent'}, 'agent'),
+                 ({'source': 'cli', 'agentRole': 'worker'}, 'agent'),
+                 ({'cwd': '/work/workspaces/slack/project'}, 'bot'),
+                 ({'agent': 'claude', 'kind': 'background'}, 'general'), ({'agent': 'claude'}, 'agent')]
+        for fields, expected in cases:
+            with self.subTest(fields=fields):
+                self.assertEqual(self.httpd.push.classify({'name': 'local'}, {**base, **fields}), expected)
+
     def test_routes_need_login_csrf_and_the_service_worker_header(self):
         self.assertEqual(self.request("GET", "/api/push")[0], 401)
         cookie, csrf = self.session()
@@ -538,6 +596,18 @@ class RouteTest(unittest.TestCase):
         self.assertEqual(self.request("HEAD", pending, headers={"Cookie": cookie, "X-Board-Push": "1"})[0], 405)
         status, body = self.request("GET", pending, headers={"Cookie": cookie, "X-Board-Push": "1"})
         self.assertEqual((status, [item["tag"] for item in body["notifications"]]), (200, ["notice-test"]))
+        self.request('POST', '/api/push/test', json.dumps({'endpoint': APPLE}), {'Cookie': cookie, 'Content-Type': 'application/json', 'X-CSRF-Token': csrf})
+        modern = pending + '&v=2'
+        status, body = self.request('GET', modern, headers={'Cookie': cookie, 'X-Board-Push': '1'})
+        self.assertEqual(status, 200)
+        self.assertEqual(body['csrfToken'], csrf)
+        ids = [item['noticeId'] for item in body['notifications']]
+        self.assertTrue(ids)
+        payload = json.dumps({'id': push.subscription_id(APPLE), 'notices': ids})
+        self.assertEqual(self.request('POST', '/api/push/ack', payload, {'Cookie': cookie, 'Content-Type': 'application/json', 'X-Board-Push': '1'})[0], 403)
+        self.assertEqual(self.request('POST', '/api/push/ack', payload, {'Cookie': cookie, 'Content-Type': 'application/json', 'X-CSRF-Token': csrf})[0], 403)
+        self.assertEqual(self.request('POST', '/api/push/ack', payload, {'Cookie': cookie, 'Content-Type': 'application/json', 'X-CSRF-Token': csrf, 'X-Board-Push': '1'})[0], 200)
+        self.assertEqual(self.request('GET', modern, headers={'Cookie': cookie, 'X-Board-Push': '1'})[1]['notifications'], [])
         self.assertEqual(self.request("GET", "/api/push/pending?id=bad", headers={"Cookie": cookie, "X-Board-Push": "1"})[0], 400)
         status, body = self.request("POST", "/api/push/unsubscribe", json.dumps({"endpoint": APPLE}),
                                     {"Cookie": cookie, "Content-Type": "application/json", "X-CSRF-Token": csrf})

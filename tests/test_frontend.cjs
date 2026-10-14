@@ -10236,3 +10236,77 @@ test('봇 요청 탭은 봇이 연 세션도 보여 주고, 누르면 그 대화
   assert.match(textOf(c.get('detail')), /Slack · 봇이 진행하는 세션 · 보기 전용/);
   assert.doesNotMatch(textOf(c.get('detail')), /이 작업에 메시지 보내기/);
 });
+
+// A conversation read that fails while another was asked for (a return to the screen, a live
+// update) is read again, rather than leaving the old screen until the next safety poll.
+function chatReadSetup({ sse = false } = {}) {
+  const chatCalls = [];
+  const timers = [];
+  let c;
+  c = client(async (url) => {
+    if (url === '/api/chat/state') {
+      let resolve, reject;
+      const promise = new Promise((a, b) => { resolve = a; reject = b; });
+      chatCalls.push({ promise, resolve, reject });
+      return promise;
+    }
+    return { ok: true, status: 200, json: async () => url.startsWith('/api/snapshot') ? { hosts: c.state.snapshot?.hosts || [], version: 1 }
+      : url === '/api/capabilities' ? { hosts: [], csrfToken: 'csrf-test' } : {} };
+  }, { setTimeout: (callback, ms) => { timers.push({ callback, ms }); return timers.length; }, clearTimeout() {} });
+  c.context.navigator = { onLine: true };
+  let sources = null;
+  if (sse) { const fake = fakeEventSource(); c.context.EventSource = fake.FakeEventSource; sources = fake.sources; }
+  return { c, chatCalls, timers, get sources() { return sources; } };
+}
+const settleRounds = async (rounds = 8) => { for (let i = 0; i < rounds; i++) await new Promise((r) => setImmediate(r)); };
+
+test('a read stalled in the background that fails after the return is read again, not left on the old screen', async () => {
+  const { c, chatCalls, timers } = chatReadSetup();
+  c.windowEvents.DOMContentLoaded();
+  await settleRounds(4);
+  const { s, entry } = selectChat(c);
+  entry.data.phase = 'working';
+  c.state.detailShown = true;
+  c.state.capabilities = { hosts: [], csrfToken: 'csrf-test' };
+  c.loadChatState(s, false);
+  await settleRounds(4);
+  assert.equal(chatCalls.length, 1);
+  c.context.document.hidden = true; c.documentEvents.visibilitychange();
+  c.context.document.hidden = false; c.documentEvents.visibilitychange();
+  await settleRounds(4);
+  assert.equal(entry.recheckQueued, true, 'the return asked for a read while the old one hung');
+  chatCalls[0].reject(new TypeError('Load failed'));
+  await settleRounds();
+  const retry = timers.filter((timer) => timer.ms === 3000).at(-1);
+  assert.ok(retry, 'the asked read is retried shortly');
+  retry.callback();
+  await settleRounds(4);
+  assert.equal(chatCalls.length, 2);
+});
+
+test('a live update that arrives during a read that then fails is read again shortly, not after the safety poll', async () => {
+  const h = chatReadSetup({ sse: true });
+  const { c, chatCalls, timers } = h;
+  const { s, entry } = selectChat(c);
+  entry.data.phase = 'working';
+  c.state.detailShown = true;
+  c.state.capabilities = { hosts: [], csrfToken: 'csrf-test' };
+  c.state.capabilitiesRevision = c.capabilitiesRevision(c.state.snapshot);
+  c.state.usageAt = Date.now(); c.state.hardwareAt = Date.now();
+  c.syncEvents();
+  h.sources[0].emit('hello', { snapshotVersion: 1 });
+  await settleRounds(4);
+  c.loadChatState(s, false);
+  await settleRounds(4);
+  const before = chatCalls.length;
+  h.sources[0].emit('chat', { digest: 'new-content' });
+  assert.equal(entry.recheckQueued, true);
+  chatCalls[before - 1].reject(Object.assign(new Error('대화 상태를 확인하지 못했습니다.'), { status: 409 }));
+  timers.length = 0;
+  await settleRounds();
+  const retry = timers.find((timer) => timer.ms === 3000);
+  assert.ok(retry, `retried in 3 s, not only the next poll: ${JSON.stringify(timers.map((t) => t.ms))}`);
+  retry.callback();
+  await settleRounds(4);
+  assert.ok(chatCalls.length > before);
+});

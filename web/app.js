@@ -4740,6 +4740,7 @@ function applyChatReceipt(entry, receipt) {
   }
   entry.pending = null;
 }
+const CHAT_RECHECK_RETRY_MS = 3000;
 async function loadChatState(s, manual = false, { join = false } = {}) {
   const entry = chatEntry(s);
   if (!currentChat(entry) || !chatVisible() || networkOffline()) return;
@@ -4764,7 +4765,6 @@ async function loadChatState(s, manual = false, { join = false } = {}) {
   entry.stateReadAuthEpoch = state.authEpoch;
   let outcome = { status: "skipped" };
   const epoch = entry.stateEpoch;
-  const pollRun = state.chatPollRun;
   let readFailed = false;
   // A read clears its own (and a send's) errors; an input error (a file too
   // large, too many files, too long a message) stays until the user acts again.
@@ -4810,9 +4810,9 @@ async function loadChatState(s, manual = false, { join = false } = {}) {
       if (!entry.error && currentChat(entry)) revealChrome();
       entry.error = `${err.message} 상태 다시 확인을 눌러 주세요.`;
     }
-    // A transient failure keeps following the session with the same backoff.
-    if (currentChat(entry) && pollRun === state.chatPollRun && !err.unauthorized && !err.staleAuth)
-      scheduleChatPoll(s, entry);
+    // A transient failure keeps following the session with the same backoff (also when the
+    // polling stopped meanwhile: scheduleChatPoll follows only the conversation on screen).
+    if (currentChat(entry) && !err.unauthorized && !err.staleAuth) scheduleChatPoll(s, entry);
   } finally {
     entry.checking = false;
     complete(outcome);
@@ -4820,8 +4820,12 @@ async function loadChatState(s, manual = false, { join = false } = {}) {
     updateChatComposer(entry);
     const recheck = entry.recheckQueued || epoch !== entry.stateEpoch;
     entry.recheckQueued = false;
-    if (recheck && !readFailed && currentChat(entry) && chatVisible() && !networkOffline())
-      queueMicrotask(() => loadChatState(s, false));
+    // A read asked for while this one ran (a return to the screen, a live update) still
+    // happens: at once, or shortly after this one failed, so the old screen never stays.
+    if (recheck && currentChat(entry) && chatVisible() && !networkOffline()) {
+      if (!readFailed) queueMicrotask(() => loadChatState(s, false));
+      else setTimeout(() => { if (currentChat(entry) && chatVisible()) loadChatState(s, false); }, CHAT_RECHECK_RETRY_MS);
+    }
   }
   return outcome;
 }

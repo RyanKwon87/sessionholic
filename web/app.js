@@ -461,6 +461,8 @@ function sheetRelease({ offset = 0, velocity = 0, height = 0, detent = "medium",
 }
 // See BottomSheet.unseenPressTaken.
 const SHEET_UNSEEN_PRESS_MS = 700;
+// A click this soon after the long press's finger lifted is that finger's.
+const SHEET_LIFT_CLICK_MS = 300;
 class BottomSheet {
   static attach(dialog, options = {}) {
     if (!dialog) return null;
@@ -508,7 +510,8 @@ class BottomSheet {
   // Taken once the finger that opened it is long gone (a click after a hold that long is
   // not that finger's: a long press makes no click).
   unseenPressTaken() {
-    return !this.pressedSinceOpen && Date.now() - (this.openedAt || 0) >= SHEET_UNSEEN_PRESS_MS;
+    return !this.pressedSinceOpen && Date.now() - (this.openedAt || 0) >= SHEET_UNSEEN_PRESS_MS &&
+      Date.now() - (state.pressLiftAt || 0) >= SHEET_LIFT_CLICK_MS;
   }
   close() {
     if (this.dialog.open) this.dialog.close();
@@ -772,7 +775,7 @@ function beginAuthEpoch() {
 const CSRF_RETRY = new Set(["/api/chat/state", "/api/chat/prompt", "/api/plan", "/api/launch",
   "/api/new-session", "/api/app-server", "/api/refresh", "/api/usage/refresh", "/api/hardware/refresh",
   "/api/push/subscribe", "/api/push/unsubscribe", "/api/session/seen", "/api/session/tidy", "/api/session/remove",
-  "/api/session/opened", "/api/chat/warm"]);
+  "/api/session/opened", "/api/chat/warm", "/api/diagnostics/dictation"]);
 // A terminal's size and scrolling; its keys never (sendInput reads the token instead).
 const CSRF_RETRY_TERMINAL = /^\/api\/terminal\/[a-f0-9]{32}\/(resize|scroll|scroll-end)$/;
 function csrfRetryable(path) {
@@ -857,7 +860,9 @@ async function api(path, { method = "GET", body, signal: callerSignal, authEpoch
       method !== "GET" && csrfRetryable(path)) {
     let refreshed = false;
     try {
-      await loadCapabilities(authEpoch, { refreshView: false });
+      // After a restart every request in flight is refused at once: one refresh serves them all.
+      state.csrfRefresh ||= loadCapabilities(authEpoch, { refreshView: false }).finally(() => { state.csrfRefresh = null; });
+      await state.csrfRefresh;
       refreshed = true;
     } catch (err) {
       if (err.unauthorized || err.staleAuth) throw err;
@@ -2183,7 +2188,7 @@ function bindPressMenu(root, rowOf, open, { onDown = null, onMove = null, onUp =
   root.addEventListener("pointerup", (event) => {
     // `fired`: this press already opened its menu, so it was not a tap.
     const fired = press.end(event);
-    if (fired) root.pressedAt = Date.now();
+    if (fired) root.pressedAt = state.pressLiftAt = Date.now();
     onUp?.(event, false, fired);
   });
   root.addEventListener("pointercancel", (event) => {
@@ -3210,7 +3215,11 @@ function pinnedToEnd(list) {
 // conversation is put back at its newest message.
 function keepAtEnd(list) {
   if (list?.pendingView) { restoreConversationView(list); return; }
-  if (!list || list.isConnected === false || !list.clientHeight || !pinnedToEnd(list)) return;
+  if (!list || list.isConnected === false || !list.clientHeight) return;
+  if (!pinnedToEnd(list)) {
+    renderJump();
+    return;
+  }
   setMessagesScroll(list, list.scrollHeight);
   list.unread = 0;
   renderJump();
@@ -3316,10 +3325,16 @@ function setTyping(typing) {
   const list = $("messages");
   const atBottom = messagesAtEnd(list);
   const before = list?.getBoundingClientRect?.().top;
+  const restore = !typing && list && list.typingFrom && list.scrollTop === list.typingFrom.set ? list.typingFrom.top : null;
+  const from = list?.scrollTop;
   if (typing) pane.classList.add("is-typing");
   else pane.classList.remove("is-typing");
   if (list && atBottom) setMessagesScroll(list, list.scrollHeight);
+  // Back from typing with no scroll since: exactly the place it had (the shift into the
+  // typing layout may have been cut short at the top).
+  else if (list && restore !== null) setMessagesScroll(list, restore);
   else if (list && typeof before === "number") setMessagesScroll(list, list.scrollTop + list.getBoundingClientRect().top - before);
+  if (list) list.typingFrom = typing && !atBottom ? { top: from, set: list.scrollTop } : null;
   renderJump();
 }
 // The viewport changed (an on-screen keyboard opened or closed, a rotation, a
@@ -4330,6 +4345,8 @@ function resizeChatInput(entry) {
   toggle.textContent = height > base + 1 || entry.expanded ? "접기" : "펼치기";
   toggle.setAttribute("aria-expanded", String(height > base + 1 || entry.expanded));
   if (atBottom) setMessagesScroll(list, list.scrollHeight);
+  // A taller composer moves the bottom of the list: the 맨 아래 button sits above it again.
+  renderJump();
 }
 // While a send is in flight or unconfirmed, its text already shows as the
 // bubble; the editor keeps it (a rejected send leaves it there) but hides it.
@@ -9011,6 +9028,13 @@ function bindPullToRefresh(root) {
   }, { passive: true });
   root.addEventListener("touchmove", (event) => {
     if (start === null || event.touches.length !== 1) return;
+    // A menu opened under the finger (a long press) takes the gesture: no refresh behind it.
+    if (document.querySelector?.("dialog[open]")) {
+      start = null;
+      distance = 0;
+      showPull(0);
+      return;
+    }
     const pulled = event.touches[0].clientY - start;
     // The pull starts only on a clearly downward drag: a sideways one (a
     // card swipe) is never a pull, and a small wobble waits for direction.
@@ -9033,7 +9057,7 @@ function bindPullToRefresh(root) {
     if (event.cancelable) event.preventDefault();
   }, { passive: false });
   const finish = () => {
-    if (start !== null && distance >= GESTURE.pullTriggerPx) pullRefresh();
+    if (start !== null && distance >= GESTURE.pullTriggerPx && !document.querySelector?.("dialog[open]")) pullRefresh();
     else if (!state.pullRefreshing) showPull(0);
     start = null;
     distance = 0;
@@ -9166,8 +9190,17 @@ function updateViewport() {
 // docked terminal, typing on the board leaves the terminal its full height, so the keyboard
 // opening and closing does not resize (redraw) the CLI. Returns whether that changed.
 function renderKeyboardRoom() {
-  const typing = touchDevice() && !phoneLayout() && !shortLayout() && editingText() && keyboardOpen();
-  const beside = typing && state.docked && !!document.activeElement?.closest?.("#app");
+  // A phone held upright folds its own way (is-typing); one held sideways is as short as a tablet
+  // with its keyboard up, so its top bar folds too.
+  const open = touchDevice() && editingText() && keyboardOpen();
+  const typing = open && (!phoneLayout() || shortLayout());
+  // Typing on the board (its sheets included) leaves a docked terminal its height.
+  const beside = typing && state.docked && !!document.activeElement?.closest?.("#app, dialog");
+  // What the keyboard covers of the window's bottom (iOS keeps the window's height): toasts
+  // stay above it.
+  const viewport = window.visualViewport;
+  const covered = open && viewport ? Math.max(0, Math.round((window.innerHeight || 0) - (viewport.offsetTop || 0) - viewport.height)) : 0;
+  document.documentElement.style?.setProperty?.("--kb-inset", `${covered}px`);
   const classes = document.body?.classList;
   const changed = !!classes?.contains?.("keyboard-beside") !== beside;
   classes?.[typing ? "add" : "remove"]("keyboard-typing");

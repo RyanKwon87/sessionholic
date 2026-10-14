@@ -9892,7 +9892,7 @@ test("typing with an iPad's on-screen keyboard folds the top bar; beside a docke
   const { c, classes, vars } = dockClient(1180);
   c.context.window.matchMedia = (query) => ({ matches: query === "(pointer: coarse)" });
   c.context.window.innerHeight = 820;
-  const field = (inApp) => ({ tagName: "TEXTAREA", closest: (selector) => (selector === "#app" && inApp ? {} : null) });
+  const field = (inApp) => ({ tagName: "TEXTAREA", closest: (selector) => (inApp && selector.split(", ").includes("#app") ? {} : null) });
   const keyboard = (height) => { c.context.window.visualViewport = { height, scale: 1 }; };
   // No keyboard: nothing folds.
   keyboard(820);
@@ -10316,4 +10316,82 @@ test('a live update that arrives during a read that then fails is read again sho
   retry.callback();
   await settleRounds(4);
   assert.ok(chatCalls.length > before);
+});
+
+test('requests refused together after a restart share one token refresh, and each is sent once more', async () => {
+  let capabilities = 0;
+  const seen = new Map();
+  const c = client(async (url) => {
+    if (url === '/api/capabilities') {
+      capabilities++;
+      await new Promise((resolve) => setImmediate(resolve));
+      return { ok: true, status: 200, json: async () => ({ csrfToken: 'fresh', hosts: [] }) };
+    }
+    seen.set(url, (seen.get(url) || 0) + 1);
+    return seen.get(url) === 1
+      ? { ok: false, status: 403, json: async () => ({ error: 'expired', code: 'csrf_expired' }) }
+      : { ok: true, status: 200, json: async () => ({ ok: true }) };
+  }, noChatTimers);
+  c.state.authenticated = true;
+  await Promise.all([c.api('/api/session/seen', { method: 'POST', body: {} }), c.api('/api/session/opened', { method: 'POST', body: {} }),
+    c.api('/api/diagnostics/dictation', { method: 'POST', body: {} })]);
+  assert.equal(capabilities, 1);
+  assert.deepEqual([...seen.values()], [2, 2, 2]);
+});
+
+test('a menu opened by a long press never runs from that finger, however late its click comes', () => {
+  const c = client(undefined, noChatTimers);
+  const ran = [];
+  c.openActionSheet({ title: '메뉴', actions: [{ label: '지우기', run: () => ran.push('지우기') }] });
+  const dialog = c.get('action-sheet');
+  dialog.bottomSheet.openedAt = Date.now() - 1500;
+  // The long press's finger lifted just now (bindPressMenu notes it): its click is not a tap.
+  c.state.pressLiftAt = Date.now();
+  c.get('action-list').children[0].events.click({ detail: 1 });
+  assert.deepEqual(ran, []);
+  c.state.pressLiftAt = Date.now() - 1000;
+  c.get('action-list').children[0].events.click({ detail: 1 });
+  assert.deepEqual(ran, ['지우기']);
+});
+
+test('the keyboard covers no toast, a sideways phone folds its top bar, and typing in a sheet keeps a docked terminal tall', async () => {
+  const { c, classes, vars } = dockClient(1180);
+  c.context.window.matchMedia = (query) => ({ matches: query === '(pointer: coarse)' });
+  c.context.window.innerHeight = 820;
+  c.context.document.activeElement = { tagName: 'TEXTAREA', closest: () => null };
+  c.context.window.visualViewport = { height: 420, scale: 1, offsetTop: 0 };
+  c.updateViewport();
+  assert.equal(vars['--kb-inset'], '400px');
+  // A phone held sideways (short): its top bar folds while typing too.
+  c.context.window.innerWidth = 844; c.context.window.innerHeight = 390;
+  c.context.window.matchMedia = (query) => ({ matches: ['(pointer: coarse)', '(max-height: 520px)'].includes(query) });
+  c.context.window.visualViewport = { height: 180, scale: 1, offsetTop: 0 };
+  c.updateViewport();
+  assert.equal(classes.has('keyboard-typing'), true);
+  // Docked, a field in a sheet (outside #app) is on the board side: the terminal keeps its height.
+  c.context.window.innerWidth = 1180; c.context.window.innerHeight = 820;
+  c.context.window.matchMedia = (query) => ({ matches: query === '(pointer: coarse)' });
+  c.context.document.activeElement = null;
+  c.context.window.visualViewport = { height: 820, scale: 1, offsetTop: 0 };
+  await c.openTerminal({ id: 'tall', mode: 'attach' });
+  c.context.document.activeElement = { tagName: 'TEXTAREA', closest: (selector) => (selector.split(', ').includes('dialog') ? {} : null) };
+  c.context.window.visualViewport = { height: 420, scale: 1, offsetTop: 0 };
+  c.updateViewport();
+  assert.equal(classes.has('keyboard-beside'), true);
+});
+
+test('leaving the typing layout puts the reader back exactly where they were, when they did not scroll', () => {
+  const c = client(undefined, noChatTimers);
+  const pane = c.get('detail');
+  const set = new Set();
+  const list = c.get('messages');
+  // Folding the header (is-typing) moves the list up 190px; scrolling clamps at the top, as in a browser.
+  pane.classList = { add: (n) => set.add(n), remove: (n) => set.delete(n), contains: (n) => set.has(n) };
+  let scroll = 82;
+  Object.defineProperty(list, 'scrollTop', { get: () => scroll, set: (value) => { scroll = Math.max(0, Math.min(2600, value)); }, configurable: true });
+  Object.assign(list, { scrollHeight: 3000, clientHeight: 400, getBoundingClientRect: () => ({ top: set.has('is-typing') ? 110 : 300 }) });
+  vm.runInContext('setTyping', c.context)(true);
+  assert.equal(list.scrollTop, 0, 'the shift into the typing layout was cut short at the top');
+  vm.runInContext('setTyping', c.context)(false);
+  assert.equal(list.scrollTop, 82);
 });

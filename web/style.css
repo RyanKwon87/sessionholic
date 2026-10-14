@@ -2311,7 +2311,8 @@ li[data-task] {
 .toast {
   position: fixed;
   left: 50%;
-  bottom: calc(24px + env(safe-area-inset-bottom));
+  /* Above an on-screen keyboard too (app.js renderKeyboardRoom sets --kb-inset). */
+  bottom: calc(24px + env(safe-area-inset-bottom) + var(--kb-inset, 0px));
   z-index: 1000;
   max-width: calc(100% - 32px);
   padding: 12px 18px;
@@ -4554,6 +4555,10 @@ body.keyboard-typing:not(.keyboard-beside) .terminal-context {
 }
 body.keyboard-beside .terminal-screen {
   height: var(--layout-height, 100dvh);
+}
+/* Typing in a short window: the conversation may shrink to nothing so the input stays shown. */
+.detail-pane.is-typing .messages {
+  min-height: 0;
 }
 /* iOS scrolled the page for its keyboard: the app follows what is on screen
    (app.js renderAppShift), instead of leaving the area above the keyboard blank. */

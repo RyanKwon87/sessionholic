@@ -375,6 +375,21 @@ class LinkNewSessionTest(unittest.TestCase):
         self.rows['remote']['codex'].append(codex_row('6', 1010))
         self.assertEqual(len(self.link()), 1)
 
+    def test_two_terminals_waiting_on_one_host_take_no_session_either_could_own(self):
+        # A second 새 세션 opened two seconds later: a session started after both is not the
+        # first one's for being earlier (it may well be the second's), so neither takes it.
+        second = {'id': 'e' * 32, 'mode': 'new-session', 'host': 'remote', 'alive': True, 'closed': False,
+                  'createdAt': 1002}
+        self.terms.rows.append(second)
+        self.rows['remote']['codex'] = [codex_row('1', 1003)]
+        self.assertEqual(self.link(), [])
+        # Once the second has its session (linked otherwise), the first takes what is left.
+        second['nativeSource'] = {'host': 'remote', 'agent': 'codex', 'id': codex_row('1', 0)['id'],
+                                  'home': '.codex', 'cwd': '/work/project'}
+        self.rows['remote']['codex'].append(codex_row('2', 1004))
+        self.assertEqual([native['id'] for native in self.link()], [codex_row('2', 0)['id']])
+        self.assertEqual(self.terms.linked[-1][0], self.terminal['id'])
+
     def test_a_claude_session_counts_with_its_session_id(self):
         self.rows['remote']['claude'] = [{'id': 'agent-0001', 'kind': 'interactive', 'cwd': '/work/project',
                                           'sessionId': '0f9c3a52-1b7e-4c1a-9d6e-5a4b3c2d1e0f', 'startedAt': 1020}]

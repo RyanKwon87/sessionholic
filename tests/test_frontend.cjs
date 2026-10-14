@@ -1878,7 +1878,7 @@ test('capability refresh immediately updates account labels while preserving exa
     { id: 'personal', home: '.codex-lab-sample', title: '실험 설정 작업', account: 'sample' },
     { id: 'standard', home: '.codex-sample', title: '공용 설정 작업', account: 'sample' },
     { id: 'foreign', home: '.codex-other', title: '원래 필터와 무관한 작업', account: '다른 설정' },
-  ].map((row) => ({ ...row, host: 'workstation', agent: 'codex', phase: 'idle', updatedAt: now }));
+  ].map((row) => ({ ...row, host: 'workstation', agent: 'codex', phase: 'idle', updatedAt: now, originator: 'codex-tui' }));
   c.state.snapshot = { hosts: [{ name: 'workstation', label: 'Workstation', ok: true, data: { codex: rows } }] };
   c.state.authenticated = true; c.state.filters.account = 'sample';
   await c.loadCapabilities();
@@ -3267,8 +3267,10 @@ function queueItem(requestId, text, attachments = [], extra = {}) {
 }
 
 function recentSession(id, fields = {}) {
+  // Opened by hand in Codex's terminal UI unless a test says otherwise (일반 세션 lists only those).
   const s = { host: 'workstation', hostLabel: 'Workstation', agent: 'codex', home: '.codex-example', id,
-    title: '검토할 작업', project: 'Sample project', account: 'Sample profile', phase: 'idle', updatedAt: 1000, ...fields };
+    title: '검토할 작업', project: 'Sample project', account: 'Sample profile', phase: 'idle', updatedAt: 1000,
+    originator: 'codex-tui', ...fields };
   s.key = [s.host, s.agent, s.home || '', s.id].join('|');
   return s;
 }
@@ -3304,8 +3306,8 @@ test('recent cards give project and full task separate priority while retaining 
   // Device gets an independent readable badge; the initiator stays separate.
   assert.equal(byClass(card, 'card-device-label')[0].textContent, 'Workstation');
   assert.equal(byClass(card, 'card-device-icon')[0].attributes['aria-hidden'], 'true');
-  assert.equal(byClass(card, 'card-initiator')[0].textContent, '출처 미확인');
-  assert.match(textOf(card), /Workstation.*출처 미확인/);
+  assert.equal(byClass(card, 'card-initiator')[0].textContent, '직접 시작');
+  assert.match(textOf(card), /Workstation.*직접 시작/);
   assert.doesNotMatch(textOf(card), /Sample profile/);
   assert.equal(calls, 0); assert.equal(c.state.chats.size, 0);
   assert.equal(s.title, title); assert.equal(s.cwd, '/Users/example/work/service');
@@ -4219,16 +4221,23 @@ test('Claude 백그라운드 대화에 입력을 시작하면 그 연결을 한 
     metadata: { nativeSource: { host: s.host, agent: s.agent, home: s.home, id: s.id }, mode: 'attach' } }];
   entry.warmedAt -= 61000; entry.warmCheckedAt = 0; type('안녕하세');
   assert.equal(warmed().length, 2);
+  // A terminal the server would not paste into (a guessed 새 세션 link, or one only started
+  // from this session) does not count: the send would open the connection, so typing does.
+  c.state.terminals = [{ id: 'b'.repeat(32), alive: true, mode: 'new-session', linkConfidence: 'estimated',
+    nativeSource: { host: s.host, agent: s.agent, home: s.home, id: s.id } },
+    { id: 'c'.repeat(32), alive: true, mode: 'attach', sourceKey: JSON.stringify(entry.source) }];
+  entry.warmedAt -= 61000; entry.warmCheckedAt = 0; type('안녕하세');
+  assert.equal(warmed().length, 3);
   // A finished session is not woken by typing.
   c.state.terminals = []; c.state.snapshot.hosts[0].data.claude[0].phase = 'done';
   entry.warmedAt -= 61000; entry.warmCheckedAt = 0; type('안녕하세요');
-  assert.equal(warmed().length, 2);
+  assert.equal(warmed().length, 3);
   // Codex takes input through its own server: never warmed.
   const codex = client(async (url) => { requests.push([url]); return { ok: true, status: 200, json: async () => ({}) }; }, noChatTimers);
   const other = selectChat(codex);
   const codexInput = findId(codex.buildChatComposer(other.s), 'chat-input');
   codexInput.value = '안녕'; codexInput.events.input();
-  assert.equal(warmed().length, 2);
+  assert.equal(warmed().length, 3);
 });
 
 function classes() {
@@ -8591,16 +8600,32 @@ test('reopening the same retained conversation restores its scroll after a hidde
   assert.equal(list.scrollTop, 840, 'selecting an already visible conversation does not replay an older view');
 });
 
-test('session origin filters never equate execution surface with its initiator', () => {
+test('the origin of a session follows how it was opened: by hand in a terminal, by an agent or program, or by a bot', () => {
   const c = client(undefined, noChatTimers); c.state.showOld = true;
-  for (const row of [{ source: 'cli' }, { kind: 'background' }, { source: 'exec' }]) {
-    assert.equal(c.initiatorOf(row), 'unknown');
-    c.state.filters.initiator = 'human'; assert.equal(c.matches(row, 100), false);
-    c.state.filters.initiator = 'unknown'; assert.equal(c.matches(row, 100), true);
+  for (const [row, origin, category] of [
+    [{ agent: 'codex', originator: 'codex-tui' }, 'human', 'general'],
+    [{ agent: 'codex', originator: 'session-board' }, 'human', 'general'],
+    [{ agent: 'codex', source: 'cli' }, 'human', 'general'],
+    [{ agent: 'claude', kind: 'interactive' }, 'human', 'general'],
+    [{ agent: 'claude', kind: 'background' }, 'human', 'general'],
+    [{ agent: 'codex', originator: 'codex_exec' }, 'agent', 'agent'],
+    [{ agent: 'codex', source: 'exec' }, 'agent', 'agent'],
+    [{ agent: 'codex', originator: 'codex-tui', initiator: 'agent' }, 'agent', 'agent'],
+    [{ agent: 'claude', kind: 'background', parentSessionId: 'parent' }, 'agent', 'agent'],
+    [{ agent: 'codex' }, 'unknown', 'agent'],
+    [{ agent: 'codex', originator: 'hermes' }, 'bot', 'bot'],
+    [{ agent: 'codex', originator: 'codex_exec', cwd: '/srv/bot/workspaces/slack' }, 'bot', 'bot'],
+    [{ agent: 'codex', originator: 'codex-tui', cwd: '/home/user/.hermes/agent' }, 'bot', 'bot'],
+  ]) {
+    assert.equal(vm.runInContext('originOf', c.context)(row), origin, JSON.stringify(row));
+    assert.equal(c.sessionCategoryOf(row), category, JSON.stringify(row));
   }
+  // 시작 주체 picks among the non-bot origins; a bot is picked by its name.
+  c.state.filters.initiator = 'human'; assert.equal(c.matches({ agent: 'codex', source: 'exec' }, 100), false);
   c.state.filters.initiator = 'agent'; c.state.sessionCategory = 'agent';
-  assert.equal(c.matches({ initiator: 'agent', initiatorName: 'Planner' }, 100), true);
-  assert.equal(c.initiatorLabel({ initiator: 'agent', initiatorName: 'Planner' }), '에이전트 시작 · Planner');
+  assert.equal(c.matches({ agent: 'codex', initiator: 'agent', initiatorName: 'Planner' }, 100), true);
+  assert.equal(c.initiatorLabel({ initiator: 'agent', initiatorName: 'Planner' }), '에이전트·프로그램 시작 · Planner');
+  assert.equal(c.initiatorLabel({ agent: 'codex', originator: 'codex_exec', cwd: '/srv/bot/workspaces/slack' }), 'Slack 시작');
 });
 
 test('Ctrl or Command K focuses the visible unified search without submitting a draft', () => {
@@ -8636,21 +8661,25 @@ test('Windows 저장 기록의 실행 미확인은 기기 연결·과거 live ph
 });
 
 
-test('세션 분류는 명시 agent만 분리하고 일반 세션에 human과 미확인 실행을 중복 없이 남긴다', () => {
+test('일반 세션은 직접 시작한 세션만, 에이전트 세션은 하위 에이전트·프로그램 실행·출처 미확인을 중복 없이 나눈다', () => {
   const c = client(undefined, noChatTimers);
-  const rows = [recentSession('human', { initiator: 'human' }), recentSession('agent', { initiator: 'agent' }),
-    ...['cli', 'background', 'exec'].map((kind) => recentSession(kind, { source: kind, kind, parentSessionId: 'agent', agentName: 'worker' }))];
+  const rows = [recentSession('human', { initiator: 'human' }), recentSession('tui'),
+    recentSession('claude-bg', { agent: 'claude', kind: 'background', originator: undefined }),
+    recentSession('agent', { initiator: 'agent' }), recentSession('exec', { originator: 'codex_exec' }),
+    recentSession('unknown', { originator: undefined })];
   setRecentSnapshot(c, rows);
   const general = rows.filter(s => c.matches(s, 1100));
-  assert.deepEqual(general.map(s => s.id), ['human', 'cli', 'background', 'exec']);
+  assert.deepEqual(general.map(s => s.id), ['human', 'tui', 'claude-bg']);
   c.state.sessionCategory = 'agent';
-  const agents = rows.filter(s => c.matches(s, 1100)); assert.deepEqual(agents.map(s => s.id), ['agent']);
+  const agents = rows.filter(s => c.matches(s, 1100)); assert.deepEqual(agents.map(s => s.id), ['agent', 'exec', 'unknown']);
   assert.equal(new Set([...general, ...agents].map(s => s.key)).size, rows.length);
   c.renderSessionCategories(rows, 1100);
-  assert.equal(c.get('session-category-general-count').textContent, '4');
-  assert.equal(c.get('session-category-agent-count').textContent, '1');
+  assert.equal(c.get('session-category-general-count').textContent, '3');
+  assert.equal(c.get('session-category-agent-count').textContent, '3');
   assert.equal(c.get('session-category-agent').attributes['aria-selected'], 'true');
   assert.equal(c.get('groups').attributes['aria-labelledby'], 'session-category-agent');
+  // The agent tab says it holds programs' and unknown runs too.
+  assert.equal(c.get('session-category-note').hidden, false);
 });
 
 test('검색은 선택 분류에서 동작하고 다른 분류의 일치 결과로 조건을 유지해 이동한다', () => {
@@ -8672,14 +8701,15 @@ test('검색은 선택 분류에서 동작하고 다른 분류의 일치 결과�
 
 test('시작 주체 필터와 분류를 동기화하고 초기화는 현재 분류를 유지한다', () => {
   const c = client(undefined, noChatTimers);
-  const rows = [recentSession('human', { initiator: 'human' }), recentSession('agent', { initiator: 'agent' }), recentSession('unknown')];
+  const rows = [recentSession('human', { initiator: 'human' }), recentSession('agent', { initiator: 'agent' }),
+    recentSession('unknown', { originator: undefined })];
   setRecentSnapshot(c, rows); c.renderFilters(rows);
   let control = c.get('filter-initiator'); control.value = 'agent'; control.events.change();
   assert.equal(c.state.sessionCategory, 'agent'); assert.equal(c.state.filters.initiator, 'agent');
   assert.equal(byClass(c.get('groups'), 'card').length, 1);
   c.resetFilters(); assert.equal(c.state.sessionCategory, 'agent'); assert.equal(c.state.filters.initiator, '');
   control = c.get('filter-initiator'); control.value = 'unknown'; control.events.change();
-  assert.equal(c.state.sessionCategory, 'general'); assert.equal(byClass(c.get('groups'), 'card').length, 1);
+  assert.equal(c.state.sessionCategory, 'agent'); assert.equal(byClass(c.get('groups'), 'card').length, 1);
   control = c.get('filter-initiator'); control.value = 'human'; control.events.change();
   assert.equal(c.get('session-category-note').hidden, true, '직접 시작만 보는 중에는 미확인 포함 안내를 숨긴다');
   c.setSessionCategory('agent'); assert.equal(c.state.filters.initiator, '', '분류와 충돌하는 시작 주체 조건만 해제한다');
@@ -8707,8 +8737,8 @@ test('시작 주체에서 봇을 고르면 그 봇이 연 세션만 보이고, �
     loaded: true, busy: false, error: '', readAt: 0, fetchedAt: null, promise: null };
   const titles = () => byClass(c.get('groups'), 'card').map((card) => byClass(card, 'card-title')[0].textContent).sort();
   c.render();
-  // Without a bot picked, a session a bot request carries stays in 봇 요청.
-  assert.deepEqual(titles(), ['직접 연 작업', '헤르메스 작업'].sort());
+  // Without a bot picked, a bot's sessions (a request's, or Hermes' own) are in 봇 요청.
+  assert.deepEqual(titles(), ['직접 연 작업']);
   const options = c.get('filter-initiator').children.map((option) => [option.value, option.textContent]);
   for (const name of ['헤르메스', '요청봇', '안내봇']) assert.ok(options.some(([value, text]) => value === 'bot:' + name && text === '봇 · ' + name), name);
   const pick = (value) => { const control = c.get('filter-initiator'); control.value = value; control.events.change(); };
@@ -8733,8 +8763,8 @@ test('시작 주체에서 봇을 고르면 그 봇이 연 세션만 보이고, �
   // The card says which bot started it.
   assert.equal(c.initiatorLabel(second), '안내봇 시작');
   assert.equal(c.initiatorLabel(mine), '직접 시작');
-  // No bot: the list follows the open conversation's own tab again (its worker is an agent session).
-  pick(''); assert.equal(c.state.sessionCategory, 'agent'); assert.deepEqual(titles(), ['헤르메스 하위 작업']);
+  // No bot: the list follows the open conversation's own tab again (Hermes' worker is the bot's).
+  pick(''); assert.equal(c.state.sessionCategory, 'bot'); assert.deepEqual(titles(), ['헤르메스 작업', '헤르메스 하위 작업'].sort());
 });
 
 test('작업에서 대화를 직접 열면 대상 분류와 목록 조건을 맞추고 분류 전환은 초안과 보기 기록을 보존한다', () => {
@@ -8885,7 +8915,7 @@ test('Windows 일회성 Claude는 에이전트 분류·기기·호출자를 유�
   c.drawDetail(s); await c.loadDetail(s, true);
   assertOneShotHistory(c);
   assert.match(textOf(c.get('detail')), /일회성 실행/);
-  assert.match(textOf(c.get('detail')), /에이전트 시작 · Codex/);
+  assert.match(textOf(c.get('detail')), /에이전트·프로그램 시작 · Codex/);
   assert.equal(c.get('chat-status').textContent, ONE_SHOT_INPUT);
   assert.equal(c.get('chat-input').disabled, true);
   assert.deepEqual(calls, [{ url: '/api/chat/state', body: { source: { host: 'windows-pc', agent: 'claude', id: s.id } } }]);
@@ -9862,7 +9892,7 @@ test("typing with an iPad's on-screen keyboard folds the top bar; beside a docke
   const { c, classes, vars } = dockClient(1180);
   c.context.window.matchMedia = (query) => ({ matches: query === "(pointer: coarse)" });
   c.context.window.innerHeight = 820;
-  const field = (inApp) => ({ tagName: "TEXTAREA", closest: (selector) => (selector === "#app" && inApp ? {} : null) });
+  const field = (inApp) => ({ tagName: "TEXTAREA", closest: (selector) => (inApp && selector.split(", ").includes("#app") ? {} : null) });
   const keyboard = (height) => { c.context.window.visualViewport = { height, scale: 1 }; };
   // No keyboard: nothing folds.
   keyboard(820);
@@ -10132,4 +10162,236 @@ test('on an iPad a press within ten seconds of the last end waits it out, saying
     c.stopDictation({ abort: true });
     await settle();
   }
+});
+
+test('docked, a terminal whose conversation is not listed yet shows that, then its conversation once listed', async () => {
+  const { c } = dockClient(1180);
+  const { s } = selectChat(c);
+  c.render();
+  assert.equal(c.state.selected, s.key);
+  // A new session's terminal: the old conversation does not stay beside it.
+  await c.openTerminal({ id: 'fresh', mode: 'new-session', host: 'workstation' });
+  assert.equal(c.state.docked, true);
+  assert.equal(c.state.selected, null);
+  assert.match(textOf(c.get('detail')), /이 터미널의 대화는 아직 목록에 없습니다/);
+  // Listed (and linked) with a later snapshot: it takes its place.
+  const fresh = { host: 'workstation', agent: 'codex', home: '.codex-example', id: 'fresh-session',
+    key: ['workstation', 'codex', '.codex-example', 'fresh-session'].join('|') };
+  c.state.snapshot.hosts[0].data.codex.push(fresh);
+  c.state.terminal = { ...c.state.terminal, nativeSource: c.sourceOf(fresh) };
+  c.render();
+  assert.equal(c.state.selected, fresh.key);
+  assert.equal(c.state.terminalVisible, true, 'the terminal stays beside its own conversation');
+  // Covering (phones, upright iPads) is unchanged: the board keeps its selection.
+  c.returnToBoard({ selectLaunchedSource: false, animate: false });
+  c.context.window.innerWidth = 834;
+  await c.openTerminal({ id: 'other-fresh', mode: 'new-session', host: 'workstation' });
+  assert.equal(c.state.docked, false);
+  assert.equal(c.state.selected, fresh.key);
+});
+
+test('docked, the conversation beside follows the terminal on docking and for a handoff, and pressing it keeps the terminal', async () => {
+  const { c } = dockClient(1180);
+  const { s } = selectChat(c);
+  const other = { host: 'workstation', agent: 'codex', home: '.codex-example', id: 'other-session',
+    key: ['workstation', 'codex', '.codex-example', 'other-session'].join('|') };
+  c.state.snapshot.hosts[0].data.codex.push(other);
+  // 크게: a terminal of s covers the board; back on the board, another conversation is picked.
+  c.state.terminalDock = false;
+  await c.openTerminal({ id: 'own', mode: 'attach', nativeSource: c.sourceOf(s) });
+  assert.equal(c.state.docked, false);
+  c.returnToBoard({ selectLaunchedSource: false, animate: false });
+  c.select(other.key);
+  await c.openTerminal({ id: 'own', mode: 'attach', nativeSource: c.sourceOf(s) });
+  // 나란히: the terminal's own conversation comes beside it, not the one picked before.
+  c.toggleDock();
+  assert.equal(c.state.docked, true);
+  assert.equal(c.state.selected, s.key);
+  // Pressing the conversation shown beside it does not hide the terminal.
+  c.select(s.key);
+  assert.equal(c.state.terminalVisible, true);
+  // A handoff's new run: its source is not shown beside it while the new run is not listed.
+  c.returnToBoard({ selectLaunchedSource: false, animate: false });
+  const target = { host: 'workstation', agent: 'codex', home: '.codex-other', id: 'handoff-target',
+    key: ['workstation', 'codex', '.codex-other', 'handoff-target'].join('|') };
+  await c.openTerminal({ id: 'handoff', mode: 'handoff', sourceKey: JSON.stringify(c.sourceOf(s)), nativeSource: c.sourceOf(target) });
+  assert.equal(c.state.selected, null);
+  assert.match(textOf(c.get('detail')), /아직 목록에 없습니다/);
+  c.state.snapshot.hosts[0].data.codex.push(target);
+  c.render();
+  assert.equal(c.state.selected, target.key);
+  assert.equal(c.state.terminalVisible, true);
+});
+
+test('봇 요청 탭은 봇이 연 세션도 보여 주고, 누르면 그 대화를 보기 전용으로 따라간다', () => {
+  const c = client(undefined, noChatTimers);
+  const slack = recentSession('slack-run', { originator: 'codex_exec', cwd: '/srv/bot/workspaces/slack', title: 'Slack 요청 작업' });
+  const mine = recentSession('mine', { title: '직접 연 작업' });
+  setRecentSnapshot(c, [slack, mine]);
+  c.state.botRequests = { requests: [], sources: [], loaded: true, busy: false, error: '', readAt: 0, fetchedAt: null, promise: null };
+  c.render();
+  // Not in 일반 세션; counted in 봇 요청.
+  assert.deepEqual(byClass(c.get('groups'), 'card').map((card) => byClass(card, 'card-title')[0].textContent), ['직접 연 작업']);
+  assert.equal(c.get('session-category-bot-count').textContent, '1');
+  c.setSessionCategory('bot');
+  assert.match(textOf(c.get('groups')), /봇이 연 세션/);
+  assert.deepEqual(byClass(c.get('groups'), 'card').map((card) => byClass(card, 'card-title')[0].textContent), ['Slack 요청 작업']);
+  // Opened: its conversation, watched (no composer), in this tab.
+  c.select(slack.key);
+  assert.equal(c.state.selected, slack.key);
+  assert.equal(c.state.sessionCategory, 'bot');
+  assert.match(textOf(c.get('detail')), /Slack · 봇이 진행하는 세션 · 보기 전용/);
+  assert.doesNotMatch(textOf(c.get('detail')), /이 작업에 메시지 보내기/);
+});
+
+// A conversation read that fails while another was asked for (a return to the screen, a live
+// update) is read again, rather than leaving the old screen until the next safety poll.
+function chatReadSetup({ sse = false } = {}) {
+  const chatCalls = [];
+  const timers = [];
+  let c;
+  c = client(async (url) => {
+    if (url === '/api/chat/state') {
+      let resolve, reject;
+      const promise = new Promise((a, b) => { resolve = a; reject = b; });
+      chatCalls.push({ promise, resolve, reject });
+      return promise;
+    }
+    return { ok: true, status: 200, json: async () => url.startsWith('/api/snapshot') ? { hosts: c.state.snapshot?.hosts || [], version: 1 }
+      : url === '/api/capabilities' ? { hosts: [], csrfToken: 'csrf-test' } : {} };
+  }, { setTimeout: (callback, ms) => { timers.push({ callback, ms }); return timers.length; }, clearTimeout() {} });
+  c.context.navigator = { onLine: true };
+  let sources = null;
+  if (sse) { const fake = fakeEventSource(); c.context.EventSource = fake.FakeEventSource; sources = fake.sources; }
+  return { c, chatCalls, timers, get sources() { return sources; } };
+}
+const settleRounds = async (rounds = 8) => { for (let i = 0; i < rounds; i++) await new Promise((r) => setImmediate(r)); };
+
+test('a read stalled in the background that fails after the return is read again, not left on the old screen', async () => {
+  const { c, chatCalls, timers } = chatReadSetup();
+  c.windowEvents.DOMContentLoaded();
+  await settleRounds(4);
+  const { s, entry } = selectChat(c);
+  entry.data.phase = 'working';
+  c.state.detailShown = true;
+  c.state.capabilities = { hosts: [], csrfToken: 'csrf-test' };
+  c.loadChatState(s, false);
+  await settleRounds(4);
+  assert.equal(chatCalls.length, 1);
+  c.context.document.hidden = true; c.documentEvents.visibilitychange();
+  c.context.document.hidden = false; c.documentEvents.visibilitychange();
+  await settleRounds(4);
+  assert.equal(entry.recheckQueued, true, 'the return asked for a read while the old one hung');
+  chatCalls[0].reject(new TypeError('Load failed'));
+  await settleRounds();
+  const retry = timers.filter((timer) => timer.ms === 3000).at(-1);
+  assert.ok(retry, 'the asked read is retried shortly');
+  retry.callback();
+  await settleRounds(4);
+  assert.equal(chatCalls.length, 2);
+});
+
+test('a live update that arrives during a read that then fails is read again shortly, not after the safety poll', async () => {
+  const h = chatReadSetup({ sse: true });
+  const { c, chatCalls, timers } = h;
+  const { s, entry } = selectChat(c);
+  entry.data.phase = 'working';
+  c.state.detailShown = true;
+  c.state.capabilities = { hosts: [], csrfToken: 'csrf-test' };
+  c.state.capabilitiesRevision = c.capabilitiesRevision(c.state.snapshot);
+  c.state.usageAt = Date.now(); c.state.hardwareAt = Date.now();
+  c.syncEvents();
+  h.sources[0].emit('hello', { snapshotVersion: 1 });
+  await settleRounds(4);
+  c.loadChatState(s, false);
+  await settleRounds(4);
+  const before = chatCalls.length;
+  h.sources[0].emit('chat', { digest: 'new-content' });
+  assert.equal(entry.recheckQueued, true);
+  chatCalls[before - 1].reject(Object.assign(new Error('대화 상태를 확인하지 못했습니다.'), { status: 409 }));
+  timers.length = 0;
+  await settleRounds();
+  const retry = timers.find((timer) => timer.ms === 3000);
+  assert.ok(retry, `retried in 3 s, not only the next poll: ${JSON.stringify(timers.map((t) => t.ms))}`);
+  retry.callback();
+  await settleRounds(4);
+  assert.ok(chatCalls.length > before);
+});
+
+test('requests refused together after a restart share one token refresh, and each is sent once more', async () => {
+  let capabilities = 0;
+  const seen = new Map();
+  const c = client(async (url) => {
+    if (url === '/api/capabilities') {
+      capabilities++;
+      await new Promise((resolve) => setImmediate(resolve));
+      return { ok: true, status: 200, json: async () => ({ csrfToken: 'fresh', hosts: [] }) };
+    }
+    seen.set(url, (seen.get(url) || 0) + 1);
+    return seen.get(url) === 1
+      ? { ok: false, status: 403, json: async () => ({ error: 'expired', code: 'csrf_expired' }) }
+      : { ok: true, status: 200, json: async () => ({ ok: true }) };
+  }, noChatTimers);
+  c.state.authenticated = true;
+  await Promise.all([c.api('/api/session/seen', { method: 'POST', body: {} }), c.api('/api/session/opened', { method: 'POST', body: {} }),
+    c.api('/api/diagnostics/dictation', { method: 'POST', body: {} })]);
+  assert.equal(capabilities, 1);
+  assert.deepEqual([...seen.values()], [2, 2, 2]);
+});
+
+test('a menu opened by a long press never runs from that finger, however late its click comes', () => {
+  const c = client(undefined, noChatTimers);
+  const ran = [];
+  c.openActionSheet({ title: '메뉴', actions: [{ label: '지우기', run: () => ran.push('지우기') }] });
+  const dialog = c.get('action-sheet');
+  dialog.bottomSheet.openedAt = Date.now() - 1500;
+  // The long press's finger lifted just now (bindPressMenu notes it): its click is not a tap.
+  c.state.pressLiftAt = Date.now();
+  c.get('action-list').children[0].events.click({ detail: 1 });
+  assert.deepEqual(ran, []);
+  c.state.pressLiftAt = Date.now() - 1000;
+  c.get('action-list').children[0].events.click({ detail: 1 });
+  assert.deepEqual(ran, ['지우기']);
+});
+
+test('the keyboard covers no toast, a sideways phone folds its top bar, and typing in a sheet keeps a docked terminal tall', async () => {
+  const { c, classes, vars } = dockClient(1180);
+  c.context.window.matchMedia = (query) => ({ matches: query === '(pointer: coarse)' });
+  c.context.window.innerHeight = 820;
+  c.context.document.activeElement = { tagName: 'TEXTAREA', closest: () => null };
+  c.context.window.visualViewport = { height: 420, scale: 1, offsetTop: 0 };
+  c.updateViewport();
+  assert.equal(vars['--kb-inset'], '400px');
+  // A phone held sideways (short): its top bar folds while typing too.
+  c.context.window.innerWidth = 844; c.context.window.innerHeight = 390;
+  c.context.window.matchMedia = (query) => ({ matches: ['(pointer: coarse)', '(max-height: 520px)'].includes(query) });
+  c.context.window.visualViewport = { height: 180, scale: 1, offsetTop: 0 };
+  c.updateViewport();
+  assert.equal(classes.has('keyboard-typing'), true);
+  // Docked, a field in a sheet (outside #app) is on the board side: the terminal keeps its height.
+  c.context.window.innerWidth = 1180; c.context.window.innerHeight = 820;
+  c.context.window.matchMedia = (query) => ({ matches: query === '(pointer: coarse)' });
+  c.context.document.activeElement = null;
+  c.context.window.visualViewport = { height: 820, scale: 1, offsetTop: 0 };
+  await c.openTerminal({ id: 'tall', mode: 'attach' });
+  c.context.document.activeElement = { tagName: 'TEXTAREA', closest: (selector) => (selector.split(', ').includes('dialog') ? {} : null) };
+  c.context.window.visualViewport = { height: 420, scale: 1, offsetTop: 0 };
+  c.updateViewport();
+  assert.equal(classes.has('keyboard-beside'), true);
+});
+
+test('leaving the typing layout puts the reader back exactly where they were, when they did not scroll', () => {
+  const c = client(undefined, noChatTimers);
+  const pane = c.get('detail');
+  const set = new Set();
+  const list = c.get('messages');
+  // Folding the header (is-typing) moves the list up 190px; scrolling clamps at the top, as in a browser.
+  pane.classList = { add: (n) => set.add(n), remove: (n) => set.delete(n), contains: (n) => set.has(n) };
+  let scroll = 82;
+  Object.defineProperty(list, 'scrollTop', { get: () => scroll, set: (value) => { scroll = Math.max(0, Math.min(2600, value)); }, configurable: true });
+  Object.assign(list, { scrollHeight: 3000, clientHeight: 400, getBoundingClientRect: () => ({ top: set.has('is-typing') ? 110 : 300 }) });
+  vm.runInContext('setTyping', c.context)(true);
+  assert.equal(list.scrollTop, 0, 'the shift into the typing layout was cut short at the top');
+  vm.runInContext('setTyping', c.context)(false);
+  assert.equal(list.scrollTop, 82);
 });

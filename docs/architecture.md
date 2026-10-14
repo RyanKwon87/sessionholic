@@ -54,7 +54,7 @@ flowchart LR
 
 | 필드 | 의미 |
 | --- | --- |
-| `initiator` | `human`(직접 시작), `agent`(에이전트 시작), `unknown`(출처 미확인) |
+| `initiator` | `human`(직접 시작), `agent`(에이전트 시작), `unknown`(출처 미확인). 화면의 분류는 이 값과 `originator`·`source`·`kind`·`cwd`로 정합니다(limitations.md) |
 | `initiatorName`, `initiatorEvidence` | 명시된 시작 주체 이름과 `explicit / subagent / board / unknown` 근거 구분 |
 | `parentSessionId` | 명시적으로 확인된 부모 세션 ID |
 | `agentName`, `agentRole` | 현재 세션의 워커 이름·역할. 시작한 부모 이름과 별도 |

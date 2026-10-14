@@ -461,6 +461,8 @@ function sheetRelease({ offset = 0, velocity = 0, height = 0, detent = "medium",
 }
 // See BottomSheet.unseenPressTaken.
 const SHEET_UNSEEN_PRESS_MS = 700;
+// A click this soon after the long press's finger lifted is that finger's.
+const SHEET_LIFT_CLICK_MS = 300;
 class BottomSheet {
   static attach(dialog, options = {}) {
     if (!dialog) return null;
@@ -508,7 +510,8 @@ class BottomSheet {
   // Taken once the finger that opened it is long gone (a click after a hold that long is
   // not that finger's: a long press makes no click).
   unseenPressTaken() {
-    return !this.pressedSinceOpen && Date.now() - (this.openedAt || 0) >= SHEET_UNSEEN_PRESS_MS;
+    return !this.pressedSinceOpen && Date.now() - (this.openedAt || 0) >= SHEET_UNSEEN_PRESS_MS &&
+      Date.now() - (state.pressLiftAt || 0) >= SHEET_LIFT_CLICK_MS;
   }
   close() {
     if (this.dialog.open) this.dialog.close();
@@ -772,7 +775,7 @@ function beginAuthEpoch() {
 const CSRF_RETRY = new Set(["/api/chat/state", "/api/chat/prompt", "/api/plan", "/api/launch",
   "/api/new-session", "/api/app-server", "/api/refresh", "/api/usage/refresh", "/api/hardware/refresh",
   "/api/push/subscribe", "/api/push/unsubscribe", "/api/session/seen", "/api/session/tidy", "/api/session/remove",
-  "/api/session/opened", "/api/chat/warm"]);
+  "/api/session/opened", "/api/chat/warm", "/api/diagnostics/dictation"]);
 // A terminal's size and scrolling; its keys never (sendInput reads the token instead).
 const CSRF_RETRY_TERMINAL = /^\/api\/terminal\/[a-f0-9]{32}\/(resize|scroll|scroll-end)$/;
 function csrfRetryable(path) {
@@ -857,7 +860,9 @@ async function api(path, { method = "GET", body, signal: callerSignal, authEpoch
       method !== "GET" && csrfRetryable(path)) {
     let refreshed = false;
     try {
-      await loadCapabilities(authEpoch, { refreshView: false });
+      // After a restart every request in flight is refused at once: one refresh serves them all.
+      state.csrfRefresh ||= loadCapabilities(authEpoch, { refreshView: false }).finally(() => { state.csrfRefresh = null; });
+      await state.csrfRefresh;
       refreshed = true;
     } catch (err) {
       if (err.unauthorized || err.staleAuth) throw err;
@@ -1027,7 +1032,6 @@ function render() {
   const now = state.snapshot.serverTime || Date.now() / 1000;
   const sessions = allSessions();
   const reading = state.detailShown && sessions.find((session) => session.key === state.selected);
-  if (reading && botRequestForNative(sourceOf(reading))) { selectBotRequest(botRequestKey(botRequestForNative(sourceOf(reading)))); return; }
   if (reading && !botFilter() && sessionCategoryOf(reading) !== state.sessionCategory) setSessionCategory(sessionCategoryOf(reading), { renderView: false, clearSelection: false });
   renderHosts(now); renderFreshness(now); renderAttention(sessions);
   // The conversation on screen is read, also when it answers or finishes while shown
@@ -1035,7 +1039,7 @@ function render() {
   const shownSession = chatVisible() && sessions.find((s) => s.key === state.selected);
   if (shownSession && sessionUnread(shownSession, now)) markSeen(shownSession);
   renderSessionList(sessions, now);
-  if (state.sessionCategory === "bot") { window.SessionholicGoals?.update?.(sessions); return; }
+  if (state.sessionCategory === "bot" && !sessions.some((s) => s.key === state.selected)) { window.SessionholicGoals?.update?.(sessions); return; }
   const selected = sessions.find((s) => s.key === state.selected);
   if (!state.selected && !$("detail").children.length) {
     const welcome = el("div", "welcome");
@@ -1051,6 +1055,11 @@ function render() {
     $("detail").append(welcome);
   }
   window.SessionholicGoals?.update?.(sessions);
+  // Its conversation listed now: it takes its place beside the docked terminal.
+  if (!selected && state.docked && state.terminal && !state.dockBeside && dockedSessionFor(state.terminal)) {
+    syncBeside();
+    return;
+  }
   if (selected) refreshDetail(selected);
   else if (state.selected) {
     state.selected = null;
@@ -1384,8 +1393,39 @@ function renderCounts(sessions) {
   placeChildren(box, chips);
 }
 // The filter sheet's selects; the button that opens it shows how many apply.
-const INITIATOR_LABELS = { human: "직접 시작", agent: "에이전트 시작", unknown: "출처 미확인" };
-function initiatorOf(s) { return ["human", "agent"].includes(s?.initiator) ? s.initiator : "unknown"; }
+const INITIATOR_LABELS = { human: "직접 시작", agent: "에이전트·프로그램 시작", unknown: "출처 미확인" };
+// Codex sessions opened by hand: its own terminal UI and a board launch (with no originator
+// recorded, an interactive source). Codex's other originators and exec runs are programs'.
+const DIRECT_ORIGINATORS = new Set(["codex-tui", "session-board"]);
+const DIRECT_CODEX_SOURCES = new Set(["cli", "vscode"]);
+// Folders bots work in (a Slack bot's workspace, Hermes' home): their sessions are the bot's.
+const BOT_FOLDERS = [[/[\\/]workspaces[\\/]slack(?:[\\/]|$)/i, "Slack"], [/[\\/]\.hermes(?:[\\/]|$)/i, "헤르메스"]];
+function botFolderOf(s) {
+  const cwd = String(s?.cwd || "");
+  return BOT_FOLDERS.find(([folder]) => folder.test(cwd))?.[1] || null;
+}
+// Who opened a session, from what the board sees of it: "bot" (a bot request's, or a bot's own),
+// "agent" (a subagent, or a program's run such as codex exec), "human" (opened by hand in a
+// terminal: Codex's terminal UI or a board launch, Claude's interactive or background session)
+// or "unknown". 일반 세션 lists only "human"; 에이전트 세션 the agents', programs' and unknown.
+function originOf(s) {
+  if (!s) return "unknown";
+  if (botNameOf(s)) return "bot";
+  if (s.initiator === "agent" || s.parentSessionId || s.agentRole) return "agent";
+  if (s.initiator === "human") return "human";
+  if (s.agent === "codex") {
+    if (s.originator) return DIRECT_ORIGINATORS.has(s.originator) ? "human" : "agent";
+    if (DIRECT_CODEX_SOURCES.has(s.source)) return "human";
+    return s.source === "exec" ? "agent" : "unknown";
+  }
+  if (s.agent === "claude" && ["interactive", "background"].includes(s.kind)) return "human";
+  return "unknown";
+}
+// 시작 주체's own values (a bot is picked by its name instead).
+function initiatorOf(s) {
+  const origin = originOf(s);
+  return origin === "bot" ? "unknown" : origin;
+}
 function initiatorLabel(s) {
   const bot = botNameOf(s);
   if (bot) return `${bot} 시작`;
@@ -1401,7 +1441,7 @@ function botNameOf(s) {
     const source = (state.botRequests.sources || []).find((item) => item.id === request.sourceId);
     return String(source?.label || request.botName || "").split(" · ")[0].trim() || null;
   }
-  return ORIGINATOR_BOTS[s?.originator] || null;
+  return ORIGINATOR_BOTS[s?.originator] || botFolderOf(s) || null;
 }
 function botFilter() {
   const value = state.filters?.initiator || "";
@@ -1468,6 +1508,12 @@ async function loadBotRequests({ refresh = false } = {}) {
   render();
   return cache.promise;
 }
+// Sessions bots opened with no request of theirs listed (a Slack bot's, Hermes'): 봇 요청 lists
+// them under the requests, most recent first.
+function botOwnSessions(sessions, now) {
+  return sessions.filter((s) => sessionCategoryOf(s) === "bot" && !botRequestForNative(sourceOf(s)) &&
+    matches(s, now, { category: false, initiator: false, phase: false })).sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+}
 function renderBotRequests() {
   const cache = state.botRequests, box = $("groups");
   const shown = cache.requests.filter(botRequestMatches).sort((a, b) => botTimestamp(b.updatedAt) - botTimestamp(a.updatedAt));
@@ -1498,9 +1544,27 @@ function renderBotRequests() {
       el("span", "bot-request-boundary", `범위 ${botLabel(request.scopeLabel)}`));
     nodes.push(card);
   }
-  if (!shown.length && !cache.busy) nodes.push(emptyState("none", state.search ? "검색에 맞는 봇 요청이 없습니다." : cache.error || cache.sources.some((source) => !source.ok) ? "봇 요청을 확인하지 못했습니다." : "표시할 봇 요청이 없습니다.", "봇에서 접수한 요청과 권한·사용 범위를 이곳에서 확인합니다."));
+  const now = state.snapshot?.serverTime || Date.now() / 1000;
+  const own = botOwnSessions(allSessions(), now);
+  if (own.length) {
+    const section = el("section", "group bot-own-sessions");
+    const head = el("h2", "group-head gray", "봇이 연 세션");
+    const count = el("span", "group-count", String(own.length));
+    head.append(count);
+    const folders = cardFolderHints(own);
+    const rows = own.map((session) => {
+      const row = card(session);
+      updateCard(row.card, session, now, folders.get(session.key));
+      return row;
+    });
+    section.append(head, ...rows);
+    nodes.push(section);
+  }
+  if (!shown.length && !own.length && !cache.busy) nodes.push(emptyState("none", state.search ? "검색에 맞는 봇 요청이 없습니다." : cache.error || cache.sources.some((source) => !source.ok) ? "봇 요청을 확인하지 못했습니다." : "표시할 봇 요청이 없습니다.", "봇에서 접수한 요청과 권한·사용 범위를 이곳에서 확인합니다."));
   box.replaceChildren(...nodes); box.setAttribute("aria-busy", String(cache.busy));
-  $("session-count").textContent = cache.loaded ? `${shown.length}개` : "-";
+  $("session-count").textContent = cache.loaded ? `${shown.length + own.length}개` : own.length ? `${own.length}개` : "-";
+  // A conversation open here (a request's session or a bot's own) draws itself (render).
+  if (allSessions().some((session) => session.key === state.selected)) return;
   const selected = cache.requests.find((request) => botRequestKey(request) === state.selectedBotRequest);
   if (state.selectedBotRequest && !selected) {
     state.selectedBotRequest = null; $("detail").replaceChildren(); setDetailShown(false); navigateView("list", true);
@@ -1509,7 +1573,14 @@ function renderBotRequests() {
 }
 function selectBotRequest(key) {
   if (!state.authenticated || state.launchBusy) return;
+  if (state.docked) undock();
   const request = state.botRequests.requests.find((row) => botRequestKey(row) === key); if (!request) return;
+  // Its session listed: its conversation, to follow (watch only), with the request's details.
+  const native = sessionForBotRequest(request);
+  if (native) {
+    select(native.key);
+    return;
+  }
   rememberConversationView(); stopChatPolling();
   state.selected = null; state.detailFor = null; state.detailRevision = null; state.detailRun += 1;
   state.selectedBotRequest = key;
@@ -1520,6 +1591,18 @@ function selectBotRequest(key) {
   const entering = phoneLayout() && !state.detailShown;
   if (entering) navigateView("detail");
   setDetailShown(true, { direction: entering ? "push" : null, focus: phoneLayout() });
+}
+// Under a bot's conversation, in place of the composer: who runs it, and where to answer.
+function botWatchNotice(s) {
+  const request = botRequestForNative(sourceOf(s));
+  const box = el("div", "bot-watch");
+  box.id = "bot-watch";
+  box.append(el("p", "bot-watch-title", [botNameOf(s), "봇이 진행하는 세션 · 보기 전용"].filter(Boolean).join(" · ")));
+  if (request)
+    box.append(el("p", "bot-watch-meta", [`요청자 ${botLabel(request.requesterLabel)}`, `채널 ${botLabel(request.channelLabel)}`,
+      `권한 ${botLabel(request.authorityLabel)}`, `상태 ${BOT_STATUS[request.status] || "상태 미확인"}`].join(" · ")));
+  box.append(el("p", "bot-watch-hint", "대화는 여기서 계속 새로 고쳐집니다. 입력과 실행 관리는 원래 봇에서 해 주세요."));
+  return box;
 }
 function drawBotRequest(request) {
   const pane = $("detail");
@@ -1544,7 +1627,15 @@ function drawBotRequest(request) {
   pane.append(head, detail);
 }
 const SESSION_CATEGORIES = { general: "일반 세션", agent: "에이전트 세션", bot: "봇 요청" };
-function sessionCategoryOf(session) { return botRequestForNative(sourceOf(session)) ? "bot" : initiatorOf(session) === "agent" ? "agent" : "general"; }
+function sessionCategoryOf(session) {
+  const origin = originOf(session);
+  return origin === "bot" ? "bot" : origin === "human" ? "general" : "agent";
+}
+// A bot request's own session, once listed: its conversation is what the request shows.
+function sessionForBotRequest(request) {
+  const ref = request?.nativeRef;
+  return ref ? allSessions().find((s) => s.host === request.host && s.agent === ref.agent && s.id === ref.id && s.home === ref.home) || null : null;
+}
 function setSessionCategory(category, { renderView = true, clearSelection = true } = {}) {
   if (!Object.hasOwn(SESSION_CATEGORIES, category) || state.launchBusy) return false;
   const changed = state.sessionCategory !== category;
@@ -1559,13 +1650,15 @@ function setSessionCategory(category, { renderView = true, clearSelection = true
   state.sessionCategory = category;
   if (changed && !state.selected && !state.selectedBotRequest) $("detail").replaceChildren();
   const origin = state.filters.initiator;
-  if (category !== "bot" && origin && !botFilter() && (origin === "agent" ? "agent" : "general") !== category) state.filters.initiator = "";
+  if (category !== "bot" && origin && !botFilter() && (origin === "human" ? "general" : "agent") !== category) state.filters.initiator = "";
   if (renderView) { render(); if (changed) $("task-list-pane").scrollTop = 0; }
   if (category === "bot" && renderView) loadBotRequests();
   return changed;
 }
 function renderSessionCategories(sessions, now) {
-  const counts = { general: 0, agent: 0, bot: state.botRequests.loaded ? state.botRequests.requests.filter(botRequestMatches).length : null };
+  const botSessions = botOwnSessions(sessions, now).length;
+  const counts = { general: 0, agent: 0,
+    bot: state.botRequests.loaded ? state.botRequests.requests.filter(botRequestMatches).length + botSessions : botSessions || null };
   for (const session of sessions) {
     const category = sessionCategoryOf(session);
     if (category !== "bot" && matches(session, now, { category: false, initiator: category === state.sessionCategory })) counts[category] += 1;
@@ -1579,7 +1672,7 @@ function renderSessionCategories(sessions, now) {
     $(`session-category-${category}-count`).textContent = counts[category] === null ? "-" : String(counts[category]);
   }
   $("groups").setAttribute("aria-labelledby", `session-category-${state.sessionCategory}`);
-  $("session-category-note").hidden = state.sessionCategory !== "general" || state.filters.initiator === "human" || !!botFilter();
+  $("session-category-note").hidden = state.sessionCategory !== "agent" || !!state.filters.initiator || !!botFilter();
   const others = Object.keys(SESSION_CATEGORIES).filter((category) => category !== state.sessionCategory && counts[category] > 0);
   const other = others[0];
   $("session-category-search").hidden = !state.search.trim() || !other;
@@ -1659,7 +1752,8 @@ function renderFilters(sessions) {
     select.addEventListener("change", () => {
       state.filters[key] = select.value;
       if (key === "account") state.accountFilterRoutes = null;
-      if (key === "initiator" && select.value) setSessionCategory(select.value === "agent" ? "agent" : "general", { renderView: false });
+      if (key === "initiator" && select.value && !select.value.startsWith(BOT_FILTER_PREFIX))
+        setSessionCategory(select.value === "human" ? "general" : "agent", { renderView: false });
       render();
     });
     field.append(select);
@@ -2094,7 +2188,7 @@ function bindPressMenu(root, rowOf, open, { onDown = null, onMove = null, onUp =
   root.addEventListener("pointerup", (event) => {
     // `fired`: this press already opened its menu, so it was not a tap.
     const fired = press.end(event);
-    if (fired) root.pressedAt = Date.now();
+    if (fired) root.pressedAt = state.pressLiftAt = Date.now();
     onUp?.(event, false, fired);
   });
   root.addEventListener("pointercancel", (event) => {
@@ -2661,15 +2755,13 @@ function restoreConversationView(list) {
 function select(key) {
   if (state.launchBusy) return;
   // A docked terminal stays beside its own conversation; another one shows without it.
-  const beside = state.docked && sessionForTerminal(state.terminal);
-  if (beside && beside.key !== key) undock();
+  if (state.docked && key !== state.dockBeside) undock();
   if (state.selected !== key) rememberConversationView();
   const target = allSessions().find((session) => session.key === key);
   const bot = target && botRequestForNative(sourceOf(target));
-  if (bot) { selectBotRequest(botRequestKey(bot)); return; }
   if (target && sessionUnread(target)) markSeen(target);
   if (target) markOpened(target);
-  state.selectedBotRequest = null;
+  state.selectedBotRequest = bot ? botRequestKey(bot) : null;
   const listChanged = target && prepareSessionListFor(target);
   if (listChanged && state.selected === key) renderSessionList(allSessions(), state.snapshot?.serverTime || Date.now() / 1000);
   const mobile = phoneLayout();
@@ -2907,7 +2999,8 @@ function drawDetail(s) {
   prompt.id = "chat-prompt";
   prompt.hidden = true;
   prompt.setAttribute("aria-live", "polite");
-  pane.append(bar, sync, list, jump, hint, prompt, buildChatComposer(s), buildContinuePanel(s));
+  pane.append(bar, sync, list, jump, hint, prompt,
+    ...(sessionCategoryOf(s) === "bot" ? [botWatchNotice(s)] : [buildChatComposer(s), buildContinuePanel(s)]));
   setChromeVisible(state.chromeVisible);
   if (!state.chromeVisible && touchDevice()) showTapHint();
 }
@@ -3122,7 +3215,11 @@ function pinnedToEnd(list) {
 // conversation is put back at its newest message.
 function keepAtEnd(list) {
   if (list?.pendingView) { restoreConversationView(list); return; }
-  if (!list || list.isConnected === false || !list.clientHeight || !pinnedToEnd(list)) return;
+  if (!list || list.isConnected === false || !list.clientHeight) return;
+  if (!pinnedToEnd(list)) {
+    renderJump();
+    return;
+  }
   setMessagesScroll(list, list.scrollHeight);
   list.unread = 0;
   renderJump();
@@ -3228,10 +3325,16 @@ function setTyping(typing) {
   const list = $("messages");
   const atBottom = messagesAtEnd(list);
   const before = list?.getBoundingClientRect?.().top;
+  const restore = !typing && list && list.typingFrom && list.scrollTop === list.typingFrom.set ? list.typingFrom.top : null;
+  const from = list?.scrollTop;
   if (typing) pane.classList.add("is-typing");
   else pane.classList.remove("is-typing");
   if (list && atBottom) setMessagesScroll(list, list.scrollHeight);
+  // Back from typing with no scroll since: exactly the place it had (the shift into the
+  // typing layout may have been cut short at the top).
+  else if (list && restore !== null) setMessagesScroll(list, restore);
   else if (list && typeof before === "number") setMessagesScroll(list, list.scrollTop + list.getBoundingClientRect().top - before);
+  if (list) list.typingFrom = typing && !atBottom ? { top: from, set: list.scrollTop } : null;
   renderJump();
 }
 // The viewport changed (an on-screen keyboard opened or closed, a rotation, a
@@ -4242,6 +4345,8 @@ function resizeChatInput(entry) {
   toggle.textContent = height > base + 1 || entry.expanded ? "접기" : "펼치기";
   toggle.setAttribute("aria-expanded", String(height > base + 1 || entry.expanded));
   if (atBottom) setMessagesScroll(list, list.scrollHeight);
+  // A taller composer moves the bottom of the list: the 맨 아래 button sits above it again.
+  renderJump();
 }
 // While a send is in flight or unconfirmed, its text already shows as the
 // bubble; the editor keeps it (a rejected send leaves it there) but hides it.
@@ -4652,6 +4757,7 @@ function applyChatReceipt(entry, receipt) {
   }
   entry.pending = null;
 }
+const CHAT_RECHECK_RETRY_MS = 3000;
 async function loadChatState(s, manual = false, { join = false } = {}) {
   const entry = chatEntry(s);
   if (!currentChat(entry) || !chatVisible() || networkOffline()) return;
@@ -4676,7 +4782,6 @@ async function loadChatState(s, manual = false, { join = false } = {}) {
   entry.stateReadAuthEpoch = state.authEpoch;
   let outcome = { status: "skipped" };
   const epoch = entry.stateEpoch;
-  const pollRun = state.chatPollRun;
   let readFailed = false;
   // A read clears its own (and a send's) errors; an input error (a file too
   // large, too many files, too long a message) stays until the user acts again.
@@ -4722,9 +4827,9 @@ async function loadChatState(s, manual = false, { join = false } = {}) {
       if (!entry.error && currentChat(entry)) revealChrome();
       entry.error = `${err.message} 상태 다시 확인을 눌러 주세요.`;
     }
-    // A transient failure keeps following the session with the same backoff.
-    if (currentChat(entry) && pollRun === state.chatPollRun && !err.unauthorized && !err.staleAuth)
-      scheduleChatPoll(s, entry);
+    // A transient failure keeps following the session with the same backoff (also when the
+    // polling stopped meanwhile: scheduleChatPoll follows only the conversation on screen).
+    if (currentChat(entry) && !err.unauthorized && !err.staleAuth) scheduleChatPoll(s, entry);
   } finally {
     entry.checking = false;
     complete(outcome);
@@ -4732,8 +4837,12 @@ async function loadChatState(s, manual = false, { join = false } = {}) {
     updateChatComposer(entry);
     const recheck = entry.recheckQueued || epoch !== entry.stateEpoch;
     entry.recheckQueued = false;
-    if (recheck && !readFailed && currentChat(entry) && chatVisible() && !networkOffline())
-      queueMicrotask(() => loadChatState(s, false));
+    // A read asked for while this one ran (a return to the screen, a live update) still
+    // happens: at once, or shortly after this one failed, so the old screen never stays.
+    if (recheck && currentChat(entry) && chatVisible() && !networkOffline()) {
+      if (!readFailed) queueMicrotask(() => loadChatState(s, false));
+      else setTimeout(() => { if (currentChat(entry) && chatVisible()) loadChatState(s, false); }, CHAT_RECHECK_RETRY_MS);
+    }
   }
   return outcome;
 }
@@ -5284,6 +5393,16 @@ function openQuickReplies(entry, input, trigger) {
 // starts a message (typing, the mic or a quick reply; chat.py warm), so the send then pastes at
 // once instead of waiting for the attach. Once a minute at most; nothing is typed by it.
 const WARM_SPACING_MS = 60000;
+// The terminal a send pastes into, as the server picks it: a live one linked to this session
+// for sure (not a 새 세션 link guessed from start times, nor one only started from it).
+function sendTerminalFor(s) {
+  const key = chatKey(sourceOf(s));
+  return state.terminals.find((terminal) => {
+    const info = terminalInfo(terminal);
+    return terminal.alive !== false && !terminal.closed && info.linkConfidence !== "estimated" &&
+      info.nativeSource?.host && chatKey(info.nativeSource) === key;
+  }) || null;
+}
 function warmChat(entry) {
   if (Date.now() - (entry.warmedAt || 0) < WARM_SPACING_MS || entry.source?.agent !== "claude") return;
   // Not more than every few seconds while typing (a terminal already open is the usual answer).
@@ -5291,7 +5410,7 @@ function warmChat(entry) {
   entry.warmCheckedAt = Date.now();
   const s = allSessions().find((session) => chatKey(sourceOf(session)) === chatKey(entry.source));
   // A finished session is not woken by typing; its send opens the connection as before.
-  if (s?.kind !== "background" || s.phase === "done" || terminalForSession(s)) return;
+  if (s?.kind !== "background" || s.phase === "done" || sendTerminalFor(s)) return;
   entry.warmedAt = Date.now();
   api("/api/chat/warm", { method: "POST", body: { source: entry.source } }).catch(() => {
     // The send opens it then, as before.
@@ -6939,6 +7058,55 @@ function dockWidth({ preferred = state.terminalDock } = {}) {
 function boardCovered() {
   return state.terminalVisible && !state.docked;
 }
+// Beside a terminal whose conversation is not listed yet: no other conversation stays there.
+function showDockWaiting() {
+  if (state.selected) rememberConversationView();
+  stopChatPolling();
+  state.selected = null;
+  state.selectedBotRequest = null;
+  state.detailFor = null;
+  state.detailRevision = null;
+  state.detailRun++;
+  const waiting = el("div", "welcome dock-waiting");
+  waiting.append(el("span", "welcome-mark", "↗"), el("h2", null, "이 터미널의 대화는 아직 목록에 없습니다."),
+    el("p", null, "새 세션이면 첫 대화가 기록되는 대로 여기에 보입니다."));
+  // The list stepped aside for the terminal: a way to it (the terminal steps aside then).
+  if (state.dockSolo) waiting.append(button("목록 보기", "secondary", backFromTerminal));
+  $("detail").replaceChildren(waiting);
+  render();
+}
+// The conversation a docked terminal belongs beside: for a handoff's or transfer's new run
+// only that run's (its source is the one it left); for any other, sessionForTerminal's.
+function dockedSessionFor(terminal) {
+  if (!terminal) return null;
+  const info = terminalInfo(terminal);
+  if (!["handoff", "transfer"].includes(info.launchMode || info.mode)) return sessionForTerminal(terminal);
+  if (!info.nativeSource?.host) return null;
+  const key = chatKey(info.nativeSource);
+  return allSessions().find((s) => chatKey(sourceOf(s)) === key) || null;
+}
+// Docked, beside the terminal stands its own conversation (dockBeside, its key) or, while it
+// is not listed, a note saying so (dockBeside null): when it opens, when it docks (a toggle,
+// a wider window, a turn to landscape) and once its conversation is listed or linked.
+function syncBeside() {
+  if (!state.docked || !state.terminal) return;
+  const beside = dockedSessionFor(state.terminal);
+  if (!beside) {
+    state.dockBeside = null;
+    if (state.selected || state.selectedBotRequest || !$("detail")?.querySelector?.(".dock-waiting")) showDockWaiting();
+    return;
+  }
+  state.dockBeside = beside.key;
+  if (beside.key === state.selected) return;
+  // A launch opens its terminal while still busy; showing its conversation is part of it.
+  const busy = state.launchBusy;
+  state.launchBusy = false;
+  try {
+    select(beside.key);
+  } finally {
+    state.launchBusy = busy;
+  }
+}
 // Docked, a key typed with nothing focused belongs to the side last touched.
 function boardKeysBlocked() {
   return state.terminalVisible && !(state.docked && state.dockSide === "board");
@@ -6966,6 +7134,7 @@ function applyDock() {
   renderDockToggle();
   renderTerminalReturn();
   if (changed) renderConnectivity();
+  if (changed && docked) syncBeside();
   return changed;
 }
 // Docked, the board stays on screen with its focus (the control that opened the terminal):
@@ -7141,18 +7310,8 @@ async function openTerminal(terminal, { recordHistory = true } = {}) {
   terminalError();
   renderTerminalReturn();
   $("terminal-reopen").hidden = true;
-  // Docked, the conversation beside it is the terminal's own.
-  const beside = state.docked && sessionForTerminal(terminal);
-  if (beside && beside.key !== state.selected) {
-    // A launch opens its terminal while still busy; showing its conversation is part of it.
-    const busy = state.launchBusy;
-    state.launchBusy = false;
-    try {
-      select(beside.key);
-    } finally {
-      state.launchBusy = busy;
-    }
-  }
+  state.dockBeside = null;
+  syncBeside();
   if (!state.terminalAlive) {
     showTerminalEnded();
     return;
@@ -7400,6 +7559,7 @@ function returnToBoard({ selectLaunchedSource = true, animate = true, loadChat =
   state.inputEpoch++;
   state.terminalOpenRun++;
   const wasDocked = state.docked;
+  state.dockBeside = null;
   state.terminalVisible = false;
   renderConnectivity();
   if (animate && !wasDocked) navTransition("dismiss", () => showTerminalScreen(false));
@@ -7981,6 +8141,9 @@ async function refreshTerminals(authEpoch = state.authEpoch) {
     const current = state.terminals.find((t) => t.id === state.terminal?.id);
     if (current) {
       state.terminal = { ...state.terminal, ...current };
+      // Linked to its session now (a new session's): its title, and beside it its conversation.
+      renameTerminals();
+      if (state.docked && !state.dockBeside) syncBeside();
       if (current.closed || current.alive === false) {
         saveDraft();
         stopTerminalReader();
@@ -8867,6 +9030,13 @@ function bindPullToRefresh(root) {
   }, { passive: true });
   root.addEventListener("touchmove", (event) => {
     if (start === null || event.touches.length !== 1) return;
+    // A menu opened under the finger (a long press) takes the gesture: no refresh behind it.
+    if (document.querySelector?.("dialog[open]")) {
+      start = null;
+      distance = 0;
+      showPull(0);
+      return;
+    }
     const pulled = event.touches[0].clientY - start;
     // The pull starts only on a clearly downward drag: a sideways one (a
     // card swipe) is never a pull, and a small wobble waits for direction.
@@ -8889,7 +9059,7 @@ function bindPullToRefresh(root) {
     if (event.cancelable) event.preventDefault();
   }, { passive: false });
   const finish = () => {
-    if (start !== null && distance >= GESTURE.pullTriggerPx) pullRefresh();
+    if (start !== null && distance >= GESTURE.pullTriggerPx && !document.querySelector?.("dialog[open]")) pullRefresh();
     else if (!state.pullRefreshing) showPull(0);
     start = null;
     distance = 0;
@@ -9022,8 +9192,17 @@ function updateViewport() {
 // docked terminal, typing on the board leaves the terminal its full height, so the keyboard
 // opening and closing does not resize (redraw) the CLI. Returns whether that changed.
 function renderKeyboardRoom() {
-  const typing = touchDevice() && !phoneLayout() && !shortLayout() && editingText() && keyboardOpen();
-  const beside = typing && state.docked && !!document.activeElement?.closest?.("#app");
+  // A phone held upright folds its own way (is-typing); one held sideways is as short as a tablet
+  // with its keyboard up, so its top bar folds too.
+  const open = touchDevice() && editingText() && keyboardOpen();
+  const typing = open && (!phoneLayout() || shortLayout());
+  // Typing on the board (its sheets included) leaves a docked terminal its height.
+  const beside = typing && state.docked && !!document.activeElement?.closest?.("#app, dialog");
+  // What the keyboard covers of the window's bottom (iOS keeps the window's height): toasts
+  // stay above it.
+  const viewport = window.visualViewport;
+  const covered = open && viewport ? Math.max(0, Math.round((window.innerHeight || 0) - (viewport.offsetTop || 0) - viewport.height)) : 0;
+  document.documentElement.style?.setProperty?.("--kb-inset", `${covered}px`);
   const classes = document.body?.classList;
   const changed = !!classes?.contains?.("keyboard-beside") !== beside;
   classes?.[typing ? "add" : "remove"]("keyboard-typing");

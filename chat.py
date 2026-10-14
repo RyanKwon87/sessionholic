@@ -57,7 +57,8 @@ MULTI_MARKS = ('[ ]', '[x]', '[X]', '[✓]', '[✔]', '☐', '☑', '☒', '◯'
 MENU_TAIL = 6
 # Claude Code's input line: a prompt with a rule right below it (its box, or the rules around
 # it) within the screen's last rows; a message in the transcript has text below it instead.
-INPUT_TAIL = 6
+# Below the box come its status, mode and task lines (six or more on a busy session).
+INPUT_TAIL = 20
 # A working session's spinner never lets the attach screen go quiet: its input line then says
 # it is ready, looked for from this long after the first output.
 SETTLE_PROMPT_SECONDS = 1.0
@@ -328,7 +329,10 @@ class Chat:
                 'acknowledged': result.get('acknowledged', False),
                 'turnId': result.get('turnId'),
                 'reason': result.get('reason'),
-                'attachments': Chat.attachment_history(result.get('attachments', []))}
+                'attachments': Chat.attachment_history(result.get('attachments', [])),
+                # A Claude send that attached the session's board terminal names it: the screen
+                # reads its terminal list then (its marks show the terminal at once).
+                **({'terminalId': result['terminalId']} if result.get('terminalId') else {})}
 
     def state(self, data, watching=False):
         """The conversation view. A watcher read (watching=True) also carries the receipts
@@ -419,9 +423,14 @@ class Chat:
         except (RuntimeError, OSError, ValueError) as exc:
             if source.get('agent') != 'codex' or source.get('phase') not in ('closed', 'notLoaded'):
                 from transfer import WorkerError
-                # Only a host that could not be reached shows its last read; a failure the
-                # host reported, or a request refused here, is shown as it is.
-                stale = None if isinstance(exc, (ValueError, WorkerError)) else self._stale(key, source, request_ids)
+                from transfer_native import DEADLINE_EXCEEDED
+                # Only a host that could not be reached, or did not answer in time (its helper's
+                # own deadline included), shows its last read; a failure the host reported, or a
+                # request refused here, is shown as it is.
+                late = isinstance(exc, WorkerError) and str(exc) == DEADLINE_EXCEEDED
+                reported = isinstance(exc, (ValueError, WorkerError)) and not late
+                stale = None if reported else self._stale(key, source, request_ids,
+                                                          slow=self.board.state[host['name']]['ok'])
                 if stale is not None:
                     return stale
                 raise
@@ -549,7 +558,7 @@ class Chat:
             self.last_good[key] = (time.time(), response, source.get('cwd'), source.get('sessionId'))
         return response
 
-    def _stale(self, key, source, request_ids):
+    def _stale(self, key, source, request_ids, slow=False):
         """The conversation as last read, read-only, while its host cannot be reached, or None
         when none was read for this exact session (a reused Claude id or a moved folder is
         another conversation). Never cached, so the next read asks the host again; its state
@@ -564,8 +573,10 @@ class Chat:
             {'delivery': 'unknown', 'reason': '기기에 연결되지 않아 전송 결과를 확인하지 못했습니다.'}, request_id)
             for request_id in request_ids]
         capability = {name: value for name, value in last.get('capability', {}).items() if name != 'action'}
+        # slow: the host is reachable but did not answer in time (not "not connected").
         capability.update(supported=False, attachments=False,
-                          reason='기기에 연결되지 않아 마지막으로 읽은 대화를 보여 줍니다. 연결되면 다시 읽습니다.')
+                          reason='기기가 제때 답하지 않아 마지막으로 읽은 대화를 보여 줍니다. 곧 다시 읽습니다.' if slow
+                          else '기기에 연결되지 않아 마지막으로 읽은 대화를 보여 줍니다. 연결되면 다시 읽습니다.')
         return {**last, 'receipts': receipts, 'capability': capability, 'stale': True, 'staleSince': int(at),
                 'phase': 'unavailable', 'workingSince': None, 'recovery': None,
                 'readOnly': True, 'prompt': None, 'promptOpenable': False}

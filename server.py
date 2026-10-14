@@ -1859,6 +1859,7 @@ class Workflow:
             return
         taken = {json.dumps(self.identity(t["nativeSource"]), sort_keys=True) for t in terminals
                  if isinstance(t.get("nativeSource"), dict)}
+        found = []
         for terminal in pending:
             host = terminal.get("host")
             data = (self.board.state.get(host) or {}).get("data") or {}
@@ -1873,6 +1874,19 @@ class Workflow:
                             or json.dumps(self.identity(native), sort_keys=True) in taken):
                         continue
                     candidates.append((started, native))
+            found.append((terminal, candidates))
+        # A session that could be either of two terminals still waiting on its host (both opened
+        # before it started) is neither's: start times cannot tell them apart, and a wrong link
+        # shows another conversation beside the terminal and opens the wrong one from its card.
+        shared = {}
+        for _terminal, candidates in found:
+            for _started, native in candidates:
+                key = json.dumps(self.identity(native), sort_keys=True)
+                shared[key] = shared.get(key, 0) + 1
+        for terminal, candidates in found:
+            candidates = [item for item in candidates
+                          if shared[json.dumps(self.identity(item[1]), sort_keys=True)] == 1
+                          and json.dumps(self.identity(item[1]), sort_keys=True) not in taken]
             if not candidates:
                 continue
             native = min(candidates, key=lambda item: item[0])[1]

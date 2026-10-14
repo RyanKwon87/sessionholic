@@ -304,6 +304,8 @@ class ChatTest(unittest.TestCase):
         self.assertEqual(set(receipt),{'requestId','status','confirmed','readbackConfirmed','currentSnapshotConfirmed',
                                        'acknowledged','turnId','reason','attachments'})
         self.assertEqual(self.chat.receipt({'delivery':'rejected'},'request-0001')['status'],'failed')
+        # A Claude send that attached its board terminal names it, for the screen's terminal list.
+        self.assertEqual(self.chat.receipt({'delivery':'accepted','terminalId':TERMINAL_ID},'request-0001')['terminalId'],TERMINAL_ID)
     def test_batch_receipts_use_one_read_and_plain_cache_hits_show_no_receipts(self):
         def rpc(host,op,args,timeout):
             self.calls.append((host['name'],op,args))
@@ -386,6 +388,7 @@ class ChatTest(unittest.TestCase):
         self.assertEqual(len(self.calls),1)
         self.assertEqual((stale['stale'],stale['readOnly'],stale['capability']['supported']),(True,True,False))
         self.assertIn('마지막으로 읽은 대화',stale['capability']['reason'])
+        self.assertIn('연결되지 않아',stale['capability']['reason'])
         self.assertEqual(stale['messages'],first['messages'])
         self.assertEqual(stale['receipts'][0]['status'],'unknown')
         # Sending still needs the host.
@@ -415,6 +418,13 @@ class ChatTest(unittest.TestCase):
         self.assertEqual((stale['stale'],stale['phase'],stale['workingSince'],stale['recovery']),(True,'unavailable',None,None))
         self.assertNotIn('action',stale['capability'])
         self.assertEqual(stale['messages'],first['messages'])
+        # Reachable but late (its helper's own deadline): the last read too, saying it was late.
+        from transfer_native import DEADLINE_EXCEEDED
+        self.chat.cache.clear()
+        self.flow.transfers.rpc=fail(WorkerError(DEADLINE_EXCEEDED))
+        late=self.chat.state({'source':REF})
+        self.assertEqual((late['stale'],late['messages']),(True,first['messages']))
+        self.assertIn('제때 답하지 않아',late['capability']['reason'])
         # A failure the host reported is shown as it is.
         self.chat.cache.clear()
         self.flow.transfers.rpc=fail(WorkerError('fixture: reported'))
@@ -970,6 +980,9 @@ class ChatClaudeTest(unittest.TestCase):
         boxed = '답변 끝\n╭──────────╮\n│ >        │\n╰──────────╯\n  ? for shortcuts'
         self.assertTrue(chat.input_ready(ruled))
         self.assertTrue(chat.input_ready(boxed))
+        # A busy session lists its status, mode and tasks below the box (six lines and more).
+        busy = ruled + '\n  ⏺ 1 background task\n  ◯ task one\n  ◯ task two\n  ◯ task three\n  ◯ task four'
+        self.assertTrue(chat.input_ready(busy))
         # A message in the transcript has text below it, not a rule; nor a message or a quote
         # with a rule below and no box or rule above (no input box drawn).
         self.assertFalse(chat.input_ready('> 사용자 메시지\n답변 첫 줄\n답변 둘째 줄'))

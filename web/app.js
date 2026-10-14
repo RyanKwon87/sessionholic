@@ -2996,15 +2996,15 @@ function drawDetail(s) {
   );
   const settings = el("div", "chat-model-controls");
   for (const kind of ["model", "effort"]) {
-    const control = button(kind === "model" ? "모델 확인 중…" : "에포트 확인 중…", "chat-model-control", () => openChatSettings(chatEntry(s), kind));
+    const control = button("확인 중…", "chat-model-control", () => openChatSettings(chatEntry(s), kind));
     control.id = `chat-${kind}-control`;
+    control.setAttribute("aria-label", `${kind === "model" ? "모델" : "에포트"} 확인 중`);
     control.setAttribute("aria-expanded", "false");
     for (const type of ["pointerdown", "mousedown"]) control.addEventListener(type, (event) => {
       if (touchDevice() && editingText()) event.preventDefault();
     });
     settings.append(control);
   }
-  titles.append(settings);
   const meta = el("div", "detail-meta");
   meta.append(...detailMetaChildren(s));
   // Shown while this session has a live board terminal (renderDetailTerminal);
@@ -3019,6 +3019,8 @@ function drawDetail(s) {
   terminal.append(mark, goTerminal);
   titles.append(meta, terminal);
   head.append(titles);
+  head.append(settings);
+  const headActions = el("div", "detail-head-actions");
   const reload = button("↻", "detail-reload icon-button", hardReload);
   reload.id = "detail-reload";
   reload.title = "캐시 지우고 앱 새로고침";
@@ -3027,13 +3029,14 @@ function drawDetail(s) {
   for (const type of ["pointerdown", "mousedown"]) reload.addEventListener(type, (event) => {
     if (touchDevice() && editingText()) event.preventDefault();
   });
-  head.append(reload);
-  const focusToggle = button("집중 모드", "focus-toggle quiet", toggleChrome);
+  headActions.append(reload);
+  const focusToggle = button("집중", "focus-toggle quiet", toggleChrome);
   focusToggle.id = "focus-toggle";
   // Keep the keyboard and compact header still until the click lands.
   focusToggle.addEventListener("pointerdown", (event) => event.preventDefault());
   focusToggle.setAttribute("aria-pressed", "false");
-  head.append(focusToggle);
+  headActions.append(focusToggle);
+  head.append(headActions);
   window.SessionholicGoals?.attachSessionDetail?.(s, head);
   pane.append(head);
   renderDetailTerminal(s);
@@ -3337,7 +3340,8 @@ function setChromeVisible(visible, { stickBottom = false } = {}) {
   setReading(!visible, { stickBottom });
   const toggle = $("focus-toggle");
   if (toggle) {
-    toggle.textContent = visible ? "집중 모드" : "집중 모드 해제";
+    toggle.textContent = visible ? "집중" : "전체 보기";
+    toggle.title = visible ? "대화 집중 모드" : "집중 모드 해제";
     toggle.setAttribute("aria-pressed", String(!visible));
     toggle.setAttribute("aria-label", visible ? "대화 집중 모드" : "집중 모드 해제");
   }
@@ -4239,7 +4243,7 @@ function updateModelControls(entry) {
     const control = $(`chat-${kind}-control`);
     if (!control) continue;
     const actual = settings[kind], pending = next[kind] && next[kind] !== actual ? next[kind] : null;
-    control.textContent = `${actual || (kind === "model" ? "모델 미확인" : "에포트 미확인")}${pending ? ` → ${pending}` : ""}`;
+    control.textContent = `${actual || "미확인"}${pending ? ` → ${pending}` : ""}`;
     const label = kind === "model" ? "모델" : "에포트";
     const explanation = pending ? "화살표 뒤 값은 다음 웹 입력부터 적용됩니다." : settings.observed === "last_response" && kind === "model" ? "마지막 응답에서 확인한 모델" : `${label} 선택`;
     control.title = `${label}: ${control.textContent} · ${explanation}`;
@@ -6117,6 +6121,9 @@ function renderMessages(s, messages, error = "", fresh = false) {
   // A failed refresh never removes a conversation that was already readable.
   if (messages == null || (error && !messages.length && previous.length))
     messages = previous.map((item) => item.message);
+  // Bot execution details stay in the original session; this view follows its chat.
+  if (sessionCategoryOf(s) === "bot")
+    messages = messages.filter((message) => ["user", "assistant"].includes(message.role));
   const selectedText = window.getSelection?.();
   const readingSelection = selectedText && !selectedText.isCollapsed &&
     (list.contains?.(selectedText.anchorNode) || list.contains?.(selectedText.focusNode));

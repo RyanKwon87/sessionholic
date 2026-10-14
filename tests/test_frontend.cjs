@@ -1305,8 +1305,8 @@ test('상단 모델·에포트는 현재 값과 다음 입력 설정을 구분�
   assert.match(c.get('chat-effort-control').attributes['aria-label'], /에포트: low → high/);
   entry.data.modelSettings = {};
   controls.updateModelControls(entry);
-  assert.equal(c.get('chat-model-control').textContent, '모델 미확인');
-  assert.equal(c.get('chat-effort-control').textContent, '에포트 미확인');
+  assert.equal(c.get('chat-model-control').textContent, '미확인');
+  assert.equal(c.get('chat-effort-control').textContent, '미확인');
 });
 
 test('모델 명령 응답이 늦어도 새 대화의 초안을 지우거나 설정을 바꾸지 않는다', async () => {
@@ -6727,7 +6727,7 @@ test('a conversation opens in focus mode; on a touch screen it says once how to 
   const { s } = selectChat(c);
   c.drawDetail(s);
   assert.equal(c.state.chromeVisible, false, 'the bars are folded');
-  assert.equal(c.get('focus-toggle').textContent, '집중 모드 해제');
+  assert.equal(c.get('focus-toggle').textContent, '전체 보기');
   assert.equal(c.get('focus-toggle').attributes['aria-pressed'], 'true');
   assert.equal(c.get('tap-hint').hidden, false, 'a touch screen is told how to bring them back');
   assert.deepEqual(writes, [['sessionholic:ui:tapHint', 'true']]);
@@ -10947,4 +10947,26 @@ test('header device chips include hardware-only devices with their actual status
     assert.match(spare.className, status === 'ready' ? /\bok\b/ : /\bbad\b/);
     if (status === 'stale') assert.match(spare.title, /이전 기기 정보/);
   }
+});
+
+
+test('bot conversations show chat only, keep original records and preserve ordinary tool groups', () => {
+  const c = client(undefined, noChatTimers);
+  const { s } = selectChat(c); s.originator = 'hermes'; c.drawDetail(s);
+  const messages = [
+    { role: 'user', text: '계획을 수정해 주세요.', ts: 1 },
+    { role: 'system', text: '내부 환경 정보' },
+    { role: 'tool', text: '$ internal-tool', toolKind: 'command' },
+    { role: 'assistant', text: '수정한 내용을 확인해 주세요.', ts: 2 },
+  ];
+  const before = JSON.stringify(messages);
+  c.renderMessages(s, messages);
+  const list = c.get('messages');
+  assert.deepEqual(Array.from(list.conversationRows, (row) => row.role), ['user', 'assistant']);
+  assert.equal(JSON.stringify(messages), before, 'display filtering never edits the source records');
+  const first = list.conversationRows[0].row;
+  c.renderMessages(s, messages);
+  assert.equal(list.conversationRows[0].row, first, 'unchanged chat keeps its selection and scroll anchors');
+  s.originator = 'terminal'; s.source = 'cli'; c.renderMessages(s, messages);
+  assert.equal(list.conversationRows.length, 4, 'ordinary sessions retain execution details');
 });

@@ -388,6 +388,7 @@ class ChatTest(unittest.TestCase):
         self.assertEqual(len(self.calls),1)
         self.assertEqual((stale['stale'],stale['readOnly'],stale['capability']['supported']),(True,True,False))
         self.assertIn('마지막으로 읽은 대화',stale['capability']['reason'])
+        self.assertIn('연결되지 않아',stale['capability']['reason'])
         self.assertEqual(stale['messages'],first['messages'])
         self.assertEqual(stale['receipts'][0]['status'],'unknown')
         # Sending still needs the host.
@@ -417,6 +418,13 @@ class ChatTest(unittest.TestCase):
         self.assertEqual((stale['stale'],stale['phase'],stale['workingSince'],stale['recovery']),(True,'unavailable',None,None))
         self.assertNotIn('action',stale['capability'])
         self.assertEqual(stale['messages'],first['messages'])
+        # Reachable but late (its helper's own deadline): the last read too, saying it was late.
+        from transfer_native import DEADLINE_EXCEEDED
+        self.chat.cache.clear()
+        self.flow.transfers.rpc=fail(WorkerError(DEADLINE_EXCEEDED))
+        late=self.chat.state({'source':REF})
+        self.assertEqual((late['stale'],late['messages']),(True,first['messages']))
+        self.assertIn('제때 답하지 않아',late['capability']['reason'])
         # A failure the host reported is shown as it is.
         self.chat.cache.clear()
         self.flow.transfers.rpc=fail(WorkerError('fixture: reported'))

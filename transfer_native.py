@@ -52,10 +52,15 @@ def _revision(value):
                                      ensure_ascii=False).encode()).hexdigest()
 
 
+# The helper's own deadline for a remote read: the board shows the last read for it, as for a
+# host it could not reach (chat.Chat._read_state).
+DEADLINE_EXCEEDED = "원본 상태 확인 시간이 초과되었습니다."
+
+
 def _remaining(deadline):
     remaining = deadline - time.monotonic()
     if remaining <= 0:
-        raise TimeoutError("원본 상태 확인 시간이 초과되었습니다.")
+        raise TimeoutError(DEADLINE_EXCEEDED)
     return remaining
 
 

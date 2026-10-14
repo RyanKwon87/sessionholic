@@ -5280,6 +5280,12 @@ body.keyboard-typing .app-reload-bar,
      beneath and shows the small centered title (body.list-collapsed). */
   .app {
     position: relative;
+    /* The floating bar needs room before every flow child, including quick reload. */
+    padding-top: calc(var(--top-inset) + var(--nav-h));
+  }
+  body.show-detail .app,
+  body.keyboard-typing .app {
+    padding-top: var(--top-inset);
   }
   .top {
     position: absolute;
@@ -5302,7 +5308,7 @@ body.keyboard-typing .app-reload-bar,
     backdrop-filter: saturate(180%) blur(20px);
   }
   .list-pane {
-    padding-top: calc(var(--nav-h) + 2px);
+    padding-top: 2px;
   }
   .home-label,
   .top .top-status {

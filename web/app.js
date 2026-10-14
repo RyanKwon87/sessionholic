@@ -1394,8 +1394,8 @@ function renderCounts(sessions) {
 }
 // The filter sheet's selects; the button that opens it shows how many apply.
 const INITIATOR_LABELS = { human: "직접 시작", agent: "에이전트·프로그램 시작", unknown: "출처 미확인" };
-// Codex sessions opened by hand: its own terminal UI and a board launch (with no originator
-// recorded, an interactive source). Codex's other originators and exec runs are programs'.
+// Codex sessions opened by hand: an interactive source (its terminal UI, an app's or IDE's
+// connection) or, with none recorded, its terminal UI or a board launch as originator.
 const DIRECT_ORIGINATORS = new Set(["codex-tui", "session-board"]);
 const DIRECT_CODEX_SOURCES = new Set(["cli", "vscode"]);
 // Folders bots work in (a Slack bot's workspace, Hermes' home): their sessions are the bot's.
@@ -1414,9 +1414,13 @@ function originOf(s) {
   if (s.initiator === "agent" || s.parentSessionId || s.agentRole) return "agent";
   if (s.initiator === "human") return "human";
   if (s.agent === "codex") {
-    if (s.originator) return DIRECT_ORIGINATORS.has(s.originator) ? "human" : "agent";
+    // How Codex recorded the run decides: its terminal UI or an app's or IDE's connection is
+    // opened by hand, exec is a program's run. The originator names the client that last
+    // attached (the board's own reader, say), so it decides only with no source recorded.
     if (DIRECT_CODEX_SOURCES.has(s.source)) return "human";
-    return s.source === "exec" ? "agent" : "unknown";
+    if (s.source === "exec") return "agent";
+    if (s.originator) return DIRECT_ORIGINATORS.has(s.originator) ? "human" : "agent";
+    return "unknown";
   }
   if (s.agent === "claude" && ["interactive", "background"].includes(s.kind)) return "human";
   return "unknown";

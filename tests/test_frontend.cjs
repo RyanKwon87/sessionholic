@@ -4221,16 +4221,23 @@ test('Claude 백그라운드 대화에 입력을 시작하면 그 연결을 한 
     metadata: { nativeSource: { host: s.host, agent: s.agent, home: s.home, id: s.id }, mode: 'attach' } }];
   entry.warmedAt -= 61000; entry.warmCheckedAt = 0; type('안녕하세');
   assert.equal(warmed().length, 2);
+  // A terminal the server would not paste into (a guessed 새 세션 link, or one only started
+  // from this session) does not count: the send would open the connection, so typing does.
+  c.state.terminals = [{ id: 'b'.repeat(32), alive: true, mode: 'new-session', linkConfidence: 'estimated',
+    nativeSource: { host: s.host, agent: s.agent, home: s.home, id: s.id } },
+    { id: 'c'.repeat(32), alive: true, mode: 'attach', sourceKey: JSON.stringify(entry.source) }];
+  entry.warmedAt -= 61000; entry.warmCheckedAt = 0; type('안녕하세');
+  assert.equal(warmed().length, 3);
   // A finished session is not woken by typing.
   c.state.terminals = []; c.state.snapshot.hosts[0].data.claude[0].phase = 'done';
   entry.warmedAt -= 61000; entry.warmCheckedAt = 0; type('안녕하세요');
-  assert.equal(warmed().length, 2);
+  assert.equal(warmed().length, 3);
   // Codex takes input through its own server: never warmed.
   const codex = client(async (url) => { requests.push([url]); return { ok: true, status: 200, json: async () => ({}) }; }, noChatTimers);
   const other = selectChat(codex);
   const codexInput = findId(codex.buildChatComposer(other.s), 'chat-input');
   codexInput.value = '안녕'; codexInput.events.input();
-  assert.equal(warmed().length, 2);
+  assert.equal(warmed().length, 3);
 });
 
 function classes() {

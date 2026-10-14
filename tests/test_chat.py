@@ -304,6 +304,8 @@ class ChatTest(unittest.TestCase):
         self.assertEqual(set(receipt),{'requestId','status','confirmed','readbackConfirmed','currentSnapshotConfirmed',
                                        'acknowledged','turnId','reason','attachments'})
         self.assertEqual(self.chat.receipt({'delivery':'rejected'},'request-0001')['status'],'failed')
+        # A Claude send that attached its board terminal names it, for the screen's terminal list.
+        self.assertEqual(self.chat.receipt({'delivery':'accepted','terminalId':TERMINAL_ID},'request-0001')['terminalId'],TERMINAL_ID)
     def test_batch_receipts_use_one_read_and_plain_cache_hits_show_no_receipts(self):
         def rpc(host,op,args,timeout):
             self.calls.append((host['name'],op,args))
@@ -970,6 +972,9 @@ class ChatClaudeTest(unittest.TestCase):
         boxed = '답변 끝\n╭──────────╮\n│ >        │\n╰──────────╯\n  ? for shortcuts'
         self.assertTrue(chat.input_ready(ruled))
         self.assertTrue(chat.input_ready(boxed))
+        # A busy session lists its status, mode and tasks below the box (six lines and more).
+        busy = ruled + '\n  ⏺ 1 background task\n  ◯ task one\n  ◯ task two\n  ◯ task three\n  ◯ task four'
+        self.assertTrue(chat.input_ready(busy))
         # A message in the transcript has text below it, not a rule; nor a message or a quote
         # with a rule below and no box or rule above (no input box drawn).
         self.assertFalse(chat.input_ready('> 사용자 메시지\n답변 첫 줄\n답변 둘째 줄'))

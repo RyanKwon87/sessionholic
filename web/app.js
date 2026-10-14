@@ -5376,6 +5376,16 @@ function openQuickReplies(entry, input, trigger) {
 // starts a message (typing, the mic or a quick reply; chat.py warm), so the send then pastes at
 // once instead of waiting for the attach. Once a minute at most; nothing is typed by it.
 const WARM_SPACING_MS = 60000;
+// The terminal a send pastes into, as the server picks it: a live one linked to this session
+// for sure (not a 새 세션 link guessed from start times, nor one only started from it).
+function sendTerminalFor(s) {
+  const key = chatKey(sourceOf(s));
+  return state.terminals.find((terminal) => {
+    const info = terminalInfo(terminal);
+    return terminal.alive !== false && !terminal.closed && info.linkConfidence !== "estimated" &&
+      info.nativeSource?.host && chatKey(info.nativeSource) === key;
+  }) || null;
+}
 function warmChat(entry) {
   if (Date.now() - (entry.warmedAt || 0) < WARM_SPACING_MS || entry.source?.agent !== "claude") return;
   // Not more than every few seconds while typing (a terminal already open is the usual answer).
@@ -5383,7 +5393,7 @@ function warmChat(entry) {
   entry.warmCheckedAt = Date.now();
   const s = allSessions().find((session) => chatKey(sourceOf(session)) === chatKey(entry.source));
   // A finished session is not woken by typing; its send opens the connection as before.
-  if (s?.kind !== "background" || s.phase === "done" || terminalForSession(s)) return;
+  if (s?.kind !== "background" || s.phase === "done" || sendTerminalFor(s)) return;
   entry.warmedAt = Date.now();
   api("/api/chat/warm", { method: "POST", body: { source: entry.source } }).catch(() => {
     // The send opens it then, as before.

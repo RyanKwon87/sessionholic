@@ -57,7 +57,8 @@ MULTI_MARKS = ('[ ]', '[x]', '[X]', '[✓]', '[✔]', '☐', '☑', '☒', '◯'
 MENU_TAIL = 6
 # Claude Code's input line: a prompt with a rule right below it (its box, or the rules around
 # it) within the screen's last rows; a message in the transcript has text below it instead.
-INPUT_TAIL = 6
+# Below the box come its status, mode and task lines (six or more on a busy session).
+INPUT_TAIL = 20
 # A working session's spinner never lets the attach screen go quiet: its input line then says
 # it is ready, looked for from this long after the first output.
 SETTLE_PROMPT_SECONDS = 1.0
@@ -328,7 +329,10 @@ class Chat:
                 'acknowledged': result.get('acknowledged', False),
                 'turnId': result.get('turnId'),
                 'reason': result.get('reason'),
-                'attachments': Chat.attachment_history(result.get('attachments', []))}
+                'attachments': Chat.attachment_history(result.get('attachments', [])),
+                # A Claude send that attached the session's board terminal names it: the screen
+                # reads its terminal list then (its marks show the terminal at once).
+                **({'terminalId': result['terminalId']} if result.get('terminalId') else {})}
 
     def state(self, data, watching=False):
         """The conversation view. A watcher read (watching=True) also carries the receipts

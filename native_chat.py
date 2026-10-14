@@ -1,4 +1,4 @@
-"""Exact native-session chat IO. No auth/model/permission overrides or retries.
+"""Exact native-session chat IO. No auth/permission overrides or automatic retries.
 
 Only the owning host invokes handle(). Attachment paths are server-resolved,
 never browser-provided. Native approvals remain in the original terminal.
@@ -26,6 +26,108 @@ REQUEST_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{7,127}\Z")
 KNOWN_TURN_STATUS = ("inProgress", "completed", "interrupted", "failed")
 NOT_STEERABLE = "현재 실행 중인 작업(/review·/compact 등)은 새 입력을 받을 수 없습니다. 끝난 뒤 다시 보내 주세요."
 FALLBACK = "승인·질문 응답과 지원되지 않는 입력은 원본 native 터미널에서 처리하세요."
+MODEL_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:/-]{0,119}\Z")
+EFFORTS = ('none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra')
+
+
+def model_settings(value):
+    value = value if isinstance(value, dict) else {}
+    model, effort = value.get('model'), value.get('reasoningEffort')
+    return {'model': model if isinstance(model, str) and MODEL_ID.fullmatch(model) else None,
+            'effort': effort if effort in EFFORTS else None}
+
+
+def _preferences(identity, home):
+    root = ledger_root(home)
+    path = root / 'chat-receipts' / (_ledger_key(identity, 'model-settings') + '.json')
+    try:
+        for folder in (root, path.parent):
+            info = folder.lstat()
+            if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
+                raise ValueError('모델 설정 저장 경로를 확인해 주세요.')
+        fd = os.open(str(path), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError:
+        return {}
+    with os.fdopen(fd, 'rb') as stream:
+        info = os.fstat(stream.fileno())
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077 or info.st_size > 4096:
+            raise ValueError('모델 설정 기록을 확인해 주세요.')
+        value = json.loads(stream.read(4097))
+    if (not isinstance(value, dict) or set(value) != {'model', 'effort'} or
+            not isinstance(value['model'], str) or not MODEL_ID.fullmatch(value['model']) or value['effort'] not in EFFORTS):
+        raise ValueError('모델 설정 기록을 확인해 주세요.')
+    return value
+
+
+def _models(client):
+    models, cursor = [], None
+    for _ in range(4):
+        result = client.call('model/list', {'limit': 100, **({'cursor': cursor} if cursor else {})})
+        if not isinstance(result, dict) or not isinstance(result.get('data'), list) or len(result['data']) > 100:
+            raise ValueError('모델 목록 형식을 확인하지 못했습니다.')
+        for row in result.get('data', []):
+            if not isinstance(row, dict) or row.get('hidden') or not isinstance(row.get('model'), str) or not MODEL_ID.fullmatch(row['model']):
+                continue
+            supported = row.get('supportedReasoningEfforts')
+            if not isinstance(supported, list) or len(supported) > 16: continue
+            efforts = [item.get('reasoningEffort') for item in supported
+                       if isinstance(item, dict) and item.get('reasoningEffort') in EFFORTS]
+            if efforts:
+                models.append({'model': row['model'], 'label': str(row.get('displayName') or row['model'])[:120],
+                               'efforts': list(dict.fromkeys(efforts)), 'defaultEffort': row.get('defaultReasoningEffort')})
+        cursor = result.get('nextCursor')
+        if not cursor: return models
+    raise ValueError('모델 목록을 모두 확인하지 못했습니다. 다시 시도해 주세요.')
+
+
+def _codex_command(client, identity, args, thread, home):
+    command = args.get('command')
+    if command == 'models':
+        return {'models': _models(client), 'current': model_settings(thread), 'next': _preferences(identity, home)}
+    if command not in ('model', 'effort', 'compact'):
+        raise ValueError('현재 세션에서 이 명령을 사용할 수 없습니다.')
+    if (args.get('source') or {}).get('cwd') not in (None, thread.get('cwd')):
+        raise ValueError('실제 세션의 작업 폴더가 변경되었습니다. 목록을 다시 읽어 주세요.')
+    request_id = _request(args.get('requestId'))
+    value = args.get('value')
+    if command == 'compact' and value is not None:
+        raise ValueError('요약 명령에는 인자를 넣지 않습니다.')
+    digest = hashlib.sha256(json.dumps([command, value], sort_keys=True).encode()).hexdigest()
+    with _Ledger(identity, 'command-' + request_id, home) as receipt:
+        prior = receipt.read()
+        if prior:
+            if prior.get('digest') != digest: raise ValueError('같은 명령 ID에 다른 값을 사용할 수 없습니다.')
+            return prior['result']
+        if not _capabilities(thread)['canSend']:
+            raise ValueError('현재 세션에서 이 명령을 사용할 수 없습니다.')
+        if command == 'compact' and _state(thread)['phase'] != 'idle':
+            raise ValueError('진행 중인 작업이 끝난 뒤 명령을 실행해 주세요.')
+        if command in ('model', 'effort'):
+            with _Ledger(identity, 'model-settings', home) as preferences:
+                current = _preferences(identity, home) or model_settings(thread)
+                model = value if command == 'model' else current.get('model')
+                chosen = next((row for row in _models(client) if row['model'] == model), None)
+                if chosen is None: raise ValueError('이 계정에서 선택할 수 있는 모델을 골라 주세요.')
+                effort = value if command == 'effort' else current.get('effort')
+                if command == 'model' and effort not in chosen['efforts']: effort = chosen['defaultEffort']
+                if effort not in chosen['efforts']: raise ValueError('이 모델이 지원하는 에포트 레벨을 골라 주세요.')
+                selected = {'model': model, 'effort': effort}
+                receipt.save({'digest': digest, 'result': {'status': 'unknown', 'reason': '모델 설정 결과를 다시 확인해 주세요.'}})
+                preferences.save(selected)
+                result = {'status': 'configured', 'current': model_settings(thread), 'next': selected,
+                          'reason': '다음 웹 입력부터 적용됩니다.'}
+        else:
+            unknown = {'status': 'unknown', 'reason': '명령 수신 여부를 확인하지 못했습니다. 자동으로 재실행하지 않습니다.'}
+            receipt.save({'digest': digest, 'result': unknown})
+            try:
+                client.call('thread/compact/start', {'threadId': identity['id']})
+                result = {'status': 'accepted', 'reason': '대화 요약을 시작했습니다.'}
+            except NativeRejected:
+                result = {'status': 'rejected', 'reason': '이 CLI에서 요약 요청을 거절했습니다.'}
+            except (OSError, TimeoutError, collector.RpcError):
+                return unknown
+        receipt.save({'digest': digest, 'result': result})
+        return result
 
 
 class NativeRejected(collector.RpcError):
@@ -442,13 +544,18 @@ def _send(client, identity, args, thread, home):
         capabilities = _capabilities(thread)
         if not capabilities["canSend"]:
             return {**before, "delivery": "rejected", "reason": capabilities["reason"], "fallback": FALLBACK}
+        options = _preferences(identity, home) if _state(thread)['phase'] == 'idle' else {}
+        if options:
+            chosen = next((row for row in _models(client) if row['model'] == options['model']), None)
+            if chosen is None or options['effort'] not in chosen['efforts']:
+                return {**before, 'delivery': 'rejected', 'reason': '선택한 모델·에포트를 다시 확인해 주세요.'}
         ledger.save({"digest": digest, "receipt": before, "attachments": manifest, "attachmentEvidence": evidence})
         acknowledged, turn_id = False, None
         try:
             # turn/start begins a turn when idle and joins the active turn otherwise;
             # the native CLI decides when the model reads it. No board-side queue.
             result = client.call("turn/start", {"threadId": identity["id"], "input": inputs,
-                                                "clientUserMessageId": request_id})
+                                                "clientUserMessageId": request_id, **options})
             acknowledged, turn_id = True, (result.get("turn") or {}).get("id")
             after = _thread(client, identity)
             receipt = _receipt(identity, request_id, after)
@@ -502,6 +609,7 @@ def _claude(identity, action, home, deadline, args):
                                "canAnswerApprovals": False, "canAnswerQuestions": False, "fallback": FALLBACK,
                                # The board delivers Claude input through its own attached terminal.
                                "reason": "Claude 입력은 보드가 연결한 터미널로 전달합니다."}}
+    result['modelSettings'] = model_settings({**row, 'reasoningEffort': row.get('effort') or row.get('effortLevel')})
     if action == "read":
         sid = row.get("sessionId")
         if not isinstance(sid, str) or not collector.SESSION_ID.fullmatch(sid):
@@ -512,6 +620,12 @@ def _claude(identity, action, home, deadline, args):
             raise ValueError("정확한 원본 Claude 대화 기록을 확인하지 못했습니다.")
         entries = list(collector.tail_entries(paths[0], 2 * 1024 * 1024))
         result["messages"] = collector.claude_messages(entries)
+        if not result['modelSettings']['model']:
+            for entry in reversed(entries):
+                model = (entry.get('message') or {}).get('model') if entry.get('type') == 'assistant' and isinstance(entry.get('message'), dict) else None
+                if isinstance(model, str) and MODEL_ID.fullmatch(model):
+                    result['modelSettings'].update(model=model, observed='last_response')
+                    break
         if result["phase"] == "working":
             # Claude Code records no turn start: "작업 중" counts from the newest user prompt
             # in the transcript, an approximation the board labels as such (workingSinceApprox).
@@ -527,7 +641,7 @@ def _claude(identity, action, home, deadline, args):
 
 def handle(args, *, home=None, timeout=10):
     """One bounded operation on the owning host; never opens/resumes a thread."""
-    if not isinstance(args, dict) or args.get("action") not in ("capabilities", "read", "send", "receipt"):
+    if not isinstance(args, dict) or args.get("action") not in ("capabilities", "read", "send", "receipt", "command"):
         raise ValueError("Native 메시지 작업이 올바르지 않습니다.")
     identity, action = native._identity(args.get("source")), args["action"]
     request_ids = _request_ids(args) if action == "read" else []
@@ -536,8 +650,10 @@ def handle(args, *, home=None, timeout=10):
         return _claude(identity, action, home, deadline, args)
     with _client(identity, home, deadline) as client:
         thread = _thread(client, identity)
+        if action == 'command':
+            return _codex_command(client, identity, args, thread, home)
         result = {"source": identity, "cwd": thread.get("cwd"), **_state(thread),
-                  "capabilities": _capabilities(thread)}
+                  "capabilities": _capabilities(thread), 'modelSettings': {**model_settings(thread), 'next': _preferences(identity, home)}}
         if action == "read":
             result["messages"] = _messages(thread, identity, home)
             # "작업 중" counts from the running turn's own start (Turn.startedAt, epoch seconds).

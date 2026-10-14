@@ -1232,6 +1232,112 @@ function selectChat(c, { home = '.codex-example', id = 'native-session', agent =
 
 const noChatTimers = { setTimeout: () => 1, clearTimeout() {} };
 
+test('즐겨찾기는 오래된 대화도 상단에 한 번만 표시하며 지우기와 검색 조건을 지킨다', () => {
+  const c = client(undefined, noChatTimers);
+  const { s } = selectChat(c);
+  Object.assign(s, { phase: 'closed', source: 'cli', title: '고정된 대화', updatedAt: 1, pinnedAt: 1 });
+  const other = { ...s, id: 'other', key: 'other', pinnedAt: null, updatedAt: 1000000 };
+  assert.equal(c.matches(s, 1000000), true);
+  c.renderGroups([s, other], 1000000);
+  const groups = c.get('groups').children;
+  assert.equal(groups[0].dataset.groupKey, 'favorites');
+  assert.equal(groups.flatMap((section) => section.children).filter((row) => row.dataset?.sessionKey === s.key).length, 1);
+  s.removedAt = 10;
+  assert.equal(c.matches(s, 1000000), false);
+  c.state.showRemoved = true; c.state.search = '다른 검색';
+  assert.equal(c.matches(s, 1000000), false);
+  c.state.search = ''; s.pinnedAt = null; s.removedAt = null; c.state.showRemoved = false;
+  assert.equal(c.matches(s, 1000000), false);
+});
+
+test('슬래시 자동완성은 키보드로 선택하고 IME와 취소를 지키며 명령을 실행하지 않는다', () => {
+  const calls = [];
+  const c = client(async (url) => { calls.push(url); return { ok: true, status: 200, json: async () => ({}) }; }, noChatTimers);
+  const { s, entry } = selectChat(c);
+  c.buildChatComposer(s);
+  const input = c.get('chat-input'); c.context.document.activeElement = input;
+  input.value = '/'; input.events.input({});
+  assert.equal(c.get('chat-slash-options').children.length, 4);
+  input.events.keydown({ key: 'ArrowDown', preventDefault() {} });
+  input.events.keydown({ key: 'Enter', preventDefault() {} });
+  assert.equal(entry.text, '/effort ');
+  assert.equal(calls.length, 0);
+  input.value = '/co'; input.events.input({});
+  input.events.keydown({ key: 'Enter', isComposing: true, preventDefault() { throw new Error('IME interrupted'); } });
+  assert.equal(entry.text, '/co');
+  input.events.keydown({ key: 'Escape', preventDefault() {} });
+  assert.equal(input.attributes['aria-expanded'], 'false');
+  assert.equal(entry.text, '/co');
+});
+
+test('슬래시 명령은 별도 제어 API를 사용하고 첨부·지원하지 않는 명령은 보내지 않는다', async () => {
+  const calls = [];
+  const c = client(async (url, options) => {
+    calls.push([url, JSON.parse(options.body)]);
+    return { ok: true, status: 200, json: async () => url === '/api/chat/command'
+      ? { status: 'configured', next: { model: 'example-one', effort: 'high' }, reason: '다음 입력부터 적용' }
+      : { route: c.sourceOf(s), phase: 'idle', capability: { supported: true }, messages: [] } };
+  }, noChatTimers);
+  const { s, entry } = selectChat(c);
+  c.buildChatComposer(s);
+  entry.text = '/effort high';
+  await c.sendChat(entry);
+  assert.equal(calls.find(([url]) => url === '/api/chat/command')[1].command, 'effort');
+  assert.equal(calls.some(([url]) => url === '/api/chat/send'), false);
+  assert.equal(entry.text, '');
+  const count = calls.filter(([url]) => url === '/api/chat/command').length;
+  entry.text = '/unsupported'; await c.sendChat(entry);
+  assert.ok(entry.error.includes('지원하는'));
+  entry.text = '/compact'; entry.attachments = [{ id: 'file' }]; await c.sendChat(entry);
+  assert.equal(calls.filter(([url]) => url === '/api/chat/command').length, count);
+});
+
+test('상단 모델·에포트는 현재 값과 다음 입력 설정을 구분하고 미확인 값을 만들지 않는다', () => {
+  const c = client(undefined, noChatTimers);
+  const { entry } = selectChat(c);
+  const controls = vm.runInContext('({ updateModelControls })', c.context);
+  entry.data.modelSettings = { model: 'example-one', effort: 'low', next: { model: 'example-two', effort: 'high' } };
+  controls.updateModelControls(entry);
+  assert.equal(c.get('chat-model-control').textContent, 'example-one → example-two');
+  assert.equal(c.get('chat-effort-control').textContent, 'low → high');
+  assert.ok(c.get('chat-model-control').title.includes('다음 웹 입력'));
+  entry.data.modelSettings = {};
+  controls.updateModelControls(entry);
+  assert.equal(c.get('chat-model-control').textContent, '모델 미확인');
+  assert.equal(c.get('chat-effort-control').textContent, '에포트 미확인');
+});
+
+test('모델 명령 응답이 늦어도 새 대화의 초안을 지우거나 설정을 바꾸지 않는다', async () => {
+  let resolve;
+  const c = client(async (url) => url === '/api/chat/command' ? new Promise((done) => { resolve = done; })
+    : { ok: true, status: 200, json: async () => ({}) }, noChatTimers);
+  const { entry } = selectChat(c);
+  entry.text = '/model example-one';
+  const sending = c.sendChat(entry);
+  const { entry: other } = selectChat(c, { id: 'other-conversation' }); other.text = '새 초안';
+  resolve({ ok: true, status: 200, json: async () => ({ status: 'configured', next: { model: 'example-one', effort: 'high' } }) });
+  await sending;
+  assert.equal(other.text, '새 초안');
+  assert.equal(other.data.modelSettings, undefined);
+  assert.equal(entry.text, '/model example-one');
+});
+
+test('명령 이전에 시작된 상태 응답이 늦게 와도 다음 모델 설정을 덮어쓰지 않는다', async () => {
+  let resolveState;
+  const c = client(async (url) => url === '/api/chat/state' ? new Promise((resolve) => { resolveState = resolve; })
+    : { ok: true, status: 200, json: async () => ({ status: 'configured', current: { model: 'example-one', effort: 'low' },
+        next: { model: 'example-two', effort: 'high' } }) }, noChatTimers);
+  const { s, entry } = selectChat(c);
+  const reading = c.loadChatState(s);
+  entry.text = '/model example-two';
+  await c.sendChat(entry);
+  resolveState({ ok: true, status: 200, json: async () => ({ route: c.sourceOf(s), phase: 'idle', capability: { supported: true },
+    messages: [], modelSettings: { model: 'example-one', effort: 'low', next: {} } }) });
+  await reading;
+  assert.equal(entry.data.modelSettings.next.model, 'example-two');
+  assert.equal(entry.data.modelSettings.next.effort, 'high');
+});
+
 test('native chat drafts are isolated by exact host, agent, home and session', () => {
   const c = client(undefined, noChatTimers);
   const { s, entry } = selectChat(c);
@@ -6071,7 +6177,7 @@ test('a swipe offers 터미널 열기, or 연결 닫기 when the session has a b
   c.cancelTerminalClose();
   c.openCardMenu(row);
   assert.deepEqual(c.get('action-list').children.map((item) => item.textContent),
-    ['대화 열기', '세션 관리', '터미널로 돌아가기', '실행 종료', '실행 종료 뒤 목록에서 지우기', '목록에서 지우기']);
+    ['대화 열기', '☆ 상단 고정 (즐겨찾기)', '세션 관리', '터미널로 돌아가기', '실행 종료', '실행 종료 뒤 목록에서 지우기', '목록에서 지우기']);
   // A vertical drag is a scroll: no swipe, no menu.
   groups.events.pointerdown({ target, pointerId: 4, pointerType: 'touch', clientX: 300, clientY: 100 });
   groups.events.pointermove({ target, pointerId: 4, clientX: 296, clientY: 130, cancelable: true, preventDefault() {} });

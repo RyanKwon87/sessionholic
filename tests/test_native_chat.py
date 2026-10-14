@@ -115,6 +115,78 @@ class NativeChatTests(unittest.TestCase):
     def writes(self, client):
         return [(method, params) for method, params in client.calls if method not in ('thread/read',) + PAGED_READS]
 
+    def models(self):
+        return {'data': [{'model': name, 'displayName': name, 'defaultReasoningEffort': 'low',
+                          'supportedReasoningEfforts': [{'reasoningEffort': level} for level in levels]}
+                         for name, levels in [('example-one', ['low', 'high']), ('example-two', ['low'])]],
+                'nextCursor': None}
+
+    def command(self, client, command, value=None, request='control-0001'):
+        return self.handle(client, {'action': 'command', 'source': self.source, 'command': command,
+                                    'value': value, 'requestId': request})
+
+    def test_model_choices_are_account_catalog_and_changes_only_apply_on_an_idle_send(self):
+        thread = {**self.thread(), 'model': 'example-one', 'reasoningEffort': 'high'}
+        client = FakeClient(thread, {'model/list': self.models()})
+        catalog = self.command(client, 'models')
+        self.assertEqual([row['model'] for row in catalog['models']], ['example-one', 'example-two'])
+        self.assertEqual(catalog['current'], {'model': 'example-one', 'effort': 'high'})
+        chosen = self.command(client, 'model', 'example-two')
+        self.assertEqual(chosen['next'], {'model': 'example-two', 'effort': 'low'})
+        self.assertEqual(chosen['current']['model'], 'example-one')
+        self.assertNotIn('turn/start', methods(client))
+        result = self.handle(client)
+        self.assertTrue(result['confirmed'])
+        sent = next(params for method, params in client.calls if method == 'turn/start')
+        self.assertEqual(set(sent), {'threadId', 'input', 'clientUserMessageId', 'model', 'effort'})
+        self.assertEqual((sent['model'], sent['effort']), ('example-two', 'low'))
+
+    def test_invalid_model_effort_and_busy_commands_never_submit_a_native_operation(self):
+        thread = {**self.thread(), 'model': 'example-one', 'reasoningEffort': 'high'}
+        client = FakeClient(thread, {'model/list': self.models()})
+        for command, value in [('model', '../../auth.json'), ('effort', 'ultra'), ('compact', 'extra')]:
+            with self.assertRaises(ValueError): self.command(client, command, value)
+        self.assertFalse(any(method in ('turn/start', 'thread/compact/start') for method in methods(client)))
+        busy = FakeClient(self.running(), {'model/list': self.models()})
+        with self.assertRaisesRegex(ValueError, '끝난'): self.command(busy, 'compact')
+        self.assertEqual(self.writes(busy), [])
+
+    def test_model_request_replay_does_not_overwrite_a_later_choice_and_preferences_survive_restart(self):
+        client = FakeClient({**self.thread(), 'model': 'example-one', 'reasoningEffort': 'high'}, {'model/list': self.models()})
+        old = self.command(client, 'model', 'example-two')
+        self.command(client, 'model', 'example-one', request='control-0002')
+        self.assertEqual(self.command(client, 'model', 'example-two'), old)
+        catalog = self.command(FakeClient(client.thread, {'model/list': self.models()}), 'models')
+        self.assertEqual(catalog['next']['model'], 'example-one')
+        with self.assertRaisesRegex(ValueError, '같은'): self.command(client, 'model', 'example-one')
+
+    def test_compact_timeout_is_not_replayed_and_acknowledgement_means_started(self):
+        client = FakeClient(self.thread(), {'thread/compact/start': TimeoutError('fixture timeout')})
+        self.assertEqual(self.command(client, 'compact')['status'], 'unknown')
+        self.assertEqual(self.command(client, 'compact')['status'], 'unknown')
+        client.thread['status'] = {'type': 'active', 'activeFlags': []}
+        self.assertEqual(self.command(client, 'compact')['status'], 'unknown')
+        self.assertEqual(methods(client).count('thread/compact/start'), 1)
+        client.thread['status'] = {'type': 'idle'}
+        client.outcomes['thread/compact/start'] = {}
+        self.assertEqual(self.command(client, 'compact', request='control-0002')['status'], 'accepted')
+        self.assertNotIn('turn/start', methods(client))
+
+    def test_a_running_turn_keeps_its_model_and_damaged_settings_block_before_send(self):
+        client = FakeClient({**self.thread(), 'model': 'example-one', 'reasoningEffort': 'high'}, {'model/list': self.models()})
+        self.command(client, 'model', 'example-two')
+        active = FakeClient(self.running())
+        self.handle(active)
+        sent = next(params for method, params in active.calls if method == 'turn/start')
+        self.assertNotIn('model', sent); self.assertNotIn('effort', sent)
+        identity = {'agent': 'codex', 'id': self.source['id'], 'home': self.source['home']}
+        path = chat.ledger_root(self.home) / 'chat-receipts' / (chat._ledger_key(identity, 'model-settings') + '.json')
+        path.chmod(0o644)
+        fresh = FakeClient(client.thread, {'model/list': self.models()})
+        args = {**self.args, 'requestId': 'different-send-0001'}
+        with self.assertRaises(ValueError): self.handle(fresh, args)
+        self.assertNotIn('turn/start', methods(fresh))
+
     def running(self, items=None):
         thread = self.thread('active')
         thread['turns'] = [{'id': 'active-1', 'status': 'inProgress', 'items': list(items or [])}]

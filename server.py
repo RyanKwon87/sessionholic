@@ -39,7 +39,7 @@ import instance
 import settings
 from goals import GoalError, Goals
 from work_service import WorkService
-from session_labels import SessionLabels, SessionOpened, SessionRemoved, SessionSeen, SessionTidied, reference as label_reference
+from session_labels import SessionLabels, SessionOpened, SessionPinned, SessionRemoved, SessionSeen, SessionTidied, reference as label_reference
 
 HERE = Path(__file__).resolve().parent
 WEB = HERE / "web"
@@ -2660,6 +2660,19 @@ class Handler(BaseHTTPRequestHandler):
         result, _changed = self.server.session_opened.mark(source, int(time.time()))
         return {'openedAt': result['seenAt']}
 
+    def session_pin(self, data):
+        if not isinstance(data, dict) or set(data) != {'source', 'pinned'} or type(data['pinned']) is not bool:
+            raise ValueError('상단에 고정할 세션과 동작을 확인해 주세요.')
+        source = self.listed_source(data['source'])
+        if data['pinned']:
+            result, changed = self.server.session_pinned.mark(source, int(time.time()))
+        else:
+            changed = self.server.session_pinned.unmark(source)
+            result = {'seenAt': None}
+        if changed:
+            self.server.board.changed(force=True)
+        return {'pinnedAt': result['seenAt'], 'version': self.server.board.version}
+
     def tidy_after_close(self, native, ended=True):
         """A session the board just ended (or whose terminal its user closed) leaves 최근 끝남.
         `ended` False is a view closed while its run goes on: a running or waiting session is
@@ -2827,6 +2840,7 @@ class Handler(BaseHTTPRequestHandler):
         snapshot = self.server.session_tidied.decorate(snapshot)
         snapshot = self.server.session_removed.decorate(snapshot)
         snapshot = self.server.session_opened.decorate(snapshot)
+        snapshot = self.server.session_pinned.decorate(snapshot)
         return {**snapshot, "bootId": self.server.boot_id}
 
     def stream_events(self, query):
@@ -2990,6 +3004,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_json(200, self.session_remove(data))
             if path == "/api/session/opened":
                 return self.send_json(200, self.session_opened(data))
+            if path == "/api/session/pin":
+                return self.send_json(200, self.session_pin(data))
             if path == "/api/diagnostics/dictation":
                 return self.send_json(200, self.server.dictation_traces.record(data, self.headers.get("User-Agent", "")))
             if path == "/api/goals":
@@ -3027,6 +3043,10 @@ class Handler(BaseHTTPRequestHandler):
                 result = self.server.chat.prompt(data)
                 if data.get("action") == "answer":
                     self.follow_closely(data)
+                return self.send_json(200, result)
+            if path == "/api/chat/command":
+                result = self.server.chat.command(data)
+                self.follow_closely(data)
                 return self.send_json(200, result)
             if path == "/api/plan":
                 return self.send_json(200, self.server.workflow.plan(data))
@@ -3179,6 +3199,7 @@ def make_server(bind, port, board, token, terminals=None, workflow=None, state_d
     server.goals = Goals(state_dir)
     server.session_labels = SessionLabels(state_dir)
     server.session_seen = SessionSeen(state_dir)
+    server.session_pinned = SessionPinned(state_dir)
     server.session_tidied = SessionTidied(state_dir)
     server.session_removed = SessionRemoved(state_dir)
     server.session_opened = SessionOpened(state_dir)

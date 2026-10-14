@@ -269,3 +269,9 @@ class SessionOpened(SessionSeen):
     orders its older sessions by it."""
     NAME, ROW_FIELD, SNAPSHOT_FIELD, CODE = 'session-opened', 'openedAt', 'sessionOpened', 'session_opened'
     WHAT = '대화를 연 기록'
+
+
+class SessionPinned(SessionSeen):
+    """Board favorites, shared by devices without modifying native session metadata."""
+    NAME, ROW_FIELD, SNAPSHOT_FIELD, CODE = 'session-pinned', 'pinnedAt', 'sessionPinned', 'session_pinned'
+    WHAT = '상단 고정 기록'

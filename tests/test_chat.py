@@ -345,7 +345,7 @@ class ChatTest(unittest.TestCase):
         self.flow.transfers.rpc=lambda *a,**k:result
         state=self.chat.state({'source':REF,'requestId':'request-0001'})
         self.assertEqual(set(state),{'route','phase','capability','messages','receipts','maxAttachmentBytes','requiresNativeTerminal',
-                                     'prompt','promptOpenable','workingSince','workingSinceApprox'})
+                                     'prompt','promptOpenable','workingSince','workingSinceApprox','modelSettings'})
         self.assertIsNone(state['prompt'])
         self.assertFalse(state['promptOpenable'])
         self.assertEqual(set(state['capability']),{'supported','attachments','reason'})
@@ -825,6 +825,22 @@ class StateShareTest(unittest.TestCase):
 
 
 class ChatHttpTest(ChatTest):
+    def test_command_route_requires_auth_csrf_origin_and_preserves_authoritative_source(self):
+        calls = []
+        self.chat.command = lambda data: calls.append(data) or {'status': 'configured'}
+        def request(headers, body):
+            client = http.client.HTTPConnection('127.0.0.1', self.port, timeout=3)
+            client.request('POST', '/api/chat/command', json.dumps(body), {'Content-Type': 'application/json', **headers})
+            response = client.getresponse(); response.read(); client.close(); return response.status
+        payload = {'source': REF, 'command': 'effort', 'value': 'high', 'requestId': 'control-0001'}
+        self.assertEqual(request({}, payload), 401)
+        auth = {'Authorization': 'Bearer synthetic'}
+        self.assertEqual(request(auth, payload), 403)
+        auth['X-CSRF-Token'] = self.httpd.csrf
+        self.assertEqual(request({**auth, 'Origin': 'https://evil.example'}, payload), 403)
+        self.assertEqual(calls, [])
+        self.assertEqual(request(auth, payload), 200)
+        self.assertEqual(calls, [payload])
     def setUp(self):
         super().setUp()
         self.httpd=server.make_server('127.0.0.1',0,self.board,'synthetic',terminals=self.flow.terminals,
@@ -963,6 +979,62 @@ class ChatClaudeTest(unittest.TestCase):
     def records(self):
         folder = self.root / 'chat' / 'claude-sends'
         return sorted(folder.glob('*.json')) if folder.exists() else []
+
+    def control(self, command, value=None, request='control-0001'):
+        return self.chat.command({'source': CLAUDE_REF, 'command': command, 'value': value, 'requestId': request})
+
+    def test_model_command_uses_one_native_slash_without_prompt_send_or_automatic_enter(self):
+        self.terminal()
+        ready = '──────────\n❯ \n──────────\n  Sonnet · medium effort\n'
+        self.terms.screens = [ready, 'Set model to Opus\n' + ready.replace('Sonnet', 'Opus')]
+        result = self.control('model', 'opus')
+        self.assertEqual(result['status'], 'confirmed')
+        self.assertEqual(result['current'], {'model': 'opus'})
+        self.assertEqual(self.terms.pastes, [(TERMINAL_ID, '/model opus', True)])
+        self.assertEqual(self.terms.keys, [])
+        self.assertEqual(self.control('model', 'opus'), result)
+        self.assertEqual(len(self.terms.pastes), 1)
+        with self.assertRaisesRegex(ValueError, '같은'): self.control('model', 'sonnet')
+
+    def test_commands_refuse_menus_existing_input_busy_and_invalid_values(self):
+        self.terminal()
+        for screen in [CLAUDE_PERMISSION, '──────────\n❯ already typed\n──────────\n', 'loading...']:
+            self.terms.screen = screen
+            with self.assertRaises(ValueError): self.control('compact')
+        self.terms.screen = '──────────\n❯ \n──────────\n'
+        self.phase = 'working'
+        with self.assertRaisesRegex(ValueError, '끝난'): self.control('compact')
+        self.phase = 'idle'
+        for command, value in [('model', 'opus\n/clear'), ('effort', 'ultra'), ('compact', 'unexpected')]:
+            with self.assertRaises(ValueError): self.control(command, value)
+        self.assertEqual(self.terms.pastes, [])
+
+    def test_lost_compact_result_is_not_repeated_and_no_success_is_inferred(self):
+        self.terminal()
+        self.terms.screen = '──────────\n❯ \n──────────\n'
+        self.terms.paste_error = OSError('fixture response lost')
+        result = self.control('compact')
+        self.assertEqual(result['status'], 'unknown')
+        self.assertEqual(self.control('compact'), result)
+        self.assertEqual(len(self.terms.pastes), 1)
+        self.assertEqual(self.terms.keys, [])
+
+    def test_compact_gets_second_enter_only_when_that_exact_command_remains_typed(self):
+        self.terminal()
+        self.terms.screens = ['──────────\n❯ \n──────────\n', '──────────\n❯ /compact\n──────────\n']
+        with patch.object(chat, 'SUBMIT_CHECK_SECONDS', 0): result = self.control('compact')
+        self.assertTrue(result['resubmitted'])
+        self.assertEqual(self.terms.keys, [(TERMINAL_ID, ['Enter'])])
+        self.assertEqual(self.control('compact'), result)
+        self.assertEqual(len(self.terms.keys), 1)
+
+    def test_model_footer_does_not_take_values_from_transcript_or_typed_input(self):
+        before = 'Opus · max effort is an example\n──────────\n❯ Sonnet high effort\n──────────\n ready\n'
+        self.assertEqual(chat.terminal_model_settings(before), {})
+        footer = '──────────\n❯ \n──────────\n  Opus · high effort\n'
+        self.assertEqual(chat.terminal_model_settings(footer), {'model': 'opus', 'effort': 'high'})
+        self.terminal(); self.terms.screen = footer
+        self.assertEqual(self.chat.state({'source': CLAUDE_REF})['modelSettings'], {'model': 'opus', 'effort': 'high', 'observed': 'runtime'})
 
     def send(self, rid='request-0001', text='안녕하세요', **extra):
         return self.chat.send({'source': CLAUDE_REF, 'requestId': rid, 'text': text, **extra})

@@ -4884,7 +4884,8 @@ function updateChatComposer(entry) {
   $("chat-send").disabled = blocked || entry.composing || (!entry.text.trim() && !entry.attachments.length);
   // A listening mic always stays pressable, so a locked input can still end it.
   $("chat-mic").disabled = !dictationListening(input) && (input.disabled || input.readOnly || entry.composing);
-  if ($("chat-quick-inline")) $("chat-quick-inline").disabled = input.disabled || input.readOnly || entry.composing;
+  for (const id of ["chat-quick", "chat-quick-inline"])
+    if ($(id)) $(id).disabled = blocked || input.disabled || input.readOnly || entry.composing;
   renderDictation();
   $("chat-send").textContent = entry.sending ? "전송 중" : "보내기";
   $("chat-send").setAttribute("aria-label", "메시지 보내기");
@@ -5695,7 +5696,7 @@ async function uploadChatFiles(entry, files) {
   updateChatComposer(entry);
 }
 // ---------- 빠른 답장 ----------
-// Phrases put into the chat input from 도구 › 빠른 답장, never sent by themselves. This
+// Selecting a phrase inserts it in the draft and sends through the normal chat flow. This
 // browser keeps its own list (설정 › 빠른 답장); until it is edited, these defaults.
 const QUICK_REPLIES_DEFAULT = ["계속 진행해 줘.", "좋아, 그렇게 해 줘.", "테스트 돌리고 결과 알려 줘.",
   "커밋하고 푸시해 줘.", "지금까지 한 일을 짧게 정리해 줘."];
@@ -5726,6 +5727,18 @@ function saveQuickReplies(text) {
   return rows;
 }
 function openQuickReplies(entry, input, trigger) {
+  const ready = () => currentChat(entry) && input === $("chat-input") && !input.disabled && !input.readOnly &&
+    !networkOffline() && chatSupported(entry) && !entry.composing && !entry.sending && !entry.pending &&
+    !entry.uploads && !entry.commandBusy;
+  if (!ready()) return;
+  const choose = (text) => {
+    closeQuickReplies();
+    // The session, editor or send state may have changed while the choices were open.
+    if (!ready()) return;
+    insertChatText(entry, input, text);
+    if (document.activeElement !== input) input.focus?.({ preventScroll: true });
+    return sendChat(entry);
+  };
   const replies = quickReplies();
   const composer = touchDevice() && document.activeElement === input ? input.closest?.(".chat-composer") : null;
   if (composer) {
@@ -5735,18 +5748,15 @@ function openQuickReplies(entry, input, trigger) {
     const panel = el("div", "chat-quick-options");
     panel.id = "chat-quick-options";
     panel.setAttribute("role", "group");
-    panel.setAttribute("aria-label", "빠른 답장 · 입력창에 넣기, 보내지 않음");
+    panel.setAttribute("aria-label", "빠른 답장 · 문구를 선택하면 바로 전송");
     const add = (text, run) => {
       const item = button(text, "action-item", run);
-      item.addEventListener("pointerdown", (event) => event.preventDefault());
+      for (const type of ["pointerdown", "mousedown"])
+        item.addEventListener(type, (event) => event.preventDefault());
       panel.append(item);
       return item;
     };
-    for (const text of replies) add(text, () => {
-      closeQuickReplies();
-      insertChatText(entry, input, text);
-      if (currentChat(entry) && document.activeElement !== input) input.focus?.({ preventScroll: true });
-    });
+    for (const text of replies) add(text, () => choose(text));
     if (!replies.length) add("설정 › 빠른 답장에서 문구를 추가해 주세요", () => {}).disabled = true;
     add("닫기", closeQuickReplies);
     trigger?.setAttribute?.("aria-expanded", "true");
@@ -5758,9 +5768,9 @@ function openQuickReplies(entry, input, trigger) {
   }
   // Chosen or cancelled, the keyboard goes back to the input, not to the closed tools menu.
   trigger?.setAttribute?.("aria-haspopup", "dialog");
-  openActionSheet({ eyebrow: "입력창에 넣기 · 보내지 않음", title: "빠른 답장", trigger: input || trigger,
+  openActionSheet({ eyebrow: "문구를 선택하면 바로 전송", title: "빠른 답장", trigger: input || trigger,
     actions: replies.length
-      ? replies.map((text) => ({ label: text, run: () => { insertChatText(entry, input, text); input.focus?.({ preventScroll: true }); } }))
+      ? replies.map((text) => ({ label: text, run: () => choose(text) }))
       : [{ label: "설정 › 빠른 답장에서 문구를 추가해 주세요", disabled: true, run() {} }] });
 }
 function closeQuickReplies() {

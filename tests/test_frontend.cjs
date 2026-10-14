@@ -4241,7 +4241,7 @@ test('a mark the board refuses brings the dot back and waits a minute; a Claude 
   assert.deepEqual([body.source.id, body.source.sessionId, body.source.home], [conversation, conversation, '.claude']);
 });
 
-test('quick replies come from this browser\'s list (the defaults until edited) and are offered for the input, never sent', () => {
+test('quick replies come from this browser\'s list and opening or cancelling never sends', () => {
   const store = new Map();
   const c = client(undefined, noChatTimers);
   c.context.localStorage = { getItem: (key) => store.get(key) ?? null, setItem: (key, value) => store.set(key, value) };
@@ -4255,7 +4255,7 @@ test('quick replies come from this browser\'s list (the defaults until edited) a
   c.openQuickReplies(entry, input, null);
   const items = c.get('action-list').children;
   assert.deepEqual(items.slice(0, 2).map((item) => item.textContent), ['첫째 문구', '둘째 문구']);
-  assert.match(c.get('action-eyebrow').textContent, /보내지 않음/);
+  assert.match(c.get('action-eyebrow').textContent, /선택하면 바로 전송/);
   c.saveQuickReplies('');
   assert.equal(c.quickReplies().length, 0);
   c.openQuickReplies(entry, input, null);
@@ -4271,7 +4271,7 @@ test('집중 모드에서는 보내기 옆 빠른 답장 버튼이 같은 문구
   const quick = findId(composer, 'chat-quick-inline');
   assert.equal(quick.attributes['aria-label'], '빠른 답장');
   quick.events.click({ currentTarget: quick });
-  assert.match(c.get('action-eyebrow').textContent, /보내지 않음/);
+  assert.match(c.get('action-eyebrow').textContent, /선택하면 바로 전송/);
   assert.equal(c.get('action-list').children[0].textContent, c.quickReplies()[0]);
   c.closeActionSheet();
   // Shown only while the bars are folded (집중 모드), where 도구 › 빠른 답장 is out of sight.
@@ -10915,9 +10915,11 @@ test('an iPad terminal mic lets go of keyboard focus even after viewport baselin
   }
 });
 
-test('touch quick replies keep the input focus, insert without sending, and close on cancel or Escape', () => {
+test('touch quick replies keep the input focus, send once on selection, and never send on cancel or Escape', async () => {
   const requests = [];
-  const c = client(async (url) => { requests.push(url); return { ok: true, status: 200, json: async () => ({}) }; }, noChatTimers);
+  const c = client(async (url, options) => { requests.push({ url, body: options?.body && JSON.parse(options.body) });
+    return { ok: true, status: 200, json: async () => url === '/api/chat/state'
+      ? { route: entry.source, capability: { supported: true }, phase: 'idle' } : { status: 'accepted' } }; }, noChatTimers);
   c.context.window.matchMedia = (query) => ({ matches: query === '(pointer: coarse)' });
   const { entry } = selectChat(c); const input = c.get('chat-input');
   const composer = node(); composer.append = function (panel) { this.children.push(panel); panel.remove = () => { this.children = this.children.filter((item) => item !== panel); }; };
@@ -10926,15 +10928,109 @@ test('touch quick replies keep the input focus, insert without sending, and clos
   c.openQuickReplies(entry, input, trigger);
   const panel = c.state.quickRepliesOpen.panel;
   assert.notEqual(c.get('action-sheet').open, true); assert.equal(c.context.document.activeElement, input);
-  let prevented = false; panel.children[0].events.pointerdown({ preventDefault() { prevented = true; } });
-  assert.equal(prevented, true); panel.children[0].events.click();
+  assert.match(panel.attributes['aria-label'], /선택하면 바로 전송/);
+  for (const type of ['pointerdown', 'mousedown']) {
+    let prevented = false; panel.children[0].events[type]({ preventDefault() { prevented = true; } });
+    assert.equal(prevented, true);
+  }
+  const sending = panel.children[0].events.click();
+  panel.children[0].events.click();
   assert.equal(entry.text, c.quickReplies()[0]); assert.equal(focused, 0); assert.equal(composer.children.length, 0);
-  assert.ok(!requests.includes('/api/chat/send'));
+  assert.equal(requests.filter((r) => r.url === '/api/chat/send').length, 1);
+  assert.equal(requests.find((r) => r.url === '/api/chat/send').body.text, c.quickReplies()[0]);
+  assert.equal(c.get('chat-input').readOnly, true);
+  await sending;
+  assert.equal(entry.text, '');
   c.openQuickReplies(entry, input, trigger); c.state.quickRepliesOpen.panel.children.at(-1).events.click();
   assert.equal(c.state.quickRepliesOpen, null); assert.equal(focused, 0);
   c.openQuickReplies(entry, input, trigger);
   c.closeChatToolsEscape({ key: 'Escape', preventDefault() {} });
   assert.equal(c.state.quickRepliesOpen, null); assert.equal(focused, 0); assert.equal(trigger.attributes['aria-expanded'], 'false');
+  assert.equal(requests.filter((r) => r.url === '/api/chat/send').length, 1);
+});
+
+test('quick reply sheet sends the selected phrase with the existing draft, selection and attachments', async () => {
+  const requests = [];
+  const c = client(async (url, options) => {
+    requests.push({ url, body: options?.body && JSON.parse(options.body) });
+    return { ok: true, status: 200, json: async () => url === '/api/chat/state'
+      ? { route: entry.source, capability: { supported: true }, phase: 'idle' } : { status: 'accepted' } };
+  }, noChatTimers);
+  const { entry } = selectChat(c); const input = c.get('chat-input');
+  input.value = entry.text = '앞 삭제 뒤'; input.selectionStart = 2; input.selectionEnd = 4;
+  entry.attachments = [{ id: 'draft-file', name: 'example.txt', size: 3 }];
+  c.openQuickReplies(entry, input, null);
+  assert.equal(requests.length, 0);
+  const item = c.get('action-list').children[0];
+  item.events.click(); item.events.click();
+  await new Promise((resolve) => setImmediate(resolve));
+  const sends = requests.filter((r) => r.url === '/api/chat/send');
+  assert.equal(sends.length, 1);
+  assert.equal(sends[0].body.text, '앞 ' + c.quickReplies()[0] + ' 뒤');
+  assert.deepEqual(sends[0].body.attachments, ['draft-file']);
+  assert.deepEqual(sends[0].body.source, JSON.parse(JSON.stringify(entry.source)));
+  assert.equal(entry.text, ''); assert.equal(entry.attachments.length, 0);
+});
+
+test('quick replies reject blocked or replaced editors before opening and again before selecting', () => {
+  const blocks = {
+    offline: (c) => { c.context.navigator = { onLine: false }; },
+    unsupported: (c, entry) => { entry.data.capability.supported = false; },
+    composing: (c, entry) => { entry.composing = true; },
+    sending: (c, entry) => { entry.sending = true; },
+    pending: (c, entry) => { entry.pending = { requestId: 'existing-request' }; },
+    uploading: (c, entry) => { entry.uploads = 1; },
+    command: (c, entry) => { entry.commandBusy = true; },
+    disabled: (c, entry, input) => { input.disabled = true; },
+    readonly: (c, entry, input) => { input.readOnly = true; },
+    session: (c) => { selectChat(c, { id: 'another-session' }); },
+    editor: (c) => { c.context.document.createElement('textarea').id = 'chat-input'; },
+  };
+  for (const [reason, block] of Object.entries(blocks)) for (const opened of [false, true]) for (const touch of [false, true]) {
+    let sends = 0;
+    const c = client(async () => { sends++; throw new Error('blocked send'); }, noChatTimers);
+    const { entry } = selectChat(c); const input = c.get('chat-input');
+    input.value = entry.text = '보존할 초안';
+    if (touch) {
+      c.context.window.matchMedia = (query) => ({ matches: query === '(pointer: coarse)' });
+      const composer = node();
+      composer.append = function (panel) { this.children.push(panel); panel.remove = () => { this.children = this.children.filter((item) => item !== panel); }; };
+      input.closest = () => composer; c.context.document.activeElement = input;
+    }
+    if (opened) c.openQuickReplies(entry, input, null);
+    const item = opened && (touch ? c.state.quickRepliesOpen.panel.children[0] : c.get('action-list').children[0]);
+    block(c, entry, input);
+    if (opened) item.events.click(); else c.openQuickReplies(entry, input, null);
+    assert.equal(sends, 0, reason + ' blocks ' + (opened ? 'selection' : 'opening'));
+    assert.equal(entry.text, '보존할 초안', reason + ' preserves draft');
+    assert.equal(input.value, '보존할 초안');
+    if (!opened) assert.notEqual(c.get('action-sheet').open, true);
+  }
+});
+
+test('quick reply delivery uncertainty stays locked and a confirmed refusal preserves the inserted draft', async () => {
+  for (const status of ['unknown', 'failed']) {
+    const requests = [];
+    const c = client(async (url, options) => {
+      requests.push({ url, body: options?.body && JSON.parse(options.body) });
+      return { ok: true, status: 200, json: async () => url === '/api/chat/state'
+        ? { route: entry.source, capability: { supported: true }, phase: 'idle' }
+        : { status, receipt: status === 'failed' ? { dispatchState: 'not_started', reason: 'fixture refusal' } : {} } };
+    }, noChatTimers);
+    const { entry } = selectChat(c); const input = c.get('chat-input');
+    c.openQuickReplies(entry, input, null); c.get('action-list').children[0].events.click();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(entry.text, c.quickReplies()[0]);
+    assert.equal(entry.outbox[0].state, status === 'unknown' ? 'uncertain' : 'failed');
+    assert.equal(!!entry.pending, status === 'unknown');
+    if (status === 'unknown') {
+      c.openQuickReplies(entry, input, null);
+      assert.notEqual(c.get('action-sheet').open, true);
+      assert.equal(c.get('chat-quick').disabled, true);
+      assert.equal(c.get('chat-quick-inline').disabled, true);
+    } else assert.match(c.get('chat-status').textContent, /전송되지 않았습니다/);
+    assert.equal(requests.filter((r) => r.url === '/api/chat/send').length, 1);
+  }
 });
 
 test('header device chips include hardware-only devices with their actual status and no duplicates', () => {

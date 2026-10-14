@@ -2985,6 +2985,7 @@ function drawDetail(s) {
   pane.replaceChildren();
   pane.dataset.key = s.key;
   const head = el("div", "detail-head");
+  head.id = "detail-head";
   const back = button("←", "back", backToList);
   back.setAttribute("aria-label", "대화에서 돌아가기");
   head.append(back);
@@ -2994,6 +2995,9 @@ function drawDetail(s) {
     el("span", "detail-device", s.hostLabel || s.host || "기기 미확인"),
     el("span", "detail-project", s.project || ""),
   );
+  const modelSummary = el("span", "chat-model-summary", "모델·에포트 확인 중…");
+  modelSummary.id = "chat-model-summary";
+  titles.append(modelSummary);
   const settings = el("div", "chat-model-controls");
   for (const kind of ["model", "effort"]) {
     const control = button("확인 중…", "chat-model-control", () => openChatSettings(chatEntry(s), kind));
@@ -4239,6 +4243,13 @@ function updateModelControls(entry) {
   if (!currentChat(entry)) return;
   const settings = entry.data?.modelSettings || {};
   const next = settings.next || {};
+  const summary = $("chat-model-summary");
+  if (summary) {
+    const values = [settings.model || "모델 미확인", settings.effort || "에포트 미확인"];
+    const pending = ["model", "effort"].filter((kind) => next[kind] && next[kind] !== settings[kind]);
+    summary.textContent = values.join(" · ") + (pending.length ? ` · 다음 ${pending.map((kind) => next[kind]).join(" · ")}` : "");
+    summary.title = `현재 ${values.join(" · ")}${pending.length ? ` · 다음 웹 입력: ${pending.map((kind) => next[kind]).join(" · ")}` : ""}`;
+  }
   for (const kind of ["model", "effort"]) {
     const control = $(`chat-${kind}-control`);
     if (!control) continue;
@@ -4257,15 +4268,17 @@ function closeChatSettings() {
 }
 async function openChatSettings(entry, kind) {
   if (!currentChat(entry) || entry.commandBusy || entry.sending || entry.pending) return;
+  const control = $(`chat-${kind}-control`);
+  const parent = $("detail-head") || control?.parentElement;
+  if (!control || !parent) return;
   closeQuickReplies();
   closeChatSettings();
-  const parent = $(`chat-${kind}-control`)?.parentElement;
-  if (!parent) return;
+  // Slash commands must open a visible panel even when focus/typing folds the controls.
   const panel = el("div", "chat-settings-panel"); panel.id = "chat-settings-panel";
   panel.setAttribute("role", "group"); panel.setAttribute("aria-label", kind === "model" ? "모델 선택" : "에포트 레벨 선택");
   panel.append(el("p", "muted", "선택지를 확인하고 있습니다…"));
   parent.append(panel);
-  const control = $(`chat-${kind}-control`); control.setAttribute("aria-expanded", "true");
+  control.setAttribute("aria-expanded", "true");
   const close = () => { if ($("chat-settings-panel") === panel) closeChatSettings(); };
   const epoch = state.authEpoch;
   const draftRevision = entry.revision;
@@ -4649,7 +4662,7 @@ function sentDraftHidden(entry) {
 }
 function closeChatToolsOutside(event) {
   const settings = $("chat-settings-panel");
-  if (settings?.isConnected && !settings.parentElement?.contains?.(event.target)) closeChatSettings();
+  if (settings?.isConnected && !settings.contains?.(event.target) && !event.target?.closest?.(".chat-model-controls")) closeChatSettings();
   const quick = state.quickRepliesOpen;
   if (quick && !quick.panel.contains?.(event.target) && event.target !== quick.trigger) closeQuickReplies();
   for (const id of ["chat-tools", "terminal-settings", "board-status"]) {

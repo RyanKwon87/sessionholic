@@ -7092,6 +7092,7 @@ input.switch:focus-visible {
 #chat-effort-control::before { content: "에포트 "; color: var(--label-2); font-size: var(--fs-cap); }
 .chat-model-control:disabled { color: var(--label-2); cursor: default; }
 .chat-model-control[aria-expanded="true"] { border-color: var(--accent); background: var(--accent-tint); }
+.chat-model-selection-note { grid-column: 1 / -1; min-width: 0; color: var(--label-2); font-size: var(--fs-cap); line-height: 1.4; overflow-wrap: anywhere; }
 .chat-settings-panel {
   position: absolute;
   top: calc(100% + 8px); right: var(--detail-pad); z-index: 42;

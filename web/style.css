@@ -736,7 +736,7 @@ select:disabled {
 .board-status-heading span { color: var(--label-2); }
 .board-status-panel .hosts { flex-direction: column; gap: 4px; }
 .board-status-panel .host { width: 100%; min-width: 0; min-height: 44px; padding: 0 10px; border-radius: 10px; background: var(--fill-soft); box-shadow: none; }
-.board-status-panel .host::before, .board-status-panel .host::after { display: none; }
+.board-status-panel .host::before, .top-status .board-status-panel .host::after { display: none; }
 .board-status-panel .host-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; text-align: left; }
 .board-status-panel .host-connection { max-width: none; color: var(--label-2); font-size: var(--fs-cap); }
 .board-status-panel .host.bad .host-connection { color: var(--red); }

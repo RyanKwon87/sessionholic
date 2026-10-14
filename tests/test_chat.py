@@ -921,6 +921,8 @@ class FakeTerminals:
 class ChatClaudeTest(unittest.TestCase):
     """Claude input is typed by the board into its own attached terminal, never by the host RPC."""
     def setUp(self):
+        # The check for a message left in the input box waits no real time here.
+        submit = patch.object(chat, 'SUBMIT_CHECK_SECONDS', 0); submit.start(); self.addCleanup(submit.stop)
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
@@ -1141,6 +1143,22 @@ class ChatClaudeTest(unittest.TestCase):
         self.assertEqual(len(self.terms.pastes), 1)
         self.assertEqual(self.calls, [('chat', 'capabilities')])
 
+    def test_a_message_left_in_the_input_box_after_its_enter_gets_enter_once_more(self):
+        # Claude Code took the Enter after the paste as a newline: the message sits in the box.
+        self.kind('interactive')
+        self.terminal()
+        top, rule = '─' * 20 + ' plan ─', '─' * 40
+        typed = '\n'.join(['답변 끝', top, '❯ 이 내용 스킬 업데이트하고싶어.', '  제안해봐 어떻게 하면 좋을지.', '  ', rule, '  Opus'])
+        self.terms.screens = ['> ', typed]
+        result = self.send(text='이 내용 스킬 업데이트하고싶어. 제안해봐 어떻게 하면 좋을지.')
+        self.assertEqual(result['status'], 'accepted')
+        self.assertEqual(self.terms.keys, [(TERMINAL_ID, ['Enter'])])
+        self.assertTrue(json.loads(self.records()[0].read_text())['receipt']['resubmitted'])
+        # Sent (the box is empty again): nothing more is pressed.
+        self.terms.screens = ['> ', '\n'.join(['답변 끝', top, '❯ ', rule, '  Opus'])]
+        self.send(rid='request-0002', text='다음 메시지')
+        self.assertEqual(len(self.terms.keys), 1)
+
     def test_a_terminal_still_loading_from_an_earlier_send_is_waited_for_before_a_paste(self):
         self.terminal()
         self.chat.unsettled.add(TERMINAL_ID)
@@ -1328,7 +1346,7 @@ class ChatClaudeTest(unittest.TestCase):
         self.terms.screen = '● 작업을 마쳤습니다. 다음에 무엇을 할까요?\n\n> '
         self.assertEqual(self.send(text='다음 단계 진행해')['status'], 'accepted')
         self.assertEqual(self.terms.pastes, [(TERMINAL_ID, '다음 단계 진행해', True)])
-        self.assertEqual(self.terms.log[-2:], ['capture', 'paste'])
+        self.assertEqual(self.terms.log[-3:], ['capture', 'paste', 'capture'])
         # A numbered list in the answer above the input line is not a menu (the old regex
         # blocked any "> 1." on screen; only a menu ending the screen blocks now).
         self.terms.screen = ANSWER_WITH_LIST.replace('  1. 테스트', '> 1. 테스트')

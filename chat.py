@@ -126,6 +126,41 @@ def _screen_lines(screen):
     return lines
 
 
+# Claude Code may take the Enter that follows a paste as a newline in its input (seen now and
+# then): this long after the paste, a message still in the input box gets Enter once more.
+SUBMIT_CHECK_SECONDS = 0.8
+PASTED_PLACEHOLDER = re.compile(r'\[Pasted text #\d+')
+
+
+def input_text(screen):
+    """The text in Claude Code's input box: its prompt line (a box or rule right above it) and
+    the lines after it up to the rule below, or None when no input box shows at the end."""
+    raw = str(screen or '').replace('\r', '').split('\n')
+    rows = list(zip(raw, _screen_lines(screen)))[-INPUT_TAIL:]
+    for index in range(len(rows) - 1, 0, -1):
+        line = rows[index][1]
+        if line is None or not INPUT_PROMPT.match(line) or not BOX_LEAD.match(rows[index - 1][0]):
+            continue
+        parts = [INPUT_PROMPT.sub('', line, count=1)]
+        for _drawn, after in rows[index + 1:]:
+            if after is None:
+                return ' '.join(part.strip() for part in parts if part.strip())
+            parts.append(after)
+        return None
+    return None
+
+
+def still_typed(screen, body):
+    """Whether `body` still sits in the input box (as typed, or folded as pasted text)."""
+    text = input_text(screen)
+    if not text:
+        return False
+    if PASTED_PLACEHOLDER.search(text):
+        return True
+    shown, sent = re.sub(r'\s+', '', text), re.sub(r'\s+', '', body)
+    return bool(shown) and sent.startswith(shown[:24])
+
+
 def input_ready(screen):
     """Whether Claude Code's input line shows at the screen's end, with no menu open: a prompt
     between a box or rule line right above it ("───── title ─", "╭───╮", read as drawn) and a
@@ -985,6 +1020,20 @@ class Chat:
                 break
         return receipt
 
+    def _confirm_submit(self, terminal_id, body):
+        """The message still in Claude Code's input box a moment after its Enter (taken as a
+        newline): Enter once more. An empty input ignores Enter, so a message the first Enter
+        sent is not sent twice. Returns whether it pressed again."""
+        time.sleep(SUBMIT_CHECK_SECONDS)
+        try:
+            screen = self.workflow.terminals.capture(terminal_id)
+            if parse_menu(screen) or not still_typed(screen, body):
+                return False
+            self.workflow.terminals.send_keys(terminal_id, ['Enter'])
+        except (RuntimeError, ValueError, KeyError, OSError):
+            return False
+        return True
+
     def _send_claude(self, ref, source, host, request_id, text, ids, manifest):
         windows = host.get('platform') == 'windows'
         if windows and source.get('kind') == 'background':
@@ -1074,6 +1123,8 @@ class Chat:
                 receipt = {**base, 'delivery': 'accepted', 'confirmed': True, 'acknowledged': True,
                            'readbackConfirmed': False,
                            'reason': 'Claude 터미널에 입력했습니다. 대화 기록 반영은 아직 확인되지 않았습니다.'}
+                if self._confirm_submit(terminal['id'], body):
+                    receipt['resubmitted'] = True
             except InputNotSent as exc:
                 path.unlink(missing_ok=True)
                 raise SendRejected(str(exc), 409) from None

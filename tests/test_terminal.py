@@ -256,7 +256,7 @@ class ValidationTest(unittest.TestCase):
                                       "paste-buffer", "-p", "-d", "-b", buffer, "-t", name))
         self.assertEqual(first.kwargs, {"input": "한글 본문\n둘째 줄".encode()})
         self.assertEqual(enter.args, ("send-keys", "-t", name, "Enter"))
-        sleep.assert_called_once_with(0.15)
+        sleep.assert_called_once_with(0.3)
         self.assertEqual(draft.args[0], "load-buffer")
         self.assertNotEqual(draft.args[2], buffer)
         # tmux refused the paste: nothing reached the CLI, so no Enter either, and

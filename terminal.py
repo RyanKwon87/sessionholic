@@ -806,8 +806,9 @@ class TerminalManager:
                 self._run("delete-buffer", "-b", buffer)
                 raise InputNotSent("터미널에 붙여넣지 못했습니다.")
             if submit:
-                # Let the TUI finish its paste handling before the separate Enter key.
-                time.sleep(0.15)
+                # Let the TUI finish its paste handling before the separate Enter key (sooner, a
+                # TUI may take the Enter as part of the paste: a newline).
+                time.sleep(0.3)
                 done = self._run("send-keys", "-t", name, "Enter")
                 if done.returncode != 0:
                     raise RuntimeError("붙여넣은 뒤 Enter를 보내지 못했습니다.")

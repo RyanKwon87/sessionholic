@@ -627,6 +627,7 @@ function closeSheet(id, returnFocus = null) {
   if (returnFocus) $(returnFocus)?.focus?.({ preventScroll: true });
 }
 function openSettings() {
+  if ($("board-status")) $("board-status").open = false;
   applyTheme();
   applyTextSize();
   if ($("quick-replies")) $("quick-replies").value = quickReplies().join("\n");
@@ -678,6 +679,7 @@ function answerOnOpen(s) {
 // Other applications' caches and every stored preference stay.
 async function hardReload({ discard = false } = {}) {
   if (state.hardReloadBusy) return;
+  if ($("board-status")) $("board-status").open = false;
   if (networkOffline()) {
     // A cleared shell could not load again until the board is reachable.
     toast("오프라인이라 캐시를 지우지 않았습니다. 연결된 뒤 다시 눌러 주세요.");
@@ -690,7 +692,8 @@ async function hardReload({ discard = false } = {}) {
     return;
   }
   state.hardReloadBusy = true;
-  const buttons = [$("hard-reload"), $("quick-reload")].filter(Boolean);
+  const buttonIds = ["hard-reload", "quick-reload", "detail-reload"];
+  const buttons = buttonIds.map($).filter(Boolean);
   for (const button of buttons) button.disabled = true;
   try {
     const keys = (await globalThis.caches?.keys?.()) || [];
@@ -710,7 +713,7 @@ async function hardReload({ discard = false } = {}) {
   setTimeout(() => {
     state.hardReloadBusy = false;
     state.discardOnReload = false;
-    for (const button of buttons) button.disabled = false;
+    for (const id of buttonIds) { const button = $(id); if (button) button.disabled = false; }
   }, 3000);
   window.location.reload();
 }
@@ -1148,11 +1151,21 @@ function renderHosts(now) {
   }
   const hosts = all.map((host, index) => ({ host, index }))
     .sort((a, b) => HOST_ORDER[hostRank(a.host)] - HOST_ORDER[hostRank(b.host)] || a.index - b.index);
+  const connected = all.filter((host) => host.ok).length;
+  $("board-status-summary").textContent = `기기 ${all.length}`;
+  $("board-status-counts").textContent = `연결 ${connected}/${all.length}`;
+  const summary = $("board-status")?.querySelector?.("summary");
+  summary?.setAttribute("aria-label", `기기 ${all.length}대, 연결 ${connected}대 · 기기 연결과 사용량 보기`);
+  if (summary) {
+    summary.title = `기기 ${all.length}대 · 연결 ${connected}대`;
+    summary.dataset.tone = !all.length ? "unknown" : connected === all.length ? "ready" : connected ? "partial" : "offline";
+  }
   for (const { host } of hosts) {
     const chip = el("button", `host ${hostTone(host)}`);
     chip.type = "button";
     chip.dataset.host = host.name;
-    chip.append(el("span", "dot"), el("span", null, host.label));
+    chip.append(el("span", "dot"), el("span", "host-name", host.label),
+      el("span", "host-connection", host.refreshing ? "확인 중" : host.ok ? "연결됨" : "연결 안 됨"));
     const notes = [...hostNotes(host, "warnings"), ...hostNotes(host, "errors")];
     const problems = notes.length ? ` · ${notes[0]}${notes.length > 1 ? ` 외 ${notes.length - 1}건` : ""}` : "";
     chip.title = host.refreshing
@@ -2967,6 +2980,7 @@ async function loadDetail(s, fresh = false) {
 }
 
 function drawDetail(s) {
+  if ($("board-status")) $("board-status").open = false;
   const pane = $("detail");
   pane.replaceChildren();
   pane.dataset.key = s.key;
@@ -2985,6 +2999,9 @@ function drawDetail(s) {
     const control = button(kind === "model" ? "모델 확인 중…" : "에포트 확인 중…", "chat-model-control", () => openChatSettings(chatEntry(s), kind));
     control.id = `chat-${kind}-control`;
     control.setAttribute("aria-expanded", "false");
+    for (const type of ["pointerdown", "mousedown"]) control.addEventListener(type, (event) => {
+      if (touchDevice() && editingText()) event.preventDefault();
+    });
     settings.append(control);
   }
   titles.append(settings);
@@ -3002,6 +3019,15 @@ function drawDetail(s) {
   terminal.append(mark, goTerminal);
   titles.append(meta, terminal);
   head.append(titles);
+  const reload = button("↻", "detail-reload icon-button", hardReload);
+  reload.id = "detail-reload";
+  reload.title = "캐시 지우고 앱 새로고침";
+  reload.setAttribute("aria-label", "캐시 지우고 앱 새로고침");
+  reload.disabled = !!state.hardReloadBusy;
+  for (const type of ["pointerdown", "mousedown"]) reload.addEventListener(type, (event) => {
+    if (touchDevice() && editingText()) event.preventDefault();
+  });
+  head.append(reload);
   const focusToggle = button("집중 모드", "focus-toggle quiet", toggleChrome);
   focusToggle.id = "focus-toggle";
   // Keep the keyboard and compact header still until the click lands.
@@ -4214,7 +4240,10 @@ function updateModelControls(entry) {
     if (!control) continue;
     const actual = settings[kind], pending = next[kind] && next[kind] !== actual ? next[kind] : null;
     control.textContent = `${actual || (kind === "model" ? "모델 미확인" : "에포트 미확인")}${pending ? ` → ${pending}` : ""}`;
-    control.title = pending ? "화살표 뒤 값은 다음 웹 입력부터 적용됩니다." : settings.observed === "last_response" && kind === "model" ? "마지막 응답에서 확인한 모델" : kind === "model" ? "모델 선택" : "에포트 레벨 선택";
+    const label = kind === "model" ? "모델" : "에포트";
+    const explanation = pending ? "화살표 뒤 값은 다음 웹 입력부터 적용됩니다." : settings.observed === "last_response" && kind === "model" ? "마지막 응답에서 확인한 모델" : `${label} 선택`;
+    control.title = `${label}: ${control.textContent} · ${explanation}`;
+    control.setAttribute("aria-label", `${label}: ${control.textContent} · 선택하기`);
     control.disabled = !chatSupported(entry) || entry.sending || !!entry.pending || !!entry.commandBusy || networkOffline();
   }
 }
@@ -4619,9 +4648,9 @@ function closeChatToolsOutside(event) {
   if (settings?.isConnected && !settings.parentElement?.contains?.(event.target)) closeChatSettings();
   const quick = state.quickRepliesOpen;
   if (quick && !quick.panel.contains?.(event.target) && event.target !== quick.trigger) closeQuickReplies();
-  for (const id of ["chat-tools", "terminal-settings"]) {
+  for (const id of ["chat-tools", "terminal-settings", "board-status"]) {
     const tools = $(id);
-    if (tools?.open && !tools.contains(event.target)) tools.open = false;
+    if (tools?.open && !tools.contains?.(event.target)) tools.open = false;
   }
   // An open card swipe closes on any touch outside its row.
   const open = state.swipeOpen;
@@ -4636,10 +4665,10 @@ function closeChatToolsEscape(event) {
     if (document.activeElement !== input) input.focus?.({ preventScroll: true });
     event.preventDefault();
   }
-  for (const id of ["chat-tools", "terminal-settings"]) {
+  for (const id of ["chat-tools", "terminal-settings", "board-status"]) {
     const tools = $(id);
     if (!tools?.open) continue;
-    const restoreSummaryFocus = tools.contains(document.activeElement);
+    const restoreSummaryFocus = tools.contains?.(document.activeElement);
     tools.open = false;
     if (restoreSummaryFocus) tools.querySelector("summary")?.focus();
     event.preventDefault();
@@ -4692,6 +4721,9 @@ function documentKeydown(event) {
   }
   closeChatToolsEscape(event);
   if (event.defaultPrevented) return;
+  // Native details keeps Enter/Space/Tab; a device overview never routes keys to an
+  // underlying conversation's approval choices or the terminal beside it.
+  if ($("board-status")?.open) { noteHardwareKey(event); return; }
   if (terminalDocumentKey(event)) {
     noteHardwareKey(event);
     return;
@@ -7350,6 +7382,7 @@ function fitTerminal() {
   }, 180);
 }
 function showTerminalScreen(visible) {
+  if ($("board-status")) $("board-status").open = false;
   $("terminal-screen").hidden = !visible;
   applyDock();
 }
@@ -9407,6 +9440,7 @@ function bindPullToRefresh(root) {
   root.addEventListener("touchcancel", () => { start = null; distance = 0; if (!state.pullRefreshing) showPull(0); }, { passive: true });
 }
 function showLogin() {
+  if ($("board-status")) $("board-status").open = false;
   closeQuickReplies();
   beginAuthEpoch();
   state.pinnedLocal.clear();
@@ -9779,6 +9813,9 @@ window.addEventListener("DOMContentLoaded", () => {
   $("settings-done").addEventListener("click", closeSettings);
   $("hard-reload")?.addEventListener("click", hardReload);
   $("quick-reload")?.addEventListener("click", hardReload);
+  $("board-status-panel")?.addEventListener("click", (event) => {
+    if (event.target?.closest?.("button")) $("board-status").open = false;
+  });
   $("update-banner")?.addEventListener("click", updateBannerPressed);
   $("quick-replies")?.addEventListener("change", (event) => { event.target.value = saveQuickReplies(event.target.value).join("\n"); });
   $("settings-dialog").addEventListener("cancel", (event) => {

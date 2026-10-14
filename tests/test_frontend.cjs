@@ -1301,6 +1301,8 @@ test('상단 모델·에포트는 현재 값과 다음 입력 설정을 구분�
   assert.equal(c.get('chat-model-control').textContent, 'example-one → example-two');
   assert.equal(c.get('chat-effort-control').textContent, 'low → high');
   assert.ok(c.get('chat-model-control').title.includes('다음 웹 입력'));
+  assert.match(c.get('chat-model-control').title, /example-one → example-two/);
+  assert.match(c.get('chat-effort-control').attributes['aria-label'], /에포트: low → high/);
   entry.data.modelSettings = {};
   controls.updateModelControls(entry);
   assert.equal(c.get('chat-model-control').textContent, '모델 미확인');
@@ -4296,10 +4298,10 @@ test('기기 상태와 사용량은 목록이 아니라 맨 위 헤더의 기기
   const list = html.slice(html.indexOf('<aside id="task-list-pane"'), html.indexOf('</aside>'));
   for (const id of ['hosts', 'hardware', 'usage']) assert.ok(header.includes(`id="${id}"`), id + ' in the header');
   for (const id of ['hardware', 'usage']) assert.ok(!list.includes(`id="${id}"`), id + ' not in the list');
-  // Usage leads the scroller, then hardware: a phone shows them without scrolling.
+  // The same controls are reachable in the expanded device overview.
   assert.ok(header.indexOf('class="top-status"') < header.indexOf('id="usage"'));
   assert.ok(header.indexOf('id="usage"') < header.indexOf('id="hardware"'));
-  assert.ok(header.indexOf('id="hardware"') < header.indexOf('id="hosts"'));
+  assert.ok(header.indexOf('id="hosts"') < header.indexOf('id="hardware"'), 'the expanded panel leads with all devices');
   // A phone's header gives the brand label's room to them.
   const phone = cssBlock(fs.readFileSync(path.join(__dirname, '../web/style.css'), 'utf8'), '@media (max-width: 700px)');
   assert.equal(phone['display'], undefined);
@@ -7210,7 +7212,92 @@ test('the visible reload button confirms unsaved work and cannot clear twice whi
   c.warnDraftUnload({ preventDefault() { warned = true; } }); assert.equal(warned, true);
   const html = indexPage();
   assert.ok(html.indexOf('id="quick-reload"') > html.indexOf('<header class="top">'));
-  assert.ok(html.indexOf('id="quick-reload"') < html.indexOf('id="session-layout"'));
+  assert.ok(html.indexOf('id="quick-reload"') < html.indexOf('</header>'), 'refresh lives in the existing header');
+  assert.equal(html.includes('app-reload-bar'), false);
+});
+
+test('the device overview distinguishes four registered devices from three connected and retains the MacBook Pro row', () => {
+  const c = client(undefined, noChatTimers); const summary = node();
+  c.get('board-status').querySelector = () => summary;
+  c.state.snapshot = { hosts: ['board', 'notebook', 'workstation'].map((name) => ({ name, label: name, ok: true, fetchedAt: 100 })) };
+  c.state.hardware = { hosts: [{ name: 'board', label: 'Board host', status: 'ready' }, { name: 'pro-notebook', label: 'MacBook Pro', status: 'offline' }] };
+  vm.runInContext('renderHosts(101)', c.context);
+  assert.equal(c.get('board-status-summary').textContent, '기기 4');
+  assert.equal(c.get('board-status-counts').textContent, '연결 3/4');
+  assert.equal(summary.dataset.tone, 'partial'); assert.match(summary.attributes['aria-label'], /기기 4대, 연결 3대/);
+  const rows = c.get('hosts').children; assert.equal(rows.length, 4);
+  const pro = rows.find((row) => row.dataset.host === 'pro-notebook');
+  assert.equal(pro.children[1].textContent, 'MacBook Pro'); assert.equal(pro.children[2].textContent, '연결 안 됨');
+  c.state.hardware.hosts[1].status = 'ready'; vm.runInContext('renderHosts(102)', c.context);
+  assert.equal(c.get('board-status-counts').textContent, '연결 4/4'); assert.equal(summary.dataset.tone, 'ready');
+  c.state.snapshot.hosts = []; c.state.hardware.hosts = []; vm.runInContext('renderHosts(103)', c.context);
+  assert.equal(summary.dataset.tone, 'unknown'); assert.equal(c.get('board-status-counts').textContent, '연결 0/0');
+});
+
+test('the device panel closes outside, after an action and on Escape without stealing an IME Escape', async () => {
+  const c = client(undefined, noChatTimers); c.context.navigator = { onLine: false }; c.windowEvents.DOMContentLoaded();
+  const panel = c.get('board-status'); const summary = node(); const action = node(); action.closest = () => action;
+  panel.querySelector = () => summary; panel.contains = (target) => target === summary || target === action;
+  panel.open = true; c.closeChatToolsOutside({ target: action }); assert.equal(panel.open, true);
+  c.closeChatToolsOutside({ target: node() }); assert.equal(panel.open, false);
+  panel.open = true; c.context.document.activeElement = action;
+  let prevented = 0;
+  c.closeChatToolsEscape({ key: 'Escape', isComposing: true, preventDefault() { prevented++; } });
+  assert.equal(panel.open, true); assert.equal(prevented, 0);
+  c.closeChatToolsEscape({ key: 'Escape', keyCode: 229, preventDefault() { prevented++; } }); assert.equal(panel.open, true);
+  c.closeChatToolsEscape({ key: 'Escape', preventDefault() { prevented++; } });
+  assert.equal(panel.open, false); assert.equal(prevented, 1); assert.equal(summary.focusCount, 1);
+  panel.open = true; c.get('board-status-panel').events.click({ target: action }); assert.equal(panel.open, false);
+  const { s } = selectChat(c);
+  const approvals = c.get('chat-prompt'); approvals.hidden = false; let chosen = 0;
+  approvals.chooseNumber = () => { chosen++; return true; };
+  c.context.__approvalKey = { key: '1', target: summary, preventDefault() {} };
+  assert.equal(vm.runInContext('promptKeydown(__approvalKey)', c.context), true);
+  assert.equal(chosen, 1, 'the underlying approval shortcut is active before opening the menu');
+  chosen = 0; panel.open = true;
+  c.documentKeydown({ key: '1', target: summary, preventDefault() {} });
+  assert.equal(chosen, 0, 'device menu keys cannot answer an underlying chat approval');
+  panel.open = true; c.drawDetail(s); assert.equal(panel.open, false);
+  panel.open = true; await c.openTerminal({ id: 'overview-terminal', mode: 'attach' }); assert.equal(panel.open, false);
+  panel.open = true; c.showLogin(); assert.equal(panel.open, false);
+});
+
+test('refresh in the conversation header shares the same unsaved-draft protection and busy state', async () => {
+  let reloaded = 0, cleared = 0;
+  const c = client(undefined, noChatTimers); c.context.window.location = { reload() { reloaded++; } };
+  c.context.caches = { keys: async () => ['sessionholic-shell-fixture'], delete: async () => { cleared++; } };
+  const { s, entry } = selectChat(c); entry.text = 'keep my draft'; c.drawDetail(s);
+  c.context.window.matchMedia = (query) => ({ matches: query === '(pointer: coarse)' });
+  c.context.document.activeElement = c.get('chat-input');
+  for (const id of ['detail-reload', 'chat-model-control', 'chat-effort-control']) {
+    for (const type of ['pointerdown', 'mousedown']) {
+      let prevented = false;
+      c.get(id).events[type]({ preventDefault() { prevented = true; } });
+      assert.equal(prevented, true, `${id}: keep the keyboard from moving the target before click`);
+    }
+  }
+  const reload = c.get('detail-reload'); assert.match(reload.attributes['aria-label'], /캐시.*새로고침/);
+  await reload.events.click(); assert.equal(reloaded, 0); assert.equal(cleared, 0);
+  assert.equal(c.get('action-sheet').open, true); assert.equal(entry.text, 'keep my draft');
+  c.get('action-list').children[0].events.click({ detail: 0 }); assert.equal(entry.text, 'keep my draft');
+  await reload.events.click(); c.get('action-list').children[1].events.click({ detail: 0 });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(reloaded, 1); assert.equal(cleared, 1);
+  assert.equal(reload.disabled, true); assert.equal(c.get('quick-reload').disabled, true);
+});
+
+test('a conversation header replaced during cache clearing is released when the refresh wait ends', async () => {
+  const timers = []; let resume;
+  const c = client(undefined, { setTimeout(callback, ms) { timers.push({ callback, ms }); return timers.length; }, clearTimeout() {} });
+  c.context.window.location = { reload() {} };
+  c.context.caches = { keys: () => new Promise((resolve) => { resume = resolve; }), delete: async () => true };
+  const { s } = selectChat(c); c.drawDetail(s);
+  const first = c.get('detail-reload'); const pending = first.events.click();
+  c.drawDetail(s); const replacement = c.get('detail-reload');
+  assert.notEqual(replacement, first); assert.equal(replacement.disabled, true);
+  resume([]); await pending;
+  timers.filter((timer) => timer.ms === 3000).at(-1).callback();
+  assert.equal(replacement.disabled, false); assert.equal(c.get('quick-reload').disabled, false);
 });
 
 test('the installation meta names preferences, titles, history and attachment folders', () => {

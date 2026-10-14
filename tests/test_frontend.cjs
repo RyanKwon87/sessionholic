@@ -10133,3 +10133,29 @@ test('on an iPad a press within ten seconds of the last end waits it out, saying
     await settle();
   }
 });
+
+test('docked, a terminal whose conversation is not listed yet shows that, then its conversation once listed', async () => {
+  const { c } = dockClient(1180);
+  const { s } = selectChat(c);
+  c.render();
+  assert.equal(c.state.selected, s.key);
+  // A new session's terminal: the old conversation does not stay beside it.
+  await c.openTerminal({ id: 'fresh', mode: 'new-session', host: 'workstation' });
+  assert.equal(c.state.docked, true);
+  assert.equal(c.state.selected, null);
+  assert.match(textOf(c.get('detail')), /이 터미널의 대화는 아직 목록에 없습니다/);
+  // Listed (and linked) with a later snapshot: it takes its place.
+  const fresh = { host: 'workstation', agent: 'codex', home: '.codex-example', id: 'fresh-session',
+    key: ['workstation', 'codex', '.codex-example', 'fresh-session'].join('|') };
+  c.state.snapshot.hosts[0].data.codex.push(fresh);
+  c.state.terminal = { ...c.state.terminal, nativeSource: c.sourceOf(fresh) };
+  c.render();
+  assert.equal(c.state.selected, fresh.key);
+  assert.equal(c.state.terminalVisible, true, 'the terminal stays beside its own conversation');
+  // Covering (phones, upright iPads) is unchanged: the board keeps its selection.
+  c.returnToBoard({ selectLaunchedSource: false, animate: false });
+  c.context.window.innerWidth = 834;
+  await c.openTerminal({ id: 'other-fresh', mode: 'new-session', host: 'workstation' });
+  assert.equal(c.state.docked, false);
+  assert.equal(c.state.selected, fresh.key);
+});

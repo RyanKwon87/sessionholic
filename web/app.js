@@ -1051,6 +1051,7 @@ function render() {
     $("detail").append(welcome);
   }
   window.SessionholicGoals?.update?.(sessions);
+  if (!selected && followDockedTerminal()) return;
   if (selected) refreshDetail(selected);
   else if (state.selected) {
     state.selected = null;
@@ -6939,6 +6940,31 @@ function dockWidth({ preferred = state.terminalDock } = {}) {
 function boardCovered() {
   return state.terminalVisible && !state.docked;
 }
+// Beside a terminal whose conversation is not listed yet: no other conversation stays there.
+function showDockWaiting() {
+  if (state.selected) rememberConversationView();
+  stopChatPolling();
+  state.selected = null;
+  state.selectedBotRequest = null;
+  state.detailFor = null;
+  state.detailRevision = null;
+  state.detailRun++;
+  const waiting = el("div", "welcome dock-waiting");
+  waiting.append(el("span", "welcome-mark", "↗"), el("h2", null, "이 터미널의 대화는 아직 목록에 없습니다."),
+    el("p", null, "새 세션이면 첫 대화가 기록되는 대로 여기에 보입니다. 다른 대화는 목록에서 고르세요."));
+  $("detail").replaceChildren(waiting);
+  render();
+}
+// The docked terminal's conversation, once listed (a snapshot or the terminal list linked
+// it), takes its place beside it. Returns whether it did.
+function followDockedTerminal() {
+  if (!state.docked || !state.terminal || state.dockFollow !== state.terminal.id || state.selected) return false;
+  const beside = sessionForTerminal(state.terminal);
+  if (!beside) return false;
+  state.dockFollow = null;
+  select(beside.key);
+  return true;
+}
 // Docked, a key typed with nothing focused belongs to the side last touched.
 function boardKeysBlocked() {
   return state.terminalVisible && !(state.docked && state.dockSide === "board");
@@ -7141,9 +7167,12 @@ async function openTerminal(terminal, { recordHistory = true } = {}) {
   terminalError();
   renderTerminalReturn();
   $("terminal-reopen").hidden = true;
-  // Docked, the conversation beside it is the terminal's own.
+  // Docked, the conversation beside it is the terminal's own; one not listed yet (a new
+  // session) shows that it is coming, never another session's conversation.
   const beside = state.docked && sessionForTerminal(terminal);
-  if (beside && beside.key !== state.selected) {
+  state.dockFollow = state.docked && !beside ? terminal.id : null;
+  if (state.dockFollow) showDockWaiting();
+  else if (beside && beside.key !== state.selected) {
     // A launch opens its terminal while still busy; showing its conversation is part of it.
     const busy = state.launchBusy;
     state.launchBusy = false;
@@ -7400,6 +7429,7 @@ function returnToBoard({ selectLaunchedSource = true, animate = true, loadChat =
   state.inputEpoch++;
   state.terminalOpenRun++;
   const wasDocked = state.docked;
+  state.dockFollow = null;
   state.terminalVisible = false;
   renderConnectivity();
   if (animate && !wasDocked) navTransition("dismiss", () => showTerminalScreen(false));
@@ -7981,6 +8011,7 @@ async function refreshTerminals(authEpoch = state.authEpoch) {
     const current = state.terminals.find((t) => t.id === state.terminal?.id);
     if (current) {
       state.terminal = { ...state.terminal, ...current };
+      followDockedTerminal();
       if (current.closed || current.alive === false) {
         saveDraft();
         stopTerminalReader();

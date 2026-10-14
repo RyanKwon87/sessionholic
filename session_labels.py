@@ -258,7 +258,7 @@ class SessionTidied(SessionSeen):
 
 class SessionRemoved(SessionSeen):
     """When a session was removed from the list (목록에서 지우기). Unlike a tidy it stays away
-    after it changes again; only answering or working brings it back (the screen decides).
+    after it changes again; the screen includes it only when explicitly requested.
     Display only: the native session and its history stay as they are."""
     NAME, ROW_FIELD, SNAPSHOT_FIELD, CODE = 'session-removed', 'removedAt', 'sessionRemoved', 'session_removed'
     WHAT = '목록에서 지운 기록'

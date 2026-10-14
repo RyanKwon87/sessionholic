@@ -7267,6 +7267,15 @@ test('refresh in the conversation header shares the same unsaved-draft protectio
   const c = client(undefined, noChatTimers); c.context.window.location = { reload() { reloaded++; } };
   c.context.caches = { keys: async () => ['sessionholic-shell-fixture'], delete: async () => { cleared++; } };
   const { s, entry } = selectChat(c); entry.text = 'keep my draft'; c.drawDetail(s);
+  c.context.window.matchMedia = (query) => ({ matches: query === '(pointer: coarse)' });
+  c.context.document.activeElement = c.get('chat-input');
+  for (const id of ['detail-reload', 'chat-model-control', 'chat-effort-control']) {
+    for (const type of ['pointerdown', 'mousedown']) {
+      let prevented = false;
+      c.get(id).events[type]({ preventDefault() { prevented = true; } });
+      assert.equal(prevented, true, `${id}: keep the keyboard from moving the target before click`);
+    }
+  }
   const reload = c.get('detail-reload'); assert.match(reload.attributes['aria-label'], /캐시.*새로고침/);
   await reload.events.click(); assert.equal(reloaded, 0); assert.equal(cleared, 0);
   assert.equal(c.get('action-sheet').open, true); assert.equal(entry.text, 'keep my draft');

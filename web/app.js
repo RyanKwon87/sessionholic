@@ -2999,6 +2999,9 @@ function drawDetail(s) {
     const control = button(kind === "model" ? "모델 확인 중…" : "에포트 확인 중…", "chat-model-control", () => openChatSettings(chatEntry(s), kind));
     control.id = `chat-${kind}-control`;
     control.setAttribute("aria-expanded", "false");
+    for (const type of ["pointerdown", "mousedown"]) control.addEventListener(type, (event) => {
+      if (touchDevice() && editingText()) event.preventDefault();
+    });
     settings.append(control);
   }
   titles.append(settings);
@@ -3021,6 +3024,9 @@ function drawDetail(s) {
   reload.title = "캐시 지우고 앱 새로고침";
   reload.setAttribute("aria-label", "캐시 지우고 앱 새로고침");
   reload.disabled = !!state.hardReloadBusy;
+  for (const type of ["pointerdown", "mousedown"]) reload.addEventListener(type, (event) => {
+    if (touchDevice() && editingText()) event.preventDefault();
+  });
   head.append(reload);
   const focusToggle = button("집중 모드", "focus-toggle quiet", toggleChrome);
   focusToggle.id = "focus-toggle";

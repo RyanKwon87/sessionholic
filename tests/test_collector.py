@@ -213,6 +213,22 @@ class PhaseTest(unittest.TestCase):
 
 
 class MessageTest(unittest.TestCase):
+
+    def test_slack_envelope_is_removed_before_clipping_without_changing_real_text(self):
+        header = '[슬랙 요청]\n- 요청자: 테스트\n- 작업 번호: 1\n[처리 원칙] 내부 처리 지침\n'
+        request = '계획을 수정해 주세요.\n\n[요청]이라는 제목도 본문에 남겨 주세요.'
+        trailer = '\n\n[마무리 규칙] 최종 답변만 Slack에 올라간다. 내부 마무리 지침'
+        wrapped = header + '[첨부 파일] ' + '내부경로' * 2000 + '\n[요청]\n' + request + trailer
+        row = collector.text_row('user', wrapped, None)
+        self.assertEqual(row['text'], request)
+        self.assertNotIn('truncated', row)
+        self.assertEqual(collector.text_row('user', wrapped.replace('\n', '\r\n'), None)['text'], request.replace('\n', '\r\n'))
+        for text in ('[요청]\n실제 본문', header + '[요청]\n', '[슬랙 요청]\n[요청]\n일반 인용'):
+            self.assertEqual(collector.text_row('user', text, None)['text'], text)
+        self.assertTrue(collector.text_row('assistant', wrapped, None)['text'].startswith('[슬랙 요청]'))
+        long = header + '[요청]\n' + '요' * 4500 + trailer
+        self.assertTrue(collector.text_row('user', long, None)['text'].startswith('요' * 4000))
+
     def test_mixed_and_image_only_codex_history_keeps_evidence_without_content(self):
         image = {"type": "localImage", "path": "/example/private/image.png"}
         rows = collector.codex_messages([{"items": [

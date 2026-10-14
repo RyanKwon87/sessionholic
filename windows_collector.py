@@ -1102,7 +1102,19 @@ def _entries(lines):
     return entries
 
 
+def _bot_request_text(text):
+    """Unwrap a recognized Slack envelope before the bounded SSH response is clipped."""
+    match = re.match(r"\s*\[슬랙 요청\][ \t]*\r?\n([\s\S]*?)^\[요청\][ \t]*\r?\n([\s\S]*)", text, re.M)
+    if not match or not all(re.search(pattern, match[1], re.M) for pattern in
+                            (r"^- 요청자:", r"^- 작업 번호:", r"^\[처리 원칙\]")):
+        return text
+    body = re.split(r"^\[마무리 규칙\][ \t]*최종 답변만 Slack에 올라간다\.", match[2], maxsplit=1, flags=re.M)[0].strip()
+    return body or text
+
+
 def _message(role, text, ts=None, **metadata):
+    if role == 'user' and isinstance(text, str):
+        text = _bot_request_text(text)
     return {'role': role, 'text': _text(text), 'ts': _epoch(ts),
             **{key: value for key, value in metadata.items() if _metadata(value)}}
 

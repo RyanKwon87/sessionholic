@@ -108,9 +108,21 @@ def clip(text, limit=TEXT_LIMIT):
     return text if len(text) <= limit else text[:limit] + " …"
 
 
+def bot_request_text(text):
+    """Unwrap the recognized Slack envelope before clipping, preserving ordinary text."""
+    match = re.match(r"\s*\[슬랙 요청\][ \t]*\r?\n([\s\S]*?)^\[요청\][ \t]*\r?\n([\s\S]*)", text, re.M)
+    if not match or not all(re.search(pattern, match[1], re.M) for pattern in
+                            (r"^- 요청자:", r"^- 작업 번호:", r"^\[처리 원칙\]")):
+        return text
+    body = re.split(r"^\[마무리 규칙\][ \t]*최종 답변만 Slack에 올라간다\.", match[2], maxsplit=1, flags=re.M)[0].strip()
+    return body or text
+
+
 def text_row(role, text, ts):
     """A clipped message row; only cut rows carry `truncated` and the original `fullLength`."""
     text = str(text or "")
+    if role == "user":
+        text = bot_request_text(text)
     row = {"role": role, "text": clip(text), "ts": ts}
     if len(text) > TEXT_LIMIT:
         row.update(truncated=True, fullLength=len(text))

@@ -673,17 +673,25 @@ function openRequestedSession() {
 function answerOnOpen(s) {
   state.answerOnOpen = { key: s.key, until: Date.now() + 30000 };
 }
-// 설정 › 캐시 지우고 새로고침: this board's shell caches go, and a worker that receives no
+// 상단 / 설정 › 캐시 지우고 새로고침: this board's shell caches go, and a worker that receives no
 // notifications is unregistered (one that does keeps its subscription and only updates).
 // Other applications' caches and every stored preference stay.
-async function hardReload() {
-  const button = $("hard-reload");
+async function hardReload({ discard = false } = {}) {
+  if (state.hardReloadBusy) return;
   if (networkOffline()) {
     // A cleared shell could not load again until the board is reachable.
     toast("오프라인이라 캐시를 지우지 않았습니다. 연결된 뒤 다시 눌러 주세요.");
     return;
   }
-  if (button) button.disabled = true;
+  if (!discard && unsavedWork()) {
+    openActionSheet({ title: "새로고침할까요?", preview: "보내지 않은 초안·첨부와 아직 확인 중인 입력이 있습니다. 새로고침하면 이 화면의 초안은 사라집니다. 대화 기록과 실행 중인 세션은 유지됩니다.",
+      actions: [{ label: "돌아가기", run: () => {} }, { label: "초안을 버리고 새로고침", danger: true, run: () => hardReload({ discard: true }) }],
+      trigger: document.activeElement });
+    return;
+  }
+  state.hardReloadBusy = true;
+  const buttons = [$("hard-reload"), $("quick-reload")].filter(Boolean);
+  for (const button of buttons) button.disabled = true;
   try {
     const keys = (await globalThis.caches?.keys?.()) || [];
     await Promise.all(keys.filter((key) => typeof key === "string" && key.startsWith(INSTANCE.cachePrefix))
@@ -697,9 +705,14 @@ async function hardReload() {
   } catch {
     // Reload anyway: the fresh page reads everything from the board again.
   }
-  window.location.reload();
+  state.discardOnReload = discard;
   // Still here (a draft's leave prompt was declined): the button works again.
-  setTimeout(() => { if (button) button.disabled = false; }, 3000);
+  setTimeout(() => {
+    state.hardReloadBusy = false;
+    state.discardOnReload = false;
+    for (const button of buttons) button.disabled = false;
+  }, 3000);
+  window.location.reload();
 }
 function closeSettings() {
   if (!$("settings-dialog").open) return;
@@ -3646,17 +3659,21 @@ const DICTATION_LANG = "ko-KR";
 const DICTATION_PREPARING = "마이크 준비 중…";
 const DICTATION_LISTENING = "듣는 중 · 끝내려면 마이크를 다시 누르세요";
 const DICTATION_ENDING = "받아쓴 글을 마무리하고 있습니다…";
-// iPadOS (WebKit) gives a listening started within about ten seconds of the last one's end no
-// sound: it starts and hears nothing (traced on an iPad: pressed 1-8 s after an end, nothing
-// heard; 11.6 s and later, heard at once). There a press waits out the rest, saying so.
+// iPad traces include rapid restarts that start but hear nothing. Leave a recovery interval
+// after an actual recognition ends; cancelling a wait never renews it. This is a mitigation,
+// not a guarantee that WebKit will return results (later starts have also stalled).
 const DICTATION_COOLDOWN_MS = 12000;
 const DICTATION_WAITING = "마이크 준비 중… iPad가 앞의 받아쓰기를 정리하고 있습니다 ·";
+function webkitTouchDictation() {
+  const agent = String(globalThis.navigator?.userAgent || "");
+  return (touchDevice() || (globalThis.navigator?.maxTouchPoints || 0) > 0)
+    && /AppleWebKit/.test(agent) && /Macintosh|iPad|iPhone|iPod/.test(agent) && !/Android/i.test(agent);
+}
 function dictationWaitingText(ms) {
   return `${DICTATION_WAITING} ${Math.max(1, Math.ceil(ms / 1000))}초 뒤 듣기 시작`;
 }
 function dictationCooldown() {
-  const agent = String(globalThis.navigator?.userAgent || "");
-  if (!touchDevice() || !/AppleWebKit/.test(agent) || /Android/i.test(agent)) return 0;
+  if (!webkitTouchDictation()) return 0;
   return Math.max(0, (state.dictationEndedAt || 0) + DICTATION_COOLDOWN_MS - Date.now());
 }
 // The status words that last only while a listening runs (the field's own note clears them).
@@ -3733,15 +3750,20 @@ function dictationCumulative() {
 function dictationListening(field) {
   return !!state.dictation && (!field || state.dictation.field === field);
 }
-// The label stays "음성 입력"; aria-pressed says whether it listens.
+// A pending restart is distinct from listening; another press cancels it.
 function renderDictation() {
   const supported = !!speechRecognitionClass();
   for (const [id, fieldId] of [["chat-mic", "chat-input"], ["draft-mic", "terminal-draft"]]) {
     const node = $(id);
     if (!node) continue;
     const listening = !!state.dictation && state.dictation.field === $(fieldId);
+    const waiting = listening && state.dictation.waiting;
+    const label = waiting ? `${Math.max(1, Math.ceil((state.dictation.waitUntil - Date.now()) / 1000))}초 뒤 음성 입력 · 눌러 취소`
+      : listening ? state.dictation.stopping ? "음성 입력 마무리 · 눌러 즉시 중지" : "음성 입력 중지" : "음성 입력";
     node.hidden = !supported;
     node.setAttribute("aria-pressed", String(listening));
+    node.setAttribute("aria-label", label);
+    node.title = label;
     setClass(node, "is-listening", listening);
   }
 }
@@ -3778,6 +3800,12 @@ function sendDictationTrace(session, outcome) {
       body: { env: trace.env, outcome: dictationReportCode(outcome), events: trace.events } }).catch(() => {});
   }, DICTATION_TRACE_DELAY_MS);
 }
+function dictationInputState(field) {
+  const selected = selectedSession();
+  const composing = field === $("terminal-draft") ? state.composing
+    : selected && field === $("chat-input") ? chatEntry(selected).composing : false;
+  return { disabled: !!field?.disabled, readOnly: !!field?.readOnly, composing: !!composing };
+}
 // report(text): the field's own status line ("" clears what this said); active(): whether
 // the field is still the one on screen.
 function startDictation(field, { report, active, releaseKeyboard = false }) {
@@ -3789,10 +3817,11 @@ function startDictation(field, { report, active, releaseKeyboard = false }) {
   // commit again a focused field's text they did not type, which reads as the user's own
   // typing, and iPadOS gives the recognition no sound while its on-screen keyboard is up (it
   // starts, and hears nothing). So the chat input's keyboard lets go while it listens. The
-  // terminal's input line lets go only of an on-screen keyboard: with a hardware keyboard,
-  // keys typed with nothing focused would go straight to the CLI. It lets go before the field
-  // is read: letting go may write the words it held once more.
-  const letGo = touchDevice() && focusedAtPress && (releaseKeyboard || keyboardOpen());
+  // terminal's input line does too on WebKit, even if a keyboard animation lost its height
+  // baseline; elsewhere it only lets go of an on-screen keyboard. Focusless hardware keys
+  // never go to the CLI while that line listens. Let go before reading the field: a keyboard
+  // may write the words it held once more.
+  const letGo = focusedAtPress && (webkitTouchDictation() || (touchDevice() && (releaseKeyboard || keyboardOpen())));
   const valueAtPress = String(field.value || "").length;
   if (letGo) field.blur?.();
   let recognition;
@@ -3816,10 +3845,11 @@ function startDictation(field, { report, active, releaseKeyboard = false }) {
       api: globalThis.SpeechRecognition ? "standard" : "webkit", field: String(field.id || ""),
       standalone: !!window.matchMedia?.("(display-mode: standalone)")?.matches, touch: touchDevice(),
       cumulative: dictationCumulative(), visibility: String(document.visibilityState || ""),
-      focused: focusedAtPress, letGo, pressValue: valueAtPress, value: value.length, start, end } } };
+      focused: focusedAtPress, letGo, pressValue: valueAtPress, value: value.length, start, end,
+      ...dictationInputState(field) } } };
   session.report = (text) => {
-    dictationTrace(session, "say", { why: dictationReportCode(text) });
     report(text);
+    dictationTrace(session, "say", { why: dictationReportCode(text), ...dictationInputState(field) });
   };
   // A recognition whose listening already ended (aborted before the platform started it) does
   // not keep the microphone: its first sign of life stops it.
@@ -3893,7 +3923,7 @@ function startDictation(field, { report, active, releaseKeyboard = false }) {
     if (state.dictation === session) session.error = String(event?.error || "unknown");
   };
   recognition.onend = () => {
-    state.dictationEndedAt = Date.now();
+    if (session.invoked) state.dictationEndedAt = Date.now();
     dictationTrace(session, "end", { cur: state.dictation === session, heard: session.heard, idle: session.idle });
     if (state.dictation === session && dictationResumable(session)) {
       // What it wrote stays; the next round's words follow it.
@@ -3926,6 +3956,7 @@ function startDictation(field, { report, active, releaseKeyboard = false }) {
     }
     if (session.waiting) {
       session.report(dictationWaitingText(session.waitUntil - Date.now()));
+      renderDictation();
       return;
     }
     session.ticks++;
@@ -3938,10 +3969,25 @@ function startDictation(field, { report, active, releaseKeyboard = false }) {
   }, 1000);
   dictationTrace(session, "press");
   const begin = () => {
+    if (state.dictation !== session) return false;
+    // A cooldown leaves time to focus the field again, switch conversations, or lock input.
+    // Check at the actual start too, rather than carrying the press's conditions forward.
+    if (!session.active() || field.disabled || field.readOnly) {
+      dictationTrace(session, "unavailable", { disabled: !!field.disabled, readOnly: !!field.readOnly });
+      stopDictation({ abort: true });
+      return false;
+    }
+    if (session.waitUntil && document.activeElement === field && (webkitTouchDictation() || (touchDevice() && (releaseKeyboard || keyboardOpen())))) {
+      field.blur?.();
+      dictationTrace(session, "release");
+    }
+    dictationTrace(session, "begin", { focused: document.activeElement === field, ...dictationInputState(field) });
     try {
+      session.invoked = true;
       recognition.start();
       return true;
     } catch {
+      session.invoked = false;
       dictationTrace(session, "error", { code: "start-threw" });
       session.error = "start";
       finishDictation(session);
@@ -4026,12 +4072,11 @@ function stopDictation({ abort = false, field = null, message = "" } = {}) {
   const session = state.dictation;
   if (!session || (field && session.field !== field)) return;
   // Still waiting to start: nothing to finish, it just does not start.
-  if (session.waiting) abort = true;
-  if (!abort && session.stopping) return;
+  if (session.waiting || session.stopping) abort = true;
   dictationTrace(session, "stop", { abort, why: dictationReportCode(message) });
   if (!abort && !session.stopping) {
     session.stopping = true;
-    // Its last words may still come; a press now would not be taken.
+    // Its last words may still come; a second press aborts without waiting for the engine.
     session.report(DICTATION_ENDING);
     session.stopTimer = setTimeout(() => {
       if (state.dictation === session) stopDictation({ abort: true, message: !session.active() ? ""
@@ -4049,6 +4094,8 @@ function stopDictation({ abort = false, field = null, message = "" } = {}) {
   clearInterval(session.timer);
   clearTimeout(session.stopTimer);
   clearTimeout(session.waitTimer);
+  // Some engines never send end after abort; still allow their audio session to unwind.
+  if (session.invoked) state.dictationEndedAt = Date.now();
   try {
     session.recognition.abort();
   } catch {
@@ -6428,6 +6475,12 @@ function backToList() {
   else setDetailShown(false, { direction: "pop", focus: true });
 }
 function backFromTerminal() {
+  // Opening beside the board replaces its history entry; a fresh page has no entry to go
+  // back to. Hiding that pane is local and keeps the conversation and run available.
+  if (state.docked) {
+    undock();
+    return;
+  }
   if (
     window.history.state?.[INSTANCE.historyKey] &&
     window.history.state.view === "terminal"
@@ -7419,6 +7472,8 @@ function releaseBoardFocus() {
 // The terminal steps aside for the board, and its history entry gives way to the board's.
 // The conversation beside it was already reading: no second read.
 function undock() {
+  const active = document.activeElement;
+  if (active?.closest?.("#terminal-screen")) active.blur?.();
   returnToBoard({ selectLaunchedSource: false, animate: false, loadChat: false });
   if (window.history.state?.[INSTANCE.historyKey] && window.history.state.view === "terminal") navigateView("list", true);
 }
@@ -8262,7 +8317,7 @@ function draftBeforeInput(event) {
 // A focused control keeps its keys, and Tab moves the focus as on any page.
 function terminalDocumentKey(event) {
   if (!state.terminalVisible || (state.docked && state.dockSide !== "terminal") || event.defaultPrevented ||
-      editingText()) return false;
+      editingText() || dictationListening($("terminal-draft"))) return false;
   const active = document.activeElement;
   if ((active && active !== document.body && active !== document.documentElement) || event.key === "Tab") {
     // Not for the CLI: a held bar modifier must not wait for a later key either.
@@ -8786,7 +8841,7 @@ function chooseTerminalMenu(key) {
   sendInput(`${key}\r`).catch(() => {});
 }
 
-function closeTerminal(id, { thenRemove = null } = {}) {
+function closeTerminal(id, { thenRemove = null, trigger = null } = {}) {
   if (state.terminalCloseBusy) return;
   if ($("close-terminal-dialog").open) {
     $("close-terminal-cancel").focus();
@@ -8796,7 +8851,9 @@ function closeTerminal(id, { thenRemove = null } = {}) {
     (state.terminal?.id === id ? state.terminal : null);
   if (!terminal) return;
   const copy = terminalCloseCopy(terminal);
-  state.closingTerminal = { ...terminal, id, title: terminalTitle(terminal), copy, trigger: document.activeElement, thenRemove };
+  state.closingTerminal = { ...terminal, id, title: terminalTitle(terminal), copy, trigger: trigger || document.activeElement, thenRemove };
+  stopDictation({ abort: true });
+  if (editingText()) document.activeElement.blur?.();
   $("close-terminal-title").textContent = copy.title;
   $("close-terminal-description").textContent = copy.description;
   $("close-terminal-name").textContent = state.closingTerminal.title;
@@ -9498,10 +9555,12 @@ function renderKeyboardRoom() {
 }
 // iOS scrolls the page to show a focused field above its keyboard before the app shrinks to
 // the space left (--app-height): the app then sits above what is on screen, which is blank
-// unless scrolled back. While an on-screen keyboard is up the app follows the visible area.
+// unless scrolled back. Both panes follow the visible area, including the interval after
+// focus leaves a field but Safari has not yet restored the viewport's scroll position.
 function renderAppShift() {
   const viewport = window.visualViewport;
-  const top = viewport && touchDevice() && editingText() && keyboardOpen()
+  const following = (editingText() && keyboardOpen()) || (state.appShift || 0) > 0;
+  const top = viewport && touchDevice() && (viewport.scale || 1) <= 1.01 && following
     ? Math.max(0, Math.round(viewport.pageTop ?? ((window.scrollY || 0) + (viewport.offsetTop || 0)))) : 0;
   if (top === (state.appShift || 0)) return;
   state.appShift = top;
@@ -9649,7 +9708,7 @@ function unsavedWork() {
     [...state.chats.values()].some((entry) => entry.text || entry.attachments.length || entry.pending || entry.uploads);
 }
 function warnDraftUnload(event) {
-  if (!unsavedWork()) return;
+  if (!unsavedWork() || state.discardOnReload) return;
   event.preventDefault();
   event.returnValue = "";
 }
@@ -9719,6 +9778,7 @@ window.addEventListener("DOMContentLoaded", () => {
   $("settings-close").addEventListener("click", closeSettings);
   $("settings-done").addEventListener("click", closeSettings);
   $("hard-reload")?.addEventListener("click", hardReload);
+  $("quick-reload")?.addEventListener("click", hardReload);
   $("update-banner")?.addEventListener("click", updateBannerPressed);
   $("quick-replies")?.addEventListener("change", (event) => { event.target.value = saveQuickReplies(event.target.value).join("\n"); });
   $("settings-dialog").addEventListener("cancel", (event) => {
@@ -9852,6 +9912,12 @@ window.addEventListener("DOMContentLoaded", () => {
   });
   $("terminal-back").addEventListener("click", backFromTerminal);
   $("terminal-dock").addEventListener("click", toggleDock);
+  // iPad can scroll/shrink both panes between press and click when focus leaves an input.
+  // Keep the hit target in place until its click decides where the focus should go.
+  for (const id of ["terminal-back", "terminal-dock", "terminal-close"])
+    for (const type of ["pointerdown", "mousedown"]) $(id).addEventListener(type, (event) => {
+      if (touchDevice() && editingText()) event.preventDefault();
+    });
   for (const [id, side] of [["app", "board"], ["terminal-screen", "terminal"]])
     for (const type of ["pointerdown", "focusin"]) $(id).addEventListener(type, () => {
       noteDockSide(side);
@@ -9859,7 +9925,7 @@ window.addEventListener("DOMContentLoaded", () => {
       if (type === "focusin" && renderKeyboardRoom()) fitTerminal();
     });
   $("terminal-close").addEventListener("click", () => {
-    if (state.terminal) closeTerminal(state.terminal.id);
+    if (state.terminal) closeTerminal(state.terminal.id, { trigger: $("terminal-close") });
   });
   $("close-terminal-confirm").addEventListener("click", confirmTerminalClose);
   $("close-terminal-cancel").addEventListener("click", cancelTerminalClose);

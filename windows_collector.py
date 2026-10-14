@@ -1108,15 +1108,22 @@ def _bot_request_text(text):
     if not match or not all(re.search(pattern, match[1], re.M) for pattern in
                             (r"^- 요청자:", r"^- 작업 번호:", r"^\[처리 원칙\]")):
         return text
-    body = re.split(r"^\[마무리 규칙\][ \t]*최종 답변만 Slack에 올라간다\.", match[2], maxsplit=1, flags=re.M)[0].strip()
-    return body or text
+    rest = match[2]
+    trailers = list(re.finditer(r"^\[마무리 규칙\][ \t]*(?:\r?\n[ \t]*)?최종 답변만 Slack에 올라간다\.", rest, re.M))
+    body = rest[:trailers[-1].start()] if trailers else rest
+    body = re.sub(r"\A(?:[ \t]*\r?\n)+", "", body)
+    body = re.sub(r"(?:\r?\n[ \t]*)+\Z", "", body)
+    return body if body.strip() else text
 
 
 def _message(role, text, ts=None, **metadata):
     if role == 'user' and isinstance(text, str):
         text = _bot_request_text(text)
-    return {'role': role, 'text': _text(text), 'ts': _epoch(ts),
-            **{key: value for key, value in metadata.items() if _metadata(value)}}
+    row = {'role': role, 'text': _text(text), 'ts': _epoch(ts),
+           **{key: value for key, value in metadata.items() if _metadata(value)}}
+    if isinstance(text, str) and len(text) > 4000:
+        row.update(truncated=True, fullLength=len(text))
+    return row
 
 
 def _codex_messages(turns):

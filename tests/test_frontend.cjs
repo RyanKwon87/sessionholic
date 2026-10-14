@@ -10970,3 +10970,55 @@ test('bot conversations show chat only, keep original records and preserve ordin
   s.originator = 'terminal'; s.source = 'cli'; c.renderMessages(s, messages);
   assert.equal(list.conversationRows.length, 4, 'ordinary sessions retain execution details');
 });
+
+
+test('folded header keeps observed model settings and slash selectors open outside folded controls', async () => {
+  const calls = [];
+  const c = client(async (url, options) => {
+    calls.push([url, options]);
+    return { ok: true, status: 200, json: async () => ({ current: { model: 'example-one', effort: 'low' },
+      next: { model: 'example-two', effort: 'high' }, models: [{ model: 'example-two', label: 'Example two', efforts: ['low', 'high'] }] }) };
+  }, noChatTimers);
+  const { s, entry } = selectChat(c); c.drawDetail(s);
+  const controls = c.get('chat-model-control').parentElement = node(); controls.hidden = true;
+  entry.data.modelSettings = { model: 'example-one', effort: 'low', next: { model: 'example-two', effort: 'high' } };
+  c.context.__entry = entry;
+  vm.runInContext('updateModelControls(__entry)', c.context);
+  assert.equal(c.get('chat-model-summary').textContent, 'example-one · low · 다음 example-two · high');
+  assert.match(c.get('chat-model-summary').title, /현재 example-one.*다음 웹 입력: example-two/);
+  for (const kind of ['model', 'effort']) {
+    entry.text = `/${kind}`;
+    await c.sendChat(entry);
+    await new Promise((resolve) => setImmediate(resolve));
+    const panel = c.get('chat-settings-panel');
+    assert.ok(c.get('detail-head').children.includes(panel), 'panel lives outside the folded model row');
+    assert.ok(!controls.children.includes(panel));
+    assert.equal(panel.attributes['aria-label'], kind === 'model' ? '모델 선택' : '에포트 레벨 선택');
+    assert.equal(c.get('chat-setting-choice').value, kind === 'model' ? 'example-two' : 'high');
+    assert.equal(entry.text, `/${kind}`, 'opening a selector does not send or discard the draft');
+  }
+  assert.ok(calls.every(([url, options]) => url === '/api/chat/command' && JSON.parse(options.body).command === 'models'));
+  entry.data.modelSettings = {}; vm.runInContext('updateModelControls(__entry)', c.context);
+  assert.equal(c.get('chat-model-summary').textContent, '모델 미확인 · 에포트 미확인');
+});
+
+
+test('header settings dismiss from title taps and cannot open without their current control', async () => {
+  const c = client(undefined, noChatTimers); const { s, entry } = selectChat(c); c.drawDetail(s);
+  const panel = node(), inside = node(), title = node(), control = node();
+  panel.isConnected = true; panel.parentElement = c.get('detail-head');
+  panel.parentElement.contains = () => true;
+  panel.contains = (target) => target === inside;
+  let removed = 0; panel.remove = () => { removed++; panel.isConnected = false; };
+  c.nodes.set('chat-settings-panel', panel);
+  c.closeChatToolsOutside({ target: inside }); assert.equal(removed, 0);
+  control.closest = (selector) => selector === '.chat-model-controls' ? control : null;
+  c.closeChatToolsOutside({ target: control }); assert.equal(removed, 0);
+  c.closeChatToolsOutside({ target: title }); assert.equal(removed, 1, 'a title tap is outside the popup even inside its header');
+  let calls = 0; c.context.fetch = () => { calls++; throw new Error('must not request a catalog'); };
+  const get = c.context.document.getElementById;
+  c.context.document.getElementById = (id) => id === 'chat-model-control' ? null : get(id);
+  c.context.__entry = entry; const before = c.get('detail-head').children.length;
+  await vm.runInContext('openChatSettings(__entry, "model")', c.context);
+  assert.equal(c.get('detail-head').children.length, before); assert.equal(calls, 0);
+});

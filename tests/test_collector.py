@@ -214,6 +214,26 @@ class PhaseTest(unittest.TestCase):
 
 class MessageTest(unittest.TestCase):
 
+    def test_slack_request_preserves_quoted_trailer_indentation_and_body_length(self):
+        header = '[슬랙 요청]\n- 요청자: 테스트\n- 작업 번호: 1\n[처리 원칙] 지침\n[요청]\n'
+        quoted = '[마무리 규칙] 최종 답변만 Slack에 올라간다. 인용된 예전 문구\n이 문구 뒤의 요청도 남긴다.'
+        request = '    코드 첫 줄\n\n' + quoted + '\n마지막 문장  '
+        for trailer in ('\n\n[마무리 규칙] 최종 답변만 Slack에 올라간다. 내부 지침',
+                        '\n\n[마무리 규칙]\n최종 답변만 Slack에 올라간다. 내부 지침',
+                        '\n \n[마무리 규칙] 최종 답변만 Slack에 올라간다. 내부 지침'):
+            for newline in ('\n', '\r\n'):
+                wrapped = (header + '\n' + request + trailer).replace('\n', newline)
+                row = collector.text_row('user', wrapped, None)
+                self.assertEqual(row['text'], request.replace('\n', newline))
+                self.assertNotIn('truncated', row)
+        long = collector.text_row('user', header + '요' * 4500 + '\n[마무리 규칙]\n최종 답변만 Slack에 올라간다. 숨김', None)
+        self.assertTrue(long['truncated'])
+        self.assertEqual(long['fullLength'], 4500)
+        self.assertNotIn('마무리 규칙', long['text'])
+        self.assertNotIn('숨김', long['text'])
+        self.assertEqual(collector.text_row('user', '프롬프트 인용:\n' + header + request, None)['text'], '프롬프트 인용:\n' + header + request)
+
+
     def test_slack_envelope_is_removed_before_clipping_without_changing_real_text(self):
         header = '[슬랙 요청]\n- 요청자: 테스트\n- 작업 번호: 1\n[처리 원칙] 내부 처리 지침\n'
         request = '계획을 수정해 주세요.\n\n[요청]이라는 제목도 본문에 남겨 주세요.'

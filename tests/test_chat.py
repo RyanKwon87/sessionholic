@@ -1322,20 +1322,46 @@ class ChatClaudeTest(unittest.TestCase):
         self.assertEqual(self.send()['status'], 'accepted')
         self.assertEqual(len(self.terms.pastes), 1)
 
-    def test_a_windows_claude_background_session_says_it_cannot_take_input(self):
+    def test_a_windows_claude_background_session_is_attached_like_a_mac_one(self):
+        # A running PC background session attaches by its job id (windows_runtime.terminal_plan):
+        # 보내기, the question card and a slash command open that exact session first.
         self.board.hosts[0]['platform'] = 'windows'
         try:
-            self.phase = 'needs_input'
-            self.terminal()
             state = self.state()
-            self.assertEqual((state['capability']['supported'], state['capability']['reason']), (False, chat.CLAUDE_WINDOWS))
+            self.assertEqual((state['capability']['supported'], state['capability']['reason']), (True, None))
             self.assertNotIn('action', state['capability'])
-            self.assertFalse(state['promptOpenable'], 'no question to open where no terminal can attach')
-            with self.assertRaises(chat.PromptRejected):
-                self.chat.prompt({'action': 'open', 'source': CLAUDE_REF})
-            self.assertEqual(self.rejected(), chat.CLAUDE_WINDOWS)
-            self.assertEqual(self.terms.pastes, [])
-            self.assertNotIn(('chat', 'capabilities'), self.calls)
+            self.assertFalse(state['capability']['attachments'], 'a PC session takes text only')
+            self.assertTrue(state['promptOpenable'])
+            opened = []
+
+            def attach(ref, source, request_id):
+                opened.append((ref['id'], source['kind'], request_id))
+                return self.terminal()
+            with patch.object(self.chat, '_open_claude_terminal', side_effect=attach):
+                self.assertEqual(self.send(rid='request-0004', text='PC 확인')['status'], 'accepted')
+                self.assertEqual(self.send(rid='request-0005', text='두 번째')['status'], 'accepted')
+            self.assertEqual(opened, [(CLAUDE_REF['id'], 'background', 'request-0004')])
+            self.assertEqual(self.terms.pastes, [(TERMINAL_ID, 'PC 확인', True), (TERMINAL_ID, '두 번째', True)])
+            # Waiting for the user with that terminal open: it still takes a reply.
+            self.phase = 'needs_input'
+            self.assertTrue(self.state()['capability']['supported'])
+            # The question card attaches through the same plan as the terminal button.
+            self.terms.rows = []
+            self.terms.chunks = [{'after': 10, 'alive': True}, {'after': 25, 'alive': True}, {'after': 25, 'alive': True}]
+            self.terms.screen = CLAUDE_QUESTION
+            with patch.object(self.flow, 'plan', return_value={'allowed': True, 'id': 'plan-1'}) as plan, \
+                    patch.object(self.flow, 'launch', side_effect=lambda *a: {'terminal': self.terminal()}):
+                result = self.chat.prompt({'source': CLAUDE_REF, 'action': 'open', 'requestId': 'prompt-0001'})
+            self.assertEqual(plan.call_args.args[0]['target'], {'host': HOST['name'], 'agent': 'claude', 'account': 'claude:default'})
+            self.assertEqual(result['prompt']['terminalId'], TERMINAL_ID)
+            # An interactive PC conversation still opens only from its terminal button (a resume).
+            self.terms.rows = []
+            self.kind('interactive')
+            with patch.object(self.chat, '_open_claude_terminal', side_effect=AssertionError('a send never resumes a PC conversation')):
+                with self.assertRaises(chat.SendRejected) as caught:
+                    self.send(rid='request-0006', text='대화형')
+            self.assertEqual((str(caught.exception), caught.exception.code), (chat.CLAUDE_WINDOWS_OPEN, 'terminal_required'))
+            self.assertEqual(len(self.terms.pastes), 2)
         finally:
             self.board.hosts[0].pop('platform')
 

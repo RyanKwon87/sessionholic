@@ -4075,12 +4075,21 @@ const MIC_ICON = '<svg aria-hidden="true" viewBox="0 0 20 20" width="20" height=
 const QUICK_ICON = '<svg aria-hidden="true" viewBox="0 0 20 20" width="20" height="20" fill="none" stroke="currentColor" ' +
   'stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M4 4.5h12a1.5 1.5 0 0 1 1.5 1.5v6.5a1.5 1.5 0 0 1-1.5 1.5H9l-3.5 2.5V14H4a1.5 1.5 0 0 1-1.5-1.5V6A1.5 1.5 0 0 1 4 4.5Z"/>' +
   '<path d="M6.5 8.25h7M6.5 10.75h4"/></svg>';
+// WebKit refuses at one of three checks, told apart only by its message (matched on the device,
+// never sent): the device's microphone, its speech recognition, or this site's permission. A
+// site refusal it remembers comes at once with no prompt, so it says where to allow it again.
+const DICTATION_REFUSALS = {
+  "User permission check has failed": "이 사이트의 마이크 사용이 거부로 기억되어 있습니다. 앱을 완전히 닫았다 다시 열고, 그래도 같으면 Safari 설정의 웹 사이트 설정 > 마이크를 '묻기'나 '허용'으로 바꿔 주세요.",
+  "Microphone permission check has failed": "기기에서 이 앱의 마이크 접근이 꺼져 있습니다. 기기 설정의 개인정보 보호 및 보안 > 마이크에서 켜 주세요.",
+  "Speech recognition service permission check has failed": "기기에서 이 앱의 음성 인식 권한이 꺼져 있습니다. 기기 설정의 개인정보 보호 및 보안 > 음성 인식에서 켜 주세요.",
+};
 function speechRecognitionClass() {
   return globalThis.SpeechRecognition || globalThis.webkitSpeechRecognition || null;
 }
 // The error code is kept in the message: it is what tells one platform's refusal from another's.
-function dictationErrorText(code) {
-  return `${DICTATION_ERRORS[code] || "음성 입력을 마치지 못했습니다. 다시 눌러 주세요."} (${code})`;
+function dictationErrorText(code, message = "") {
+  const words = (Object.hasOwn(DICTATION_REFUSALS, message) && DICTATION_REFUSALS[message]) || DICTATION_ERRORS[code];
+  return `${words || "음성 입력을 마치지 못했습니다. 다시 눌러 주세요."} (${code})`;
 }
 // What was heard so far: the results in order, final and still changing. Android's Chrome
 // may give each result everything heard before it; there (only) a result that repeats all
@@ -4368,7 +4377,7 @@ function resumeDictation(session, field, { report, active, releaseKeyboard }) {
   const parkedMs = Math.min(Date.now() - (session.parkedAt || Date.now()), 1e9);
   Object.assign(session, { field, reportTo: report, active, prefix: press.value.slice(0, press.start), suffix: press.value.slice(press.end),
     written: press.value, wrote: false, results: [], finals: [], finalText: "", restarts: 0, heard: false, started: true,
-    silent: false, error: "", applying: false, stopping: false, ticks: 0, idle: 0, base: press.start,
+    silent: false, error: "", errorMessage: "", applying: false, stopping: false, ticks: 0, idle: 0, base: press.start,
     trace: dictationTraceFor(field, press, { resumed: true, parkedMs }) });
   state.dictation = session;
   session.timer = dictationTimer(session);
@@ -4405,7 +4414,7 @@ function startDictation(field, { report, active, releaseKeyboard = false }) {
     return false;
   }
   const session = { field, recognition, reportTo: report, active, prefix: press.value.slice(0, press.start), suffix: press.value.slice(press.end),
-    written: press.value, wrote: false, results: [], finals: [], finalText: "", restarts: 0, heard: false, started: false, silent: false, error: "", applying: false, stopping: false,
+    written: press.value, wrote: false, results: [], finals: [], finalText: "", restarts: 0, heard: false, started: false, silent: false, error: "", errorMessage: "", applying: false, stopping: false,
     ticks: 0, idle: 0, timer: null, stopTimer: null, parkTimer: null, beganAt: 0, endNoted: false, seen: 0, skip: 0, trace,
     base: press.start };
   session.report = (text) => {
@@ -4514,7 +4523,10 @@ function startDictation(field, { report, active, releaseKeyboard = false }) {
     if (replaced(recognition, "error")) return;
     dictationTrace(session, "error", { code: String(event?.error || "unknown").slice(0, 40), cur: state.dictation === session,
       ...(event?.message ? { msg: dictationMessageCode(event.message) } : {}) });
-    if (state.dictation === session) session.error = String(event?.error || "unknown");
+    if (state.dictation === session) {
+      session.error = String(event?.error || "unknown");
+      session.errorMessage = String(event?.message || "").trim();
+    }
   };
   recognition.onend = () => {
     if (replaced(recognition, "end")) return;
@@ -4534,7 +4546,7 @@ function startDictation(field, { report, active, releaseKeyboard = false }) {
       // What it wrote stays; the next round's words follow it.
       const text = dictationText(session.results);
       if (text) session.prefix += (session.prefix && !/\s$/.test(session.prefix) ? " " : "") + text;
-      Object.assign(session, { results: [], finals: [], finalText: "", error: "", restarts: session.restarts + 1, skip: 0 });
+      Object.assign(session, { results: [], finals: [], finalText: "", error: "", errorMessage: "", restarts: session.restarts + 1, skip: 0 });
       try {
         recognition.start();
         dictationTrace(session, "restart", { ok: true, round: session.restarts });
@@ -4593,7 +4605,7 @@ function dictationOutcome(session) {
   const platformAbort = session.error === "aborted" && !session.stopping;
   const error = session.error === "aborted" ? "" : session.error;
   if (platformAbort) return session.heard ? `${DICTATION_INTERRUPTED} (aborted)` : `${DICTATION_ENDED_AT_ONCE} (aborted)`;
-  if (error) return dictationErrorText(error);
+  if (error) return dictationErrorText(error, session.errorMessage);
   if (!session.stopping && !session.heard && session.ticks === 0) return `${DICTATION_ENDED_AT_ONCE} (end)`;
   if (!session.heard) return DICTATION_ERRORS["no-speech"];
   return session.silent ? DICTATION_SILENCE_END : "";

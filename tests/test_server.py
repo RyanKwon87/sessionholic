@@ -4,6 +4,7 @@ import json
 import os
 import shlex
 import shutil
+import stat
 import subprocess
 from pathlib import Path
 import sys
@@ -1024,6 +1025,29 @@ class BoardCollectionTest(unittest.TestCase):
                 self.assertEqual(len(written), 2, "a clean shutdown saves what is still pending")
             restored = server.Board(HOSTS, 60, runner=fake_runner([]), state_dir=directory)
             self.assertEqual(len(restored.reads), 6)
+
+    def test_a_record_kept_for_once_only_work_is_synced_but_the_board_cache_is_not(self):
+        calls, sync, swap = [], os.fsync, os.replace
+
+        def fsync(fd):
+            calls.append("fsync folder" if stat.S_ISDIR(os.fstat(fd).st_mode) else "fsync file")
+            sync(fd)
+
+        def replace(source, target):
+            calls.append("replace")
+            swap(source, target)
+        with tempfile.TemporaryDirectory() as directory, \
+             patch("server.os.fsync", side_effect=fsync), patch("server.os.replace", side_effect=replace):
+            marker = Path(directory) / "handoffs" / "marker.json"
+            server.private_json(marker, {"status": "staging"})
+            self.assertEqual(calls, ["fsync file", "replace", "fsync folder"])
+            self.assertEqual(json.loads(marker.read_text()), {"status": "staging"})
+            calls.clear()
+            board = self.board(fake_runner([]), hosts=HOSTS, state_dir=directory)
+            self.assertTrue(board.poll(HOSTS[0]))
+            board.read("remote", "claude", "a1b2c3d4-0000", None)
+            board.flush_reads()
+            self.assertEqual(calls, ["replace", "replace"], "snapshot.json and conversations.json: no sync")
 
     def test_hosts_collect_in_parallel_but_never_twice_at_once(self):
         release = threading.Event()

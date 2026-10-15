@@ -1073,12 +1073,14 @@ class Board:
                          + (f" — {detail}" if detail else "") + "\n")
 
     def persist(self, filename, build):
-        """State files are only a cache; a failed write never changes a collection result."""
+        """State files are only a cache; a failed write never changes a collection result.
+        Written often (every collection, every 30 seconds of a resident watcher), so not
+        synced to disk: a crash at worst brings back an older list or fewer saved reads."""
         if not self.state_dir:
             return
         with self.save_lock:
             try:
-                private_json(self.state_dir / filename, build())
+                private_json(self.state_dir / filename, build(), durable=False)
             except Exception as exc:
                 sys.stderr.write(f"{LOG_PREFIX}: 상태 파일 {filename} 저장 실패 ({type(exc).__name__})\n")
 
@@ -1466,7 +1468,11 @@ class DictationTraces:
         return {"ok": True}
 
 
-def private_json(path, value):
+def private_json(path, value, durable=True):
+    """Replace `path` with `value` as owner-only JSON in one step. `durable` (the default) syncs
+    the new file before it replaces the old one, and the folder after, so a record written to
+    be acted on once (a send or command receipt, a handoff or transfer marker) is not found
+    empty or missing after a crash; a cache written often passes False."""
     path = Path(path)
     if path.parent.is_symlink() or path.is_symlink():
         raise ValueError("상태 경로는 심볼릭 링크를 사용할 수 없습니다.")
@@ -1479,9 +1485,22 @@ def private_json(path, value):
     try:
         with os.fdopen(fd, "w") as stream:
             json.dump(value, stream, ensure_ascii=False)
+            if durable:
+                stream.flush()
+                os.fsync(stream.fileno())
         os.replace(temp, path)
     finally:
         temp.unlink(missing_ok=True)
+    if durable:
+        folder = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(folder)
+        except OSError as exc:
+            # The file is in place; a file system that cannot sync a folder only loses that.
+            if exc.errno != errno.EINVAL:
+                raise
+        finally:
+            os.close(folder)
 
 
 class LaunchFailure(RuntimeError):

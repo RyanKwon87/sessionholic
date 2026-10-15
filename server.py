@@ -447,6 +447,31 @@ LOG_ROTATE_BYTES = 20 * 1024 * 1024
 LOG_ROTATE_SECONDS = 1800
 # What <name>.1 keeps of a rotated log: its end.
 LOG_KEEP_BYTES = 5 * 1024 * 1024
+# Held while a line goes through LogStream and while rotate_own_logs copies and empties that
+# file: a line written between the copy and the truncation would be in neither.
+LOG_LOCK = threading.RLock()
+
+
+class LogStream:
+    """sys.stdout or sys.stderr whose writes wait for a rotation in progress (main installs
+    it). Only writes through it wait: a child process that inherited the descriptor does not."""
+    def __init__(self, stream):
+        self.stream = stream
+
+    def write(self, text):
+        with LOG_LOCK:
+            return self.stream.write(text)
+
+    def writelines(self, lines):
+        with LOG_LOCK:
+            return self.stream.writelines(lines)
+
+    def flush(self):
+        with LOG_LOCK:
+            return self.stream.flush()
+
+    def __getattr__(self, name):
+        return getattr(self.stream, name)
 
 
 def rotate_own_logs(state_dir, limit=LOG_ROTATE_BYTES):
@@ -477,24 +502,25 @@ def rotate_own_logs(state_dir, limit=LOG_ROTATE_BYTES):
             if not same:
                 continue
             kept = path.with_name(path.name + ".1")
-            try:
-                stream.flush()
-            except (OSError, ValueError):
-                pass
-            try:
-                with open(path, "rb") as source, open(kept, "wb") as target:
-                    source.seek(max(0, info.st_size - LOG_KEEP_BYTES))
-                    shutil.copyfileobj(source, target)
-            except OSError:
+            with LOG_LOCK:
                 try:
-                    kept.unlink()
+                    stream.flush()
+                except (OSError, ValueError):
+                    pass
+                try:
+                    with open(path, "rb") as source, open(kept, "wb") as target:
+                        source.seek(max(0, info.st_size - LOG_KEEP_BYTES))
+                        shutil.copyfileobj(source, target)
+                except OSError:
+                    try:
+                        kept.unlink()
+                    except OSError:
+                        pass
+                try:
+                    os.ftruncate(fd, 0)
+                    rotated.append(path.name)
                 except OSError:
                     pass
-            try:
-                os.ftruncate(fd, 0)
-                rotated.append(path.name)
-            except OSError:
-                pass
             break
     return rotated
 
@@ -951,6 +977,9 @@ class Board:
         # Seconds; instance values so a test can shorten them.
         self.live_grace, self.live_ping, self.live_silence = 60.0, 10.0, 30.0
         self.live_tick, self.live_exit_wait = 0.5, 2.0
+        # Kept reads are saved to conversations.json together, this long after the first
+        # unsaved one (save_reads_later), never by the request that read them.
+        self.reads_save_delay, self.reads_dirty, self.reads_saver = 5.0, False, None
         if self.state_dir:
             self.state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
             prepare_ssh_control_dir(self.state_dir)
@@ -1070,14 +1099,59 @@ class Board:
                          + (f" — {detail}" if detail else "") + "\n")
 
     def persist(self, filename, build):
-        """State files are only a cache; a failed write never changes a collection result."""
+        """State files are only a cache; a failed write never changes a collection result.
+        Written often (every collection, every 30 seconds of a resident watcher), so not
+        synced to disk: a crash at worst brings back an older list or fewer saved reads."""
         if not self.state_dir:
             return
         with self.save_lock:
             try:
-                private_json(self.state_dir / filename, build())
+                private_json(self.state_dir / filename, build(), durable=False)
             except Exception as exc:
                 sys.stderr.write(f"{LOG_PREFIX}: 상태 파일 {filename} 저장 실패 ({type(exc).__name__})\n")
+
+    def save_reads_later(self):
+        """A kept read changed the conversation cache: one background write a few seconds
+        later saves it with every read made meanwhile. Rewriting the whole file (megabytes)
+        on each read cost the reading request that time. A write still pending when the
+        process is killed is lost; conversations.json is only a cache (a restarted board
+        shows a saved read only while its host is unreachable, and reads it again otherwise),
+        and a clean shutdown (close_live) writes it."""
+        if not self.state_dir:
+            return
+        with self.lock:
+            self.reads_dirty = True
+            if self.reads_saver is not None:
+                return
+            saver = self.reads_saver = threading.Thread(target=self._save_reads_soon, daemon=True,
+                                                        name=THREAD_PREFIX + "-reads")
+        try:
+            saver.start()
+        except RuntimeError:
+            with self.lock:
+                self.reads_saver = None
+            self.flush_reads()
+
+    def _save_reads_soon(self):
+        time.sleep(self.reads_save_delay)
+        with self.lock:
+            # Cleared before writing: a read kept during the write starts the next saver.
+            self.reads_saver = None
+        # A deferred write never brings back a state folder removed since the read.
+        if self.state_dir.is_dir():
+            self.flush_reads()
+
+    def flush_reads(self):
+        """Write conversations.json now if a kept read changed it since the last write.
+        Through persist: the same save_lock as snapshot.json, so the two writes take turns."""
+        def saved_reads():
+            with self.lock:
+                self.reads_dirty = False
+                return [{"key": list(k), "at": v[0], "data": v[1]} for k, v in self.reads.items()]
+        with self.lock:
+            if not self.reads_dirty:
+                return
+        self.persist("conversations.json", saved_reads)
 
     def request_refresh(self, host_name=None, force=False):
         if host_name is not None and not isinstance(host_name, str):
@@ -1299,7 +1373,7 @@ class Board:
             self.start_polls([fallback])
 
     def close_live(self):
-        """Server shutdown: stop every watcher and its manager."""
+        """Server shutdown: stop every watcher and its manager, and save reads still pending."""
         with self.lock:
             self.live_closed = True
             streams = list(self.streams.values())
@@ -1311,6 +1385,7 @@ class Board:
             stream.stop()
         if manager is not None and manager is not threading.current_thread() and manager.ident is not None:
             manager.join(5)
+        self.flush_reads()
 
     def snapshot(self):
         with self.lock:
@@ -1361,10 +1436,7 @@ class Board:
                     self.reads.pop(next(iter(self.reads)))
                 self.reads[key] = (fetched, result)
         if not result.get("error"):
-            def saved_reads():
-                with self.lock:
-                    return [{"key": list(k), "at": v[0], "data": v[1]} for k, v in self.reads.items()]
-            self.persist("conversations.json", saved_reads)
+            self.save_reads_later()
         return {**result, "fetchedAt": int(fetched), "stale": False}
 
 
@@ -1422,7 +1494,11 @@ class DictationTraces:
         return {"ok": True}
 
 
-def private_json(path, value):
+def private_json(path, value, durable=True):
+    """Replace `path` with `value` as owner-only JSON in one step. `durable` (the default) syncs
+    the new file before it replaces the old one, and the folder after, so a record written to
+    be acted on once (a send or command receipt, a handoff or transfer marker) is not found
+    empty or missing after a crash; a cache written often passes False."""
     path = Path(path)
     if path.parent.is_symlink() or path.is_symlink():
         raise ValueError("상태 경로는 심볼릭 링크를 사용할 수 없습니다.")
@@ -1435,9 +1511,22 @@ def private_json(path, value):
     try:
         with os.fdopen(fd, "w") as stream:
             json.dump(value, stream, ensure_ascii=False)
+            if durable:
+                stream.flush()
+                os.fsync(stream.fileno())
         os.replace(temp, path)
     finally:
         temp.unlink(missing_ok=True)
+    if durable:
+        folder = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(folder)
+        except OSError as exc:
+            # The file is in place; a file system that cannot sync a folder only loses that.
+            if exc.errno != errno.EINVAL:
+                raise
+        finally:
+            os.close(folder)
 
 
 class LaunchFailure(RuntimeError):
@@ -3592,6 +3681,8 @@ def main(argv=None):
         print(f"표준 출력의 일회용 로그인 링크를 {ONCE_TTL // 60}분 안에 개인 브라우저에서 여세요. 한 번만 사용할 수 있습니다.",
               file=sys.stderr)
     if args.state_dir:
+        # From here every line this process logs waits for a rotation of its file in progress.
+        sys.stdout, sys.stderr = LogStream(sys.stdout), LogStream(sys.stderr)
         threading.Thread(target=rotate_logs_forever, args=(args.state_dir,), daemon=True,
                          name=THREAD_PREFIX + "-logs").start()
     httpd.workflow.start_hold_sweep()

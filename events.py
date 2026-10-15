@@ -11,6 +11,7 @@ that the set of live terminals changed (a tmux session that ended on its own).
 """
 import hashlib
 import json
+import socket
 import sys
 import threading
 import time
@@ -118,7 +119,7 @@ class EventHub:
                  peer_check=PEER_CHECK, clock=time.monotonic, max_watchers=MAX_WATCHERS,
                  room_wait=ROOM_WAIT, boot_id=None, terminals=None,
                  terminal_interval=TERMINAL_INTERVAL, terminal_error=TERMINAL_ERROR_INTERVAL,
-                 snapshot_gap=SNAPSHOT_GAP):
+                 snapshot_gap=SNAPSHOT_GAP, log=None):
         self.board, self.chat = board, chat
         # The server process's bootId, sent with hello: snapshot versions restart with it.
         self.boot_id = boot_id
@@ -127,6 +128,8 @@ class EventHub:
         self.fast, self.idle, self.error = fast, tuple(idle), error
         self.peer_check, self.clock = peer_check, clock
         self.snapshot_gap = snapshot_gap
+        # Writes the line logged when a stream ends; None: sys.stderr at that moment.
+        self.log = log
         # Lock order: the board lock or the terminal manager's lock may be held when
         # snapshot_changed or terminals_changed takes this lock; nothing here calls into
         # the board, the terminals or a conversation while holding it.
@@ -318,7 +321,9 @@ class EventHub:
         self.room.notify_all()
 
     def pump(self, stream, write, peer_closed):
-        """Write hello, then changes and heartbeats until the client leaves or the hub closes."""
+        """Write hello, then changes and heartbeats until the client leaves or the hub closes.
+        The end is logged in one line (log_end)."""
+        began, notices, reason = self.clock(), 0, "error"
         try:
             hello = {"snapshotVersion": stream.hello}
             if self.boot_id is not None:
@@ -341,9 +346,11 @@ class EventHub:
                     version, digest, closed = stream.version, stream.digest, self.closed
                     terminals = stream.terminals
                 if closed:
+                    reason = "server"
                     return
                 out = b""
                 held = False
+                count = 0
                 if version is not None and version > sent_version:
                     now = self.clock()
                     # Only a resident watcher's changes wait for the gap: a collection that
@@ -352,26 +359,44 @@ class EventHub:
                     if announced is None or now - announced >= self.snapshot_gap or urgent > sent_version:
                         out += encode_event("snapshot", {"version": version})
                         sent_version, announced = version, now
+                        count += 1
                     else:
                         held = True
                 if digest is not None and digest != sent_digest:
                     out += encode_event("chat", {"digest": digest})
                     sent_digest = digest
+                    count += 1
                 if terminals is not None and (sent_terminals is None or terminals > sent_terminals):
                     # Several changes since the last write are one announcement.
                     out += encode_event("terminals", {"version": terminals})
                     sent_terminals = terminals
+                    count += 1
                 now = self.clock()
                 if now >= next_ping:
                     out += b": ping\n\n"
                     next_ping = now + self.heartbeat
                 if out:
                     write(out)
+                    notices += count
                 elif peer_closed():
+                    reason = "client"
                     return
-        except OSError:
+        except OSError as exc:
             # A closed tab, a dropped network or a stalled reader ends only this stream.
+            reason = "timeout" if isinstance(exc, (socket.timeout, TimeoutError)) else "write"
             return
+        finally:
+            self.log_end(stream, reason, self.clock() - began, notices)
+
+    def log_end(self, stream, reason, seconds, notices):
+        """One line per ended stream: why, how long it was open, whether it followed a
+        conversation and how many changes it announced; never which conversation, the
+        client's address or its cookie. `reason`: client (the client closed it: a tab hidden
+        or closed, another conversation opened, a reload), write (a write failed), timeout
+        (a write blocked past the socket timeout: a stalled reader), server (the hub closed:
+        shutdown), error (anything else, logged by the caller)."""
+        (self.log or sys.stderr.write)("%s: 실시간 연결 종료 (%s, %.1f초, 대화 %s, 알림 %d)\n" % (
+            BRAND["logPrefix"], reason, seconds, "있음" if stream.key is not None else "없음", notices))
 
     def close(self):
         with self.lock:

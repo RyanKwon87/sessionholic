@@ -630,6 +630,7 @@ class ContinuityTest(unittest.TestCase):
         self.board.state_dir = Path(self.temp.name)
         self.board.runner = lambda *a: {'messages': [{'role': 'user', 'text': 'name@example.com sk-proj-12345678901234567890'}]}
         self.board.read('local', 'codex', SOURCE['id'], '.codex')
+        self.board.flush_reads()
         restored = server.Board([HOST], 60, state_dir=self.temp.name)
         restored.state['local']['paused'] = True
         result = restored.read('local', 'codex', SOURCE['id'], '.codex')

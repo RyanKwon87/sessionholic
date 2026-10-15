@@ -4,6 +4,7 @@ import json
 import os
 import shlex
 import shutil
+import stat
 import subprocess
 from pathlib import Path
 import sys
@@ -994,11 +995,59 @@ class BoardCollectionTest(unittest.TestCase):
                  patch("sys.stderr", new_callable=io.StringIO) as log:
                 self.assertTrue(board.poll(HOSTS[0]))
                 result = board.read("remote", "claude", "a1b2c3d4-0000", None)
+                board.flush_reads()
             self.assertEqual(result["messages"][0]["text"], "hi")
             entry = board.state["remote"]
             self.assertEqual((entry["ok"], entry["refreshing"], entry["error"]), (True, False, None))
             self.assertIn("snapshot.json", log.getvalue())
             self.assertIn("conversations.json", log.getvalue())
+
+    def test_conversation_reads_are_saved_together_after_the_requests_that_read_them(self):
+        with tempfile.TemporaryDirectory() as directory:
+            board = self.board(fake_runner([]), hosts=HOSTS, state_dir=directory)
+            board.reads_save_delay = 0.2
+            written, original = [], server.private_json
+
+            def record(path, value, **kwargs):
+                written.append(Path(path).name)
+                return original(path, value, **kwargs)
+            with patch("server.private_json", side_effect=record):
+                for number in range(5):
+                    board.read("remote", "claude", "a1b2c3d4-%04d" % number, None)
+                self.assertEqual(written, [], "a read never rewrites the whole file itself")
+                wait_for(lambda: written)
+                time.sleep(0.3)
+                self.assertEqual(written, ["conversations.json"], "five reads, one write")
+                board.reads_save_delay = 60
+                board.read("remote", "claude", "a1b2c3d4-0005", None)
+                self.assertEqual(len(written), 1)
+                board.close_live()
+                self.assertEqual(len(written), 2, "a clean shutdown saves what is still pending")
+            restored = server.Board(HOSTS, 60, runner=fake_runner([]), state_dir=directory)
+            self.assertEqual(len(restored.reads), 6)
+
+    def test_a_record_kept_for_once_only_work_is_synced_but_the_board_cache_is_not(self):
+        calls, sync, swap = [], os.fsync, os.replace
+
+        def fsync(fd):
+            calls.append("fsync folder" if stat.S_ISDIR(os.fstat(fd).st_mode) else "fsync file")
+            sync(fd)
+
+        def replace(source, target):
+            calls.append("replace")
+            swap(source, target)
+        with tempfile.TemporaryDirectory() as directory, \
+             patch("server.os.fsync", side_effect=fsync), patch("server.os.replace", side_effect=replace):
+            marker = Path(directory) / "handoffs" / "marker.json"
+            server.private_json(marker, {"status": "staging"})
+            self.assertEqual(calls, ["fsync file", "replace", "fsync folder"])
+            self.assertEqual(json.loads(marker.read_text()), {"status": "staging"})
+            calls.clear()
+            board = self.board(fake_runner([]), hosts=HOSTS, state_dir=directory)
+            self.assertTrue(board.poll(HOSTS[0]))
+            board.read("remote", "claude", "a1b2c3d4-0000", None)
+            board.flush_reads()
+            self.assertEqual(calls, ["replace", "replace"], "snapshot.json and conversations.json: no sync")
 
     def test_hosts_collect_in_parallel_but_never_twice_at_once(self):
         release = threading.Event()
@@ -1300,6 +1349,34 @@ class OperationsLogTest(unittest.TestCase):
             os.dup2(saved, 2); os.close(saved); os.close(fd)
         self.assertEqual(log.read_bytes(), b"", "a full disk still gets the space back")
         self.assertFalse((state / "stderr.log.1").exists(), "no half-written copy is left behind")
+
+    def test_a_line_logged_while_the_log_is_rotated_is_not_lost(self):
+        state = Path(tempfile.mkdtemp()); self.addCleanup(shutil.rmtree, state)
+        log = state / "stderr.log"
+        fd = os.open(str(log), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        os.write(fd, b"x" * 4096)
+        saved = os.dup(2)
+        copy, writers = server.shutil.copyfileobj, []
+
+        def copy_then_log(source, target):
+            copy(source, target)
+            # Another request logs right after the copy, before the log is emptied.
+            writer = threading.Thread(target=lambda: sys.stderr.write("during rotation\n"))
+            writer.start()
+            writers.append(writer)
+            writer.join(0.2)
+        try:
+            os.dup2(fd, 2)
+            with open(2, "w", buffering=1, closefd=False) as raw, \
+                 patch("sys.stderr", server.LogStream(raw)), \
+                 patch.object(server.shutil, "copyfileobj", side_effect=copy_then_log):
+                self.assertEqual(server.rotate_own_logs(state, limit=1024), ["stderr.log"])
+                writers[0].join(5)
+                sys.stderr.write("after\n")
+        finally:
+            os.dup2(saved, 2); os.close(saved); os.close(fd)
+        self.assertEqual((state / "stderr.log.1").read_bytes(), b"x" * 4096)
+        self.assertEqual(log.read_bytes(), b"during rotation\nafter\n")
 
     def test_a_watcher_delivering_ends_a_logged_failure(self):
         board = server.Board(HOSTS, 60, runner=lambda host, args, timeout: (_ for _ in ()).throw(RuntimeError("SSH 연결 실패")))

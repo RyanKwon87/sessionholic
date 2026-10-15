@@ -1,15 +1,19 @@
+import io
 import json
 import os
 from pathlib import Path
 import random
+import re
 import secrets
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
 import threading
 import time
 import unittest
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import events  # noqa: E402
@@ -187,6 +191,42 @@ class EventHubTest(unittest.TestCase):
         self.assertFalse(departed.thread.is_alive())
         self.assertTrue(staying.thread.is_alive())
         self.assertEqual(self.hub.streams, {staying.stream})
+
+    def test_each_stream_end_is_logged_once_with_its_reason_and_nothing_that_names_the_conversation(self):
+        def stalled(data):
+            raise socket.timeout("fixture")
+        lines = []
+        hub = events.EventHub(self.board, self.chat, heartbeat=0.1, grace=0.3, fast=0.02,
+                              idle=(0.04, 0.04), error=0.08, peer_check=0.02, log=lines.append)
+        self.addCleanup(hub.close)
+        departed = Reader(hub, hub.open(REF))
+        wait_for(lambda: departed.events("chat"))
+        departed.gone = True
+        departed.thread.join(2)
+        broken = Reader(hub, hub.open(), fail_after=1)
+        broken.thread.join(2)
+        stream = hub.open()
+        hub.pump(stream, stalled, lambda: False)
+        hub.close_stream(stream)
+        staying = Reader(hub, hub.open())
+        wait_for(lambda: staying.events("hello"))
+        self.board.change()
+        wait_for(lambda: staying.events("snapshot"))
+        hub.close()
+        staying.thread.join(2)
+        ends = "".join(lines).splitlines()
+        prefix = re.escape(events.BRAND["logPrefix"])
+        self.assertEqual(len(ends), 4, ends)
+        self.assertRegex(ends[0], r"^%s: 실시간 연결 종료 \(client, \d+\.\d초, 대화 있음, 알림 1\)$" % prefix)
+        self.assertRegex(ends[1], r"^%s: 실시간 연결 종료 \(write, \d+\.\d초, 대화 없음, 알림 0\)$" % prefix)
+        self.assertRegex(ends[2], r"^%s: 실시간 연결 종료 \(timeout, \d+\.\d초, 대화 없음, 알림 0\)$" % prefix)
+        self.assertRegex(ends[3], r"^%s: 실시간 연결 종료 \(server, \d+\.\d초, 대화 없음, 알림 1\)$" % prefix)
+        for private in (REF["id"], REF["host"], REF["home"]):
+            self.assertNotIn(private, "".join(lines))
+        with patch("sys.stderr", new_callable=io.StringIO) as log:
+            self.hub.log_end(events.Stream(), "client", 12.34, 0)
+        self.assertRegex(log.getvalue(), r"^%s: 실시간 연결 종료 \(client, 12\.3초, 대화 없음, 알림 0\)\n$" % prefix,
+                         "without its own writer a hub logs to stderr")
 
     def test_one_watcher_per_conversation_with_grace_stop(self):
         # Room for a loaded machine: the reuse checks below sleep 0.2 seconds inside the grace.

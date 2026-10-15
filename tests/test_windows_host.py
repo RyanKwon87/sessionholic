@@ -301,6 +301,60 @@ class WindowsRoutingTest(unittest.TestCase):
             self.assertEqual(self.flow.close_idle_codex_attaches(), [])
         self.assertEqual(len(released), 3)
 
+    def test_unused_runs_close_only_resting_at_an_empty_prompt_on_two_sweeps_and_not_at_work(self):
+        native = {'host': HOST['name'], 'agent': 'codex', 'id': SID, 'home': '.codex', 'cwd': ROW['cwd']}
+        rest = '\x1b[0m› \x1b[2mImplement {feature}\x1b[0m\n'
+        screens = {'a' * 32: rest, 'b' * 32: rest}
+        rows = [{'id': 'a' * 32, 'host': HOST['name'], 'mode': 'new-session', 'nativeSource': native},
+                {'id': 'b' * 32, 'host': HOST['name'], 'mode': 'new-session', 'program': 'ssh'}]
+        released, looks = [], []
+        self.terms.idle_runs = lambda: [row for row in rows if row['id'] not in released]
+        self.terms.release_run = lambda tid: released.append(tid) or {'id': tid, 'host': HOST['name']}
+
+        def capture(tid, styled=False, touch=True):
+            looks.append((styled, touch))
+            return screens[tid]
+        self.terms.capture = capture
+        self.board.state[HOST['name']]['fetchedAt'] = int(time.time())
+        clock = [1000.0]
+        with patch.object(self.flow, 'end_hold') as end, patch.object(server.time, 'monotonic', lambda: clock[0]):
+            # A session at work or waiting keeps its run; the SSH one (no session) waits a sweep.
+            for phase in ('working', 'needs_input', 'unknown'):
+                self.board.state[HOST['name']]['data']['codex'][0]['phase'] = phase
+                self.assertEqual(self.flow.close_idle_runs(), [], phase)
+            self.board.state[HOST['name']]['data']['codex'][0]['phase'] = 'idle'
+            self.assertEqual(self.flow.close_idle_runs(), [], 'the first resting look only notes it')
+            # Something typed meanwhile starts the count again.
+            screens['b' * 32] = '\x1b[0m› 빌드 고쳐줘\x1b[0m\n'
+            clock[0] += self.flow.RUN_REST_SECONDS
+            self.assertEqual(self.flow.close_idle_runs(), ['a' * 32])
+            screens['b' * 32] = rest
+            clock[0] += self.flow.RUN_REST_SECONDS - 1
+            self.assertEqual(self.flow.close_idle_runs(), [])
+            clock[0] += self.flow.RUN_REST_SECONDS
+            self.assertEqual(self.flow.close_idle_runs(), ['b' * 32])
+            self.assertEqual(end.call_count, 2)
+        self.assertTrue(looks and all(look == (True, False) for look in looks), 'the sweep reads colours, never as a use')
+        # Its host's list not current (or not ok): the run of a named session is left alone.
+        released.clear()
+        self.flow.runs_at_rest.clear()
+        clock[0] += 1
+        for fetched, ok in ((int(time.time()) - self.flow.CODEX_RELEASE_LIST_AGE - 60, True), (int(time.time()), False)):
+            self.board.state[HOST['name']].update(fetchedAt=fetched, ok=ok)
+            with patch.object(server.time, 'monotonic', lambda: clock[0]):
+                self.flow.close_idle_runs()
+            self.assertNotIn('a' * 32, self.flow.runs_at_rest)
+
+    def test_spare_connections_close_with_their_held_run(self):
+        released = []
+        self.terms.spare_attaches = lambda: [{'id': 'c' * 32}]
+        self.terms.release_spare_attach = lambda tid: released.append(tid) or {'id': tid, 'host': HOST['name']}
+        with patch.object(self.flow, 'end_hold') as end:
+            self.assertEqual(self.flow.close_spare_attaches(), ['c' * 32])
+        end.assert_called_once()
+        self.terms.release_spare_attach = lambda tid: None  # Used again since it was named.
+        self.assertEqual(self.flow.close_spare_attaches(), [])
+
     def test_same_windows_session_can_plan_terminal_without_reserving_it(self):
         with patch.object(self.flow.transfers, 'rpc', return_value={'argv': ['fixture'], 'cwd': ROW['cwd']}) as rpc, \
                 patch.object(server.shutil, 'which', return_value='/fixture/tmux'):

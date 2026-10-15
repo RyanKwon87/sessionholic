@@ -1550,6 +1550,9 @@ class Workflow:
         self.transfers = Transfers(board.hosts, state_dir)
         # What 새 세션 terminals run, read from their host at most once a minute.
         self.program_lock, self.program_busy, self.program_asked = threading.Lock(), set(), {}
+        # Terminal id -> when the sweep first found its unused run resting at an empty prompt
+        # (close_idle_runs); a sweep that finds it otherwise forgets it.
+        self.runs_at_rest = {}
 
     # How long a repeat of a request id waits for the same request still running.
     REQUEST_WAIT = 660
@@ -1850,6 +1853,8 @@ class Workflow:
     HOLD_KEEP_SECONDS = 24 * 3600
     # An unused Codex connection is closed only on a list of its host read this recently.
     CODEX_RELEASE_LIST_AGE = 300
+    # An unused run closes once its screen rested at an empty prompt on sweeps this far apart.
+    RUN_REST_SECONDS = 300
 
     def end_hold(self, terminal):
         """The run a closed terminal kept on its host ends too, in the background (a remote
@@ -1995,6 +2000,74 @@ class Workflow:
             closed.append(row["id"])
         return closed
 
+    def close_spare_attaches(self):
+        """End connections (attach) left unused whose session has another live board terminal
+        (terminals.spare_attaches): only this board's second view of it ends. Returns their IDs."""
+        spare = getattr(self.terminals, "spare_attaches", None)
+        if spare is None:
+            return []
+        closed = []
+        for row in spare():
+            try:
+                ended = self.terminals.release_spare_attach(row["id"])
+            except (RuntimeError, OSError, ValueError, KeyError):
+                continue
+            if ended is None:
+                continue
+            self.end_hold(ended)
+            sys.stderr.write("같은 세션의 남는 연결을 정리했습니다: %s\n" % ended.get("host"))
+            closed.append(row["id"])
+        return closed
+
+    def close_idle_runs(self):
+        """End terminals running their own CLI left unused for hours (terminals.idle_runs) whose
+        screen rests at an empty prompt on two sweeps RUN_REST_SECONDS apart: no turn running, no
+        question, nothing typed (chat.screen_at_rest). A session it names must be idle, done or
+        no longer listed on a list of its host read lately; one at work or waiting keeps it. A
+        session on another host over SSH names none: its screen decides. The board's sweep
+        looking never counts as a use. Returns their IDs."""
+        idle = getattr(self.terminals, "idle_runs", None)
+        if idle is None:
+            return []
+        from chat import screen_at_rest
+        now, closed, resting = time.monotonic(), [], set()
+        for row in idle():
+            native = row.get("nativeSource")
+            if isinstance(native, dict):
+                host = self.board.state.get(native.get("host")) or {}
+                fetched = host.get("fetchedAt")
+                if (not host.get("ok") or not isinstance(fetched, (int, float))
+                        or time.time() - fetched > self.CODEX_RELEASE_LIST_AGE):
+                    continue
+                try:
+                    phase = self.board.source(native).get("phase")
+                except ValueError:
+                    phase = "done"  # No longer listed: archived or gone.
+                if phase not in ("idle", "done", "closed"):
+                    continue
+            try:
+                screen = self.terminals.capture(row["id"], styled=True, touch=False)
+            except (RuntimeError, OSError, ValueError, KeyError):
+                continue
+            if not screen_at_rest(screen):
+                continue
+            resting.add(row["id"])
+            if now - self.runs_at_rest.setdefault(row["id"], now) < self.RUN_REST_SECONDS:
+                continue
+            try:
+                ended = self.terminals.release_run(row["id"])
+            except (RuntimeError, OSError, ValueError, KeyError):
+                continue
+            if ended is None:
+                continue
+            resting.discard(row["id"])
+            self.end_hold(ended)
+            sys.stderr.write("쓰지 않고 쉬는 실행 터미널을 정리했습니다: %s %s\n"
+                             % (ended.get("host"), ended.get("program") or ended.get("mode")))
+            closed.append(row["id"])
+        self.runs_at_rest = {key: value for key, value in self.runs_at_rest.items() if key in resting}
+        return closed
+
     def start_hold_sweep(self):
         def run():
             time.sleep(self.HOLD_SWEEP_FIRST)
@@ -2003,6 +2076,8 @@ class Workflow:
                 try:
                     self.close_idle_launchers()
                     self.close_idle_codex_attaches()
+                    self.close_spare_attaches()
+                    self.close_idle_runs()
                 except Exception as exc:  # The sweep never stops the board.
                     sys.stderr.write("새 세션 터미널 정리에 실패했습니다: %s\n" % type(exc).__name__)
                 try:

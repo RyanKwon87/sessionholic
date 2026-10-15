@@ -13,6 +13,7 @@ import threading
 import time
 import unittest
 from unittest.mock import Mock, patch
+import uuid
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import terminal  # noqa: E402
@@ -992,6 +993,61 @@ class TmuxFixtureTest(unittest.TestCase):
         self.assertIsNone(self.manager.release_codex_attach(codex["id"]), "already closed")
         alive = {item["key"]: item["alive"] for item in self.manager.list()}
         self.assertEqual((alive["codex"], alive["recent"], alive["launched"]), (False, True, True))
+
+    def test_unused_runs_are_named_for_a_screen_check_and_the_sweep_looking_is_no_use(self):
+        self.manager.max_terminals = 12
+        old = time.monotonic() - terminal.RUN_IDLE - 1
+
+        def run(key, mode, program=None, idle=old):
+            created = self.connection(key, mode, idle=False)
+            if program is not None or mode == "new-session":
+                self.manager.set_program(created["id"], {"program": program, "cwd": None})
+            self.manager.terminals[created["id"]].touched = idle
+            return created
+        codex = run("codex", "new-session", "codex")
+        ssh = run("ssh", "new-session", "ssh")
+        resume = run("resume", "resume")
+        run("recent", "new-session", "claude", idle=time.monotonic() - terminal.RUN_IDLE + 60)
+        run("menu", "new-session", None)  # A launcher menu is idle_launchers'.
+        run("agents", "new-session", "claude-agents")
+        run("attach", "attach")
+        self.assertEqual({row["id"] for row in self.manager.idle_runs()}, {codex["id"], ssh["id"], resume["id"]})
+        # The sweep's own look at the screen (with its colours) keeps it unused; a browser's does not.
+        self.assertIn("\x1b[", self.manager.capture(codex["id"], styled=True, touch=False) + "\x1b[")
+        self.assertIn(codex["id"], {row["id"] for row in self.manager.idle_runs()})
+        self.manager.capture(resume["id"])
+        self.assertIsNone(self.manager.release_run(resume["id"]), "a browser looked at it meanwhile")
+        row = self.manager.release_run(codex["id"])
+        self.assertEqual((row["closed"], row["closedReason"]), (True, "released"))
+        self.assertIsNone(self.manager.release_run(codex["id"]), "already closed")
+        alive = {item["key"]: item["alive"] for item in self.manager.list()}
+        self.assertEqual((alive["codex"], alive["ssh"], alive["resume"]), (False, True, True))
+
+    def test_a_second_connection_to_a_session_is_spare_once_unused(self):
+        self.manager.max_terminals = 12
+        native = {"host": "local", "agent": "codex", "id": str(uuid.uuid4()), "home": ".codex", "cwd": self.directory.name}
+        other = {**native, "id": str(uuid.uuid4())}
+        unused = time.monotonic() - terminal.CLOSE_IDLE - 1
+        running = self.connection("running", "new-session", idle=False, nativeSource=native)
+        first = self.connection("first", "attach", nativeSource=native)
+        second = self.connection("second", "attach", nativeSource=native)
+        for item in (running, first, second):
+            self.manager.terminals[item["id"]].touched = unused
+        # The run stays: both views of its session are spare.
+        self.assertEqual({row["id"] for row in self.manager.spare_attaches()}, {first["id"], second["id"]})
+        # Two views and no run: the one used last stays.
+        lone_old = self.connection("lone-old", "attach", nativeSource=other)
+        lone_new = self.connection("lone-new", "attach", nativeSource=other)
+        self.manager.terminals[lone_old["id"]].touched = unused - 60
+        self.manager.terminals[lone_new["id"]].touched = unused
+        self.connection("single", "attach", nativeSource={**native, "id": str(uuid.uuid4())})
+        self.assertEqual({row["id"] for row in self.manager.spare_attaches()}, {first["id"], second["id"], lone_old["id"]})
+        self.manager.terminals[second["id"]].touched = time.monotonic()  # In use again.
+        self.assertIsNone(self.manager.release_spare_attach(second["id"]))
+        row = self.manager.release_spare_attach(first["id"])
+        self.assertEqual((row["closed"], row["closedReason"]), (True, "released"))
+        alive = {item["key"]: item["alive"] for item in self.manager.list()}
+        self.assertEqual((alive["running"], alive["first"], alive["second"]), (True, False, True))
 
     def test_a_codex_connection_is_never_released_for_room(self):
         self.connection("codex", "attach", agent="codex")

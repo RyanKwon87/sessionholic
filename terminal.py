@@ -63,6 +63,11 @@ LAUNCHER_PROGRAM_FRESH = 900
 # or waiting (Terminals.idle_codex_attaches): only the board's TUI client ends, the thread
 # stays on its project's server. It is never closed just to make room (_release_idle).
 CODEX_ATTACH_IDLE = 1800
+# A terminal that runs its own CLI (RUN_MODES: Claude, Codex, or a session on another host over
+# SSH) unused this long is named for a screen check (Terminals.idle_runs): the board closes it
+# only when it rests at an empty prompt and the session it names is not at work.
+RUN_IDLE = 3 * 3600
+RUN_MODES = ("new-session", "resume", "handoff", "transfer")
 # After a look on other tmux servers told nothing (_elsewhere), the next one waits this long.
 LOOK_AGAIN_SECONDS = 600
 # Closed rows kept, the oldest forgotten first. The user's own closes are kept longer:
@@ -778,14 +783,17 @@ class TerminalManager:
             raise RuntimeError("터미널 화면을 스크롤하지 못했습니다.")
         return {"ok": True, "mode": "app", "position": None}
 
-    def capture(self, terminal_id):
-        """Visible screen text of the live pane (no history, no escape sequences)."""
+    def capture(self, terminal_id, styled=False, touch=True):
+        """Visible screen text of the live pane (no history). `styled` keeps its colour and
+        attribute codes (SGR), which tell a prompt's grey placeholder from typed text. A look by
+        the board's own sweep (`touch` False) does not count as the terminal being used."""
         with self.lock:
-            terminal = self._use(terminal_id)
+            terminal = self._use(terminal_id) if touch else self._get(terminal_id)
         if terminal.record.get("closed", False) or not terminal.alive:
             raise RuntimeError("터미널 연결이 종료되었습니다.")
         try:
-            done = subprocess.run(self._command("capture-pane", "-p", "-t", terminal.record["name"]),
+            done = subprocess.run(self._command("capture-pane", "-p", *(["-e"] if styled else []),
+                                                "-t", terminal.record["name"]),
                                   stdin=subprocess.DEVNULL, capture_output=True, timeout=10)
         except (OSError, subprocess.TimeoutExpired):
             raise RuntimeError("터미널 화면을 확인하지 못했습니다.") from None
@@ -1066,6 +1074,74 @@ class TerminalManager:
         its held run on a remote host), else None."""
         with self.lock:
             if terminal_id not in self.idle_launchers():
+                return None
+            terminal = self._get(terminal_id)
+            self._end(terminal, "released")
+            row = self._public(terminal)
+        self._changed()
+        return row
+
+    def idle_runs(self):
+        """Rows of terminals that run their own CLI (RUN_MODES) unused for RUN_IDLE; the caller
+        ends one only when its screen rests at an empty prompt and the session it names is not
+        at work (release_run). A 새 세션 terminal counts once its program was read as Claude,
+        Codex or an SSH connection: its menu and Claude's agent view are idle_launchers'."""
+        now = time.monotonic()
+        with self.lock:
+            rows = []
+            for terminal in self.terminals.values():
+                metadata = terminal.record["metadata"]
+                if (metadata.get("mode") not in RUN_MODES or terminal.record.get("closed", False)
+                        or terminal.record["key"] in self.reservations or self._unrecorded(terminal)
+                        or self._foreign(terminal) or now - terminal.touched < RUN_IDLE
+                        or (metadata.get("mode") == "new-session"
+                            and metadata.get("program") not in ("claude", "codex", "ssh"))):
+                    continue
+                if self._exists(terminal):
+                    rows.append(self._public(terminal))
+            return rows
+
+    def release_run(self, terminal_id):
+        """End one terminal idle_runs named, if it still is one (nobody used it meanwhile); its
+        row (the caller ends its held run on a remote host), else None."""
+        with self.lock:
+            if terminal_id not in {row["id"] for row in self.idle_runs()}:
+                return None
+            terminal = self._get(terminal_id)
+            self._end(terminal, "released")
+            row = self._public(terminal)
+        self._changed()
+        return row
+
+    def spare_attaches(self):
+        """Rows of board connections (attach) unused for CLOSE_IDLE whose session has another
+        live board terminal: the one running it stays, else the one used last. Closing a
+        connection ends only this board's view, never the session."""
+        now = time.monotonic()
+        with self.lock:
+            groups = {}
+            for terminal in self.terminals.values():
+                native = terminal.record["metadata"].get("nativeSource")
+                if (not isinstance(native, dict) or terminal.record.get("closed", False)
+                        or self._unrecorded(terminal) or self._foreign(terminal)):
+                    continue
+                key = (native.get("host"), native.get("agent"), native.get("home") or "", native.get("id"))
+                groups.setdefault(key, []).append(terminal)
+            spare = []
+            for group in groups.values():
+                group = [terminal for terminal in group if self._exists(terminal)] if len(group) > 1 else []
+                if len(group) < 2:
+                    continue
+                keep = (next((terminal for terminal in group if not self._releasable(terminal)), None)
+                        or max(group, key=lambda terminal: terminal.touched))
+                spare += [self._public(terminal) for terminal in group if terminal is not keep
+                          and self._releasable(terminal) and now - terminal.touched >= CLOSE_IDLE]
+            return spare
+
+    def release_spare_attach(self, terminal_id):
+        """End one connection spare_attaches named, if it still is one; its row, else None."""
+        with self.lock:
+            if terminal_id not in {row["id"] for row in self.spare_attaches()}:
                 return None
             terminal = self._get(terminal_id)
             self._end(terminal, "released")

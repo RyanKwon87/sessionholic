@@ -5500,6 +5500,20 @@ test('beside the list a conversation shows no back chevron; where the list stepp
   assert.doesNotMatch(after.replace(block, ''), /\.detail-head > \.back \{[^}]*display: (?:inline-)?flex/);
 });
 
+test('on a phone board the toast drops in under the status bar as a blurred capsule, clear of the input and the terminal bar', () => {
+  const css = styleSheet();
+  const phone = /@media \(max-width: 700px\) \{\s*\.terminal-screen\[hidden\] ~ \.toast \{([^}]*)\}/.exec(css);
+  assert.ok(phone, 'a phone rule for the board toast');
+  assert.match(phone[1], /top: calc\(var\(--top-inset\) \+ 8px\);/);
+  assert.match(phone[1], /bottom: auto;/);
+  assert.match(phone[1], /background: var\(--toast-banner-bg\);/);
+  assert.match(phone[1], /backdrop-filter: saturate\(180%\) blur\(20px\);/);
+  assert.ok(cssBlock(css, ':root')['--toast-banner-bg'] && cssBlock(css, ':root[data-theme="dark"]')['--toast-banner-bg']);
+  // Offline in a conversation, the banner holds that place: the toast goes below it.
+  assert.match(css, /body\.show-detail \.offline-banner:not\(\[hidden\]\) ~ \.terminal-screen\[hidden\] ~ \.toast \{\s*top: calc\(var\(--top-inset\) \+ 56px\);/);
+  assert.match(css, /\.terminal-screen:not\(\[hidden\]\) ~ \.toast \{\s*bottom: calc\(var\(--terminal-tools-h/, 'the terminal keeps its toast above the keys');
+});
+
 test('bottom sheets follow the finger, dismiss on a long or fast pull, step between heights and spring back when dismissal is refused', () => {
   const c = client(undefined, noChatTimers);
   const release = (fields) => c.sheetRelease({ height: 600, detent: 'medium', ...fields });

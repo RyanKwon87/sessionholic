@@ -9681,6 +9681,15 @@ function renderTerminals() {
   $("running-error").hidden = !state.terminalsError;
   $("running-refresh").hidden = !state.terminalsError;
   $("running-count").textContent = direct.length || connections.length;
+  if (state.terminalTidy) {
+    if (alive.length || state.terminalTidy.busy) {
+      if ($("running-tidy")) $("running-tidy").hidden = true;
+      renderTerminalTidy(list);
+      renderTerminalMarks();
+      return;
+    }
+    state.terminalTidy = null;
+  }
   const row = (terminal) => {
     const node = button("", "running-terminal", () => {
       closeSheet("terminals-dialog");
@@ -9725,11 +9734,157 @@ function renderTerminals() {
     if (restoreFocus?.action === "connections") toggle.focus();
     if (state.showConnections) connections.forEach(row);
   }
+  // 터미널 정리 opens from under the list (startTerminalTidy).
+  if ($("running-tidy")) $("running-tidy").hidden = !alive.length;
   // Cards and the open conversation offer "연결 닫기" for these terminals, and
   // show "터미널 열림" while one is live.
   renderTerminalMarks();
   const selected = selectedSession();
   if (selected) updateChatComposer(chatEntry(selected));
+}
+// 터미널 정리: every open terminal beside the listed session it belongs to; the ones left over
+// (no session, a session gone from the list or ended, a second terminal of one session, a
+// repeated agent list) come checked. The terminal open on this screen, and one running a
+// session at work, cannot be picked: closing those pulls away or cuts what is in use.
+const TERMINAL_TIDY_IDLE = 10 * 60;
+function terminalTidyPlan(terminals = state.terminals) {
+  const alive = terminals.filter((terminal) => terminal && terminal.alive !== false && !terminal.closed);
+  const sessions = new Map(allSessions().map((s) => [chatKey(sourceOf(s)), s]));
+  const repeats = duplicateTerminals(alive);
+  const now = Date.now() / 1000;
+  const rows = alive.map((terminal) => {
+    const info = terminalInfo(terminal);
+    // As terminalForSession: the run it attached to, else the session it was opened from; one
+    // that runs another session (a handoff, a transfer) is only that session's.
+    const refs = [];
+    let refHost = info.nativeSource?.host || "";
+    if (refHost) refs.push(chatKey(info.nativeSource));
+    else try {
+      const source = JSON.parse(info.sourceKey || "null");
+      if (source && typeof source === "object") { refs.push(chatKey(source)); refHost = source.host || ""; }
+    } catch {
+      /* no source recorded */
+    }
+    const key = refs.find((ref) => sessions.has(ref)) || null;
+    const session = key ? sessions.get(key) : null;
+    // A host whose list did not come back may still run it: nothing there is proposed.
+    const hostName = refHost || info.host;
+    const unread = !!hostName && state.snapshot?.hosts?.find((host) => host.name === hostName)?.ok !== true;
+    // Unused time from the board (since its last start); an older board gives the age.
+    const idle = Number.isFinite(terminal.idleSeconds) ? terminal.idleSeconds
+      : Number.isFinite(info.createdAt) ? Math.max(0, now - info.createdAt) : null;
+    // Closing one of these ends the run it holds; closing an attach only ends this view of it.
+    const runs = ["new-session", "resume", "handoff", "transfer"].includes(info.mode);
+    const row = { terminal, session, key, idle, runs, checked: false, locked: false, reason: "" };
+    if (state.terminal?.id === terminal.id) Object.assign(row, { locked: true, reason: "지금 이 화면에서 연 터미널" });
+    else if (unread) row.reason = "기기 목록을 읽지 못해 확인 전";
+    else if (!session) {
+      // Just opened, it may not be in the list yet (a session) or be in use (a shell).
+      const fresh = idle !== null && idle < (refs.length ? 120 : TERMINAL_TIDY_IDLE);
+      Object.assign(row, { checked: !fresh, reason: refs.length ? "보드 목록에 없는 세션" : "연결된 세션 없음" });
+    } else if (["done", "closed"].includes(session.phase)) Object.assign(row, { checked: true, reason: "끝난 세션" });
+    else if (["working", "needs_input"].includes(session.phase))
+      Object.assign(row, runs ? { locked: true, reason: "작업 중 · 닫으면 실행이 끊깁니다" } : { reason: "작업 중인 세션의 연결" });
+    else row.reason = session.phase === "unknown" ? "실행 상태 확인 전" : "쉬는 중인 세션";
+    row.unread = unread;
+    return row;
+  });
+  // A second terminal of one session: the one on this screen stays, else the one running it,
+  // else the most recently used; the others are proposed.
+  const bySession = new Map();
+  for (const row of rows) if (row.key) bySession.set(row.key, [...(bySession.get(row.key) || []), row]);
+  for (const group of bySession.values()) {
+    if (group.length < 2) continue;
+    const keep = group.find((row) => state.terminal?.id === row.terminal.id) || group.find((row) => row.runs) ||
+      [...group].sort((a, b) => (a.idle ?? Infinity) - (b.idle ?? Infinity))[0];
+    for (const row of group) if (row !== keep && !row.locked && !row.unread) Object.assign(row, { checked: true, reason: "같은 세션에 터미널이 또 있음" });
+  }
+  for (const row of rows)
+    if (repeats.has(row.terminal.id) && !row.locked && !row.unread) Object.assign(row, { checked: true, reason: "같은 에이전트 목록이 이미 열려 있음" });
+  return rows;
+}
+function startTerminalTidy() {
+  if (state.terminalTidy?.busy) return;
+  state.terminalTidy = { choices: new Map(), busy: false };
+  renderTerminals();
+  $("running-list").querySelector?.(".running-tidy-row input:not(:disabled)")?.focus?.();
+}
+function terminalIdleLabel(idle) {
+  if (!Number.isFinite(idle)) return "";
+  if (idle < 60) return "방금 사용";
+  if (idle < 3600) return `${Math.floor(idle / 60)}분째 사용 안 함`;
+  if (idle < 86400) return `${Math.floor(idle / 3600)}시간째 사용 안 함`;
+  return `${Math.floor(idle / 86400)}일째 사용 안 함`;
+}
+function renderTerminalTidy(list) {
+  const tidy = state.terminalTidy;
+  const plan = terminalTidyPlan();
+  // A choice made here stays across list updates; a terminal new to the list starts as proposed.
+  const chosen = () => plan.filter((row) => !row.locked &&
+    (tidy.choices.has(row.terminal.id) ? tidy.choices.get(row.terminal.id) : row.checked));
+  list.append(el("p", "running-tidy-note", "정리할 터미널을 고르세요. 남은 터미널(세션 없음·끝난 세션·같은 세션의 중복)은 미리 골라 두었습니다."));
+  const go = button("", "primary danger running-tidy-go", () => tidyTerminals(chosen().map((row) => row.terminal)));
+  const updateGo = () => {
+    const count = chosen().length;
+    go.textContent = tidy.busy ? "정리하는 중…" : count ? `선택한 ${count}개 정리` : "고른 터미널 없음";
+    go.disabled = tidy.busy || !count;
+  };
+  for (const row of plan) {
+    const item = el("label", `running-tidy-row${row.locked ? " locked" : ""}`);
+    const box = el("input");
+    box.type = "checkbox";
+    box.checked = !row.locked && (tidy.choices.has(row.terminal.id) ? tidy.choices.get(row.terminal.id) : row.checked);
+    box.disabled = row.locked || tidy.busy;
+    box.dataset.terminalId = row.terminal.id;
+    box.addEventListener("change", () => { tidy.choices.set(row.terminal.id, !!box.checked); updateGo(); });
+    const copy = el("span", "running-tidy-copy");
+    copy.append(el("strong", "running-terminal-title", terminalTitle(row.terminal)),
+      el("span", "running-terminal-meta", [row.session ? `세션 · ${row.session.title || "제목 없는 작업"}` : "연결된 세션 없음",
+        targetLabel(terminalInfo(row.terminal))].filter(Boolean).join(" · ")),
+      el("span", "running-tidy-reason", [row.reason, terminalIdleLabel(row.idle)].filter(Boolean).join(" · ")));
+    item.append(box, copy);
+    list.append(item);
+  }
+  const cancel = button("취소", "secondary", () => { state.terminalTidy = null; renderTerminals(); });
+  cancel.disabled = tidy.busy;
+  const actions = el("div", "running-tidy-actions");
+  actions.append(cancel, go);
+  list.append(actions);
+  updateGo();
+}
+// Closes the picked terminals one by one through the same close as each row's, then says how
+// it went. A terminal opened on this screen since the plan was drawn is left alone.
+async function tidyTerminals(terminals) {
+  const tidy = state.terminalTidy;
+  if (!tidy || tidy.busy || !terminals.length) return;
+  const authEpoch = state.authEpoch;
+  tidy.busy = true;
+  renderTerminals();
+  let closed = 0, failed = 0, remote = false, inputPending = null;
+  try {
+    for (const terminal of terminals) {
+      if (state.terminal?.id === terminal.id) continue;
+      try {
+        const result = await api(`/api/terminal/${encodeURIComponent(terminal.id)}/close`, { method: "POST", body: {}, authEpoch });
+        assertAuthEpoch(authEpoch);
+        rememberTerminal({ id: terminal.id }, { alive: false, closed: true });
+        // As one close: the last answer says whether receipt cleanup still waits.
+        inputPending = result.inputCleanupPending === true;
+        if (result.remoteCleanupPending === true) remote = true;
+        closed++;
+      } catch (err) {
+        if (err.unauthorized || err.staleAuth) return;
+        failed++;
+      }
+    }
+  } finally {
+    if (authEpoch === state.authEpoch && state.terminalTidy === tidy) state.terminalTidy = null;
+  }
+  if (inputPending !== null) updateInputCleanupNotice(inputPending);
+  toast(`터미널 ${closed}개를 정리했습니다.${failed ? ` ${failed}개는 결과를 확인하지 못했습니다. 목록을 다시 확인해 주세요.` : ""}` +
+    (remote ? " 실행 기기에 연결되면 그 기기의 실행도 종료합니다." : ""));
+  await refreshTerminals(authEpoch);
+  renderTerminals();
 }
 
 // "앱 서버 켜기": start one Codex account's daemon on its host, then read the list and
@@ -10546,6 +10701,7 @@ function showLogin() {
   state.loginBusy = false;
   state.launchBusy = false;
   state.terminalCloseBusy = false;
+  state.terminalTidy = null;
   $("refresh").disabled = false;
   $("running-refresh").disabled = false;
   $("login-submit").disabled = false;
@@ -10962,10 +11118,13 @@ window.addEventListener("DOMContentLoaded", () => {
   $("session-categories").addEventListener("keydown", sessionCategoryKeydown);
   $("session-category-search-action").addEventListener("click", (event) => setSessionCategory(event.currentTarget.dataset.category));
   $("running-terminals").addEventListener("click", () => {
+    // The sheet opens on its list; 터미널 정리 is a step from there.
+    if (!state.terminalTidy?.busy) state.terminalTidy = null;
     renderTerminals();
     sheet("terminals-dialog").open();
   });
   $("terminals-close").addEventListener("click", () => closeSheet("terminals-dialog", "running-terminals"));
+  $("running-tidy").addEventListener("click", startTerminalTidy);
   $("new-session").addEventListener("click", () => openNewSession());
   $("new-session-close").addEventListener("click", () => closeNewSession());
   $("action-close").addEventListener("click", () => closeActionSheet());

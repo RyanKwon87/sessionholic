@@ -644,6 +644,7 @@ const SHEETS = {
   "action-sheet": { detents: ["medium"], onDismiss: () => closeActionSheet() },
   "session-control-dialog": { onDismiss: () => closeSessionControl() },
   "session-label-dialog": { onDismiss: () => window.SessionholicLabels?.close?.() },
+  "questions-dialog": { onDismiss: () => closeQuestions() },
 };
 function sheet(id) {
   return BottomSheet.attach($(id), SHEETS[id]);
@@ -3146,7 +3147,16 @@ function refreshDetail(s) {
   else patchDetailMetadata(s);
   // A conversation opened: the ones not used for a while give back what was read for them.
   if (fresh) trimChatMemory(chatEntry(s));
-  loadDetail(s, fresh);
+  const reading = loadDetail(s, fresh);
+  if (!fresh) return;
+  // Its questions are read once as it opens (the sheet and a send read them again), after
+  // the conversation itself: the host is not asked for both at once.
+  const identity = conversationIdentity(s);
+  const questions = () => {
+    const shown = selectedSession();
+    if (shown && conversationIdentity(shown) === identity && state.detailFor === shown.key) loadQuestions(shown);
+  };
+  reading.then(questions, questions);
 }
 function detailMetaChildren(s) {
   const [label, tone] = BADGES[s.runtimeKnown === false ? "unknown" : s.phase] || ["상태 확인 필요", "gray"];
@@ -3244,6 +3254,8 @@ async function loadDetail(s, fresh = false) {
 
 function drawDetail(s) {
   if ($("board-status")) $("board-status").open = false;
+  // The questions sheet belongs to the conversation drawn before.
+  if ($("questions-dialog")?.open) closeSheet("questions-dialog");
   const pane = $("detail");
   pane.replaceChildren();
   pane.dataset.key = s.key;
@@ -3373,8 +3385,10 @@ function drawDetail(s) {
   prompt.id = "chat-prompt";
   prompt.hidden = true;
   prompt.setAttribute("aria-live", "polite");
-  pane.append(bar, sync, list, jump, hint, prompt,
-    ...(sessionCategoryOf(s) === "bot" ? [botWatchNotice(s)] : [buildChatComposer(s), buildContinuePanel(s)]));
+  // 내 질문: between the sync line and the conversation, also in 집중 모드 (not for a bot's chat).
+  const bot = sessionCategoryOf(s) === "bot";
+  pane.append(bar, sync, ...(bot ? [] : [buildQuestionPin()]), list, jump, hint, prompt,
+    ...(bot ? [botWatchNotice(s)] : [buildChatComposer(s), buildContinuePanel(s)]));
   setChromeVisible(state.chromeVisible);
   if (!state.chromeVisible && touchDevice()) showTapHint();
 }
@@ -3948,7 +3962,7 @@ function currentChat(entry, selected = selectedSession() || null) {
 // heard, a read or command in flight, or the conversation on screen.
 const CHAT_MEMORY_KEEP = 12;
 function chatMemoryHeld(entry) {
-  return !!(entry.data || entry.conversation || entry.fullMessages?.size || entry.historyPreview);
+  return !!(entry.data || entry.conversation || entry.fullMessages?.size || entry.historyPreview || entry.questions);
 }
 function chatEntryInUse(entry, shown) {
   return !!(entry.text || entry.attachments?.length || entry.pending || entry.sending || entry.uploads ||
@@ -3969,6 +3983,7 @@ function trimChatMemory(opened = null) {
     entry.conversation = null;
     entry.fullMessages = new Map();
     entry.historyPreview = null;
+    entry.questions = null;
   }
 }
 function networkOffline() {
@@ -6031,6 +6046,8 @@ async function sendChat(entry, message = null) {
     ...outboxOrigin(entry.conversation?.messages) });
   updateChatComposer(entry);
   refreshConversationView(entry, true);
+  // Whether the message may be in the transcript now (내 질문 is read again a while after).
+  let sent = false;
   try {
     const result = await api("/api/chat/send", { method: "POST", body: {
       source: pending.source, requestId: pending.requestId, text: pending.text, attachments: pending.attachments,
@@ -6039,6 +6056,7 @@ async function sendChat(entry, message = null) {
     if (result.receipt?.requestId && result.receipt.requestId !== pending.requestId)
       throw new Error("요청 확인 번호가 일치하지 않습니다.");
     applyChatReceipt(entry, { ...result.receipt, requestId: pending.requestId, status: result.status || "unknown" });
+    sent = result.status !== "failed";
     if (["accepted", "queued", "completed"].includes(result.status)) haptic("success");
     // A Claude send may have attached the session's board terminal: its marks show it now.
     if (pending.source?.agent === "claude" && result.receipt?.terminalId) refreshTerminals();
@@ -6070,6 +6088,7 @@ async function sendChat(entry, message = null) {
         }
       } else {
         // HTTP status alone cannot establish whether the native runtime started.
+        sent = true;
         entry.receipt = { requestId: pending.requestId, status: "unknown", attachments: pending.attachmentDetails };
         entry.error = "전송 결과를 확인하지 못했습니다. 상태 다시 확인을 눌러 주세요. 중복 전송은 잠겼습니다.";
       }
@@ -6085,6 +6104,7 @@ async function sendChat(entry, message = null) {
     if (currentChat(entry)) revealChrome();
     const s = selectedSession();
     if (currentChat(entry) && s) { state.chatPollCount = 0; loadChatState(s, true); }
+    if (sent) queueQuestionsRefresh(entry);
   }
 }
 // --- Sent-from-here bubbles (outbox) ------------------------------------------
@@ -7258,9 +7278,10 @@ function historyPreviewRow(s, entry) {
   if (!preview) return null;
   if (!preview.item) {
     const row = el("section", "history-message-preview");
-    row.setAttribute("aria-label", "검색한 저장 메시지");
+    // A search hit by default; a question opened from 내 질문 says so.
+    row.setAttribute("aria-label", preview.label || "검색한 저장 메시지");
     const heading = el("div", "history-preview-heading");
-    heading.append(el("strong", null, "검색한 메시지 · 저장 기록"), button("닫기", "secondary", () => {
+    heading.append(el("strong", null, preview.label || "검색한 메시지 · 저장 기록"), button("닫기", "secondary", () => {
       if (entry.historyPreview === preview) { entry.historyPreview = null; refreshConversationView(entry); }
     }));
     const bubble = el("div", "bubble"); row.append(heading, bubble);
@@ -7272,6 +7293,265 @@ function historyPreviewRow(s, entry) {
   }
   longMessageControls(s, entry, preview.item);
   return preview.item.row;
+}
+// The preview sits at the top of the conversation: it is brought into view, and the
+// conversation stops following its end so the next read does not carry the reader away.
+function showHistoryPreview(entry) {
+  const list = $("messages"), row = entry.historyPreview?.item?.row;
+  if (!list || !row || ![...list.children].includes(row)) return;
+  list.pendingView = null;
+  list.pinned = false;
+  const box = rowBox(list, row);
+  setMessagesScroll(list, Math.max(0, (box ? box.top : 0) - 8));
+  rememberConversationView();
+  renderJump();
+}
+
+// --- 내 질문: the user's own messages in this session's saved record --------------------
+// The conversation shows its newest 80 items only; the questions asked before them stay
+// reachable here. Read when a conversation opens, when the sheet opens and a while after a
+// send from here, never on the conversation's polling. Newest first, 300 a page.
+const QUESTIONS_PAGE = 300;
+const QUESTIONS_AFTER_SEND_MS = 4000;
+const QUESTIONS_MIN_GAP_MS = 15000;
+const QUESTION_PREVIEW_LABEL = "내 질문 · 저장 기록";
+// A bot's conversation holds many people's messages (Slack), not this user's questions.
+function questionsSupported(s) {
+  return !!s && sessionCategoryOf(s) !== "bot" && !(claudeWithoutId(s) && !s.sessionId);
+}
+function questionsOf(entry, s) {
+  const q = entry?.questions;
+  return q && q.identity === conversationIdentity(s) && q.authEpoch === state.authEpoch ? q : null;
+}
+function questionSource(s) {
+  return { ...sourceOf(s), ...(s.agent === "claude" && s.sessionId ? { sessionId: s.sessionId } : {}) };
+}
+const questionKey = (item) => `${item.recordOffset}:${item.bodyHash}`;
+const questionText = (text) => String(text || "").replace(/\s+/g, " ").trim();
+function validQuestions(data) {
+  if (data?.readOnly !== true || !Array.isArray(data.questions) || data.questions.length > QUESTIONS_PAGE ||
+      typeof data.complete !== "boolean" || data.before != null && !Number.isInteger(data.before))
+    throw new Error("질문 목록 응답을 확인하지 못했습니다.");
+  return data.questions.map((item) => {
+    if (!item || !/^[a-f0-9]{64}$/.test(item.bodyHash || "") || typeof item.snippet !== "string" ||
+        !Number.isInteger(item.recordOffset) || item.recordOffset < 0 || !Number.isInteger(item.fullLength) ||
+        item.fullLength < 0 || item.ts != null && !Number.isFinite(item.ts))
+      throw new Error("질문 목록이 올바르지 않습니다.");
+    return { bodyHash: item.bodyHash, snippet: item.snippet, recordOffset: item.recordOffset,
+      ts: item.ts ?? null, fullLength: item.fullLength };
+  });
+}
+async function loadQuestions(s, { more = false } = {}) {
+  const entry = chatEntry(s);
+  if (!currentChat(entry) || !questionsSupported(s) || networkOffline()) return;
+  let q = questionsOf(entry, s);
+  // One read of a conversation's questions at a time: a second ask joins the one going.
+  if (q?.loading) return q.loading;
+  if (more && (!q || q.complete || !Number.isInteger(q.before))) return;
+  const identity = conversationIdentity(s), authEpoch = state.authEpoch;
+  if (!q) q = entry.questions = { identity, authEpoch, items: [], complete: false, before: null, loaded: false,
+    failed: false, error: "", readAt: 0, loading: null, more: false, rows: new Map() };
+  const params = new URLSearchParams({ ...questionSource(s), ...(more ? { before: String(q.before) } : {}) });
+  const current = () => authEpoch === state.authEpoch && state.authenticated && entry.questions === q &&
+    state.chats.get(chatKey(entry.source)) === entry && conversationIdentity(selectedSession()) === identity;
+  q.more = more;
+  q.error = "";
+  q.loading = (async () => {
+    try {
+      // The server allows questions reads apart from 전체 보기 and body search (its own limit).
+      const data = await api(`/api/history/questions?${params}`, { authEpoch });
+      if (!current()) return;
+      const items = validQuestions(data);
+      // A page that says there is more but not where it ends is the last one: no dead button.
+      const complete = data.complete || !Number.isInteger(data.before);
+      if (more) {
+        const seen = new Set(q.items.map(questionKey));
+        q.items = q.items.concat(items.filter((item) => !seen.has(questionKey(item))));
+      } else q.items = items;
+      q.complete = complete;
+      q.before = complete ? null : data.before;
+      q.loaded = true;
+      q.failed = false;
+    } catch (err) {
+      if (!current() || err.unauthorized || err.staleAuth) return;
+      q.error = err.message;
+      // Unreadable here (a Windows device's session, a record that is gone): the count goes
+      // quietly. A list already read stays; the sheet says why it was not read again.
+      if (!q.loaded) q.failed = true;
+    } finally {
+      q.loading = null;
+      q.more = false;
+      q.readAt = Date.now();
+      if (current()) { renderQuestionPin(); renderQuestionsSheet(); }
+    }
+  })();
+  renderQuestionsSheet();
+  return q.loading;
+}
+// A while after a send from here, the list is read again (once for a burst of sends, and
+// not sooner than QUESTIONS_MIN_GAP_MS after the last read).
+function queueQuestionsRefresh(entry) {
+  const s = selectedSession();
+  if (!s || !currentChat(entry, s) || !questionsSupported(s)) return;
+  const identity = conversationIdentity(s);
+  const readAt = questionsOf(entry, s)?.readAt || 0;
+  clearTimeout(entry.questionsTimer);
+  entry.questionsTimer = setTimeout(() => {
+    entry.questionsTimer = null;
+    const shown = selectedSession();
+    if (shown && currentChat(entry, shown) && conversationIdentity(shown) === identity) loadQuestions(shown);
+  }, Math.max(QUESTIONS_AFTER_SEND_MS, readAt + QUESTIONS_MIN_GAP_MS - Date.now()));
+}
+// The newest message of the user's on screen: a send from here not in the transcript yet,
+// or the conversation's last user row.
+function latestShownQuestion(entry, s) {
+  const sent = (entry.outbox || []).filter((item) => item.state !== "failed" && (item.text || item.attachments?.length)).at(-1);
+  if (sent) return { text: sent.text || "", ts: Math.floor(sent.at / 1000), files: sent.attachments?.length || 0, sent: true };
+  const list = $("messages");
+  const rows = list?.conversationSource === chatKey(sourceOf(s)) ? list.conversationRows || [] : [];
+  for (let index = rows.length - 1; index >= 0; index--) {
+    if (rows[index].role !== "user") continue;
+    const message = rows[index].message, shown = userMessageParts(message);
+    return { text: shown.body, raw: message.text, ts: Number.isFinite(message.ts) ? message.ts : null,
+      bodyHash: message.bodyHash || null, files: shown.attachments.length };
+  }
+  return null;
+}
+function sameQuestion(local, remote) {
+  if (local.bodyHash) return local.bodyHash === remote.bodyHash;
+  const a = questionText(local.raw ?? local.text), b = questionText(remote.snippet).replace(/…$/, "");
+  return !!b && (a === b || b.length >= 200 && a.startsWith(b));
+}
+// The newer of the saved list's first question and the one on screen.
+function lastQuestion(entry, s, q = questionsOf(entry, s)) {
+  const local = latestShownQuestion(entry, s), remote = q?.items[0];
+  if (!remote) return local;
+  const saved = { text: remote.snippet, ts: remote.ts, files: 0 };
+  if (!local) return saved;
+  if (local.sent || sameQuestion(local, remote)) return { ...local, ts: local.ts ?? remote.ts };
+  // The conversation is read more often than the list, so its question is the newer one,
+  // unless both have a time and the list's is later.
+  return Number.isFinite(local.ts) && Number.isFinite(remote.ts) && remote.ts > local.ts ? saved : local;
+}
+function questionSummary(question) {
+  const text = Array.from(questionText(question.text)).slice(0, 300).join("");
+  return text || (question.files ? `첨부 ${question.files}개` : "내용 없음");
+}
+function buildQuestionPin() {
+  const pin = el("section", "question-pin");
+  pin.id = "question-pin";
+  pin.hidden = true;
+  pin.setAttribute("aria-label", "내 마지막 질문");
+  const summary = button("", "question-pin-summary", toggleQuestionPin);
+  summary.id = "question-pin-summary";
+  summary.setAttribute("aria-expanded", "false");
+  // On a tablet the keyboard stays up while the line folds or unfolds.
+  summary.addEventListener("pointerdown", (event) => { if (touchDevice() && editingText()) event.preventDefault(); });
+  const time = el("span", "question-pin-time");
+  time.id = "question-pin-time";
+  const text = el("span", "question-pin-text");
+  text.id = "question-pin-text";
+  summary.append(el("span", "question-pin-label", "내 질문"), time, text);
+  const count = button("", "question-pin-count", openQuestions);
+  count.id = "question-pin-count";
+  count.hidden = true;
+  count.setAttribute("aria-haspopup", "dialog");
+  pin.append(summary, count);
+  return pin;
+}
+// The line above the conversation: shown once a question of the user's is known, its count
+// once the saved list was read. Changes keep the reader's place (keepReadingPlace).
+function renderQuestionPin(s = selectedSession() || null) {
+  const pin = $("question-pin");
+  if (!pin || !s || state.selected !== s.key || $("detail").dataset.key !== s.key) return;
+  const entry = chatEntry(s);
+  if (!currentChat(entry, s)) return;
+  const q = questionsOf(entry, s);
+  const last = questionsSupported(s) ? lastQuestion(entry, s, q) : null;
+  const text = last ? questionSummary(last) : "";
+  // Another question folds the line again.
+  if (pin.questionText !== text) pin.expanded = false;
+  const expanded = !!last && !!pin.expanded;
+  const total = q?.loaded && !q.failed ? q.items.length : 0;
+  const count = total ? `질문 ${total}개${q.complete ? "" : "+"} ›` : "";
+  const time = last ? clock(last.ts) : "";
+  const revision = JSON.stringify([!!last, text, time, count, expanded]);
+  if (pin.dataset.revision === revision) return;
+  keepReadingPlace(() => {
+    pin.dataset.revision = revision;
+    pin.questionText = text;
+    pin.hidden = !last;
+    setClass(pin, "is-expanded", expanded);
+    const timeNode = $("question-pin-time"), textNode = $("question-pin-text"), countNode = $("question-pin-count");
+    timeNode.textContent = time;
+    timeNode.hidden = !time;
+    textNode.textContent = text;
+    $("question-pin-summary").setAttribute("aria-expanded", String(expanded));
+    countNode.textContent = count;
+    countNode.hidden = !count;
+    countNode.setAttribute("aria-label", `내 질문 ${total}개${q?.complete ? "" : " 이상"} 모두 보기`);
+  });
+}
+function toggleQuestionPin() {
+  const pin = $("question-pin");
+  if (!pin || pin.hidden) return;
+  pin.expanded = !pin.expanded;
+  renderQuestionPin();
+}
+function openQuestions() {
+  const s = selectedSession();
+  if (!s || !state.authenticated || !questionsSupported(s)) return;
+  $("questions-dialog").dataset.identity = conversationIdentity(s);
+  $("questions-eyebrow").textContent = s.title || "이 세션";
+  renderQuestionsSheet({ force: true });
+  sheet("questions-dialog").open();
+  loadQuestions(s);
+}
+function closeQuestions() {
+  closeSheet("questions-dialog", "question-pin-count");
+}
+function renderQuestionsSheet({ force = false } = {}) {
+  const dialog = $("questions-dialog"), s = selectedSession();
+  if (!dialog || !s || (!dialog.open && !force) || dialog.dataset.identity !== conversationIdentity(s)) return;
+  const q = questionsOf(chatEntry(s), s);
+  const items = q?.items || [];
+  const rows = q?.rows || new Map();
+  const desired = items.map((item) => {
+    const key = questionKey(item);
+    if (!rows.has(key)) {
+      const row = button("", "questions-row", () => openQuestion(item));
+      row.append(el("span", "questions-row-time", item.ts ? clock(item.ts) : "시각 미확인"),
+        el("span", "questions-row-text", questionText(item.snippet) || "내용 없음"));
+      rows.set(key, row);
+    }
+    return rows.get(key);
+  });
+  const list = $("questions-list"), keep = new Set(desired);
+  for (const row of [...list.children]) if (!keep.has(row)) list.removeChild(row);
+  desired.forEach((row, index) => { if (list.children[index] !== row) list.insertBefore(row, list.children[index] || null); });
+  $("questions-status").textContent = !q || (q.loading && !q.loaded) ? "질문을 불러오고 있습니다…"
+    : q.failed ? `질문 목록을 불러오지 못했습니다. ${q.error}`.trim()
+    : !items.length ? "이 세션에서 보낸 질문이 아직 없습니다."
+    : `최신순 · ${items.length}개${q.complete ? "" : "+"}${q.error ? ` · ${q.error}` : ""}`;
+  const more = $("questions-more");
+  more.hidden = !q?.loaded || q.complete || !Number.isInteger(q.before);
+  more.disabled = !!q?.loading;
+  more.textContent = q?.loading && q.more ? "불러오는 중…" : "더 이전 질문 불러오기";
+}
+// A question from the sheet opens as the saved-record preview at the top of the
+// conversation (as a body-search hit does), with its full text read from the record.
+function openQuestion(item) {
+  const s = selectedSession();
+  if (!s || !state.authenticated) return;
+  const entry = chatEntry(s);
+  if (!questionsOf(entry, s)) return;
+  closeQuestions();
+  entry.historyPreview = { source: questionSource(s), bodyHash: item.bodyHash, role: "user", snippet: item.snippet,
+    recordOffset: item.recordOffset, fullLength: item.fullLength, ts: item.ts, label: QUESTION_PREVIEW_LABEL, item: null };
+  historyPreviewRow(s, entry);
+  refreshConversationView(entry);
+  showHistoryPreview(entry);
+  return loadLongMessage(s, entry.historyPreview.item);
 }
 function renderMessages(s, messages, error = "", fresh = false) {
   const list = $("messages");
@@ -7508,6 +7788,8 @@ function renderMessages(s, messages, error = "", fresh = false) {
   restoreConversationView(list);
   if (list.pendingView && typeof requestAnimationFrame === "function") requestAnimationFrame(() => restoreConversationView(list));
   renderJump();
+  // A new question of the user's (sent from here or read in the transcript) shows above.
+  renderQuestionPin(s);
 }
 
 // A row's top and height in the conversation's own scrolled content, or null
@@ -11144,7 +11426,7 @@ function showLogin() {
   $("login").hidden = false;
   if ($("plan-dialog").open) $("plan-dialog").close();
   if ($("settings-dialog").open) $("settings-dialog").close();
-  for (const id of ["usage-dialog", "hardware-dialog", "filter-dialog", "terminals-dialog", "new-session-dialog", "action-sheet"]) if ($(id)?.open) $(id).close();
+  for (const id of ["usage-dialog", "hardware-dialog", "filter-dialog", "terminals-dialog", "new-session-dialog", "action-sheet", "questions-dialog"]) if ($(id)?.open) $(id).close();
   renderConnectivity();
   updateThemeColor();
   $("login-token").focus();
@@ -11511,6 +11793,11 @@ window.addEventListener("DOMContentLoaded", () => {
   $("filter-open").addEventListener("click", () => sheet("filter-dialog").open());
   $("filter-close").addEventListener("click", () => closeSheet("filter-dialog", "filter-open"));
   $("filter-reset").addEventListener("click", resetFilters);
+  $("questions-close").addEventListener("click", closeQuestions);
+  $("questions-more").addEventListener("click", () => {
+    const s = selectedSession();
+    if (s) loadQuestions(s, { more: true });
+  });
   for (const category of Object.keys(SESSION_CATEGORIES))
     $(`session-category-${category}`).addEventListener("click", () => setSessionCategory(category));
   $("session-categories").addEventListener("keydown", sessionCategoryKeydown);

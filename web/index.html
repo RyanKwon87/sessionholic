@@ -610,6 +610,19 @@
         <p id="new-session-error" class="error" role="alert" hidden></p>
       </div>
     </dialog>
+    <dialog id="questions-dialog" class="plan-dialog sheet questions-dialog" aria-labelledby="questions-title">
+      <div class="sheet-handle" aria-hidden="true"></div>
+      <div class="dialog-top">
+        <p id="questions-eyebrow" class="eyebrow">이 세션</p>
+        <button id="questions-close" class="sheet-done" type="button">완료</button>
+      </div>
+      <h2 id="questions-title">내 질문</h2>
+      <div class="dialog-body">
+        <p id="questions-status" class="questions-status" role="status"></p>
+        <div id="questions-list" class="questions-list"></div>
+        <button id="questions-more" class="secondary questions-more" type="button" hidden>더 이전 질문 불러오기</button>
+      </div>
+    </dialog>
     <dialog id="action-sheet" class="plan-dialog sheet action-sheet" aria-labelledby="action-title">
       <div class="sheet-handle" aria-hidden="true"></div>
       <div class="dialog-top">

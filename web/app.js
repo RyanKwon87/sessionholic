@@ -3893,6 +3893,28 @@ const DICTATION_ENDING = "받아쓴 글을 마무리하고 있습니다…";
 // cooldown) did not help: both starts after one stalled.
 const DICTATION_STALE_START_MS = 100;
 const DICTATION_STALE_RETRY_MS = 600;
+// A fresh recognition in the same page stayed stale (12 of 12 on an iPad, also 20 s later)
+// where reloading the page ended it: the retry starts in a new same-origin document, a
+// hidden frame removed with the listening.
+function dictationFrame() {
+  const frame = document.createElement("iframe");
+  frame.setAttribute("allow", "microphone");
+  frame.setAttribute("aria-hidden", "true");
+  frame.setAttribute("tabindex", "-1");
+  Object.assign(frame.style, { position: "fixed", width: "1px", height: "1px", left: "-10px", top: "-10px",
+    border: "0", opacity: "0", pointerEvents: "none" });
+  document.body.append(frame);
+  return frame;
+}
+function removeDictationFrame(session) {
+  const frame = session.frame;
+  session.frame = null;
+  try {
+    frame?.remove?.();
+  } catch {
+    // Already gone.
+  }
+}
 const DICTATION_STUCK = "iPad 음성 인식이 소리를 받지 못하는 상태입니다. 잠시 뒤 다시 눌러 주세요.";
 function webkitTouchDictation() {
   const agent = String(globalThis.navigator?.userAgent || "");
@@ -4064,8 +4086,10 @@ function startDictation(field, { report, active, releaseKeyboard = false }) {
   const focusAtPress = dictationFocusCode();
   const keyboardAtPress = keyboardOpen();
   if (letGo) field.blur?.();
-  const make = () => {
-    const made = new Recognition();
+  const madeBefore = state.dictationMade || 0;
+  const make = (Kind = Recognition) => {
+    const made = new Kind();
+    state.dictationMade = (state.dictationMade || 0) + 1;
     made.lang = DICTATION_LANG;
     made.interimResults = true;
     made.continuous = true;
@@ -4084,7 +4108,7 @@ function startDictation(field, { report, active, releaseKeyboard = false }) {
   const end = Number.isInteger(field.selectionEnd) ? Math.min(Math.max(start, field.selectionEnd), value.length) : start;
   const session = { field, recognition, report, active, prefix: value.slice(0, start), suffix: value.slice(end),
     written: value, wrote: false, results: [], finals: [], finalText: "", restarts: 0, heard: false, started: false, silent: false, error: "", applying: false, stopping: false,
-    ticks: 0, idle: 0, timer: null, stopTimer: null, beganAt: 0, retried: false, retrying: false, retryTimer: null,
+    ticks: 0, idle: 0, timer: null, stopTimer: null, beganAt: 0, retried: false, retrying: false, retryTimer: null, frame: null, endNoted: false,
     trace: { t0: Date.now(), sent: false, events: [], env: {
       api: globalThis.SpeechRecognition ? "standard" : "webkit", field: String(field.id || ""),
       standalone: !!window.matchMedia?.("(display-mode: standalone)")?.matches, touch: touchDevice(),
@@ -4093,7 +4117,7 @@ function startDictation(field, { report, active, releaseKeyboard = false }) {
       // The keyboard and focus at the press, and how long ago (and how) the last listening ended.
       kb: keyboardAtPress, act: focusAtPress,
       sinceEnd: state.dictationEndedAt ? Math.min(Date.now() - state.dictationEndedAt, 1e9) : null,
-      lastEnd: state.dictationEndHow || "",
+      lastEnd: state.dictationEndHow || "", made: madeBefore,
       ...dictationInputState(field) } } };
   session.report = (text) => {
     report(text);
@@ -4127,7 +4151,8 @@ function startDictation(field, { report, active, releaseKeyboard = false }) {
   let begin = () => false;
   // WebKit on a touch device: an audio start this soon after the start was asked for is a
   // capture that gives no sound (DICTATION_STALE_START_MS). It is replaced once by a fresh
-  // recognition after a pause; a second one ends the listening at once.
+  // recognition in a new document (dictationFrame) after a pause; a second one ends the
+  // listening at once.
   const staleStart = (rec, lag) => {
     if (!webkitTouchDictation() || state.dictation !== session || session.stopping || session.heard
         || lag > DICTATION_STALE_START_MS) return false;
@@ -4148,13 +4173,18 @@ function startDictation(field, { report, active, releaseKeyboard = false }) {
       if (state.dictation !== session) return;
       session.retrying = false;
       try {
-        session.recognition = make();
+        session.frame = dictationFrame();
+        const view = session.frame.contentWindow;
+        const Kind = view?.SpeechRecognition || view?.webkitSpeechRecognition;
+        if (!Kind) throw new Error("no recognition in the frame");
+        session.recognition = make(Kind);
       } catch {
+        dictationTrace(session, "retry", { frame: false });
         stopDictation({ abort: true, message: DICTATION_STUCK });
         return;
       }
       wire(session.recognition);
-      dictationTrace(session, "retry");
+      dictationTrace(session, "retry", { frame: true });
       begin();
     }, DICTATION_STALE_RETRY_MS);
     return true;
@@ -4223,7 +4253,9 @@ function startDictation(field, { report, active, releaseKeyboard = false }) {
     };
     rec.onend = () => {
       if (replaced(rec, "end")) return;
-      if (session.invoked) {
+      // The first way this listening ended is kept (an abort's late end does not overwrite it).
+      if (session.invoked && !session.endNoted) {
+        session.endNoted = true;
         state.dictationEndedAt = Date.now();
         state.dictationEndHow = (session.stopping ? "stop" : session.error ? "error:" + session.error : "end")
           .replace(/[^A-Za-z0-9_.:+-]/g, "").slice(0, 40);
@@ -4341,6 +4373,7 @@ function finishDictation(session) {
   clearInterval(session.timer);
   clearTimeout(session.stopTimer);
   clearTimeout(session.retryTimer);
+  removeDictationFrame(session);
   const outcome = dictationOutcome(session);
   session.report(outcome);
   renderDictation();
@@ -4375,7 +4408,8 @@ function stopDictation({ abort = false, field = null, message = "" } = {}) {
   clearTimeout(session.stopTimer);
   clearTimeout(session.retryTimer);
   // Some engines never send end after abort: the end is noted here too.
-  if (session.invoked) {
+  if (session.invoked && !session.endNoted) {
+    session.endNoted = true;
     state.dictationEndedAt = Date.now();
     state.dictationEndHow = "abort";
   }
@@ -4384,6 +4418,7 @@ function stopDictation({ abort = false, field = null, message = "" } = {}) {
   } catch {
     // Already ended.
   }
+  removeDictationFrame(session);
   session.report(message);
   renderDictation();
   sendDictationTrace(session, message);

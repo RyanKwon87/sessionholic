@@ -883,6 +883,17 @@ class HelperTest(unittest.TestCase):
         self.assertEqual(entry["error"], "SSH 연결 실패")
         self.assertEqual(entry["data"]["claude"][0]["title"], "정산")
 
+    def test_a_failed_read_never_pushes_a_kept_one_out_of_a_full_cache(self):
+        board = server.Board(HOSTS, 60, runner=lambda host, args, timeout: {"messages": [{"role": "user", "text": "본문"}]})
+        for number in range(128):
+            board.read("remote", "claude", "session-%04d" % number, None)
+        first = next(iter(board.reads))
+        board.runner = lambda host, args, timeout: {"messages": [], "error": "읽지 못함"}
+        board.read("remote", "claude", "session-failed", None)
+        self.assertEqual(len(board.reads), 128)
+        self.assertIn(first, board.reads, "a failed read keeps no room for itself")
+        self.assertNotIn(("remote", "claude", "session-failed", None), board.reads)
+
     def test_open_flag_prints_one_time_login_link(self):
         class FakeServer:
             server_address = ("127.0.0.1", 8799)

@@ -7,6 +7,8 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import types
 import unittest
 from unittest.mock import Mock, patch
@@ -251,6 +253,70 @@ class BotRequestsTest(unittest.TestCase):
         self.assertTrue(stale['stale'])
         self.assertEqual(stale['nativeRef']['id'], self.sid)
         self.assertEqual([row['ok'] for row in result['sources']], [False, True])
+
+    def test_a_slow_ledger_read_never_holds_the_session_guards(self):
+        self.ledger()
+        self.native()
+        api = self.configure()
+        api.snapshot()
+        source = {'host': 'mini', 'agent': 'codex', 'id': self.sid, 'home': '.codex'}
+        entered, release = threading.Event(), threading.Event()
+        def slow(source_row):
+            entered.set()
+            release.wait(5)
+            return bots.read_source(source_row, self.home)
+        with patch.object(api, '_collect', side_effect=slow):
+            reading = threading.Thread(target=api.snapshot, kwargs={'force': True})
+            reading.start()
+            self.assertTrue(entered.wait(5))
+            started = time.monotonic()
+            self.assertTrue(api.owns(source))
+            self.assertEqual(len(api.requests_now()), 1)
+            self.assertLess(time.monotonic() - started, 1, 'a guard answers while the ledger is being read')
+            release.set()
+            reading.join(5)
+        self.assertFalse(reading.is_alive())
+
+    def test_guards_answer_from_the_last_list_and_read_an_old_one_again_behind_once(self):
+        self.ledger()
+        api = self.configure()
+        with patch.object(api, '_collect', wraps=api._collect) as collect:
+            self.assertEqual(len(api.requests_now()), 1, 'the first read is waited for')
+            self.assertEqual(collect.call_count, 1)
+            self.assertEqual(len(api.requests_now()), 1)
+            self.assertEqual(collect.call_count, 1, 'a current list is not read again')
+            for cached in api._source_cache.values():
+                cached['fetched'] -= bots.CACHE_SECONDS + 1
+            api._read_at -= bots.CACHE_SECONDS + 1
+            gate = threading.Event()
+            original = api.snapshot
+            def held(*args, **kwargs):
+                gate.wait(5)
+                return original(*args, **kwargs)
+            with patch.object(api, 'snapshot', side_effect=held):
+                self.assertEqual(len(api.requests_now()), 1, 'an old list answers at once')
+                self.assertEqual(len(api.requests_now()), 1)
+                gate.set()
+                for _ in range(100):
+                    if not api._behind:
+                        break
+                    time.sleep(0.02)
+            self.assertFalse(api._behind)
+            self.assertEqual(collect.call_count, 2, 'read again behind, once')
+
+    def test_a_failed_source_is_read_again_after_a_while_without_a_forced_refresh(self):
+        self.ledger()
+        api = self.configure()
+        api.snapshot()
+        with patch.object(api, '_collect', side_effect=TimeoutError()):
+            self.assertFalse(api.snapshot(force=True)['sources'][0]['ok'])
+        api._source_cache[self.source['id']]['fetched'] -= bots.CACHE_SECONDS + 1
+        with patch.object(api, '_collect', wraps=api._collect) as collect:
+            self.assertFalse(api.snapshot()['sources'][0]['ok'])
+            self.assertEqual(collect.call_count, 0, 'not at every list read')
+            api._source_cache[self.source['id']]['fetched'] -= bots.FAILED_RETRY_SECONDS
+            self.assertTrue(api.snapshot()['sources'][0]['ok'])
+            self.assertEqual(collect.call_count, 1)
 
     def test_a_bot_session_stays_the_bots_after_the_ledger_stops_naming_it(self):
         self.ledger()

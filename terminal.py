@@ -40,6 +40,10 @@ except ModuleNotFoundError as missing:
 ID = re.compile(r"^[0-9a-f]{32}$")
 SOCKET = re.compile(r"^[A-Za-z0-9_-]{1,60}$")
 BUFFER_LIMIT = 1024 * 1024
+# A read with new output answers no sooner than this after it began, or once this much gathered
+# (TerminalSession.read): a streaming screen was dozens of reads a second.
+READ_GATHER_SECONDS = 0.08
+READ_GATHER_BYTES = 32 * 1024
 INPUT_LIMIT = 32 * 1024
 MAX_TERMINALS = 16
 # A board connection to an existing session left unused this long may be released
@@ -204,11 +208,23 @@ class _Terminal:
             self.condition.notify_all()
 
     def read(self, after, wait, epoch=None):
-        deadline = time.monotonic() + wait
+        started = time.monotonic()
+        deadline = started + wait
         with self.condition:
             changed_epoch = epoch is not None and epoch != self.epoch
             while after == self.offset and self.alive and not changed_epoch:
                 remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                self.condition.wait(remaining)
+            # A TUI drawing streams in many small writes, and a reader asks again at once: new
+            # output gathers until READ_GATHER_SECONDS from this read's start (or a buffer's
+            # worth), so a stream is a few reads a second, not dozens. A read that waited long
+            # (a key's echo) is past that and answers at once.
+            gather = min(started + READ_GATHER_SECONDS, deadline)
+            while (self.alive and not changed_epoch and self.offset - len(self.output) <= after < self.offset
+                   and self.offset - after < READ_GATHER_BYTES):
+                remaining = gather - time.monotonic()
                 if remaining <= 0:
                     break
                 self.condition.wait(remaining)

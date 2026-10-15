@@ -583,26 +583,43 @@ def _send(client, identity, args, thread, home):
         return receipt
 
 
-def _claude(identity, action, home, deadline, args):
-    binary = native._claude_binary(home)
-    rows = json.loads(native._claude_run(binary, ["agents", "--json", "--all"], deadline))
-    matches = [r for r in rows if isinstance(r, dict) and r.get("id") == identity["id"]] if isinstance(rows, list) else []
+def _transcript(home, sid):
+    """The one transcript file of Claude session `sid` on this host, or None."""
+    if not isinstance(sid, str) or not collector.SESSION_ID.fullmatch(sid):
+        return None
+    root = launch._home(home) / ".claude/projects"
+    paths = [p for p in root.glob("*/" + sid + ".jsonl") if p.is_file() and not p.is_symlink()]
+    return paths[0] if len(paths) == 1 else None
+
+
+def _listed_row(action, args, home):
+    """For a board read only: the board's own row (state, status, kind, cwd, sessionId) and its
+    transcript, when that row is current and its transcript is here; else None (`claude agents`).
+
+    The board sends `liveRow` only while this host's resident watch delivers its rows
+    (collector.watch_local): the Claude registry is stat'ed every second, `claude agents` runs on a
+    change at most every 2 s (and every 60 s regardless), snapshots go out at least 1 s apart. So
+    the row's phase trails the session by about 1-3 s, where `claude agents` here took ~170 ms of
+    every read. The conversation itself is read from the transcript now, never late. A host
+    collected one-shot (every 60 s or more) sends no `liveRow`, nor do upload's cwd check, a send
+    or capabilities: those still ask `claude agents`."""
     source = args.get("source") or {}
-    if not matches and source.get("kind") == "interactive" and source.get("sessionId") == identity["id"]:
-        # Board-created --session-id UUID differs from agents' terminal row ID.
-        # The server supplies this binding; cwd and native sessionId must agree.
-        try:
-            bound_id = str(uuid.UUID(identity["id"]))
-        except (ValueError, AttributeError):
-            bound_id = None
-        if bound_id == identity["id"] and isinstance(rows, list) and source.get("cwd"):
-            matches = [r for r in rows if isinstance(r, dict) and r.get("kind") == "interactive"
-                       and r.get("sessionId") == bound_id and r.get("cwd") == source["cwd"]]
-    if len(matches) != 1:
-        raise ValueError("정확한 원본 Claude 세션을 확인하지 못했습니다.")
-    row = matches[0]
-    if source.get("cwd") is not None and source["cwd"] != row.get("cwd"):
-        raise ValueError("실제 Claude 세션의 작업 폴더가 변경되었습니다. 목록을 다시 읽어 주세요.")
+    if (action != "read" or args.get("liveRow") is not True or source.get("kind") not in ("interactive", "background")
+            or not any(isinstance(source.get(key), str) for key in ("state", "status"))):
+        return None
+    path = _transcript(home, source.get("sessionId"))
+    if path is None:
+        return None
+    return {key: source.get(key) for key in ("state", "status", "kind", "cwd", "sessionId")}, path
+
+
+def _claude(identity, action, home, deadline, args):
+    source = args.get("source") or {}
+    listed = _listed_row(action, args, home)
+    if listed:
+        row, transcript = listed
+    else:
+        row, transcript = _agents_row(identity, home, deadline, source), None
     result = {"source": identity, "phase": collector.claude_phase(row.get("state"), row.get("status")),
               "kind": row.get("kind"), "cwd": row.get("cwd"), "requiresNativeTerminal": True,
               "capabilities": {"canRead": True, "canSend": False, "canAttachImages": False,
@@ -614,11 +631,10 @@ def _claude(identity, action, home, deadline, args):
         sid = row.get("sessionId")
         if not isinstance(sid, str) or not collector.SESSION_ID.fullmatch(sid):
             raise ValueError("원본 Claude 대화 ID를 확인하지 못했습니다.")
-        root = launch._home(home) / ".claude/projects"
-        paths = [p for p in root.glob("*/" + sid + ".jsonl") if p.is_file() and not p.is_symlink()]
-        if len(paths) != 1:
+        transcript = transcript or _transcript(home, sid)
+        if transcript is None:
             raise ValueError("정확한 원본 Claude 대화 기록을 확인하지 못했습니다.")
-        entries = list(collector.tail_entries(paths[0], 2 * 1024 * 1024))
+        entries = list(collector.tail_entries(transcript, 2 * 1024 * 1024))
         result["messages"] = collector.claude_messages(entries)
         # `claude agents` names neither: each response records its model and effort. The newest
         # main-thread one counts (a subagent's or a <synthetic> one says nothing of the session).
@@ -644,6 +660,29 @@ def _claude(identity, action, home, deadline, args):
                        "confirmed": False, "readbackConfirmed": False, "canRetry": False,
                        "reason": result["capabilities"]["reason"], "fallback": FALLBACK})
     return result
+
+
+def _agents_row(identity, home, deadline, source):
+    """The session's row as `claude agents` lists it now (exactly one, in the listed folder)."""
+    binary = native._claude_binary(home)
+    rows = json.loads(native._claude_run(binary, ["agents", "--json", "--all"], deadline))
+    matches = [r for r in rows if isinstance(r, dict) and r.get("id") == identity["id"]] if isinstance(rows, list) else []
+    if not matches and source.get("kind") == "interactive" and source.get("sessionId") == identity["id"]:
+        # Board-created --session-id UUID differs from agents' terminal row ID.
+        # The server supplies this binding; cwd and native sessionId must agree.
+        try:
+            bound_id = str(uuid.UUID(identity["id"]))
+        except (ValueError, AttributeError):
+            bound_id = None
+        if bound_id == identity["id"] and isinstance(rows, list) and source.get("cwd"):
+            matches = [r for r in rows if isinstance(r, dict) and r.get("kind") == "interactive"
+                       and r.get("sessionId") == bound_id and r.get("cwd") == source["cwd"]]
+    if len(matches) != 1:
+        raise ValueError("정확한 원본 Claude 세션을 확인하지 못했습니다.")
+    row = matches[0]
+    if source.get("cwd") is not None and source["cwd"] != row.get("cwd"):
+        raise ValueError("실제 Claude 세션의 작업 폴더가 변경되었습니다. 목록을 다시 읽어 주세요.")
+    return row
 
 
 def handle(args, *, home=None, timeout=10):

@@ -292,6 +292,43 @@ class CoordinatorTest(unittest.TestCase):
         with patch('transfer.time.monotonic',return_value=1000.0+transfer.PROFILE_FAILURE_TTL+1):
             with self.assertRaises(RuntimeError):self.flow.profiles(HOSTS[1])
         self.assertEqual(len(self.calls),2)
+    def test_an_expired_profile_list_is_answered_at_once_and_read_again_once_in_the_background(self):
+        release,reads=threading.Event(),[]
+        def rpc(host,op,args=None,timeout=30):
+            reads.append(threading.current_thread())
+            if len(reads)>1 and not release.wait(30):raise RuntimeError('fixture never released')
+            return {'profiles':[{'id':'p%d'%len(reads)}],'launcher':{'available':True,'label':'L%d'%len(reads)}}
+        self.flow.rpc=rpc
+        self.addCleanup(release.set)
+        clock=[1000.0]
+        with patch('transfer.time.monotonic',side_effect=lambda:clock[0]),\
+             concurrent.futures.ThreadPoolExecutor(1) as pool:
+            self.assertEqual(self.flow.profiles(HOSTS[1]),[{'id':'p1'}])
+            clock[0]+=121
+            # Expired: the request is answered from the list it has, never waiting for the host.
+            self.assertEqual(pool.submit(self.flow.profiles,HOSTS[1]).result(timeout=10),[{'id':'p1'}])
+            self.assertEqual(self.flow.launcher(HOSTS[1])['label'],'L1')
+            self.assertEqual(len(reads),2)
+            self.assertIsNot(reads[1],threading.current_thread())
+            # While that read runs, no second one starts.
+            self.assertEqual(self.flow.profiles(HOSTS[1]),[{'id':'p1'}])
+            self.assertEqual(len(reads),2)
+            release.set()
+            deadline=time.time()+30
+            while 'local' in self.flow.profile_reading and time.time()<deadline:time.sleep(0.01)
+            self.assertEqual(self.flow.profiles(HOSTS[1]),[{'id':'p2'}])
+            self.assertEqual(self.flow.launcher(HOSTS[1])['label'],'L2')
+            # A forced read (a plan's) still asks the host in the caller's own request.
+            self.assertEqual(self.flow.profiles(HOSTS[1],refresh=True),[{'id':'p3'}])
+            self.assertIs(reads[2],threading.current_thread())
+            # A failure since the list expired is reported as before, and not retried.
+            def fail(*a,**k):reads.append('failed');raise RuntimeError('offline')
+            self.flow.rpc=fail
+            clock[0]+=100
+            with self.assertRaises(RuntimeError):self.flow.profiles(HOSTS[1],refresh=True)
+            clock[0]+=21
+            with self.assertRaisesRegex(RuntimeError,'offline'):self.flow.profiles(HOSTS[1])
+            self.assertEqual(reads[3:],['failed'])
     def test_handoff_metadata_omits_preview_size_listing(self):
         original=self.flow.rpc
         seen={}
@@ -619,7 +656,8 @@ class RuntimeInstallTest(unittest.TestCase):
         current=self.root/('worker-'+self.flow.runtime()['sha256']+'.pyz')
         self.assertEqual(self.flow.runtime_paths['self'],str(current))
         self.status()
-        self.assertEqual(sorted(p.name for p in self.root.iterdir()),[current.name])
+        # The archive and the folder it is unpacked to (the call runs from there).
+        self.assertEqual(sorted(p.name for p in self.root.iterdir()),[current.name[:-4],current.name])
         current.write_bytes(b'corrupt helper')
         self.assertEqual(self.status(),{'prepared':False,'started':False})
         self.assertEqual(hashlib.sha256(current.read_bytes()).hexdigest(),self.flow.runtime()['sha256'])
@@ -690,6 +728,101 @@ class RuntimeInstallTest(unittest.TestCase):
                             capture_output=True,timeout=30)
         self.assertNotEqual(done.returncode,0)
         self.assertEqual(list(self.root.iterdir()),[])
+    def folder(self):
+        return self.root/('worker-'+self.flow.runtime()['sha256'])
+    def bootstrap(self,full=True,job='f'*32):
+        runtime=self.flow.runtime()
+        payload={'sha256':runtime['sha256'],'request':{'op':'status','args':{'transferId':job}}}
+        if full:payload['runtime']=runtime['runtime']
+        done=subprocess.run([sys.executable,'-I','-c',transfer.BOOTSTRAP],input=json.dumps(payload).encode(),
+                            capture_output=True,timeout=60)
+        self.assertEqual(done.returncode,0,done.stderr.decode())
+        return json.loads(done.stdout)
+    def test_helper_runs_from_its_unpacked_folder_with_the_board_names(self):
+        # The host names another instance file: the helper still uses the board's names.
+        decoy=self.home/'decoy.json'
+        decoy.write_text(json.dumps({'version':1,'remote':{'transfersDir':'.local/state/decoy-transfers'}}))
+        decoy.chmod(0o600)
+        with patch.dict(os.environ,{'SESSIONHOLIC_INSTANCE':str(decoy)}):
+            for _ in range(2):self.assertEqual(self.status(),{'prepared':False,'started':False})
+        current=self.root/('worker-'+self.flow.runtime()['sha256']+'.pyz')
+        # The archive stays the helper's path (terminal steps run it).
+        self.assertEqual(self.flow.runtime_paths['self'],str(current))
+        archive=zipfile.ZipFile(io.BytesIO(base64.b64decode(self.flow.runtime()['runtime'])))
+        for name in archive.namelist():
+            self.assertEqual((self.folder()/name).read_bytes(),archive.read(name))
+        self.assertEqual(stat.S_IMODE(self.folder().stat().st_mode),0o700)
+        # Compiled modules are kept next to the sources, also where Python writes none by default.
+        tag=sys.implementation.cache_tag
+        for module in ('transfer_worker','instance','collector'):
+            self.assertTrue((self.folder()/'__pycache__'/(module+'.'+tag+'.pyc')).is_file(),module)
+        self.assertTrue((self.home/'.local/state/sessionholic-transfers'/('f'*32)).is_dir())
+        self.assertFalse((self.home/'.local/state/decoy-transfers').exists())
+    def test_archive_is_hashed_again_only_when_it_changed_and_marked_used_hourly(self):
+        self.bootstrap()
+        current=self.root/('worker-'+self.flow.runtime()['sha256']+'.pyz')
+        info=current.stat()
+        self.assertEqual((self.folder()/'.verified').read_text(),'%d %d %d'%(info.st_ino,info.st_size,info.st_mtime_ns))
+        # Same inode, size and mtime as recorded: taken as checked, never hashed or replaced.
+        original=current.read_bytes()
+        with open(current,'r+b') as out:out.write(b'x'*len(original))
+        os.utime(current,ns=(info.st_atime_ns,info.st_mtime_ns))
+        self.assertEqual(self.bootstrap(full=False)['result'],{'prepared':False,'started':False})
+        self.assertEqual(current.read_bytes(),b'x'*len(original))
+        # A changed mtime is checked again: this copy is no longer the helper and is replaced.
+        os.utime(current,(info.st_atime,info.st_mtime+1))
+        self.assertEqual(self.bootstrap(full=False),{'ok':False,'needRuntime':True,'sha256':self.flow.runtime()['sha256']})
+        self.bootstrap()
+        self.assertEqual(current.read_bytes(),original)
+        # Unused for over an hour and unchanged since its check: not hashed again, but touched
+        # (another version's sweep keeps it) and recorded again.
+        with open(current,'r+b') as out:out.write(b'x'*len(original))
+        hours=time.time()-2*3600
+        os.utime(current,(hours,hours))
+        info=current.stat()
+        (self.folder()/'.verified').write_text('%d %d %d'%(info.st_ino,info.st_size,info.st_mtime_ns))
+        self.assertEqual(self.bootstrap(full=False)['result'],{'prepared':False,'started':False})
+        self.assertEqual(current.read_bytes(),b'x'*len(original))
+        info=current.stat()
+        self.assertGreater(info.st_mtime,time.time()-600)
+        self.assertEqual((self.folder()/'.verified').read_text(),'%d %d %d'%(info.st_ino,info.st_size,info.st_mtime_ns))
+    def test_first_calls_racing_each_unpack_and_leave_one_whole_folder(self):
+        with concurrent.futures.ThreadPoolExecutor(4) as pool:
+            # Separate transfers: one transfer's status takes its own lock.
+            replies=list(pool.map(lambda n:self.bootstrap(job=str(n)*32),range(4)))
+        self.assertEqual([reply['result'] for reply in replies],[{'prepared':False,'started':False}]*4)
+        sha=self.flow.runtime()['sha256']
+        self.assertEqual(sorted(p.name for p in self.root.iterdir()),['worker-'+sha,'worker-'+sha+'.pyz'])
+        archive=zipfile.ZipFile(io.BytesIO(base64.b64decode(self.flow.runtime()['runtime'])))
+        self.assertTrue(set(archive.namelist())<={p.name for p in self.folder().iterdir()})
+    def test_a_folder_missing_a_module_is_unpacked_again(self):
+        self.bootstrap()
+        (self.folder()/'launcher_programs.py').unlink()
+        (self.folder()/'.verified').unlink()
+        self.assertEqual(self.bootstrap(full=False)['result'],{'prepared':False,'started':False})
+        self.assertTrue((self.folder()/'launcher_programs.py').is_file())
+        self.assertEqual([p.name for p in self.root.iterdir() if p.name.startswith('.')],[])
+    @unittest.skipIf(os.getuid()==0,'root reads any file')
+    def test_a_folder_that_cannot_be_used_falls_back_to_the_archive(self):
+        self.bootstrap()
+        (self.folder()/'instance.json').chmod(0)
+        self.addCleanup((self.folder()/'instance.json').chmod,0o600)
+        reply=self.bootstrap(full=False)
+        self.assertEqual(reply['result'],{'prepared':False,'started':False})
+        self.assertTrue(reply['runtime'].endswith('.pyz'))
+    def test_other_versions_folders_go_with_their_archives(self):
+        self.root.mkdir(parents=True,mode=0o700)
+        gone,kept=self.root/('worker-'+'0'*64),self.root/('worker-'+'1'*64)
+        busy,left=self.root/('.worker-'+'2'*64+'.'+'3'*12+'.dir'),self.root/('.worker-'+'4'*64+'.'+'5'*12+'.dir')
+        for folder in (gone,kept,busy,left):
+            folder.mkdir(mode=0o700);(folder/'module.py').write_text('x=1\n')
+        (self.root/('worker-'+'1'*64+'.pyz')).write_bytes(b'fixture')
+        old=time.time()-3*86400
+        os.utime(left,(old,old))
+        self.bootstrap()
+        self.assertFalse(gone.exists());self.assertFalse(left.exists())
+        self.assertTrue(kept.is_dir());self.assertTrue(busy.is_dir())
+        self.assertTrue(self.folder().is_dir())
 
 
 class RuntimeMemoryTest(unittest.TestCase):

@@ -42,10 +42,18 @@ UNKNOWN_HANDOFF = ('원격 기기의 인계 준비 결과를 확인하지 못했
 # A call normally carries only the helper's SHA-256. When `worker-<sha>.pyz` is missing or
 # corrupt the bootstrap answers {"needRuntime": true} without running anything, and the
 # coordinator sends the full helper, which is verified and replaced atomically.
-# Other versions unused for a day are removed. The runtime folder (instance
-# `remote.runtimeDir`, under the remote home) is filled in once at import.
+# A call runs the helper from its folder `worker-<sha>/`, unpacked once from the verified
+# archive, where Python keeps the compiled modules (__pycache__): from the archive itself every
+# call compiled each module again. The folder is written in a temporary folder and renamed into
+# place, so two first calls racing never use half of one. The archive is hashed again only when
+# its inode, size or mtime differs from those recorded in the folder (`.verified`) at the last
+# check, and is still marked as used, at most hourly. Its path stays the helper's path (a
+# terminal step runs the archive). A folder that cannot be prepared: the call runs from the
+# archive as before. Other versions unused for a day are removed, a version's folder with its
+# archive. The runtime folder (instance `remote.runtimeDir`, under the remote home) is filled
+# in once at import.
 _BOOTSTRAP = r'''
-import base64,hashlib,io,json,os,pathlib,re,runpy,stat,sys,time
+import base64,hashlib,io,json,os,pathlib,re,stat,sys,time
 p=json.load(sys.stdin); sha=p['sha256']; limit=2*1024*1024
 assert re.fullmatch('[0-9a-f]{64}',sha)
 data=base64.b64decode(p['runtime'],validate=True) if 'runtime' in p else None
@@ -55,14 +63,32 @@ for d in (root,)+tuple(root.parents):
  if d.exists(): assert not d.is_symlink() and d.is_dir()
 root.mkdir(parents=True,exist_ok=True,mode=0o700)
 assert root.stat().st_uid==os.getuid();root.chmod(0o700)
-path=root/('worker-'+sha+'.pyz')
+path=root/('worker-'+sha+'.pyz');unpacked=root/('worker-'+sha);stamp=unpacked/'.verified'
+def mine(s,kind): return kind(s.st_mode) and s.st_uid==os.getuid()
+def mark(s): return '%d %d %d'%(s.st_ino,s.st_size,s.st_mtime_ns)
+def recorded():
+ try:
+  if not mine(os.lstat(str(unpacked)),stat.S_ISDIR): return None
+  with os.fdopen(os.open(str(stamp),os.O_RDONLY|os.O_NOFOLLOW)) as f: return f.read(100)
+ except (OSError,ValueError): return None
+known=recorded()
 def valid():
+ # (its stat, its bytes when hashed now), or None when missing or not this helper.
  try: fd=os.open(str(path),os.O_RDONLY|os.O_NOFOLLOW)
- except OSError: return False
+ except OSError: return None
  with os.fdopen(fd,'rb') as f:
-  s=os.fstat(f.fileno())
-  return stat.S_ISREG(s.st_mode) and s.st_uid==os.getuid() and hashlib.sha256(f.read(limit+1)).hexdigest()==sha
-if not valid():
+  s=os.fstat(f.fileno());raw=None
+  if not mine(s,stat.S_ISREG): return None
+  if mark(s)!=known:
+   raw=f.read(limit+1)
+   if hashlib.sha256(raw).hexdigest()!=sha: return None
+  # Used: another version's sweep keeps it (a day), touched through the checked descriptor.
+  if raw is not None or time.time()-s.st_mtime>3600:
+   try: os.utime(f.fileno());s=os.fstat(f.fileno())
+   except OSError: pass
+  return s,raw
+v=valid()
+if v is None:
  if data is None:
   sys.stdout.write(json.dumps({'ok':False,'needRuntime':True,'sha256':sha}));sys.stdout.flush();sys.exit(0)
  tmp=root/('.worker-'+sha+'.'+os.urandom(6).hex()+'.tmp')
@@ -72,16 +98,77 @@ if not valid():
   os.replace(str(tmp),str(path))
  finally:
   if os.path.lexists(str(tmp)): os.unlink(str(tmp))
- assert valid()
+ v=valid()
+ assert v is not None
+s,raw=v
 try:
- os.utime(str(path));old=time.time()-86400
- for n in os.listdir(str(root)):
+ old=time.time()-86400;listed=os.listdir(str(root))
+ for n in listed:
   if n!=path.name and re.fullmatch(r'worker-[0-9a-f]{64}\.pyz|\.worker-[0-9a-f]{64}\.[0-9a-f]{12}\.tmp',n):
-   s=os.lstat(str(root/n))
-   if stat.S_ISREG(s.st_mode) and s.st_uid==os.getuid() and s.st_mtime<old: os.unlink(str(root/n))
+   e=os.lstat(str(root/n))
+   if mine(e,stat.S_ISREG) and e.st_mtime<old: os.unlink(str(root/n))
+ for n in listed:
+  # A version's folder goes with its archive; one an unpacking left (.dir) after a day.
+  if n!=unpacked.name and re.fullmatch(r'worker-[0-9a-f]{64}|\.worker-[0-9a-f]{64}\.[0-9a-f]{12}\.dir',n):
+   e=os.lstat(str(root/n))
+   if mine(e,stat.S_ISDIR) and (e.st_mtime<old if n[0]=='.' else not os.path.lexists(str(root/(n+'.pyz')))):
+    import shutil;shutil.rmtree(str(root/n),ignore_errors=True)
 except OSError: pass
-sys.argv=[str(path)];sys.path.insert(0,str(path));sys.stdin=io.TextIOWrapper(io.BytesIO(json.dumps(p['request']).encode()))
-runpy.run_path(str(path),run_name='__main__')
+def whole():
+ import zipfile
+ try:
+  if not mine(os.lstat(str(unpacked)),stat.S_ISDIR): return False
+  with zipfile.ZipFile(io.BytesIO(raw)) as z:
+   for i in z.infolist():
+    e=os.lstat(str(unpacked/i.filename))
+    if not mine(e,stat.S_ISREG) or e.st_size!=i.file_size: return False
+ except OSError: return False
+ return True
+def drop(q):
+ import shutil
+ if mine(os.lstat(str(q)),stat.S_ISDIR): shutil.rmtree(str(q),ignore_errors=True)
+ else: os.unlink(str(q))
+def unpack():
+ import zipfile
+ tmp=root/('.worker-'+sha+'.'+os.urandom(6).hex()+'.dir');os.mkdir(str(tmp),0o700)
+ try:
+  with zipfile.ZipFile(io.BytesIO(raw)) as z:
+   for i in z.infolist():
+    assert re.fullmatch(r'[A-Za-z0-9_][A-Za-z0-9_.-]*',i.filename)
+    fd=os.open(str(tmp/i.filename),os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600)
+    with os.fdopen(fd,'wb') as f: f.write(z.read(i));f.flush();os.fsync(f.fileno())
+  try: os.replace(str(tmp),str(unpacked))
+  except OSError:
+   if whole(): return
+   # Not whole (or not this user's folder): moved aside, never used.
+   aside=root/('.worker-'+sha+'.'+os.urandom(6).hex()+'.dir');os.replace(str(unpacked),str(aside))
+   try: os.replace(str(tmp),str(unpacked))
+   finally: drop(aside)
+ finally:
+  if os.path.lexists(str(tmp)): drop(tmp)
+here=None
+try:
+ if raw is not None and not whole(): unpack()
+ if mark(s)!=known:
+  t=unpacked/('.verified.'+os.urandom(6).hex())
+  try:
+   with os.fdopen(os.open(str(t),os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600),'w') as f: f.write(mark(s))
+   os.replace(str(t),str(stamp))
+  finally:
+   if os.path.lexists(str(t)): os.unlink(str(t))
+ blob=(unpacked/'instance.json').read_bytes();here=unpacked
+except Exception: pass
+sys.argv=[str(path)];sys.stdin=io.TextIOWrapper(io.BytesIO(json.dumps(p['request']).encode()))
+if here is None:
+ import runpy;sys.path.insert(0,str(path));runpy.run_path(str(path),run_name='__main__')
+else:
+ # macOS's python3 writes no compiled modules by default: in this folder (this user's, private) it does.
+ sys.dont_write_bytecode=False
+ # The board's names (instance.json), never this host's own instance file or environment.
+ import importlib.machinery,types
+ m=types.ModuleType('instance');m.__file__=str(here/'instance.py');m.INJECTED=blob;sys.modules['instance']=m
+ sys.path.insert(0,str(here));importlib.machinery.SourceFileLoader('instance',m.__file__).exec_module(m)
+ import transfer_worker;transfer_worker.main()
 '''
 BOOTSTRAP = _BOOTSTRAP.replace('@RUNTIME_DIR@', repr(instance.current()['remote']['runtimeDir']), 1)
 
@@ -157,6 +244,8 @@ class Transfers:
         self.hold_tag = hashlib.sha256(str(self.base_dir.resolve()).encode()).hexdigest()[:8]
         self.hold_waiting = self.base_dir / 'hold-waiting'
         self.profile_failures = {}
+        # Hosts whose expired account list is being read again in the background.
+        self.profile_reading = set()
         self.lock = threading.RLock()
         self._runtime = None
 
@@ -381,6 +470,29 @@ class Transfers:
             # A failed probe is not retried automatically, but only for a bounded time.
             if not refresh and failure and time.monotonic() - failure[0] < PROFILE_FAILURE_TTL:
                 raise RuntimeError(failure[1])
+            # An expired list is answered at once (a request never waits for the host's helper);
+            # one background read per host renews it, and its failure is recorded as above.
+            if not refresh and cached:
+                if host['name'] not in self.profile_reading:
+                    self.profile_reading.add(host['name'])
+                    try:
+                        threading.Thread(target=self._renew_profiles, args=(host,), daemon=True,
+                                         name='profiles').start()
+                    except RuntimeError:
+                        self.profile_reading.discard(host['name'])
+                return cached[1]
+        return self._read_profiles(host)
+
+    def _renew_profiles(self, host):
+        try:
+            self._read_profiles(host)
+        except (RuntimeError, OSError, ValueError):
+            pass  # Kept as this host's failure; the next request reports it.
+        finally:
+            with self.lock:
+                self.profile_reading.discard(host['name'])
+
+    def _read_profiles(self, host):
         try:
             data = self.rpc(host, 'profiles', timeout=12)
             if not isinstance(data, dict) or not isinstance(data.get('profiles'), list):

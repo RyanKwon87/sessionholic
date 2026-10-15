@@ -267,6 +267,16 @@ class ChatTest(unittest.TestCase):
         with self.assertRaises(ValueError): self.chat.upload({**REF,'host':'evil'},'file',b'X')
         result=self.chat.upload({**REF,'cwd':'/evil'},'safe.txt',b'X')['attachment']
         self.assertTrue(result['path'].startswith(str(self.project.resolve())))
+    def test_a_slow_codex_send_reports_its_host_request_as_one_step(self):
+        import contextlib, io
+        ticks = iter(range(1000))
+        self.chat.clock = lambda: next(ticks) * 1.5
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.chat.send({'source':REF,'requestId':'request-0001','text':'개인 메시지'})
+        lines = [line for line in err.getvalue().splitlines() if ': 느린 전송 ' in line]
+        self.assertEqual(len(lines), 1)
+        self.assertTrue(lines[0].endswith(' codex 4.50s prepare=1.50 send=1.50 rest=1.50'), lines[0])
     def test_cwd_drift_blocks_upload(self):
         self.source['cwd']='/changed'
         self.board.poll(HOST)
@@ -515,6 +525,24 @@ class ChatTest(unittest.TestCase):
         cached=self.chat.cache[key]
         self.chat.cache[key]=(cached[0]-chat.STATE_CACHE_SECONDS,)+cached[1:]
         self.chat.state({'source':REF,'requestIds':['request-000a']})
+        self.assertEqual(len(self.calls),reads+2)
+
+    def test_clients_share_a_read_for_three_seconds_while_the_watcher_reads_again_after_two(self):
+        key=chat.Chat.state_key(self.source)
+        def age(seconds):
+            cached=self.chat.cache[key]
+            self.chat.cache[key]=(cached[0]-seconds,)+cached[1:]
+        self.chat.state({'source':REF},watching=True)
+        reads=len(self.calls)
+        age(2.5)
+        # A client polling every 3 s takes the watcher's newest read.
+        self.chat.state({'source':REF})
+        self.assertEqual(len(self.calls),reads)
+        # The watcher's own next read (2 s after its last ended) asks the host again.
+        self.chat.state({'source':REF},watching=True)
+        self.assertEqual(len(self.calls),reads+1)
+        age(3.01)
+        self.chat.state({'source':REF})
         self.assertEqual(len(self.calls),reads+2)
 
     def test_waiting_ids_expire_are_bounded_and_only_valid(self):
@@ -983,6 +1011,22 @@ class ChatClaudeTest(unittest.TestCase):
     def control(self, command, value=None, request='control-0001'):
         return self.chat.command({'source': CLAUDE_REF, 'command': command, 'value': value, 'requestId': request})
 
+    def test_only_a_conversation_read_from_a_live_host_lets_the_host_skip_claude_agents(self):
+        seen, original = [], self.flow.transfers.rpc
+        def rpc(host, op, args, timeout):
+            if op == 'chat':
+                seen.append((args['action'], args.get('liveRow')))
+            return original(host, op, args, timeout)
+        self.flow.transfers.rpc = rpc
+        self.chat.state({'source': CLAUDE_REF})
+        # The host's resident watch delivers its rows: the read says so.
+        self.board.state['local']['live'] = True
+        self.chat._forget_state(CLAUDE_REF)
+        self.chat.state({'source': CLAUDE_REF})
+        # Upload's check of the real folder never takes the listed row.
+        self.chat.upload(CLAUDE_REF, 'note.txt', b'fixture')
+        self.assertEqual(seen, [('read', None), ('read', True), ('read', None)])
+
     def test_model_command_uses_one_native_slash_without_prompt_send_or_automatic_enter(self):
         self.terminal()
         ready = '──────────\n❯ \n──────────\n  Sonnet · medium effort\n'
@@ -1228,6 +1272,30 @@ class ChatClaudeTest(unittest.TestCase):
         restarted.send({'source': CLAUDE_REF, 'requestId': 'request-0001', 'text': '첫 줄\n둘째 줄'})
         self.assertEqual(len(self.terms.pastes), 1)
         self.assertEqual(self.calls, [('chat', 'capabilities')])
+
+    def test_a_slow_send_leaves_one_line_of_its_step_times_and_nothing_of_the_message(self):
+        import contextlib, io, instance
+        self.kind('interactive')
+        self.terminal()
+        mark = instance.current()['brand']['logPrefix'] + ': 느린 전송 '
+        def sent(text, rid, clock):
+            self.chat.clock = clock
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                self.assertEqual(self.send(rid=rid, text=text)['status'], 'accepted')
+            return [line for line in err.getvalue().splitlines() if line.startswith(mark)]
+        # Each step takes half a second on this clock.
+        ticks = iter(range(1000))
+        lines = sent('개인 메시지 본문', 'request-0001', lambda: next(ticks) * 0.5)
+        self.assertEqual(len(lines), 1)
+        words = lines[0][len(mark):].split(' ')
+        self.assertEqual(words[:2], ['claude', '4.50s'])
+        self.assertEqual([word.split('=')[0] for word in words[2:]],
+                         ['prepare', 'lock', 'capabilities', 'terminal', 'screen', 'paste', 'submit', 'save', 'rest'])
+        for private in ('개인', '본문', self.row['title'], TERMINAL_ID, CLAUDE_REF['id'], CLAUDE_SID, 'local'):
+            self.assertNotIn(private, lines[0])
+        # A send under two seconds says nothing.
+        self.assertEqual(sent('다음 메시지', 'request-0002', lambda: 7.0), [])
 
     def test_a_message_left_in_the_input_box_after_its_enter_gets_enter_once_more(self):
         # Claude Code took the Enter after the paste as a newline: the message sits in the box.

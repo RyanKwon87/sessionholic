@@ -812,6 +812,43 @@ class NativeChatTests(unittest.TestCase):
         self.assertEqual(len(run.call_args_list), 4)
         self.assertTrue(all(call.args[1] == ['agents', '--json', '--all'] for call in run.call_args_list))
 
+    def test_board_read_of_a_current_claude_row_takes_its_phase_without_claude_agents(self):
+        sid = str(uuid.uuid4())
+        folder = self.home / '.claude/projects/p'
+        folder.mkdir(parents=True)
+        (folder / (sid + '.jsonl')).write_text(json.dumps(
+            {'type': 'user', 'timestamp': '2026-10-11T01:00:00Z', 'message': {'content': 'fixture'}}) + '\n')
+        # As the board lists it (collector.claude_row), from a host whose resident watch delivers.
+        source = {'agent': 'claude', 'home': '.claude', 'id': 'back1234', 'sessionId': sid, 'kind': 'background',
+                  'state': 'working', 'status': 'busy', 'phase': 'working', 'cwd': str(self.cwd)}
+        read = {'action': 'read', 'source': source, 'liveRow': True}
+        with patch.object(chat.native, '_claude_binary', side_effect=AssertionError('no claude lookup')), \
+                patch.object(chat.native, '_claude_run', side_effect=AssertionError('no claude agents')):
+            result = chat.handle(read, home=self.home)
+            # With receipts asked along, as a client's read is.
+            self.assertEqual(chat.handle({**read, 'requestId': self.request}, home=self.home)['phase'], 'working')
+        self.assertEqual(result['messages'][0]['text'], 'fixture')
+        self.assertEqual((result['phase'], result['kind'], result['cwd']), ('working', 'background', str(self.cwd)))
+        self.assertEqual(result['workingSince'], collector.to_epoch('2026-10-11T01:00:00Z'))
+        self.assertFalse(result['capabilities']['canSend'])
+        # Anything else asks `claude agents` as before: a row not known current, another action,
+        # a row without its state, a transcript not on this host.
+        row = {'id': 'back1234', 'sessionId': sid, 'kind': 'background', 'state': 'idle', 'status': 'idle',
+               'cwd': str(self.cwd)}
+        missing = str(uuid.uuid4())
+        for args in ({**read, 'liveRow': None}, {**read, 'action': 'capabilities'},
+                     {**read, 'source': {key: value for key, value in source.items() if key not in ('state', 'status')}},
+                     {**read, 'source': {**source, 'sessionId': missing}}):
+            agents_row = {**row, 'sessionId': args['source']['sessionId']}
+            with self.subTest(args=args), patch.object(chat.native, '_claude_binary', return_value='/fixture/claude'), \
+                    patch.object(chat.native, '_claude_run', return_value=json.dumps([agents_row]).encode()) as run:
+                if args['source']['sessionId'] == missing:
+                    with self.assertRaisesRegex(ValueError, '대화 기록'):
+                        chat.handle(args, home=self.home)
+                else:
+                    self.assertEqual(chat.handle(args, home=self.home)['phase'], 'idle')
+                self.assertEqual(run.call_count, 1)
+
     def test_native_read_times_answers_by_their_whole_turn_and_reports_the_running_turn_start(self):
         thread = self.thread('active')
         thread['turns'] = [

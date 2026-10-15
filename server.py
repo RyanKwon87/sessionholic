@@ -3105,6 +3105,13 @@ class Handler(BaseHTTPRequestHandler):
                         return self.send_json(200, result)
                     finally:
                         self.server.history_gate.release()
+                if url.path == "/api/history/questions":
+                    if not self.server.questions_gate.acquire(blocking=False):
+                        return self.send_json(429, {"error": "질문 목록을 읽고 있습니다. 잠시 뒤 다시 시도해 주세요."})
+                    try:
+                        return self.send_json(200, self.history_questions(query))
+                    finally:
+                        self.server.questions_gate.release()
                 if url.path == "/api/work":
                     if not getattr(self.server, "work_list", True):
                         # Only a screen from before the work tab was retired asks for this: it is
@@ -3244,6 +3251,32 @@ class Handler(BaseHTTPRequestHandler):
                 not isinstance(result.get('text'), str) or len(result['text']) > 65536):
             raise RuntimeError('메시지 본문 응답이 일치하지 않습니다.')
         return {**result, 'readOnly': True}
+
+    def history_questions(self, query):
+        """The user's own messages of one listed session, newest first (collector.history_questions):
+        each one's body hash, record offset, time, length and a one-line snippet. `before` goes on
+        to older ones where the last read stopped."""
+        if set(query) - {'host', 'agent', 'id', 'home', 'sessionId', 'before'}:
+            raise ValueError('질문 목록 읽기 형식이 올바르지 않습니다.')
+        source = self.listed_source({key: query[key] for key in ('host', 'agent', 'id', 'home', 'sessionId') if key in query})
+        native = {key: value for key, value in self.history_native(source).items() if key != 'offset'}
+        if query.get('before') is not None:
+            native['before'] = self.history_number(query.get('before'))
+        result = self.history_read(source, {'sources': [native], 'questions': True})[0]
+        if result.get('error'):
+            raise RuntimeError(result['error'] if isinstance(result['error'], str) else '질문 목록을 읽지 못했습니다.')
+        questions, before = result.get('questions'), result.get('before')
+        if (not isinstance(questions, list) or len(questions) > 300 or not isinstance(result.get('complete'), bool) or
+                not (before is None or type(before) is int and before >= 0) or
+                any(not isinstance(item, dict) or not re.fullmatch(r'[a-f0-9]{64}', str(item.get('bodyHash'))) or
+                    not isinstance(item.get('snippet'), str) or len(item['snippet']) > 300 or
+                    type(item.get('recordOffset')) is not int or item['recordOffset'] < 0 or
+                    not (item.get('ts') is None or type(item.get('ts')) is int) or type(item.get('fullLength')) is not int
+                    for item in questions)):
+            raise RuntimeError('질문 목록 응답을 확인하지 못했습니다.')
+        return {'questions': [{key: item.get(key) for key in ('bodyHash', 'snippet', 'recordOffset', 'ts', 'fullLength')}
+                              for item in questions],
+                'complete': result['complete'], 'before': before, 'readOnly': True}
 
     def history_search(self, query):
         if set(query) - {'q', 'cursor', 'includeRemoved'}:
@@ -3724,6 +3757,8 @@ def make_server(bind, port, board, token, terminals=None, workflow=None, state_d
     server.boot_id = secrets.token_urlsafe(12)
     server.upload_gate = threading.BoundedSemaphore(2)
     server.history_gate = threading.BoundedSemaphore(2)
+    # 질문 목록 reads (one per conversation opened) never wait behind 전체 보기 or a search.
+    server.questions_gate = threading.BoundedSemaphore(2)
     server.bot_conversation_gate = threading.BoundedSemaphore(2)
     server.assets = StaticAssets(WEB)
     try:

@@ -725,6 +725,70 @@ class HistoryHTTPTest(unittest.TestCase):
         finally:
             self.httpd.history_gate.release(); self.httpd.history_gate.release()
 
+    def question(self, index):
+        return {'bodyHash': '%064x' % index, 'snippet': '질문 %d' % index, 'recordOffset': 100 + index,
+                'ts': 1700000000 + index, 'fullLength': 4}
+
+    def test_questions_are_read_once_for_a_listed_session_and_go_on_with_before(self):
+        from urllib.parse import urlencode
+        calls = []
+        def run(host, args, timeout):
+            calls.append(json.loads(args[1])); self.assertEqual(args[0], 'history')
+            native = calls[-1]['sources'][0]
+            more = 'before' not in native
+            return {'readOnly': True, 'results': [{'source': native, 'questions': [self.question(2), self.question(1)] if more else [self.question(0)],
+                    'complete': not more, 'before': 40 if more else None, 'scannedBytes': 9, 'skipped': 0}]}
+        self.board.runner = run
+        route = '/api/history/questions?' + urlencode(self.source)
+        self.assertEqual(self.request('GET', route, auth=False)[0].status, 401); self.assertEqual(calls, [])
+        response, data = self.request('GET', route)
+        self.assertEqual(response.status, 200)
+        self.assertEqual(data, {'questions': [self.question(2), self.question(1)], 'complete': False, 'before': 40, 'readOnly': True})
+        self.assertEqual(calls[-1]['questions'], True)
+        self.assertNotIn('offset', calls[-1]['sources'][0])
+        response, data = self.request('GET', route + '&before=40')
+        self.assertEqual((data['questions'], data['complete'], data['before']), ([self.question(0)], True, None))
+        self.assertEqual(calls[-1]['sources'][0]['before'], 40)
+        # Unknown arguments, a session not listed, a bad position: refused before any read.
+        before = len(calls)
+        for changed in ({'path': '/private'}, {'id': str(uuid.uuid4())}, {'before': '-1'}, {'before': 'x'}):
+            self.assertEqual(self.request('GET', '/api/history/questions?' + urlencode({**self.source, **changed}))[0].status, 400)
+        self.assertEqual(len(calls), before)
+
+    def test_a_questions_answer_for_another_session_or_out_of_shape_is_never_shown(self):
+        from urllib.parse import urlencode
+        route = '/api/history/questions?' + urlencode(self.source)
+        bad_rows = [{**self.question(1), 'bodyHash': 'zz'}, {**self.question(1), 'snippet': 'x' * 301},
+                    {**self.question(1), 'recordOffset': -1}, {**self.question(1), 'ts': 'now'}]
+        for case in ['source', 'error', 'many'] + bad_rows:
+            def run(host, args, timeout, case=case):
+                native = json.loads(args[1])['sources'][0]
+                row = {'source': native, 'questions': [self.question(1)], 'complete': True, 'before': None}
+                if case == 'source': row['source'] = {**native, 'id': 'different-id'}
+                elif case == 'error': row = {'source': native, 'error': '저장 대화 기록을 확인하지 못했습니다.', 'complete': True}
+                elif case == 'many': row['questions'] = [self.question(index) for index in range(301)]
+                else: row['questions'] = [case]
+                return {'readOnly': True, 'results': [row]}
+            self.board.runner = run
+            response, data = self.request('GET', route)
+            self.assertNotEqual(response.status, 200, case); self.assertNotIn('질문 1', json.dumps(data, ensure_ascii=False))
+
+    def test_questions_have_their_own_parallel_limit(self):
+        from urllib.parse import urlencode
+        self.board.runner = lambda host, args, timeout: {'readOnly': True, 'results': [
+            {'source': json.loads(args[1])['sources'][0], 'questions': [], 'complete': True, 'before': None}]}
+        self.httpd.history_gate.acquire(); self.httpd.history_gate.acquire()
+        try:
+            self.assertEqual(self.request('GET', '/api/history/questions?' + urlencode(self.source))[0].status, 200,
+                             'a 전체 보기 or search in progress does not hold the questions back')
+        finally:
+            self.httpd.history_gate.release(); self.httpd.history_gate.release()
+        self.httpd.questions_gate.acquire(); self.httpd.questions_gate.acquire()
+        try:
+            self.assertEqual(self.request('GET', '/api/history/questions?' + urlencode(self.source))[0].status, 429)
+        finally:
+            self.httpd.questions_gate.release(); self.httpd.questions_gate.release()
+
 
 class SnapshotResponseTest(unittest.TestCase):
     """/api/snapshot is kept while nothing in it changed, and every input of it changes it."""

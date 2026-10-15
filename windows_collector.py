@@ -1368,20 +1368,150 @@ def history_scan(path, parser, request, *, deadline=None):
         FULL_MESSAGE_TEXT.reset(token)
 
 
+def history_identity(stream, request):
+    """Raise unless the opened ledger is the requested session, as its first records name it."""
+    header = []
+    for value in history_header_rows(stream):
+        header.append(value)
+        if value.get('type') == 'session_meta' or value.get('sessionId'): break
+    if request.get('agent') == 'codex':
+        identity = next((row.get('payload') for row in header if row.get('type') == 'session_meta'), None)
+        if not isinstance(identity, dict) or identity.get('id') != request.get('id'):
+            raise ValueError('저장 기록의 세션 신원이 바뀌었습니다.')
+    elif request.get('agent') == 'claude':
+        sid = next((row.get('sessionId') for row in header if row.get('sessionId')), None)
+        if sid and sid != request.get('id'):
+            raise ValueError('저장 기록의 대화 신원이 바뀌었습니다.')
+
+
+# 질문 목록, as collector.py: the user's own messages of one saved ledger, newest first, read from
+# its end backward.
+QUESTION_LIMIT = 300
+QUESTION_BLOCK = 1024 * 1024
+QUESTION_LINE = 8 * 1024 * 1024
+QUESTION_SNIPPET = 300
+QUESTION_REPEAT_SECONDS = 120
+QUESTION_MARK = re.compile(rb'"role"\s*:\s*"user"|"type"\s*:\s*"(?:user|attachment)"')
+
+
+def lines_backward(stream, end, deadline):
+    """(start offset, line) of the records before `end`, last first; a record longer than
+    QUESTION_LINE comes as (start, None). Ends with ("stop", end of the record not read) once the
+    deadline passes, else when the start of the file is reached."""
+    position, parts, size = end, [], 0
+    line_end = end
+    while position > 0:
+        if time.monotonic() >= deadline:
+            yield "stop", line_end
+            return
+        step = min(QUESTION_BLOCK, position)
+        position -= step
+        stream.seek(position)
+        chunk = stream.read(step)
+        cut = len(chunk)
+        while True:
+            newline = chunk.rfind(b'\n', 0, cut)
+            piece = chunk[newline + 1:cut]
+            if size <= QUESTION_LINE:
+                parts.append(piece)
+            size += len(piece)
+            if newline < 0:
+                break
+            start = position + newline + 1
+            yield start, (b''.join(reversed(parts)) if size <= QUESTION_LINE else None)
+            parts, size, line_end, cut = [], 0, position + newline, newline
+    if parts or size:
+        yield 0, (b''.join(reversed(parts)) if size <= QUESTION_LINE else None)
+
+
+def history_questions(path, parser, request, *, deadline=None):
+    """As collector.history_questions: the user's messages, newest first, with where to go on."""
+    before = request.get('before')
+    if before is not None and (type(before) is not int or before < 0):
+        raise ValueError('기록 위치가 올바르지 않습니다.')
+    deadline = deadline or time.monotonic() + 8
+    found, skipped, scanned = [], 0, 0
+    resume = None
+    token = FULL_MESSAGE_TEXT.set(True)
+    try:
+        fd = os.open(str(path), os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0))
+        with os.fdopen(fd, 'rb') as stream:
+            info = os.fstat(stream.fileno())
+            if (not stat.S_ISREG(info.st_mode) or (before is not None and before > info.st_size) or
+                    hasattr(os, 'getuid') and info.st_uid != os.getuid()):
+                raise ValueError('저장 기록 위치를 확인해 주세요.')
+            history_identity(stream, request)
+            end = info.st_size if before is None else before
+            if before is not None and before < info.st_size:
+                stream.seek(before)
+                if stream.read(1) != b'\n':
+                    raise ValueError('기록의 위치가 바뀌었습니다. 질문 목록을 다시 불러와 주세요.')
+            for start, raw in lines_backward(stream, end, deadline):
+                if start == 'stop':
+                    resume = raw
+                    break
+                if raw is None:
+                    skipped += 1
+                    continue
+                scanned += len(raw) + 1
+                if not QUESTION_MARK.search(raw):
+                    continue
+                try:
+                    entry = json.loads(raw)
+                    rows = parser(entry) if isinstance(entry, dict) else []
+                except (ValueError, TypeError, KeyError, UnicodeError, RecursionError):
+                    skipped += 1
+                    continue
+                for row in reversed(rows):
+                    text = row.get('text')
+                    if row.get('role') != 'user' or not isinstance(text, str) or not text:
+                        continue
+                    text = re.sub(r'[\ud800-\udfff]', '�', text)
+                    at = row.get('ts')
+                    found.append({'bodyHash': hashlib.sha256(text.encode()).hexdigest(),
+                                  'snippet': ' '.join(text.split())[:QUESTION_SNIPPET], 'recordOffset': start,
+                                  'ts': int(at) if isinstance(at, (int, float)) and not isinstance(at, bool) else None,
+                                  'fullLength': len(text)})
+                if len(found) >= QUESTION_LIMIT:
+                    resume = start - 1 if start > 0 else None
+                    break
+            if (os.fstat(stream.fileno()).st_ino != info.st_ino or
+                    os.fstat(stream.fileno()).st_size < info.st_size):
+                raise ValueError('기록이 바뀌었습니다. 다시 읽어 주세요.')
+    finally:
+        FULL_MESSAGE_TEXT.reset(token)
+    questions, seen = [], {}
+    for question in reversed(found):
+        words, at = question['snippet'], question['ts']
+        last = seen.get(words)
+        if last is not None and at is not None and 0 <= at - last <= QUESTION_REPEAT_SECONDS:
+            continue
+        seen[words] = at
+        questions.append(question)
+    questions.reverse()
+    return {'questions': questions, 'complete': resume is None, 'before': resume,
+            'scannedBytes': scanned, 'skipped': skipped}
+
+
 def history_request(payload, resolve):
-    if (not isinstance(payload, dict) or set(payload) - {'sources', 'query', 'bodyHash', 'textOffset', 'recent'} or
-            not isinstance(payload.get('sources'), list) or not 1 <= len(payload['sources']) <= 5):
+    if (not isinstance(payload, dict) or set(payload) - {'sources', 'query', 'bodyHash', 'textOffset', 'recent', 'questions'} or
+            not isinstance(payload.get('sources'), list) or not 1 <= len(payload['sources']) <= 5 or
+            not (payload.get('questions') is None or payload['questions'] is True) or
+            payload.get('questions') is True and len(payload['sources']) != 1):
         raise ValueError('읽을 대화 목록이 올바르지 않습니다.')
     results = []
     deadline = time.monotonic() + 12
     for source in payload['sources']:
-        if (not isinstance(source, dict) or set(source) - {'agent', 'id', 'home', 'offset'} or
+        if (not isinstance(source, dict) or set(source) - {'agent', 'id', 'home', 'offset', 'before'} or
                 source.get('agent') not in ('codex', 'claude')):
             raise ValueError('대화 식별자가 올바르지 않습니다.')
         try:
             path, parser = resolve(source)
-            result = history_scan(path, parser, {**source, **{key: payload[key] for key in ('query', 'bodyHash', 'textOffset', 'recent') if key in payload}},
-                                  deadline=min(deadline, time.monotonic() + 4))
+            if payload.get('questions'):
+                result = history_questions(path, parser, source, deadline=time.monotonic() + 8)
+            else:
+                result = history_scan(path, parser, {**source, **{key: payload[key] for key in ('query', 'bodyHash', 'textOffset', 'recent') if key in payload}},
+                                      deadline=min(deadline, time.monotonic() + 4))
         except (OSError, ValueError, KeyError):
             result = {'error': '저장 대화 기록을 확인하지 못했습니다.', 'complete': True, 'hits': [], 'nextOffset': None}
         results.append({'source': source, **result})

@@ -1354,6 +1354,84 @@ class SavedHistoryTest(unittest.TestCase):
             second = module.history_scan(self.path, parser, {**self.source, 'query': '검색어', 'offset': first['nextOffset']})
             self.assertEqual(len(second['hits']), 5); self.assertTrue(second['complete'])
 
+    def asked(self, text, at):
+        return {**self.message(text, role='user'), 'timestamp': '2026-10-16T%02d:%02d:00Z' % divmod(at, 60)}
+
+    def test_questions_are_the_user_messages_newest_first_and_the_full_read_finds_each(self):
+        self.write(self.asked('첫  질문\n둘째 줄', 1), self.message('답변'), self.asked('둘째 질문', 3), self.message('x' * 70000),
+                   self.asked('셋째 질문', 5))
+        for module, parser in self.parsers:
+            with self.subTest(platform=module.__name__):
+                result = module.history_questions(self.path, parser, self.source)
+                self.assertEqual([item['snippet'] for item in result['questions']], ['셋째 질문', '둘째 질문', '첫 질문 둘째 줄'])
+                self.assertEqual((result['complete'], result['before']), (True, None))
+                oldest = result['questions'][-1]
+                self.assertEqual(oldest['fullLength'], len('첫  질문\n둘째 줄'))
+                full = module.history_scan(self.path, parser, {**self.source, 'bodyHash': oldest['bodyHash'],
+                                                               'offset': oldest['recordOffset']})
+                self.assertEqual(full['text'], '첫  질문\n둘째 줄')
+                self.assertFalse(module.FULL_MESSAGE_TEXT.get())
+
+    def test_questions_stop_at_the_limit_or_deadline_and_go_on_from_where_they_stopped(self):
+        self.write(*[self.asked('질문 %d' % index, index) for index in range(7)])
+        for module, parser in self.parsers:
+            with self.subTest(platform=module.__name__), patch.object(module, 'QUESTION_LIMIT', 3), \
+                    patch.object(module, 'QUESTION_BLOCK', 64):
+                first = module.history_questions(self.path, parser, self.source)
+                self.assertEqual([item['snippet'] for item in first['questions']], ['질문 6', '질문 5', '질문 4'])
+                self.assertFalse(first['complete'])
+                second = module.history_questions(self.path, parser, {**self.source, 'before': first['before']})
+                self.assertEqual([item['snippet'] for item in second['questions']], ['질문 3', '질문 2', '질문 1'])
+                third = module.history_questions(self.path, parser, {**self.source, 'before': second['before']})
+                self.assertEqual([item['snippet'] for item in third['questions']], ['질문 0'])
+                self.assertTrue(third['complete'])
+                # Out of time before reading anything: no questions, and the next read starts at the end.
+                late = module.history_questions(self.path, parser, self.source, deadline=time.monotonic() - 1)
+                self.assertEqual((late['questions'], late['complete'], late['before']), ([], False, self.path.stat().st_size))
+                # A position that is no record boundary, past the end, or another session's ledger.
+                for request in ({**self.source, 'before': 1}, {**self.source, 'before': 10 ** 9},
+                                {**self.source, 'before': True}, {**self.source, 'id': 'wrong-id-123'}):
+                    with self.assertRaises(ValueError):
+                        module.history_questions(self.path, parser, request)
+
+    def test_questions_skip_an_oversized_record_and_count_a_quick_repeat_once(self):
+        self.write(self.asked('반복 질문', 1), self.asked('반복 질문', 2), self.asked('y' * 5000, 3), self.asked('반복 질문', 9),
+                   self.asked('마지막', 10))
+        for module, parser in self.parsers:
+            with self.subTest(platform=module.__name__), patch.object(module, 'QUESTION_LINE', 4096):
+                result = module.history_questions(self.path, parser, self.source)
+                # The repeat a minute later is the same message logged twice; seven minutes later it is asked again.
+                self.assertEqual([item['snippet'] for item in result['questions']], ['마지막', '반복 질문', '반복 질문'])
+                self.assertEqual(result['skipped'], 1)
+
+    def test_claude_questions_include_messages_typed_while_it_worked(self):
+        sid = 'claude-question-session'
+        path = self.home / 'claude.jsonl'
+        rows = [{'type': 'user', 'sessionId': sid, 'timestamp': '2026-10-16T01:00:00Z', 'message': {'role': 'user', 'content': '시작해 줘'}},
+                {'type': 'assistant', 'sessionId': sid, 'timestamp': '2026-10-16T01:00:05Z',
+                 'message': {'role': 'assistant', 'content': [{'type': 'text', 'text': '네'}]}},
+                {'type': 'user', 'sessionId': sid, 'timestamp': '2026-10-16T01:00:09Z',
+                 'message': {'role': 'user', 'content': [{'type': 'tool_result', 'tool_use_id': 't1', 'content': 'ok'}]}},
+                {'type': 'user', 'sessionId': sid, 'timestamp': '2026-10-16T01:02:00Z', 'message': {'role': 'user', 'content': '이것도 해 줘'}}]
+        path.write_text('\n'.join(json.dumps(row, ensure_ascii=False) for row in rows) + '\n')
+        result = collector.history_questions(path, lambda entry: collector.claude_messages([entry]), {'agent': 'claude', 'id': sid})
+        self.assertEqual([item['snippet'] for item in result['questions']], ['이것도 해 줘', '시작해 줘'])
+        self.assertEqual(result['questions'][0]['ts'], collector.to_epoch('2026-10-16T01:02:00Z'))
+
+    def test_a_questions_request_names_one_session(self):
+        for module in (collector, self.windows):
+            with self.subTest(platform=module.__name__):
+                resolve = lambda source: (self.path, collector.saved_rollout_rows)
+                self.write(self.asked('질문', 1))
+                result = module.history_request({'sources': [self.source], 'questions': True}, resolve)
+                self.assertEqual(result['results'][0]['questions'][0]['snippet'], '질문')
+                self.assertEqual(result['results'][0]['source'], self.source)
+                for payload in ({'sources': [self.source, self.source], 'questions': True},
+                                {'sources': [self.source], 'questions': 1},
+                                {'sources': [{**self.source, 'cwd': '/x'}], 'questions': True}):
+                    with self.assertRaises(ValueError):
+                        module.history_request(payload, resolve)
+
     def test_wrong_identity_and_hash_unknown_never_return_another_message(self):
         self.write(self.message('known body'))
         for module, parser in self.parsers:

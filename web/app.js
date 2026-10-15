@@ -249,6 +249,8 @@ const state = {
   terminalMomentum: null,
   toastTimer: null,
   chats: new Map(),
+  // Counts conversation opens: an entry's usedAt says which ones were used last (trimChatMemory).
+  chatUse: 0,
   draftSavedShapes: new Map(),
   quickRepliesShared: null,
   quickRepliesLocal: null,
@@ -1799,7 +1801,7 @@ async function loadBotConversation(group, { force = false } = {}) {
   if (entry && !force && !entry.error && entry.revision === revision && Date.now() - entry.readAt < BOT_CONVERSATION_MS) {
     renderBotConversation(group); return;
   }
-  if (!entry) { entry = { data: null, error: "", readAt: 0, revision, promise: null }; state.botConversations.set(key, entry); }
+  if (!entry) { entry = { data: null, error: "", readAt: 0, revision, promise: null }; state.botConversations.set(key, entry); trimBotConversations(key); }
   if (networkOffline()) { entry.error = "오프라인입니다. 연결 후 대화를 다시 불러와 주세요."; renderBotConversation(group); return; }
   const authEpoch = state.authEpoch;
   entry.error = "";
@@ -1819,6 +1821,16 @@ async function loadBotConversation(group, { force = false } = {}) {
   })();
   renderBotConversation(group);
   return entry.promise;
+}
+// The bot conversations read last stay (as many as chats keep); an older one is read again
+// when opened. The one opening, the one on screen and one being read always stay.
+function trimBotConversations(opening) {
+  const conversations = state.botConversations;
+  if (conversations.size <= CHAT_MEMORY_KEEP) return;
+  const shown = $("bot-conversation")?.dataset?.conversationKey;
+  const idle = [...conversations].filter(([key, entry]) => key !== opening && key !== shown && !entry.promise)
+    .sort((a, b) => (b[1].readAt || 0) - (a[1].readAt || 0));
+  for (const [key] of idle.slice(Math.max(0, CHAT_MEMORY_KEEP - (conversations.size - idle.length)))) conversations.delete(key);
 }
 function renderBotConversation(group) {
   const { key, latest: request } = group, box = $("bot-conversation");
@@ -3102,6 +3114,8 @@ function refreshDetail(s) {
   state.detailRevision = revision;
   if (fresh) drawDetail(s);
   else patchDetailMetadata(s);
+  // A conversation opened: the ones not used for a while give back what was read for them.
+  if (fresh) trimChatMemory(chatEntry(s));
   loadDetail(s, fresh);
 }
 function detailMetaChildren(s) {
@@ -3896,6 +3910,36 @@ function chatEntry(s) {
 // allSessions() rebuilds every row, so one composer update finds it once.
 function currentChat(entry, selected = selectedSession() || null) {
   return !!selected && chatEntry(selected) === entry && state.authenticated;
+}
+// Every conversation opened since the board was unlocked keeps an entry (its draft and send
+// state). What was read for it (state, transcript, full messages) stays for the ones used
+// last; an older one reads it again when opened. An entry in use keeps everything and takes
+// its place among them first: a draft or files, a send, an upload, a word being composed or
+// heard, a read or command in flight, or the conversation on screen.
+const CHAT_MEMORY_KEEP = 12;
+function chatMemoryHeld(entry) {
+  return !!(entry.data || entry.conversation || entry.fullMessages?.size || entry.historyPreview);
+}
+function chatEntryInUse(entry, shown) {
+  return !!(entry.text || entry.attachments?.length || entry.pending || entry.sending || entry.uploads ||
+    entry.uploadQueue?.length || entry.outbox?.length || entry.composing || entry.checking || entry.commandBusy ||
+    entry.recovering || entry.promptBusy) || shown.has(chatKey(entry.source));
+}
+function trimChatMemory(opened = null) {
+  if (opened) opened.usedAt = ++state.chatUse;
+  // The one opening counts already: its read is on the way.
+  const held = [...state.chats.values()].filter((entry) => entry === opened || chatMemoryHeld(entry));
+  if (held.length <= CHAT_MEMORY_KEEP) return;
+  // On screen: the composer and the conversation (a listening mic is in that composer).
+  const shown = new Set([$("chat-composer")?.dataset?.source, $("messages")?.conversationSource].filter(Boolean));
+  if (opened) shown.add(chatKey(opened.source));
+  const idle = held.filter((entry) => !chatEntryInUse(entry, shown)).sort((a, b) => (b.usedAt || 0) - (a.usedAt || 0));
+  for (const entry of idle.slice(Math.max(0, CHAT_MEMORY_KEEP - (held.length - idle.length)))) {
+    entry.data = null;
+    entry.conversation = null;
+    entry.fullMessages = new Map();
+    entry.historyPreview = null;
+  }
 }
 function networkOffline() {
   return state.offline || globalThis.navigator?.onLine === false;

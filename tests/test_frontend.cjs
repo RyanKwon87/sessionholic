@@ -9365,6 +9365,55 @@ test('작업에서 대화를 직접 열면 대상 분류와 목록 조건을 맞
   c.select(human.key); assert.equal(c.state.sessionCategory, 'general'); assert.equal(c.chatEntry(human).text, '보내지 않은 초안');
 });
 
+test('opened conversations keep what was read only for the 12 used last, never drop a draft, and read an older one again', async () => {
+  const reads = [];
+  const c = client(async (url, opts) => {
+    if (url === '/api/chat/state') {
+      const source = JSON.parse(opts.body).source; reads.push(source.id);
+      return { ok: true, status: 200, json: async () => ({ route: source, capability: { supported: true }, phase: 'idle', receipts: [],
+        messages: [{ role: 'user', text: `질문 ${source.id}` }, { role: 'assistant', text: `답변 ${source.id}` }] }) };
+    }
+    if (String(url).startsWith('/api/bot-requests/conversation'))
+      return { ok: true, status: 200, json: async () => ({ segments: [{ messages: [{ role: 'assistant', text: '봇 답변' }] }] }) };
+    return { ok: true, status: 200, json: async () => ({ ok: true }) };
+  }, noChatTimers);
+  const sessions = Array.from({ length: 20 }, (_, i) => recentSession(`memory-${i}`, { updatedAt: 1000 + i }));
+  setRecentSnapshot(c, sessions);
+  const held = () => [...c.state.chats.values()].filter((e) => e.data || e.conversation || e.fullMessages.size || e.historyPreview);
+  const file = { id: 'file-1', name: 'notes.txt', size: 4, type: 'text/plain' };
+  for (const [i, s] of sessions.entries()) {
+    c.select(s.key); await settle();
+    const entry = c.chatEntry(s);
+    assert.ok(entry.data && entry.conversation, `${s.id} is read when opened`);
+    if (i === 1) entry.text = '보내지 않은 초안';
+    if (i === 2) entry.attachments = [file];
+    if (i === 3) entry.outbox = [{ requestId: 'request-0001', text: '보낸 글', state: 'uncertain', at: 1 }];
+    assert.ok(held().length <= 12, `at most 12 conversations keep what was read (${held().length} after ${i + 1})`);
+  }
+  const entryOf = (i) => c.chatEntry(sessions[i]);
+  assert.equal(entryOf(1).text, '보내지 않은 초안');
+  assert.deepEqual(entryOf(2).attachments, [file]);
+  for (const i of [1, 2, 3]) assert.ok(entryOf(i).data && entryOf(i).conversation, `an entry in use (${i}) keeps everything`);
+  assert.ok(entryOf(19).data, 'the conversation on screen keeps it');
+  assert.equal(entryOf(0).data, null); assert.equal(entryOf(0).conversation, null);
+  assert.equal(entryOf(0).fullMessages.size, 0);
+  // Reopened, a conversation that gave it back reads it again and shows it.
+  const before = reads.filter((id) => id === 'memory-0').length;
+  c.select(sessions[0].key); await settle();
+  assert.equal(reads.filter((id) => id === 'memory-0').length, before + 1);
+  assert.ok(entryOf(0).data && entryOf(0).conversation);
+  assert.match(textOf(c.get('messages')), /답변 memory-0/);
+  assert.ok(held().length <= 12);
+  // Bot conversations read on opening keep as many.
+  const loadBotConversation = vm.runInContext('loadBotConversation', c.context);
+  for (let i = 0; i < 20; i++) {
+    const request = { id: `bot-${i}`, sourceId: 'sample-bot', updatedAt: i, conversationRef: `conversation-${i}` };
+    await loadBotConversation({ key: `bot-${i}`, latest: request, requests: [request] });
+  }
+  assert.ok(c.state.botConversations.size <= 12, `bot conversations kept: ${c.state.botConversations.size}`);
+  assert.ok(c.state.botConversations.has('bot-19'));
+});
+
 test('잠금은 분류 선택과 시작 주체 조건을 일반 세션으로 초기화한다', () => {
   const c = client(undefined, noChatTimers);
   c.state.sessionCategory = 'agent'; c.state.filters.initiator = 'agent'; c.showLogin();

@@ -55,6 +55,10 @@ CLOSE_IDLE = 600
 LAUNCHER_MENU_IDLE = 600
 LAUNCHER_AGENTS_IDLE = 1800
 LAUNCHER_PROGRAM_FRESH = 900
+# A Codex connection (attach) unused this long may be closed when its session is not working
+# or waiting (Terminals.idle_codex_attaches): only the board's TUI client ends, the thread
+# stays on its project's server. It is never closed just to make room (_release_idle).
+CODEX_ATTACH_IDLE = 1800
 # After a look on other tmux servers told nothing (_elsewhere), the next one waits this long.
 LOOK_AGAIN_SECONDS = 600
 # Closed rows kept, the oldest forgotten first. The user's own closes are kept longer:
@@ -1017,6 +1021,26 @@ class TerminalManager:
                         and not metadata.get("typed") and idle >= LAUNCHER_MENU_IDLE):
                     found.append(terminal.record["id"])
         return found
+
+    def idle_codex_attaches(self):
+        """Rows of Codex connections (attach) unused for CODEX_ATTACH_IDLE; the caller ends one
+        only when its session is not working or waiting (release_codex_attach)."""
+        now = time.monotonic()
+        with self.lock:
+            return [self._public(t) for t in self.terminals.values()
+                    if self._releasable(t) and t.record["metadata"].get("agent") == "codex"
+                    and now - t.touched >= CODEX_ATTACH_IDLE and self._exists(t)]
+
+    def release_codex_attach(self, terminal_id):
+        """End one connection idle_codex_attaches named, if it still is one; its row, else None."""
+        with self.lock:
+            if terminal_id not in {row["id"] for row in self.idle_codex_attaches()}:
+                return None
+            terminal = self._get(terminal_id)
+            self._end(terminal, "released")
+            row = self._public(terminal)
+        self._changed()
+        return row
 
     def release_launcher(self, terminal_id):
         """End one terminal idle_launchers named, if it still is one; its row (the caller ends

@@ -943,6 +943,22 @@ class TmuxFixtureTest(unittest.TestCase):
         self.assertTrue(next(item for item in self.manager.list() if item["key"] == "typed")["typed"])
         self.assertEqual(self.manager.idle_launchers(), [], "a restart counts unused time again")
 
+    def test_an_unused_codex_connection_is_named_for_a_session_check_and_ended_when_asked(self):
+        self.manager.max_terminals = 5
+        codex = self.connection("codex", "attach", agent="codex")
+        recent = self.connection("recent", "attach", idle=False, agent="codex")
+        claude = self.connection("claude", "attach", agent="claude")
+        launched = self.connection("launched", "new-session", agent="codex")
+        for item in (codex, claude, launched):
+            self.manager.terminals[item["id"]].touched = time.monotonic() - terminal.CODEX_ATTACH_IDLE - 1
+        self.assertEqual([row["id"] for row in self.manager.idle_codex_attaches()], [codex["id"]])
+        self.assertIsNone(self.manager.release_codex_attach(recent["id"]))
+        row = self.manager.release_codex_attach(codex["id"])
+        self.assertEqual((row["closed"], row["closedReason"]), (True, "released"))
+        self.assertIsNone(self.manager.release_codex_attach(codex["id"]), "already closed")
+        alive = {item["key"]: item["alive"] for item in self.manager.list()}
+        self.assertEqual((alive["codex"], alive["recent"], alive["launched"]), (False, True, True))
+
     def test_a_codex_connection_is_never_released_for_room(self):
         self.connection("codex", "attach", agent="codex")
         with self.assertRaisesRegex(RuntimeError, "가득"):

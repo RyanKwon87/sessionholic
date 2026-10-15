@@ -9341,6 +9341,31 @@ function dictationClient() {
   return { c, calls, intervals, tick, recognitions, FakeRecognition, result, settle, stopTimer, timeouts, frames };
 }
 
+test('the terminal button opens the session terminal already open instead of planning a second', () => {
+  const c = client(undefined, noChatTimers);
+  const { s } = selectChat(c);
+  vm.runInContext('openTerminal = (terminal) => { globalThis.openedTerminal = terminal; };'
+    + 'preparePlan = () => { globalThis.planned = (globalThis.planned || 0) + 1; };'
+    + 'toast = (text) => { (globalThis.toasts = globalThis.toasts || []).push(text); };', c.context);
+  const exact = { id: 'a'.repeat(32), alive: true, closed: false, mode: 'attach', host: 'workstation',
+    nativeSource: { ...c.sourceOf(s) }, linkConfidence: 'exact' };
+  c.state.terminals = [exact];
+  c.openChatTerminal(s);
+  assert.equal(c.context.openedTerminal.id, exact.id);
+  assert.equal(c.context.planned, undefined, 'no second connection is planned');
+  assert.equal(c.context.toasts, undefined);
+  // A 새 세션 terminal linked by its start time is that session's too (its mark says so): opened, with a note.
+  const estimated = { ...exact, id: 'b'.repeat(32), mode: 'new-session', linkConfidence: 'estimated' };
+  c.state.terminals = [estimated];
+  c.openChatTerminal(s);
+  assert.equal(c.context.openedTerminal.id, estimated.id);
+  assert.match(c.context.toasts[0], /추정/);
+  // None live for this session (ended, or another session's): a plan as before.
+  c.state.terminals = [{ ...exact, alive: false }, { ...exact, id: 'c'.repeat(32), nativeSource: { ...exact.nativeSource, id: 'other' } }];
+  c.openChatTerminal(s);
+  assert.equal(c.context.planned, 1);
+});
+
 test('a browser without speech recognition shows no mic', () => {
   const { c } = dictationClient();
   const { s } = selectChat(c);

@@ -43,6 +43,44 @@ def _key(identity):
     return hashlib.sha256(json.dumps(identity, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
 
 
+# Every store identifies every listed row on every snapshot (six times a row): a row's key
+# is kept by the fields _identity reads. Bounded; emptied when full.
+_ROW_FIELDS = ('host', 'agent', 'id', 'home', 'kind', 'sessionId')
+_ROW_KEYS = {}
+_ROW_KEYS_LIMIT = 8192
+
+
+def _row_key(source):
+    """_key(_identity(source)) of a listed row, or None when it cannot be identified."""
+    try:
+        memo = tuple(source.get(name) for name in _ROW_FIELDS)
+        found = _ROW_KEYS.get(memo, False)
+    except TypeError:
+        # A field that cannot be a dictionary key: identified without the memo.
+        memo, found = None, False
+    if found is False:
+        try:
+            found = _key(_identity(source))
+        except (GoalError, ValueError):
+            found = None
+        if memo is not None:
+            if len(_ROW_KEYS) >= _ROW_KEYS_LIMIT:
+                _ROW_KEYS.clear()
+            _ROW_KEYS[memo] = found
+    return found
+
+
+def _lstat_key(path):
+    """What changes when a store file is replaced (every write is a new file), rewritten in
+    place, or has its owner, mode or links changed; None when it is missing or unreadable."""
+    try:
+        info = os.lstat(path)
+    except OSError:
+        return None
+    return (info.st_dev, info.st_ino, info.st_mode, info.st_uid, info.st_nlink, info.st_size,
+            info.st_mtime_ns, info.st_ctime_ns)
+
+
 def _title(value):
     if value is None:
         return None
@@ -53,7 +91,27 @@ def _title(value):
     return scrub_text(value.strip()) or None
 
 
-class SessionLabels(Goals):
+class _KeptRead:
+    """A display store's parsed file, kept for decorate (which only looks) while the file is
+    the same, so the list's poll does not parse and check an unchanged file again."""
+    def state_key(self):
+        """Changes whenever what decorate reads could have: the store file and its lock file."""
+        return _lstat_key(self.path), _lstat_key(self.lock_path)
+
+    def _read_cached(self):
+        """_read, kept while _lstat_key of the file stays the same; the caller holds _storage.
+        The key is taken before reading: a file replaced meanwhile is read again next time.
+        Writers change what _read returns before writing it, so they never get this one."""
+        key = _lstat_key(self.path)
+        kept = getattr(self, '_kept', None)
+        if key is not None and kept is not None and kept[0] == key:
+            return kept[1]
+        data = self._read()
+        self._kept = (key, data) if key is not None and data is not None else None
+        return data
+
+
+class SessionLabels(_KeptRead, Goals):
     """Reuse the existing private-file, flock and atomic-write contract only.
 
     No goal, native process, conversation, SSH or external service is consulted.
@@ -98,11 +156,14 @@ class SessionLabels(Goals):
             raise self._unavailable() from None
 
     @staticmethod
-    def _display(source, title):
+    def _titles(source, title):
         original = source.get('title') or source.get('name') or '제목 없는 작업'
         original = scrub_text(original) if isinstance(original, str) else '제목 없는 작업'
-        return {'source': _identity(source), 'titleAlias': title, 'originalTitle': original,
-                'displayTitle': title or original}
+        return {'titleAlias': title, 'originalTitle': original, 'displayTitle': title or original}
+
+    @classmethod
+    def _display(cls, source, title):
+        return {'source': _identity(source), **cls._titles(source, title)}
 
     def set(self, source, title):
         identity, title = _identity(source), _title(title)
@@ -121,22 +182,23 @@ class SessionLabels(Goals):
                 self._write(data)
             return {**self._display(source, title), 'revision': data['revision']}
 
-    def decorate(self, snapshot):
-        snapshot = copy.deepcopy(snapshot)
+    def decorate(self, snapshot, in_place=False):
+        """`in_place`: the snapshot is the caller's own copy (Board.snapshot makes one) and its
+        rows are decorated as they are instead of in a copy."""
+        if not in_place:
+            snapshot = copy.deepcopy(snapshot)
         try:
             with self._storage():
-                data = self._read()
+                data = self._read_cached()
         except GoalError as exc:
             return {**snapshot, 'sessionLabels': {'ok': False, **exc.payload}}
         for host in snapshot.get('hosts', []):
             for agent in ('codex', 'claude'):
                 for row in (host.get('data') or {}).get(agent, []):
-                    try:
-                        source = {**row, 'host': host['name'], 'agent': agent}
-                        alias = data['labels'].get(_key(_identity(source)), {}).get('title')
-                        row.update({key: value for key, value in self._display(source, alias).items() if key != 'source'})
-                    except (GoalError, ValueError):
+                    key = _row_key({**row, 'host': host['name'], 'agent': agent})
+                    if key is None:
                         continue  # Unidentifiable rows stay visible, without an alias.
+                    row.update(self._titles(row, data['labels'].get(key, {}).get('title')))
         return {**snapshot, 'sessionLabels': {'ok': True, 'revision': data['revision']}}
 
 
@@ -144,7 +206,7 @@ class SessionLabels(Goals):
 MAX_SEEN = 2000
 
 
-class SessionSeen(Goals):
+class SessionSeen(_KeptRead, Goals):
     """The private-file, flock and atomic-write contract of the goal store, for one small
     file. `since` is when this board started keeping it: a session that last changed
     before then is not called unread (its first deploy lights nothing up)."""
@@ -217,12 +279,14 @@ class SessionSeen(Goals):
             self._write(data)
             return True
 
-    def decorate(self, snapshot):
-        """Each row's `seenAt` (None when never looked at here) and the board's `since`."""
-        snapshot = copy.deepcopy(snapshot)
+    def decorate(self, snapshot, in_place=False):
+        """Each row's `seenAt` (None when never looked at here) and the board's `since`.
+        `in_place` as for SessionLabels.decorate."""
+        if not in_place:
+            snapshot = copy.deepcopy(snapshot)
         try:
             with self._storage():
-                data = self._read()
+                data = self._read_cached()
             if data is None:
                 # The first read starts the record: what changed before now counts as read.
                 with self._storage(write=True):
@@ -239,12 +303,11 @@ class SessionSeen(Goals):
         for host in snapshot.get('hosts', []):
             for agent in ('codex', 'claude'):
                 for row in (host.get('data') or {}).get(agent, []):
-                    try:
-                        source = {**row, 'host': host['name'], 'agent': agent}
-                        found = data['seen'].get(_key(_identity(source)))
-                        row[self.ROW_FIELD] = found['at'] if found else None
-                    except (GoalError, ValueError):
+                    key = _row_key({**row, 'host': host['name'], 'agent': agent})
+                    if key is None:
                         continue
+                    found = data['seen'].get(key)
+                    row[self.ROW_FIELD] = found['at'] if found else None
         return {**snapshot, self.SNAPSHOT_FIELD: {'ok': True, 'since': data['since']}}
 
 
@@ -277,7 +340,7 @@ class SessionPinned(SessionSeen):
     WHAT = '상단 고정 기록'
 
 
-class BoardPreferences(Goals):
+class BoardPreferences(_KeptRead, Goals):
     """Small shared UI preferences; never credentials, drafts or native settings."""
     def __init__(self, state_dir):
         super().__init__(state_dir)

@@ -4909,15 +4909,21 @@ body.dock-solo .settings-lock { display: flex; }
 .usage-note {
   margin: 0;
 }
+/* Label and value take what their text needs (a device's "5.2 GB / 8 GB", a larger text
+   size's "100%"); the bar takes the rest. */
 .usage-window {
   display: grid;
-  grid-template-columns: 44px minmax(0, 1fr) 40px;
+  grid-template-columns: minmax(44px, max-content) minmax(48px, 1fr) minmax(40px, max-content);
   align-items: center;
   gap: 2px 8px;
   font-size: var(--fs-cap);
 }
 .usage-window-reset {
   grid-column: 2 / -1;
+}
+.usage-window-label,
+.usage-window-value {
+  white-space: nowrap;
 }
 .usage-window-value {
   text-align: right;
@@ -5806,7 +5812,7 @@ body.dock-solo .settings-lock { display: flex; }
   border-top: 0;
 }
 .dialog-body .usage-window {
-  grid-template-columns: 52px minmax(0, 1fr) 44px;
+  grid-template-columns: minmax(52px, max-content) minmax(48px, 1fr) minmax(44px, max-content);
   padding: 3px 0;
   font-size: var(--fs-sub);
 }

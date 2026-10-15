@@ -9331,7 +9331,14 @@ function dictationClient() {
   const settle = () => new Promise((resolve) => setImmediate(resolve));
   const tick = (times = 1) => { for (let i = 0; i < times; i++) for (const callback of [...intervals.values()]) callback(); };
   const stopTimer = () => timeouts.filter((timer) => timer.ms === 8000).at(-1);
-  return { c, calls, intervals, tick, recognitions, FakeRecognition, result, settle, stopTimer, timeouts };
+  // A hidden frame (an iPad retry) holds the same recognition the page has, unless a test says otherwise.
+  const frames = [];
+  c.context.document.body.append = (frame) => {
+    frames.push(frame);
+    frame.contentWindow = { webkitSpeechRecognition: c.context.webkitSpeechRecognition };
+    frame.remove = () => { frame.removed = true; };
+  };
+  return { c, calls, intervals, tick, recognitions, FakeRecognition, result, settle, stopTimer, timeouts, frames };
 }
 
 test('a browser without speech recognition shows no mic', () => {
@@ -10386,8 +10393,8 @@ test('a menu whose taps iPadOS kept for its own selection still works once the o
   assert.deepEqual(ran, ['복사']);
 });
 
-test('an iPad press listens at once; a start that gives no sound is replaced once, and a second ends at once', async () => {
-  const { c, FakeRecognition, recognitions, result, settle, tick, timeouts } = dictationClient();
+test('an iPad press listens at once; a start that gives no sound is replaced once in a fresh frame, and a second ends at once', async () => {
+  const { c, FakeRecognition, recognitions, result, settle, tick, timeouts, frames } = dictationClient();
   c.context.webkitSpeechRecognition = FakeRecognition;
   c.context.navigator = { userAgent: 'Macintosh AppleWebKit Safari', onLine: true };
   c.context.window.matchMedia = (query) => ({ matches: query === '(pointer: coarse)' });
@@ -10412,6 +10419,10 @@ test('an iPad press listens at once; a start that gives no sound is replaced onc
   const second = recognitions.at(-1);
   assert.notEqual(second, first);
   assert.equal(second.started, 1);
+  assert.equal(frames.length, 1, 'the retry runs in a new document');
+  assert.equal(frames[0].tagName, 'IFRAME');
+  assert.equal(frames[0].attributes.allow, 'microphone');
+  assert.equal(frames[0].removed, undefined);
   c.state.dictation.beganAt -= 400; // A start that takes its time hears.
   second.onstart(); second.onaudiostart();
   assert.equal(c.get('chat-status').textContent, c.DICTATION_LISTENING);
@@ -10421,6 +10432,7 @@ test('an iPad press listens at once; a start that gives no sound is replaced onc
   assert.ok(events.includes('stale') && events.includes('retry') && events.includes('old:end'), events.join(' '));
   mic.events.click(); await settle();
   assert.equal(c.state.dictation, null);
+  assert.equal(frames[0].removed, true, 'the frame goes with its listening');
   // A retry that also gives no sound ends at once, without waiting out the silence.
   input.value = '';
   mic.events.click();
@@ -10434,6 +10446,18 @@ test('an iPad press listens at once; a start that gives no sound is replaced onc
   assert.equal(fourth.aborted, 1);
   assert.equal(c.get('chat-status').textContent, c.DICTATION_STUCK);
   assert.equal(recognitions.length, 4, 'only one retry');
+  assert.equal(frames.at(-1).removed, true);
+  // No recognition in the frame: it says so at once instead of hanging.
+  c.context.document.body.append = (frame) => { frames.push(frame); frame.contentWindow = {}; frame.remove = () => { frame.removed = true; }; };
+  mic.events.click();
+  recognitions.at(-1).onaudiostart();
+  const trace = c.state.dictation.trace;
+  timeouts.filter((timer) => timer.ms === 600).at(-1).callback();
+  assert.equal(c.state.dictation, null);
+  assert.equal(c.get('chat-status').textContent, c.DICTATION_STUCK);
+  assert.equal(trace.events.find((event) => event.e === 'retry').frame, false);
+  assert.equal(frames.at(-1).removed, true);
+  assert.equal(recognitions.length, 5);
   // Not on Android or a mouse device: an instant start is listened to.
   for (const [agent, coarse] of [['Mozilla/5.0 (Linux; Android 15) AppleWebKit/537.36 Chrome/141', true], ['Macintosh AppleWebKit Safari', false]]) {
     c.context.navigator = { userAgent: agent, onLine: true };
@@ -10897,11 +10921,14 @@ test('an iPad press after an abort starts at once; the trace says how the last e
   const stoppedAt = Date.now(); c.stopDictation({ abort: true });
   assert.ok(c.state.dictationEndedAt >= stoppedAt);
   assert.equal(c.state.dictationEndHow, 'abort');
+  first.onend(); // Its late end does not rewrite how the listening ended.
+  assert.equal(c.state.dictationEndHow, 'abort');
   mic.events.click(); const second = recognitions.at(-1);
   assert.equal(second.started, 1);
   assert.equal(mic.attributes['aria-label'], '음성 입력 중지');
   const { env } = c.state.dictation.trace;
   assert.equal(env.lastEnd, 'abort');
+  assert.equal(env.made, 1, 'recognitions this page made before the press');
   assert.ok(Number.isInteger(env.sinceEnd) && env.sinceEnd >= 0);
   assert.equal(typeof env.kb, 'boolean');
   assert.match(env.act, /^[A-Za-z0-9_.:+-]{0,40}$/);

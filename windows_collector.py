@@ -29,11 +29,16 @@ import uuid
 LIMIT = 100
 ENDPOINT_LIMIT = 16
 TAIL_BYTES = 2 * 1024 * 1024
+# Lines of a file's end parsed at most.
+ENTRY_LIMIT = 2000
 # A Claude list row reads only a transcript's end: Claude appends its rename and generated
 # titles again and again, so the newest of each and the last answer sit in the final kilobytes.
 CLAUDE_LABEL_TAIL = 64 * 1024
 CLAUDE_TITLES = (('custom-title', 'customTitle'), ('agent-name', 'agentName'), ('ai-title', 'aiTitle'))
+# As collector.recent_window: the newest MESSAGE_LIMIT questions and answers with every row
+# after the oldest of them, at most ROW_LIMIT rows.
 MESSAGE_LIMIT = 80
+ROW_LIMIT = 400
 FULL_MESSAGE_TEXT = ContextVar('full_message_text', default=False)
 SID = re.compile(r'[0-9A-Za-z-]{8,64}\Z')
 CAPABILITIES = {'readOnly': True, 'canRead': True, 'canSend': False, 'canLaunch': False, 'canControl': False}
@@ -1037,8 +1042,10 @@ class WindowsCollector:
                             'activeFlags': [], 'updatedAt': row.get('updatedAt'), 'readOnly': True,
                             'historyNotice': dict(NOT_PERSISTED), 'executionMode': 'one-shot', 'transcriptAvailability': 'disabled'}
                 raise ValueError('정확한 PC Claude 대화 기록을 찾지 못했습니다.')
-            messages = _claude_messages(_tail(path))
-            return {'messages': messages, 'phase': row.get('phase', 'unknown'), 'runtimeKnown': row.get('runtimeKnown', False),
+            entries, whole = _tail_read(path)
+            messages, dropped = _recent_window(_claude_rows(entries))
+            return {'messages': messages, 'olderOmitted': dropped or not whole,
+                    'phase': row.get('phase', 'unknown'), 'runtimeKnown': row.get('runtimeKnown', False),
                     'activeFlags': [], 'updatedAt': int(path.stat().st_mtime), 'readOnly': True,
                     **{key: row[key] for key in ('executionMode', 'transcriptAvailability') if key in row}}
         if home != '.codex':
@@ -1063,7 +1070,8 @@ class WindowsCollector:
                 thread = result.get('thread') if isinstance(result, dict) else None
                 if not isinstance(thread, dict) or thread.get('id') != sid or _norm(thread.get('cwd')) != _norm(row['cwd']):
                     raise ValueError('PC 서버 대화의 소유 경계가 다릅니다.')
-                observed.append({'messages': _codex_messages(thread.get('turns') or []), 'phase': _phase(thread.get('status')),
+                messages, dropped = _recent_window(_codex_rows(thread.get('turns') or []))
+                observed.append({'messages': messages, 'olderOmitted': dropped, 'phase': _phase(thread.get('status')),
                         'runtimeKnown': _phase(thread.get('status')) != 'unknown',
                         'activeFlags': _flags(thread.get('status')),
                         'updatedAt': _epoch(thread.get('updatedAt')), 'readOnly': True})
@@ -1081,7 +1089,9 @@ class WindowsCollector:
         meta = next((entry.get('payload') for entry in _head(path) if entry.get('type') == 'session_meta'), None)
         if not isinstance(meta, dict) or meta.get('id') != sid or _norm(meta.get('cwd')) != _norm(row['cwd']):
             raise ValueError('PC 저장 대화의 세션 신원을 확인하지 못했습니다.')
-        return {'messages': _rollout_messages(_tail(path)), 'phase': 'unknown', 'runtimeKnown': False,
+        entries, whole = _tail_read(path)
+        messages, dropped = _recent_window(_rollout_rows(entries))
+        return {'messages': messages, 'olderOmitted': dropped or not whole, 'phase': 'unknown', 'runtimeKnown': False,
                 'activeFlags': [], 'updatedAt': _epoch(row['updated_at']), 'readOnly': True,
                 'runtimeReason': '저장된 대화입니다. 현재 실행 상태는 확인되지 않았습니다.'}
 
@@ -1093,13 +1103,33 @@ def _head(path):
 
 
 def _tail(path, limit=TAIL_BYTES):
+    return _tail_read(path, limit)[0]
+
+
+def _tail_read(path, limit=TAIL_BYTES):
+    """(entries of the file's end, whether they reach back to its start)."""
     with path.open('rb') as stream:
         stream.seek(0, os.SEEK_END)
         size = stream.tell()
         stream.seek(max(0, size - limit))
         raw = stream.read(limit)
     lines = raw.splitlines()
-    return _entries(lines[1:] if size > limit else lines)
+    if size > limit:
+        lines = lines[1:]
+    return _entries(lines), size <= limit and len(lines) <= ENTRY_LIMIT
+
+
+def _recent_window(rows):
+    """(window, olderOmitted), as collector.recent_window (this reader runs on its own)."""
+    start, seen = 0, 0
+    for index in range(len(rows) - 1, -1, -1):
+        if rows[index].get('role') in ('user', 'assistant'):
+            seen += 1
+            if seen == MESSAGE_LIMIT:
+                start = index
+                break
+    start = max(start, len(rows) - ROW_LIMIT)
+    return rows[start:], start > 0
 
 
 def _one_line(value, limit):
@@ -1125,7 +1155,7 @@ def _claude_label(path):
 
 def _entries(lines):
     entries = []
-    for raw in lines[-2000:]:
+    for raw in lines[-ENTRY_LIMIT:]:
         try:
             item = json.loads(raw)
             if isinstance(item, dict):
@@ -1184,6 +1214,10 @@ def _message(role, text, ts=None, **metadata):
 
 
 def _codex_messages(turns):
+    return _recent_window(_codex_rows(turns))[0]
+
+
+def _codex_rows(turns):
     result = []
     for turn in turns if isinstance(turns, list) else []:
         if not isinstance(turn, dict):
@@ -1202,10 +1236,14 @@ def _codex_messages(turns):
                 result.append(_message('assistant', item['text'], turn.get('completedAt'), phase=item.get('phase'), **metadata))
             elif item.get('type') == 'commandExecution':
                 result.append(_message('tool', '$ ' + _text(item.get('command'), 160), toolKind='command', **metadata))
-    return result[-MESSAGE_LIMIT:]
+    return result
 
 
 def _claude_messages(entries):
+    return _recent_window(_claude_rows(entries))[0]
+
+
+def _claude_rows(entries):
     result = []
     for entry in entries:
         message = entry.get('message')
@@ -1216,10 +1254,14 @@ def _claude_messages(entries):
         text = content if isinstance(content, str) else '\n'.join(block.get('text', '') for block in content or [] if isinstance(block, dict) and block.get('type') == 'text' and isinstance(block.get('text'), str)) if isinstance(content, list) else ''
         if text and not text.startswith(('<system-reminder>', '[Request interrupted by user')):
             result.append(_message(role, text, entry.get('timestamp'), messageId=entry.get('uuid')))
-    return result[-MESSAGE_LIMIT:]
+    return result
 
 
 def _rollout_messages(entries):
+    return _recent_window(_rollout_rows(entries))[0]
+
+
+def _rollout_rows(entries):
     result = []
     turn = None
     for entry in entries:
@@ -1240,7 +1282,7 @@ def _rollout_messages(entries):
             text = '\n'.join(value for value in texts if value is not None)
             if text:
                 result.append(_message(role, text, entry.get('timestamp'), turnId=turn, messageId=payload.get('id'), phase=payload.get('phase')))
-    return result[-MESSAGE_LIMIT:]
+    return result
 
 
 def history_header_rows(stream):

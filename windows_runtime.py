@@ -445,7 +445,8 @@ class WindowsRuntime:
                     receipt = saved['result']
             receipts.append(receipt)
         capabilities = {**_capabilities(thread), 'canLaunch': True}
-        result = {**_state(thread), 'messages': wc._codex_messages(thread['turns']), 'cwd': observed['cwd'],
+        messages, older = wc._recent_window(wc._codex_rows(thread['turns']))
+        result = {**_state(thread), 'messages': messages, 'olderOmitted': older, 'cwd': observed['cwd'],
                   'capabilities': capabilities, 'readOnly': not capabilities['canSend'], 'receipts': receipts}
         if action == 'receipt':
             result.update(receipts[0])

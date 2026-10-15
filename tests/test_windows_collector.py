@@ -777,6 +777,30 @@ class WindowsCollectorTest(unittest.TestCase):
         result = self.reader.read('claude', sid)
         self.assertEqual(len(result['messages']), wc.MESSAGE_LIMIT)
         self.assertEqual(result['messages'][0]['text'], '합성 20')
+        self.assertIs(result['olderOmitted'], True)
+        sid, path = self.claude_transcript(messages=[{'type': 'user', 'message': {'content': '합성 %d' % index}} for index in range(3)])
+        self.assertIs(self.reader.read('claude', sid)['olderOmitted'], False)
+        # A transcript longer than the bytes read may hold older messages.
+        self.assertEqual([wc._tail_read(path, limit)[1] for limit in (64, wc.TAIL_BYTES)], [False, True])
+
+    def test_pc_reads_follow_the_same_window_as_the_board(self):
+        self.assertEqual((wc.MESSAGE_LIMIT, wc.ROW_LIMIT), (80, 400))
+        # The saved rollout of a stopped server, read whole.
+        self.assertIs(self.reader.read('codex', self.sid, '.codex')['olderOmitted'], False)
+        self.endpoint()
+        self.live['turns'] = [{'id': 'turn-%d' % number, 'status': 'completed', 'startedAt': number, 'completedAt': number, 'items':
+            [{'id': 'input-%d' % number, 'type': 'userMessage', 'content': [{'type': 'text', 'text': '합성 입력 %d' % number}]}]
+            + [{'id': 'command-%d-%d' % (number, index), 'type': 'commandExecution', 'command': 'dir'} for index in range(5)]
+            + [{'id': 'answer-%d' % number, 'type': 'agentMessage', 'text': '합성 답변 %d' % number}]} for number in range(100)]
+        result = self.reader.read('codex', self.sid, '.codex')
+        # 7 rows a turn: the 80 newest inputs and answers with the commands between them.
+        self.assertEqual((len(result['messages']), result['messages'][0]['text'], result['olderOmitted']), (280, '합성 입력 60', True))
+        self.live['turns'] = [{'id': 'turn-1', 'status': 'completed', 'items': [
+            {'id': 'command-%d' % index, 'type': 'commandExecution', 'command': 'dir'} for index in range(500)]}]
+        result = self.reader.read('codex', self.sid, '.codex')
+        self.assertEqual((len(result['messages']), result['olderOmitted']), (wc.ROW_LIMIT, True))
+        self.live['turns'] = self.live['turns'][:0]
+        self.assertIs(self.reader.read('codex', self.sid, '.codex')['olderOmitted'], False)
 
     def test_cli_errors_are_json_without_paths_or_raw_exception(self):
         with patch.object(wc, 'WindowsCollector', return_value=self.reader), contextlib.redirect_stdout(io.StringIO()) as output:

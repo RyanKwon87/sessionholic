@@ -790,11 +790,13 @@ class FakeDaemon:
     """A Codex app-server stand-in on a real Unix socket: WebSocket upgrade, JSON-RPC
     replies from `threads`, and notifications pushed to every initialized client."""
 
-    def __init__(self, path, threads=None, loaded=(), reject_state_db=False):
+    def __init__(self, path, threads=None, loaded=(), reject_state_db=False, account=None):
         self.path = str(path)
         self.threads = list(threads or [])
         self.loaded = list(loaded)
         self.reject_state_db = reject_state_db
+        # account/read's answer; None: a daemon that does not know the method.
+        self.account = account
         self.lock = threading.Lock()
         self.calls, self.clients, self.workers = [], [], []
         self.capabilities = []
@@ -874,6 +876,8 @@ class FakeDaemon:
                 reply = {"result": {"data": json.loads(json.dumps(self.threads))}}
             elif method == "thread/loaded/list":
                 reply = {"result": {"data": list(self.loaded)}}
+            elif method == "account/read" and self.account is not None:
+                reply = {"result": {"account": self.account, "requiresOpenaiAuth": True}}
             else:
                 reply = {"error": {"code": -32601, "message": "not here"}}
         self.send(conn, dict(reply, id=message["id"]))
@@ -1061,6 +1065,17 @@ class WatchTest(unittest.TestCase):
         writer.close()
         bye, _ = out.wait(lambda m: m.get("type") == "bye")
         self.assertEqual(bye["reason"], "stdin-closed")
+
+    def test_the_watch_says_which_account_each_home_runs_on(self):
+        daemon = self.daemon(threads=[thread_row("t1")],
+                             account={"type": "chatgpt", "email": "someone@example.com", "planType": "pro"})
+        with patch.dict(collector.CODEX_LOGINS, clear=True):
+            watch, writer, out = self.start()
+            first, _ = out.wait(lambda m: m.get("type") == "snapshot")
+            writer.close()
+            out.wait(lambda m: m.get("type") == "bye")
+        self.assertEqual(first["data"]["codex"][0]["login"], {"kind": "chatgpt", "email": "someone@example.com", "plan": "pro"})
+        self.assertEqual(daemon.count("account/read"), 1)
 
     def test_backup_polls_and_minor_changes_wait_longer(self):
         daemon = self.daemon(threads=[thread_row("t1")])

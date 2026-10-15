@@ -382,6 +382,10 @@ class WindowsRoutingTest(unittest.TestCase):
         self.assertIn("'" + SID + "'", script)
         with self.assertRaises(ValueError):
             self.flow.transfers.windows_terminal(HOST, {**spec, 'env': {'TOKEN': 'value'}})
+        # A running PC Claude background session: `claude attach <job id>` as literal arguments.
+        attach = {'argv': ['C:/Users/example/.local/bin/claude.exe', 'attach', SID[:8]], 'cwd': 'C:/Work', 'env': {}}
+        script = base64.b64decode(self.flow.transfers.windows_terminal(HOST, attach)[-1].split()[-1]).decode('utf-16le')
+        self.assertIn("& 'C:/Users/example/.local/bin/claude.exe' 'attach' '" + SID[:8] + "'; exit $LASTEXITCODE", script)
 
 
 class WindowsHTTPTest(unittest.TestCase):

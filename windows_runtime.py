@@ -24,6 +24,9 @@ import uuid
 import windows_collector as wc
 
 REQUEST = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.:-]{7,127}\Z')
+# A Claude background run's job id: what `claude --bg` prints, `claude agents` lists and
+# `claude attach` takes (the session UUID is refused there).
+CLAUDE_JOB = re.compile(r'[0-9a-z]{8}\Z')
 
 
 class NotLoaded(ValueError):
@@ -632,7 +635,15 @@ class WindowsRuntime:
             observed = self._claude(source)
             if observed['row'].get('kind') != 'bg':
                 raise ValueError('이 Claude 세션은 원래 대화형 터미널에서 실행 중입니다. 정확한 연결을 지원하는 background 세션만 열 수 있습니다.')
-            raise ValueError('이 PC Claude background 세션의 터미널 연결 식별자를 확인하지 못했습니다. 원본 PC 터미널에서 이어가세요.')
+            # The verified owner's registry record names its job. Closing the board terminal
+            # ends only this attach client; the run keeps going.
+            job = observed['row'].get('jobId')
+            if not isinstance(job, str) or not CLAUDE_JOB.fullmatch(job):
+                raise ValueError('이 PC Claude background 세션의 터미널 연결 식별자를 확인하지 못했습니다. 원본 PC 터미널에서 이어가세요.')
+            binary = self.reader.home / '.local/bin/claude.exe'
+            if not binary.is_file():
+                raise ValueError('PC Claude 실행 파일을 확인하지 못했습니다.')
+            argv, cwd = [str(binary), 'attach', job], observed['row'].get('cwd')
         if not isinstance(cwd, str) or not Path(wc._windows_path(cwd)).is_dir():
             raise ValueError('PC 원본 작업 폴더를 확인하지 못했습니다.')
         return {'argv': argv, 'cwd': cwd, 'env': {'CODEX_HOME': str(self.reader.codex_home)} if identity['agent'] == 'codex' else {},

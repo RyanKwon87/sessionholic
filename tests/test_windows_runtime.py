@@ -350,6 +350,36 @@ class WindowsRuntimeTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.runtime.terminal_plan(source)
 
+    def test_a_running_claude_background_session_attaches_by_its_job_id(self):
+        source, row, path = self.claude('bg')
+        job = source['id'][:8]
+        path.write_text(json.dumps({**row, 'jobId': job}))
+        plan = self.runtime.terminal_plan(source)
+        self.assertEqual(plan['argv'], [str(self.home / '.local/bin/claude.exe'), 'attach', job])
+        self.assertEqual((plan['cwd'], plan['env'], plan['connectionMode']), (str(self.reader.cwd), {}, 'attach'))
+        self.assertEqual((plan['nativeSource']['id'], plan['nativeSource']['kind']), (source['id'], 'background'))
+        self.assertNotIn('resumed', plan)
+        # Not a job id `claude attach` takes: no attach to some other run.
+        for value in (source['id'], 'ABCD1234', '1234567', '12345678 ', 'a1b2c3d4e', 12345678):
+            path.write_text(json.dumps({**row, 'jobId': value}))
+            with self.assertRaisesRegex(ValueError, '연결 식별자'):
+                self.runtime.terminal_plan(source)
+        # Mid-update the run keeps its renamed old image while no claude.exe exists yet.
+        path.write_text(json.dumps({**row, 'jobId': job}))
+        old = self.home / '.local/bin/claude.exe.old.1792000000000.45'
+        old.touch()
+        self.reader.processes[45]['exe'] = str(old)
+        (self.home / '.local/bin/claude.exe').unlink()
+        with patch.object(self.reader, '_claude_executable', lambda exe: Path(exe).is_file()), \
+                self.assertRaisesRegex(ValueError, '실행 파일'):
+            self.runtime.terminal_plan(source)
+        self.reader.processes[45]['exe'] = str(self.home / '.local/bin/claude.exe')
+        # A record another process now owns is no live run: its old job id is never attached.
+        (self.home / '.local/bin/claude.exe').touch()
+        path.write_text(json.dumps({**row, 'jobId': job, 'procStart': '134362358929099999'}))
+        with self.assertRaises(ValueError):
+            self.runtime.terminal_plan(source)
+
     def test_native_vendor_remote_nested_sources_are_rejected(self):
         for value in ('vendorRemote', {'vendorRemote': {}}, {'wrapper': [{'vendorRemote': 'x'}]}):
             self.reader.thread['threadSource'] = value

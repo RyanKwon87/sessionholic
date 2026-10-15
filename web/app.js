@@ -11454,7 +11454,6 @@ window.addEventListener("DOMContentLoaded", () => {
   });
   $("settings").addEventListener("click", openSettings);
   $("settings-close").addEventListener("click", closeSettings);
-  $("settings-done").addEventListener("click", closeSettings);
   $("hard-reload")?.addEventListener("click", hardReload);
   $("quick-reload")?.addEventListener("click", hardReload);
   $("board-status-panel")?.addEventListener("click", (event) => {
@@ -11498,7 +11497,6 @@ window.addEventListener("DOMContentLoaded", () => {
   $("hardware-close").addEventListener("click", () => closeSheet("hardware-dialog", "hardware"));
   $("filter-open").addEventListener("click", () => sheet("filter-dialog").open());
   $("filter-close").addEventListener("click", () => closeSheet("filter-dialog", "filter-open"));
-  $("filter-done").addEventListener("click", () => closeSheet("filter-dialog", "filter-open"));
   $("filter-reset").addEventListener("click", resetFilters);
   for (const category of Object.keys(SESSION_CATEGORIES))
     $(`session-category-${category}`).addEventListener("click", () => setSessionCategory(category));

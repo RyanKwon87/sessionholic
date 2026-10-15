@@ -5148,7 +5148,7 @@ test('the settings sheet opens from the top bar with the current theme and retur
   assert.equal(c.get('theme-dark').checked, true);
   c.get('theme-light').events.change({ target: { checked: true } });
   assert.equal(c.state.theme, 'light');
-  c.get('settings-done').events.click();
+  c.get('settings-close').events.click();
   assert.equal(c.get('settings-dialog').open, false);
   assert.equal(c.get('settings').focusCount, 1);
   let prevented = 0;
@@ -6828,6 +6828,25 @@ test('a swipe offers 터미널 열기, or 연결 닫기 when the session has a b
   groups.events.pointermove({ target, pointerId: 4, clientX: 296, clientY: 130, cancelable: true, preventDefault() {} });
   groups.events.pointerup({ pointerId: 4 });
   assert.equal(c.state.swipeOpen, null);
+});
+
+test('the settings and filter sheets close from one 완료 at the top right, as iOS sheets do', () => {
+  const html = indexPage();
+  for (const [id, label] of [['settings-close', '설정'], ['filter-close', '필터']]) {
+    assert.match(html, new RegExp(`<button id="${id}" class="sheet-done" type="button">완료</button>`), `${label}: 완료 at the top`);
+  }
+  assert.doesNotMatch(html, /id="(?:settings|filter)-done"/, 'no second close button at the bottom');
+  assert.match(html, /<div class="dialog-actions">\s*<button id="filter-reset" class="secondary" type="button">초기화<\/button>\s*<\/div>/);
+  assert.doesNotMatch(source, /(?:settings|filter)-done/);
+  assert.match(styleSheet(), /\.dialog-top \.sheet-done \{[^}]*margin-left: auto;[^}]*color: var\(--accent\);/);
+  const c = client(undefined, noChatTimers);
+  c.context.navigator = { onLine: false };
+  c.windowEvents.DOMContentLoaded();
+  c.get('filter-open').events.click();
+  assert.equal(c.get('filter-dialog').open, true);
+  c.get('filter-close').events.click();
+  assert.equal(c.get('filter-dialog').open, false);
+  assert.equal(c.get('filter-open').focusCount, 1, 'focus returns to the filter button');
 });
 
 test('a card held for its menu lifts like an iOS context menu; a move, the lifted finger or a mouse never leave it lifted', () => {

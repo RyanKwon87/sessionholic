@@ -2341,6 +2341,24 @@ li[data-task] {
     transparent 15.5px
   );
 }
+/* Sheets whose changes apply at once (settings, filter) close from one 완료 at the
+   top right, as iOS sheets do. */
+.dialog-top .sheet-done {
+  flex: none;
+  min-height: var(--tap);
+  margin-left: auto;
+  margin-right: 4px;
+  padding: 0 12px;
+  border: 0;
+  border-radius: var(--radius-s);
+  background: transparent;
+  color: var(--accent);
+  font-size: var(--fs-body);
+  font-weight: 600;
+}
+.dialog-top .sheet-done:active:not(:disabled) {
+  opacity: 0.5;
+}
 .plan-dialog h2 {
   flex: none;
   margin-bottom: 14px;
@@ -3275,6 +3293,10 @@ li[data-task] {
     flex-direction: column-reverse;
     gap: 8px;
     padding: 16px var(--sheet-pad) max(16px, env(safe-area-inset-bottom));
+  }
+  /* With no button row below, a sheet's last lines clear the home indicator. */
+  .sheet > .dialog-body:last-child {
+    padding-bottom: max(16px, env(safe-area-inset-bottom));
   }
   .dialog-actions button {
     width: 100%;

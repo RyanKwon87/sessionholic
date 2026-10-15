@@ -866,7 +866,7 @@ class TmuxFixtureTest(unittest.TestCase):
         self.assertEqual((rows["old"]["alive"], rows["old"]["closedReason"]), (False, "released"))
         self.assertTrue(rows["recent"]["alive"])
         self.assertTrue(rows["owned"]["alive"], "a terminal running its own CLI never closes by itself")
-        self.assertTrue(rows["codex"]["alive"], "a Codex connection closes only when room is needed")
+        self.assertTrue(rows["codex"]["alive"], "a Codex connection is never closed by the board")
         self.assertTrue(changes)
         self.assertIsNotNone(recent)
 
@@ -888,6 +888,67 @@ class TmuxFixtureTest(unittest.TestCase):
         self.assertIsNone(next(item for item in self.manager.list() if item["key"] == "launched")["programCwd"])
         with self.assertRaises(ValueError):
             self.manager.set_program(launched["id"], {"program": "rm -rf"})
+        # Its launcher named with nothing below it: the menu waits. An SSH connection is a program.
+        self.manager.set_program(launched["id"], {"program": None, "launcher": True})
+        row = next(item for item in self.manager.list() if item["key"] == "launched")
+        self.assertEqual((row["program"], row["programMenu"]), (None, True))
+        self.manager.set_program(launched["id"], {"program": "ssh", "cwd": None})
+        row = next(item for item in self.manager.list() if item["key"] == "launched")
+        self.assertEqual((row["program"], row["programMenu"]), ("ssh", False))
+        self.manager.set_program(launched["id"], {"program": None})
+        self.assertFalse(next(item for item in self.manager.list() if item["key"] == "launched")["programMenu"])
+
+    def test_unused_launcher_menus_and_agent_views_close_and_nothing_else_does(self):
+        self.manager.max_terminals = 12
+
+        def launcher(key, info, idle):
+            created = self.connection(key, "new-session", idle=False)
+            if info is not None:
+                self.manager.set_program(created["id"], info)
+            self.manager.terminals[created["id"]].touched = time.monotonic() - idle
+            return created
+        old = terminal.LAUNCHER_AGENTS_IDLE + 1
+        menu = launcher("menu", {"program": None, "launcher": True}, terminal.LAUNCHER_MENU_IDLE + 1)
+        launcher("fresh-menu", {"program": None, "launcher": True}, terminal.LAUNCHER_MENU_IDLE - 30)
+        typed = launcher("typed", {"program": None, "launcher": True}, 0)
+        self.manager.write(typed["id"], "1\n")  # A menu choice, through the board.
+        self.manager.terminals[typed["id"]].touched = time.monotonic() - old
+        agents = launcher("agents", {"program": "claude-agents", "cwd": None}, old)
+        launcher("recent-agents", {"program": "claude-agents", "cwd": None}, terminal.LAUNCHER_MENU_IDLE + 1)
+        for program in ("claude", "codex", "ssh"):
+            launcher(program, {"program": program, "cwd": None}, old)
+        launcher("unnamed", {"program": None}, old)  # No launcher named on its host.
+        launcher("unread", None, old)  # Its program never read.
+        stale = launcher("stale", {"program": "claude-agents", "cwd": None}, old)
+        self.manager.terminals[stale["id"]].record["metadata"]["programAt"] = int(time.time()) - terminal.LAUNCHER_PROGRAM_FRESH - 1
+        attach = self.connection("attach", "attach")
+        self.manager.terminals[attach["id"]].touched = time.monotonic() - old
+        self.assertEqual(set(self.manager.idle_launchers()), {menu["id"], agents["id"]})
+        changes = []
+        self.manager.add_listener(lambda: changes.append(1))
+        row = self.manager.release_launcher(menu["id"])
+        self.assertEqual((row["closed"], row["closedReason"], row["host"]), (True, "released", "local"))
+        self.assertTrue(changes)
+        self.assertIsNone(self.manager.release_launcher(menu["id"]), "already closed")
+        self.manager.read(agents["id"], 0, 0)  # Looked at again: no longer unused.
+        self.assertIsNone(self.manager.release_launcher(agents["id"]))
+        rows = {item["key"]: item for item in self.manager.list()}
+        self.assertFalse(rows["menu"]["alive"])
+        for key in ("fresh-menu", "typed", "agents", "recent-agents", "claude", "codex", "ssh", "unnamed", "unread", "stale", "attach"):
+            self.assertTrue(rows[key]["alive"], key)
+        # Typing is kept across a restart: a chosen menu is never taken for an untouched one.
+        self.manager.close()
+        self.manager = terminal.TerminalManager(state_dir=self.directory.name, socket_name=self.socket, max_terminals=12)
+        self.managers.append(self.manager)
+        self.assertTrue(next(item for item in self.manager.list() if item["key"] == "typed")["typed"])
+        self.assertEqual(self.manager.idle_launchers(), [], "a restart counts unused time again")
+
+    def test_a_codex_connection_is_never_released_for_room(self):
+        self.connection("codex", "attach", agent="codex")
+        with self.assertRaisesRegex(RuntimeError, "가득"):
+            with self.manager.reserve("next"):
+                self.fail("a Codex connection was released for room")
+        self.assertTrue(next(row for row in self.manager.list() if row["key"] == "codex")["alive"])
 
     def test_a_browser_read_keeps_a_connection_from_being_released(self):
         old = self.connection("old", "attach")

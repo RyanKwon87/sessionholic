@@ -14,6 +14,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
@@ -172,9 +173,10 @@ class FakeTerminals:
 
     def __init__(self):
         self.created = []
+        self.rows = []
 
     def list(self):
-        return []
+        return list(self.rows)
 
     @contextmanager
     def reserve(self, key):
@@ -225,6 +227,51 @@ class WorkflowNewSessionTest(unittest.TestCase):
             with self.assertRaises(ValueError):
                 self.flow.new_session(payload)
         self.assertEqual(len(self.terms.created), 1)
+
+    def test_pressed_again_while_a_menu_waits_on_that_host_opens_that_menu(self):
+        now = int(time.time())
+        waiting = {'id': 'a' * 32, 'mode': 'new-session', 'host': 'local', 'alive': True, 'closed': False,
+                   'program': None, 'programMenu': True, 'createdAt': now - 30}
+        self.terms.rows = [waiting, {**waiting, 'id': 'b' * 32, 'createdAt': now - 60}]
+        result = self.flow.new_session({'host': 'local', 'requestId': 'request-0031'})
+        self.assertEqual((result['terminal']['id'], result['reused']), ('a' * 32, True))
+        self.assertEqual(self.terms.created, [])
+        self.assertEqual(self.flow.new_session({'host': 'local', 'requestId': 'request-0031'}), result)
+        # Anything else opens a new one: typed into, running something, not read as a menu,
+        # too old, another preset, another host, ended, or a PC's menu.
+        for changed in ({'typed': True}, {'program': 'claude'}, {'programMenu': False}, {'programMenu': None},
+                        {'createdAt': now - server.Workflow.LAUNCHER_REUSE_SECONDS - 1}, {'preset': 'max'},
+                        {'host': 'remote'}, {'alive': False}, {'closed': True}):
+            with self.subTest(changed=changed):
+                self.terms.rows = [{**waiting, **changed}]
+                before = len(self.terms.created)
+                self.assertNotIn('reused', self.flow.new_session({'host': 'local', 'requestId': 'request-%04d' % (100 + len(self.terms.created))}))
+                self.assertEqual(len(self.terms.created), before + 1)
+        self.terms.rows = [{**waiting, 'preset': 'max'}]
+        self.assertTrue(self.flow.new_session({'host': 'local', 'requestId': 'request-0041', 'preset': 'max'})['reused'])
+        pc = {**LOCAL, 'name': 'pc', 'platform': 'windows'}
+        self.assertIsNone(self.flow.waiting_launcher(pc, None))
+
+    def test_unused_launchers_are_closed_with_their_held_runs_and_nothing_else(self):
+        released, ended = [], []
+
+        class Terms(FakeTerminals):
+            def idle_launchers(self):
+                return ['a' * 32, 'b' * 32, 'c' * 32]
+
+            def release_launcher(self, terminal_id):
+                if terminal_id == 'b' * 32:
+                    return None  # In use again since it was named.
+                if terminal_id == 'c' * 32:
+                    raise RuntimeError('tmux')
+                released.append(terminal_id)
+                return {'id': terminal_id, 'host': 'remote', 'holdName': 'sh-0123456789abcdef', 'program': 'claude-agents'}
+        self.flow.terminals = Terms()
+        with patch.object(self.flow, 'end_hold', side_effect=lambda row: ended.append(row['holdName'])):
+            self.assertEqual(self.flow.close_idle_launchers(), ['a' * 32])
+        self.assertEqual((released, ended), (['a' * 32], ['sh-0123456789abcdef']))
+        self.flow.terminals = FakeTerminals()  # A manager without the rule closes nothing.
+        self.assertEqual(self.flow.close_idle_launchers(), [])
 
     def test_a_new_session_request_repeated_while_it_opens_waits_and_opens_once(self):
         started, release = threading.Event(), threading.Event()

@@ -1664,6 +1664,27 @@ class Workflow:
         self.board.request_refresh(host["name"], force=True)
         return {"ok": True, "started": result["started"]}
 
+    LAUNCHER_REUSE_SECONDS = 600
+
+    def waiting_launcher(self, host, preset):
+        """The newest 새 세션 terminal on `host` still at its launcher's menu (its host named the
+        launcher with nothing below it, and nobody typed into it), opened within
+        LAUNCHER_REUSE_SECONDS with the same preset; else None. A PC's menu is never read (its
+        program is not named), so it is never reused."""
+        if host.get("platform") == "windows":
+            return None
+        try:
+            rows = self.terminals.list()
+        except (RuntimeError, OSError, ValueError):
+            return None
+        now = time.time()
+        waiting = [row for row in rows
+                   if row.get("mode") == "new-session" and row.get("host") == host["name"] and row.get("alive")
+                   and not row.get("closed") and row.get("program") is None and row.get("programMenu") is True
+                   and not row.get("typed") and (row.get("preset") or None) == (preset or None)
+                   and type(row.get("createdAt")) is int and 0 <= now - row["createdAt"] < self.LAUNCHER_REUSE_SECONDS]
+        return max(waiting, key=lambda row: row["createdAt"]) if waiting else None
+
     def new_session(self, payload):
         """Open a host's own launcher in a new board terminal. The launcher, not the board,
         chooses the project, agent and account, so nothing else is decided here."""
@@ -1689,6 +1710,13 @@ class Workflow:
         try:
             if not host["local"] and not self.board.state[host["name"]]["ok"]:
                 raise RuntimeError("기기에 연결할 수 없어 새 세션을 열지 않았어요.")
+            waiting = self.waiting_launcher(host, preset)
+            if waiting is not None:
+                # Pressed again while one still waits at its menu: that one opens, not a second.
+                result = {"terminal": waiting, "mode": "new-session", "reused": True}
+                self._finish(request_id, signature, result)
+                settled = True
+                return result
             key = "new-session:" + request_id
             with self.terminals.reserve(key):
                 if host["local"]:
@@ -1711,7 +1739,8 @@ class Workflow:
                                                          + (["--preset", preset] if preset else []))
                     spec = {"argv": argv, "holdName": hold, "cwd": str(Path.home()), "env": collector.tool_env()}
                 metadata = {"title": label + (" · " + LAUNCH_PRESETS[preset]["label"] if preset else ""),
-                            "host": host["name"], "mode": "new-session", "createdAt": int(time.time())}
+                            "host": host["name"], "mode": "new-session", "createdAt": int(time.time()),
+                            **({"preset": preset} if preset else {})}
                 if spec.get("holdName"):
                     metadata["holdName"] = spec["holdName"]
                 terminal = self.terminals.create(key, spec["argv"], spec["cwd"], spec["env"], metadata)
@@ -1819,11 +1848,36 @@ class Workflow:
                 sys.stderr.write("테스트가 남긴 실행 %s개와 tmux 소켓 파일 %s개를 정리했습니다: %s\n"
                                  % (result.get("processes", 0), result.get("sockets", 0), host["name"]))
 
+    def close_idle_launchers(self):
+        """End 새 세션 terminals left unused that run nothing of their own (a launcher still at
+        its menu, Claude's agent view: terminals.idle_launchers), with the run each kept on its
+        host. One that runs Claude, Codex or an SSH connection never is. Returns their IDs."""
+        idle = getattr(self.terminals, "idle_launchers", None)
+        if idle is None:
+            return []
+        closed = []
+        for terminal_id in idle():
+            try:
+                row = self.terminals.release_launcher(terminal_id)
+            except (RuntimeError, OSError, ValueError, KeyError):
+                continue
+            if row is None:
+                continue
+            self.end_hold(row)
+            sys.stderr.write("쓰지 않는 새 세션 터미널을 정리했습니다: %s %s\n"
+                             % (row.get("host"), row.get("program") or "menu"))
+            closed.append(terminal_id)
+        return closed
+
     def start_hold_sweep(self):
         def run():
             time.sleep(self.HOLD_SWEEP_FIRST)
             swept = None
             while True:
+                try:
+                    self.close_idle_launchers()
+                except Exception as exc:  # The sweep never stops the board.
+                    sys.stderr.write("새 세션 터미널 정리에 실패했습니다: %s\n" % type(exc).__name__)
                 try:
                     self.sweep_holds()
                 except Exception as exc:  # The sweep never stops the board.

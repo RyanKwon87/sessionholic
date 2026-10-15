@@ -447,6 +447,31 @@ LOG_ROTATE_BYTES = 20 * 1024 * 1024
 LOG_ROTATE_SECONDS = 1800
 # What <name>.1 keeps of a rotated log: its end.
 LOG_KEEP_BYTES = 5 * 1024 * 1024
+# Held while a line goes through LogStream and while rotate_own_logs copies and empties that
+# file: a line written between the copy and the truncation would be in neither.
+LOG_LOCK = threading.RLock()
+
+
+class LogStream:
+    """sys.stdout or sys.stderr whose writes wait for a rotation in progress (main installs
+    it). Only writes through it wait: a child process that inherited the descriptor does not."""
+    def __init__(self, stream):
+        self.stream = stream
+
+    def write(self, text):
+        with LOG_LOCK:
+            return self.stream.write(text)
+
+    def writelines(self, lines):
+        with LOG_LOCK:
+            return self.stream.writelines(lines)
+
+    def flush(self):
+        with LOG_LOCK:
+            return self.stream.flush()
+
+    def __getattr__(self, name):
+        return getattr(self.stream, name)
 
 
 def rotate_own_logs(state_dir, limit=LOG_ROTATE_BYTES):
@@ -477,24 +502,25 @@ def rotate_own_logs(state_dir, limit=LOG_ROTATE_BYTES):
             if not same:
                 continue
             kept = path.with_name(path.name + ".1")
-            try:
-                stream.flush()
-            except (OSError, ValueError):
-                pass
-            try:
-                with open(path, "rb") as source, open(kept, "wb") as target:
-                    source.seek(max(0, info.st_size - LOG_KEEP_BYTES))
-                    shutil.copyfileobj(source, target)
-            except OSError:
+            with LOG_LOCK:
                 try:
-                    kept.unlink()
+                    stream.flush()
+                except (OSError, ValueError):
+                    pass
+                try:
+                    with open(path, "rb") as source, open(kept, "wb") as target:
+                        source.seek(max(0, info.st_size - LOG_KEEP_BYTES))
+                        shutil.copyfileobj(source, target)
+                except OSError:
+                    try:
+                        kept.unlink()
+                    except OSError:
+                        pass
+                try:
+                    os.ftruncate(fd, 0)
+                    rotated.append(path.name)
                 except OSError:
                     pass
-            try:
-                os.ftruncate(fd, 0)
-                rotated.append(path.name)
-            except OSError:
-                pass
             break
     return rotated
 
@@ -3655,6 +3681,8 @@ def main(argv=None):
         print(f"표준 출력의 일회용 로그인 링크를 {ONCE_TTL // 60}분 안에 개인 브라우저에서 여세요. 한 번만 사용할 수 있습니다.",
               file=sys.stderr)
     if args.state_dir:
+        # From here every line this process logs waits for a rotation of its file in progress.
+        sys.stdout, sys.stderr = LogStream(sys.stdout), LogStream(sys.stderr)
         threading.Thread(target=rotate_logs_forever, args=(args.state_dir,), daemon=True,
                          name=THREAD_PREFIX + "-logs").start()
     httpd.workflow.start_hold_sweep()

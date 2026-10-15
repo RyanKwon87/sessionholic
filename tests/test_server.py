@@ -1350,6 +1350,34 @@ class OperationsLogTest(unittest.TestCase):
         self.assertEqual(log.read_bytes(), b"", "a full disk still gets the space back")
         self.assertFalse((state / "stderr.log.1").exists(), "no half-written copy is left behind")
 
+    def test_a_line_logged_while_the_log_is_rotated_is_not_lost(self):
+        state = Path(tempfile.mkdtemp()); self.addCleanup(shutil.rmtree, state)
+        log = state / "stderr.log"
+        fd = os.open(str(log), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        os.write(fd, b"x" * 4096)
+        saved = os.dup(2)
+        copy, writers = server.shutil.copyfileobj, []
+
+        def copy_then_log(source, target):
+            copy(source, target)
+            # Another request logs right after the copy, before the log is emptied.
+            writer = threading.Thread(target=lambda: sys.stderr.write("during rotation\n"))
+            writer.start()
+            writers.append(writer)
+            writer.join(0.2)
+        try:
+            os.dup2(fd, 2)
+            with open(2, "w", buffering=1, closefd=False) as raw, \
+                 patch("sys.stderr", server.LogStream(raw)), \
+                 patch.object(server.shutil, "copyfileobj", side_effect=copy_then_log):
+                self.assertEqual(server.rotate_own_logs(state, limit=1024), ["stderr.log"])
+                writers[0].join(5)
+                sys.stderr.write("after\n")
+        finally:
+            os.dup2(saved, 2); os.close(saved); os.close(fd)
+        self.assertEqual((state / "stderr.log.1").read_bytes(), b"x" * 4096)
+        self.assertEqual(log.read_bytes(), b"during rotation\nafter\n")
+
     def test_a_watcher_delivering_ends_a_logged_failure(self):
         board = server.Board(HOSTS, 60, runner=lambda host, args, timeout: (_ for _ in ()).throw(RuntimeError("SSH 연결 실패")))
         stream = server.HostStream(board, HOSTS[0])

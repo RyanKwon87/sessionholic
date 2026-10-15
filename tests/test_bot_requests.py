@@ -453,6 +453,31 @@ class BotRequestsTest(unittest.TestCase):
         # A notice the gateway wrote itself is not the person's.
         self.assertIsNone(typed('[IMPORTANT: Background process 1a2b matched "done".]'))
         self.assertIsNone(typed(self.THREAD))
+        # A context compaction's summary is not the person's: alone it is not shown, the words
+        # merged before it or following its end are (Hermes's own unwrap).
+        summary = '[CONTEXT COMPACTION — REFERENCE ONLY] 앞선 대화 요약\n## Historical Task Snapshot\n- 합성'
+        end = '\n--- END OF CONTEXT SUMMARY — respond to the message below, not the summary above ---\n\n'
+        self.assertIsNone(typed(summary))
+        self.assertIsNone(typed(summary + end))
+        self.assertEqual(typed(summary + end + self.SENDER + '요약 뒤의 말'), ('요약 뒤의 말', True))
+        self.assertEqual(typed('[PRIOR CONTEXT — for reference only; not a new message]\n' + self.SENDER + '원래 글\n'
+                               '[END OF PRIOR CONTEXT — COMPACTION SUMMARY BELOW]\n' + summary), ('원래 글', True))
+        self.assertEqual(typed(summary[:30], '나' * 20 + end + '긴 요약 뒤의 말'), ('긴 요약 뒤의 말', True))
+        self.assertIsNone(typed(summary[:30], '나' * 20))
+        # Turns Hermes itself tells as carrying no words of the person's; a system note before them.
+        for synthetic in ('[ASYNC DELEGATION COMPLETE — d1]\n결과', '[System: 합성 알림]', 'Cronjob Response: 결과',
+                          '[Your active task list was preserved]', '[OUT-OF-BAND 알림]'):
+            self.assertIsNone(typed(synthetic), synthetic)
+        self.assertEqual(typed('[System note: The user\'s session was reset.]\n\n' + self.SENDER + '새로 시작'),
+                         ('새로 시작', True))
+        self.assertIsNone(typed('[System note: The previous turn was interrupted.]'))
+        self.assertEqual(typed('[System note: 합성 메모]\n\n[Replying to: "앞 글"]\n\n' + self.SENDER + '답장 글'),
+                         ('답장 글', True))
+        # The gateway frames its own events too: a notice or a skill after a thread's context.
+        self.assertIsNone(typed(self.THREAD + '\n\n[New message]\n[IMPORTANT: Background process 1a2b completed.]'))
+        self.assertEqual(typed(self.THREAD + '\n\n[New message]\n' + self.SENDER + self.SKILL
+                               + 'The user has provided the following instruction alongside the skill invocation: 이어서'),
+                         ('/work 이어서', True))
         # A turn longer than the read: the words are at its end, after the last block.
         head = self.THREAD[:60] + '가' * 100
         self.assertEqual(typed(head, '나' * 50 + '\n[End of thread context]\n\n\n\n[New message]\n' + self.SENDER + '끝의 말'),
@@ -474,12 +499,17 @@ class BotRequestsTest(unittest.TestCase):
             ('assistant', '네, 진행할게요.', None, 1700000002),
             ('user', '[IMPORTANT: Background process 1a2b matched "done".]', None, 1700000003),
             ('user', long_turn, None, 1700000004),
-            ('user', self.SENDER + '토큰 xoxb-example-secret-value 확인', None, 1700000005)]})
+            ('user', self.SENDER + '토큰 xoxb-example-secret-value 확인', None, 1700000005),
+            # A compaction's summaries, as either side, and an answer it merged one into.
+            ('user', '[CONTEXT COMPACTION — REFERENCE ONLY] 요약 본문', None, 1700000006),
+            ('assistant', '[CONTEXT COMPACTION — REFERENCE ONLY] 요약 본문', None, 1700000007),
+            ('assistant', '[PRIOR CONTEXT — for reference only; not a new message]\n앞선 답\n'
+                          '[END OF PRIOR CONTEXT — COMPACTION SUMMARY BELOW]\n[CONTEXT COMPACTION] 요약', None, 1700000008)]})
         api = self.configure()
         [segment] = api.conversation(self.source['id'], api.snapshot()['requests'][0]['id'])['segments']
         shown = [(m['role'], m['text']) for m in segment['messages']]
         self.assertEqual(shown, [('user', '이어서 해 주세요'), ('assistant', '네, 진행할게요.'),
-                                 ('user', '긴 맥락 뒤의 말'), ('user', '토큰 [가림] 확인')])
+                                 ('user', '긴 맥락 뒤의 말'), ('user', '토큰 [가림] 확인'), ('assistant', '앞선 답')])
         for message in segment['messages']:
             self.assertNotIn('truncated', message, message['text'])
         body = json.dumps(segment, ensure_ascii=False)

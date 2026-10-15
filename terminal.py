@@ -48,6 +48,13 @@ RELEASE_IDLE = 60
 # Unused this long, a Claude connection is closed even with room to spare; sending to the
 # session (or 질문 불러오기) attaches it again.
 CLOSE_IDLE = 600
+# A 새 세션 terminal left at its launcher's menu (nothing chosen, nothing typed), or showing
+# Claude's agent view, is closed after this long unused (Terminals.idle_launchers). One that
+# runs Claude, Codex or an SSH connection never is; nor is one whose program was not read
+# within LAUNCHER_PROGRAM_FRESH (the board reads it every minute or five).
+LAUNCHER_MENU_IDLE = 600
+LAUNCHER_AGENTS_IDLE = 1800
+LAUNCHER_PROGRAM_FRESH = 900
 # After a look on other tmux servers told nothing (_elsewhere), the next one waits this long.
 LOOK_AGAIN_SECONDS = 600
 # Closed rows kept, the oldest forgotten first. The user's own closes are kept longer:
@@ -644,6 +651,7 @@ class TerminalManager:
         with self.lock:
             terminal = self._use(terminal_id)
             self._attach(terminal)
+            self._typed(terminal)
         self._leave_scroll(terminal)
         with terminal.io_lock:
             if (terminal.record.get("closed", False) or terminal.fd is None
@@ -769,6 +777,7 @@ class TerminalManager:
             raise ValueError("보낼 수 없는 키 입력입니다.")
         with self.lock:
             terminal = self._use(terminal_id)
+            self._typed(terminal)
         if terminal.record.get("closed", False) or not terminal.alive:
             raise RuntimeError("터미널 연결이 종료되었습니다.")
         self._leave_scroll(terminal)
@@ -794,6 +803,7 @@ class TerminalManager:
         with self.lock:
             terminal = self._use(terminal_id)
             self._attach(terminal)
+            self._typed(terminal)
         if terminal.record.get("closed", False) or not terminal.alive:
             raise InputNotSent("터미널 연결이 종료되었습니다.")
         self._leave_scroll(terminal)
@@ -950,25 +960,75 @@ class TerminalManager:
     def set_program(self, terminal_id, info):
         """Record what a 새 세션 terminal runs (read from its host); never its identity or command."""
         program = info.get("program") if isinstance(info, dict) else None
-        if program not in (None, "claude-agents", "claude", "codex"):
+        if program not in (None, "claude-agents", "claude", "codex", "ssh"):
             raise ValueError("실행 프로그램 정보가 올바르지 않습니다.")
         cwd = info.get("cwd")
         cwd = cwd if isinstance(cwd, str) and cwd.startswith("/") and len(cwd) <= 4096 and "\0" not in cwd else None
+        # Its host named its launcher and nothing runs below it: the launcher's menu still waits.
+        menu = program is None and info.get("launcher") is True
         with self.lock:
             terminal = self._get(terminal_id)
             if terminal.record.get("closed", False) or terminal.record["metadata"].get("mode") != "new-session":
                 return False
             previous = terminal.record["metadata"]
             terminal.record["metadata"] = _metadata({**previous, "program": program, "programCwd": cwd,
-                                                     "programAt": int(time.time())})
+                                                     "programMenu": menu, "programAt": int(time.time())})
             try:
                 self._save()
             except BaseException:
                 terminal.record["metadata"] = previous
                 raise
-        if (previous.get("program"), previous.get("programCwd")) != (program, cwd):
+        if (previous.get("program"), previous.get("programCwd"), previous.get("programMenu")) != (program, cwd, menu):
             self._changed()
         return True
+
+    def _typed(self, terminal):
+        """A 새 세션 terminal someone typed into (a menu choice included) is never taken for an
+        untouched menu (idle_launchers); the caller holds self.lock. Saving is best effort."""
+        metadata = terminal.record["metadata"]
+        if metadata.get("mode") != "new-session" or metadata.get("typed"):
+            return
+        terminal.record["metadata"] = {**metadata, "typed": True}
+        try:
+            self._save()
+        except (ValueError, RuntimeError, OSError):
+            pass  # Kept in memory: saved with the next change.
+
+    def idle_launchers(self):
+        """IDs of 새 세션 terminals left unused that run nothing of their own: a launcher still
+        at its menu (its host named it, nothing runs below it, nobody typed into it) after
+        LAUNCHER_MENU_IDLE, or Claude's agent view (the sessions it lists run under Claude's
+        daemon, not under it) after LAUNCHER_AGENTS_IDLE. Never one running Claude, Codex or an
+        SSH connection, one whose program is unknown or not read lately, or one being opened."""
+        now, wall = time.monotonic(), time.time()
+        found = []
+        with self.lock:
+            for terminal in self.terminals.values():
+                metadata = terminal.record["metadata"]
+                read = metadata.get("programAt")
+                if (metadata.get("mode") != "new-session" or terminal.record.get("closed", False)
+                        or terminal.record["key"] in self.reservations or self._unrecorded(terminal)
+                        or self._foreign(terminal) or type(read) is not int or wall - read > LAUNCHER_PROGRAM_FRESH):
+                    continue
+                idle = now - terminal.touched
+                if metadata.get("program") == "claude-agents" and idle >= LAUNCHER_AGENTS_IDLE:
+                    found.append(terminal.record["id"])
+                elif (metadata.get("program") is None and metadata.get("programMenu") is True
+                        and not metadata.get("typed") and idle >= LAUNCHER_MENU_IDLE):
+                    found.append(terminal.record["id"])
+        return found
+
+    def release_launcher(self, terminal_id):
+        """End one terminal idle_launchers named, if it still is one; its row (the caller ends
+        its held run on a remote host), else None."""
+        with self.lock:
+            if terminal_id not in self.idle_launchers():
+                return None
+            terminal = self._get(terminal_id)
+            self._end(terminal, "released")
+            row = self._public(terminal)
+        self._changed()
+        return row
 
     def close_terminal(self, terminal_id):
         """Stop one generated tmux session; retain its key as a closed record."""
@@ -1093,8 +1153,11 @@ class TerminalManager:
         use within RELEASE_IDLE seconds, or one being launched is never released.
         """
         now = time.monotonic()
+        # A Codex connection is a TUI its user opened and may be working in (the board never
+        # opens one by itself, unlike a Claude connection): it is not closed to make room.
         idle = [t for t in self.terminals.values()
                 if self._releasable(t) and t.record["key"] != keep
+                and t.record["metadata"].get("agent") != "codex"
                 and now - t.touched >= RELEASE_IDLE and self._exists(t)]
         if not idle:
             return False

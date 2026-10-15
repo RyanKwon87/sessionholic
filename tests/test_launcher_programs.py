@@ -113,6 +113,20 @@ class ProgramTest(unittest.TestCase):
         self.assertEqual(lp.describe([first, {**second, "createdAt": opened}], LAUNCHER, rows[2:]),
                          {FIRST: {"program": None}, SECOND: {"program": None}})
 
+    def test_a_launcher_at_its_menu_and_one_running_ssh_are_told_apart(self):
+        opened = started("Mon Oct 12 15:16:51 2026")
+        terminal = {"id": FIRST, "createdAt": opened}
+        launcher = (10, 1, opened + 1, "/bin/zsh -lic zz")
+        # Nothing chosen yet: only the launcher's own interpreters below it.
+        menu = [launcher, (11, 10, opened + 1, "/usr/bin/python3 /Users/example/.config/zz/ag.py")]
+        self.assertEqual(lp.describe([terminal], LAUNCHER, menu), {FIRST: {"program": None, "launcher": True}})
+        # A PC session the launcher opened: SSH is work of its own, never a menu.
+        remote = menu + [(12, 11, opened + 9, "ssh -t -o BatchMode=yes beaulink powershell")]
+        self.assertEqual(lp.describe([terminal], LAUNCHER, remote), {FIRST: {"program": "ssh", "cwd": None, "pid": 12}})
+        self.assertEqual(lp.program_of("/usr/bin/ssh -t host"), {"program": "ssh", "cwd": None})
+        # No launcher named: no claim either way.
+        self.assertEqual(lp.describe([terminal], LAUNCHER, []), {FIRST: {"program": None}})
+
     def test_a_host_without_a_launcher_reports_nothing(self):
         with patch("launch.new_session", side_effect=ValueError("no launcher")):
             self.assertEqual(lp.launcher_programs({"terminals": []}), {"terminals": {}})

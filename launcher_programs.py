@@ -53,7 +53,7 @@ def table(runner=None, uid=None):
 
 
 def program_of(command):
-    """{"program", "cwd"} for an agent CLI's command line, else None."""
+    """{"program", "cwd"} for an agent CLI's (or an SSH connection's) command line, else None."""
     words = command.split()
     if not words:
         return None
@@ -74,11 +74,15 @@ def program_of(command):
         if rest[:2] == ["app-server", "daemon"] or rest[:1] == ["app-server"]:
             return None
         return {"program": "codex", "cwd": None}
+    # A session the launcher opened on another host (a PC's): work of its own, never a menu.
+    if name == "ssh":
+        return {"program": "ssh", "cwd": None}
     return None
 
 
 def describe(terminals, launcher, rows):
-    """{terminal id: {"program", "cwd", "pid"} or {"program": None}} for the given terminals."""
+    """{terminal id: {"program", "cwd", "pid"}, {"program": None, "launcher": True} (its launcher,
+    nothing chosen below it) or {"program": None} (no launcher named)} for the given terminals."""
     expected = " ".join(launcher)
     children = {}
     for pid, ppid, _, _ in rows:
@@ -140,7 +144,8 @@ def describe(terminals, launcher, rows):
                     found = {**found, "pid": pid}
                     break
             queue.extend(sorted(children.get(pid, [])))
-        result[identifier] = found or {"program": None}
+        # Its own launcher, with nothing chosen below it yet: the menu still waits.
+        result[identifier] = found or {"program": None, "launcher": True}
     return result
 
 

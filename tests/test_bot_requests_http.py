@@ -43,6 +43,43 @@ class BotRequestsHTTPTest(unittest.TestCase):
         self.assertEqual(response.status, 200)
         self.bots.snapshot.assert_called_with(force=True)
 
+    def test_conversation_is_a_logged_in_get_bounded_to_two_reads_and_scrubbed(self):
+        conversation = {'segments': [{'kind': 'hermes', 'messages': [{'role': 'assistant', 'text': '키 sk-proj-' + 'a' * 24}]}]}
+        self.bots.conversation = Mock(return_value=conversation)
+        path = '/api/bot-requests/conversation?source=fixture-source&request=fixture-source:' + '0' * 24
+        response, _ = self.request('GET', path, authenticated=False)
+        self.assertEqual(response.status, 401)
+        self.bots.conversation.assert_not_called()
+        response, data = self.request('GET', path)
+        self.assertEqual(response.status, 200)
+        self.assertNotIn('sk-proj-', data['segments'][0]['messages'][0]['text'])
+        args = self.bots.conversation.call_args
+        self.assertEqual(args.args, ('fixture-source', 'fixture-source:' + '0' * 24))
+        self.assertEqual(args.kwargs['read_native'].__name__, 'bot_native_messages')
+        self.bots.conversation.side_effect = ValueError('봇 요청을 찾지 못했습니다.')
+        response, data = self.request('GET', path)
+        self.assertEqual((response.status, data['error']), (400, '봇 요청을 찾지 못했습니다.'))
+        for _ in range(2):
+            self.httpd.bot_conversation_gate.acquire()
+        try:
+            response, _ = self.request('GET', path)
+            self.assertEqual(response.status, 429)
+        finally:
+            for _ in range(2):
+                self.httpd.bot_conversation_gate.release()
+
+    def test_bot_codex_part_is_read_like_any_session_without_observing_work(self):
+        handler = SimpleNamespace(server=self.httpd)
+        with patch.object(self.board, 'read', return_value={'messages': [{'role': 'user', 'text': '요청'}]}) as read, \
+                patch.object(self.httpd.work, 'observe', side_effect=AssertionError('work observed')):
+            from server import Handler
+            messages = Handler.bot_native_messages(handler, self.host['name'], self.ref)
+            self.assertEqual(messages, [{'role': 'user', 'text': '요청'}])
+            read.assert_called_once_with(self.host['name'], 'codex', self.ref['id'], '.codex')
+            read.return_value = {'error': 'PRIVATE'}
+            with self.assertRaises(RuntimeError):
+                Handler.bot_native_messages(handler, self.host['name'], self.ref)
+
     def test_known_bot_cannot_inherit_direct_send_terminal_or_termination(self):
         requests = [('/api/chat/send', {'source': self.ref, 'requestId': 'bot-block-send-01', 'text': '합성 입력'}),
                     ('/api/plan', {'source': self.ref, 'target': {'host': self.host['name'], 'agent': 'codex', 'account': 'codex:.codex'}}),

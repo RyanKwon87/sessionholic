@@ -2868,6 +2868,17 @@ class Handler(BaseHTTPRequestHandler):
                     return self.send_json(200, self.server.work.snapshot())
                 if url.path == "/api/bot-requests":
                     return self.send_json(200, scrub_payload(self.server.bot_requests.snapshot()))
+                if url.path == "/api/bot-requests/conversation":
+                    # A listed request's conversation, watch-only: a bounded read-only read,
+                    # at most two at once. Nothing is sent to, or resumed in, the bot.
+                    if not self.server.bot_conversation_gate.acquire(blocking=False):
+                        return self.send_json(429, {"error": "봇 대화를 읽고 있습니다. 잠시 뒤 다시 시도해 주세요."})
+                    try:
+                        result = self.server.bot_requests.conversation(query.get("source"), query.get("request"),
+                                                                       read_native=self.bot_native_messages)
+                    finally:
+                        self.server.bot_conversation_gate.release()
+                    return self.send_json(200, scrub_payload(result))
                 if url.path == "/api/push":
                     return self.send_json(200, self.server.push.status(query.get("id")))
                 if url.path == "/api/push/pending":
@@ -2952,6 +2963,13 @@ class Handler(BaseHTTPRequestHandler):
     def history_native(source, offset=0):
         return {"agent": source["agent"], "id": source.get('sessionId') or source['id'] if source['agent'] == 'claude' else source['id'],
                 "home": source.get('home') or ('.claude' if source['agent'] == 'claude' else '.codex'), "offset": offset}
+
+    def bot_native_messages(self, host, native):
+        """A bot's Codex session read as the board reads any session (its cache and window)."""
+        result = self.server.board.read(host, native.get("agent"), native.get("id"), native.get("home"))
+        if not isinstance(result, dict) or result.get("error"):
+            raise RuntimeError("대화를 읽지 못했습니다.")
+        return result.get("messages") or []
 
     def history_read(self, source, payload):
         host = next((host for host in self.server.board.hosts if host['name'] == source['host']), None)
@@ -3449,6 +3467,7 @@ def make_server(bind, port, board, token, terminals=None, workflow=None, state_d
     server.boot_id = secrets.token_urlsafe(12)
     server.upload_gate = threading.BoundedSemaphore(2)
     server.history_gate = threading.BoundedSemaphore(2)
+    server.bot_conversation_gate = threading.BoundedSemaphore(2)
     server.assets = StaticAssets(WEB)
     try:
         server.terminals = terminals if terminals is not None else TerminalManager(state_dir=Path(state_dir) / "terminals", max_terminals=max_terminals or MAX_TERMINALS)

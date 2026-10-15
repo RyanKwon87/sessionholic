@@ -7042,6 +7042,17 @@ input.switch:focus-visible {
 .bot-request-metadata dt { color: var(--label-2); }
 .bot-request-metadata dd { margin: 0; overflow-wrap: anywhere; }
 .bot-native-note { margin-top: 20px; font-size: var(--fs-sub); line-height: 1.6; color: var(--label-2); }
+/* A bot request's conversation under its details: the session view's bubbles, watch-only. */
+.bot-conversation { display: flex; flex-direction: column; gap: 14px; margin-top: 24px; padding-top: 20px; border-top: 1px solid var(--sep); }
+.bot-conversation-title { margin: 0; color: var(--label-2); font-size: var(--fs-sub); font-weight: 600; }
+.bot-conversation-status { margin: 0; color: var(--label-2); font-size: var(--fs-sub); }
+.bot-conversation .bot-source-notice { margin: 0; }
+.bot-conversation .bot-source-notice p { margin: 0 0 8px; }
+.bot-conversation .group-empty, .bot-conversation .conversation-window-notice { margin: 0; }
+/* One conversation of several sessions: a line where one session ends and the next begins. */
+.bot-conversation-break { display: flex; align-items: center; gap: 10px; margin: 6px 0 0; color: var(--label-2); font-size: var(--fs-cap); line-height: 1.5; }
+.bot-conversation-break::before, .bot-conversation-break::after { content: ""; flex: 1; min-width: 16px; border-top: 1px solid var(--sep); }
+.bot-request-count { padding: 1px 6px; border-radius: 5px; background: var(--fill-soft); color: var(--label-2); font-size: var(--fs-cap); line-height: 1.5; }
 
 /* Non-persistent runs have an execution state, without a saved conversation. */
 .card-execution, .detail-execution { color: var(--label-2); font-size: var(--fs-cap); }

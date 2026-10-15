@@ -299,13 +299,19 @@ def _request_ids(args):
 
 
 def _messages(thread, identity=None, home=None):
-    out = []
+    """(rows, olderOmitted): the thread's window (collector.recent_window), built newest first."""
+    out, seen, older = [], 0, False
     # Only the retained history window may read attachment metadata from disk.
     for turn in reversed(thread["turns"]):
         # Rows of a whole turn at once: which answer is final (and so carries the turn's
         # completion time) depends on the turn's other items.
         for item, rows in reversed(collector.codex_turn_rows(turn)):
-            manifest = _history_attachments(identity, item.get("clientId"), home, item.get("content")) if rows and identity and item.get("type") == "userMessage" else []
+            if not rows:
+                continue
+            if seen >= collector.MESSAGE_LIMIT or len(out) >= collector.ROW_LIMIT:
+                older = True
+                break
+            manifest = _history_attachments(identity, item.get("clientId"), home, item.get("content")) if identity and item.get("type") == "userMessage" else []
             group = []
             # As collector.codex_messages marks them: which answer is the turn's final one.
             marks = {}
@@ -322,9 +328,11 @@ def _messages(thread, identity=None, home=None):
                 group.append({**row, **marks, "turnId": turn.get("id"), "turnStatus": turn.get("status"),
                             "itemId": item.get("id"), "clientId": item.get("clientId")})
             out[0:0] = group
-            if len(out) >= collector.MESSAGE_LIMIT:
-                return out[-collector.MESSAGE_LIMIT:]
-    return out[-collector.MESSAGE_LIMIT:]
+            seen += collector.conversation_count(group)
+        if older:
+            break
+    window, dropped = collector.recent_window(out)
+    return window, older or dropped or thread.get("olderUnread") is True
 
 
 def _inputs(value):
@@ -634,8 +642,7 @@ def _claude(identity, action, home, deadline, args):
         transcript = transcript or _transcript(home, sid)
         if transcript is None:
             raise ValueError("정확한 원본 Claude 대화 기록을 확인하지 못했습니다.")
-        entries = list(collector.tail_entries(transcript, 2 * 1024 * 1024))
-        result["messages"] = collector.claude_messages(entries)
+        entries, result["messages"], result["olderOmitted"] = collector.claude_conversation(transcript)
         # `claude agents` names neither: each response records its model and effort. The newest
         # main-thread one counts (a subagent's or a <synthetic> one says nothing of the session).
         if not (result['modelSettings']['model'] and result['modelSettings']['effort']):
@@ -701,7 +708,7 @@ def handle(args, *, home=None, timeout=10):
         result = {"source": identity, "cwd": thread.get("cwd"), **_state(thread),
                   "capabilities": _capabilities(thread), 'modelSettings': {**model_settings(thread), 'next': _preferences(identity, home)}}
         if action == "read":
-            result["messages"] = _messages(thread, identity, home)
+            result["messages"], result["olderOmitted"] = _messages(thread, identity, home)
             # "작업 중" counts from the running turn's own start (Turn.startedAt, epoch seconds).
             active = [t for t in thread["turns"] if t.get("status") == "inProgress"]
             since = collector.to_epoch(active[-1].get("startedAt")) if active else None

@@ -58,7 +58,14 @@ SESSION_ID = re.compile(r"^[0-9A-Za-z-]{8,64}$")
 EXTRA_PATH = ["/opt/homebrew/bin", str(HOME / ".local/bin"), "/usr/local/bin", "/usr/bin", "/bin"]
 TEXT_LIMIT = 4000
 FULL_MESSAGE_TEXT = ContextVar('full_message_text', default=False)
+# A conversation read shows its newest MESSAGE_LIMIT questions and answers with every row
+# (tool records, notes) after the oldest of them, at most ROW_LIMIT rows (recent_window).
 MESSAGE_LIMIT = 80
+ROW_LIMIT = 400
+CONVERSATION_ROLES = ("user", "assistant")
+# A Claude conversation read takes this much of the transcript's end, widened step by step
+# while it holds fewer than MESSAGE_LIMIT questions and answers (claude_conversation).
+CLAUDE_READ_TAILS = (2 * 1024 * 1024, 8 * 1024 * 1024, 32 * 1024 * 1024)
 # Codex history is read newest-first in pages of this many items, at most this many pages.
 HISTORY_PAGE = 100
 HISTORY_PAGES = 10
@@ -280,6 +287,11 @@ def claude_transcript_index():
 
 
 def tail_entries(path, max_bytes):
+    yield from _tail_read(path, max_bytes)[0]
+
+
+def _tail_read(path, max_bytes):
+    """(entries of the file's last `max_bytes`, whether that reached the file's start)."""
     with open(path, "rb") as stream:
         stream.seek(0, 2)
         size = stream.tell()
@@ -288,13 +300,52 @@ def tail_entries(path, max_bytes):
     lines = data.split(b"\n")
     if size > max_bytes:
         lines = lines[1:]  # the first line was cut in the middle
+    entries = []
     for raw in lines:
         try:
             entry = json.loads(raw)
         except ValueError:
             continue
         if isinstance(entry, dict):
-            yield entry
+            entries.append(entry)
+    return entries, size <= max_bytes
+
+
+def recent_window(rows, limit=MESSAGE_LIMIT, cap=ROW_LIMIT):
+    """(window, olderOmitted): the newest `limit` questions and answers (role user or
+    assistant) with every row after the oldest of them, at most the last `cap` rows.
+
+    Tool records and notes stay (the board folds a run of them into one line), so a turn
+    that ran many tools no longer pushes the questions before it out of view."""
+    start, seen = 0, 0
+    for index in range(len(rows) - 1, -1, -1):
+        if isinstance(rows[index], dict) and rows[index].get("role") in CONVERSATION_ROLES:
+            seen += 1
+            if seen == limit:
+                start = index
+                break
+    start = max(start, len(rows) - cap)
+    return rows[start:], start > 0
+
+
+def conversation_count(rows):
+    return sum(1 for row in rows if isinstance(row, dict) and row.get("role") in CONVERSATION_ROLES)
+
+
+def claude_conversation(path):
+    """(entries, window, olderOmitted) of a Claude transcript read from its end.
+
+    2 MB first; while that holds fewer than MESSAGE_LIMIT questions and answers (and fewer
+    than ROW_LIMIT rows) and the file is longer, 8 MB and then 32 MB at most. A session that
+    worked on images for hours keeps only minutes in its last 2 MB. olderOmitted: the window
+    dropped rows, or the read did not reach the transcript's start."""
+    for limit in CLAUDE_READ_TAILS:
+        entries, whole = _tail_read(path, limit)
+        rows = claude_rows(entries)
+        if whole or conversation_count(rows) >= MESSAGE_LIMIT or len(rows) >= ROW_LIMIT:
+            break
+    window, dropped = recent_window(rows)
+    return entries, window, dropped or not whole
 
 
 def user_text(text):
@@ -384,6 +435,11 @@ def evidence_id(value):
 
 
 def claude_messages(entries):
+    return recent_window(claude_rows(entries))[0]
+
+
+def claude_rows(entries):
+    """Every row of these transcript entries, oldest first (claude_messages windows them)."""
     out = []
     # Queued input since the last answer; an interrupt hands it back to the input line, and
     # Claude Code then records it once more as a plain prompt, which is shown instead.
@@ -448,7 +504,7 @@ def claude_messages(entries):
                     dropped.update(id(row) for row in again[1])
     if dropped:
         out = [row for row in out if id(row) not in dropped]
-    return out[-MESSAGE_LIMIT:]
+    return out
 
 
 def claude_prompt_at(entries):
@@ -1187,14 +1243,44 @@ def paging_unsupported(error, method):
     return isinstance(error, RpcReplyError) and error.code == -32600 and ("unknown variant `%s`" % method) in str(error)
 
 
-def codex_recent_thread(server, thread_id, rows=MESSAGE_LIMIT):
+def codex_conversation_item(item):
+    """Whether a Codex item shows as a question or an answer (as codex_turn_rows draws it)."""
+    kind = item.get("type")
+    if kind == "agentMessage":
+        return bool(str(item.get("text") or "").strip())
+    if kind != "userMessage":
+        return False
+    content = item.get("content") if isinstance(item.get("content"), list) else []
+    return bool(native_attachments(content)) or any(
+        (codex_user_text(str(c.get("text") or "")) or "").strip()
+        for c in content if isinstance(c, dict) and c.get("type") == "text")
+
+
+def codex_window_edge(entries, limit=MESSAGE_LIMIT, cap=ROW_LIMIT):
+    """The turn of the oldest row recent_window keeps of these newest-first items, or None
+    while they hold fewer than `limit` questions and answers and fewer than `cap` rows."""
+    seen = shown = 0
+    for entry in entries:
+        item = entry["item"]
+        if codex_conversation_item(item):
+            seen += 1
+        elif item.get("type") not in CODEX_TOOL_KINDS:
+            continue
+        shown += 1
+        if seen >= limit or shown >= cap:
+            return entry["turnId"]
+    return None
+
+
+def codex_recent_thread(server, thread_id):
     """`thread/read` result whose thread carries only its latest turns, read page by page.
 
     `includeTurns` loads the whole rollout, which grows to hundreds of MB after hours of
     image work, so one conversation read could outlast its deadline. The metadata read is
-    cheap, and items come newest-first until `rows` rows are covered and the turn of the oldest
-    of them reaches its user message. Turns come with their status only; their items are those
-    read, so the oldest turn may be cut short.
+    cheap, and items come newest-first until the window (recent_window) is covered and the
+    turn of its oldest row reaches its user message. Turns come with their status only; their
+    items are those read, so the oldest turn may be cut short. The thread's `olderUnread` says
+    older items were left unread.
     None when the daemon predates the paged methods or the thread is stored in the legacy
     format, so the caller reads the thread whole."""
     result = server.call("thread/read", {"threadId": thread_id, "includeTurns": False})
@@ -1216,12 +1302,11 @@ def codex_recent_thread(server, thread_id, rows=MESSAGE_LIMIT):
             cursor = page.get("nextCursor")
             if not cursor:
                 break
-            shown = [entry for entry in entries
-                     if entry["item"].get("type") in ("userMessage", "agentMessage") or entry["item"].get("type") in CODEX_TOOL_KINDS]
             # Enough once the turn of the oldest row shown reaches back to its user message.
-            edge = shown[rows - 1]["turnId"] if len(shown) >= rows else None
+            edge = codex_window_edge(entries)
             if edge and any(entry["turnId"] == edge and entry["item"].get("type") == "userMessage" for entry in entries):
                 break
+        older = bool(cursor)
         wanted = set(entry["turnId"] for entry in entries)
         turns, cursor, method = [], None, "thread/turns/list"
         for _ in range(HISTORY_PAGES):
@@ -1249,10 +1334,16 @@ def codex_recent_thread(server, thread_id, rows=MESSAGE_LIMIT):
     last = max((found.index(turn_id) for turn_id in wanted if turn_id in found), default=-1)
     thread["turns"] = [{**turn, "items": items.get(turn["id"], []), "itemsView": "full"}
                        for turn in reversed(turns[:last + 1] if wanted else turns[:1])]
+    thread["olderUnread"] = older
     return {**result, "thread": thread}
 
 
 def codex_messages(turns):
+    return recent_window(codex_rows(turns))[0]
+
+
+def codex_rows(turns):
+    """Every row of these turns, oldest first (codex_messages windows them)."""
     out = []
     for turn in turns:
         if not isinstance(turn, dict):
@@ -1268,7 +1359,7 @@ def codex_messages(turns):
                 if _item.get("phase") in ("commentary", "final_answer"):
                     row["phase"] = _item["phase"]
             out.extend(rows)
-    return out[-MESSAGE_LIMIT:]
+    return out
 
 
 # ---------- tmux ----------
@@ -1331,7 +1422,8 @@ def read(agent, session_id, home_key=None):
         if not path:
             return {"messages": [], "error": "대화 기록 파일을 찾지 못했습니다."}
         try:
-            return {"messages": claude_messages(tail_entries(path, 2 * 1024 * 1024))}
+            _entries, messages, older = claude_conversation(path)
+            return {"messages": messages, "olderOmitted": older}
         except OSError:
             # The transcript can move or lose permissions between lookup and read.
             return {"messages": [], "error": "대화 기록 파일을 읽지 못했습니다."}
@@ -1357,7 +1449,8 @@ def read(agent, session_id, home_key=None):
         status = status if isinstance(status, dict) else {"type": status}
         flags = status.get("activeFlags") or []
         phase = {"active": "needs_input" if flags else "working", "idle": "idle", "notLoaded": "unavailable"}.get(status.get("type"), "unavailable")
-        return {"messages": codex_messages(turns if isinstance(turns, list) else []),
+        messages, dropped = recent_window(codex_rows(turns if isinstance(turns, list) else []))
+        return {"messages": messages, "olderOmitted": dropped or thread.get("olderUnread") is True,
                 "phase": phase, "activeFlags": flags, "updatedAt": thread.get("updatedAt"),
                 "turns": [{"id": turn.get("id"), "status": turn.get("status")} for turn in (turns or []) if isinstance(turn, dict)]}
     raise ValueError("지원하지 않는 에이전트입니다.")

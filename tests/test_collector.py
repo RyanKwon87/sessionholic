@@ -505,6 +505,122 @@ class MessageTest(unittest.TestCase):
         self.assertIn("읽지 못했습니다", result["error"])
 
 
+class ConversationWindowTest(unittest.TestCase):
+    """A read shows the newest 80 questions and answers with every row after the oldest of them."""
+
+    @staticmethod
+    def pairs(count, tools, start=0):
+        """`count` Claude turns: a question, then an answer that ran `tools` commands."""
+        entries = []
+        for number in range(start, start + count):
+            entries.append({"type": "user", "uuid": "u%d" % number, "message": {"content": "질문 %d" % number}})
+            entries.append({"type": "assistant", "uuid": "a%d" % number, "message": {"content":
+                [{"type": "text", "text": "답변 %d" % number}] +
+                [{"type": "tool_use", "name": "Bash", "input": {"command": "echo %d" % index}} for index in range(tools)]}})
+        return entries
+
+    @staticmethod
+    def filler(size):
+        """A tool result the board does not show, as large as an attached image."""
+        return {"type": "user", "message": {"content": [{"type": "tool_result", "content": "x" * size}]}}
+
+    def transcript(self, entries):
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        path = Path(folder.name) / "fixture.jsonl"
+        path.write_text("".join(json.dumps(entry, ensure_ascii=False) + "\n" for entry in entries))
+        return path
+
+    def test_limits(self):
+        self.assertEqual((collector.MESSAGE_LIMIT, collector.ROW_LIMIT), (80, 400))
+        self.assertEqual(collector.CLAUDE_READ_TAILS, (2 * 1024 * 1024, 8 * 1024 * 1024, 32 * 1024 * 1024))
+
+    def test_tool_rows_never_push_questions_out_of_the_window(self):
+        rows = collector.claude_messages(self.pairs(100, 5))
+        # 7 rows a turn (question, answer, 5 commands): the last 40 turns.
+        self.assertEqual(collector.conversation_count(rows), collector.MESSAGE_LIMIT)
+        self.assertEqual(len(rows), 40 * 7)
+        self.assertEqual((rows[0]["role"], rows[0]["text"]), ("user", "질문 60"))
+        self.assertEqual(rows[-1]["text"], "Bash · echo 4")
+        self.assertEqual(collector.recent_window(collector.claude_rows(self.pairs(100, 5))), (rows, True))
+        codex = collector.codex_messages([{"id": "turn-%d" % number, "status": "completed", "items":
+            [{"type": "userMessage", "content": [{"type": "text", "text": "질문 %d" % number}]}] +
+            [{"type": "commandExecution", "command": "ls"}] * 5 + [{"type": "agentMessage", "text": "답변 %d" % number}]}
+            for number in range(100)])
+        self.assertEqual((len(codex), collector.conversation_count(codex), codex[0]["text"]), (280, 80, "질문 60"))
+
+    def test_window_keeps_at_most_400_rows(self):
+        rows = collector.claude_rows(self.pairs(50, 20))
+        window, older = collector.recent_window(rows)
+        self.assertEqual(window, rows[-collector.ROW_LIMIT:])
+        self.assertLess(collector.conversation_count(window), collector.MESSAGE_LIMIT)
+        self.assertTrue(older)
+
+    def test_a_conversation_inside_the_window_is_whole(self):
+        for entries in (self.pairs(30, 3), self.pairs(40, 2)):
+            rows = collector.claude_rows(entries)
+            self.assertEqual(collector.recent_window(rows), (rows, False))
+        # Notes and tool records before the 80th newest question or answer are left out; notes
+        # (a compaction, an interruption) never count as one.
+        rows = [{"role": "tool", "text": "앞 도구"}] + collector.claude_rows(self.pairs(40, 2)) + [{"role": "system", "text": "메모"}]
+        window, older = collector.recent_window(rows)
+        self.assertEqual((window[0]["text"], window[-1]["text"], older), ("질문 0", "메모", True))
+
+    def test_claude_read_widens_from_2_to_8_mb_until_80_questions_and_answers(self):
+        entries = []
+        for number in range(100):
+            entries += self.pairs(1, 1, number) + [self.filler(60 * 1024)]
+        path = self.transcript(entries)
+        with patch.object(collector, "_tail_read", wraps=collector._tail_read) as read:
+            got, rows, older = collector.claude_conversation(path)
+        self.assertEqual([call.args[1] for call in read.call_args_list], [2 * 1024 * 1024, 8 * 1024 * 1024])
+        self.assertEqual(collector.conversation_count(rows), collector.MESSAGE_LIMIT)
+        self.assertEqual(rows[0]["text"], "질문 60")
+        self.assertTrue(older)
+        self.assertEqual(len(got), len(entries), "the 8 MB read reached the start of this 6 MB file")
+
+    def test_claude_read_stops_widening_at_32_mb(self):
+        entries = []
+        for number in range(100):
+            entries += self.pairs(1, 0, number) + [self.filler(20 * 1024)]
+        path = self.transcript(entries)
+        # The same steps, a thousand times smaller.
+        with patch.object(collector, "CLAUDE_READ_TAILS", (2 * 1024, 8 * 1024, 32 * 1024)), \
+                patch.object(collector, "_tail_read", wraps=collector._tail_read) as read:
+            got, rows, older = collector.claude_conversation(path)
+        self.assertEqual([call.args[1] for call in read.call_args_list], [2 * 1024, 8 * 1024, 32 * 1024])
+        self.assertEqual([row["text"] for row in rows], ["질문 99", "답변 99"])
+        self.assertTrue(older, "the read never reached the transcript's start")
+
+    def test_claude_read_of_a_short_transcript_reads_once_and_says_nothing_is_left_out(self):
+        path = self.transcript(self.pairs(3, 2))
+        with patch.object(collector, "_tail_read", wraps=collector._tail_read) as read:
+            got, rows, older = collector.claude_conversation(path)
+        self.assertEqual(read.call_count, 1)
+        self.assertEqual((len(rows), older), (12, False))
+
+    def test_read_says_whether_older_rows_were_left_out(self):
+        sid = "019a0000-0000-7000-8000-000000000000"
+        for entries, length, older in ((self.pairs(100, 5), 280, True), (self.pairs(3, 1), 9, False)):
+            with patch.object(collector, "claude_transcript", return_value=self.transcript(entries)):
+                result = collector.read("claude", sid)
+            self.assertEqual((len(result["messages"]), result["olderOmitted"]), (length, older))
+        home = Path(self.transcript([]).parent)
+        socket_path = home / ".codex" / collector.SOCKET_REL
+        socket_path.parent.mkdir(parents=True)
+        socket_path.touch()
+        turns = [{"id": "turn-%d" % number, "status": "completed", "items": [
+            {"type": "userMessage", "content": [{"type": "text", "text": "질문 %d" % number}]},
+            {"type": "commandExecution", "command": "ls"}, {"type": "agentMessage", "text": "답변 %d" % number}]}
+            for number in range(100)]
+        for count, unread, length, older in ((100, False, 120, True), (3, False, 9, False), (3, True, 9, True)):
+            thread = {"id": sid, "status": {"type": "idle"}, "turns": turns[-count:], "olderUnread": unread}
+            with patch.object(collector, "HOME", home), patch.object(collector, "AppServer"), \
+                    patch.object(collector, "codex_recent_thread", return_value={"thread": thread}):
+                result = collector.read("codex", sid, ".codex")
+            self.assertEqual((len(result["messages"]), result["olderOmitted"]), (length, older))
+
+
 class SnapshotIsolationTest(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()

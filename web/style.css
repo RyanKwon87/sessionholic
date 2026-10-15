@@ -7023,6 +7023,10 @@ input.switch:focus-visible {
 .bot-conversation .bot-source-notice { margin: 0; }
 .bot-conversation .bot-source-notice p { margin: 0 0 8px; }
 .bot-conversation .group-empty, .bot-conversation .conversation-window-notice { margin: 0; }
+/* One conversation of several sessions: a line where one session ends and the next begins. */
+.bot-conversation-break { display: flex; align-items: center; gap: 10px; margin: 6px 0 0; color: var(--label-2); font-size: var(--fs-cap); line-height: 1.5; }
+.bot-conversation-break::before, .bot-conversation-break::after { content: ""; flex: 1; min-width: 16px; border-top: 1px solid var(--sep); }
+.bot-request-count { padding: 1px 6px; border-radius: 5px; background: var(--fill-soft); color: var(--label-2); font-size: var(--fs-cap); line-height: 1.5; }
 
 /* Non-persistent runs have an execution state, without a saved conversation. */
 .card-execution, .detail-execution { color: var(--label-2); font-size: var(--fs-cap); }

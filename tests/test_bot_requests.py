@@ -558,6 +558,97 @@ class BotRequestsTest(unittest.TestCase):
         self.assertEqual(result['conversations'][0]['messages'][0]['text'], '요청')
         self.assertEqual(done.stderr, b'')
 
+    # Conversation keys: synthetic direct-message and thread keys only.
+    def keyed_ledger(self, tasks):
+        """tasks: [(codex_thread, session_key)] in receipt order, finished one second apart."""
+        self.source = {**self.source, 'path': 'bot/slack/ledger.sqlite3'}
+        path = self.ledger(len(tasks))
+        with closing(sqlite3.connect(path)) as db, db:
+            db.execute('ALTER TABLE tasks ADD COLUMN session_key TEXT')
+            for number, (thread, key) in enumerate(tasks, 1):
+                db.execute('UPDATE tasks SET codex_thread=?,session_key=?,finished_at=? WHERE id=?',
+                           (thread, key, 1700000100 + number, number))
+        return path
+
+    def test_requests_sharing_a_conversation_key_share_an_alias_that_hides_the_key(self):
+        self.keyed_ledger([(None, 'D_EXAMPLE:dm'), (None, 'D_EXAMPLE:dm'), (None, 'C_EXAMPLE:1700000000.000100'), (None, None)])
+        rows = {row['id']: row for row in bots.read_source(self.source, self.home)['requests']}
+        keys = [rows[bots._opaque(self.source, number)]['conversationKey'] for number in (1, 2, 3, 4)]
+        self.assertEqual(keys[0], keys[1])
+        self.assertNotEqual(keys[0], keys[2])
+        self.assertIsNone(keys[3])
+        self.assertRegex(keys[0], r'\Aexample-bot:[0-9a-f]{24}\Z')
+        api = self.configure()
+        body = json.dumps(api.snapshot())
+        for private in ('D_EXAMPLE', '1700000000.000100', ':dm'):
+            self.assertNotIn(private, body)
+        self.assertEqual(len({row['conversationKey'] for row in api.snapshot()['requests']}), 3)
+        # A remote answer cannot name a key outside its source.
+        row = {'id': bots._opaque(self.source, 1), 'sourceId': self.source['id'], 'host': 'mini', 'nativeRef': None}
+        for forged in ('other:' + '0' * 24, 'D_EXAMPLE:dm', 7):
+            with self.subTest(forged=forged), self.assertRaises(bots.SourceError):
+                bots.BotRequests._checked(self.source, {'requests': [{**row, 'conversationKey': forged}]})
+
+    def test_a_conversation_key_joins_its_codex_and_hermes_sessions_oldest_first(self):
+        first, second, elsewhere = '20990101_000000_aaa111', '20990101_000000_bbb222', '20990101_000000_ccc333'
+        self.keyed_ledger([(self.sid, 'D_EXAMPLE:dm'), (self.sid, 'D_EXAMPLE:dm'), ('hermes:' + first + '#g1', 'D_EXAMPLE:dm'),
+                           ('hermes:' + second + '#g2', 'D_EXAMPLE:dm'), ('hermes:' + elsewhere + '#g3', 'D_OTHER:dm')])
+        self.native()
+        self.hermes_store(self.home / 'bot/hermes/state.db', {
+            first: [('user', '첫 요청', None, 1700000001)], second: [('assistant', '둘째 답변', None, 1700000002)],
+            elsewhere: [('user', 'ELSEWHERE_PRIVATE', None, 1700000003)]})
+        api = self.configure()
+        api.snapshot()
+        read = Mock(return_value=[{'role': 'user', 'text': 'Codex 요청'}, {'role': 'tool', 'text': 'TOOL_PRIVATE'}])
+        with patch.object(api, '_collect', wraps=api._collect) as collect:
+            result = api.conversation(self.source['id'], bots._opaque(self.source, 4), read_native=read)
+        self.assertEqual([(part['kind'], part['requests']) for part in result['segments']], [('codex', 2), ('hermes', 1), ('hermes', 1)])
+        self.assertEqual([[message['text'] for message in part['messages']] for part in result['segments']],
+                         [['Codex 요청'], ['첫 요청'], ['둘째 답변']])
+        self.assertEqual([part['firstAt'] for part in result['segments']], sorted(part['firstAt'] for part in result['segments']))
+        read.assert_called_once_with('mini', {'agent': 'codex', 'id': self.sid, 'home': '.codex'})
+        self.assertEqual([call.args[1] for call in collect.call_args_list], [[second, first]], 'one Hermes read, newest first')
+        body = json.dumps(result, ensure_ascii=False)
+        for private in ('ELSEWHERE_PRIVATE', 'TOOL_PRIVATE', first, second):
+            self.assertNotIn(private, body)
+        # The older request of the same conversation opens the same view.
+        older = api.conversation(self.source['id'], bots._opaque(self.source, 1), read_native=read)
+        self.assertEqual([part['kind'] for part in older['segments']], ['codex', 'hermes', 'hermes'])
+        # A full Codex window says older rows may be missing.
+        read.return_value = [{'role': 'assistant', 'text': '답변'}] * bots.CONVERSATION_ROWS
+        self.assertTrue(api.conversation(self.source['id'], bots._opaque(self.source, 1), read_native=read)['segments'][0]['more'])
+
+    def test_only_the_newest_sessions_of_a_long_conversation_are_read(self):
+        sessions = ['20990101_00000%d_abc123' % number for number in range(bots.CONVERSATION_SESSIONS + 2)]
+        self.keyed_ledger([('hermes:' + session, 'D_EXAMPLE:dm') for session in sessions])
+        self.hermes_store(self.home / 'bot/hermes/state.db',
+                          {session: [('user', '요청 ' + session[-8], None, 1700000001)] for session in sessions})
+        api = self.configure()
+        result = api.conversation(self.source['id'], api.snapshot()['requests'][0]['id'])
+        self.assertEqual([part['messages'][0]['text'] for part in result['segments']],
+                         ['요청 %d' % number for number in range(2, bots.CONVERSATION_SESSIONS + 2)])
+
+    def test_gateway_sessions_of_one_thread_share_a_key_and_are_read_together(self):
+        source = {**self.source, 'kind': 'hermes_sqlite', 'path': '.hermes/state.db'}
+        path = self.database(source)
+        with closing(sqlite3.connect(path)) as db, db:
+            db.executescript('''CREATE TABLE sessions(id TEXT PRIMARY KEY,source TEXT,session_key TEXT,user_id TEXT,chat_id TEXT,
+                started_at REAL,ended_at REAL,origin_json TEXT);
+                CREATE INDEX idx_started ON sessions(started_at);''')
+            for number, (name, key) in enumerate([('gateway-1', 'thread-a'), ('gateway-2', 'thread-a'), ('gateway-3', 'thread-b')]):
+                db.execute('INSERT INTO sessions VALUES(?,?,?,?,?,?,?,?)', (name, 'slack', key, 'user', 'chat', 1700000000 + number, None, '{}'))
+        self.hermes_store(path, {'gateway-1': [('user', '앞 대화', None, 1700000001)],
+                                 'gateway-2': [('assistant', '뒤 대화', None, 1700000002)],
+                                 'gateway-3': [('user', 'OTHER_THREAD', None, 1700000003)]})
+        api = self.configure([source])
+        rows = {row['id']: row for row in api.snapshot()['requests']}
+        one, two, three = (rows[bots._opaque(source, name)] for name in ('gateway-1', 'gateway-2', 'gateway-3'))
+        self.assertEqual(one['conversationKey'], two['conversationKey'])
+        self.assertNotEqual(one['conversationKey'], three['conversationKey'])
+        result = api.conversation(source['id'], two['id'])
+        self.assertEqual([part['messages'][0]['text'] for part in result['segments']], ['앞 대화', '뒤 대화'])
+        self.assertNotIn('OTHER_THREAD', json.dumps(result, ensure_ascii=False))
+
     def test_missing_configuration_is_empty_and_never_discovers_unregistered_databases(self):
         with patch.object(Path, 'home', return_value=self.home):
             api = bots.BotRequests(self.hosts, self.config, self.home/'state')

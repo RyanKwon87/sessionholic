@@ -497,3 +497,89 @@ test("대화 읽기 실패는 자동 재시도 없이 다시 불러오기로만 
   assert.equal(c.state.botConversations.size, 0);
   assert.doesNotMatch(textOf(c.get("detail")), /잠금 뒤 도착/);
 });
+
+test("같은 대화 키의 요청은 카드 하나로 묶여 최신 상태·요청 수를 보이고, 열면 세션 경계 구분선과 함께 시간순 대화를 읽는다", async () => {
+  const replies = [];
+  const c = client((url) => {
+    if (!url.startsWith("/api/bot-requests/conversation?")) throw new Error(`Unexpected fixture route: ${url}`);
+    const next = deferred(); replies.push(next); return next.promise;
+  });
+  const key = "source-alpha:" + "c".repeat(24), hermes = { kind: "hermes", id: "source-alpha:" + "a".repeat(24) };
+  const older = request({ id: "source-alpha:" + "1".repeat(24), title: "첫 요청 제목", status: "completed", updatedAt: 2000000000,
+    conversationKey: key, nativeRef: { agent: "codex", id: "thread-unlisted", home: ".codex" } });
+  const middle = request({ id: "source-alpha:" + "2".repeat(24), title: "둘째 요청", status: "completed", updatedAt: 2000000050,
+    conversationKey: key, conversationRef: hermes });
+  const newest = request({ id: "source-alpha:" + "3".repeat(24), title: "최근 요청", status: "running", updatedAt: 2000000100,
+    conversationKey: key, conversationRef: hermes });
+  const alone = request({ id: "source-alpha:" + "4".repeat(24), title: "따로 온 요청", status: "completed", updatedAt: 2000000070 });
+  cache(c, [older, alone, newest, middle]);
+  c.setSessionCategory("bot");
+  let cards = byClass(c.get("groups"), "bot-request-card");
+  assert.equal(cards.length, 2, "한 대화의 요청 셋은 카드 하나다");
+  assert.match(textOf(cards[0]), /진행 중.*요청 3개.*최근 요청/);
+  assert.doesNotMatch(textOf(cards[0]), /첫 요청 제목/);
+  assert.doesNotMatch(textOf(cards[1]), /요청 \d+개/, "혼자인 요청에는 개수를 붙이지 않는다");
+  assert.equal(c.get("session-category-bot-count").textContent, "2");
+  assert.equal(c.get("session-count").textContent, "2개");
+  // An older request's words still find its conversation.
+  c.state.search = "첫 요청"; c.renderBotRequests();
+  cards = byClass(c.get("groups"), "bot-request-card");
+  assert.equal(cards.length, 1);
+  const groupKey = cards[0].dataset.botRequestKey;
+  assert.equal(groupKey, JSON.stringify(["source-alpha", "conversation", key]));
+  c.state.search = "";
+  cards[0].events.click();
+  assert.equal(c.state.selectedBotRequest, groupKey);
+  assert.equal(c.state.selected, null);
+  const detail = c.get("detail");
+  assert.match(textOf(detail), /최근 요청/);
+  assert.match(textOf(detail), /이 대화의 요청 3개/);
+  assert.equal(conversationCalls(c).length, 1);
+  assert.equal(new URL(conversationCalls(c)[0].url, "http://fixture.invalid").searchParams.get("request"), newest.id);
+  replies[0].resolve(response({ segments: [
+    { kind: "codex", requests: 1, firstAt: "2033-05-18T03:33:20Z", messages: [{ role: "user", text: "예전 요청" }, { role: "assistant", text: "예전 답변" }] },
+    { kind: "hermes", requests: 2, firstAt: "2033-05-18T03:34:10Z", messages: [{ role: "user", text: "새 요청" }, { role: "assistant", text: "새 답변" }] }] }));
+  await c.state.botConversations.get(groupKey).promise;
+  const breaks = byClass(detail, "bot-conversation-break");
+  assert.equal(breaks.length, 2);
+  assert.match(breaks[0].textContent, /^Codex 세션 · /);
+  assert.match(breaks[1].textContent, /^Hermes 세션 · .* · 요청 2개$/);
+  assert.equal(breaks[1].attributes.role, "separator");
+  assert.match(textOf(byClass(detail, "bot-conversation")[0]), /Codex 세션.*예전 요청.*예전 답변.*Hermes 세션.*새 요청.*새 답변/);
+  // A newer request of the same conversation keeps its card and selection, and reads it again.
+  const newer = request({ id: "source-alpha:" + "5".repeat(24), title: "더 새 요청", updatedAt: 2000000200, conversationKey: key, conversationRef: hermes });
+  cache(c, [older, alone, newest, middle, newer]); c.renderBotRequests();
+  assert.equal(c.state.selectedBotRequest, groupKey);
+  assert.equal(byClass(c.get("groups"), "bot-request-card").length, 2);
+  assert.match(textOf(byClass(c.get("groups"), "bot-request-card")[0]), /요청 4개.*더 새 요청/);
+  assert.equal(conversationCalls(c).length, 2);
+  assert.equal(new URL(conversationCalls(c)[1].url, "http://fixture.invalid").searchParams.get("request"), newer.id);
+});
+
+test("한 Codex 세션뿐인 대화는 그 세션을 그대로 열고, 여러 세션이면 이어 붙인 보기 전용 대화를 연다", () => {
+  const c = client((url) => {
+    if (!url.startsWith("/api/bot-requests/conversation?")) throw new Error(`Unexpected fixture route: ${url}`);
+    return deferred().promise;
+  });
+  const one = session({ id: "native-one" }), two = session({ id: "native-two" }), three = session({ id: "native-three" });
+  addSessions(c, [one, two, three]);
+  const single = "source-alpha:" + "d".repeat(24), several = "source-alpha:" + "e".repeat(24);
+  cache(c, [
+    request({ id: "source-alpha:" + "1".repeat(24), conversationKey: single, nativeRef: c.sourceOf(one), updatedAt: 2000000001 }),
+    request({ id: "source-alpha:" + "2".repeat(24), conversationKey: single, nativeRef: c.sourceOf(one), updatedAt: 2000000002 }),
+    request({ id: "source-alpha:" + "3".repeat(24), conversationKey: several, nativeRef: c.sourceOf(two), updatedAt: 2000000003 }),
+    request({ id: "source-alpha:" + "4".repeat(24), conversationKey: several, nativeRef: c.sourceOf(three), updatedAt: 2000000004 })]);
+  const singleKey = JSON.stringify(["source-alpha", "conversation", single]);
+  const severalKey = JSON.stringify(["source-alpha", "conversation", several]);
+  c.selectBotRequest(singleKey);
+  assert.equal(c.state.selected, one.key, "그 세션의 대화를 그대로 따라간다");
+  assert.equal(c.state.selectedBotRequest, singleKey);
+  assert.equal(conversationCalls(c).length, 0);
+  c.selectBotRequest(severalKey);
+  assert.equal(c.state.selected, null);
+  assert.equal(c.state.selectedBotRequest, severalKey);
+  assert.equal(conversationCalls(c).length, 1);
+  // One of its sessions opened from elsewhere still belongs to that conversation's card.
+  c.select(two.key);
+  assert.equal(c.state.selectedBotRequest, severalKey);
+});

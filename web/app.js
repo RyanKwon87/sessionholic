@@ -1540,6 +1540,33 @@ const BOT_STATUS = { pending: "대기", queued: "대기", waiting: "대기", run
 function emptyBotRequests() { return { requests: [], sources: [], loaded: false, busy: false, error: "", readAt: 0, fetchedAt: null, promise: null }; }
 function botTimestamp(value) { return typeof value === "number" ? value * 1000 : Date.parse(value) || 0; }
 function botRequestKey(request) { return JSON.stringify([request.sourceId, request.id]); }
+// One card per conversation: the requests a bot keeps under one conversation key (a direct
+// message, a thread) are one card and one view; a request without a key is its own.
+function botGroupKey(request) {
+  return request.conversationKey ? JSON.stringify([request.sourceId, "conversation", request.conversationKey]) : botRequestKey(request);
+}
+function botGroups(requests) {
+  const groups = new Map();
+  for (const request of requests) {
+    const key = botGroupKey(request);
+    if (!groups.has(key)) groups.set(key, { key, requests: [] });
+    groups.get(key).requests.push(request);
+  }
+  for (const group of groups.values()) {
+    group.requests.sort((a, b) => botTimestamp(b.updatedAt) - botTimestamp(a.updatedAt));
+    group.latest = group.requests[0];
+  }
+  return [...groups.values()].sort((a, b) => botTimestamp(b.latest.updatedAt) - botTimestamp(a.latest.updatedAt));
+}
+function shownBotGroups() { return botGroups(state.botRequests.requests).filter((group) => group.requests.some(botRequestMatches)); }
+function botGroupFor(key) { return key ? botGroups(state.botRequests.requests).find((group) => group.key === key) || null : null; }
+// A conversation that is one listed Codex session and nothing else opens as that session.
+function botGroupSession(group) {
+  if (group.requests.some((request) => request.conversationRef)) return null;
+  const linked = group.requests.filter((request) => request.nativeRef);
+  const sessions = new Set(linked.map((request) => JSON.stringify([request.host, request.nativeRef.agent, request.nativeRef.id, request.nativeRef.home])));
+  return sessions.size === 1 ? sessionForBotRequest(linked[0]) : null;
+}
 function botLabel(value) { return typeof value === "string" && value.trim() && !["unknown", "unconfirmed"].includes(value.trim().toLowerCase()) ? value.trim() : "미확인"; }
 function botRequestStale(request) { return !!(request.stale || state.botRequests.error || state.botRequests.sources.some((source) => source.id === request.sourceId && source.stale)); }
 function botRequestForNative(source) {
@@ -1580,7 +1607,7 @@ async function loadBotRequests({ refresh = false } = {}) {
       Object.assign(cache, botSnapshot(data), { loaded: true, readAt: Date.now() });
       const selected = selectedSession();
       const moved = selected && botRequestForNative(sourceOf(selected));
-      if (moved) selectBotRequest(botRequestKey(moved));
+      if (moved) selectBotRequest(botGroupKey(moved));
     } catch (err) {
       if (authEpoch === state.authEpoch && state.botRequests === cache && !err.staleAuth && !err.unauthorized)
         cache.error = err.message || "봇 요청을 확인하지 못했습니다. 다시 확인해 주세요.";
@@ -1601,7 +1628,7 @@ function botOwnSessions(sessions, now) {
 }
 function renderBotRequests() {
   const cache = state.botRequests, box = $("groups");
-  const shown = cache.requests.filter(botRequestMatches).sort((a, b) => botTimestamp(b.updatedAt) - botTimestamp(a.updatedAt));
+  const shown = shownBotGroups();
   const tools = el("div", "bot-list-tools");
   const note = el("p", "muted", cache.busy ? "봇 요청을 확인하고 있습니다…" : cache.loaded ? `확인된 요청 ${cache.requests.length}개` : "봇 요청을 확인해 주세요.");
   const refresh = button(cache.busy ? "확인 중…" : "새로고침", "secondary", () => loadBotRequests({ refresh: true }));
@@ -1617,12 +1644,13 @@ function renderBotRequests() {
     nodes.push(notice);
   }
   if (cache.busy && !cache.loaded) nodes.push(skeletonList("봇 요청을 확인하고 있습니다…"));
-  for (const request of shown) {
-    const key = botRequestKey(request);
+  for (const group of shown) {
+    const { key, latest: request } = group;
     const card = button("", "bot-request-card", () => selectBotRequest(key)); card.dataset.botRequestKey = key;
     card.setAttribute("aria-pressed", String(state.selectedBotRequest === key));
     const meta = el("span", "bot-request-top"); meta.append(el("strong", "bot-name", botLabel(request.botName)), el("span", "bot-status", BOT_STATUS[request.status] || "상태 미확인"));
-    if (botRequestStale(request)) meta.append(el("span", "bot-stale-tag", "이전 정보"));
+    if (group.requests.length > 1) meta.append(el("span", "bot-request-count", `요청 ${group.requests.length}개`));
+    if (group.requests.some(botRequestStale)) meta.append(el("span", "bot-stale-tag", "이전 정보"));
     card.append(meta, el("span", "bot-request-title", botLabel(request.title)),
       el("span", "bot-request-context", `요청자 ${botLabel(request.requesterLabel)} · 채널 ${botLabel(request.channelLabel)}`),
       el("span", "bot-request-boundary", `권한 ${botLabel(request.authorityLabel)}`),
@@ -1650,7 +1678,7 @@ function renderBotRequests() {
   $("session-count").textContent = cache.loaded ? `${shown.length + own.length}개` : own.length ? `${own.length}개` : "-";
   // A conversation open here (a request's session or a bot's own) draws itself (render).
   if (allSessions().some((session) => session.key === state.selected)) return;
-  const selected = cache.requests.find((request) => botRequestKey(request) === state.selectedBotRequest);
+  const selected = botGroupFor(state.selectedBotRequest);
   if (state.selectedBotRequest && !selected) {
     state.selectedBotRequest = null; $("detail").replaceChildren(); setDetailShown(false); navigateView("list", true);
   } else if (selected) drawBotRequest(selected);
@@ -1659,9 +1687,9 @@ function renderBotRequests() {
 function selectBotRequest(key) {
   if (!state.authenticated || state.launchBusy) return;
   if (state.docked) undock();
-  const request = state.botRequests.requests.find((row) => botRequestKey(row) === key); if (!request) return;
-  // Its session listed: its conversation, to follow (watch only), with the request's details.
-  const native = sessionForBotRequest(request);
+  const group = botGroupFor(key); if (!group) return;
+  // Its one session listed: its conversation, to follow (watch only), with the request's details.
+  const native = botGroupSession(group);
   if (native) {
     select(native.key);
     return;
@@ -1689,10 +1717,10 @@ function botWatchNotice(s) {
   box.append(el("p", "bot-watch-hint", "대화는 여기서 계속 새로 고쳐집니다. 입력과 실행 관리는 원래 봇에서 해 주세요."));
   return box;
 }
-function drawBotRequest(request) {
-  const pane = $("detail");
-  const stale = botRequestStale(request);
-  const revision = JSON.stringify([request, stale]);
+function drawBotRequest(group) {
+  const pane = $("detail"), request = group.latest;
+  const stale = group.requests.some(botRequestStale);
+  const revision = JSON.stringify([group.requests, stale]);
   if (pane.dataset.botRevision === revision && pane.querySelector?.(".bot-request-detail")) return;
   pane.replaceChildren(); pane.dataset.key = ""; pane.dataset.botRevision = revision;
   pane.classList.remove("is-reading", "is-typing"); state.chromeVisible = true;
@@ -1704,37 +1732,38 @@ function drawBotRequest(request) {
   if (stale) detail.append(el("p", "bot-source-notice", "이전 정보 · 마지막으로 확인한 요청입니다. 새로고침으로 최신 상태를 확인해 주세요."));
   detail.append(el("p", "bot-request-guidance", "이 요청은 원래 봇에서 이어가세요. 아래 권한과 사용 범위가 적용됩니다."));
   const metadata = el("dl", "bot-request-metadata");
-  for (const [label, value] of [["봇", request.botName], ["요청자", request.requesterLabel], ["채널", request.channelLabel], ["권한", request.authorityLabel], ["사용 범위", request.scopeLabel], ["기기", request.host ? hostLabel(request.host) : null], ["상태", BOT_STATUS[request.status]]]) {
+  for (const [label, value] of [["봇", request.botName], ["요청자", request.requesterLabel], ["채널", request.channelLabel], ["권한", request.authorityLabel], ["사용 범위", request.scopeLabel], ["기기", request.host ? hostLabel(request.host) : null], ["상태", BOT_STATUS[request.status]],
+    ...(group.requests.length > 1 ? [["이 대화의 요청", `${group.requests.length}개`]] : [])]) {
     const row = el("div"); row.append(el("dt", "", label), el("dd", "", botLabel(value))); metadata.append(row);
   }
   detail.append(metadata);
-  if (request.nativeRef) detail.append(el("p", "bot-native-note", "연결된 세션 기록이 있습니다. 입력과 실행 관리는 원래 봇에서 진행해 주세요."));
+  if (group.requests.some((row) => row.nativeRef)) detail.append(el("p", "bot-native-note", "연결된 세션 기록이 있습니다. 입력과 실행 관리는 원래 봇에서 진행해 주세요."));
   // Its conversation below the details, watch-only (no composer, no session control).
-  const readable = botConversationReadable(request);
+  const readable = botConversationReadable(group);
   if (readable) {
     const conversation = el("section", "bot-conversation"); conversation.id = "bot-conversation";
     conversation.setAttribute("aria-label", "봇 대화 기록");
-    conversation.dataset.conversationKey = botConversationKey(request);
+    conversation.dataset.conversationKey = group.key;
     detail.append(conversation);
   }
   pane.append(head, detail);
-  if (readable) loadBotConversation(request);
+  if (readable) loadBotConversation(group);
 }
-// A request whose bot kept its conversation (a Hermes session, or a Codex one not listed
-// here): read on opening, once a minute at most unless the request changed or asked again.
+// A conversation whose bot kept it (Hermes sessions, or Codex ones not listed here, one part
+// per session in time order): read on opening, once a minute at most unless one of its
+// requests changed or it is asked again. The server gathers the requests from the newest one.
 const BOT_CONVERSATION_MS = 60000;
-function botConversationReadable(request) { return !!(request?.conversationRef || request?.nativeRef); }
-function botConversationKey(request) { return botRequestKey(request); }
-async function loadBotConversation(request, { force = false } = {}) {
-  if (!state.authenticated || !botConversationReadable(request)) return;
-  const key = botConversationKey(request), revision = String(request.updatedAt ?? "");
+function botConversationReadable(group) { return group.requests.some((request) => request.conversationRef || request.nativeRef); }
+async function loadBotConversation(group, { force = false } = {}) {
+  if (!state.authenticated || !botConversationReadable(group)) return;
+  const { key, latest: request } = group, revision = JSON.stringify(group.requests.map((row) => [row.id, row.updatedAt ?? null]));
   let entry = state.botConversations.get(key);
   if (entry?.promise) return entry.promise;
   if (entry && !force && !entry.error && entry.revision === revision && Date.now() - entry.readAt < BOT_CONVERSATION_MS) {
-    renderBotConversation(request); return;
+    renderBotConversation(group); return;
   }
   if (!entry) { entry = { data: null, error: "", readAt: 0, revision, promise: null }; state.botConversations.set(key, entry); }
-  if (networkOffline()) { entry.error = "오프라인입니다. 연결 후 대화를 다시 불러와 주세요."; renderBotConversation(request); return; }
+  if (networkOffline()) { entry.error = "오프라인입니다. 연결 후 대화를 다시 불러와 주세요."; renderBotConversation(group); return; }
   const authEpoch = state.authEpoch;
   entry.error = "";
   entry.promise = (async () => {
@@ -1748,14 +1777,14 @@ async function loadBotConversation(request, { force = false } = {}) {
       if (authEpoch === state.authEpoch && state.botConversations.get(key) === entry && !err.staleAuth && !err.unauthorized)
         entry.error = err.message || "봇 대화를 읽지 못했습니다. 다시 확인해 주세요.";
     } finally {
-      if (state.botConversations.get(key) === entry) { entry.promise = null; renderBotConversation(request); }
+      if (state.botConversations.get(key) === entry) { entry.promise = null; renderBotConversation(group); }
     }
   })();
-  renderBotConversation(request);
+  renderBotConversation(group);
   return entry.promise;
 }
-function renderBotConversation(request) {
-  const key = botConversationKey(request), box = $("bot-conversation");
+function renderBotConversation(group) {
+  const { key, latest: request } = group, box = $("bot-conversation");
   if (!box || box.dataset.conversationKey !== key) return;
   const entry = state.botConversations.get(key);
   const segments = entry?.data?.segments || [];
@@ -1764,10 +1793,12 @@ function renderBotConversation(request) {
   if (entry?.error) {
     const notice = el("div", "bot-source-notice"); notice.setAttribute("role", "status");
     notice.append(el("p", "", entry.data ? `${entry.error} 마지막으로 읽은 대화를 표시합니다.` : entry.error),
-      button("대화 다시 불러오기", "secondary", () => loadBotConversation(request, { force: true })));
+      button("대화 다시 불러오기", "secondary", () => loadBotConversation(group, { force: true })));
     nodes.push(notice);
   }
   for (const segment of segments) {
+    // Where one session of the conversation ends and the next begins.
+    if (segments.length > 1) nodes.push(botConversationBreak(segment));
     if (segment.error) nodes.push(el("p", "bot-source-notice", segment.error));
     if (segment.more) nodes.push(el("p", "conversation-window-notice", "이 대화의 앞부분 일부는 여기에 나오지 않습니다."));
     for (const message of segment.messages) nodes.push(botMessageRow(message, request));
@@ -1776,6 +1807,14 @@ function renderBotConversation(request) {
   if (entry?.data && !segments.length) nodes.push(el("p", "group-empty", "이 요청에서 읽을 수 있는 대화가 없습니다."));
   box.replaceChildren(...nodes);
   box.setAttribute("aria-busy", String(!!entry?.promise));
+}
+function botConversationBreak(segment) {
+  const when = botTimestamp(segment.firstAt);
+  const label = [segment.kind === "codex" ? "Codex 세션" : "Hermes 세션", when ? clock(when / 1000) : "",
+    segment.requests > 1 ? `요청 ${segment.requests}개` : ""].filter(Boolean).join(" · ");
+  const line = el("p", "bot-conversation-break", label);
+  line.setAttribute("role", "separator");
+  return line;
 }
 // One message, in the same bubbles as a session's conversation; nothing here sends or acts.
 function botMessageRow(message, request) {
@@ -1828,7 +1867,7 @@ function setSessionCategory(category, { renderView = true, clearSelection = true
 function renderSessionCategories(sessions, now) {
   const botSessions = botOwnSessions(sessions, now).length;
   const counts = { general: 0, agent: 0,
-    bot: state.botRequests.loaded ? state.botRequests.requests.filter(botRequestMatches).length + botSessions : botSessions || null };
+    bot: state.botRequests.loaded ? shownBotGroups().length + botSessions : botSessions || null };
   for (const session of sessions) {
     const category = sessionCategoryOf(session);
     if (category !== "bot" && matches(session, now, { category: false, initiator: category === state.sessionCategory })) counts[category] += 1;
@@ -2746,7 +2785,7 @@ function closeSessionControl(force = false) {
 async function manageSession(s, trigger = null) {
   if (!s || !state.authenticated || sessionControl?.busy) return;
   const bot = botRequestForNative(sourceOf(s));
-  if (bot) { selectBotRequest(botRequestKey(bot)); return; }
+  if (bot) { selectBotRequest(botGroupKey(bot)); return; }
   closeSessionControl(true);
   let dialog = $("session-control-dialog");
   if (!dialog) {
@@ -2943,7 +2982,7 @@ function select(key) {
   const bot = target && botRequestForNative(sourceOf(target));
   if (target && sessionUnread(target)) markSeen(target);
   if (target) markOpened(target);
-  state.selectedBotRequest = bot ? botRequestKey(bot) : null;
+  state.selectedBotRequest = bot ? botGroupKey(bot) : null;
   const listChanged = target && prepareSessionListFor(target);
   if (listChanged && state.selected === key) renderSessionList(allSessions(), state.snapshot?.serverTime || Date.now() / 1000);
   const mobile = phoneLayout();
@@ -6477,7 +6516,7 @@ async function recoverChatSession(s) {
 function openChatTerminal(s) {
   if (state.selected !== s.key || state.launchBusy) return;
   const bot = botRequestForNative(sourceOf(s));
-  if (bot) { selectBotRequest(botRequestKey(bot)); return; }
+  if (bot) { selectBotRequest(botGroupKey(bot)); return; }
   if (chatOneShot(chatEntry(s))) { toast(ONE_SHOT_NO_INPUT); return; }
   if (chatRecovery(chatEntry(s))) return recoverChatSession(s);
   if (state.terminalAlive && chatKey(terminalInfo(state.terminal).nativeSource || {}) === chatKey(sourceOf(s))) {
@@ -7585,7 +7624,7 @@ async function preparePlan({ resume = false } = {}) {
   if (!s || !state.route) return;
   if (chatOneShot(chatEntry(s))) { toast(ONE_SHOT_NO_INPUT); return; }
   const bot = botRequestForNative(sourceOf(s));
-  if (bot) { selectBotRequest(botRequestKey(bot)); return; }
+  if (bot) { selectBotRequest(botGroupKey(bot)); return; }
   if (state.launchBusy || $("plan-dialog").open) {
     $(state.launchBusy ? "plan-dialog" : "plan-cancel").focus();
     return;

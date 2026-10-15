@@ -6,6 +6,7 @@ Request lists read metadata only. A bot's conversation (its user and assistant
 text, never tool calls or results) is read only for the request the board was
 asked to show, bounded and read-only, and is shown watch-only.
 """
+from concurrent.futures import ThreadPoolExecutor
 import copy
 from datetime import datetime, timezone
 import hashlib
@@ -166,14 +167,18 @@ def _index_on(connection, table, columns):
     return None
 
 
-def _base(source, key, *, title, status, updated, channel=None, requester=None, native=None, conversation=None):
+def _base(source, key, *, title, status, updated, channel=None, requester=None, native=None, conversation=None,
+          thread=None):
     # `_conversation` (a Hermes session id) stays with the board; the page sees only its alias.
+    # `conversationKey` aliases the bot's own conversation key (a direct message, a thread): the
+    # requests sharing it are one conversation on the page.
     return {"id": _opaque(source, key), "sourceId": source["id"], "botName": source["label"],
             "host": source["host"], "channelLabel": channel or "채널 미확인",
             "requesterLabel": requester or "요청자 미확인", "authorityLabel": source["authorityLabel"],
             "scopeLabel": source["scopeLabel"], "title": title, "status": status,
             "updatedAt": _stamp(updated), "nativeRef": native,
-            "conversationRef": _conversation_ref(source, conversation), "_conversation": conversation}
+            "conversationRef": _conversation_ref(source, conversation), "_conversation": conversation,
+            "conversationKey": _opaque(source, "conversation:" + thread) if isinstance(thread, str) and thread.strip() else None}
 
 
 def _conversation_ref(source, session):
@@ -212,7 +217,8 @@ def _hermes(connection, source):
     if index is None:
         raise SourceError("봇 세션의 최신 기록 인덱스를 확인하지 못했습니다.")
     activity = "last_activity_at" if "last_activity_at" in columns else "started_at"
-    query = ('SELECT id,user_id,chat_id,started_at,ended_at,' + activity + ' AS activity,substr(origin_json,1,16384) AS origin '
+    query = ('SELECT id,user_id,chat_id,substr(session_key,1,512) AS session_key,started_at,ended_at,'
+             + activity + ' AS activity,substr(origin_json,1,16384) AS origin '
              'FROM sessions INDEXED BY "' + index.replace('"', '""') + '" '
              "WHERE source='slack' AND session_key IS NOT NULL ORDER BY started_at DESC LIMIT ?")
     result = []
@@ -227,12 +233,15 @@ def _hermes(connection, source):
                             updated=row["ended_at"] or row["activity"] or row["started_at"],
                             channel=_text(origin.get("chat_name"), _alias("채널", source, row["chat_id"]), 60),
                             requester=_text(origin.get("user_name"), _alias("요청자", source, row["user_id"]), 40),
-                            conversation=row["id"] if isinstance(row["id"], str) and HERMES_ID.fullmatch(row["id"]) else None))
+                            conversation=row["id"] if isinstance(row["id"], str) and HERMES_ID.fullmatch(row["id"]) else None,
+                            thread=row["session_key"]))
     return result
 
 
 def _ledger(connection, source):
-    _columns(connection, "tasks", {"id", "channel", "user", "text", "status", "codex_thread", "created_at", "started_at", "finished_at"})
+    columns = _columns(connection, "tasks", {"id", "channel", "user", "text", "status", "codex_thread", "created_at", "started_at", "finished_at"})
+    # The bot's own conversation key (a direct message's, a thread's), when it keeps one.
+    thread = "substr(session_key,1,512)" if "session_key" in columns else "NULL"
     _columns(connection, "users", {"id", "name", "real_name"})
     _columns(connection, "channels", {"id", "name"})
     _primary_key(connection, "tasks", "id", integer=True)
@@ -240,10 +249,11 @@ def _ledger(connection, source):
     _primary_key(connection, "channels", "id")
     # The integer primary key is the receipt order. Exact ID joins are bounded
     # to these requests. A later session mapping never rewrites old task ownership.
-    query = ("SELECT t.id,t.channel,t.user,substr(t.text,1,2048) AS title,t.status,t.codex_thread,"
+    query = ("SELECT t.id,t.channel,t.user,substr(t.text,1,2048) AS title,t.status,t.codex_thread,t.thread,"
              "t.created_at,t.started_at,t.finished_at,substr(u.real_name,1,200) AS real_name,"
              "substr(u.name,1,200) AS user_name,substr(c.name,1,200) AS channel_name "
-             "FROM (SELECT id,channel,user,substr(text,1,2048) AS text,status,codex_thread,created_at,started_at,finished_at "
+             "FROM (SELECT id,channel,user,substr(text,1,2048) AS text,status,codex_thread," + thread + " AS thread,"
+             "created_at,started_at,finished_at "
              "FROM tasks ORDER BY id DESC LIMIT ?) t LEFT JOIN users u ON u.id=t.user "
              "LEFT JOIN channels c ON c.id=t.channel ORDER BY t.id DESC")
     result = []
@@ -253,7 +263,8 @@ def _ledger(connection, source):
                             updated=row["finished_at"] or row["started_at"] or row["created_at"],
                             channel=_text(row["channel_name"], _alias("채널", source, row["channel"]), 60),
                             requester=_text(row["real_name"] or row["user_name"], _alias("요청자", source, row["user"]), 40),
-                            native=_native(row["codex_thread"]), conversation=_hermes_session(row["codex_thread"])))
+                            native=_native(row["codex_thread"]), conversation=_hermes_session(row["codex_thread"]),
+                            thread=row["thread"]))
     if len(result) > LIMIT or len({row["id"] for row in result}) != len(result):
         raise SourceError("봇 원장의 요청과 사용자 연결이 고유하지 않습니다.")
     return result
@@ -513,12 +524,16 @@ class BotRequests:
                         or not HERMES_ID.fullmatch(session) or ref != _conversation_ref(source, session)):
                     raise SourceError("봇 요청의 대화 연결이 올바르지 않습니다.")
                 sessions[row["id"]] = session
+            thread = row.get("conversationKey")
+            if thread is not None and (not isinstance(thread, str)
+                                       or not re.fullmatch(re.escape(source["id"]) + r":[0-9a-f]{24}", thread)):
+                raise SourceError("봇 요청의 대화 묶음이 올바르지 않습니다.")
             checked.append({"id": row["id"], "sourceId": source["id"], "host": source["host"],
                             "botName": source["label"], "authorityLabel": source["authorityLabel"], "scopeLabel": source["scopeLabel"],
                             **{key: _text(row.get(key), "미확인", limit) for key, limit in
                                (("channelLabel", 60), ("requesterLabel", 40), ("title", 120), ("status", 40))},
                             "updatedAt": _stamp(row.get("updatedAt")), "nativeRef": native,
-                            "conversationRef": ref})
+                            "conversationRef": ref, "conversationKey": thread})
         if len({row["id"] for row in checked}) != len(checked):
             raise SourceError("봇 요청 식별자가 중복되었습니다.")
         return checked, sessions
@@ -575,10 +590,11 @@ class BotRequests:
             return copy.deepcopy(result)
 
     def conversation(self, source_id, request_id, read_native=None):
-        """A listed request's conversation, watch-only: its Hermes session read from the bot's
-        database (bounded, read-only), or its Codex session through `read_native(host,
-        nativeRef)`, the board's own read. Each part says when it could not be read; nothing
-        is written, sent or resumed."""
+        """A listed request's conversation (with the requests sharing its conversation key, one
+        part per session, oldest first), watch-only: a Hermes session read from the bot's
+        database (bounded, read-only), a Codex session through `read_native(host, nativeRef)`,
+        the board's own read. Each part says when it could not be read; nothing is written,
+        sent or resumed."""
         if (not isinstance(source_id, str) or not IDENTIFIER.fullmatch(source_id) or not isinstance(request_id, str)
                 or not re.fullmatch(re.escape(source_id) + r":[0-9a-f]{24}", request_id)):
             raise ValueError("봇 요청을 확인하지 못했습니다.")
@@ -595,36 +611,46 @@ class BotRequests:
             source, sessions = cached["source"], dict(cached["sessions"])
             parts = self._parts(self._members(cached["rows"], target), sessions)
         hermes = [part["ref"] for part in reversed(parts) if part["kind"] == "hermes"]
-        read, failure = {}, "이 대화 기록을 읽지 못했습니다. 잠시 뒤 다시 확인해 주세요."
-        if hermes:
+        failure = "이 대화 기록을 읽지 못했습니다. 잠시 뒤 다시 확인해 주세요."
+        failed = (OSError, ValueError, RuntimeError, KeyError, sqlite3.Error, subprocess.TimeoutExpired)
+        # The bot's Hermes sessions in one read, its Codex ones through the board's reads, together.
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            hermes_read = pool.submit(self._collect, source, hermes) if hermes else None
+            codex_reads = {index: pool.submit(read_native, source["host"], part["ref"])
+                           for index, part in enumerate(parts) if part["kind"] == "codex" and read_native is not None}
             try:
-                read = self._checked_conversations(hermes, self._collect(source, hermes))
-            except (OSError, ValueError, RuntimeError, sqlite3.Error, subprocess.TimeoutExpired):
+                read = self._checked_conversations(hermes, hermes_read.result()) if hermes_read else {}
+            except failed:
                 read = {}
-        segments = []
-        for part in parts:
-            segment = {"kind": part["kind"], "requests": part["requests"], "firstAt": part["firstAt"],
-                       "lastAt": part["lastAt"], "messages": [], "more": False, "error": None}
-            if part["kind"] == "hermes":
-                if part["ref"] in read:
-                    segment.update(read[part["ref"]])
+            segments = []
+            for index, part in enumerate(parts):
+                segment = {"kind": part["kind"], "requests": part["requests"], "firstAt": part["firstAt"],
+                           "lastAt": part["lastAt"], "messages": [], "more": False, "error": None}
+                if part["kind"] == "hermes":
+                    if part["ref"] in read:
+                        segment.update(read[part["ref"]])
+                    else:
+                        segment["error"] = failure
                 else:
-                    segment["error"] = failure
-            else:
-                try:
-                    if read_native is None:
-                        raise RuntimeError("no native reader")
-                    segment["messages"] = [_shown(row) for row in read_native(source["host"], part["ref"]) or []
-                                           if isinstance(row, dict) and row.get("role") in ("user", "assistant")]
-                except (OSError, ValueError, RuntimeError, KeyError, subprocess.TimeoutExpired):
-                    segment["error"] = failure
-            segments.append(segment)
+                    try:
+                        if index not in codex_reads:
+                            raise RuntimeError("no native reader")
+                        rows = codex_reads[index].result() or []
+                        segment["messages"] = [_shown(row) for row in rows
+                                               if isinstance(row, dict) and row.get("role") in ("user", "assistant")]
+                        # The board's read is a window of the newest rows: older ones may be cut.
+                        segment["more"] = len(rows) >= CONVERSATION_ROWS
+                    except failed:
+                        segment["error"] = failure
+                segments.append(segment)
         return {"segments": segments, "fetchedAt": _now()}
 
     @staticmethod
     def _members(rows, target):
-        """The requests one conversation view shows."""
-        return [target]
+        """The requests one conversation view shows: those sharing the bot's conversation key
+        (a direct message, a thread) among the listed ones, or the request alone."""
+        key = target.get("conversationKey")
+        return [row for row in rows if row.get("conversationKey") == key] if key else [target]
 
     @staticmethod
     def _parts(members, sessions):

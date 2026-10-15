@@ -3024,6 +3024,26 @@ test('chat resize preserves active Korean composition and respects keyboard view
   assert.equal(input.value, '아직 입력 중인 한글');
 });
 
+test('a sent draft kept but drawn empty gives the editor no scrollbar until it shows again', () => {
+  const c = client(undefined, noChatTimers);
+  const { s, entry } = selectChat(c);
+  wireTree(c, c.buildChatComposer(s));
+  const input = c.get('chat-input');
+  Object.defineProperty(input, 'scrollHeight', { get: () => 20 + 22 * input.value.split('\n').length });
+  input.value = entry.text = Array(8).fill('보낸 긴 글').join('\n'); input.events.input();
+  assert.equal(input.style.overflowY, 'auto', '긴 초안은 스크롤된다');
+  // Sent and not yet confirmed: the bubble shows it, the editor keeps it drawn empty.
+  entry.pending = { requestId: 'sent-request', revision: entry.revision, text: entry.text, attachments: [] };
+  c.updateChatComposer(entry);
+  assert.match(c.get('chat-composer').className, /is-sent-draft/);
+  assert.equal(input.style.overflowY, 'hidden');
+  assert.equal(input.scrollTop, 0);
+  // Refused: the draft shows again, and scrolls again.
+  entry.pending = null;
+  c.updateChatComposer(entry);
+  assert.equal(input.style.overflowY, 'auto');
+});
+
 test('programmatic clipboard insertion grows the editor and accepted delivery shrinks it without clearing newer drafts', async () => {
   const text = '복사 첫 줄\n둘째 줄\n셋째 줄';
   const c = client(undefined, noChatTimers);
@@ -3315,6 +3335,53 @@ test('reselecting a conversation renders current memory before transport and pre
   assert.match(textOf(list), /new appended reply/);
   assert.equal(c.get('conversation-sync-notice').hidden, true);
   assert.equal(c.get('chat-input'), input); assert.equal(entry.composing, true); assert.equal(entry.text, input.value);
+});
+
+test('an open conversation read again behind the reader keeps the line above it and its device list time does not reread it', async () => {
+  let calls = 0; let release = null;
+  const c = client(async (url, options) => {
+    calls++;
+    if (release === false) await new Promise((resolve) => { release = resolve; });
+    return { ok: true, status: 200, json: async () => ({ route: JSON.parse(options.body).source,
+      capability: { supported: true }, phase: 'working', messages: [{ role: 'assistant', text: '읽던 답변' }] }) };
+  }, noChatTimers);
+  const { s } = selectChat(c);
+  const host = c.state.snapshot.hosts[0];
+  host.data.codex[0] = s; s.updatedAt = 100; host.fetchedAt = 1000;
+  const listed = () => c.allSessions().find((item) => item.key === s.key);
+  const settle = async () => { for (let i = 0; i < 5; i++) await new Promise((resolve) => setImmediate(resolve)); };
+  c.refreshDetail(listed()); await settle();
+  const notice = c.get('conversation-sync-notice');
+  assert.equal(notice.hidden, true);
+  const first = calls;
+  // The device was listed again (another session moved): nothing of this one changed.
+  host.fetchedAt = 1003;
+  c.refreshDetail(listed()); await settle();
+  assert.equal(calls, first, 'a new list time alone does not read it again');
+  // The session itself moved: read again behind it, with no "확인 중" line shown and gone.
+  release = false; s.updatedAt = 101; host.fetchedAt = 1006;
+  c.refreshDetail(listed()); await settle();
+  assert.equal(calls, first + 1);
+  assert.equal(notice.hidden, true, 'the line above the conversation stays as it was');
+  release(); await settle();
+  assert.equal(notice.hidden, true);
+  // A stale device still says how old its list is (the header follows its time).
+  const revision = vm.runInContext('detailRevision', c.context);
+  assert.notEqual(revision({ ...s, stale: true, fetchedAt: 1 }), revision({ ...s, stale: true, fetchedAt: 2 }));
+  assert.equal(revision({ ...s, fetchedAt: 1 }), revision({ ...s, fetchedAt: 2 }));
+});
+
+test('model and effort say they are being checked until the session state is read', async () => {
+  const c = client(async (url, options) => ({ ok: true, status: 200, json: async () => ({ route: JSON.parse(options.body).source,
+    capability: { supported: true }, phase: 'idle', modelSettings: { model: 'gpt-5', effort: 'high' }, messages: [] }) }), noChatTimers);
+  const { s, entry } = selectChat(c);
+  entry.data = null;
+  c.buildChatComposer(s);
+  c.updateChatComposer(entry);
+  assert.equal(c.get('chat-model-summary').textContent, '모델·에포트 확인 중…');
+  assert.equal(c.get('chat-model-control').textContent, '확인 중…');
+  await c.loadChatState(s, true);
+  assert.equal(c.get('chat-model-summary').textContent, 'gpt-5 · high');
 });
 
 test('failed refresh keeps the cached transcript with an explicit stale notice and successful retry clears it', async () => {

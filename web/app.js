@@ -2087,6 +2087,9 @@ function renderGroups(shown, now) {
       if (node.dataset?.sessionKey) cards.set(node.dataset.sessionKey, node);
   }
   const focused = active?.dataset?.sessionKey && cards.get(active.dataset.sessionKey)?.card === active ? active : null;
+  // Scrolled down the list, the first card on screen keeps its place when cards above it move
+  // (a session going to 답 필요). At the top the top stays, where such a card is seen.
+  const anchor = scroll > 0 ? listAnchor(pane, cards) : null;
   const folders = cardFolderHints(shown);
   const desired = [];
   const visible = new Set();
@@ -2157,6 +2160,20 @@ function renderGroups(shown, now) {
   placeChildren(box, desired);
   if (focused && visible.has(focused) && document.activeElement !== focused) focused.focus({ preventScroll: true });
   if (typeof scroll === "number") pane.scrollTop = scroll;
+  if (anchor?.node.isConnected) {
+    const moved = anchor.node.getBoundingClientRect().top - pane.getBoundingClientRect().top - anchor.offset;
+    if (moved) pane.scrollTop += moved;
+  }
+}
+// The first card on screen in the list and its distance from the list's top (layout only).
+function listAnchor(pane, cards) {
+  const top = pane?.getBoundingClientRect?.().top;
+  if (!Number.isFinite(top)) return null;
+  for (const node of cards.values()) {
+    const box = node.getBoundingClientRect?.();
+    if (box && Number.isFinite(box.bottom) && box.bottom > top) return { node, offset: box.top - top };
+  }
+  return null;
 }
 // Empty and loading states of the list: an icon, a short title, what to do,
 // and at most one action.
@@ -3061,8 +3078,10 @@ function select(key) {
   state.detailShown = wasShown;
   setDetailShown(true, { direction: entering ? "push" : null, focus: mobile });
 }
+// What redraws an open conversation's header and reads it again. The device's list time counts
+// only while the header says how old a stale list is: every listing of the device changed it.
 function detailRevision(s) {
-  return JSON.stringify([s.stale, s.phase, s.title, s.project, s.account, s.hostLabel, s.fetchedAt,
+  return JSON.stringify([s.stale, s.phase, s.title, s.project, s.account, s.hostLabel, s.stale ? s.fetchedAt : null,
     s.cwd || null, s.sessionId || null, s.runtimeKnown, s.readOnly, s.initiator, s.initiatorName, s.initiatorEvidence, s.parentSessionId,
     s.executionMode, s.transcriptAvailability, s.historyNotice]);
 }
@@ -3093,6 +3112,9 @@ function detailMetaChildren(s) {
 function patchDetailMetadata(s) {
   const pane = $("detail");
   if (pane.dataset.key !== s.key) return;
+  keepReadingPlace(() => patchDetailHead(pane, s));
+}
+function patchDetailHead(pane, s) {
   const title = pane.querySelector(".detail-title");
   const eyebrow = pane.querySelector(".detail-project");
   if (title) title.textContent = s.title || "제목 없는 작업";
@@ -3132,7 +3154,9 @@ async function loadDetail(s, fresh = false) {
   const usableCache = cached && cached.authEpoch === authEpoch && cached.identity === identity;
   if (usableCache) {
     renderMessages(s, cached.messages, "", fresh);
-    conversationSyncNotice(s, "checking");
+    // Said when it opens. A read again behind an open conversation (its device listed anew,
+    // the session updated) keeps the line it has: a line shown and gone moved the reader's text.
+    if (fresh) conversationSyncNotice(s, "checking");
   }
   if (networkOffline() || !chatVisible()) {
     conversationSyncNotice(s, "stale");
@@ -3593,6 +3617,17 @@ function setMessagesScroll(list, top) {
   list.scrollTop = top;
   list.lastScrollTop = list.scrollTop;
 }
+// Something above the conversation changed height (a notice, the header's text): a reader
+// scrolled back keeps the line being read where it was, as setReading does for the folding
+// header. A pinned list is put back at its end by keepAtEnd.
+function keepReadingPlace(change) {
+  const list = $("messages");
+  const before = list?.clientHeight ? list.getBoundingClientRect?.().top : undefined;
+  change();
+  if (!list || typeof before !== "number" || pinnedToEnd(list)) return;
+  const shift = list.getBoundingClientRect().top - before;
+  if (shift) setMessagesScroll(list, list.scrollTop + shift);
+}
 // The class mirror of state.chromeVisible (and of the input's focus):
 // "is-reading" folds the header and the composer tools.
 // 집중 모드 adds 빠른 답장 to the input's row: a short hint keeps it on one line on a phone.
@@ -3747,8 +3782,12 @@ function conversationSyncNotice(s, status) {
     : status === "failed" && sameCache ? "저장된 대화 · 최신 내용을 확인하지 못했습니다."
     : status === "stale" && sameCache ? "저장된 대화 · 연결 후 최신 내용을 확인해 주세요." : "";
   const notice = $("conversation-sync-notice");
-  notice.textContent = text;
-  notice.hidden = !text;
+  if (notice.textContent === text && notice.hidden === !text) return;
+  // The line sits right above the conversation: shown or gone, the text being read stays put.
+  keepReadingPlace(() => {
+    notice.textContent = text;
+    notice.hidden = !text;
+  });
 }
 function attachmentMetadata(files) {
   if (!Array.isArray(files)) return [];
@@ -4852,27 +4891,39 @@ function updateModelControls(entry) {
     : `세션에서 확인: ${observedValues.join(" · ")}`;
   const note = $("chat-model-selection-note");
   const noteText = changed ? `다음 메시지에 사용 · ${observed}` : "";
-  if (note) {
-    if (note.textContent !== noteText) note.textContent = noteText;
-    note.hidden = !changed;
-  }
   const summary = $("chat-model-summary");
-  if (summary) {
-    const values = [selected.model || "모델 미확인", selected.effort || "에포트 미확인"].join(" · ");
-    summary.textContent = (changed ? "선택 " : "") + values;
-    summary.title = changed ? `다음 메시지 설정: ${values} · ${observed}` : observed;
-  }
-  for (const kind of ["model", "effort"]) {
-    const control = $(`chat-${kind}-control`);
-    if (!control) continue;
-    const actual = settings[kind], pending = next[kind] && next[kind] !== actual ? next[kind] : null;
-    control.textContent = selected[kind] || "미확인";
-    const label = kind === "model" ? "모델" : "에포트";
-    const explanation = pending ? `다음 메시지에 사용 · ${kind === "model" ? observedLabel : "세션에서 확인"}: ${actual || "미확인"}` : settings.observed === "last_response" && kind === "model" ? "마지막 응답에서 확인한 모델" : `${label} 선택`;
-    control.title = `${label}: ${control.textContent} · ${explanation}`;
-    control.setAttribute("aria-label", `${label}: ${control.textContent} · 선택하기`);
-    control.disabled = !chatSupported(entry) || entry.sending || !!entry.pending || !!entry.commandBusy || networkOffline();
-  }
+  // Before the session's state is read, it is not "미확인" yet: the drawn "확인 중…" stays.
+  const reading = !entry.data;
+  const values = [selected.model || "모델 미확인", selected.effort || "에포트 미확인"].join(" · ");
+  const summaryText = reading ? "모델·에포트 확인 중…" : (changed ? "선택 " : "") + values;
+  const controlText = (kind) => reading ? "확인 중…" : selected[kind] || "미확인";
+  const apply = () => {
+    if (note) {
+      if (note.textContent !== noteText) note.textContent = noteText;
+      note.hidden = !changed;
+    }
+    if (summary) {
+      if (summary.textContent !== summaryText) summary.textContent = summaryText;
+      summary.title = changed ? `다음 메시지 설정: ${values} · ${observed}` : observed;
+    }
+    for (const kind of ["model", "effort"]) {
+      const control = $(`chat-${kind}-control`);
+      if (!control) continue;
+      const actual = settings[kind], pending = next[kind] && next[kind] !== actual ? next[kind] : null;
+      if (control.textContent !== controlText(kind)) control.textContent = controlText(kind);
+      const label = kind === "model" ? "모델" : "에포트";
+      const explanation = pending ? `다음 메시지에 사용 · ${kind === "model" ? observedLabel : "세션에서 확인"}: ${actual || "미확인"}` : settings.observed === "last_response" && kind === "model" ? "마지막 응답에서 확인한 모델" : `${label} 선택`;
+      control.title = `${label}: ${control.textContent} · ${explanation}`;
+      control.setAttribute("aria-label", `${label}: ${control.textContent} · 선택하기`);
+      control.disabled = !chatSupported(entry) || entry.sending || !!entry.pending || !!entry.commandBusy || networkOffline();
+    }
+  };
+  // Another model name can wrap the header's text: only then is the reader's place kept.
+  const headChanges = (note && (note.textContent !== noteText || note.hidden !== !changed)) ||
+    (summary && summary.textContent !== summaryText) ||
+    ["model", "effort"].some((kind) => $(`chat-${kind}-control`) && $(`chat-${kind}-control`).textContent !== controlText(kind));
+  if (headChanges) keepReadingPlace(apply);
+  else apply();
 }
 function closeChatSettings() {
   $("chat-settings-panel")?.remove?.();
@@ -5297,15 +5348,22 @@ function resizeChatInput(entry) {
   const list = $("messages");
   const atBottom = list && list.scrollHeight - list.scrollTop - list.clientHeight < 50;
   const inputScroll = input.scrollTop || 0;
+  // Followed to its end only when it was there (typing at the end): a status read resizes it
+  // too, and must not pull a draft scrolled back for reading down to its last line.
+  // (Within a line: a new last line may be in before the browser follows the caret to it.)
+  const wasAtEnd = inputScroll + (input.clientHeight || 0) >= (input.scrollHeight || 0) - line - 2;
   input.style.minHeight = `${minimum}px`;
   input.style.maxHeight = `${cap}px`;
   input.style.height = "0px";
   const content = input.value ? input.scrollHeight + border || minimum : minimum;
   const height = Math.max(minimum, Math.min(cap, content));
   input.style.height = `${Math.ceil(height)}px`;
-  input.style.overflowY = content > cap ? "auto" : "hidden";
-  input.scrollTop = input.value ? inputScroll : 0;
-  if (document.activeElement === input && input.selectionEnd === input.value.length && content > cap)
+  // A sent draft is kept but drawn empty (.is-sent-draft): its lines past the one-line cap
+  // give no scrollbar to an editor that shows nothing.
+  const hidden = sentDraftHidden(entry);
+  input.style.overflowY = content > cap && !hidden ? "auto" : "hidden";
+  input.scrollTop = input.value && !hidden ? inputScroll : 0;
+  if (document.activeElement === input && input.selectionEnd === input.value.length && content > cap && wasAtEnd && !hidden)
     input.scrollTop = input.scrollHeight;
   input.dataset.grown = String(height > base + 1);
   const toggle = $("chat-expand");
@@ -5556,7 +5614,9 @@ function updateChatComposer(entry) {
     ? "첨부는 이 작업 폴더에 저장됐습니다. 첨부의 ‘경로’를 복사해 터미널에 붙여넣으세요."
     : entry.data?.capability?.reason || "직접 입력을 지원하지 않습니다. 터미널을 사용해 주세요.";
   const dictating = state.dictation?.field === input;
-  $("chat-status").textContent = (offline ? "오프라인입니다. 초안은 유지됩니다. 연결 후 상태를 확인하고 보내 주세요." : (dictating && entry.dictationNotice) || entry.error || (oneShot ? ONE_SHOT_NO_INPUT : entry.dictationNotice || entry.notice || (entry.uploads ? `첨부 ${entry.uploads}개를 올리고 있습니다…` : !entry.data ? (claudeWithoutId(selectedSession()) ? CLAUDE_NO_SEND : "메시지 전송 환경을 확인하고 있습니다…") : !supported ? unsupportedCopy : receiptNotice(entry) || phaseCopy))) + budgetNote;
+  const statusCopy = offline ? "오프라인입니다. 초안은 유지됩니다. 연결 후 상태를 확인하고 보내 주세요." : (dictating && entry.dictationNotice) || entry.error || (oneShot ? ONE_SHOT_NO_INPUT : entry.dictationNotice || entry.notice || (entry.uploads ? `첨부 ${entry.uploads}개를 올리고 있습니다…` : !entry.data ? (claudeWithoutId(selectedSession()) ? CLAUDE_NO_SEND : "메시지 전송 환경을 확인하고 있습니다…") : !supported ? unsupportedCopy : receiptNotice(entry) || phaseCopy));
+  // The paused-check note adds only what the line does not say yet ("상태 다시 확인" twice was).
+  $("chat-status").textContent = statusCopy + (budgetNote && !statusCopy.includes("상태 다시 확인") ? budgetNote : budgetNote ? " 자동 상태 확인을 잠시 멈췄습니다." : "");
   $("chat-status").setAttribute("data-attention", String(!!(offline || chatHostOffline(entry) || entry.error || entry.receipt?.status === "unknown")));
   const deliveryVisible = updateChatDeliveryEvidence(entry);
   const chips = $("chat-attachments");

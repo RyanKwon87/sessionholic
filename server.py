@@ -1869,6 +1869,36 @@ class Workflow:
             closed.append(terminal_id)
         return closed
 
+    def close_idle_codex_attaches(self):
+        """End Codex connections left unused (terminals.idle_codex_attaches) whose session is idle
+        or done, or no longer listed (archived): read from the board's last list of its host,
+        never a fresh call, and never while that host's list is not current. Only the board's TUI
+        client ends; the thread stays on its project's server. Returns their IDs."""
+        idle = getattr(self.terminals, "idle_codex_attaches", None)
+        if idle is None:
+            return []
+        closed = []
+        for row in idle():
+            native = row.get("nativeSource")
+            if not isinstance(native, dict) or not (self.board.state.get(native.get("host")) or {}).get("ok"):
+                continue
+            try:
+                phase = self.board.source(native).get("phase")
+            except ValueError:
+                phase = "done"  # No longer listed: archived or gone.
+            if phase not in ("idle", "done", "closed"):
+                continue
+            try:
+                ended = self.terminals.release_codex_attach(row["id"])
+            except (RuntimeError, OSError, ValueError, KeyError):
+                continue
+            if ended is None:
+                continue
+            self.end_hold(ended)
+            sys.stderr.write("쓰지 않는 Codex 연결을 정리했습니다: %s %s\n" % (ended.get("host"), str(native.get("id"))[:8]))
+            closed.append(row["id"])
+        return closed
+
     def start_hold_sweep(self):
         def run():
             time.sleep(self.HOLD_SWEEP_FIRST)
@@ -1876,6 +1906,7 @@ class Workflow:
             while True:
                 try:
                     self.close_idle_launchers()
+                    self.close_idle_codex_attaches()
                 except Exception as exc:  # The sweep never stops the board.
                     sys.stderr.write("새 세션 터미널 정리에 실패했습니다: %s\n" % type(exc).__name__)
                 try:
@@ -2094,6 +2125,14 @@ class Workflow:
         windows_resumed = False
         route_key = hashlib.sha256(json.dumps([self.identity(source), target], sort_keys=True).encode()).hexdigest()
         existing = next((item for item in self.terminals.list() if item.get("alive") and item.get("key", "").split(":")[0] == route_key), None)
+        if existing is None and same:
+            # The session already runs in another board terminal linked to it exactly (a handoff's
+            # or a resume's new run): that one opens again, never a second connection to it. A
+            # 새 세션 terminal linked only by its start time is the screen's choice to open.
+            existing = next((item for item in self.terminals.list()
+                             if item.get("alive") and not item.get("closed") and item.get("linkConfidence") != "estimated"
+                             and isinstance(item.get("nativeSource"), dict)
+                             and self.identity(item["nativeSource"]) == self.identity(source)), None)
         if allowed and resume:
             preview = self.resume_preview(source)
             allowed, reason = preview["allowed"], preview.get("reason")
@@ -2143,6 +2182,8 @@ class Workflow:
                 "reason": reason, "summary": summary,
                 "warnings": warnings, "source": self.identity(source), "target": target,
                 "expiresAt": int(time.time()) + 180}
+        if mode == "reconnect" and existing is not None and existing.get("id"):
+            plan["reconnectId"] = existing["id"]
         if transfer_preview is not None:
             plan["transfer"] = transfer_preview
         with self.lock:
@@ -2207,8 +2248,13 @@ class Workflow:
             # The route may have been busy for a while: the plan is checked again.
             if plan["expiresAt"] <= time.time():
                 raise ValueError("선택이 만료됐어요. 실행 설정을 다시 확인해 주세요.")
-            previous = [item for item in self.terminals.list() if item.get("key", "").split(":")[0] == key_base]
+            rows = self.terminals.list()
+            previous = [item for item in rows if item.get("key", "").split(":")[0] == key_base]
             live = next((item for item in reversed(previous) if item.get("alive")), None)
+            if live is None and plan["mode"] == "reconnect" and plan.get("reconnectId"):
+                # The session's own terminal on another route (plan): that one, while it lives.
+                live = next((item for item in rows if item.get("id") == plan["reconnectId"]
+                             and item.get("alive") and not item.get("closed")), None)
             if live:
                 # Settled once linked: a waiting repeat never changes it while it is answered.
                 result = self._link_handoff_goals({"terminal": live, "mode": plan["mode"], "reused": True})

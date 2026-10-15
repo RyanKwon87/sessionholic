@@ -257,6 +257,43 @@ class WindowsRoutingTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, '연결할 수 없어'):
             self.flow.new_session({'host': HOST['name'], 'requestId': 'fixture-launch-0003'})
 
+    def test_a_session_already_open_in_another_board_terminal_reconnects_to_it(self):
+        native = {'host': HOST['name'], 'agent': 'codex', 'id': SID, 'home': '.codex', 'cwd': ROW['cwd']}
+        live = {'id': 'f' * 32, 'key': 'another-route', 'alive': True, 'closed': False, 'mode': 'handoff', 'nativeSource': native}
+        self.terms.list = lambda: [live]
+        target = {'host': HOST['name'], 'agent': 'codex', 'account': 'codex:.codex'}
+        with patch.object(self.flow.transfers, 'rpc', side_effect=AssertionError('no PC plan for a terminal already open')), \
+                patch.object(server.shutil, 'which', return_value='/fixture/tmux'):
+            plan = self.flow.plan({'source': REF, 'target': target})
+            self.assertEqual((plan['mode'], plan['reconnectId']), ('reconnect', 'f' * 32))
+            result = self.flow.launch(plan['id'], 'request-reconnect-0001')
+        self.assertEqual((result['terminal']['id'], result['reused']), ('f' * 32, True))
+        self.terms.reserve.assert_not_called()
+        # Linked only by its start time (the screen's choice), or ended: a plan of its own as before.
+        for row in ({**live, 'linkConfidence': 'estimated'}, {**live, 'alive': False}):
+            self.terms.list = lambda row=row: [row]
+            with patch.object(self.flow.transfers, 'rpc', return_value={'argv': ['fixture'], 'cwd': ROW['cwd']}), \
+                    patch.object(server.shutil, 'which', return_value='/fixture/tmux'):
+                self.assertEqual(self.flow.plan({'source': REF, 'target': target})['mode'], 'attach')
+
+    def test_unused_codex_connections_close_only_when_their_session_is_idle_done_or_gone(self):
+        native = {'host': HOST['name'], 'agent': 'codex', 'id': SID, 'home': '.codex', 'cwd': ROW['cwd']}
+        released = []
+        self.terms.idle_codex_attaches = lambda: [{'id': 'a' * 32, 'host': HOST['name'], 'nativeSource': native}]
+        self.terms.release_codex_attach = lambda tid: released.append(tid) or {'id': tid, 'host': HOST['name']}
+        with patch.object(self.flow, 'end_hold') as end:
+            for phase, closes in (('working', False), ('needs_input', False), ('unknown', False), (None, False),
+                                  ('idle', True), ('done', True)):
+                self.board.state[HOST['name']]['data']['codex'][0]['phase'] = phase
+                self.assertEqual(self.flow.close_idle_codex_attaches(), ['a' * 32] if closes else [], phase)
+            self.assertEqual(end.call_count, 2)
+            # No longer listed (archived): closed. Its host's list not current: left alone.
+            self.board.state[HOST['name']]['data']['codex'] = []
+            self.assertEqual(self.flow.close_idle_codex_attaches(), ['a' * 32])
+            self.board.state[HOST['name']]['ok'] = False
+            self.assertEqual(self.flow.close_idle_codex_attaches(), [])
+        self.assertEqual(len(released), 3)
+
     def test_same_windows_session_can_plan_terminal_without_reserving_it(self):
         with patch.object(self.flow.transfers, 'rpc', return_value={'argv': ['fixture'], 'cwd': ROW['cwd']}) as rpc, \
                 patch.object(server.shutil, 'which', return_value='/fixture/tmux'):

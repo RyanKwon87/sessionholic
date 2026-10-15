@@ -6397,6 +6397,14 @@ function openChatTerminal(s) {
     openTerminal(state.terminal);
     return;
   }
+  // The session already has a live board terminal (its "터미널 열림" mark): that one opens,
+  // never a second connection to the same session.
+  const open = terminalForSession(s);
+  if (open) {
+    if (terminalEstimated(open)) toast("시작 시각으로 추정한 이 세션의 터미널을 엽니다.");
+    openTerminal(open);
+    return;
+  }
   if (s.nativeSource) { toast("이 실행의 터미널이 종료됐습니다. 새로고침 후 세션 목록에서 선택해 주세요."); return; }
   state.route = { host: s.host, agent: s.agent, account: accountOf(s) };
   populateRoute(s);

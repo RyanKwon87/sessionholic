@@ -12,6 +12,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -419,6 +420,38 @@ class StaticRenderTest(unittest.TestCase):
 
     def tearDown(self):
         self.directory.cleanup()
+
+    def test_an_installation_icon_folder_replaces_only_the_app_icons(self):
+        icons = Path(self.directory.name) / "icons"
+        icons.mkdir()
+        for name in ("icon-192.png", "icon.svg"):
+            (self.web / name).write_bytes(b"shipped " + name.encode())
+        (self.web / "icon-512.png").write_bytes(b"shipped 512")
+        (icons / "icon-192.png").write_bytes(b"own 192")
+        (icons / "icon.svg").write_bytes(b"<svg>own</svg>")
+        (icons / "app.js").write_text("console.log('never from here');\n")
+        own = instance.parse({**copy.deepcopy(DEMO), "brand": {**DEMO["brand"], "iconDir": str(icons)}})
+        shipped = server.StaticAssets(self.web, names=self.demo)
+        assets = server.StaticAssets(self.web, names=own)
+        self.assertEqual(assets.file("icon-192.png")["body"], b"own 192")
+        self.assertEqual(assets.file("icon.svg")["body"], b"<svg>own</svg>")
+        # A file the folder lacks, and every other file, stay the shipped ones.
+        self.assertEqual(assets.file("icon-512.png")["body"], b"shipped 512")
+        self.assertEqual(assets.file("app.js")["body"], (self.web / "app.js").read_bytes())
+        # The page's asset versions and the worker's cache follow the replaced icon.
+        self.assertNotEqual(assets.manifest()["/icon-192.png"], shipped.manifest()["/icon-192.png"])
+        self.assertNotEqual(server.shell_cache_name(assets.sources(), own), server.shell_cache_name(shipped.sources(), own))
+        # A link, an empty file or one over the limit is never served from the folder.
+        (icons / "icon.svg").unlink()
+        (icons / "icon.svg").symlink_to(self.web / "index.html")
+        (icons / "icon-512.png").write_bytes(b"")
+        self.assertEqual(assets.file("icon.svg")["body"], b"shipped icon.svg")
+        self.assertEqual(assets.file("icon-512.png")["body"], b"shipped 512")
+        with patch.object(server, "ICON_LIMIT", 4):
+            self.assertEqual(server.StaticAssets(self.web, names=own).file("icon-192.png")["body"], b"shipped icon-192.png")
+        for bad in ("icons", "./icons", "/a/../b", ""):
+            with self.assertRaises(ValueError):
+                instance.parse({**copy.deepcopy(DEMO), "brand": {**DEMO["brand"], "iconDir": bad}})
 
     def test_check_fails_when_the_worker_has_no_cache_line(self):
         # The public names leave sw.js as it is when rendering, but the install check

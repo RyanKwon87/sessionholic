@@ -106,6 +106,9 @@ SW_PREFIX = re.compile(r'(\.filter\(\(key\) => key\.startsWith\()("[^"\n]*")(\) 
 SW_HEADER = re.compile(r"^(// )(Sessionholic)( caches only public static assets\.)", re.M)
 SW_PRIVATE_SUBJECT = "A private PWA"
 RENDERED = ("manifest.webmanifest", "sw.js")
+# The app icons an installation may replace with its own (instance brand.iconDir).
+ICON_FILES = ("icon.svg", "icon-192.png", "icon-512.png", "icon-maskable-512.png")
+ICON_LIMIT = 2 * 1024 * 1024
 ASSET_REF = re.compile(r'\b(src|href)="(/[^"?#]*)"')
 # A stalled event-stream reader is dropped after this many seconds of a blocked write.
 STREAM_WRITE_TIMEOUT = 30
@@ -684,18 +687,31 @@ class StaticAssets:
                 packed = None
         return {"body": body, "gzip": packed, "sha8": digest[:8], "etag": digest[:16]}
 
+    def icon_override(self, name):
+        """This installation's own icon file (brand.iconDir) for one of ICON_FILES, else None:
+        a regular file owned by this user, through no link, at most ICON_LIMIT bytes."""
+        folder = self.names["brand"].get("iconDir") if name in ICON_FILES else None
+        if not folder:
+            return None
+        try:
+            path = instance.safe_path(Path(folder).expanduser() / name)
+            info = path.stat()
+        except (ValueError, OSError):
+            return None
+        return path if stat.S_ISREG(info.st_mode) and 0 < info.st_size <= ICON_LIMIT else None
+
     def source(self, name):
-        """One file exactly as installed."""
+        """One file exactly as installed (an icon: this installation's own, when it has one)."""
         if not STATIC.fullmatch(name):
             return None
-        path = self.root / name
+        path = self.icon_override(name) or self.root / name
         try:
             info = path.stat()
         except OSError:
             return None
         if not stat.S_ISREG(info.st_mode):
             return None
-        key = (info.st_mtime_ns, info.st_size)
+        key = (str(path), info.st_mtime_ns, info.st_size)
         with self.lock:
             cached = self.files.get(name)
         if cached and cached[0] == key:

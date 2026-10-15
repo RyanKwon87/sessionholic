@@ -1425,6 +1425,62 @@ test('IME and mismatched native routes block chat submission', async () => {
   assert.equal(sends, 0);
 });
 
+test('the send key stays pressable for a word still composing and commits it before sending', async () => {
+  for (const commit of ['compositionend', 'final input']) {
+    const sent = [];
+    const c = client(async (url, options) => {
+      if (url === '/api/chat/send') sent.push(JSON.parse(options.body).text);
+      return { ok: true, status: 200, json: async () => ({ status: 'accepted', receipt: {} }) };
+    }, noChatTimers);
+    const { s, entry } = selectChat(c);
+    const composer = c.buildChatComposer(s);
+    const input = findId(composer, 'chat-input');
+    const send = findId(composer, 'chat-send');
+    c.context.document.activeElement = input;
+    // Samsung's keyboard: "계속" is still underlined (composing) after "개선해 ".
+    input.value = '개선해 계속'; input.events.compositionstart(); input.events.input({ isComposing: true });
+    assert.equal(entry.composing, true);
+    assert.equal(send.disabled, false, commit);
+    let blurs = 0;
+    input.blur = () => {
+      blurs++;
+      c.context.document.activeElement = null;
+      input.value = '개선해 계속해';
+      if (commit === 'compositionend') { input.events.compositionend(); input.events.input({ isComposing: false }); }
+      else input.events.input({ isComposing: false });
+    };
+    const clicked = send.events.click();
+    send.events.click(); // A second tap while it commits sends nothing more.
+    assert.equal(sent.length, 0, 'nothing leaves before the commit settles');
+    c.flushFrames();
+    await clicked;
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(blurs, 1, commit);
+    assert.equal(entry.composing, false, commit);
+    assert.deepEqual(sent, ['개선해 계속해'], commit);
+  }
+});
+
+test('a word the input method never commits is not sent and stays in the field', async () => {
+  const timeouts = [];
+  let sends = 0;
+  const c = client(async (url) => { if (url === '/api/chat/send') sends++; return { ok: true, status: 200, json: async () => ({}) }; },
+    { setTimeout: (callback, ms) => { timeouts.push({ callback, ms }); return timeouts.length; }, clearTimeout() {} });
+  const { s, entry } = selectChat(c);
+  const composer = c.buildChatComposer(s);
+  const input = findId(composer, 'chat-input');
+  input.value = '조합 중'; input.events.compositionstart(); input.events.input({ isComposing: true });
+  input.blur = () => {};
+  const clicked = findId(composer, 'chat-send').events.click();
+  c.flushFrames();
+  timeouts.find((item) => item.ms === 1500).callback();
+  await clicked;
+  assert.equal(sends, 0);
+  assert.equal(entry.composing, true);
+  assert.equal(input.value, '조합 중');
+  assert.match(c.get('toast').textContent, /한글 입력을 확정하지 못해 보내지 않았습니다/);
+});
+
 test('native attachment upload binds raw bytes to its exact source and rejects oversized files locally', async () => {
   const requests = [];
   const c = client(async (url, options) => {

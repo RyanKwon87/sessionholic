@@ -1355,9 +1355,10 @@ class Board:
         result["messages"] = result.get("messages", [])[-80:]
         fetched = time.time()
         with self.lock:
-            if len(self.reads) >= 128 and key not in self.reads:
-                self.reads.pop(next(iter(self.reads)))
+            # Only a read that is kept makes room: a failed one never pushes a good one out.
             if not result.get("error"):
+                if len(self.reads) >= 128 and key not in self.reads:
+                    self.reads.pop(next(iter(self.reads)))
                 self.reads[key] = (fetched, result)
         if not result.get("error"):
             def saved_reads():
@@ -1758,6 +1759,8 @@ class Workflow:
     # A terminal that ended by itself (a connection it could not take back) may have left its
     # run going: kept this long, as is a hold no terminal record names any more.
     HOLD_KEEP_SECONDS = 24 * 3600
+    # An unused Codex connection is closed only on a list of its host read this recently.
+    CODEX_RELEASE_LIST_AGE = 300
 
     def end_hold(self, terminal):
         """The run a closed terminal kept on its host ends too, in the background (a remote
@@ -1880,7 +1883,11 @@ class Workflow:
         closed = []
         for row in idle():
             native = row.get("nativeSource")
-            if not isinstance(native, dict) or not (self.board.state.get(native.get("host")) or {}).get("ok"):
+            host = self.board.state.get(native.get("host")) if isinstance(native, dict) else None
+            # A list the board stopped reading (nobody watching) is not current, though it read ok.
+            fetched = (host or {}).get("fetchedAt")
+            if (not isinstance(native, dict) or not (host or {}).get("ok") or not isinstance(fetched, (int, float))
+                    or time.time() - fetched > self.CODEX_RELEASE_LIST_AGE):
                 continue
             try:
                 phase = self.board.source(native).get("phase")
@@ -2025,7 +2032,10 @@ class Workflow:
         service = getattr(self, "bot_requests", None)
         if service is None:
             return None
-        for request in service.snapshot().get("requests", []):
+        # On the way of every read, send and notification: the last list at once, never a wait
+        # for a bot's ledger to be read (BotRequests.requests_now).
+        now = getattr(service, "requests_now", None)
+        for request in (now() if now else service.snapshot().get("requests", [])):
             native = request.get("nativeRef")
             if isinstance(native, dict) and self.identity({**native, "host": request.get("host")}) == self.identity(source):
                 return request

@@ -25,6 +25,9 @@ import uuid
 
 LIMIT = 100
 CACHE_SECONDS = 120
+# A source whose read failed is read again after this long without a forced refresh (a down bot
+# would otherwise keep its new sessions out of the bot-session guard until someone refreshes).
+FAILED_RETRY_SECONDS = 600
 KINDS = {"holicii_sqlite", "hermes_sqlite", "slack_ledger"}
 IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}\Z")
 FIELDS = {"id", "label", "host", "kind", "path", "authorityLabel", "scopeLabel"}
@@ -601,7 +604,9 @@ class BotRequests:
         self.config_path, self.state_dir = Path(config_path), Path(state_dir)
         self.home = Path.home()
         self._lock = threading.Lock()
-        self._cache, self._source_cache = None, {}
+        # Held through a read of the sources (snapshot): one read at a time, outside self._lock.
+        self._reading = threading.Lock()
+        self._cache, self._source_cache, self._read_at, self._behind = None, {}, 0.0, False
         self._owner_keys, self._owners_unsaved = None, False
 
     # A ledger lists only its recent requests: a bot's session stays the bot's after it
@@ -724,56 +729,107 @@ class BotRequests:
             raise SourceError("봇 요청 식별자가 중복되었습니다.")
         return checked, sessions
 
+    def _cached(self, source):
+        """A source's last read, while its settings are the same."""
+        cached = self._source_cache.get(source["id"])
+        return cached if cached and cached["signature"] == json.dumps(source, sort_keys=True) else None
+
+    @staticmethod
+    def _current(cached, force):
+        """A read still good: within its time, a failed one for longer (a bot may be down a while)."""
+        limit = FAILED_RETRY_SECONDS if cached and cached["failed"] else CACHE_SECONDS
+        return bool(cached) and not force and time.monotonic() - cached["fetched"] < limit
+
     def snapshot(self, force=False):
         if type(force) is not bool:
             raise ValueError("봇 요청 새로고침 값이 올바르지 않습니다.")
-        with self._lock:
-            result = {"requests": [], "sources": [], "fetchedAt": _now()}
-            changed = self._cache is None
-            try:
-                sources = self._sources()
-            except (OSError, ValueError, RuntimeError):
-                sources, changed = [], True
-                # A broken config must not erase prior bot/native ownership evidence.
-                if self._cache:
-                    result["requests"] = [{**row, "stale": True} for row in self._cache["requests"]]
-                    result["sources"] = [{**row, "ok": False, "stale": True,
-                                          "error": "봇 출처 설정을 읽지 못했습니다."}
-                                         for row in self._cache["sources"] if row["id"] != "configuration"]
-                result["sources"].append({"id": "configuration", "label": "봇 출처 설정", "host": None,
-                                          "ok": False, "error": "봇 출처 설정을 읽지 못했습니다.", "updatedAt": None})
-            for source in sources:
-                signature = json.dumps(source, sort_keys=True)
-                cached = self._source_cache.get(source["id"])
-                if cached and cached["signature"] != signature:
-                    cached = None
-                if cached and not force and (cached["failed"] or time.monotonic() - cached["fetched"] < CACHE_SECONDS):
-                    result["requests"].extend(cached["rows"])
-                    result["sources"].append(cached["status"])
-                    continue
-                changed = True
-                status = {key: source[key] for key in ("id", "label", "host")}
+        # One read of the sources at a time. The reads themselves (a remote one over SSH, up to
+        # 20 s) hold no lock that a session guard (requests_now, owns) waits on.
+        with self._reading:
+            with self._lock:
                 try:
-                    rows, sessions = self._checked(source, self._collect(source))
-                    status.update(ok=True, error=None, updatedAt=_now())
-                    failed = False
+                    sources, broken = self._sources(), False
+                except (OSError, ValueError, RuntimeError):
+                    sources, broken = [], True
+                due = [source for source in sources if not self._current(self._cached(source), force)]
+            outcomes = {}
+            for source in due:
+                try:
+                    outcomes[source["id"]] = self._checked(source, self._collect(source))
                 except (OSError, ValueError, RuntimeError, sqlite3.Error, subprocess.TimeoutExpired):
-                    failed = True
-                    rows = [{**row, "stale": True} for row in cached["rows"]] if cached else []
-                    sessions = dict(cached["sessions"]) if cached else {}
-                    status.update(ok=False, error="봇 원장을 읽지 못했습니다. 출처와 연결을 확인해 주세요.",
-                                  updatedAt=cached["status"]["updatedAt"] if cached else None, stale=bool(rows))
-                self._source_cache[source["id"]] = {"signature": signature, "source": source, "rows": rows,
-                                                    "sessions": sessions, "status": status,
-                                                    "failed": failed, "fetched": time.monotonic()}
-                result["requests"].extend(rows)
-                result["sources"].append(status)
-            result["requests"].sort(key=lambda row: row["updatedAt"] or "", reverse=True)
-            self._remember(result["requests"])
-            if not changed and self._cache and result["sources"] == self._cache["sources"]:
-                result["fetchedAt"] = self._cache["fetchedAt"]
-            self._cache = result
-            return copy.deepcopy(result)
+                    outcomes[source["id"]] = None
+            with self._lock:
+                return self._assemble(sources, broken, outcomes)
+
+    def _assemble(self, sources, broken, outcomes):
+        """The list from each source's new read (outcomes: rows and sessions, or None for a failed
+        read) or its last one."""
+        result = {"requests": [], "sources": [], "fetchedAt": _now()}
+        changed = self._cache is None
+        if broken:
+            changed = True
+            # A broken config must not erase prior bot/native ownership evidence.
+            if self._cache:
+                result["requests"] = [{**row, "stale": True} for row in self._cache["requests"]]
+                result["sources"] = [{**row, "ok": False, "stale": True,
+                                      "error": "봇 출처 설정을 읽지 못했습니다."}
+                                     for row in self._cache["sources"] if row["id"] != "configuration"]
+            result["sources"].append({"id": "configuration", "label": "봇 출처 설정", "host": None,
+                                      "ok": False, "error": "봇 출처 설정을 읽지 못했습니다.", "updatedAt": None})
+        for source in sources:
+            cached = self._cached(source)
+            if source["id"] not in outcomes:
+                # Current when planned; still there, as _reading is held from the plan to here and
+                # only a read of the sources writes _source_cache.
+                result["requests"].extend(cached["rows"])
+                result["sources"].append(cached["status"])
+                continue
+            changed = True
+            status = {key: source[key] for key in ("id", "label", "host")}
+            if outcomes[source["id"]] is not None:
+                rows, sessions = outcomes[source["id"]]
+                status.update(ok=True, error=None, updatedAt=_now())
+                failed = False
+            else:
+                failed = True
+                rows = [{**row, "stale": True} for row in cached["rows"]] if cached else []
+                sessions = dict(cached["sessions"]) if cached else {}
+                status.update(ok=False, error="봇 원장을 읽지 못했습니다. 출처와 연결을 확인해 주세요.",
+                              updatedAt=cached["status"]["updatedAt"] if cached else None, stale=bool(rows))
+            self._source_cache[source["id"]] = {"signature": json.dumps(source, sort_keys=True), "source": source,
+                                                "rows": rows, "sessions": sessions, "status": status,
+                                                "failed": failed, "fetched": time.monotonic()}
+            result["requests"].extend(rows)
+            result["sources"].append(status)
+        result["requests"].sort(key=lambda row: row["updatedAt"] or "", reverse=True)
+        self._remember(result["requests"])
+        if not changed and self._cache and result["sources"] == self._cache["sources"]:
+            result["fetchedAt"] = self._cache["fetchedAt"]
+        self._cache, self._read_at = result, time.monotonic()
+        return copy.deepcopy(result)
+
+    def requests_now(self):
+        """The listed requests as last read, at once, for a guard on the way of a read, a send or a
+        notification (callers only read them): a list older than its time is read again behind
+        (one read at a time). Only a board that has never read them waits for the first read."""
+        with self._lock:
+            cache = self._cache
+            behind = (cache is not None and not self._behind
+                      and time.monotonic() - self._read_at >= CACHE_SECONDS)
+            if behind:
+                self._behind = True
+        if cache is None:
+            return self.snapshot()["requests"]
+        if behind:
+            threading.Thread(target=self._read_behind, name="bot-requests", daemon=True).start()
+        return cache["requests"]
+
+    def _read_behind(self):
+        try:
+            self.snapshot()
+        finally:
+            with self._lock:
+                self._behind = False
 
     def conversation(self, source_id, request_id, read_native=None):
         """A listed request's conversation (with the requests sharing its conversation key, one
@@ -784,7 +840,7 @@ class BotRequests:
         if (not isinstance(source_id, str) or not IDENTIFIER.fullmatch(source_id) or not isinstance(request_id, str)
                 or not re.fullmatch(re.escape(source_id) + r":[0-9a-f]{24}", request_id)):
             raise ValueError("봇 요청을 확인하지 못했습니다.")
-        self.snapshot()
+        self.requests_now()
         with self._lock:
             # Only a source still configured, as it was when its requests were read.
             configured = {row["id"]: json.dumps(row, sort_keys=True) for row in self._sources()}

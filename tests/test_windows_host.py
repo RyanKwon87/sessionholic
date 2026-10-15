@@ -7,6 +7,7 @@ import re
 import sys
 import tempfile
 import threading
+import time
 from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
@@ -281,6 +282,7 @@ class WindowsRoutingTest(unittest.TestCase):
         released = []
         self.terms.idle_codex_attaches = lambda: [{'id': 'a' * 32, 'host': HOST['name'], 'nativeSource': native}]
         self.terms.release_codex_attach = lambda tid: released.append(tid) or {'id': tid, 'host': HOST['name']}
+        self.board.state[HOST['name']]['fetchedAt'] = int(time.time())
         with patch.object(self.flow, 'end_hold') as end:
             for phase, closes in (('working', False), ('needs_input', False), ('unknown', False), (None, False),
                                   ('idle', True), ('done', True)):
@@ -290,6 +292,11 @@ class WindowsRoutingTest(unittest.TestCase):
             # No longer listed (archived): closed. Its host's list not current: left alone.
             self.board.state[HOST['name']]['data']['codex'] = []
             self.assertEqual(self.flow.close_idle_codex_attaches(), ['a' * 32])
+            # A list the board stopped reading (nobody watching) is not current, though it read ok.
+            for fetched in (int(time.time()) - self.flow.CODEX_RELEASE_LIST_AGE - 60, None):
+                self.board.state[HOST['name']]['fetchedAt'] = fetched
+                self.assertEqual(self.flow.close_idle_codex_attaches(), [], fetched)
+            self.board.state[HOST['name']]['fetchedAt'] = int(time.time())
             self.board.state[HOST['name']]['ok'] = False
             self.assertEqual(self.flow.close_idle_codex_attaches(), [])
         self.assertEqual(len(released), 3)

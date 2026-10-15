@@ -185,6 +185,13 @@ class CoordinatorTest(unittest.TestCase):
         self.assertTrue(Path(command[0]).is_absolute())
         self.assertIn('-tt',command)
         self.assertIn("'/path with space/runtime.pyz'",command[-1])
+    def test_a_current_profile_list_stands_though_a_forced_read_failed_since(self):
+        self.flow.rpc=lambda *a,**k:{'profiles':[{'id':'p1'}]}
+        self.assertEqual(self.flow.profiles(HOSTS[1]),[{'id':'p1'}])
+        def fail(*a,**k):raise RuntimeError('offline')
+        self.flow.rpc=fail
+        with self.assertRaises(RuntimeError):self.flow.profiles(HOSTS[1],refresh=True)
+        self.assertEqual(self.flow.profiles(HOSTS[1]),[{'id':'p1'}],'the current list is not hidden by the failure')
     def test_profile_failure_does_not_retry_automatically(self):
         def fail(*a,**k):self.calls.append(('host','probe'));raise RuntimeError('offline')
         self.flow.rpc=fail

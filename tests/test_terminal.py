@@ -62,6 +62,29 @@ class BufferTest(unittest.TestCase):
         self.assertFalse(stream.read(0, 20)["alive"])
         self.assertLess(time.monotonic() - started, 0.5)
 
+    def test_streaming_output_gathers_briefly_but_an_echo_after_a_wait_answers_at_once(self):
+        stream = terminal._Terminal({"id": "a" * 32}, 1024 * 1024)
+        stream.append(b"first")
+        threading.Timer(0.02, stream.append, (b" second",)).start()
+        started = time.monotonic()
+        gathered = stream.read(0, 20)
+        self.assertEqual(base64.b64decode(gathered["data"]), b"first second", "a stream is one read, not two")
+        self.assertGreaterEqual(time.monotonic() - started, terminal.READ_GATHER_SECONDS - 0.01)
+        # A read that waited past the gathering time (a key's echo) answers when it arrives.
+        threading.Timer(0.2, stream.append, (b"x",)).start()
+        started = time.monotonic()
+        echo = stream.read(gathered["after"], 20)
+        self.assertEqual(base64.b64decode(echo["data"]), b"x")
+        self.assertLess(time.monotonic() - started, 0.2 + 0.06)
+        # No wait asked, a full buffer's worth, or a reset: at once.
+        stream.append(b"y")
+        started = time.monotonic()
+        self.assertEqual(base64.b64decode(stream.read(echo["after"], 0)["data"]), b"y")
+        stream.append(b"z" * terminal.READ_GATHER_BYTES)
+        self.assertTrue(stream.read(echo["after"] + 1, 20)["data"])
+        self.assertTrue(stream.read(0, 20, "0" * 32)["reset"])
+        self.assertLess(time.monotonic() - started, terminal.READ_GATHER_SECONDS)
+
 
 class ValidationTest(unittest.TestCase):
     def setUp(self):

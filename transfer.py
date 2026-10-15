@@ -374,11 +374,13 @@ class Transfers:
         with self.lock:
             cached = self.profile_cache.get(host['name'])
             failure = self.profile_failures.get(host['name'])
+            # A current list stands, though a forced read (a plan's) failed since: that failure
+            # must not hide it.
+            if not refresh and cached and time.monotonic() - cached[0] < 120:
+                return cached[1]
             # A failed probe is not retried automatically, but only for a bounded time.
             if not refresh and failure and time.monotonic() - failure[0] < PROFILE_FAILURE_TTL:
                 raise RuntimeError(failure[1])
-            if not refresh and cached and time.monotonic() - cached[0] < 120:
-                return cached[1]
         try:
             data = self.rpc(host, 'profiles', timeout=12)
             if not isinstance(data, dict) or not isinstance(data.get('profiles'), list):

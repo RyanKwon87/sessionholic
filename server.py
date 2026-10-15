@@ -951,6 +951,9 @@ class Board:
         # Seconds; instance values so a test can shorten them.
         self.live_grace, self.live_ping, self.live_silence = 60.0, 10.0, 30.0
         self.live_tick, self.live_exit_wait = 0.5, 2.0
+        # Kept reads are saved to conversations.json together, this long after the first
+        # unsaved one (save_reads_later), never by the request that read them.
+        self.reads_save_delay, self.reads_dirty, self.reads_saver = 5.0, False, None
         if self.state_dir:
             self.state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
             prepare_ssh_control_dir(self.state_dir)
@@ -1078,6 +1081,49 @@ class Board:
                 private_json(self.state_dir / filename, build())
             except Exception as exc:
                 sys.stderr.write(f"{LOG_PREFIX}: 상태 파일 {filename} 저장 실패 ({type(exc).__name__})\n")
+
+    def save_reads_later(self):
+        """A kept read changed the conversation cache: one background write a few seconds
+        later saves it with every read made meanwhile. Rewriting the whole file (megabytes)
+        on each read cost the reading request that time. A write still pending when the
+        process is killed is lost; conversations.json is only a cache (a restarted board
+        shows a saved read only while its host is unreachable, and reads it again otherwise),
+        and a clean shutdown (close_live) writes it."""
+        if not self.state_dir:
+            return
+        with self.lock:
+            self.reads_dirty = True
+            if self.reads_saver is not None:
+                return
+            saver = self.reads_saver = threading.Thread(target=self._save_reads_soon, daemon=True,
+                                                        name=THREAD_PREFIX + "-reads")
+        try:
+            saver.start()
+        except RuntimeError:
+            with self.lock:
+                self.reads_saver = None
+            self.flush_reads()
+
+    def _save_reads_soon(self):
+        time.sleep(self.reads_save_delay)
+        with self.lock:
+            # Cleared before writing: a read kept during the write starts the next saver.
+            self.reads_saver = None
+        # A deferred write never brings back a state folder removed since the read.
+        if self.state_dir.is_dir():
+            self.flush_reads()
+
+    def flush_reads(self):
+        """Write conversations.json now if a kept read changed it since the last write.
+        Through persist: the same save_lock as snapshot.json, so the two writes take turns."""
+        def saved_reads():
+            with self.lock:
+                self.reads_dirty = False
+                return [{"key": list(k), "at": v[0], "data": v[1]} for k, v in self.reads.items()]
+        with self.lock:
+            if not self.reads_dirty:
+                return
+        self.persist("conversations.json", saved_reads)
 
     def request_refresh(self, host_name=None, force=False):
         if host_name is not None and not isinstance(host_name, str):
@@ -1299,7 +1345,7 @@ class Board:
             self.start_polls([fallback])
 
     def close_live(self):
-        """Server shutdown: stop every watcher and its manager."""
+        """Server shutdown: stop every watcher and its manager, and save reads still pending."""
         with self.lock:
             self.live_closed = True
             streams = list(self.streams.values())
@@ -1311,6 +1357,7 @@ class Board:
             stream.stop()
         if manager is not None and manager is not threading.current_thread() and manager.ident is not None:
             manager.join(5)
+        self.flush_reads()
 
     def snapshot(self):
         with self.lock:
@@ -1361,10 +1408,7 @@ class Board:
                     self.reads.pop(next(iter(self.reads)))
                 self.reads[key] = (fetched, result)
         if not result.get("error"):
-            def saved_reads():
-                with self.lock:
-                    return [{"key": list(k), "at": v[0], "data": v[1]} for k, v in self.reads.items()]
-            self.persist("conversations.json", saved_reads)
+            self.save_reads_later()
         return {**result, "fetchedAt": int(fetched), "stale": False}
 
 

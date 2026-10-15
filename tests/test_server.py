@@ -994,11 +994,36 @@ class BoardCollectionTest(unittest.TestCase):
                  patch("sys.stderr", new_callable=io.StringIO) as log:
                 self.assertTrue(board.poll(HOSTS[0]))
                 result = board.read("remote", "claude", "a1b2c3d4-0000", None)
+                board.flush_reads()
             self.assertEqual(result["messages"][0]["text"], "hi")
             entry = board.state["remote"]
             self.assertEqual((entry["ok"], entry["refreshing"], entry["error"]), (True, False, None))
             self.assertIn("snapshot.json", log.getvalue())
             self.assertIn("conversations.json", log.getvalue())
+
+    def test_conversation_reads_are_saved_together_after_the_requests_that_read_them(self):
+        with tempfile.TemporaryDirectory() as directory:
+            board = self.board(fake_runner([]), hosts=HOSTS, state_dir=directory)
+            board.reads_save_delay = 0.2
+            written, original = [], server.private_json
+
+            def record(path, value, **kwargs):
+                written.append(Path(path).name)
+                return original(path, value, **kwargs)
+            with patch("server.private_json", side_effect=record):
+                for number in range(5):
+                    board.read("remote", "claude", "a1b2c3d4-%04d" % number, None)
+                self.assertEqual(written, [], "a read never rewrites the whole file itself")
+                wait_for(lambda: written)
+                time.sleep(0.3)
+                self.assertEqual(written, ["conversations.json"], "five reads, one write")
+                board.reads_save_delay = 60
+                board.read("remote", "claude", "a1b2c3d4-0005", None)
+                self.assertEqual(len(written), 1)
+                board.close_live()
+                self.assertEqual(len(written), 2, "a clean shutdown saves what is still pending")
+            restored = server.Board(HOSTS, 60, runner=fake_runner([]), state_dir=directory)
+            self.assertEqual(len(restored.reads), 6)
 
     def test_hosts_collect_in_parallel_but_never_twice_at_once(self):
         release = threading.Event()

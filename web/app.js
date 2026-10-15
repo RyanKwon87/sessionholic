@@ -3885,26 +3885,23 @@ const DICTATION_LANG = "ko-KR";
 const DICTATION_PREPARING = "마이크 준비 중…";
 const DICTATION_LISTENING = "듣는 중 · 끝내려면 마이크를 다시 누르세요";
 const DICTATION_ENDING = "받아쓴 글을 마무리하고 있습니다…";
-// iPad traces include rapid restarts that start but hear nothing. Leave a recovery interval
-// after an actual recognition ends; cancelling a wait never renews it. This is a mitigation,
-// not a guarantee that WebKit will return results (later starts have also stalled).
-const DICTATION_COOLDOWN_MS = 12000;
-const DICTATION_WAITING = "마이크 준비 중… iPad가 앞의 받아쓰기를 정리하고 있습니다 ·";
+// iPad traces: a recognition whose audio starts within this long of being asked to heard
+// nothing at all in 7 of 8 failures (the platform hands it a capture that gives no sound,
+// and says nothing about it), while no working start was that fast (199 ms at least). Such
+// a start is replaced once by a fresh recognition after a short pause; a second one ends
+// the listening at once instead of after the silence. Waiting before a press (a 12 s
+// cooldown) did not help: both starts after one stalled.
+const DICTATION_STALE_START_MS = 100;
+const DICTATION_STALE_RETRY_MS = 600;
+const DICTATION_STUCK = "iPad 음성 인식이 소리를 받지 못하는 상태입니다. 잠시 뒤 다시 눌러 주세요.";
 function webkitTouchDictation() {
   const agent = String(globalThis.navigator?.userAgent || "");
   return (touchDevice() || (globalThis.navigator?.maxTouchPoints || 0) > 0)
     && /AppleWebKit/.test(agent) && /Macintosh|iPad|iPhone|iPod/.test(agent) && !/Android/i.test(agent);
 }
-function dictationWaitingText(ms) {
-  return `${DICTATION_WAITING} ${Math.max(1, Math.ceil(ms / 1000))}초 뒤 듣기 시작`;
-}
-function dictationCooldown() {
-  if (!webkitTouchDictation()) return 0;
-  return Math.max(0, (state.dictationEndedAt || 0) + DICTATION_COOLDOWN_MS - Date.now());
-}
 // The status words that last only while a listening runs (the field's own note clears them).
 function dictationTransient(text) {
-  return [DICTATION_PREPARING, DICTATION_LISTENING, DICTATION_ENDING].includes(text) || String(text || "").startsWith(DICTATION_WAITING);
+  return [DICTATION_PREPARING, DICTATION_LISTENING, DICTATION_ENDING].includes(text);
 }
 const DICTATION_STALLED = "음성 인식이 응답하지 않아 멈췄습니다. 들은 글은 남겨 두었습니다. 다시 누르거나 키보드의 받아쓰기를 써 주세요.";
 const DICTATION_NOT_STARTED = "음성 인식이 시작되지 않아 멈췄습니다. 권한 창이 떴다면 허용한 뒤 마이크를 다시 누르거나, 키보드의 받아쓰기를 써 주세요.";
@@ -3983,9 +3980,7 @@ function renderDictation() {
     const node = $(id);
     if (!node) continue;
     const listening = !!state.dictation && state.dictation.field === $(fieldId);
-    const waiting = listening && state.dictation.waiting;
-    const label = waiting ? `${Math.max(1, Math.ceil((state.dictation.waitUntil - Date.now()) / 1000))}초 뒤 음성 입력 · 눌러 취소`
-      : listening ? state.dictation.stopping ? "음성 입력 마무리 · 눌러 즉시 중지" : "음성 입력 중지" : "음성 입력";
+    const label = listening ? state.dictation.stopping ? "음성 입력 마무리 · 눌러 즉시 중지" : "음성 입력 중지" : "음성 입력";
     node.hidden = !supported;
     node.setAttribute("aria-pressed", String(listening));
     node.setAttribute("aria-label", label);
@@ -4008,13 +4003,30 @@ function dictationReportCode(text) {
   if (!text) return "";
   const known = [[DICTATION_PREPARING, "preparing"], [DICTATION_LISTENING, "listening"], [DICTATION_ENDING, "ending"],
     [DICTATION_STALLED, "stalled"], [DICTATION_NOT_STARTED, "not-started"], [DICTATION_SILENCE_END, "silence"],
-    [DICTATION_CHANGED, "changed"]];
+    [DICTATION_CHANGED, "changed"], [DICTATION_STUCK, "stuck"]];
   for (const [message, code] of known) if (text === message) return code;
-  if (text.startsWith(DICTATION_WAITING)) return "waiting";
   const detail = /\(([a-z-]+)\)$/.exec(text)?.[1] || "";
   if (text.startsWith(DICTATION_ENDED_AT_ONCE)) return `ended-at-once:${detail}`;
   if (text.startsWith(DICTATION_INTERRUPTED)) return `interrupted:${detail}`;
   return detail ? `error:${detail}` : "other";
+}
+// A platform's error message as a code; its words never leave the device. WebKit reports
+// most failures as "aborted" and puts the actual reason only in this message.
+function dictationMessageCode(message) {
+  const text = String(message || "");
+  if (!text) return "";
+  let hash = 0x811c9dc5;
+  for (const char of text) hash = Math.imul(hash ^ char.codePointAt(0), 0x01000193) >>> 0;
+  const kind = [[/audio|session|capture|microphone/i, "audio"], [/permission|denied|not allowed|authori/i, "perm"],
+    [/network|connect|server/i, "net"], [/cancel|abort|interrupt/i, "cancel"], [/busy|in use|already/i, "busy"],
+    [/speech|recogni/i, "speech"]].find(([pattern]) => pattern.test(text))?.[1] || "msg";
+  return `${kind}:${hash.toString(16).padStart(8, "0")}.${Math.min(text.length, 9999)}`;
+}
+// Where the focus was when the mic was pressed (an element's kind and id, never its text).
+function dictationFocusCode() {
+  const node = document.activeElement;
+  if (!node || node === document.body) return "body";
+  return `${String(node.tagName || "").toLowerCase()}:${String(node.id || "")}`.replace(/[^A-Za-z0-9_.:+-]/g, "").slice(0, 40);
 }
 function sendDictationTrace(session, outcome) {
   const trace = session.trace;
@@ -4049,14 +4061,20 @@ function startDictation(field, { report, active, releaseKeyboard = false }) {
   // may write the words it held once more.
   const letGo = focusedAtPress && (webkitTouchDictation() || (touchDevice() && (releaseKeyboard || keyboardOpen())));
   const valueAtPress = String(field.value || "").length;
+  const focusAtPress = dictationFocusCode();
+  const keyboardAtPress = keyboardOpen();
   if (letGo) field.blur?.();
+  const make = () => {
+    const made = new Recognition();
+    made.lang = DICTATION_LANG;
+    made.interimResults = true;
+    made.continuous = true;
+    made.maxAlternatives = 1;
+    return made;
+  };
   let recognition;
   try {
-    recognition = new Recognition();
-    recognition.lang = DICTATION_LANG;
-    recognition.interimResults = true;
-    recognition.continuous = true;
-    recognition.maxAlternatives = 1;
+    recognition = make();
   } catch {
     report("이 브라우저에서 음성 입력을 시작하지 못했습니다. 키보드의 받아쓰기를 써 주세요.");
     return false;
@@ -4066,107 +4084,169 @@ function startDictation(field, { report, active, releaseKeyboard = false }) {
   const end = Number.isInteger(field.selectionEnd) ? Math.min(Math.max(start, field.selectionEnd), value.length) : start;
   const session = { field, recognition, report, active, prefix: value.slice(0, start), suffix: value.slice(end),
     written: value, wrote: false, results: [], finals: [], finalText: "", restarts: 0, heard: false, started: false, silent: false, error: "", applying: false, stopping: false,
-    ticks: 0, idle: 0, timer: null, stopTimer: null,
+    ticks: 0, idle: 0, timer: null, stopTimer: null, beganAt: 0, retried: false, retrying: false, retryTimer: null,
     trace: { t0: Date.now(), sent: false, events: [], env: {
       api: globalThis.SpeechRecognition ? "standard" : "webkit", field: String(field.id || ""),
       standalone: !!window.matchMedia?.("(display-mode: standalone)")?.matches, touch: touchDevice(),
       cumulative: dictationCumulative(), visibility: String(document.visibilityState || ""),
       focused: focusedAtPress, letGo, pressValue: valueAtPress, value: value.length, start, end,
+      // The keyboard and focus at the press, and how long ago (and how) the last listening ended.
+      kb: keyboardAtPress, act: focusAtPress,
+      sinceEnd: state.dictationEndedAt ? Math.min(Date.now() - state.dictationEndedAt, 1e9) : null,
+      lastEnd: state.dictationEndHow || "",
       ...dictationInputState(field) } } };
   session.report = (text) => {
     report(text);
     dictationTrace(session, "say", { why: dictationReportCode(text), ...dictationInputState(field) });
   };
+  // A recognition replaced after a stale start (below) is over: what it still reports is
+  // traced, never applied, and does not end this listening.
+  const replaced = (rec, name) => {
+    if (session.recognition === rec) return false;
+    dictationTrace(session, "old:" + name);
+    return true;
+  };
   // A recognition whose listening already ended (aborted before the platform started it) does
   // not keep the microphone: its first sign of life stops it.
-  const orphaned = () => {
+  const orphaned = (rec) => {
     if (state.dictation === session) return false;
     dictationTrace(session, "orphan");
     try {
-      recognition.abort();
+      rec.abort();
     } catch {
       // Already ended.
     }
     return true;
   };
-  const listening = () => {
-    if (orphaned() || session.started) return;
+  const listening = (rec) => {
+    if (orphaned(rec) || session.started) return;
     session.started = true;
     session.idle = 0;
     session.report(DICTATION_LISTENING);
   };
-  for (const name of ["start", "audiostart"]) {
-    recognition["on" + name] = () => {
-      dictationTrace(session, name, { cur: state.dictation === session });
-      listening();
-    };
-  }
-  for (const name of ["soundstart", "speechstart", "speechend", "soundend", "audioend", "nomatch"])
-    recognition["on" + name] = () => dictationTrace(session, name, { cur: state.dictation === session });
-  recognition.onresult = (event) => {
-    const heard = Array.from(event?.results || []);
-    dictationTrace(session, "result", { cur: state.dictation === session, n: heard.length, idx: event?.resultIndex ?? null,
-      fin: heard.filter((result) => result?.isFinal).length, last: !!heard.at(-1)?.isFinal, len: dictationText(heard).length });
-    if (orphaned()) return;
-    // Off screen, or the text changed by other means (a paste, a restored message): those win.
-    if (!session.active()) {
-      dictationTrace(session, "inactive", { chat: chatVisible(), hidden: !!document.hidden });
-      stopDictation({ abort: true });
-      return;
+  let begin = () => false;
+  // WebKit on a touch device: an audio start this soon after the start was asked for is a
+  // capture that gives no sound (DICTATION_STALE_START_MS). It is replaced once by a fresh
+  // recognition after a pause; a second one ends the listening at once.
+  const staleStart = (rec, lag) => {
+    if (!webkitTouchDictation() || state.dictation !== session || session.stopping || session.heard
+        || lag > DICTATION_STALE_START_MS) return false;
+    if (session.retried) {
+      dictationTrace(session, "stale", { lag, retry: true });
+      stopDictation({ abort: true, message: DICTATION_STUCK });
+      return true;
     }
-    if (field.value !== session.written && !rebaseDictation(session)) {
-      dictationTrace(session, "changed", { value: String(field.value || "").length, written: session.written.length });
-      stopDictation({ abort: true, message: DICTATION_CHANGED });
-      return;
+    dictationTrace(session, "stale", { lag });
+    Object.assign(session, { retried: true, retrying: true, recognition: null, started: false, ticks: 0, idle: 0, error: "" });
+    try {
+      rec.abort();
+    } catch {
+      // Already ended.
     }
-    listening();
-    session.idle = 0;
-    session.restarts = 0;  // Heard: a long dictation restarts once per phrase without limit.
-    // Final results never change and keep their places while the list grows (results still
-    // changing may merge or drop). A list whose earlier finals are gone or say something
-    // else started over (WebKit after a pause): the words those finals wrote stay, and the
-    // new list follows them, unless it already holds them (Android repeats what it heard).
-    const list = Array.from(event.results || []);
-    const finals = [];
-    for (const result of list) {
-      if (!result?.isFinal) break;
-      finals.push(String(result?.[0]?.transcript || ""));
-    }
-    const same = (a, b) => dictationRepeats(a, b) && dictationRepeats(b, a);
-    const kept = session.finals.every((text, i) => i < finals.length && same(text, finals[i]));
-    const repeats = dictationCumulative() && dictationRepeats(session.finalText, String(list[0]?.[0]?.transcript || ""));
-    if (!kept && session.finalText && !repeats) {
-      session.prefix += (session.prefix && !/\s$/.test(session.prefix) ? " " : "") + session.finalText;
-    }
-    session.finals = finals;
-    session.finalText = dictationText(list.slice(0, finals.length));
-    session.results = event.results;
-    session.heard = true;
-    applyDictation(session);
-  };
-  recognition.onerror = (event) => {
-    dictationTrace(session, "error", { code: String(event?.error || "unknown").slice(0, 40), cur: state.dictation === session });
-    if (state.dictation === session) session.error = String(event?.error || "unknown");
-  };
-  recognition.onend = () => {
-    if (session.invoked) state.dictationEndedAt = Date.now();
-    dictationTrace(session, "end", { cur: state.dictation === session, heard: session.heard, idle: session.idle });
-    if (state.dictation === session && dictationResumable(session)) {
-      // What it wrote stays; the next round's words follow it.
-      const text = dictationText(session.results);
-      if (text) session.prefix += (session.prefix && !/\s$/.test(session.prefix) ? " " : "") + text;
-      Object.assign(session, { results: [], finals: [], finalText: "", error: "", restarts: session.restarts + 1 });
+    session.report(DICTATION_PREPARING);
+    session.retryTimer = setTimeout(() => {
+      if (state.dictation !== session) return;
+      session.retrying = false;
       try {
-        recognition.start();
-        dictationTrace(session, "restart", { ok: true, round: session.restarts });
-        return;
+        session.recognition = make();
       } catch {
-        // Not startable again: it ends as before.
-        dictationTrace(session, "restart", { ok: false, round: session.restarts });
+        stopDictation({ abort: true, message: DICTATION_STUCK });
+        return;
       }
-    }
-    finishDictation(session);
+      wire(session.recognition);
+      dictationTrace(session, "retry");
+      begin();
+    }, DICTATION_STALE_RETRY_MS);
+    return true;
   };
+  const wire = (rec) => {
+    for (const name of ["start", "audiostart"]) {
+      rec["on" + name] = () => {
+        if (replaced(rec, name)) return;
+        const lag = Date.now() - session.beganAt;
+        dictationTrace(session, name, { cur: state.dictation === session, lag });
+        if (name === "audiostart" && staleStart(rec, lag)) return;
+        listening(rec);
+      };
+    }
+    for (const name of ["soundstart", "speechstart", "speechend", "soundend", "audioend", "nomatch"])
+      rec["on" + name] = () => {
+        if (!replaced(rec, name)) dictationTrace(session, name, { cur: state.dictation === session });
+      };
+    rec.onresult = (event) => {
+      if (replaced(rec, "result")) return;
+      const heard = Array.from(event?.results || []);
+      dictationTrace(session, "result", { cur: state.dictation === session, n: heard.length, idx: event?.resultIndex ?? null,
+        fin: heard.filter((result) => result?.isFinal).length, last: !!heard.at(-1)?.isFinal, len: dictationText(heard).length });
+      if (orphaned(rec)) return;
+      // Off screen, or the text changed by other means (a paste, a restored message): those win.
+      if (!session.active()) {
+        dictationTrace(session, "inactive", { chat: chatVisible(), hidden: !!document.hidden });
+        stopDictation({ abort: true });
+        return;
+      }
+      if (field.value !== session.written && !rebaseDictation(session)) {
+        dictationTrace(session, "changed", { value: String(field.value || "").length, written: session.written.length });
+        stopDictation({ abort: true, message: DICTATION_CHANGED });
+        return;
+      }
+      listening(rec);
+      session.idle = 0;
+      session.restarts = 0;  // Heard: a long dictation restarts once per phrase without limit.
+      // Final results never change and keep their places while the list grows (results still
+      // changing may merge or drop). A list whose earlier finals are gone or say something
+      // else started over (WebKit after a pause): the words those finals wrote stay, and the
+      // new list follows them, unless it already holds them (Android repeats what it heard).
+      const list = Array.from(event.results || []);
+      const finals = [];
+      for (const result of list) {
+        if (!result?.isFinal) break;
+        finals.push(String(result?.[0]?.transcript || ""));
+      }
+      const same = (a, b) => dictationRepeats(a, b) && dictationRepeats(b, a);
+      const kept = session.finals.every((text, i) => i < finals.length && same(text, finals[i]));
+      const repeats = dictationCumulative() && dictationRepeats(session.finalText, String(list[0]?.[0]?.transcript || ""));
+      if (!kept && session.finalText && !repeats) {
+        session.prefix += (session.prefix && !/\s$/.test(session.prefix) ? " " : "") + session.finalText;
+      }
+      session.finals = finals;
+      session.finalText = dictationText(list.slice(0, finals.length));
+      session.results = event.results;
+      session.heard = true;
+      applyDictation(session);
+    };
+    rec.onerror = (event) => {
+      if (replaced(rec, "error")) return;
+      dictationTrace(session, "error", { code: String(event?.error || "unknown").slice(0, 40), cur: state.dictation === session,
+        ...(event?.message ? { msg: dictationMessageCode(event.message) } : {}) });
+      if (state.dictation === session) session.error = String(event?.error || "unknown");
+    };
+    rec.onend = () => {
+      if (replaced(rec, "end")) return;
+      if (session.invoked) {
+        state.dictationEndedAt = Date.now();
+        state.dictationEndHow = (session.stopping ? "stop" : session.error ? "error:" + session.error : "end")
+          .replace(/[^A-Za-z0-9_.:+-]/g, "").slice(0, 40);
+      }
+      dictationTrace(session, "end", { cur: state.dictation === session, heard: session.heard, idle: session.idle });
+      if (state.dictation === session && dictationResumable(session)) {
+        // What it wrote stays; the next round's words follow it.
+        const text = dictationText(session.results);
+        if (text) session.prefix += (session.prefix && !/\s$/.test(session.prefix) ? " " : "") + text;
+        Object.assign(session, { results: [], finals: [], finalText: "", error: "", restarts: session.restarts + 1 });
+        try {
+          rec.start();
+          dictationTrace(session, "restart", { ok: true, round: session.restarts });
+          return;
+        } catch {
+          // Not startable again: it ends as before.
+          dictationTrace(session, "restart", { ok: false, round: session.restarts });
+        }
+      }
+      finishDictation(session);
+    };
+  };
+  wire(recognition);
   state.dictation = session;
   session.timer = setInterval(() => {
     if (state.dictation !== session) return;
@@ -4180,11 +4260,7 @@ function startDictation(field, { report, active, releaseKeyboard = false }) {
       stopDictation({ abort: true, message: dictationOutcome(session) });
       return;
     }
-    if (session.waiting) {
-      session.report(dictationWaitingText(session.waitUntil - Date.now()));
-      renderDictation();
-      return;
-    }
+    if (session.retrying) return;
     session.ticks++;
     session.idle++;
     if (!session.started && session.ticks >= DICTATION_START_TICKS) stopDictation({ abort: true, message: DICTATION_NOT_STARTED });
@@ -4194,23 +4270,19 @@ function startDictation(field, { report, active, releaseKeyboard = false }) {
     }
   }, 1000);
   dictationTrace(session, "press");
-  const begin = () => {
+  begin = () => {
     if (state.dictation !== session) return false;
-    // A cooldown leaves time to focus the field again, switch conversations, or lock input.
-    // Check at the actual start too, rather than carrying the press's conditions forward.
+    // A retry starts a moment after the press: the field must still be on screen and open.
     if (!session.active() || field.disabled || field.readOnly) {
       dictationTrace(session, "unavailable", { disabled: !!field.disabled, readOnly: !!field.readOnly });
       stopDictation({ abort: true });
       return false;
     }
-    if (session.waitUntil && document.activeElement === field && (webkitTouchDictation() || (touchDevice() && (releaseKeyboard || keyboardOpen())))) {
-      field.blur?.();
-      dictationTrace(session, "release");
-    }
     dictationTrace(session, "begin", { focused: document.activeElement === field, ...dictationInputState(field) });
     try {
       session.invoked = true;
-      recognition.start();
+      session.beganAt = Date.now();
+      session.recognition.start();
       return true;
     } catch {
       session.invoked = false;
@@ -4220,27 +4292,9 @@ function startDictation(field, { report, active, releaseKeyboard = false }) {
       return false;
     }
   };
-  const wait = dictationCooldown();
-  if (wait > 0) {
-    Object.assign(session, { waiting: true, waitUntil: Date.now() + wait });
-    dictationTrace(session, "wait", { ms: wait });
-    session.report(dictationWaitingText(wait));
-    renderDictation();
-    session.waitTimer = setTimeout(() => {
-      if (state.dictation !== session) return;
-      session.waiting = false;
-      dictationTrace(session, "waited");
-      session.report(DICTATION_PREPARING);
-      begin();
-    }, wait);
-    return true;
-  }
   session.report(DICTATION_PREPARING);
   renderDictation();
-  if (!begin()) {
-    return false;
-  }
-  return true;
+  return begin();
 }
 function applyDictation(session) {
   const { field } = session;
@@ -4286,7 +4340,7 @@ function finishDictation(session) {
   state.dictation = null;
   clearInterval(session.timer);
   clearTimeout(session.stopTimer);
-  clearTimeout(session.waitTimer);
+  clearTimeout(session.retryTimer);
   const outcome = dictationOutcome(session);
   session.report(outcome);
   renderDictation();
@@ -4297,8 +4351,8 @@ function finishDictation(session) {
 function stopDictation({ abort = false, field = null, message = "" } = {}) {
   const session = state.dictation;
   if (!session || (field && session.field !== field)) return;
-  // Still waiting to start: nothing to finish, it just does not start.
-  if (session.waiting || session.stopping) abort = true;
+  // Between a stale start and its retry: nothing to finish, the retry just does not start.
+  if (session.retrying || session.stopping) abort = true;
   dictationTrace(session, "stop", { abort, why: dictationReportCode(message) });
   if (!abort && !session.stopping) {
     session.stopping = true;
@@ -4319,11 +4373,14 @@ function stopDictation({ abort = false, field = null, message = "" } = {}) {
   state.dictation = null;
   clearInterval(session.timer);
   clearTimeout(session.stopTimer);
-  clearTimeout(session.waitTimer);
-  // Some engines never send end after abort; still allow their audio session to unwind.
-  if (session.invoked) state.dictationEndedAt = Date.now();
+  clearTimeout(session.retryTimer);
+  // Some engines never send end after abort: the end is noted here too.
+  if (session.invoked) {
+    state.dictationEndedAt = Date.now();
+    state.dictationEndHow = "abort";
+  }
   try {
-    session.recognition.abort();
+    session.recognition?.abort();
   } catch {
     // Already ended.
   }

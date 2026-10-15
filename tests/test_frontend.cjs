@@ -134,7 +134,7 @@ function client(
   vm.runInContext(messageSource, context);
   vm.runInContext(source, context);
   const api = vm.runInContext(
-    "({state,api,sourceOf,accountOf,sendInput,pasteDraft,prepareDraftPaste,startDraftComposition,endDraftComposition,inputDraft,stopTerminalReader,startTerminalReader,closePlan,navigateView,backToList,backFromTerminal,closeTerminal,cancelTerminalClose,confirmTerminalClose,populateAccount,populateRoute,updateContinue,renderPlan,launchPlan,openTerminal,saveDraft,draftKey,refreshTerminals,renderTerminals,renderTerminalReturn,renderFilters,terminalCloseCopy,warnDraftUnload,preparePlan,renderGroups,renderMessages,loadDetail,chatKey,chatEntry,currentChat,chatSupported,chatRecovery,recoverChatSession,openChatTerminal,chatAttachmentsSupported,buildChatComposer,sendChat,loadChatState,applyChatReceipt,uploadChatFiles,pasteChat,scheduleChatPoll,stopChatPolling,openNativeChat,allSessions,buildContinuePanel,chatReceiptCopy,returnToBoard,readChatClipboard,accountDisplay,sessionAccountLabel,closeChatToolsOutside,closeChatToolsEscape,drawDetail,refreshDetail,loadCapabilities,matches,recoverConnection,networkOffline,poll,select,focusDetailBack,restoreSelectedCardFocus,showLogin,lock,beginAuthEpoch,resizeChatInput,updateViewport,draftKeydown,configureTerminalKeyboard,queueTerminalScroll,flushTerminalScroll,terminalScrollEnd,resetTerminalScroll,renderAttention,chatPollDelay,pullRefresh,readingScroll,renderJump,pullDistance,listScroll,setReading,renderPrompt,promptAction,renderUsage,loadUsage,applyTheme,setTheme,updateThemeColor,haptic,navTransition,setDetailShown,chatVisible,sheetRelease,BottomSheet,sheet,openSettings,closeSettings,setTyping,pinchFontSize,setTerminalFontSize,loadXterm,assetUrl,syncEvents,closeEvents,eventsHealthy,renderFreshness,schedule,touchDevice,togglePhaseFilter,renderCounts,createLongPress,swipeIntent,swipeRelease,groupMessageRows,setTextSize,applyTextSize,renderConnectivity,terminalForSession,swipeActionFor,openMessageMenu,openCardMenu,messageActions,outboxShape,outboxMatches,outboxOrigin,settleOutbox,retryOutbox,renderAttachmentTiles,attachmentThumb,sendUpload,openActionSheet,closeActionSheet,setListCollapsed,closeSwipe,settleSwipe,prepareSwipe,runSwipeAction,GESTURE,setChromeVisible,toggleChrome,revealChrome,isChromeTap,snapshotAnnounced,updateChatComposer,capabilitiesRevision,toolKindOf,userMessageParts,formatElapsed,tickWorking,renderTerminalMarks,renderDetailTerminal,terminalsAnnounced,goToSessionTerminal,rememberTerminal,terminalMenu,updateTerminalMenu,chooseTerminalMenu,clearTerminalMenu,renderNewSession,openNewSession,startNewSession,startAppServer,rememberConversationView,restoreConversationView,conversationIdentity,initiatorOf,initiatorLabel,documentKeydown,sessionCategoryOf,setSessionCategory,renderSessionCategories,prepareSessionListFor,sessionCategoryKeydown,render,resetFilters,terminalTitle,renameTerminals,requestedSessionFrom,requestSessionOpen,openRequestedSession,answerOnOpen,hardReload,terminalKeyBytes,terminalKeyFromEvent,pressTerminalKey,toggleTerminalMod,clearTerminalMods,renderTerminalMods,draftBeforeInput,terminalDocumentKey,xtermKeyEvent,renderHardware,loadHardware,startDictation,stopDictation,dictationText,toggleDraftDictation,renderDictation,DICTATION_LISTENING,DICTATION_ERRORS,DICTATION_PREPARING,DICTATION_STALLED,DICTATION_ENDED_AT_ONCE,DICTATION_INTERRUPTED,DICTATION_NOT_STARTED,DICTATION_SILENCE_END,DICTATION_CHANGED,DICTATION_ENDING,bindDraftInput,insertChatText,reloadForUpdate,checkWebVersion,unsavedWork,detailMetaChildren,updateBannerPressed,manualRefresh,listNavigationKeydown,sessionUnread,markSeen,quickReplies,saveQuickReplies,openQuickReplies,terminalEndedCopy,terminalContextCopy,sessionForTerminal,showTerminalEnded,reopenEndedTerminal,csrfRetryable,tidySession,sessionRemoved,removeSession,showSessionAgain,markOpened,groupOf,chatPlaceholder,applyDock,dockWidth,boardCovered,boardKeysBlocked,noteDockSide,toggleDock,redock,finishTerminalClose,renderKeyboardRoom})",
+    "({state,api,sourceOf,accountOf,sendInput,pasteDraft,prepareDraftPaste,startDraftComposition,endDraftComposition,inputDraft,stopTerminalReader,startTerminalReader,closePlan,navigateView,backToList,backFromTerminal,closeTerminal,cancelTerminalClose,confirmTerminalClose,populateAccount,populateRoute,updateContinue,renderPlan,launchPlan,openTerminal,saveDraft,draftKey,refreshTerminals,renderTerminals,renderTerminalReturn,renderFilters,terminalCloseCopy,warnDraftUnload,preparePlan,renderGroups,renderMessages,loadDetail,chatKey,chatEntry,currentChat,chatSupported,chatRecovery,recoverChatSession,openChatTerminal,chatAttachmentsSupported,buildChatComposer,sendChat,loadChatState,applyChatReceipt,uploadChatFiles,pasteChat,scheduleChatPoll,stopChatPolling,openNativeChat,allSessions,buildContinuePanel,chatReceiptCopy,returnToBoard,readChatClipboard,accountDisplay,sessionAccountLabel,closeChatToolsOutside,closeChatToolsEscape,drawDetail,refreshDetail,loadCapabilities,matches,recoverConnection,networkOffline,poll,select,focusDetailBack,restoreSelectedCardFocus,showLogin,lock,beginAuthEpoch,resizeChatInput,updateViewport,draftKeydown,configureTerminalKeyboard,queueTerminalScroll,flushTerminalScroll,terminalScrollEnd,resetTerminalScroll,renderAttention,chatPollDelay,pullRefresh,readingScroll,renderJump,pullDistance,listScroll,setReading,renderPrompt,promptAction,renderUsage,loadUsage,applyTheme,setTheme,updateThemeColor,haptic,navTransition,setDetailShown,chatVisible,sheetRelease,BottomSheet,sheet,openSettings,closeSettings,setTyping,pinchFontSize,setTerminalFontSize,loadXterm,assetUrl,syncEvents,closeEvents,eventsHealthy,renderFreshness,schedule,touchDevice,togglePhaseFilter,renderCounts,createLongPress,swipeIntent,swipeRelease,groupMessageRows,setTextSize,applyTextSize,renderConnectivity,terminalForSession,swipeActionFor,openMessageMenu,openCardMenu,messageActions,outboxShape,outboxMatches,outboxOrigin,settleOutbox,retryOutbox,renderAttachmentTiles,attachmentThumb,sendUpload,openActionSheet,closeActionSheet,setListCollapsed,closeSwipe,settleSwipe,prepareSwipe,runSwipeAction,GESTURE,setChromeVisible,toggleChrome,revealChrome,isChromeTap,snapshotAnnounced,updateChatComposer,capabilitiesRevision,toolKindOf,userMessageParts,formatElapsed,tickWorking,renderTerminalMarks,renderDetailTerminal,terminalsAnnounced,goToSessionTerminal,rememberTerminal,terminalMenu,updateTerminalMenu,chooseTerminalMenu,clearTerminalMenu,renderNewSession,openNewSession,startNewSession,startAppServer,rememberConversationView,restoreConversationView,conversationIdentity,initiatorOf,initiatorLabel,documentKeydown,sessionCategoryOf,setSessionCategory,renderSessionCategories,prepareSessionListFor,sessionCategoryKeydown,render,resetFilters,terminalTitle,renameTerminals,requestedSessionFrom,requestSessionOpen,openRequestedSession,answerOnOpen,hardReload,terminalKeyBytes,terminalKeyFromEvent,pressTerminalKey,toggleTerminalMod,clearTerminalMods,renderTerminalMods,draftBeforeInput,terminalDocumentKey,xtermKeyEvent,renderHardware,loadHardware,startDictation,stopDictation,dictationText,toggleDraftDictation,renderDictation,DICTATION_LISTENING,DICTATION_ERRORS,DICTATION_PREPARING,DICTATION_STALLED,DICTATION_ENDED_AT_ONCE,DICTATION_INTERRUPTED,DICTATION_NOT_STARTED,DICTATION_SILENCE_END,DICTATION_CHANGED,DICTATION_ENDING,DICTATION_STUCK,bindDraftInput,insertChatText,reloadForUpdate,checkWebVersion,unsavedWork,detailMetaChildren,updateBannerPressed,manualRefresh,listNavigationKeydown,sessionUnread,markSeen,quickReplies,saveQuickReplies,openQuickReplies,terminalEndedCopy,terminalContextCopy,sessionForTerminal,showTerminalEnded,reopenEndedTerminal,csrfRetryable,tidySession,sessionRemoved,removeSession,showSessionAgain,markOpened,groupOf,chatPlaceholder,applyDock,dockWidth,boardCovered,boardKeysBlocked,noteDockSide,toggleDock,redock,finishTerminalClose,renderKeyboardRoom})",
     context,
   );
   api.state.csrf = "csrf-test";
@@ -10386,62 +10386,64 @@ test('a menu whose taps iPadOS kept for its own selection still works once the o
   assert.deepEqual(ran, ['복사']);
 });
 
-test('on an iPad a press within ten seconds of the last end waits it out, saying so, then listens', async () => {
-  const ipad = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/27.0 Safari/605.1.15';
-  const { c, recognitions, FakeRecognition, result, settle, timeouts, tick } = dictationClient();
+test('an iPad press listens at once; a start that gives no sound is replaced once, and a second ends at once', async () => {
+  const { c, FakeRecognition, recognitions, result, settle, tick, timeouts } = dictationClient();
   c.context.webkitSpeechRecognition = FakeRecognition;
-  c.context.navigator = { userAgent: ipad, onLine: true };
+  c.context.navigator = { userAgent: 'Macintosh AppleWebKit Safari', onLine: true };
   c.context.window.matchMedia = (query) => ({ matches: query === '(pointer: coarse)' });
-  const { s } = selectChat(c);
-  const composer = c.buildChatComposer(s);
-  const input = findId(composer, 'chat-input');
-  const mic = findId(composer, 'chat-mic');
-  // The first listening starts at once.
-  mic.events.click();
-  const [first] = recognitions;
-  assert.equal(first.started, 1);
-  first.onstart();
-  first.onresult(result('첫 말'));
-  mic.events.click();
-  await settle();
-  assert.equal(c.state.dictation, null);
-  // Pressed again right away: it waits, says how long, and starts once the time is up.
-  mic.events.click();
-  const second = recognitions.at(-1);
-  assert.notEqual(second, first);
-  assert.equal(second.started, 0);
-  assert.match(c.get('chat-status').textContent, /앞의 받아쓰기를 정리하고 있습니다 · 1[12]초 뒤 듣기 시작/);
-  assert.equal(mic.attributes['aria-pressed'], 'true', 'the mic shows it is on its way');
-  tick(3);
-  assert.equal(c.state.dictation?.recognition, second, 'waiting does not count as not starting');
-  const wait = timeouts.filter((timer) => timer.ms > 10000 && timer.ms <= 12000).at(-1);
-  assert.ok(wait);
-  wait.callback();
-  assert.equal(second.started, 1);
-  assert.equal(c.get('chat-status').textContent, c.DICTATION_PREPARING);
-  second.onstart();
-  second.onresult(result('둘째 말'));
-  assert.equal(input.value, '첫 말 둘째 말');
-  // Pressed during the wait, it simply does not start.
-  c.stopDictation({ abort: true });
-  await settle();
+  const { s } = selectChat(c); const composer = c.buildChatComposer(s);
+  const input = findId(composer, 'chat-input'); const mic = findId(composer, 'chat-mic');
+  // Right after the last end: no waiting any more.
   c.state.dictationEndedAt = Date.now();
   mic.events.click();
-  const third = recognitions.at(-1);
-  mic.events.click();
+  const first = recognitions.at(-1);
+  assert.equal(first.started, 1);
+  // Its audio "starts" as soon as it is asked to: a capture that gives no sound.
+  first.onstart(); first.onaudiostart();
+  assert.equal(first.aborted, 1);
+  assert.equal(c.state.dictation?.recognition, null);
+  assert.equal(c.get('chat-status').textContent, c.DICTATION_PREPARING);
+  assert.equal(mic.attributes['aria-pressed'], 'true');
+  await settle();
+  assert.ok(c.state.dictation, 'the replaced recognition ending does not end the listening');
+  tick(20);
+  assert.ok(c.state.dictation, 'the pause before the retry does not count as not starting');
+  timeouts.filter((timer) => timer.ms === 600).at(-1).callback();
+  const second = recognitions.at(-1);
+  assert.notEqual(second, first);
+  assert.equal(second.started, 1);
+  c.state.dictation.beganAt -= 400; // A start that takes its time hears.
+  second.onstart(); second.onaudiostart();
+  assert.equal(c.get('chat-status').textContent, c.DICTATION_LISTENING);
+  second.onresult(result('다시 들린 말'));
+  assert.equal(input.value, '다시 들린 말');
+  const events = c.state.dictation.trace.events.map((event) => event.e);
+  assert.ok(events.includes('stale') && events.includes('retry') && events.includes('old:end'), events.join(' '));
+  mic.events.click(); await settle();
   assert.equal(c.state.dictation, null);
-  timeouts.filter((timer) => timer.ms > 10000 && timer.ms <= 12000).at(-1).callback();
-  assert.equal(third.started, 0);
-  assert.equal(c.get('chat-status').textContent, '');
-  // Not on Android or a mouse device: no wait.
-  for (const [agent, coarse] of [['Mozilla/5.0 (Linux; Android 15) AppleWebKit/537.36 Chrome/141', true], [ipad, false]]) {
+  // A retry that also gives no sound ends at once, without waiting out the silence.
+  input.value = '';
+  mic.events.click();
+  const third = recognitions.at(-1);
+  third.onaudiostart();
+  timeouts.filter((timer) => timer.ms === 600).at(-1).callback();
+  const fourth = recognitions.at(-1);
+  assert.notEqual(fourth, third);
+  fourth.onaudiostart();
+  assert.equal(c.state.dictation, null);
+  assert.equal(fourth.aborted, 1);
+  assert.equal(c.get('chat-status').textContent, c.DICTATION_STUCK);
+  assert.equal(recognitions.length, 4, 'only one retry');
+  // Not on Android or a mouse device: an instant start is listened to.
+  for (const [agent, coarse] of [['Mozilla/5.0 (Linux; Android 15) AppleWebKit/537.36 Chrome/141', true], ['Macintosh AppleWebKit Safari', false]]) {
     c.context.navigator = { userAgent: agent, onLine: true };
     c.context.window.matchMedia = (query) => ({ matches: coarse && query === '(pointer: coarse)' });
-    c.state.dictationEndedAt = Date.now();
     mic.events.click();
-    assert.equal(recognitions.at(-1).started, 1, agent);
-    c.stopDictation({ abort: true });
-    await settle();
+    const rec = recognitions.at(-1);
+    rec.onaudiostart();
+    assert.equal(c.state.dictation?.recognition, rec, agent);
+    assert.equal(c.get('chat-status').textContent, c.DICTATION_LISTENING, agent);
+    c.stopDictation({ abort: true }); await settle();
   }
 });
 
@@ -10849,53 +10851,68 @@ test('a second tap can abort a recognizer that did not finish stopping, then ano
   assert.equal(recognitions.at(-1).started, 1);
 });
 
-test('an iPad waiting to restart checks focus, the visible conversation and input locks again before starting', () => {
-  for (const changed of ['focused', 'locked', 'offscreen']) {
+test('an iPad retry checks the visible conversation and input locks again before starting', () => {
+  for (const changed of ['locked', 'offscreen', 'unchanged']) {
     const { c, FakeRecognition, recognitions, timeouts } = dictationClient();
     c.context.webkitSpeechRecognition = FakeRecognition;
     c.context.navigator = { userAgent: 'Macintosh AppleWebKit Safari', onLine: true };
     c.context.window.matchMedia = (query) => ({ matches: query === '(pointer: coarse)' });
     const { s, entry } = selectChat(c); const composer = c.buildChatComposer(s);
-    const input = findId(composer, 'chat-input'); const mic = findId(composer, 'chat-mic');
-    c.state.dictationEndedAt = Date.now(); mic.events.click();
-    const rec = recognitions.at(-1); assert.equal(rec.started, 0);
-    let blurred = 0;
-    input.blur = () => { blurred++; c.context.document.activeElement = c.context.document.body; };
-    if (changed === 'focused') c.context.document.activeElement = input;
-    if (changed === 'locked') { entry.pending = { requestId: 'locked-during-wait' }; c.updateChatComposer(entry); }
+    const mic = findId(composer, 'chat-mic');
+    mic.events.click();
+    recognitions.at(-1).onaudiostart();
+    if (changed === 'locked') { entry.pending = { requestId: 'locked-during-retry' }; c.updateChatComposer(entry); }
     if (changed === 'offscreen') c.state.selected = null;
-    timeouts.find((timer) => timer.ms > 10000 && timer.ms <= 12000).callback();
-    assert.equal(rec.started, changed === 'focused' ? 1 : 0, changed);
-    if (changed === 'focused') assert.equal(blurred, 1);
-    else assert.equal(c.state.dictation, null);
+    timeouts.find((timer) => timer.ms === 600).callback();
+    assert.equal(recognitions.at(-1).started, changed === 'unchanged' ? 1 : 0, changed);
+    if (changed !== 'unchanged') assert.equal(c.state.dictation, null, changed);
   }
 });
 
-test('cancelling an iPad restart that never opened the mic does not renew the twelve-second cooldown', async () => {
-  const { c, FakeRecognition, recognitions, settle } = dictationClient();
+test('pressing the mic during an iPad retry pause ends it, and the retry never starts', async () => {
+  const { c, FakeRecognition, recognitions, settle, timeouts } = dictationClient();
   c.context.webkitSpeechRecognition = FakeRecognition;
   c.context.navigator = { userAgent: 'Macintosh AppleWebKit Safari' };
   c.context.window.matchMedia = (query) => ({ matches: query === '(pointer: coarse)' });
   const { s } = selectChat(c); const composer = c.buildChatComposer(s);
   const mic = findId(composer, 'chat-mic');
-  const previousEnd = Date.now() - 5000; c.state.dictationEndedAt = previousEnd;
-  mic.events.click(); assert.equal(recognitions.at(-1).started, 0);
+  mic.events.click();
+  recognitions.at(-1).onaudiostart();
   mic.events.click(); await settle();
-  assert.equal(c.state.dictationEndedAt, previousEnd, 'no recognition was started or ended by cancelling the wait');
+  assert.equal(c.state.dictation, null);
+  assert.equal(mic.attributes['aria-pressed'], 'false');
+  timeouts.filter((timer) => timer.ms === 600).at(-1).callback();
+  assert.equal(recognitions.length, 1, 'no fresh recognition after the listening ended');
 });
 
-test('an iPad recognizer that never reports end after abort still gets recovery time before reusing the microphone', () => {
+test('an iPad press after an abort starts at once; the trace says how the last ended and codes the platform message', () => {
   const { c, FakeRecognition, recognitions } = dictationClient();
   c.context.webkitSpeechRecognition = FakeRecognition;
   c.context.navigator = { userAgent: 'Macintosh AppleWebKit Safari' };
   c.context.window.matchMedia = (query) => ({ matches: query === '(pointer: coarse)' });
   const { s } = selectChat(c); const composer = c.buildChatComposer(s); const mic = findId(composer, 'chat-mic');
-  mic.events.click(); const first = recognitions.at(-1); first.onstart();
+  mic.events.click(); const first = recognitions.at(-1);
+  c.state.dictation.beganAt -= 500; first.onstart(); first.onaudiostart();
   first.abort = function () { this.aborted++; };
   const stoppedAt = Date.now(); c.stopDictation({ abort: true });
   assert.ok(c.state.dictationEndedAt >= stoppedAt);
-  mic.events.click(); assert.equal(recognitions.at(-1).started, 0);
-  assert.match(mic.attributes['aria-label'], /초 뒤 음성 입력.*취소/);
+  assert.equal(c.state.dictationEndHow, 'abort');
+  mic.events.click(); const second = recognitions.at(-1);
+  assert.equal(second.started, 1);
+  assert.equal(mic.attributes['aria-label'], '음성 입력 중지');
+  const { env } = c.state.dictation.trace;
+  assert.equal(env.lastEnd, 'abort');
+  assert.ok(Number.isInteger(env.sinceEnd) && env.sinceEnd >= 0);
+  assert.equal(typeof env.kb, 'boolean');
+  assert.match(env.act, /^[A-Za-z0-9_.:+-]{0,40}$/);
+  second.onerror({ error: 'aborted', message: 'Audio session failed to activate: 오류' });
+  const error = c.state.dictation.trace.events.find((event) => event.e === 'error');
+  assert.match(error.msg, /^audio:[0-9a-f]{8}\.\d+$/);
+  assert.ok(!JSON.stringify(c.state.dictation.trace).includes('Audio session'), 'the message words never leave the device');
+  // Every string the trace holds is a code the board accepts (ASCII, at most 48 characters).
+  const strings = [...Object.values(env), ...c.state.dictation.trace.events.flatMap((event) => Object.values(event))]
+    .filter((value) => typeof value === 'string');
+  for (const value of strings) assert.match(value, /^[A-Za-z0-9_.:+-]{0,48}$/, value);
 });
 
 test('an iPad terminal mic lets go of keyboard focus even after viewport baseline was lost or a trackpad is connected', () => {

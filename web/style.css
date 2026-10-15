@@ -767,6 +767,10 @@ select:disabled {
 }
 .top-status .top-chip::before { content: none; }
 .top-status .top-chip .usage-summary { min-width: 0; white-space: normal; }
+/* Usage takes the width its percentages need (the device chip goes below it), and wraps its
+   pills only in a panel narrower than they are: they ran into the device chip before. */
+.board-status-inspectors #usage.top-chip { flex: 1 1 auto; }
+.board-status-inspectors .top-chip .usage-summary { flex-wrap: wrap; }
 
 .host {
   display: inline-flex;
@@ -1563,7 +1567,8 @@ button.host:focus-visible {
   font-size: var(--fs-cap);
   line-height: 1.35;
 }
-.card-agent { flex: none; color: var(--codex); font-weight: 500; }
+/* The agent's name gives way before the time runs out of the card (narrow cards, large text). */
+.card-agent { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--codex); font-weight: 500; }
 .card-agent.claude { color: var(--claude); }
 .card-host { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .card-host::before { content: "·"; margin-right: 6px; }
@@ -3880,7 +3885,8 @@ li[data-task] {
 .chat-composer .chat-main > #chat-send {
   flex: none;
   order: 0;
-  min-width: var(--tap);
+  /* As wide for "전송 중" as for "보내기": the button no longer moves under the finger. */
+  min-width: max(var(--tap), calc(2.9em + 28px));
   min-height: var(--tap);
   margin: 0;
   padding: 0 14px;
@@ -4071,9 +4077,11 @@ li[data-task] {
     max-height: 30vh;
     min-height: calc(2lh + 22px);
   }
+  /* Two lines even with the keyboard up: a one-line box cut a two-line notice (a refused or
+     unconfirmed send) mid-sentence behind a scrollbar. */
   .chat-composer.is-compact .chat-status {
-    max-height: 18px;
-    max-height: calc(1lh + 1px);
+    max-height: 36px;
+    max-height: calc(2lh + 2px);
   }
   .chat-composer .chat-attachments {
     max-height: 48px;
@@ -4695,6 +4703,8 @@ body.dock-solo .settings-lock { display: flex; }
   padding: 12px;
   overflow-y: auto;
   overscroll-behavior: contain;
+  /* A key moving the focus scrolls an option clear of the send kept at the bottom. */
+  scroll-padding-bottom: 72px;
   border: 1px solid var(--accent);
   border-radius: 14px;
   background: var(--surface);
@@ -4721,6 +4731,9 @@ body.dock-solo .settings-lock { display: flex; }
   font-size: var(--fs-sub);
 }
 .chat-prompt-question {
+  /* The question (the command to approve) keeps its height; the card scrolls as a whole. As
+     the card's one shrinkable child it was squeezed to half a line beside many options. */
+  flex-shrink: 0;
   max-height: 9.5em;
   margin: 0;
   padding: 8px 10px;
@@ -4791,6 +4804,17 @@ body.dock-solo .settings-lock { display: flex; }
 }
 .chat-prompt .primary {
   min-height: 44px;
+  /* The question shows whole (the command to approve), so a long one with many options
+     scrolls the card: its send stays at the card's bottom, never scrolled out of sight. */
+  position: sticky;
+  bottom: 0;
+  z-index: 1;
+  /* It stops at the card's 12px padding: the mask covers that strip, so no option shows under it. */
+  box-shadow: 0 12px 0 2px var(--surface), 0 -6px 0 2px var(--surface);
+}
+.chat-prompt .primary:disabled {
+  /* Opaque over the options it may cover while they scroll under it. */
+  background: linear-gradient(var(--fill), var(--fill)), var(--surface);
 }
 
 /* Wide touch screens (tablets): phone-sized text, one reading column for the
@@ -5667,7 +5691,8 @@ body.dock-solo .settings-lock { display: flex; }
   margin-top: 4px;
 }
 .card-meta .card-project {
-  flex: 0 1 auto;
+  /* The project gives way first; the agent's name only once the project is gone. */
+  flex: 0 1000 auto;
   min-width: 0;
   margin: 0;
   overflow: hidden;

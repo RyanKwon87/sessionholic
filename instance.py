@@ -132,6 +132,9 @@ _SCHEMA = {
         "loginTokenHelp": _help, "logPrefix": lambda v: _plain(v, 64),
         "serverVersion": _pattern("serverVersion"), "threadPrefix": _pattern("threadPrefix"),
         "codexClientName": _pattern("codexClientName"),
+        # Optional: a private folder whose icon.svg, icon-192.png, icon-512.png and
+        # icon-maskable-512.png stand in for the shipped ones (server.StaticAssets).
+        "iconDir": _absolute,
     },
     "web": {key: _pattern(key) for key in ("storagePrefix", "historyKey", "cachePrefix", "manifestId")},
     "paths": {"configDir": _absolute, "tokenFile": _absolute, "defaultHosts": _absolute,

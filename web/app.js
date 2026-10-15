@@ -2742,6 +2742,14 @@ function openCardMenu(row, at = null) {
 }
 function bindCardGestures(root) {
   let drag = null;
+  // The card a finger holds still lifts toward its menu, as iOS context menus do
+  // (style.css .card-row.is-pressing waits past a tap); any move or lift drops it.
+  let pressed = null;
+  const lift = (row, event = null) => {
+    if (pressed) setClass(pressed.row, "is-pressing", false);
+    pressed = row ? { row, id: event.pointerId, x: event.clientX, y: event.clientY } : null;
+    if (pressed) setClass(row, "is-pressing", true);
+  };
   const rowOf = (target) => {
     const row = target?.closest?.(".card-row");
     return row?.card ? row : null;
@@ -2751,12 +2759,16 @@ function bindCardGestures(root) {
       const row = rowOf(event.target);
       if (state.swipeOpen && state.swipeOpen !== row) closeSwipe();
       drag = null;
+      lift(null);
       if (!row || event.pointerType === "mouse" || event.target?.closest?.(".card-swipe-action")) return;
       drag = { row, id: event.pointerId, x: event.clientX, y: event.clientY, intent: null, offset: 0,
         base: state.swipeOpen === row ? -GESTURE.swipeRevealPx : 0, samples: [[Date.now(), event.clientX]] };
+      if (event.isPrimary !== false && state.swipeOpen !== row) lift(row, event);
     },
     // Returns true once the drag is a swipe, which ends the long press.
     onMove(event) {
+      if (pressed && event.pointerId === pressed.id &&
+          Math.hypot((event.clientX || 0) - pressed.x, (event.clientY || 0) - pressed.y) > GESTURE.pressSlopPx) lift(null);
       if (!drag || event.pointerId !== drag.id) return false;
       const dx = event.clientX - drag.x;
       const dy = event.clientY - drag.y;
@@ -2781,6 +2793,7 @@ function bindCardGestures(root) {
       return true;
     },
     onUp(event, cancelled) {
+      if (pressed && event.pointerId === pressed.id) lift(null);
       const current = drag;
       if (!current || event.pointerId !== current.id) return;
       drag = null;

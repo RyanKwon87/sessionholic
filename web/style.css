@@ -83,6 +83,7 @@
   --shadow-dialog: 0 24px 64px rgba(0, 0, 0, 0.2), 0 0 0 0.5px rgba(0, 0, 0, 0.08);
   --shadow-toast: 0 8px 30px rgba(0, 0, 0, 0.2);
   --shadow-nav: -8px 0 28px rgba(0, 0, 0, 0.12);
+  --shadow-lift: 0 10px 30px rgba(0, 0, 0, 0.16);
   --sheet-handle: rgba(60, 60, 67, 0.3);
   --segment-on: #ffffff;
   --terminal-tile: #1c1c1e;
@@ -160,6 +161,7 @@
   --press-scale: 0.97;
   --press-scale-card: 0.985;
   --press-scale-key: 0.98;
+  --press-scale-lift: 1.03;
 
   --font:
     -apple-system, BlinkMacSystemFont, system-ui, "Apple SD Gothic Neo",
@@ -247,6 +249,7 @@
     --shadow-dialog: 0 24px 64px rgba(0, 0, 0, 0.6), 0 0 0 0.5px rgba(255, 255, 255, 0.1);
     --shadow-toast: 0 8px 30px rgba(0, 0, 0, 0.5);
     --shadow-nav: -8px 0 28px rgba(0, 0, 0, 0.5);
+    --shadow-lift: 0 10px 30px rgba(0, 0, 0, 0.6);
     --sheet-handle: rgba(235, 235, 245, 0.3);
     --segment-on: #636366;
     --terminal-tile: #3a3a3c;
@@ -327,6 +330,7 @@
   --shadow-dialog: 0 24px 64px rgba(0, 0, 0, 0.6), 0 0 0 0.5px rgba(255, 255, 255, 0.1);
   --shadow-toast: 0 8px 30px rgba(0, 0, 0, 0.5);
   --shadow-nav: -8px 0 28px rgba(0, 0, 0, 0.5);
+  --shadow-lift: 0 10px 30px rgba(0, 0, 0, 0.6);
   --sheet-handle: rgba(235, 235, 245, 0.3);
   --segment-on: #636366;
   --terminal-tile: #3a3a3c;
@@ -3509,6 +3513,7 @@ li[data-task] {
     --press-scale: 1;
     --press-scale-card: 1;
     --press-scale-key: 1;
+    --press-scale-lift: 1;
   }
   * {
     transition: none !important;
@@ -5791,6 +5796,26 @@ body.edge-settling :is(.app, .app > *, .list-pane, .detail-pane, .terminal-scree
 .card-row.is-swiping > .card:active,
 .card-row.is-open > .card:active {
   transform: translateX(var(--swipe-x, 0px));
+}
+/* A card held for its menu lifts like an iOS context menu (app.js bindCardGestures):
+   a tap only dips it; held on, it grows and casts a shadow just as the menu opens
+   (450ms: GESTURE.longPressMs). The row is lifted, as it clips the card. */
+.card-row.is-pressing {
+  z-index: 2;
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-lift);
+  animation: card-lift 450ms var(--ease-out) both;
+}
+@keyframes card-lift {
+  0%,
+  40% {
+    transform: none;
+    box-shadow: 0 0 0 0 transparent;
+  }
+  100% {
+    transform: scale(var(--press-scale-lift));
+    box-shadow: var(--shadow-lift);
+  }
 }
 .card-title {
   grid-area: title;

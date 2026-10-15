@@ -6830,6 +6830,42 @@ test('a swipe offers 터미널 열기, or 연결 닫기 when the session has a b
   assert.equal(c.state.swipeOpen, null);
 });
 
+test('a card held for its menu lifts like an iOS context menu; a move, the lifted finger or a mouse never leave it lifted', () => {
+  const c = client(undefined, noChatTimers);
+  const s = recentSession('lift-me');
+  setRecentSnapshot(c, [s]); c.renderGroups([s], 1100);
+  const row = byClass(c.get('groups'), 'card-row')[0];
+  const groups = c.get('groups');
+  vm.runInContext('bindCardGestures', c.context)(groups);
+  const target = { closest: (selector) => (selector === '.card-row' ? row : null) };
+  const lifted = () => /\bis-pressing\b/.test(row.className);
+  const down = (id, extra = {}) => groups.events.pointerdown({ target, pointerId: id, pointerType: 'touch', clientX: 300, clientY: 100, ...extra });
+  const move = (id, x, y) => groups.events.pointermove({ target, pointerId: id, clientX: x, clientY: y, cancelable: true, preventDefault() {} });
+  down(1);
+  assert.equal(lifted(), true, 'held: it lifts (style.css delays it past a tap)');
+  move(1, 302, 104);
+  assert.equal(lifted(), true, 'a small wobble keeps it');
+  move(1, 300, 130);
+  assert.equal(lifted(), false, 'a scroll drops it');
+  groups.events.pointerup({ pointerId: 1 });
+  down(2); groups.events.pointerup({ pointerId: 2 });
+  assert.equal(lifted(), false, 'the finger lifts');
+  down(3); groups.events.pointercancel({ pointerId: 3 });
+  assert.equal(lifted(), false, 'the browser took the touch');
+  down(4); move(4, 270, 101);
+  assert.equal(lifted(), false, 'a swipe drops it');
+  groups.events.pointerup({ pointerId: 4 });
+  c.closeSwipe();
+  down(5, { pointerType: 'mouse' });
+  assert.equal(lifted(), false, 'a mouse opens the menu by its right click');
+  const css = styleSheet();
+  assert.match(css, /\.card-row\.is-pressing \{[^}]*box-shadow: var\(--shadow-lift\)/);
+  assert.match(css, /\.card-row\.is-pressing \{[^}]*animation: card-lift 450ms/, 'the lift ends as the menu opens (GESTURE.longPressMs)');
+  assert.equal(c.GESTURE.longPressMs, 450);
+  const light = cssBlock(css, ':root'), dark = cssBlock(css, ':root[data-theme="dark"]');
+  assert.ok(light['--shadow-lift'] && dark['--shadow-lift'] && light['--shadow-lift'] !== dark['--shadow-lift']);
+});
+
 test('consecutive messages from one speaker group under one name and time, with tighter spacing, and regroup on new rows', () => {
   const c = client(undefined, noChatTimers); const { s } = selectChat(c);
   const messages = [{ role: 'assistant', text: '첫 답변', ts: 1000 }, { role: 'assistant', text: '이어지는 답변', ts: 1060 },

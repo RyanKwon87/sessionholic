@@ -79,6 +79,35 @@ const MessageFormat = (() => {
     }
     return /^https?:\/\/[^/?#]/i.test(url.slice(0, end)) ? url.slice(0, end) : "";
   }
+  // Codex's own file citation (`:codex-file-citation[label]{path="…" line_range_start=… purpose=…}`):
+  // a web address becomes a link (its label, else the address), a file its path in code (with
+  // its lines); anything else, or a malformed one, stays text.
+  const CITATION = /^:codex-file-citation(?:\[([^\]\n]{0,200})\])?\{([^{}\n]{0,4096})\}/;
+  function citationAttributes(body) {
+    const attributes = {};
+    const pattern = /([A-Za-z_][\w-]{0,40})\s*=\s*(?:"((?:[^"\\]|\\.)*)"|'([^']*)'|([^\s"'}]+))/g;
+    for (const match of body.matchAll(pattern))
+      attributes[match[1]] = (match[2] !== undefined ? match[2].replace(/\\(.)/g, "$1") : match[3] ?? match[4]);
+    return attributes;
+  }
+  function citation(text, budget, links) {
+    const match = text.slice(0, 4400).match(CITATION);
+    if (!match) return null;
+    const attributes = citationAttributes(match[2]);
+    const path = String(attributes.path || "").trim();
+    if (!path) return null;
+    spend(budget, "work", match[0].length);
+    const label = (match[1] || attributes.title || "").trim();
+    const href = safeHref(path);
+    if (href && links)
+      return { length: match[0].length, node: make(budget, "link", { children: [make(budget, "text", { text: label || path })],
+        destination: path, href, auto: !label }) };
+    if (href) return { length: match[0].length, node: make(budget, "text", { text: label || path }) };
+    const start = /^\d{1,7}$/.test(attributes.line_range_start || "") ? attributes.line_range_start : "";
+    const end = /^\d{1,7}$/.test(attributes.line_range_end || "") ? attributes.line_range_end : "";
+    const lines = start ? `:${start}${end && end !== start ? `-${end}` : ""}` : "";
+    return { length: match[0].length, node: make(budget, "code", { text: (label ? `${label} · ` : "") + path + lines }) };
+  }
   function inline(text, budget, depth = 0, links = true) {
     if (depth > MAX_DEPTH) return [make(budget, "text", { text })];
     const out = [];
@@ -177,6 +206,10 @@ const MessageFormat = (() => {
       const char = text[index];
       if (char === "\\" && /[\\`*_[\]{}()#+.!>~-]/.test(text[index + 1] || "")) {
         buffer += text[index + 1]; index += 2; continue;
+      }
+      if (char === ":" && text.startsWith(":codex-file-citation", index)) {
+        const cited = citation(text.slice(index), budget, links);
+        if (cited) { flush(); out.push(cited.node); index += cited.length; continue; }
       }
       if (char === "<" && links) {
         const angle = text.slice(index, index + 2050).match(/^<(https?:\/\/[^\s<>]+)>/i);

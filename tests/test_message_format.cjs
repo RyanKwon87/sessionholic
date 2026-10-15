@@ -332,3 +332,36 @@ test('B7·B13: a code block has a header row with its language and the copy icon
   const css = fs.readFileSync(path.join(__dirname, '../web/style.css'), 'utf8');
   assert.match(css, /\.message-code-head \.message-block-copy \{[^}]*position: relative;/);
 });
+
+test('a Codex file citation shows a web address as one link and a file as its path in code, never the raw directive', () => {
+  const format = formatter();
+  const root = element();
+  const textOf = (node) => (typeof node === 'string' ? node : (node.textContent || '') + node.children.map(textOf).join(''));
+  const sheet = 'https://docs.example/spreadsheets/d/abc/edit#gid=2026101501';
+  format.render(root, `정산 내역만 남겼습니다.\n\n:codex-file-citation{path="${sheet}" purpose="output"}`);
+  let links = byTag(root, 'a');
+  assert.equal(links.length, 1);
+  assert.equal(links[0].attributes.href, sheet);
+  assert.equal(textOf(links[0]), sheet);
+  assert.doesNotMatch(textOf(root), /codex-file-citation|purpose=/);
+  // A label names the link; single quotes are read too.
+  format.render(root, `보고서: :codex-file-citation[정산 시트]{path='${sheet}'} 확인`);
+  links = byTag(root, 'a');
+  assert.equal(textOf(links[0]), '정산 시트');
+  assert.equal(textOf(root), '보고서: 정산 시트 확인');
+  // A file is its path in code, with its lines.
+  format.render(root, ':codex-file-citation{path="web/app.js" line_range_start=12 line_range_end=20}');
+  assert.equal(byTag(root, 'a').length, 0);
+  assert.equal(textOf(byTag(root, 'code')[0]), 'web/app.js:12-20');
+  format.render(root, ':codex-file-citation{path="web/app.js" line_range_start="7" line_range_end="7"}');
+  assert.equal(textOf(byTag(root, 'code')[0]), 'web/app.js:7');
+  // Not a safe web address, no path, or not closed: no link, and a malformed one stays text.
+  format.render(root, ':codex-file-citation{path="javascript:alert(1)"}');
+  assert.equal(byTag(root, 'a').length, 0);
+  format.render(root, ':codex-file-citation{purpose="output"} :codex-file-citation{path="x"');
+  assert.equal(byTag(root, 'a').length, 0);
+  assert.match(textOf(root), /:codex-file-citation\{purpose="output"\}/);
+  // Inside a link's own label there is no second link.
+  format.render(root, `[보기 :codex-file-citation{path="${sheet}"}](https://other.example/)`);
+  assert.deepEqual(byTag(root, 'a').map((node) => node.attributes.href), ['https://other.example/']);
+});

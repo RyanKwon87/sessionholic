@@ -418,6 +418,74 @@ class BotRequestsTest(unittest.TestCase):
         self.assertFalse(Path(str(store) + '-wal').exists())
         self.assertFalse(Path(str(store) + '-shm').exists())
 
+    # A Hermes gateway's framing around the person's words (synthetic, in the gateway's own markers).
+    SENDER = '[예시 사용자 | Slack user <@U0EXAMPLE1>] '
+    THREAD = ('[Thread context — prior messages in this thread (not yet in conversation history):]\n'
+              '[assistant] 앞선 답변\n예시 동료: 앞선 말\n[End of thread context]\n\n')
+    SKILL = ('[IMPORTANT: The user has invoked the "work" skill, indicating they want you to follow its '
+             'instructions. The full skill content is loaded below.]\n\n# 스킬 본문\n')
+    QUOTED = 'The user has provided the following instruction alongside the skill invocation: 본문 속 인용\n'
+
+    def test_hermes_user_turns_show_only_what_the_person_typed(self):
+        typed = bots._hermes_typed
+        cases = [
+            ('재고를 알려 주세요', '재고를 알려 주세요'),
+            (self.SENDER + '재고를 알려 주세요', '재고를 알려 주세요'),
+            (self.THREAD + '\n\n[New message]\n' + self.SENDER + '이어서 해 주세요', '이어서 해 주세요'),
+            ('[Replying to: "예전 메시지"]\n\n' + self.SENDER + '이거 다시', '이거 다시'),
+            ('[Replying to your previous message: "앞 답"]\n\n그대로 진행', '그대로 진행'),
+            ("[The user sent a document: '표.pdf'. It is saved at: /tmp/x.pdf. Extract it.]\n\n요약해 주세요", '요약해 주세요'),
+            ("[The user sent a document: '표.pdf'. It is saved at: /tmp/x.pdf.]\n\n", bots.HERMES_ATTACHED),
+            ('[이전 채널 메시지]\n예시 동료: 안녕\n\n[New message]\n' + self.SENDER + '새 요청', '새 요청'),
+            # The body may quote the instruction line: the last one is the person's.
+            (self.SKILL + self.QUOTED + 'The user has provided the following instruction alongside the skill invocation: '
+             '제목을 고쳐 줘\n\n[Runtime note: 합성]', '/work 제목을 고쳐 줘'),
+            (self.SKILL, '/work'),
+            ('[IMPORTANT: The user has invoked the "/clean /work" skill bundle, follow each.]\nUser instruction: 정리해 줘'
+             '\n\n[Loaded as part of the bundle]\n본문', '/clean /work 정리해 줘'),
+            # The person's own brackets, Slack links and mentions stay as typed.
+            ('[긴급] 오늘 배송 확인', '[긴급] 오늘 배송 확인'),
+            ('<https://example.slack.com/archives/D0EXAMPLE/p1> 이거 봐 주세요', '<https://example.slack.com/archives/D0EXAMPLE/p1> 이거 봐 주세요'),
+            ('[예시 사용자] 이름표만 있는 글', '[예시 사용자] 이름표만 있는 글'),
+        ]
+        for stored, shown in cases:
+            self.assertEqual(typed(stored), (shown, True), stored[:40])
+        # A notice the gateway wrote itself is not the person's.
+        self.assertIsNone(typed('[IMPORTANT: Background process 1a2b matched "done".]'))
+        self.assertIsNone(typed(self.THREAD))
+        # A turn longer than the read: the words are at its end, after the last block.
+        head = self.THREAD[:60] + '가' * 100
+        self.assertEqual(typed(head, '나' * 50 + '\n[End of thread context]\n\n\n\n[New message]\n' + self.SENDER + '끝의 말'),
+                         ('끝의 말', True))
+        self.assertEqual(typed(self.SKILL, '본문 끝\nThe user has provided the following instruction alongside the '
+                                          'skill invocation: 긴 스킬 지시'), ('/work 긴 스킬 지시', True))
+        # The person's own long text keeps its start, said to be cut (its label still off).
+        self.assertEqual(typed(self.SENDER + '다' * 30, '라' * 30), ('다' * 30, False))
+        self.assertEqual(typed('마' * 30, '바' * 30), ('마' * 30, False))
+
+    def test_conversation_hides_the_gateway_framing_and_its_notices(self):
+        session = '20990101_000000_abc123'
+        self.hermes_ledger(['hermes:' + session])
+        long_turn = self.THREAD[:-len('[End of thread context]\n\n')] + ('예시 동료: ' + '가' * 200 + '\n') * 100 + \
+            '[End of thread context]\n\n\n\n[New message]\n' + self.SENDER + '긴 맥락 뒤의 말'
+        self.assertGreater(len(long_turn), bots.BODY_LIMIT)
+        self.hermes_store(self.home / 'bot/hermes/state.db', {session: [
+            ('user', self.THREAD + '\n\n[New message]\n' + self.SENDER + '이어서 해 주세요', None, 1700000001),
+            ('assistant', '네, 진행할게요.', None, 1700000002),
+            ('user', '[IMPORTANT: Background process 1a2b matched "done".]', None, 1700000003),
+            ('user', long_turn, None, 1700000004),
+            ('user', self.SENDER + '토큰 xoxb-example-secret-value 확인', None, 1700000005)]})
+        api = self.configure()
+        [segment] = api.conversation(self.source['id'], api.snapshot()['requests'][0]['id'])['segments']
+        shown = [(m['role'], m['text']) for m in segment['messages']]
+        self.assertEqual(shown, [('user', '이어서 해 주세요'), ('assistant', '네, 진행할게요.'),
+                                 ('user', '긴 맥락 뒤의 말'), ('user', '토큰 [가림] 확인')])
+        for message in segment['messages']:
+            self.assertNotIn('truncated', message, message['text'])
+        body = json.dumps(segment, ensure_ascii=False)
+        for framing in ('Slack user', 'Thread context', 'New message', '앞선 답변', 'IMPORTANT', 'U0EXAMPLE1'):
+            self.assertNotIn(framing, body)
+
     def test_conversation_is_bounded_to_the_newest_rows_and_cut_bodies_say_so(self):
         session = '20990101_000000_abc123'
         self.hermes_ledger(['hermes:' + session])

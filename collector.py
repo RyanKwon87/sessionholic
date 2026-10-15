@@ -124,6 +124,30 @@ def bot_request_text(text):
     return body if body.strip() else text
 
 
+# Blocks a harness writes into a Codex user turn, never the person's words: Codex's own AGENTS.md
+# and environment notes (a bot that starts Codex may pass them as the turn's input too).
+CODEX_HARNESS = (("# AGENTS.md instructions for ", "</INSTRUCTIONS>"),
+                 ("<environment_context>", "</environment_context>"),
+                 ("<user_instructions>", "</user_instructions>"))
+
+
+def codex_user_text(text):
+    """A Codex user text without the harness blocks it starts with; None when it is only those."""
+    rest, cut = text, False
+    while True:
+        head = rest.lstrip()
+        block = next((pair for pair in CODEX_HARNESS if head.startswith(pair[0])), None)
+        if block is None:
+            break
+        end = head.find(block[1])
+        if end < 0:
+            return None  # an unclosed block runs to the end
+        rest, cut = head[end + len(block[1]):], True
+    if not cut:
+        return text
+    return rest.strip() or None
+
+
 def text_row(role, text, ts):
     """A clipped message row; only cut rows carry `truncated` and the original `fullLength`."""
     text = re.sub(r'[\ud800-\udfff]', '\ufffd', str(text or ""))
@@ -1069,16 +1093,18 @@ def codex_turn_rows(turn):
     final = {index for index in answers if items[index].get("phase") == "final_answer"}
     if not final and answers and (completed is not None or turn.get("status") in ("completed", "interrupted", "failed")):
         final = {answers[-1]}
-    first_user = next((index for index, item in enumerate(items) if item.get("type") == "userMessage"), None)
+    # The turn's first user row shown (a harness block alone is not one) carries its start.
+    stamped = False
     out = []
     for index, item in enumerate(items):
         kind = item.get("type")
         rows = []
         if kind == "userMessage":
-            ts = started if index == first_user else None
+            ts = None if stamped else started
             content = item.get("content") if isinstance(item.get("content"), list) else []
-            text = "\n".join(str(c.get("text") or "") for c in content
-                             if isinstance(c, dict) and c.get("type") == "text").strip()
+            texts = (codex_user_text(str(c.get("text") or "")) for c in content
+                     if isinstance(c, dict) and c.get("type") == "text")
+            text = "\n".join(value for value in texts if value is not None).strip()
             attached = native_attachments(content)
             if text or attached:
                 fallback = "[이미지 첨부]" if all(a["kind"] == "image" for a in attached) else "[파일 첨부]"
@@ -1086,6 +1112,7 @@ def codex_turn_rows(turn):
                 if attached:
                     row["attachments"] = attached
                 rows.append(row)
+                stamped = True
         elif kind == "agentMessage" and str(item.get("text") or "").strip():
             rows.append(text_row("assistant", item["text"], completed if index in final else None))
         elif kind in CODEX_TOOL_KINDS:
@@ -1824,8 +1851,11 @@ def saved_rollout_rows(entry):
     role = payload.get('role')
     if role not in ('user', 'assistant'):
         return []
-    text = '\n'.join(block.get('text', '') for block in payload.get('content') or []
-                     if isinstance(block, dict) and block.get('type') in ('input_text', 'output_text') and isinstance(block.get('text'), str))
+    texts = (block.get('text', '') for block in payload.get('content') or []
+             if isinstance(block, dict) and block.get('type') in ('input_text', 'output_text') and isinstance(block.get('text'), str))
+    if role == 'user':
+        texts = (codex_user_text(value) for value in texts)
+    text = '\n'.join(value for value in texts if value is not None)
     if role == 'user': text = text.strip()
     return [text_row(role, text, to_epoch(entry.get('timestamp')))] if text else []
 

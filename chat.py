@@ -224,6 +224,78 @@ def terminal_model_settings(screen):
     return {**({'model': model[1].lower()} if model else {}), **({'effort': effort[1].lower()} if effort else {})}
 
 
+# A turn in progress: Claude ("✻ … (12s · esc to interrupt)") and Codex ("Working (5s • esc to
+# interrupt)") both say so on screen until it ends; a background Claude session's view shows its
+# time and tokens without the key ("(12s · ↓ 3.4k tokens)").
+TURN_RUNNING = re.compile(r'esc to (?:interrupt|cancel)|\(\d+[smh](?:\s*\d+[smh])*\s*[·•][^)\n]*\btokens\b', re.I)
+SGR = re.compile(r'\x1b\[([0-9;]*)m')
+
+
+def _typed_after_prompt(line):
+    """Whether a prompt line (with its SGR codes) shows typed text after its prompt mark. An empty
+    prompt's placeholder is drawn dim (Codex) or grey (Claude), and Claude's cursor cell in
+    reverse video; typed text is drawn in the plain colour."""
+    dim = grey = reverse = False
+    seen_mark = False
+    position = 0
+    for match in list(SGR.finditer(line)) + [None]:
+        text = line[position:match.start() if match else len(line)]
+        for char in text:
+            if not seen_mark:
+                seen_mark = char in '❯›>'
+                continue
+            if not char.isspace() and not (dim or grey or reverse):
+                return True
+        if match is None:
+            break
+        position = match.end()
+        codes = [int(code) if code.isdigit() else 0 for code in match[1].split(';')] if match[1] else [0]
+        index = 0
+        while index < len(codes):
+            code = codes[index]
+            if code == 0:
+                dim = grey = reverse = False
+            elif code == 2:
+                dim = True
+            elif code == 22:
+                dim = False
+            elif code == 7:
+                reverse = True
+            elif code == 27:
+                reverse = False
+            elif code == 90:
+                grey = True
+            elif code in (38, 48) and index + 1 < len(codes):
+                shade = None
+                if codes[index + 1] == 2 and index + 4 < len(codes):
+                    r, g, b = codes[index + 2:index + 5]
+                    shade = r if r == g == b else None
+                    index += 4
+                elif codes[index + 1] == 5 and index + 2 < len(codes):
+                    n = codes[index + 2]
+                    shade = 128 if n == 8 or 240 <= n <= 250 else None
+                    index += 2
+                if code == 38:
+                    grey = shade is not None and 90 <= shade <= 180
+            elif 30 <= code <= 37 or code in (39,) or 91 <= code <= 97:
+                grey = False
+            index += 1
+    return False
+
+
+def screen_at_rest(styled):
+    """A TUI waiting at an empty prompt, from its screen with SGR codes (capture-pane -e): no
+    turn running, no menu or question, a prompt line near the bottom, and nothing typed after
+    it. Anything else (a working turn, an approval, a draft, a screen not understood) is not."""
+    styled = str(styled or '').replace('\r', '')
+    plain = SGR.sub('', styled)
+    rows = [(drawn, SGR.sub('', drawn)) for drawn in styled.split('\n') if SGR.sub('', drawn).strip()][-INPUT_TAIL:]
+    if not rows or any(TURN_RUNNING.search(text) for _drawn, text in rows) or parse_menu(plain) is not None:
+        return False
+    prompt = next((drawn for drawn, text in reversed(rows) if INPUT_PROMPT.match(text)), None)
+    return prompt is not None and not _typed_after_prompt(prompt)
+
+
 def _indent(line):
     return len(line) - len(line.lstrip())
 

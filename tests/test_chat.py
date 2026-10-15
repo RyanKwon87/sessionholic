@@ -227,6 +227,32 @@ class MenuParserTest(unittest.TestCase):
         screen = '셋째\n\n둘째\n\n첫째\n❯ 1. 예\n  2. 아니요\n'
         self.assertEqual(chat.parse_menu(screen)['question'], '둘째\n\n첫째')
 
+    def test_a_screen_rests_only_at_an_empty_prompt_with_no_turn_running(self):
+        # As tmux capture-pane -e draws them: Codex's placeholder dim, Claude's grey after its
+        # reverse-video cursor cell.
+        codex = ('• 수정했습니다.\n\n\x1b[0m› \x1b[2mImplement {feature}\x1b[0m\n\n'
+                 '  \x1b[2m100% context left\x1b[0m\n')
+        claude = ('● 끝났습니다.\n\n────────────\n❯ \x1b[7mT\x1b[27m\x1b[38;2;153;153;153mry "fix lint errors"\x1b[39m\n'
+                  '────────────\n  Opus 5.5 · xhigh\n')
+        self.assertTrue(chat.screen_at_rest(codex))
+        self.assertTrue(chat.screen_at_rest(claude))
+        self.assertTrue(chat.screen_at_rest(codex.replace('\x1b[2m', '\x1b[90m')), 'bright black is grey too')
+        self.assertTrue(chat.screen_at_rest(codex.replace('\x1b[2m', '\x1b[38;5;244m')))
+        self.assertTrue(chat.screen_at_rest('\x1b[0m› \x1b[0m\n'), 'an empty prompt without a placeholder')
+        # Typed and left there: never closed (the draft would be lost).
+        self.assertFalse(chat.screen_at_rest(codex.replace('\x1b[2mImplement {feature}', '빌드 고쳐줘')))
+        self.assertFalse(chat.screen_at_rest(claude.replace('\x1b[7mT\x1b[27m\x1b[38;2;153;153;153mry "fix lint errors"\x1b[39m',
+                                                             '빌드 고쳐줘\x1b[7m \x1b[27m')))
+        self.assertFalse(chat.screen_at_rest(codex.replace('\x1b[2m', '\x1b[38;2;230;230;230m')), 'bright text is typed')
+        # A turn running, a question or approval, no prompt, nothing on screen.
+        self.assertFalse(chat.screen_at_rest('• Working (12s • esc to interrupt)\n\n' + codex))
+        self.assertFalse(chat.screen_at_rest('✻ Thinking… (3s · esc to interrupt)\n' + claude))
+        self.assertFalse(chat.screen_at_rest('✢ Running… (1m 12s · ↓ 3.4k tokens)\n' + claude), 'a background view')
+        self.assertTrue(chat.screen_at_rest('● 토큰 수(tokens)를 셌습니다.\n' + claude), 'a word in the transcript')
+        self.assertFalse(chat.screen_at_rest(CLAUDE_PERMISSION))
+        self.assertFalse(chat.screen_at_rest('Windows PowerShell\nPS C:\\Users\\example> \n'))
+        self.assertFalse(chat.screen_at_rest(''))
+
 
 class ChatTest(unittest.TestCase):
     def setUp(self):

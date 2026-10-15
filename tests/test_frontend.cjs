@@ -12751,7 +12751,8 @@ test('내 질문 줄은 눌러 4줄까지 펼치고 다시 눌러 접으며, 다
   assert.doesNotMatch(pin.className, /\bis-expanded\b/, 'another question folds it');
   assert.equal(summary.attributes['aria-expanded'], 'false');
   const css = styleSheet();
-  assert.match(css, /\.question-pin\.is-expanded \.question-pin-text \{[^}]*-webkit-line-clamp: 4;[^}]*white-space: normal;/);
+  assert.match(css, /\.question-pin\.is-expanded \.question-pin-text \{[^}]*flex-basis: 100%;[^}]*-webkit-line-clamp: 4;[^}]*white-space: normal;/);
+  assert.match(css, /\.question-pin\.is-expanded \.question-pin-summary \{\s*flex-wrap: wrap;/, 'unfolded, it takes the whole width below its label');
   assert.match(css, /\.question-pin-text \{[^}]*white-space: nowrap;[^}]*text-overflow: ellipsis;/);
 });
 
@@ -12830,6 +12831,8 @@ test('내 질문 시트는 최신순으로 시각과 요약을 보이고, 더 �
   // 완료 at the top right closes it and gives the focus back to the count.
   assert.match(indexPage(), /<dialog id="questions-dialog" class="plan-dialog sheet questions-dialog" aria-labelledby="questions-title">/);
   assert.match(indexPage(), /<button id="questions-close" class="sheet-done" type="button">완료<\/button>\s*<\/div>\s*<h2 id="questions-title">내 질문<\/h2>/);
+  // The eyebrow is the session's title on one line: a long unspaced title never widens the sheet.
+  assert.match(styleSheet(), /#questions-eyebrow \{[^}]*min-width: 0;[^}]*white-space: nowrap;[^}]*text-overflow: ellipsis;/);
   const focus = count.focusCount || 0;
   c.get('questions-close').events.click();
   assert.equal(dialog.open, false);

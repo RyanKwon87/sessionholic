@@ -4592,10 +4592,10 @@ li[data-task] {
   display: flex;
   flex: 1 1 auto;
   align-items: baseline;
-  gap: 6px;
+  gap: 0 6px;
   min-width: 0;
   min-height: 30px;
-  padding: 6px 0;
+  padding: 5px 0;
   border: 0;
   border-radius: 0;
   background: transparent;
@@ -4623,7 +4623,13 @@ li[data-task] {
   white-space: nowrap;
   text-overflow: ellipsis;
 }
+/* Unfolded, the question takes the line's whole width below its label and time. */
+.question-pin.is-expanded .question-pin-summary {
+  flex-wrap: wrap;
+}
 .question-pin.is-expanded .question-pin-text {
+  flex-basis: 100%;
+  margin-top: 2px;
   display: -webkit-box;
   -webkit-box-orient: vertical;
   -webkit-line-clamp: 4;
@@ -4651,7 +4657,15 @@ li[data-task] {
     display: none;
   }
 }
-/* The sheet of 내 질문: newest first, a time and two lines each. */
+/* The sheet of 내 질문: newest first, a time and two lines each. Its eyebrow is the
+   session's title, cut to one line (a long unspaced title must not widen the sheet). */
+#questions-eyebrow {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
 .questions-status {
   margin: 0 0 10px;
   color: var(--label-2);

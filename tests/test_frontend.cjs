@@ -4934,6 +4934,40 @@ test('an input error (a file too large) stays until the user acts again; a state
   assert.doesNotMatch(status(), /확인하지 못했습니다/);
 });
 
+test('a composer update, a keystroke and a chat read find the selected session a few times, not once per check', async () => {
+  // allSessions() rebuilds every row of every device; it ran 15 times per composer update,
+  // 16 per keystroke and 38 per read (11 ms and 40 ms on a board with 600 to 1000 sessions).
+  const c = client(async (url, opts) => ({ ok: true, status: 200, json: async () => url === '/api/chat/state'
+    ? { route: JSON.parse(opts.body).source, capability: { supported: true, attachments: true }, phase: 'working', receipts: [],
+      messages: [{ role: 'assistant', text: '진행 중입니다.' }], modelSettings: { model: 'sample-model', effort: 'high' } }
+    : { ok: true } }), noChatTimers);
+  const { s, entry } = selectChat(c);
+  const others = Array.from({ length: 30 }, (_, i) => ({ host: 'workstation', agent: 'codex', home: '.codex-example', id: `other-${i}` }));
+  c.state.snapshot.hosts[0].data.codex.push(...others);
+  wireTree(c, c.buildChatComposer(s)); await settle();
+  await c.loadChatState(s, false);
+  vm.runInContext('var __rows = 0; var __allSessionsOriginal = allSessions; allSessions = function () { __rows++; return __allSessionsOriginal(); };', c.context);
+  const rows = () => { const n = vm.runInContext('__rows', c.context); vm.runInContext('__rows = 0', c.context); return n; };
+  c.updateChatComposer(entry);
+  assert.ok(rows() <= 2, 'one composer update');
+  const input = c.get('chat-input'); input.value = '확인'; input.events.input({ isComposing: false });
+  assert.equal(entry.text, '확인');
+  assert.ok(rows() <= 2, 'one keystroke');
+  const read = await c.loadChatState(s, false);
+  assert.equal(read.status, 'success');
+  assert.ok(rows() <= 4, 'one chat read that changes nothing');
+  // Passing the selected session down keeps every check on the conversation on screen.
+  assert.equal(c.get('chat-send').disabled, false);
+  assert.equal(c.get('chat-attach').disabled, false);
+  assert.equal(c.chatSupported(entry), true);
+  // A one-shot run is still told by its own row (chatKey), without a scan of every session.
+  c.state.snapshot.hosts[0].data.codex[0].executionMode = 'one-shot';
+  c.updateChatComposer(entry);
+  assert.equal(c.chatSupported(entry), false);
+  assert.equal(c.get('chat-input').disabled, true);
+  assert.equal(c.get('chat-terminal').hidden, true);
+});
+
 test('the machines chip says how many answer and the sheet shows each one\'s CPU, memory, disk, battery and uptime', async () => {
   const c = client(undefined, noChatTimers);
   const box = c.get('hardware');

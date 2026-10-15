@@ -1000,8 +1000,9 @@ function allSessions() {
 // The open conversation's own read says what its session does now; the list
 // may say so only a minute later (a host without a resident collector). Its
 // card, header and counts follow the read until the list's phase changes.
-function noteLivePhase(s, data) {
-  const listed = allSessions().find((value) => value.key === s?.key);
+function noteLivePhase(s, data, selected = null) {
+  // The selected session's row, when the caller just found it, is this one.
+  const listed = selected && selected.key === s?.key ? selected : allSessions().find((value) => value.key === s?.key);
   if (!listed || listed.runtimeKnown === false || listed.listedPhase === undefined && listed.nativeSource || !BADGES[data?.phase] ||
       chatKey(data.route || {}) !== chatKey(sourceOf(listed))) return;
   if (data.phase === listed.listedPhase) state.livePhases.delete(listed.key);
@@ -1014,7 +1015,9 @@ function noteLivePhase(s, data) {
     state.detailRevision = detailRevision(shown);
     patchDetailMetadata(shown);
     render();
+    return true;
   }
+  return false;
 }
 function sourceOf(s) {
   const source = {
@@ -3336,9 +3339,9 @@ function drawDetail(s) {
 // second, explicit tap, and the server rechecks the exact menu first.
 const AGENT_NAMES = { claude: "Claude", codex: "Codex" };
 const PROMPT_INLINE_OPTIONS = 4;
-function renderPrompt(s, data) {
+function renderPrompt(s, data, selected = selectedSession() || null) {
   const card = $("chat-prompt");
-  if (!card || !currentChat(chatEntry(s))) return;
+  if (!card || !currentChat(chatEntry(s), selected)) return;
   const entry = chatEntry(s);
   const prompt = data?.prompt && Array.isArray(data.prompt.options) && data.prompt.options.length ? data.prompt : null;
   const openable = !prompt && data?.promptOpenable === true && data?.phase === "needs_input";
@@ -3889,8 +3892,9 @@ function chatEntry(s) {
   }
   return state.chats.get(key);
 }
-function currentChat(entry) {
-  const selected = selectedSession();
+// `selected` lets a caller that already found the selected session pass it down:
+// allSessions() rebuilds every row, so one composer update finds it once.
+function currentChat(entry, selected = selectedSession() || null) {
   return !!selected && chatEntry(selected) === entry && state.authenticated;
 }
 function networkOffline() {
@@ -4041,16 +4045,17 @@ function persistAllDrafts() {
 function chatVisible() {
   return !document.hidden && !boardCovered() && (!phoneLayout() || state.detailShown);
 }
-function chatHostOffline(entry) {
-  const session = selectedSession();
+function chatHostOffline(entry, session = selectedSession() || null) {
   return state.snapshot?.hosts?.find((host) => host.name === entry.source.host)?.ok === false ||
     capsHost(entry.source.host)?.online === false ||
     (session && chatKey(sourceOf(session)) === chatKey(entry.source) && session.online === false);
 }
-function chatOneShot(entry) {
+// Asked only about the conversation on screen (every caller checks currentChat first):
+// its own row says so, found by its chatKey, not by a scan of every session.
+function chatOneShot(entry, session = selectedSession() || null) {
   if (chatKey(entry.data?.route || {}) === chatKey(entry.source) && sessionOneShot(entry.data)) return true;
-  return allSessions().some((session) => chatKey(sourceOf(session)) === chatKey(entry.source) &&
-    (sessionOneShot(session) || entry.conversation?.identity === conversationIdentity(session) && sessionOneShot(entry.conversation)));
+  return !!session && chatKey(sourceOf(session)) === chatKey(entry.source) &&
+    (sessionOneShot(session) || entry.conversation?.identity === conversationIdentity(session) && sessionOneShot(entry.conversation));
 }
 function conversationHistoryNotice(s, entry) {
   const data = entry?.data && chatKey(entry.data.route || {}) === chatKey(sourceOf(s)) ? entry.data : null;
@@ -4061,26 +4066,26 @@ function conversationHistoryNotice(s, entry) {
   if (notice?.code === "not_persisted") return typeof notice.message === "string" && notice.message.trim() ? notice.message : ONE_SHOT_HISTORY;
   return "";
 }
-function chatRecovery(entry) {
+function chatRecovery(entry, selected = selectedSession() || null) {
   if (botRequestForNative(entry.source)) return null;
-  if (chatHostOffline(entry)) return { supported: true, action: "refresh_host",
-    reason: chatOneShot(entry) ? "기기에 연결되지 않았습니다. 연결을 확인한 뒤 실행 상태를 확인해 주세요." : "기기에 연결되지 않았습니다. 연결을 확인한 뒤 같은 세션을 이어갈 수 있습니다." };
-  if (chatOneShot(entry)) return null;
+  if (chatHostOffline(entry, selected)) return { supported: true, action: "refresh_host",
+    reason: chatOneShot(entry, selected) ? "기기에 연결되지 않았습니다. 연결을 확인한 뒤 실행 상태를 확인해 주세요." : "기기에 연결되지 않았습니다. 연결을 확인한 뒤 같은 세션을 이어갈 수 있습니다." };
+  if (chatOneShot(entry, selected)) return null;
   if (chatKey(entry.data?.route || {}) !== chatKey(entry.source)) return null;
   const recovery = entry.data?.recovery;
   if (recovery?.supported !== true || recovery.closedByBoard === true) return null;
   return ["resume_session", "refresh_host"].includes(recovery.action) ? recovery : null;
 }
-function chatSupported(entry) {
-  return !botRequestForNative(entry.source) && !chatOneShot(entry) && !chatHostOffline(entry) && entry.data?.capability?.supported === true &&
+function chatSupported(entry, selected = selectedSession() || null) {
+  return !botRequestForNative(entry.source) && !chatOneShot(entry, selected) && !chatHostOffline(entry, selected) && entry.data?.capability?.supported === true &&
     chatKey(entry.data.route || {}) === chatKey(entry.source);
 }
 // The server's capability says sending needs a board terminal the user opens.
-function terminalRequired(entry) {
-  return !chatOneShot(entry) && entry.data?.capability?.action === "open_terminal" && chatKey(entry.data.route || {}) === chatKey(entry.source);
+function terminalRequired(entry, selected = selectedSession() || null) {
+  return !chatOneShot(entry, selected) && entry.data?.capability?.action === "open_terminal" && chatKey(entry.data.route || {}) === chatKey(entry.source);
 }
-function chatAttachmentsSupported(entry) {
-  return !botRequestForNative(entry.source) && !chatOneShot(entry) && !!entry.data && chatKey(entry.data.route || {}) === chatKey(entry.source) &&
+function chatAttachmentsSupported(entry, selected = selectedSession() || null) {
+  return !botRequestForNative(entry.source) && !chatOneShot(entry, selected) && !!entry.data && chatKey(entry.data.route || {}) === chatKey(entry.source) &&
     entry.data.phase !== "unavailable" && entry.data.capability?.attachments !== false;
 }
 // ---------- 음성 입력 ----------
@@ -4878,8 +4883,9 @@ function slashKeydown(entry, event, input) {
   } else chooseSlash(entry, entry.slashIndex || 0, input);
   return true;
 }
-function updateModelControls(entry) {
-  if (!currentChat(entry)) return;
+function updateModelControls(entry, session = selectedSession() || null) {
+  if (!currentChat(entry, session)) return;
+  const supported = chatSupported(entry, session);
   const settings = entry.data?.modelSettings || {};
   const next = entry.source.agent === "codex" ? settings.next || {} : {};
   const selected = { model: next.model || settings.model, effort: next.effort || settings.effort };
@@ -4915,7 +4921,7 @@ function updateModelControls(entry) {
       const explanation = pending ? `다음 메시지에 사용 · ${observedLabel}: ${actual || "미확인"}` : settings.observed === "last_response" ? `마지막 응답에서 확인한 ${label}` : `${label} 선택`;
       control.title = `${label}: ${control.textContent} · ${explanation}`;
       control.setAttribute("aria-label", `${label}: ${control.textContent} · 선택하기`);
-      control.disabled = !chatSupported(entry) || entry.sending || !!entry.pending || !!entry.commandBusy || networkOffline();
+      control.disabled = !supported || entry.sending || !!entry.pending || !!entry.commandBusy || networkOffline();
     }
   };
   // Another model name can wrap the header's text: only then is the reader's place kept.
@@ -5335,8 +5341,8 @@ function buildChatComposer(s) {
   });
   return box;
 }
-function resizeChatInput(entry) {
-  if (!currentChat(entry) || $("chat-composer")?.dataset.source !== chatKey(entry.source)) return;
+function resizeChatInput(entry, selected = selectedSession() || null) {
+  if (!currentChat(entry, selected) || $("chat-composer")?.dataset.source !== chatKey(entry.source)) return;
   const input = $("chat-input");
   const style = window.getComputedStyle?.(input);
   const line = parseFloat(style?.lineHeight) || 22;
@@ -5552,12 +5558,12 @@ function receiptNotice(entry) {
   if (["completed", "interrupted"].includes(status) && phase === "working") return "";
   return chatReceiptCopy(entry.receipt);
 }
-function updateChatComposer(entry) {
+function updateChatComposer(entry, selected = selectedSession() || null) {
   persistChatDraft(entry);
-  if (!currentChat(entry) || $("chat-composer")?.dataset.source !== chatKey(entry.source)) return;
-  updateModelControls(entry);
-  const supported = chatSupported(entry);
-  const oneShot = chatOneShot(entry);
+  if (!currentChat(entry, selected) || $("chat-composer")?.dataset.source !== chatKey(entry.source)) return;
+  updateModelControls(entry, selected);
+  const supported = chatSupported(entry, selected);
+  const oneShot = chatOneShot(entry, selected);
   $("chat-composer").classList.toggle?.("is-busy", entry.data?.phase === "working" || entry.sending || !!entry.uploads);
   $("chat-composer").classList.toggle?.("is-error", !!entry.error || entry.receipt?.status === "failed");
   $("chat-composer").classList.toggle?.("is-unknown", !!entry.pending && !entry.sending);
@@ -5566,8 +5572,8 @@ function updateChatComposer(entry) {
   const blocked = offline || !supported || entry.sending || !!entry.pending || !!entry.uploads || !!entry.commandBusy;
   // No board terminal yet (Claude background): the draft can be written now and
   // sent once the user opened the terminal from the gate.
-  const recovery = chatRecovery(entry);
-  const gateOn = !supported && !recovery && terminalRequired(entry);
+  const recovery = chatRecovery(entry, selected);
+  const gateOn = !supported && !recovery && terminalRequired(entry, selected);
   $("chat-recovery").hidden = !recovery;
   $("chat-recovery-text").textContent = recovery?.reason || (recovery?.action === "resume_session" ? "대화 기록과 초안을 유지하고 같은 세션을 다시 엽니다." : "");
   $("chat-recover").textContent = entry.recovering ? "연결 확인 중…" : recovery?.action === "refresh_host" ? "기기 연결 다시 확인" : "세션 다시 열기";
@@ -5584,7 +5590,7 @@ function updateChatComposer(entry) {
   input.disabled = !supported && !gateOn && recovery?.action !== "resume_session";
   input.readOnly = !input.disabled && (entry.sending || !!entry.pending || !!entry.commandBusy);
   input.setAttribute("aria-disabled", String(input.disabled || input.readOnly));
-  $("chat-attach").disabled = offline || !chatAttachmentsSupported(entry) || entry.sending || !!entry.pending || !!entry.uploads;
+  $("chat-attach").disabled = offline || !chatAttachmentsSupported(entry, selected) || entry.sending || !!entry.pending || !!entry.uploads;
   $("chat-clipboard").disabled = $("chat-attach").disabled;
   // A word still composing does not lock it: the send commits it first (buildChatComposer).
   $("chat-send").disabled = blocked || (!entry.text.trim() && !entry.attachments.length);
@@ -5603,7 +5609,7 @@ function updateChatComposer(entry) {
   if (continuation) continuation.hidden = oneShot;
   const native = terminalInfo(state.terminal).nativeSource;
   $("chat-native-open").hidden = !native || chatKey(native) === chatKey(entry.source) || !state.terminalAlive;
-  const openTerminalRow = terminalForSession(selectedSession());
+  const openTerminalRow = terminalForSession(selected);
   $("chat-terminal-close").hidden = !openTerminalRow;
   if (openTerminalRow) $("chat-terminal-close").textContent = terminalCloseCopy(openTerminalRow).action;
   const phase = entry.data?.phase;
@@ -5616,10 +5622,10 @@ function updateChatComposer(entry) {
     ? "첨부는 이 작업 폴더에 저장됐습니다. 첨부의 ‘경로’를 복사해 터미널에 붙여넣으세요."
     : entry.data?.capability?.reason || "직접 입력을 지원하지 않습니다. 터미널을 사용해 주세요.";
   const dictating = state.dictation?.field === input;
-  const statusCopy = offline ? "오프라인입니다. 초안은 유지됩니다. 연결 후 상태를 확인하고 보내 주세요." : (dictating && entry.dictationNotice) || entry.error || (oneShot ? ONE_SHOT_NO_INPUT : entry.dictationNotice || entry.notice || (entry.uploads ? `첨부 ${entry.uploads}개를 올리고 있습니다…` : !entry.data ? (claudeWithoutId(selectedSession()) ? CLAUDE_NO_SEND : "메시지 전송 환경을 확인하고 있습니다…") : !supported ? unsupportedCopy : receiptNotice(entry) || phaseCopy));
+  const statusCopy = offline ? "오프라인입니다. 초안은 유지됩니다. 연결 후 상태를 확인하고 보내 주세요." : (dictating && entry.dictationNotice) || entry.error || (oneShot ? ONE_SHOT_NO_INPUT : entry.dictationNotice || entry.notice || (entry.uploads ? `첨부 ${entry.uploads}개를 올리고 있습니다…` : !entry.data ? (claudeWithoutId(selected) ? CLAUDE_NO_SEND : "메시지 전송 환경을 확인하고 있습니다…") : !supported ? unsupportedCopy : receiptNotice(entry) || phaseCopy));
   // The paused-check note adds only what the line does not say yet ("상태 다시 확인" twice was).
   $("chat-status").textContent = statusCopy + (budgetNote && !statusCopy.includes("상태 다시 확인") ? budgetNote : budgetNote ? " 자동 상태 확인을 잠시 멈췄습니다." : "");
-  $("chat-status").setAttribute("data-attention", String(!!(offline || chatHostOffline(entry) || entry.error || entry.receipt?.status === "unknown")));
+  $("chat-status").setAttribute("data-attention", String(!!(offline || chatHostOffline(entry, selected) || entry.error || entry.receipt?.status === "unknown")));
   const deliveryVisible = updateChatDeliveryEvidence(entry);
   const chips = $("chat-attachments");
   // While a bubble resends its own message, another draft's files stay as they are.
@@ -5633,7 +5639,7 @@ function updateChatComposer(entry) {
   attachmentsLabel.textContent = selectedCaption;
   chips.setAttribute("aria-label", selectedCaption);
   renderAttachmentTiles(entry, chips);
-  resizeChatInput(entry);
+  resizeChatInput(entry, selected);
 }
 // Attachment tiles: a row that scrolls sideways. Images show a local preview
 // (an object URL of the picked file, memory only, revoked once the tile is
@@ -5770,12 +5776,12 @@ function chatPollDelay(count) {
   // Fast while a reply is likely, then slower; long turns keep being followed.
   return count < 10 ? 3000 : count < 30 ? 5000 : count < 90 ? 10000 : 20000;
 }
-function scheduleChatPoll(s, entry) {
-  if (!currentChat(entry)) return;
+function scheduleChatPoll(s, entry, selected = selectedSession() || null) {
+  if (!currentChat(entry, selected)) return;
   clearTimeout(state.chatPollTimer);
   // A bubble still waiting for its message keeps the conversation followed, so it
   // goes when the message (or an answer after it) shows, or when it times out.
-  if (networkOffline() || !currentChat(entry) || !chatVisible() || state.chatPollCount >= CHAT_POLL_MAX ||
+  if (networkOffline() || !chatVisible() || state.chatPollCount >= CHAT_POLL_MAX ||
       (!entry.pending && !(entry.error && entry.error !== entry.inputError) && !entry.data?.prompt &&
        !["working", "needs_input"].includes(entry.data?.phase) &&
        !(entry.outbox || []).some(outboxAwaitsAgent))) return;
@@ -5786,7 +5792,7 @@ function scheduleChatPoll(s, entry) {
     loadChatState(s, false);
   }, chatPollDelay(state.chatPollCount));
 }
-function applyChatReceipt(entry, receipt) {
+function applyChatReceipt(entry, receipt, selected) {
   if (!receipt || (entry.pending && receipt.requestId !== entry.pending.requestId)) return;
   const fallback = entry.pending?.attachmentDetails ||
     (entry.receipt?.requestId === receipt.requestId ? entry.receipt.attachments : []);
@@ -5799,9 +5805,9 @@ function applyChatReceipt(entry, receipt) {
       draftIsPending(entry)) {
     entry.text = "";
     entry.attachments = [];
-    if (currentChat(entry)) {
+    if (currentChat(entry, selected)) {
       $("chat-input").value = "";
-      resizeChatInput(entry);
+      resizeChatInput(entry, selected);
     }
   }
   entry.pending = null;
@@ -5810,7 +5816,9 @@ function applyChatReceipt(entry, receipt) {
 const CHAT_RECHECK_RETRY_MS = 3000;
 async function loadChatState(s, manual = false, { join = false } = {}) {
   const entry = chatEntry(s);
-  if (!currentChat(entry) || !chatVisible() || networkOffline()) return;
+  // Found once before the read and once after it (the selection may change meanwhile).
+  let selected = selectedSession() || null;
+  if (!currentChat(entry, selected) || !chatVisible() || networkOffline()) return;
   // Without an id the session has no chat state; its transcript (if named) is read directly.
   if (claudeWithoutId(s)) return { status: "skipped" };
   const identity = conversationIdentity(s);
@@ -5837,7 +5845,7 @@ async function loadChatState(s, manual = false, { join = false } = {}) {
   // large, too many files, too long a message) stays until the user acts again.
   const clearError = () => { if (entry.error !== entry.inputError) entry.error = ""; };
   if (manual) { state.chatPollCount = 0; clearError(); }
-  updateChatComposer(entry);
+  updateChatComposer(entry, selected);
   try {
     const lastRequestId = entry.pending?.requestId ||
       (entry.receipt?.dispatchState === "not_started" || ["completed", "interrupted", "failed"].includes(entry.receipt?.status) ? null : entry.receipt?.requestId);
@@ -5846,45 +5854,48 @@ async function loadChatState(s, manual = false, { join = false } = {}) {
       source: entry.source, ...(lastRequestId ? { requestId: lastRequestId } : {}),
       ...(requestIds.length ? { requestIds } : {}),
     } });
+    selected = selectedSession() || null;
     if (!state.authenticated || state.chats.get(chatKey(entry.source)) !== entry) return;
-    if (epoch !== entry.stateEpoch || currentChat(entry) && conversationIdentity(selectedSession()) !== identity) return;
+    if (epoch !== entry.stateEpoch || currentChat(entry, selected) && conversationIdentity(selected) !== identity) return;
     entry.data = data;
     outcome = { status: "success", data };
     clearError();
     for (const receipt of data.receipts || []) {
       if (receipt.requestId === entry.pending?.requestId ||
           (entry.receipt?.dispatchState !== "not_started" && receipt.requestId === entry.receipt?.requestId))
-        applyChatReceipt(entry, receipt);
+        applyChatReceipt(entry, receipt, selected);
     }
-    renderPrompt(s, data);
+    renderPrompt(s, data, selected);
     if (chatReadSupported(entry, data)) {
       rememberConversation(s, data.messages, data);
-      if (currentChat(entry)) {
+      if (currentChat(entry, selected)) {
         renderMessages(s, data.messages);
         conversationSyncNotice(s, data.stale ? "stale" : "");
       }
     }
-    noteLivePhase(s, data);
-    scheduleChatPoll(s, entry);
+    // A phase the read changed redraws the board: the selected row is found again after it.
+    if (noteLivePhase(s, data, selected)) selected = selectedSession() || null;
+    scheduleChatPoll(s, entry, selected);
   } catch (err) {
+    selected = selectedSession() || null;
     readFailed = true;
     outcome = { status: "failed", error: err };
     if (!err.unauthorized && !err.staleAuth && epoch === entry.stateEpoch &&
-        currentChat(entry) && conversationIdentity(selectedSession()) === identity)
+        currentChat(entry, selected) && conversationIdentity(selected) === identity)
       conversationSyncNotice(s, "failed");
     if (!err.unauthorized && !err.staleAuth && epoch === entry.stateEpoch) {
       // A connection problem that just started shows the bars (its notice is in them).
-      if (!entry.error && currentChat(entry)) revealChrome();
+      if (!entry.error && currentChat(entry, selected)) revealChrome();
       entry.error = `${err.message} 상태 다시 확인을 눌러 주세요.`;
     }
     // A transient failure keeps following the session with the same backoff (also when the
     // polling stopped meanwhile: scheduleChatPoll follows only the conversation on screen).
-    if (currentChat(entry) && !err.unauthorized && !err.staleAuth) scheduleChatPoll(s, entry);
+    if (currentChat(entry, selected) && !err.unauthorized && !err.staleAuth) scheduleChatPoll(s, entry, selected);
   } finally {
     entry.checking = false;
     complete(outcome);
     entry.stateReadPromise = null;
-    updateChatComposer(entry);
+    updateChatComposer(entry, selected);
     const recheck = entry.recheckQueued || epoch !== entry.stateEpoch;
     entry.recheckQueued = false;
     // A read asked for while this one ran (a return to the screen, a live update) still

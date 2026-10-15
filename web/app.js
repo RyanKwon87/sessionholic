@@ -9778,10 +9778,18 @@ function terminalTidyPlan(terminals = state.terminals) {
     const row = { terminal, session, key, idle, runs, checked: false, locked: false, reason: "" };
     if (state.terminal?.id === terminal.id) Object.assign(row, { locked: true, reason: "지금 이 화면에서 연 터미널" });
     else if (unread) row.reason = "기기 목록을 읽지 못해 확인 전";
-    else if (!session) {
-      // Just opened, it may not be in the list yet (a session) or be in use (a shell).
-      const fresh = idle !== null && idle < (refs.length ? 120 : TERMINAL_TIDY_IDLE);
-      Object.assign(row, { checked: !fresh, reason: refs.length ? "보드 목록에 없는 세션" : "연결된 세션 없음" });
+    else if (!session && refs.length) {
+      // A session the list leaves out (archived, not read yet) may still be at work in a run;
+      // a view of it is proposed once it had time to be listed.
+      if (runs) row.reason = "목록에 없는 세션을 실행 중 · 닫으면 실행이 끊길 수 있습니다";
+      else Object.assign(row, { checked: idle === null || idle >= 120, reason: "보드 목록에 없는 세션" });
+    } else if (!session) {
+      // No session known: a shell (ssh, the launcher menu) or an agent list is proposed once
+      // unused a while; an agent CLI not linked yet, or one not read, may be at work.
+      const shell = info.program === "ssh" || info.program === "claude-agents" || (!info.program && info.programMenu === true);
+      if (!shell) row.reason = info.program ? "세션을 아직 확인하지 못한 실행 · 닫으면 실행이 끊길 수 있습니다" : "실행 중인 프로그램을 확인하지 못함";
+      else Object.assign(row, { checked: idle === null || idle >= TERMINAL_TIDY_IDLE,
+        reason: info.program === "claude-agents" ? "에이전트 목록 화면 · 목록의 세션은 계속 실행" : "연결된 세션 없음" });
     } else if (["done", "closed"].includes(session.phase)) Object.assign(row, { checked: true, reason: "끝난 세션" });
     else if (["working", "needs_input"].includes(session.phase))
       Object.assign(row, runs ? { locked: true, reason: "작업 중 · 닫으면 실행이 끊깁니다" } : { reason: "작업 중인 세션의 연결" });

@@ -970,7 +970,13 @@ test('터미널 정리 proposes the terminals left over and never the ones in us
   const away = { id: '3'.repeat(32), alive: true, closed: false, host: 'laptop', mode: 'new-session', program: 'codex', idleSeconds: 900,
     nativeSource: { host: 'laptop', agent: 'codex', home: '.codex', id: 'away-1' } };
   c.state.snapshot.hosts.push({ name: 'laptop', label: 'Laptop', ok: false, data: null });
-  c.state.terminals.push(handoff, away);
+  // A run of a session the list leaves out, an agent CLI not linked yet, the launcher menu.
+  const unlistedRun = { id: '4'.repeat(32), alive: true, closed: false, host: 'workstation', mode: 'resume', idleSeconds: 9000,
+    nativeSource: { host: 'workstation', agent: 'codex', home: '.codex', id: 'archived-1' } };
+  const unlinked = { id: '5'.repeat(32), alive: true, closed: false, host: 'workstation', mode: 'new-session', program: 'codex', idleSeconds: 9000 };
+  const unread = { id: '6'.repeat(32), alive: true, closed: false, host: 'workstation', mode: 'new-session', idleSeconds: 9000 };
+  const menu = { id: '7'.repeat(32), alive: true, closed: false, host: 'workstation', mode: 'new-session', programMenu: true, idleSeconds: 900 };
+  c.state.terminals.push(handoff, away, unlistedRun, unlinked, unread, menu);
   const plan = vm.runInContext('terminalTidyPlan', c.context)();
   const of = (terminal) => plan.find((row) => row.terminal.id === terminal.id);
   const expect = (terminal, checked, locked, reason) => {
@@ -985,9 +991,13 @@ test('터미널 정리 proposes the terminals left over and never the ones in us
   expect(terminals.ended, true, false, /끝난 세션/);
   expect(terminals.gone, true, false, /보드 목록에 없는 세션/);
   expect(open, false, true, /지금 이 화면에서 연 터미널/);
-  expect(handoff, true, false, /보드 목록에 없는 세션/);
+  expect(handoff, false, false, /목록에 없는 세션을 실행 중/);
   assert.equal(of(handoff).session, null, 'a handoff is not the session it was opened from');
   expect(away, false, false, /기기 목록을 읽지 못해 확인 전/);
+  expect(unlistedRun, false, false, /목록에 없는 세션을 실행 중 · 닫으면 실행이 끊길 수 있습니다/);
+  expect(unlinked, false, false, /세션을 아직 확인하지 못한 실행/);
+  expect(unread, false, false, /실행 중인 프로그램을 확인하지 못함/);
+  expect(menu, true, false, /연결된 세션 없음/);
   assert.equal(of(terminals.extra).session.id, 'working-1', 'each terminal shows the session it belongs to');
   assert.equal(vm.runInContext('terminalIdleLabel', c.context)(3600), '1시간째 사용 안 함');
 });

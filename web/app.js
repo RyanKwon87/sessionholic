@@ -4142,10 +4142,21 @@ function renderDictationOverlay() {
   if (!session) return;
   const stop = $("dictation-overlay-stop");
   if (stop && !stop.dataset.bound) {
-    // 끝내기: as the mic pressed again (the last words land, then it parks or ends).
+    // 보내지 않고 끝내기: as the mic pressed again (the last words land, then it parks or ends).
     stop.dataset.bound = "1";
     stop.addEventListener("click", () => {
       if (state.dictation) stopDictation({ field: state.dictation.field });
+    });
+  }
+  const send = $("dictation-overlay-send");
+  if (send && !send.dataset.bound) {
+    // 보내기: the same end, then the field's own send once the listening is done.
+    send.dataset.bound = "1";
+    send.addEventListener("click", () => {
+      const listening = state.dictation;
+      if (!listening) return;
+      listening.sendWhenDone = dictationSendButton(listening.field);
+      stopDictation({ field: listening.field });
     });
   }
   setClass(overlay, "is-listening", !!session.started && !session.stopping);
@@ -4312,11 +4323,27 @@ function parkDictation(session, settle) {
   dictationTrace(session, "park");
   session.report(DICTATION_PARKED);
   renderDictation();
+  dictationSendIfAsked(session);
   sendDictationTrace(session, DICTATION_PARKED);
   clearTimeout(session.parkTimer);
   session.parkTimer = setTimeout(() => {
     if (state.dictationParked === session) dropParkedDictation("expired");
   }, DICTATION_PARK_MS);
+}
+// The send button of the field a listening writes into (the chat's 보내기, the terminal
+// line's 보내기): pressed as the user would, so every rule of that send (nothing to send, a
+// send under way, a word still composing, a locked field) still holds.
+function dictationSendButton(field) {
+  return field === $("chat-input") ? $("chat-send") : field === $("terminal-draft") ? $("draft-paste") : null;
+}
+// The mic screen's 보내기 was pressed: now that the listening is done (parked or ended, its
+// last words in the field), its field's send runs once.
+function dictationSendIfAsked(session) {
+  const send = session.sendWhenDone;
+  if (!send) return;
+  session.sendWhenDone = null;
+  dictationTrace(session, "send");
+  setTimeout(() => send.click?.(), 0);
 }
 // The parked engine ends (its time is up, the page is hidden, another kind of start).
 function dropParkedDictation(reason) {
@@ -4586,6 +4613,7 @@ function finishDictation(session) {
   const outcome = dictationOutcome(session);
   session.report(outcome);
   renderDictation();
+  dictationSendIfAsked(session);
   sendDictationTrace(session, outcome);
 }
 // stop: the last words still arrive (onend finishes); pressed again while it ends, or not
@@ -4631,6 +4659,7 @@ function stopDictation({ abort = false, field = null, message = "", park = false
   }
   session.report(message);
   renderDictation();
+  dictationSendIfAsked(session);
   sendDictationTrace(session, message);
 }
 // The text changed by the user (typed, or an input method's word): their words win. An

@@ -9421,6 +9421,52 @@ test('a listening shows the mic screen with the words it heard, large, and its �
   assert.equal(ipad.c.get('dictation-overlay-status').textContent, '듣는 중');
 });
 
+test('the mic screen 보내기 lets the last words land, then presses the field own send once', async () => {
+  const { c, FakeRecognition, recognitions, result, settle, timeouts } = dictationClient();
+  c.context.webkitSpeechRecognition = FakeRecognition;
+  const { s } = selectChat(c); const composer = c.buildChatComposer(s);
+  const input = findId(composer, 'chat-input'); const mic = findId(composer, 'chat-mic');
+  let sent = 0;
+  findId(composer, 'chat-send').click = () => { sent++; };
+  const runZero = () => { for (const timer of timeouts.filter((item) => item.ms === 0 && !item.ran)) { timer.ran = true; timer.callback(); } };
+  mic.events.click();
+  const rec = recognitions.at(-1);
+  rec.onstart(); rec.onresult(result('보낼 말'));
+  c.get('dictation-overlay-send').events.click();
+  assert.equal(c.get('dictation-overlay-status').textContent, c.DICTATION_ENDING, 'it lets the last words land first');
+  runZero();
+  assert.equal(sent, 0, 'not before the listening is done');
+  await settle();
+  assert.equal(c.state.dictation, null);
+  runZero();
+  assert.equal(sent, 1);
+  assert.equal(input.value, '보낼 말');
+  assert.ok(c.state.dictation === null && recognitions.length === 1);
+  // 보내지 않고 끝내기 never sends.
+  mic.events.click();
+  recognitions.at(-1).onstart();
+  c.get('dictation-overlay-stop').events.click();
+  await settle(); runZero();
+  assert.equal(sent, 1);
+  // On an iPad it sends once the engine parked (after its last words), and the terminal line uses its own send.
+  const ipad = ipadDictation();
+  let pressed = 0;
+  ipad.c.state.terminal = { id: 'term-1' }; ipad.c.state.terminalVisible = true;
+  const draft = ipad.c.get('terminal-draft'); ipad.c.bindDraftInput(draft); draft.value = '';
+  ipad.c.get('draft-paste').click = () => { pressed++; };
+  ipad.c.toggleDraftDictation();
+  const rec2 = ipad.recognitions.at(-1);
+  ipad.c.state.dictation.beganAt -= 400; rec2.onstart(); rec2.onaudiostart(); rec2.onresult(ipad.result('상태 보여 줘'));
+  ipad.c.get('dictation-overlay-send').events.click();
+  for (const timer of ipad.timeouts.filter((item) => item.ms === 0)) timer.callback();
+  assert.equal(pressed, 0, 'not while its last words may still land');
+  ipad.timeouts.filter((timer) => timer.ms === 800).at(-1).callback();
+  assert.ok(ipad.c.state.dictationParked);
+  for (const timer of ipad.timeouts.filter((item) => item.ms === 0)) timer.callback();
+  assert.equal(pressed, 1);
+  assert.equal(draft.value, '상태 보여 줘');
+});
+
 test('a browser without speech recognition shows no mic', () => {
   const { c } = dictationClient();
   const { s } = selectChat(c);

@@ -7285,15 +7285,24 @@ body.terminal-docked .detail-head > .chat-model-controls { grid-column: 1 / -1; 
 .dictation-text .dictation-before + .dictation-heard,
 .dictation-text .dictation-before + .dictation-placeholder { margin-left: 0.3em; }
 .dictation-text .dictation-placeholder { color: var(--label-3); }
-.dictation-stop {
-  min-width: 200px;
-  min-height: 56px;
-  padding: 0 28px;
+.dictation-send {
+  min-width: 220px;
+  min-height: 60px;
+  padding: 0 32px;
   border: 0;
-  border-radius: 28px;
-  background: var(--recording);
-  color: var(--on-recording);
-  font-size: var(--fs-head);
+  border-radius: 30px;
+  background: var(--accent);
+  color: var(--on-accent);
+  font-size: var(--fs-title);
   font-weight: 700;
 }
+.dictation-stop {
+  min-height: 44px;
+  padding: 0 16px;
+  border: 0;
+  background: transparent;
+  color: var(--label-2);
+  font-size: var(--fs-body);
+}
+.dictation-send:focus-visible,
 .dictation-stop:focus-visible { outline: 3px solid var(--accent); outline-offset: 3px; }

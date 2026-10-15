@@ -10927,13 +10927,21 @@ function renderAppShift() {
 }
 // The keyboard's room as this device reports it (sizes and offsets, never content), sent to
 // the board like the mic's trace when an on-screen keyboard opens: at once, once it settled
-// and a second later. A few per page.
-const KEYBOARD_TRACES = 12;
+// and a second later. A few per page, each saying something new: every opening in the same
+// field with the same room gave the same rows and filled half the mic's trace file.
+const KEYBOARD_TRACES = 4;
+// Sizes within this many px of a trace already sent are the same room.
+const KEYBOARD_TRACE_SLACK = 4;
+function keyboardTraceSeen(shape, values) {
+  return (state.keyboardTraceShapes || []).some((seen) => seen.shape === shape && seen.values.length === values.length &&
+    seen.values.every((value, index) => value === values[index] ||
+      value != null && values[index] != null && Math.abs(value - values[index]) <= KEYBOARD_TRACE_SLACK));
+}
 function traceKeyboardRoom() {
   const open = touchDevice() && editingText() && keyboardOpen();
   if (open === !!state.keyboardTraced) return;
   state.keyboardTraced = open;
-  if (!open || (state.keyboardTraces = (state.keyboardTraces || 0) + 1) > KEYBOARD_TRACES) return;
+  if (!open || (state.keyboardTraces || 0) >= KEYBOARD_TRACES) return;
   const t0 = Date.now();
   const events = [];
   const env = { kind: "viewport", field: String(document.activeElement?.id || ""), touch: true,
@@ -10953,6 +10961,11 @@ function traceKeyboardRoom() {
   setTimeout(() => snap("settled"), 400);
   setTimeout(() => snap("later"), 1500);
   setTimeout(() => {
+    const shape = JSON.stringify([env.field, env.standalone, env.phone, env.width, env.docked]);
+    const values = events.flatMap(({ t, e, ...sizes }) => [e, ...Object.values(sizes)]);
+    if ((state.keyboardTraces || 0) >= KEYBOARD_TRACES || keyboardTraceSeen(shape, values)) return;
+    state.keyboardTraces = (state.keyboardTraces || 0) + 1;
+    (state.keyboardTraceShapes ||= []).push({ shape, values });
     api("/api/diagnostics/dictation", { method: "POST", body: { env, outcome: "viewport", events } }).catch(() => {});
   }, 1700);
 }

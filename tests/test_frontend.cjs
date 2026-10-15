@@ -10832,6 +10832,51 @@ test('with an on-screen keyboard up, the app follows what iOS scrolled on screen
   assert.equal(classes.has('app-shifted'), false);
 });
 
+test('the keyboard room is traced only when it says something new, and a few times per page', async () => {
+  const timers = [];
+  const posts = [];
+  const c = client(async (url, opts) => {
+    if (String(url).includes('/api/diagnostics/dictation')) posts.push(JSON.parse(opts.body));
+    return { ok: true, status: 200, json: async () => ({ ok: true }) };
+  }, { setTimeout: (callback, ms) => { timers.push({ callback, ms }); return timers.length; }, clearTimeout() {} });
+  c.context.document.body.classList = { add() {}, remove() {}, contains: () => false };
+  c.context.document.documentElement.style = { setProperty() {} };
+  c.context.window.matchMedia = (query) => ({ matches: query === '(pointer: coarse)' });
+  c.context.window.innerWidth = 1180;
+  c.context.window.innerHeight = 820;
+  const field = (id, top) => ({ tagName: 'TEXTAREA', id, getBoundingClientRect: () => ({ top, bottom: top + 32 }) });
+  // The keyboard opens over a field (its trace's three rows, then the send) and closes again.
+  const typeIn = async (node, height) => {
+    c.context.document.activeElement = node;
+    c.context.window.visualViewport = { height, scale: 1, offsetTop: 0, pageTop: 0 };
+    c.updateViewport();
+    const queued = timers.splice(0);
+    for (const timer of queued.filter((t) => [400, 1500].includes(t.ms))) timer.callback();
+    queued.find((t) => t.ms === 1700)?.callback();
+    await new Promise((resolve) => setImmediate(resolve));
+    c.context.document.activeElement = null;
+    c.context.window.visualViewport = { height: 820, scale: 1, offsetTop: 0, pageTop: 0 };
+    c.updateViewport();
+    timers.splice(0);
+  };
+  const chat = field('chat-input', 380);
+  await typeIn(chat, 420);
+  assert.equal(posts.length, 1);
+  assert.deepEqual(posts[0].events.map((event) => event.e), ['open', 'settled', 'later']);
+  // The same room again (or a px off) says nothing new.
+  await typeIn(chat, 420);
+  await typeIn(chat, 422);
+  assert.equal(posts.length, 1, 'the same room is traced once');
+  // Another room (a taller keyboard) or another field is.
+  await typeIn(chat, 360);
+  await typeIn(field('terminal-draft', 300), 420);
+  assert.equal(posts.length, 3);
+  assert.deepEqual(posts.map((post) => [post.env.field, post.events[0].vh]), [['chat-input', 420], ['chat-input', 360], ['terminal-draft', 420]]);
+  // A few per page, however many rooms.
+  for (const height of [300, 320, 340, 380, 400]) await typeIn(chat, height);
+  assert.equal(posts.length, 4);
+});
+
 test('a menu whose taps iPadOS kept for its own selection still works once the opening finger is long gone', () => {
   const c = client(undefined, noChatTimers);
   let cleared = 0;

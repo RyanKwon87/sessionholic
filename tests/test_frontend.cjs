@@ -5491,6 +5491,15 @@ test('a tapped text field on a touch screen shows its border and caret, not the 
   assert.match(css, /\.draft-panel textarea:focus \{\s*border-color: var\(--t-blue\);/);
 });
 
+test('beside the list a conversation shows no back chevron; where the list stepped aside it keeps one', () => {
+  const css = styleSheet();
+  const block = /@media \(min-width: 701px\) \{\s*body:not\(\.dock-solo\):not\(\.goal-has-conversation\) \.detail-head > \.back \{\s*display: none;\s*\}\s*body:not\(\.dock-solo\):not\(\.goal-has-conversation\) \.detail-head > \.detail-titles \{\s*grid-column: 1 \/ 3;\s*\}\s*\}/;
+  assert.match(css, block);
+  // Later rules must not show it again on wide screens.
+  const after = css.slice(css.search(block));
+  assert.doesNotMatch(after.replace(block, ''), /\.detail-head > \.back \{[^}]*display: (?:inline-)?flex/);
+});
+
 test('bottom sheets follow the finger, dismiss on a long or fast pull, step between heights and spring back when dismissal is refused', () => {
   const c = client(undefined, noChatTimers);
   const release = (fields) => c.sheetRelease({ height: 600, detent: 'medium', ...fields });

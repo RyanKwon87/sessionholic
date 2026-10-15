@@ -937,12 +937,46 @@ def loaded_threads(server):
     return set(loaded.get("data") or []) if isinstance(loaded, dict) else set()
 
 
+# Which account each Codex home is signed in to, as its daemon says (account/read): path ->
+# (when read, login). Read again after this long; a resident watch keeps it between lists.
+CODEX_LOGIN_SECONDS = 600
+CODEX_LOGINS = {}
+CODEX_PLANS = re.compile(r"[a-z0-9_]{1,40}\Z")
+
+
+def codex_login(server, path):
+    """The home's signed-in account: {"kind": "chatgpt", "email", "plan"}, {"kind": "apiKey"} or
+    another kind, None when signed out; kept CODEX_LOGIN_SECONDS. A daemon that cannot say
+    (an older Codex) leaves it unknown, and the list is read as before."""
+    now = time.monotonic()
+    kept = CODEX_LOGINS.get(path)
+    if kept and now - kept[0] < CODEX_LOGIN_SECONDS:
+        return kept[1]
+    try:
+        reply = server.call("account/read", {"refreshToken": False})
+    except Exception:  # Asked after the list was read: never what fails it.
+        return kept[1] if kept else None
+    account = reply.get("account") if isinstance(reply, dict) else None
+    login = None
+    if isinstance(account, dict) and isinstance(account.get("type"), str) and len(account["type"]) <= 40:
+        login = {"kind": account["type"]}
+        email, plan = account.get("email"), account.get("planType")
+        if isinstance(email, str) and 0 < len(email) <= 254 and "@" in email:
+            login["email"] = email
+        if isinstance(plan, str) and CODEX_PLANS.fullmatch(plan):
+            login["plan"] = plan
+    CODEX_LOGINS[path] = (now, login)
+    return login
+
+
 def codex_home_threads(path, full=False):
-    """One home's thread list over its own daemon connection: (listed, loaded, failure)."""
+    """One home's thread list over its own daemon connection: (listed, loaded, failure).
+    Its signed-in account is noted on the way (codex_login)."""
     try:
         with AppServer(path / SOCKET_REL) as server:
             listed, _ = list_threads(server, quick=not full)
             loaded = loaded_threads(server)
+            codex_login(server, path)
     except OSError as error:
         if error.errno in (errno.ENOENT, errno.ECONNREFUSED) and daemon_socket_state(path / SOCKET_REL) == "closed":
             return None, None, "stale"
@@ -1049,6 +1083,9 @@ def codex_threads(errors, projects, full=False):
         if fallback:
             reply = codex_db_threads(path)
         rows, failures = codex_home_rows(key, project_id, account, reply, projects, offline=fallback)
+        login = (CODEX_LOGINS.get(path) or (0, None))[1]
+        for row in rows if login else []:
+            row["login"] = dict(login)
         out.extend(rows)
         errors.extend(failures)
     for (key, path), (project_id, account) in zip(offline, codex_labels(offline)):

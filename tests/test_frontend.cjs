@@ -2006,6 +2006,28 @@ test('native destination account display uses the exact profile label and never 
   assert.equal(c.accountDisplay(null, '.codex-lab-sample'), '현재 계정 설정');
 });
 
+test('a Codex session names the account its home is signed in to, before the setting name', () => {
+  const c = client(undefined, noChatTimers);
+  const profile = { id: 'codex:.codex', label: '기본 Codex' };
+  c.state.capabilities = { hosts: [{ name: 'homeserver', label: 'Home server', agents: [{ id: 'codex', accounts: [profile] }] }] };
+  const row = (login, agent = 'codex') => ({ agent, id: 'login-row', home: '.codex', title: '세션', phase: 'idle', updatedAt: 1,
+    cwd: '/tmp', ...(login ? { login } : {}) });
+  c.state.snapshot = { hosts: [{ name: 'homeserver', label: 'Home server', ok: true, data: {
+    codex: [row({ kind: 'chatgpt', email: 'someone@example.com', plan: 'pro' })], claude: [] } }] };
+  const [shown] = c.allSessions();
+  assert.equal(shown.account, 'someone@example.com · Pro');
+  const meta = c.detailMetaChildren(shown).map((node) => node.textContent).join(' | ');
+  assert.match(meta, /Codex · someone@example\.com · Pro · Home server/);
+  assert.equal(c.sessionAccountLabel({ ...row({ kind: 'chatgpt', email: 'someone@example.com', plan: 'unknown' }), host: 'homeserver' }),
+    'someone@example.com', 'a plan it cannot name is left out');
+  assert.equal(c.sessionAccountLabel({ ...row({ kind: 'apiKey' }), host: 'homeserver' }), 'API 키');
+  // Not known (a PC, an older Codex, signed out): the setting's name as before.
+  assert.equal(c.sessionAccountLabel({ ...row(null), host: 'homeserver' }), '기본 Codex');
+  assert.equal(c.sessionAccountLabel({ ...row({ kind: 'chatgpt' }), host: 'homeserver' }), '기본 Codex');
+  assert.equal(c.sessionAccountLabel({ ...row({ kind: 'chatgpt', email: 'someone@example.com' }, 'claude'), host: 'homeserver' }),
+    '현재 계정 설정', 'only Codex homes say so');
+});
+
 test('unsupported direct chat attachments explain persistent storage and path-copy terminal fallback', () => {
   const c = client(undefined, noChatTimers);
   const { entry } = selectChat(c, { agent: 'claude', home: '.claude' });

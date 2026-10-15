@@ -52,6 +52,7 @@
 - Codex 연결은 확인된 로컬 daemon 세션과 정확한 세션 식별자를 사용합니다. vendor의 cloud Remote 세션, 불명확한 ID, 또는 필요한 daemon 연결이 없는 세션을 임의로 재개하지 않습니다.
 - Claude background 세션은 exact attach를 지원합니다. 기존 interactive 세션의 직접 attach는 지원하지 않으며 native 터미널을 사용해야 합니다.
 - 계정 전환과 새 세션 생성은 대상 호스트에 이미 준비되어 있는 계정을 사용합니다. 로그인 자격증명이나 provider 설정을 다른 호스트로 복사하지 않습니다.
+- Mac 기기의 Codex 세션은 그 계정 홈이 실제로 로그인한 계정(메일과 요금제, API 키면 "API 키")을 세션 상단·카드·계정 필터에 보여 줍니다. 수집기가 목록을 읽는 같은 app-server 연결에서 `account/read`로 묻고(토큰 갱신 없음) 10분 동안 보관하며, 인증 파일은 읽지 않습니다. 이를 지원하지 않는 Codex, 로그아웃 상태, Windows 기기의 세션은 기존처럼 설정의 표시 이름을 보여 줍니다.
 - 버전 2의 `profiles[].launchEnabled` 또는 `profileRules[].launchEnabled`를 `false`로 두면 프로필과 기록은 남기고 보드의 새 CLI 실행·앱 서버 시작을 거부합니다. 라우터 계정 정책의 중단 계정도 실행하지 않습니다. `hide`는 수집도 숨기고 `excludeSuspended`는 중단 계정 수집을 제외하는 별도 설정입니다. 임의 `launcher.command` 내부의 계정 선택·실행 정책은 그 실행 명령이 담당합니다.
 - 보드의 새 세션 터미널과 나중에 나타난 native 대화를 시각으로 짝짓는 연결은 `estimated`이며 정확한 매핑이 아닙니다. 같은 기기에서 거의 동시에 시작된 다른 대화를 가리킬 수 있습니다. 이를 native 대화의 직접 시작 증거나 목표 자동 연결 근거로 사용하지 않습니다. 외부 실행 기록의 launch ID와 보드 요청을 정확하게 연결하는 계약은 아직 지원하지 않습니다.
 

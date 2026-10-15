@@ -664,24 +664,90 @@ class StateDbListingTest(unittest.TestCase):
 
     def home_threads(self, full=False, **options):
         calls = []
-        with patch.object(collector, "AppServer", lambda path: self.Server(calls, **options)):
+        with patch.object(collector, "AppServer", lambda path: self.Server(calls, **options)), \
+                patch.dict(collector.CODEX_LOGINS, clear=True):
             reply = collector.codex_home_threads(Path("/synthetic/.codex"), full)
         return reply, [(method, params.get("useStateDbOnly")) for method, params in calls]
 
     def test_state_db_listing_and_one_retry_without_the_argument(self):
         reply, calls = self.home_threads()
         self.assertEqual(reply[2], None)
-        self.assertEqual(calls, [("thread/list", True), ("thread/loaded/list", None)])
+        self.assertEqual(calls, [("thread/list", True), ("thread/loaded/list", None), ("account/read", None)])
         reply, calls = self.home_threads(reject=True)
         self.assertEqual([row["id"] for row in reply[0]["data"]], ["t1"])
-        self.assertEqual(calls, [("thread/list", True), ("thread/list", None), ("thread/loaded/list", None)])
+        self.assertEqual(calls, [("thread/list", True), ("thread/list", None), ("thread/loaded/list", None),
+                                 ("account/read", None)])
 
     def test_connection_failures_and_full_listing_are_not_retried(self):
         reply, calls = self.home_threads(broken=True)
         self.assertEqual(reply, (None, None, "connect"))
         self.assertEqual(calls, [("thread/list", True)])
         reply, calls = self.home_threads(full=True)
-        self.assertEqual(calls, [("thread/list", None), ("thread/loaded/list", None)])
+        self.assertEqual(calls, [("thread/list", None), ("thread/loaded/list", None), ("account/read", None)])
+
+
+class CodexLoginTest(unittest.TestCase):
+    """Which account a Codex home is signed in to, as its daemon says (account/read)."""
+
+    class Server:
+        def __init__(self, account=None, error=None):
+            self.account, self.error, self.calls = account, error, 0
+        def call(self, method, params):
+            self.calls += 1
+            assert (method, params) == ("account/read", {"refreshToken": False})
+            if self.error:
+                raise self.error
+            return {"account": self.account, "requiresOpenaiAuth": True}
+
+    def setUp(self):
+        patcher = patch.dict(collector.CODEX_LOGINS, clear=True)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_the_signed_in_account_is_read_and_kept_a_while(self):
+        path = Path("/synthetic/.codex")
+        server = self.Server({"type": "chatgpt", "email": "someone@example.com", "planType": "pro"})
+        self.assertEqual(collector.codex_login(server, path), {"kind": "chatgpt", "email": "someone@example.com", "plan": "pro"})
+        self.assertEqual(collector.codex_login(server, path)["email"], "someone@example.com")
+        self.assertEqual(server.calls, 1, "kept, not asked again")
+        clock = time.monotonic() + collector.CODEX_LOGIN_SECONDS + 1
+        with patch.object(collector.time, "monotonic", lambda: clock):
+            collector.codex_login(server, path)
+        self.assertEqual(server.calls, 2)
+        for account, login in (({"type": "apiKey"}, {"kind": "apiKey"}), (None, None),
+                               ({"type": "chatgpt", "email": "no-at-sign", "planType": "../x"}, {"kind": "chatgpt"})):
+            collector.CODEX_LOGINS.clear()
+            self.assertEqual(collector.codex_login(self.Server(account), path), login, account)
+
+    def test_a_daemon_that_cannot_say_leaves_it_unknown_and_the_list_is_read(self):
+        path = Path("/synthetic/.codex")
+        older = self.Server(error=collector.RpcReplyError("unknown method", -32601))
+        self.assertIsNone(collector.codex_login(older, path))
+        collector.CODEX_LOGINS[path] = (time.monotonic() - collector.CODEX_LOGIN_SECONDS - 1,
+                                        {"kind": "chatgpt", "email": "someone@example.com"})
+        self.assertEqual(collector.codex_login(self.Server(error=OSError("gone")), path)["email"], "someone@example.com",
+                         "a failed ask keeps what was known")
+
+        class Listing(StateDbListingTest.Server):
+            def call(self, method, params):
+                if method == "account/read":
+                    raise TypeError("unexpected")
+                return super().call(method, params)
+        with patch.object(collector, "AppServer", lambda _path: Listing([])):
+            reply = collector.codex_home_threads(path)
+        self.assertIsNone(reply[2], "the list stands")
+
+    def test_each_row_of_a_home_carries_its_login(self):
+        homes = [(".codex", Path("/synthetic/.codex")), (".codex-other", Path("/synthetic/.codex-other"))]
+        listed = {"data": [{"id": "11111111-1111-4111-8111-111111111111", "status": {"type": "idle"}, "cwd": "/tmp"}]}
+        collector.CODEX_LOGINS[homes[0][1]] = (time.monotonic(), {"kind": "chatgpt", "email": "someone@example.com", "plan": "plus"})
+        with patch.object(collector, "codex_homes", return_value=homes), \
+                patch.object(collector, "codex_offline_homes", return_value=[]), \
+                patch.object(collector, "codex_labels", return_value=[(None, "first"), (None, "second")]), \
+                patch.object(collector, "codex_home_threads", return_value=(listed, set(), None)):
+            rows = collector.codex_threads([], [])
+        self.assertEqual(rows[0]["login"], {"kind": "chatgpt", "email": "someone@example.com", "plan": "plus"})
+        self.assertNotIn("login", rows[1], "a home not known says nothing")
 
     def test_reply_errors_keep_their_code_and_remain_rpc_errors(self):
         wire = (b'HTTP/1.1 101 Switching Protocols\r\n\r\n' + SocketBufferTest.frame(b'{"id":1,"result":{}}')

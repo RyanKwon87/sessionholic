@@ -4934,6 +4934,35 @@ test('an input error (a file too large) stays until the user acts again; a state
   assert.doesNotMatch(status(), /확인하지 못했습니다/);
 });
 
+test('a timed-out chat read with the checks paused says what to do once, in two phone lines', async () => {
+  const limits = [];
+  const c = client((path, options) => new Promise((resolve, reject) => {
+    options.signal.addEventListener('abort', () => reject(Object.assign(new Error('The operation was aborted.'), { name: 'AbortError' })));
+  }), noChatTimers);
+  c.context.AbortSignal = { timeout(ms) { const controller = new AbortController(); limits.push({ ms, controller }); return controller.signal; } };
+  const { s, entry } = selectChat(c);
+  wireTree(c, c.buildChatComposer(s));
+  c.state.chatPollCount = 240;
+  const read = c.loadChatState(s, false);
+  limits.at(-1).controller.abort();
+  assert.equal((await read).status, 'failed');
+  const status = c.get('chat-status').textContent;
+  // It was "…다시 시도해 주세요. 상태 다시 확인을 눌러 주세요. 자동 상태 확인을 잠시 멈췄습니다." (79 characters,
+  // three lines at the large text size on a phone with its keyboard up, scrolled inside a two-line box).
+  assert.equal(status, '응답이 늦어 기다리기를 멈췄습니다. 연결을 확인한 뒤 상태 다시 확인을 눌러 주세요. 자동 확인은 멈췄습니다.');
+  assert.equal(status.split('상태 다시 확인').length - 1, 1);
+  assert.equal(c.get('chat-status').attributes['data-attention'], 'true');
+  // Another failure keeps its own words and the same short note.
+  entry.error = '연결이 끊겼습니다. 상태 다시 확인을 눌러 주세요.';
+  c.updateChatComposer(entry);
+  assert.equal(c.get('chat-status').textContent, '연결이 끊겼습니다. 상태 다시 확인을 눌러 주세요. 자동 확인은 멈췄습니다.');
+  // A line without the button's name still names it.
+  entry.error = '';
+  entry.data = { ...entry.data, phase: 'working' };
+  c.updateChatComposer(entry);
+  assert.match(c.get('chat-status').textContent, /자동 상태 확인을 잠시 멈췄습니다\. 상태 다시 확인을 눌러 주세요\.$/);
+});
+
 test('a composer update, a keystroke and a chat read find the selected session a few times, not once per check', async () => {
   // allSessions() rebuilds every row of every device; it ran 15 times per composer update,
   // 16 per keystroke and 38 per read (11 ms and 40 ms on a board with 600 to 1000 sessions).

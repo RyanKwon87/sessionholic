@@ -5658,7 +5658,7 @@ function updateChatComposer(entry, selected = selectedSession() || null) {
   if (openTerminalRow) $("chat-terminal-close").textContent = terminalCloseCopy(openTerminalRow).action;
   const phase = entry.data?.phase;
   const phaseCopy = phase === "working" ? "작업 중 · 지금 보내도 CLI가 이어서 반영합니다." : phase === "needs_input" ? (entry.data?.prompt ? "답변·승인 필요 · 위 카드에서 답해 주세요." : "답변·승인 필요 · 터미널에서 처리해 주세요.") : entry.expanded ? "위의 실제 세션에 메시지를 전달합니다." : "";
-  const budgetNote = state.chatPollCount >= CHAT_POLL_MAX ? " 자동 상태 확인을 잠시 멈췄습니다. 상태 다시 확인을 눌러 주세요." : "";
+  const budgetNote = state.chatPollCount >= CHAT_POLL_MAX ? CHAT_CHECKS_PAUSED : "";
   // The gate itself says what to do; the status line only adds that a refused
   // message was not sent.
   const unsupportedCopy = oneShot ? ONE_SHOT_NO_INPUT : (gateOn || recovery) ? (entry.receipt?.dispatchState === "not_started"
@@ -5668,7 +5668,7 @@ function updateChatComposer(entry, selected = selectedSession() || null) {
   const dictating = state.dictation?.field === input;
   const statusCopy = offline ? "오프라인입니다. 초안은 유지됩니다. 연결 후 상태를 확인하고 보내 주세요." : (dictating && entry.dictationNotice) || entry.error || (oneShot ? ONE_SHOT_NO_INPUT : entry.dictationNotice || entry.notice || (entry.uploads ? `첨부 ${entry.uploads}개를 올리고 있습니다…` : !entry.data ? (claudeWithoutId(selected) ? CLAUDE_NO_SEND : "메시지 전송 환경을 확인하고 있습니다…") : !supported ? unsupportedCopy : receiptNotice(entry) || phaseCopy));
   // The paused-check note adds only what the line does not say yet ("상태 다시 확인" twice was).
-  $("chat-status").textContent = statusCopy + (budgetNote && !statusCopy.includes("상태 다시 확인") ? budgetNote : budgetNote ? " 자동 상태 확인을 잠시 멈췄습니다." : "");
+  $("chat-status").textContent = statusCopy + (budgetNote && !statusCopy.includes("상태 다시 확인") ? budgetNote : budgetNote ? CHAT_CHECKS_PAUSED_SHORT : "");
   $("chat-status").setAttribute("data-attention", String(!!(offline || chatHostOffline(entry, selected) || entry.error || entry.receipt?.status === "unknown")));
   const deliveryVisible = updateChatDeliveryEvidence(entry);
   const chips = $("chat-attachments");
@@ -5814,6 +5814,11 @@ function stopChatPolling() {
   state.chatPollCount = 0;
 }
 const CHAT_POLL_MAX = 240;
+// Phone status lines hold two lines with the keyboard up; a timed-out read with the checks
+// paused said "다시 시도" and "상태 다시 확인" both and took three at the large text size.
+const CHAT_CHECKS_PAUSED = " 자동 상태 확인을 잠시 멈췄습니다. 상태 다시 확인을 눌러 주세요.";
+const CHAT_CHECKS_PAUSED_SHORT = " 자동 확인은 멈췄습니다.";
+const CHAT_STATE_TIMEOUT = "응답이 늦어 기다리기를 멈췄습니다. 연결을 확인한 뒤 상태 다시 확인을 눌러 주세요.";
 function chatPollDelay(count) {
   // Live updates announce changes; polling is then only a safety net.
   if (eventsHealthy()) return EVENTS_SAFETY_MS.chat;
@@ -5930,7 +5935,7 @@ async function loadChatState(s, manual = false, { join = false } = {}) {
     if (!err.unauthorized && !err.staleAuth && epoch === entry.stateEpoch) {
       // A connection problem that just started shows the bars (its notice is in them).
       if (!entry.error && currentChat(entry, selected)) revealChrome();
-      entry.error = `${err.message} 상태 다시 확인을 눌러 주세요.`;
+      entry.error = err.timeout ? CHAT_STATE_TIMEOUT : `${err.message} 상태 다시 확인을 눌러 주세요.`;
     }
     // A transient failure keeps following the session with the same backoff (also when the
     // polling stopped meanwhile: scheduleChatPoll follows only the conversation on screen).

@@ -137,6 +137,8 @@ class ServerTest(unittest.TestCase):
         secret = "fixture-private-" + "detail"
         cookie, csrf = self.csrf_session()
         with patch("sys.stderr", new_callable=io.StringIO) as log:
+            # A new board version: the snapshot is made again rather than served as kept.
+            self.board.changed(force=True)
             with patch.object(self.board, "snapshot", side_effect=TypeError(secret)):
                 res, data = self.request("GET", "/api/snapshot", headers={"Cookie": cookie})
             self.assertEqual(res.status, 500)

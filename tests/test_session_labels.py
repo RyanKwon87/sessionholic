@@ -1,13 +1,16 @@
 """Synthetic persistence, exact identity and authenticated board-only title edits."""
 import copy
+import gzip
 import http.client
 import json
 import os
 from pathlib import Path
+import re
 import stat
 import sys
 import tempfile
 import threading
+import time
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
@@ -721,6 +724,207 @@ class HistoryHTTPTest(unittest.TestCase):
             self.assertEqual(response.status, 429)
         finally:
             self.httpd.history_gate.release(); self.httpd.history_gate.release()
+
+
+class SnapshotResponseTest(unittest.TestCase):
+    """/api/snapshot is kept while nothing in it changed, and every input of it changes it."""
+    setUp = SessionLabelsHTTPTest.setUp
+    tearDown = SessionLabelsHTTPTest.tearDown
+    request = SessionLabelsHTTPTest.request
+    STORES = ('session_labels', 'session_seen', 'session_tidied', 'session_removed', 'session_opened', 'session_pinned')
+    FIELDS = ('sessionLabels', 'sessionSeen', 'sessionTidied', 'sessionRemoved', 'sessionOpened', 'sessionPinned')
+
+    def counted(self):
+        """Patches counting deep copies and store file reads (both still done)."""
+        copies, reads = [], []
+        deepcopy, labels, seen = copy.deepcopy, SessionLabels._read, SessionSeen._read
+        patches = (patch('copy.deepcopy', side_effect=lambda *a, **k: copies.append(1) or deepcopy(*a, **k)),
+                   patch.object(SessionSeen, '_read', autospec=True, side_effect=lambda store: reads.append(1) or seen(store)),
+                   patch.object(SessionLabels, '_read', autospec=True, side_effect=lambda store: reads.append(1) or labels(store)))
+        return copies, reads, patches
+
+    def raw(self, gzip_ok=False):
+        client = http.client.HTTPConnection('127.0.0.1', self.httpd.server_address[1], timeout=5)
+        client.request('GET', '/api/snapshot', headers={'Cookie': self.cookie,
+                                                        'Accept-Encoding': 'gzip' if gzip_ok else 'identity'})
+        response = client.getresponse()
+        body = response.read()
+        client.close()
+        self.assertEqual(response.status, 200, body[:200])
+        if response.getheader('Content-Encoding') == 'gzip':
+            body = gzip.decompress(body)
+        return response, body
+
+    def snapshot(self):
+        return json.loads(self.raw()[1])
+
+    def warm(self):
+        # The first answer starts the read and tidy records (new files): the next one is kept.
+        self.snapshot()
+        return self.snapshot()
+
+    def fresh(self):
+        """What the board answered before answers were kept: every store's decorate on its
+        own copy, chained, then the bootId and preferences, serialized as send_json does."""
+        snapshot = self.board.snapshot()
+        for name in self.STORES:
+            snapshot = getattr(self.httpd, name).decorate(snapshot)
+        snapshot = {**snapshot, 'bootId': self.httpd.boot_id, 'quickReplyPreferences': self.httpd.preferences.snapshot()}
+        return json.dumps(snapshot, ensure_ascii=False).encode()
+
+    def test_an_unchanged_snapshot_is_answered_without_copying_or_reading_any_store(self):
+        self.httpd.session_labels.set(self.source, 'Alias')
+        first = self.warm()
+        copies, reads, patches = self.counted()
+        with patches[0], patches[1], patches[2]:
+            again = self.snapshot()
+        self.assertEqual((len(copies), len(reads)), (0, 0))
+        self.assertEqual({**again, 'serverTime': 0}, {**first, 'serverTime': 0})
+
+    def test_a_board_change_copies_the_list_once_and_reads_no_unchanged_store_again(self):
+        import session_labels
+        self.httpd.session_labels.set(self.source, 'Alias')
+        self.warm()
+        self.native['title'] = 'Changed native title'
+        self.board.changed()
+        copies, reads, patches = self.counted()
+        identities, identity = [], session_labels._identity
+        with patches[0], patches[1], patches[2], \
+             patch.object(session_labels, '_identity', side_effect=lambda source: identities.append(1) or identity(source)):
+            row = self.snapshot()['hosts'][0]['data']['codex'][0]
+        self.assertEqual((row['displayTitle'], row['originalTitle']), ('Alias', 'Changed native title'))
+        self.assertEqual(len(copies), 1, 'Board.snapshot copies the hosts; the stores decorate that copy')
+        self.assertEqual((len(reads), len(identities)), (0, 0), 'unchanged files and rows are not read or identified again')
+
+    def test_a_kept_answer_is_the_same_bytes_as_a_fresh_one(self):
+        self.httpd.session_labels.set(self.source, 'Board name')
+        self.httpd.session_seen.mark(self.source, 4000)
+        self.httpd.session_pinned.mark(self.source, 4100)
+        self.httpd.preferences.set_quick_replies(['계속 진행'], 0)
+        other = {**self.native, 'id': str(uuid.uuid4()), 'title': None, 'name': '이름 sk-proj-12345678901234567890'}
+        claude = {'id': '', 'kind': 'interactive', 'sessionId': str(uuid.uuid4()), 'title': 'Claude'}
+        broken = {'id': 'not a session id', 'title': 'Unidentifiable'}
+        self.board.state[self.host['name']]['data'].update(codex=[self.native, other, broken], claude=[claude])
+        self.board.changed()
+        self.snapshot()
+        # serverTime is the time of each answer; every other byte is compared as is.
+        head = re.compile(rb'^\{"serverTime": (\d+), ')
+
+        def split(body):
+            found = head.match(body)
+            self.assertIsNotNone(found, body[:40])
+            return int(found[1]), body[found.end():]
+        expected = self.fresh()
+        for gzip_ok in (False, True, False, True):
+            before = int(time.time())
+            response, body = self.raw(gzip_ok)
+            at, rest = split(body)
+            self.assertEqual(rest, split(expected)[1])
+            self.assertTrue(before <= at <= time.time())
+            self.assertEqual(response.getheader('Content-Encoding'), 'gzip' if gzip_ok else None)
+            self.assertEqual(response.getheader('Vary'), 'Accept-Encoding')
+            self.assertEqual(response.getheader('Cache-Control'), 'no-store')
+        decoded = json.loads(expected)
+        rows = decoded['hosts'][0]['data']
+        self.assertEqual(rows['codex'][0]['displayTitle'], 'Board name')
+        self.assertNotIn('sk-proj', rows['codex'][1]['originalTitle'])
+        self.assertNotIn('displayTitle', rows['codex'][2])
+        self.assertEqual(rows['claude'][0]['displayTitle'], 'Claude')
+
+    def test_every_input_of_a_kept_answer_changes_the_next_one(self):
+        from session_labels import BoardPreferences, SessionOpened, SessionPinned, SessionRemoved
+        directory = self.temp.name
+
+        def row():
+            return self.snapshot()['hosts'][0]['data']['codex'][0]
+
+        def native_title():
+            self.native['title'] = 'Renamed natively'
+            self.board.changed()
+
+        def boot():
+            self.httpd.boot_id = 'another-boot'
+
+        # Each store is written through its own instance, as another process would.
+        changes = (
+            ('board', native_title, lambda: row()['originalTitle'], 'Renamed natively'),
+            ('labels', lambda: SessionLabels(directory).set(self.source, 'Alias'), lambda: row()['displayTitle'], 'Alias'),
+            ('seen', lambda: SessionSeen(directory).mark(self.source, 4001), lambda: row()['seenAt'], 4001),
+            ('tidied', lambda: SessionTidied(directory).mark(self.source, 4002), lambda: row()['tidiedAt'], 4002),
+            ('removed', lambda: SessionRemoved(directory).mark(self.source, 4003), lambda: row()['removedAt'], 4003),
+            ('opened', lambda: SessionOpened(directory).mark(self.source, 4004), lambda: row()['openedAt'], 4004),
+            ('pinned', lambda: SessionPinned(directory).mark(self.source, 4005), lambda: row()['pinnedAt'], 4005),
+            ('preferences', lambda: BoardPreferences(directory).set_quick_replies(['다음'], 0),
+             lambda: self.snapshot()['quickReplyPreferences']['quickReplies'], ['다음']),
+            ('bootId', boot, lambda: self.snapshot()['bootId'], 'another-boot'),
+        )
+        for name, change, read, expected in changes:
+            with self.subTest(name):
+                self.warm()
+                self.assertNotEqual(read(), expected)
+                change()
+                self.assertEqual(read(), expected)
+        with self.subTest('serverTime'):
+            kept = self.warm()['serverTime']
+            # The session cookie is checked against the same clock: move it a day ahead only.
+            with patch.object(server.time, 'time', return_value=kept + 86400.5):
+                with patch.object(server.Handler, 'authorized', return_value=True):
+                    self.assertEqual(self.snapshot()['serverTime'], kept + 86400)
+
+    def test_a_store_that_cannot_be_read_is_reported_and_never_kept(self):
+        self.warm()
+        labels = Path(self.temp.name) / 'session-labels.json'
+        SessionLabels(self.temp.name).set(self.source, 'Alias')
+        saved = labels.read_bytes()
+        labels.write_text('{"version": 9}')
+        os.chmod(labels, 0o600)
+        self.assertFalse(self.snapshot()['sessionLabels']['ok'])
+        self.assertFalse(self.snapshot()['sessionLabels']['ok'], 'still unreadable: read again, not kept')
+        labels.write_bytes(saved)
+        self.assertEqual(self.snapshot()['hosts'][0]['data']['codex'][0]['displayTitle'], 'Alias')
+        # A passing failure (its lock was busy) with nothing else changed: the next answer reads again.
+        self.board.changed(force=True)
+        with patch.object(self.httpd.session_labels, '_storage', side_effect=SessionLabels._unavailable()):
+            self.assertFalse(self.snapshot()['sessionLabels']['ok'])
+        self.assertTrue(self.snapshot()['sessionLabels']['ok'])
+        # A state folder that is no longer private turns every store off, as before.
+        self.warm()
+        os.chmod(self.temp.name, 0o755)
+        try:
+            snapshot = self.snapshot()
+        finally:
+            os.chmod(self.temp.name, 0o700)
+        self.assertFalse(any(snapshot[field]['ok'] for field in self.FIELDS))
+        self.assertTrue(all(self.snapshot()[field]['ok'] for field in self.FIELDS + ('quickReplyPreferences',)))
+
+    def test_a_row_key_is_the_same_with_or_without_the_memo(self):
+        import session_labels
+        from session_labels import _identity, _key, _row_key
+        sid = str(uuid.uuid4())
+        rows = [
+            {'host': 'example-mini', 'agent': 'codex', 'id': sid, 'home': '.codex'},
+            {'host': 'example-mini', 'agent': 'codex', 'id': sid, 'home': '.codex-work'},
+            {'host': 'example-mini', 'agent': 'codex', 'id': sid},
+            {'host': 'example-mini', 'agent': 'claude', 'id': '', 'kind': 'interactive', 'sessionId': sid},
+            {'host': 'example-mini', 'agent': 'claude', 'id': 'worker-1234', 'sessionId': sid},
+            {'host': 'example-mini', 'agent': 'claude', 'id': 'worker-1234', 'sessionId': 'bad id'},
+            {'host': 'example-mini', 'agent': 'codex', 'id': sid, 'home': '../x'},
+            {'host': 'example-mini', 'agent': 'gemini', 'id': sid},
+            {'host': 'example-mini', 'agent': 'codex', 'id': 1234567890},
+            {'host': 'example-mini', 'agent': 'codex', 'id': sid, 'home': ['.codex']},
+        ]
+        for row in rows:
+            try:
+                expected = _key(_identity(row))
+            except (GoalError, ValueError):
+                expected = None
+            with self.subTest(row=row):
+                self.assertEqual(_row_key(row), expected)
+                self.assertEqual(_row_key(dict(row)), expected, 'from the memo')
+        with patch.object(session_labels, '_ROW_KEYS_LIMIT', 2), patch.dict(session_labels._ROW_KEYS, clear=True):
+            for row in rows:
+                _row_key(row)
+            self.assertLessEqual(len(session_labels._ROW_KEYS), 2)
 
 
 if __name__ == '__main__':

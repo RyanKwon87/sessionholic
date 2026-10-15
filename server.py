@@ -2643,6 +2643,77 @@ def host_allowed(value):
     return host in ("127.0.0.1", "localhost", "[::1]") or host.endswith(".ts.net")
 
 
+def display_stores(server):
+    """The stores a snapshot is decorated with, in order, then the shared preferences."""
+    return (server.session_labels, server.session_seen, server.session_tidied, server.session_removed,
+            server.session_opened, server.session_pinned, server.preferences)
+
+
+# A snapshot field each display store adds; a body is kept only when every one read.
+STORE_FIELDS = ("sessionLabels", "sessionSeen", "sessionTidied", "sessionRemoved", "sessionOpened",
+                "sessionPinned", "quickReplyPreferences")
+
+
+class SnapshotResponses:
+    """The /api/snapshot body, kept while nothing it is made of changed: each open page asks
+    every few seconds, and a body was a copy of every host's list per store, six store reads
+    and a serialization.
+
+    A body depends on, and is kept under (key):
+    - the board's published host state: Board.version (every change of it goes through
+      Board.changed, which counts a version only when the state differs), which also covers
+      `interval` and `version` in the body;
+    - each display store and the shared preferences: their file and lock file (state_key; a
+      write is a new file, so one by this process or another is seen);
+    - this server process's bootId;
+    - the state folder still being safe to read (checked on every answer, not kept).
+    `serverTime` is stamped on each answer, never kept. A body in which any store could not
+    be read is not kept, so it is read again until it reads."""
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.key = self.rest = self.packed = None
+
+    @staticmethod
+    def key_of(server):
+        """The key of what a body would be now, or None when the state folder is not safe."""
+        try:
+            settings.safe_path(server.session_labels.directory, directory=True, private=True, allow_missing=True)
+        except ValueError:
+            return None
+        return (server.board.version, server.boot_id) + tuple(store.state_key() for store in display_stores(server))
+
+    def body(self, handler, gzip_ok):
+        """(JSON body, its gzip when the client takes it, else None): the bytes
+        send_json(200, handler.snapshot()) sends. The caller has linked new sessions."""
+        # Taken before the body is made: a change meanwhile only makes the next answer a new body.
+        key = self.key_of(handler.server)
+        with self.lock:
+            rest = self.rest if key is not None and key == self.key else None
+            packed = self.packed
+        if rest is not None:
+            now = int(time.time())
+            body = b'{"serverTime": %d, ' % now + rest
+        else:
+            snapshot = handler.decorated_snapshot()
+            body = json.dumps(snapshot, ensure_ascii=False).encode()
+            now = snapshot.get("serverTime")
+            head = b'{"serverTime": %d, ' % now if type(now) is int else None
+            if (key is not None and head is not None and body.startswith(head)
+                    and all(snapshot.get(field, {}).get("ok") is True for field in STORE_FIELDS)):
+                with self.lock:
+                    self.key, self.rest, self.packed = key, body[len(head):], None
+        if not gzip_ok or len(body) < GZIP_MIN:
+            return body, None
+        if packed is not None and packed[:2] == (key, now) and key is not None:
+            return body, packed[2]
+        compressed = gzip.compress(body, compresslevel=6, mtime=0)
+        with self.lock:
+            if key is not None and key == self.key:
+                # Several pages asking within the same second share one compression.
+                self.packed = (key, now, compressed)
+        return body, compressed
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = BRAND["serverVersion"]
     responded = False
@@ -3074,7 +3145,7 @@ class Handler(BaseHTTPRequestHandler):
                 if url.path == "/api/snapshot":
                     if query.get("refresh") == "1":
                         self.server.board.request_refresh()
-                    return self.send_json(200, self.snapshot())
+                    return self.send_snapshot()
                 if url.path == "/api/read":
                     result = self.server.board.read(query.get("host"), query.get("agent"), query.get("id"), query.get("home"))
                     self.observe_work(query, result)
@@ -3252,17 +3323,28 @@ class Handler(BaseHTTPRequestHandler):
         """The board's snapshot with this server process's bootId."""
         # A "새 세션" terminal's session may have appeared in this snapshot.
         self.server.workflow.link_new_sessions()
-        snapshot = self.server.session_labels.decorate(self.server.board.snapshot())
-        snapshot = self.server.session_seen.decorate(snapshot)
-        snapshot = self.server.session_tidied.decorate(snapshot)
-        snapshot = self.server.session_removed.decorate(snapshot)
-        snapshot = self.server.session_opened.decorate(snapshot)
-        snapshot = self.server.session_pinned.decorate(snapshot)
+        return self.decorated_snapshot()
+
+    def decorated_snapshot(self):
+        """Board.snapshot() (a copy of its own, so decorated in place) with each display store's
+        fields, this server process's bootId and the shared preferences."""
+        snapshot = self.server.board.snapshot()
+        for store in display_stores(self.server)[:-1]:
+            snapshot = store.decorate(snapshot, in_place=True)
         try:
             preferences = self.server.preferences.snapshot()
         except GoalError as exc:
             preferences = {"ok": False, **exc.payload}
         return {**snapshot, "bootId": self.server.boot_id, "quickReplyPreferences": preferences}
+
+    def send_snapshot(self):
+        """send_json(200, self.snapshot()), served by SnapshotResponses while nothing in it changed."""
+        self.server.workflow.link_new_sessions()
+        body, packed = self.server.snapshot_responses.body(self, self.accepts_gzip())
+        extra = {"Cache-Control": "no-store", "Vary": "Accept-Encoding"}
+        if packed is not None:
+            extra["Content-Encoding"] = "gzip"
+        self.send_body(200, packed or body, "application/json; charset=utf-8", extra)
 
     def stream_events(self, query):
         """Server-sent events; the same cookie login as other reads, no CSRF for a GET."""
@@ -3451,7 +3533,7 @@ class Handler(BaseHTTPRequestHandler):
                 if host is not None and not isinstance(host, str):
                     raise ValueError("기기 이름 형식이 올바르지 않습니다.")
                 self.server.board.request_refresh(host, force=True)
-                return self.send_json(200, self.snapshot())
+                return self.send_snapshot()
             if path == "/api/usage/refresh" and self.server.usage is not None:
                 return self.send_json(200, self.server.usage.snapshot(force=True))
             if path == "/api/hardware/refresh" and getattr(self.server, "hardware", None) is not None:
@@ -3631,6 +3713,7 @@ def make_server(bind, port, board, token, terminals=None, workflow=None, state_d
     server.session_tidied = SessionTidied(state_dir)
     server.session_removed = SessionRemoved(state_dir)
     server.session_opened = SessionOpened(state_dir)
+    server.snapshot_responses = SnapshotResponses()
     server.dictation_traces = DictationTraces(state_dir)
     server.cookie_name = COOKIE + "_" + str(server.server_address[1])
     server.once, server.once_lock = ("", 0), threading.Lock()
@@ -3676,7 +3759,9 @@ def make_server(bind, port, board, token, terminals=None, workflow=None, state_d
         except (RuntimeError, OSError, ValueError):
             return "unknown"
         return collector.session_category(row)
-    server.push = PushService(board, state_dir, classify=push_category, labels=server.session_labels.decorate,
+    # Board.snapshot() hands the push watcher a copy of its own: its titles are set in place.
+    server.push = PushService(board, state_dir, classify=push_category,
+                              labels=lambda snapshot: server.session_labels.decorate(snapshot, in_place=True),
                               log_prefix=LOG_PREFIX, enabled=push)
     if push:
         server.push.start()

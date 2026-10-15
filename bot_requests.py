@@ -835,7 +835,7 @@ class BotRequests:
         """A listed request's conversation (with the requests sharing its conversation key, one
         part per session, oldest first), watch-only: a Hermes session read from the bot's
         database (bounded, read-only), a Codex session through `read_native(host, nativeRef)`,
-        the board's own read. Each part says when it could not be read; nothing is written,
+        the board's own read ({"messages", "olderOmitted"}). Each part says when it could not be read; nothing is written,
         sent or resumed."""
         if (not isinstance(source_id, str) or not IDENTIFIER.fullmatch(source_id) or not isinstance(request_id, str)
                 or not re.fullmatch(re.escape(source_id) + r":[0-9a-f]{24}", request_id)):
@@ -877,11 +877,13 @@ class BotRequests:
                     try:
                         if index not in codex_reads:
                             raise RuntimeError("no native reader")
-                        rows = codex_reads[index].result() or []
+                        native = codex_reads[index].result()
+                        native = native if isinstance(native, dict) else {}
+                        rows = native.get("messages") if isinstance(native.get("messages"), list) else []
                         segment["messages"] = [_shown(row) for row in rows
                                                if isinstance(row, dict) and row.get("role") in ("user", "assistant")]
-                        # The board's read is a window of the newest rows: older ones may be cut.
-                        segment["more"] = len(rows) >= CONVERSATION_ROWS
+                        # The board's read is a window of the newest rows and says when it cut older ones.
+                        segment["more"] = native.get("olderOmitted") is True
                     except failed:
                         segment["error"] = failure
                 segments.append(segment)

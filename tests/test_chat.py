@@ -380,8 +380,9 @@ class ChatTest(unittest.TestCase):
                 'queueState':{'available':True,'complete':True,'total':1,'truncated':False,'reason':'PRIVATE'}}
         self.flow.transfers.rpc=lambda *a,**k:result
         state=self.chat.state({'source':REF,'requestId':'request-0001'})
-        self.assertEqual(set(state),{'route','phase','capability','messages','receipts','maxAttachmentBytes','requiresNativeTerminal',
+        self.assertEqual(set(state),{'route','phase','capability','messages','olderOmitted','receipts','maxAttachmentBytes','requiresNativeTerminal',
                                      'prompt','promptOpenable','workingSince','workingSinceApprox','modelSettings'})
+        self.assertIs(state['olderOmitted'],False)
         self.assertIsNone(state['prompt'])
         self.assertFalse(state['promptOpenable'])
         self.assertEqual(set(state['capability']),{'supported','attachments','reason'})
@@ -389,6 +390,16 @@ class ChatTest(unittest.TestCase):
         self.assertNotIn('PRIVATE',json.dumps(state))
         self.assertNotIn('queueId',state['receipts'][0])
         self.assertFalse(hasattr(chat.Chat,'queue_history'))
+    def test_state_passes_the_whole_window_and_whether_older_rows_were_left_out(self):
+        rows=[{'role':'tool' if i%4 else 'user','text':'합성 %d'%i,'ts':i} for i in range(300)]
+        result={'phase':'idle','capabilities':{'canSend':True},'messages':rows,'olderOmitted':True}
+        self.flow.transfers.rpc=lambda *a,**k:result
+        state=self.chat.state({'source':REF})
+        self.assertEqual(len(state['messages']),300)
+        self.assertIs(state['olderOmitted'],True)
+        for value in (False,None,'yes',1):
+            result['olderOmitted']=value; self.chat.cache.clear()
+            self.assertIs(self.chat.state({'source':REF})['olderOmitted'],False)
     def test_state_says_since_when_the_agent_works_only_while_it_works(self):
         result={'phase':'working','capabilities':{'canSend':True},'messages':[],'workingSince':1791334800}
         self.flow.transfers.rpc=lambda *a,**k:result

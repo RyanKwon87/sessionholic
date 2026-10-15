@@ -54,6 +54,34 @@ class SessionRecoveryTest(unittest.TestCase):
         self.assertEqual(result['messages'][0]['text'], '합성 대화')
         self.assertEqual(result['recovery']['action'], 'resume_session')
 
+    def test_saved_transcript_read_keeps_the_window_and_says_older_rows_were_left_out(self):
+        # A question every third row: the 80 newest start at row 60.
+        rows = [{'role': 'user' if index % 3 == 0 else 'tool', 'text': '합성 %d' % index, 'ts': index} for index in range(300)]
+        self.board.runner = lambda host, args, timeout: {'messages': rows, 'olderOmitted': True}
+        with patch.object(self.service, 'rpc', side_effect=RuntimeError('daemon disconnected')), \
+                patch.object(self.flow, 'resume_preview', return_value={'allowed': True}):
+            result = self.service.state({'source': REF})
+        self.assertEqual((len(result['messages']), result['messages'][0]['text']), (240, '합성 60'))
+        self.assertIs(result['olderOmitted'], True)
+
+    def test_board_read_keeps_the_hosts_window_and_bounds_any_other(self):
+        sent = {}
+        self.board.runner = lambda host, args, timeout: dict(sent)
+        def read(messages, older=None):
+            sent.clear()
+            sent['messages'] = messages
+            if older is not None:
+                sent['olderOmitted'] = older
+            result = self.board.read(HOST['name'], 'codex', REF['id'], REF['home'], fresh=True)
+            return len(result['messages']), result['olderOmitted']
+        tools = [{'role': 'tool', 'text': 'ls'}] * 100
+        self.assertEqual(read(tools + [{'role': 'user', 'text': '질문'}] * 20, False), (120, False))
+        self.assertEqual(read([{'role': 'user', 'text': '질문'}] * 3, True), (3, True))
+        # More than any host sends: the same window, said to be cut.
+        self.assertEqual(read([{'role': 'assistant', 'text': '답변'}] * 1000), (80, True))
+        self.assertEqual(read(tools * 10), (400, True))
+        self.assertEqual(read('not a list'), (0, False))
+
     def test_failed_recovery_probe_offers_connection_check_only(self):
         with patch.object(self.service, 'rpc', return_value={'phase': 'closed', 'messages': []}), \
                 patch.object(self.flow, 'resume_preview', side_effect=RuntimeError('offline')):

@@ -651,9 +651,10 @@ class BotRequestsTest(unittest.TestCase):
         self.native()
         api = self.configure()
         request = api.snapshot()['requests'][0]
-        read = Mock(return_value=[{'role': 'user', 'text': '요청', 'ts': 1700000001, 'attachments': ['x']},
-                                  {'role': 'tool', 'text': 'TOOL_PRIVATE'},
-                                  {'role': 'assistant', 'text': '답변', 'ts': 1700000002, 'truncated': True, 'fullLength': 9000}])
+        read = Mock(return_value={'messages': [{'role': 'user', 'text': '요청', 'ts': 1700000001, 'attachments': ['x']},
+                                               {'role': 'tool', 'text': 'TOOL_PRIVATE'},
+                                               {'role': 'assistant', 'text': '답변', 'ts': 1700000002, 'truncated': True, 'fullLength': 9000}],
+                                  'olderOmitted': False})
         [segment] = api.conversation(self.source['id'], request['id'], read_native=read)['segments']
         read.assert_called_once_with('mini', {'agent': 'codex', 'id': self.sid, 'home': '.codex'})
         self.assertEqual(segment['kind'], 'codex')
@@ -763,7 +764,7 @@ class BotRequestsTest(unittest.TestCase):
             elsewhere: [('user', 'ELSEWHERE_PRIVATE', None, 1700000003)]})
         api = self.configure()
         api.snapshot()
-        read = Mock(return_value=[{'role': 'user', 'text': 'Codex 요청'}, {'role': 'tool', 'text': 'TOOL_PRIVATE'}])
+        read = Mock(return_value={'messages': [{'role': 'user', 'text': 'Codex 요청'}, {'role': 'tool', 'text': 'TOOL_PRIVATE'}]})
         with patch.object(api, '_collect', wraps=api._collect) as collect:
             result = api.conversation(self.source['id'], bots._opaque(self.source, 4), read_native=read)
         self.assertEqual([(part['kind'], part['requests']) for part in result['segments']], [('codex', 2), ('hermes', 1), ('hermes', 1)])
@@ -778,8 +779,13 @@ class BotRequestsTest(unittest.TestCase):
         # The older request of the same conversation opens the same view.
         older = api.conversation(self.source['id'], bots._opaque(self.source, 1), read_native=read)
         self.assertEqual([part['kind'] for part in older['segments']], ['codex', 'hermes', 'hermes'])
-        # A full Codex window says older rows may be missing.
-        read.return_value = [{'role': 'assistant', 'text': '답변'}] * bots.CONVERSATION_ROWS
+        self.assertFalse(older['segments'][0]['more'])
+        # The board's read says whether it left older rows out, whatever its length: a window
+        # with tool rows holds more than 80 rows without cutting anything.
+        read.return_value = {'messages': [{'role': 'assistant', 'text': '답변'}, {'role': 'tool', 'text': 'ls'}] * 100,
+                             'olderOmitted': False}
+        self.assertFalse(api.conversation(self.source['id'], bots._opaque(self.source, 1), read_native=read)['segments'][0]['more'])
+        read.return_value = {'messages': [{'role': 'assistant', 'text': '답변'}], 'olderOmitted': True}
         self.assertTrue(api.conversation(self.source['id'], bots._opaque(self.source, 1), read_native=read)['segments'][0]['more'])
 
     def test_only_the_newest_sessions_of_a_long_conversation_are_read(self):

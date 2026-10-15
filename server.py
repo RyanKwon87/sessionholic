@@ -1443,7 +1443,11 @@ class Board:
                 raise RuntimeError("기기 연결을 다시 확인한 뒤 대화를 읽어 주세요.")
         args = ["read", agent, session_id] + ([home] if agent == "codex" else [])
         result = scrub_payload(self.runner(host, args, 30))
-        result["messages"] = result.get("messages", [])[-80:]
+        import collector
+        # The host already sent its window; this only bounds what any host may send.
+        rows = result.get("messages")
+        result["messages"], dropped = collector.recent_window(rows if isinstance(rows, list) else [])
+        result["olderOmitted"] = dropped or result.get("olderOmitted") is True
         fetched = time.time()
         with self.lock:
             # Only a read that is kept makes room: a failed one never pushes a good one out.
@@ -3233,11 +3237,12 @@ class Handler(BaseHTTPRequestHandler):
                 "home": source.get('home') or ('.claude' if source['agent'] == 'claude' else '.codex'), "offset": offset}
 
     def bot_native_messages(self, host, native):
-        """A bot's Codex session read as the board reads any session (its cache and window)."""
+        """A bot's Codex session read as the board reads any session (its cache and window):
+        its rows, and whether rows before them were left out."""
         result = self.server.board.read(host, native.get("agent"), native.get("id"), native.get("home"))
         if not isinstance(result, dict) or result.get("error"):
             raise RuntimeError("대화를 읽지 못했습니다.")
-        return result.get("messages") or []
+        return {"messages": result.get("messages") or [], "olderOmitted": result.get("olderOmitted") is True}
 
     def history_read(self, source, payload):
         host = next((host for host in self.server.board.hosts if host['name'] == source['host']), None)

@@ -292,6 +292,43 @@ class CoordinatorTest(unittest.TestCase):
         with patch('transfer.time.monotonic',return_value=1000.0+transfer.PROFILE_FAILURE_TTL+1):
             with self.assertRaises(RuntimeError):self.flow.profiles(HOSTS[1])
         self.assertEqual(len(self.calls),2)
+    def test_an_expired_profile_list_is_answered_at_once_and_read_again_once_in_the_background(self):
+        release,reads=threading.Event(),[]
+        def rpc(host,op,args=None,timeout=30):
+            reads.append(threading.current_thread())
+            if len(reads)>1 and not release.wait(30):raise RuntimeError('fixture never released')
+            return {'profiles':[{'id':'p%d'%len(reads)}],'launcher':{'available':True,'label':'L%d'%len(reads)}}
+        self.flow.rpc=rpc
+        self.addCleanup(release.set)
+        clock=[1000.0]
+        with patch('transfer.time.monotonic',side_effect=lambda:clock[0]),\
+             concurrent.futures.ThreadPoolExecutor(1) as pool:
+            self.assertEqual(self.flow.profiles(HOSTS[1]),[{'id':'p1'}])
+            clock[0]+=121
+            # Expired: the request is answered from the list it has, never waiting for the host.
+            self.assertEqual(pool.submit(self.flow.profiles,HOSTS[1]).result(timeout=10),[{'id':'p1'}])
+            self.assertEqual(self.flow.launcher(HOSTS[1])['label'],'L1')
+            self.assertEqual(len(reads),2)
+            self.assertIsNot(reads[1],threading.current_thread())
+            # While that read runs, no second one starts.
+            self.assertEqual(self.flow.profiles(HOSTS[1]),[{'id':'p1'}])
+            self.assertEqual(len(reads),2)
+            release.set()
+            deadline=time.time()+30
+            while 'local' in self.flow.profile_reading and time.time()<deadline:time.sleep(0.01)
+            self.assertEqual(self.flow.profiles(HOSTS[1]),[{'id':'p2'}])
+            self.assertEqual(self.flow.launcher(HOSTS[1])['label'],'L2')
+            # A forced read (a plan's) still asks the host in the caller's own request.
+            self.assertEqual(self.flow.profiles(HOSTS[1],refresh=True),[{'id':'p3'}])
+            self.assertIs(reads[2],threading.current_thread())
+            # A failure since the list expired is reported as before, and not retried.
+            def fail(*a,**k):reads.append('failed');raise RuntimeError('offline')
+            self.flow.rpc=fail
+            clock[0]+=100
+            with self.assertRaises(RuntimeError):self.flow.profiles(HOSTS[1],refresh=True)
+            clock[0]+=21
+            with self.assertRaisesRegex(RuntimeError,'offline'):self.flow.profiles(HOSTS[1])
+            self.assertEqual(reads[3:],['failed'])
     def test_handoff_metadata_omits_preview_size_listing(self):
         original=self.flow.rpc
         seen={}

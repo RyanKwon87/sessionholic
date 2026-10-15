@@ -244,6 +244,8 @@ class Transfers:
         self.hold_tag = hashlib.sha256(str(self.base_dir.resolve()).encode()).hexdigest()[:8]
         self.hold_waiting = self.base_dir / 'hold-waiting'
         self.profile_failures = {}
+        # Hosts whose expired account list is being read again in the background.
+        self.profile_reading = set()
         self.lock = threading.RLock()
         self._runtime = None
 
@@ -468,6 +470,29 @@ class Transfers:
             # A failed probe is not retried automatically, but only for a bounded time.
             if not refresh and failure and time.monotonic() - failure[0] < PROFILE_FAILURE_TTL:
                 raise RuntimeError(failure[1])
+            # An expired list is answered at once (a request never waits for the host's helper);
+            # one background read per host renews it, and its failure is recorded as above.
+            if not refresh and cached:
+                if host['name'] not in self.profile_reading:
+                    self.profile_reading.add(host['name'])
+                    try:
+                        threading.Thread(target=self._renew_profiles, args=(host,), daemon=True,
+                                         name='profiles').start()
+                    except RuntimeError:
+                        self.profile_reading.discard(host['name'])
+                return cached[1]
+        return self._read_profiles(host)
+
+    def _renew_profiles(self, host):
+        try:
+            self._read_profiles(host)
+        except (RuntimeError, OSError, ValueError):
+            pass  # Kept as this host's failure; the next request reports it.
+        finally:
+            with self.lock:
+                self.profile_reading.discard(host['name'])
+
+    def _read_profiles(self, host):
         try:
             data = self.rpc(host, 'profiles', timeout=12)
             if not isinstance(data, dict) or not isinstance(data.get('profiles'), list):

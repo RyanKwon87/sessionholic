@@ -45,6 +45,13 @@ class BufferTest(unittest.TestCase):
         self.assertTrue(public["alive"])
         self.assertFalse(public["closed"])
 
+    def test_public_rows_say_how_long_a_terminal_went_unused(self):
+        stream = terminal._Terminal({"id": "a" * 32, "key": "fixture", "metadata": {}}, 8)
+        stream.touched = time.monotonic() - 125
+        self.assertGreaterEqual(terminal.TerminalManager._public(stream)["idleSeconds"], 125)
+        stream.touched = time.monotonic() + 5  # a clock that moved back never reads negative
+        self.assertEqual(terminal.TerminalManager._public(stream)["idleSeconds"], 0)
+
     def test_epoch_reset_replays_full_buffer_even_when_offsets_overlap(self):
         stream = terminal._Terminal({"id": "a" * 32}, 64)
         stream.append(b"full-new-screen")

@@ -936,6 +936,106 @@ test("failed terminal listing keeps previous rows and exposes retry; a closed ro
   assert.match(c.get("terminal-status").textContent, /실행 기기의 최근 작업/);
 });
 
+function tidyFixture(fetchImpl) {
+  const c = client(fetchImpl, noChatTimers);
+  const session = (id, phase) => ({ host: 'workstation', agent: 'codex', home: '.codex', id, phase, title: `세션 ${id}`,
+    key: ['workstation', 'codex', '.codex', id].join('|') });
+  const working = session('working-1', 'working'), idle = session('idle-1', 'idle'), done = session('done-1', 'done');
+  c.state.snapshot = { hosts: [{ name: 'workstation', label: 'Workstation', ok: true, data: { codex: [working, idle, done] } }] };
+  c.state.authenticated = true;
+  const ref = (s) => ({ host: s.host, agent: s.agent, home: s.home, id: s.id });
+  const term = (id, fields) => ({ id: id.repeat(32).slice(0, 32), alive: true, closed: false, host: 'workstation', ...fields });
+  const terminals = {
+    oldShell: term('a', { mode: 'new-session', program: 'ssh', idleSeconds: 3600 }),
+    newShell: term('b', { mode: 'new-session', program: 'ssh', idleSeconds: 30 }),
+    running: term('c', { mode: 'new-session', program: 'codex', nativeSource: ref(working), idleSeconds: 5 }),
+    extra: term('d', { mode: 'attach', agent: 'codex', nativeSource: ref(working), idleSeconds: 900 }),
+    resting: term('e', { mode: 'attach', agent: 'codex', nativeSource: ref(idle), idleSeconds: 900 }),
+    ended: term('f', { mode: 'new-session', program: 'codex', nativeSource: ref(done), idleSeconds: 900 }),
+    gone: term('0', { mode: 'attach', agent: 'codex', nativeSource: { ...ref(idle), id: 'gone-1' }, idleSeconds: 900 }),
+  };
+  c.state.terminals = Object.values(terminals);
+  return { c, terminals };
+}
+
+test('터미널 정리 proposes the terminals left over and never the ones in use', () => {
+  const { c, terminals } = tidyFixture();
+  const open = { id: '1'.repeat(32), alive: true, closed: false, host: 'workstation', mode: 'new-session', program: 'ssh', idleSeconds: 9999 };
+  c.state.terminals.push(open); c.state.terminal = open;
+  // A handoff from a listed session runs a session not listed yet; a host whose list did not
+  // come back may still run its session.
+  const handoff = { id: '2'.repeat(32), alive: true, closed: false, host: 'workstation', mode: 'handoff', program: 'codex', idleSeconds: 900,
+    sourceKey: JSON.stringify({ host: 'workstation', agent: 'codex', home: '.codex', id: 'done-1' }),
+    nativeSource: { host: 'workstation', agent: 'codex', home: '.codex', id: 'new-1' } };
+  const away = { id: '3'.repeat(32), alive: true, closed: false, host: 'laptop', mode: 'new-session', program: 'codex', idleSeconds: 900,
+    nativeSource: { host: 'laptop', agent: 'codex', home: '.codex', id: 'away-1' } };
+  c.state.snapshot.hosts.push({ name: 'laptop', label: 'Laptop', ok: false, data: null });
+  // A run of a session the list leaves out, an agent CLI not linked yet, the launcher menu.
+  const unlistedRun = { id: '4'.repeat(32), alive: true, closed: false, host: 'workstation', mode: 'resume', idleSeconds: 9000,
+    nativeSource: { host: 'workstation', agent: 'codex', home: '.codex', id: 'archived-1' } };
+  const unlinked = { id: '5'.repeat(32), alive: true, closed: false, host: 'workstation', mode: 'new-session', program: 'codex', idleSeconds: 9000 };
+  const unread = { id: '6'.repeat(32), alive: true, closed: false, host: 'workstation', mode: 'new-session', idleSeconds: 9000 };
+  const menu = { id: '7'.repeat(32), alive: true, closed: false, host: 'workstation', mode: 'new-session', programMenu: true, idleSeconds: 900 };
+  c.state.terminals.push(handoff, away, unlistedRun, unlinked, unread, menu);
+  const plan = vm.runInContext('terminalTidyPlan', c.context)();
+  const of = (terminal) => plan.find((row) => row.terminal.id === terminal.id);
+  const expect = (terminal, checked, locked, reason) => {
+    const row = of(terminal);
+    assert.equal(row.checked, checked, reason); assert.equal(row.locked, locked, reason); assert.match(row.reason, reason);
+  };
+  expect(terminals.oldShell, true, false, /연결된 세션 없음/);
+  expect(terminals.newShell, false, false, /연결된 세션 없음/);
+  expect(terminals.running, false, true, /작업 중 · 닫으면 실행이 끊깁니다/);
+  expect(terminals.extra, true, false, /같은 세션에 터미널이 또 있음/);
+  expect(terminals.resting, false, false, /쉬는 중인 세션/);
+  expect(terminals.ended, true, false, /끝난 세션/);
+  expect(terminals.gone, true, false, /보드 목록에 없는 세션/);
+  expect(open, false, true, /지금 이 화면에서 연 터미널/);
+  expect(handoff, false, false, /목록에 없는 세션을 실행 중/);
+  assert.equal(of(handoff).session, null, 'a handoff is not the session it was opened from');
+  expect(away, false, false, /기기 목록을 읽지 못해 확인 전/);
+  expect(unlistedRun, false, false, /목록에 없는 세션을 실행 중 · 닫으면 실행이 끊길 수 있습니다/);
+  expect(unlinked, false, false, /세션을 아직 확인하지 못한 실행/);
+  expect(unread, false, false, /실행 중인 프로그램을 확인하지 못함/);
+  expect(menu, true, false, /연결된 세션 없음/);
+  assert.equal(of(terminals.extra).session.id, 'working-1', 'each terminal shows the session it belongs to');
+  assert.equal(vm.runInContext('terminalIdleLabel', c.context)(3600), '1시간째 사용 안 함');
+});
+
+test('터미널 정리 closes only the picked terminals, one by one, then says how it went', async () => {
+  const closes = [];
+  const { c, terminals } = tidyFixture(async (url, options) => {
+    if (url.endsWith('/close')) {
+      closes.push(url.split('/')[3]);
+      if (url.includes('f'.repeat(32))) throw new Error('lost');
+      return { ok: true, status: 200, json: async () => ({ closed: true }) };
+    }
+    return { ok: true, status: 200, json: async () => ({ terminals: [], version: 2 }) };
+  });
+  vm.runInContext('startTerminalTidy', c.context)();
+  const list = c.get('running-list');
+  assert.equal(c.get('running-tidy').hidden, true, 'the entry hides while the checklist shows');
+  const boxes = findClass(list, 'running-tidy-row').map((row) => row.children[0]);
+  const box = (terminal) => boxes.find((input) => input.dataset.terminalId === terminal.id);
+  assert.equal(box(terminals.running).disabled, true);
+  // The person keeps the shell left over after all.
+  box(terminals.oldShell).checked = false; box(terminals.oldShell).events.change();
+  // A list update redraws the checklist; the choice and the proposals stay.
+  vm.runInContext('renderTerminals', c.context)();
+  const redrawn = findClass(list, 'running-tidy-row').map((row) => row.children[0]);
+  const again = (terminal) => redrawn.find((input) => input.dataset.terminalId === terminal.id);
+  assert.equal(again(terminals.oldShell).checked, false, 'a box the person unticked stays unticked');
+  assert.equal(again(terminals.extra).checked, true);
+  assert.equal(again(terminals.running).checked, false);
+  const go = findClass(list, 'running-tidy-go')[0];
+  assert.match(go.textContent, /선택한 3개 정리/);
+  await go.events.click();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(closes, [terminals.extra.id, terminals.ended.id, terminals.gone.id]);
+  assert.match(c.get('toast').textContent, /터미널 2개를 정리했습니다\. 1개는 결과를 확인하지 못했습니다/);
+  assert.equal(c.state.terminalTidy, null);
+});
+
 test("capability and filter refresh retain selected choices and block missing accounts or offline hosts", () => {
   const c = client();
   const source = { key: "source", host: "workstation", agent: "codex", home: ".codex-example" };

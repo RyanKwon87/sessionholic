@@ -450,10 +450,13 @@ class TerminalManager:
 
     @staticmethod
     def _public(terminal):
+        # Seconds since a browser last read, typed into or resized it (the board's own screen
+        # reads count): what 터미널 정리 says of a terminal left over.
+        idle = max(0, int(time.monotonic() - terminal.touched)) if isinstance(terminal.touched, (int, float)) else None
         return {**copy.deepcopy(terminal.record["metadata"]), "id": terminal.record["id"], "key": terminal.record["key"],
                 "metadata": copy.deepcopy(terminal.record["metadata"]), "alive": terminal.alive,
                 "closed": terminal.record.get("closed", False), "closedReason": terminal.record.get("closedReason"),
-                "closedAt": terminal.record.get("closedAt")}
+                "closedAt": terminal.record.get("closedAt"), "idleSeconds": idle}
 
     def _get(self, terminal_id):
         if self._closed:

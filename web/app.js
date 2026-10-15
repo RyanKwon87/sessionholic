@@ -9062,7 +9062,10 @@ async function openTerminal(terminal, { recordHistory = true } = {}) {
   state.terminalVisible = true;
   state.dockSide = "terminal";
   renderConnectivity();
-  const shown = presenting && !docking ? navTransition("present", () => showTerminalScreen(true)) : (showTerminalScreen(true), null);
+  // A phone pushes the terminal like its other screens (and an edge swipe pops it); a wider
+  // screen presents it over the board.
+  const shown = presenting && !docking
+    ? navTransition(phoneLayout() ? "push" : "present", () => showTerminalScreen(true)) : (showTerminalScreen(true), null);
   releaseBoardFocus();
   updateThemeColor();
   if (boardCovered()) closeEvents();
@@ -9337,7 +9340,7 @@ function returnToBoard({ selectLaunchedSource = true, animate = true, loadChat =
   state.dockBeside = null;
   state.terminalVisible = false;
   renderConnectivity();
-  if (animate && !wasDocked) navTransition("dismiss", () => showTerminalScreen(false));
+  if (animate && !wasDocked) navTransition(phoneLayout() ? "pop" : "dismiss", () => showTerminalScreen(false));
   else showTerminalScreen(false);
   updateThemeColor();
   renderTerminalReturn();

@@ -5092,8 +5092,9 @@ body.dock-solo .settings-lock { display: flex; }
 }
 
 /* Screen changes slide like iOS navigation. app.js sets data-nav on <html>
-   only while a view transition runs: push/pop between the list and a
-   conversation, present/dismiss for the terminal. */
+   only while a view transition runs: push/pop between a phone's screens (the
+   list, a conversation, a terminal), present/dismiss for a terminal covering
+   a wider board. */
 :root[data-nav]::view-transition-old(root),
 :root[data-nav]::view-transition-new(root) {
   animation-duration: var(--dur-nav);

@@ -5533,6 +5533,17 @@ test('on a phone back buttons name the screen they return to: 세션 from a conv
   assert.equal(back.attributes['aria-label'], '세션 목록으로 돌아가기');
 });
 
+test('a phone pushes its terminal in from the right and pops it back like its other screens; an iPad still presents it', async () => {
+  for (const [phone, width, open, close] of [[true, 390, 'push', 'pop'], [false, 834, 'present', 'dismiss']]) {
+    const e = edgeClient({ phone, width });
+    e.slides.length = 0;
+    await e.c.openTerminal({ id: 'term-1', mode: 'attach' });
+    assert.deepEqual(e.slides, [open], `${width}px opens`);
+    e.c.returnToBoard({ selectLaunchedSource: false });
+    assert.deepEqual(e.slides, [open, close], `${width}px closes`);
+  }
+});
+
 test('bottom sheets follow the finger, dismiss on a long or fast pull, step between heights and spring back when dismissal is refused', () => {
   const c = client(undefined, noChatTimers);
   const release = (fields) => c.sheetRelease({ height: 600, detent: 'medium', ...fields });

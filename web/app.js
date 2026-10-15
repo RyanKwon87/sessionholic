@@ -164,8 +164,8 @@ const state = {
   csrf: "",
   selected: null,
   filters: { host: "", agent: "", project: "", account: "", initiator: "" },
-  // The status chips above the list ("needs_input" or "working"); tapping the
-  // active chip again clears it.
+  // The status chips above the list (a GROUPS key: "needs_input", "working",
+  // "finished" or "rest"); tapping the active chip again clears it.
   phaseFilter: "",
   sessionCategory: "general",
   selectedBotRequest: null,
@@ -1436,10 +1436,16 @@ function renderAttention(sessions) {
     /* badges are optional */
   }
 }
-// Status chips: "답 필요 N" and "작업 중 N" filter the list to that state;
-// tapping the active chip again shows everything. The buttons are kept and
-// only relabelled, so keyboard focus stays on a chip while counts change.
-const PHASE_LABELS = { needs_input: "답 필요", working: "작업 중" };
+// Status chips: one per list group ("답 필요 N", "작업 중 N", "최근 끝남 N",
+// "이전 N") filters the list to that group; tapping the active chip again
+// shows everything. The buttons are kept and only relabelled, so keyboard
+// focus stays on a chip while counts change.
+const PHASE_EMPTY = {
+  needs_input: "답이 필요한 세션이 없습니다.",
+  working: "작업 중인 세션이 없습니다.",
+  finished: "최근 끝난 세션이 없습니다.",
+  rest: "이전 세션이 없습니다.",
+};
 function togglePhaseFilter(key) {
   state.phaseFilter = state.phaseFilter === key ? "" : key;
   haptic("select");
@@ -1447,12 +1453,12 @@ function togglePhaseFilter(key) {
 }
 function renderCounts(sessions) {
   const box = $("counts");
-  const counts = GROUPS.slice(0, 2).map((group) => sessions.filter((s) => groupOf(s) === group.key).length);
+  const counts = GROUPS.map((group) => sessions.filter((s) => groupOf(s) === group.key).length);
   const revision = `${counts.join(",")}|${state.phaseFilter}`;
   if (box.dataset.revision === revision) return;
   box.dataset.revision = revision;
   box.chips ||= new Map();
-  const chips = GROUPS.slice(0, 2).map((group, index) => {
+  const chips = GROUPS.map((group, index) => {
     let chip = box.chips.get(group.key);
     if (!chip) {
       chip = button("", "count", () => togglePhaseFilter(group.key));
@@ -1464,9 +1470,9 @@ function renderCounts(sessions) {
     const n = counts[index];
     const active = state.phaseFilter === group.key;
     chip.className = `count ${group.tone}${n ? "" : " zero"}${active ? " is-active" : ""}`;
-    chip.chipLabel.textContent = `${PHASE_LABELS[group.key]} ${n}`;
+    chip.chipLabel.textContent = `${group.label} ${n}`;
     chip.setAttribute("aria-pressed", String(active));
-    chip.setAttribute("aria-label", `${PHASE_LABELS[group.key]} ${n}개${active ? ", 이것만 보는 중" : ""}`);
+    chip.setAttribute("aria-label", `${group.label} ${n}개${active ? ", 이것만 보는 중" : ""}`);
     return chip;
   });
   placeChildren(box, chips);
@@ -1970,8 +1976,10 @@ function renderGroups(shown, now) {
     };
     let empty;
     if (state.phaseFilter && !searching && !filtering) {
-      empty = emptyState("filter", state.phaseFilter === "needs_input" ? "답이 필요한 세션이 없습니다." : "작업 중인 세션이 없습니다.",
-        "다른 세션은 필터를 해제하면 보입니다.", button("필터 해제", "secondary", () => togglePhaseFilter(state.phaseFilter)));
+      // 이전 leaves out conversations older than three days here (showOld counts as filtering).
+      empty = emptyState("filter", PHASE_EMPTY[state.phaseFilter],
+        state.phaseFilter === "rest" ? "3일 지난 대화는 제외되어 있습니다. 필터에서 오래된 기록을 포함할 수 있습니다." : "다른 세션은 필터를 해제하면 보입니다.",
+        button("필터 해제", "secondary", () => togglePhaseFilter(state.phaseFilter)));
     } else if (searching || filtering || state.phaseFilter) {
       empty = emptyState("search", "조건에 맞는 세션이 없습니다.",
         `${searching ? `‘${state.search}’ 검색. ` : ""}${filtering ? "선택한 필터가 적용되어 있습니다. " : ""}${state.showRemoved ? "지운 세션도 포함했습니다. " : ""}${state.showOld ? "오래된 기록도 포함했습니다." : "3일 지난 대화는 제외되어 있습니다. 필터에서 오래된 기록을 포함할 수 있습니다."}`,

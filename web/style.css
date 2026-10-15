@@ -989,6 +989,13 @@ button.host:focus-visible {
 .count.amber .dot {
   background: var(--orange-dot);
 }
+.count.green {
+  background: var(--green-tint);
+  color: var(--green-text);
+}
+.count.green .dot {
+  background: var(--green-dot);
+}
 .count.zero {
   background: var(--fill-soft);
   color: var(--label-2);
@@ -5434,6 +5441,11 @@ body.dock-solo .settings-lock { display: flex; }
   box-shadow: none;
   color: var(--orange);
 }
+.list-chips .count.green {
+  background: var(--green-tint);
+  box-shadow: none;
+  color: var(--green-text);
+}
 .list-chips .count.zero {
   background: var(--chip-bg);
   box-shadow: inset 0 0 0 0.5px var(--sep);
@@ -5449,6 +5461,14 @@ body.dock-solo .settings-lock { display: flex; }
   background: var(--orange-dot);
   color: var(--on-orange);
 }
+/* White on the bright green fill is about 2:1; the dark text of the orange
+   fill reads in both themes. */
+.list-chips .count.is-active.green {
+  background: var(--green-dot);
+  color: var(--on-orange);
+}
+/* 이전 (gray) fills like an empty chip. */
+.list-chips .count.is-active.gray,
 .list-chips .count.is-active.zero {
   background: var(--label-2);
   color: var(--surface);

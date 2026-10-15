@@ -7952,7 +7952,20 @@ function accountDisplay(profile, fallback) {
   if (typeof fallback === "string" && fallback && !/^(?:\.codex|codex:|\.claude)/.test(fallback)) return fallback;
   return "현재 계정 설정";
 }
+const CODEX_PLANS = { free: "Free", go: "Go", plus: "Plus", pro: "Pro", prolite: "Pro Lite", promax: "Pro Max",
+  team: "Team", business: "Business", enterprise: "Enterprise", edu: "Edu" };
+// The account a Codex home is signed in to, as its daemon said (collector login): its email and
+// plan; an API key or another kind by name. Empty when not known (a PC, an older Codex).
+function codexLoginLabel(login) {
+  if (!login || typeof login !== "object") return "";
+  if (login.kind === "apiKey") return "API 키";
+  if (typeof login.email !== "string" || !login.email) return "";
+  return [login.email, CODEX_PLANS[login.plan] || ""].filter(Boolean).join(" · ");
+}
 function sessionAccountLabel(s) {
+  // A Codex session names the account its home actually runs on, before the setting's name.
+  const login = s.agent === "codex" ? codexLoginLabel(s.login) : "";
+  if (login) return login;
   const profile = capsAgent(s.host, s.agent)?.accounts?.find((account) => account.id === accountOf(s));
   return accountDisplay(profile, s.account);
 }

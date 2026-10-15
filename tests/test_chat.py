@@ -983,6 +983,22 @@ class ChatClaudeTest(unittest.TestCase):
     def control(self, command, value=None, request='control-0001'):
         return self.chat.command({'source': CLAUDE_REF, 'command': command, 'value': value, 'requestId': request})
 
+    def test_only_a_conversation_read_from_a_live_host_lets_the_host_skip_claude_agents(self):
+        seen, original = [], self.flow.transfers.rpc
+        def rpc(host, op, args, timeout):
+            if op == 'chat':
+                seen.append((args['action'], args.get('liveRow')))
+            return original(host, op, args, timeout)
+        self.flow.transfers.rpc = rpc
+        self.chat.state({'source': CLAUDE_REF})
+        # The host's resident watch delivers its rows: the read says so.
+        self.board.state['local']['live'] = True
+        self.chat._forget_state(CLAUDE_REF)
+        self.chat.state({'source': CLAUDE_REF})
+        # Upload's check of the real folder never takes the listed row.
+        self.chat.upload(CLAUDE_REF, 'note.txt', b'fixture')
+        self.assertEqual(seen, [('read', None), ('read', True), ('read', None)])
+
     def test_model_command_uses_one_native_slash_without_prompt_send_or_automatic_enter(self):
         self.terminal()
         ready = '──────────\n❯ \n──────────\n  Sonnet · medium effort\n'

@@ -474,6 +474,11 @@ class Chat:
             stale = self._stale(key, source, request_ids)
             if stale is not None:
                 return stale
+        if (source.get('agent') == 'claude' and host.get('platform') != 'windows'
+                and self.board.state[host['name']].get('live')):
+            # This row came from the host's resident watch seconds ago: the host may take its
+            # phase instead of running `claude agents` for every read (native_chat._listed_row).
+            kwargs = {**kwargs, 'liveRow': True}
         try:
             result = self.rpc(host, 'read', source, **kwargs)
         except (RuntimeError, OSError, ValueError) as exc:

@@ -1636,7 +1636,9 @@ function renderBotRequests() {
   const cache = state.botRequests, box = $("groups");
   const shown = shownBotGroups();
   const tools = el("div", "bot-list-tools");
-  const note = el("p", "muted", cache.busy ? "봇 요청을 확인하고 있습니다…" : cache.loaded ? `확인된 요청 ${cache.requests.length}개` : "봇 요청을 확인해 주세요.");
+  // One card per conversation (a DM's requests together), so both counts are said.
+  const note = el("p", "muted", cache.busy ? "봇 요청을 확인하고 있습니다…" : cache.loaded
+    ? `요청 ${cache.requests.length}개 · 대화 ${botGroups(cache.requests).length}개` : "봇 요청을 확인해 주세요.");
   const refresh = button(cache.busy ? "확인 중…" : "새로고침", "secondary", () => loadBotRequests({ refresh: true }));
   refresh.id = "bot-requests-refresh"; refresh.disabled = cache.busy || networkOffline();
   tools.append(note, refresh);
@@ -4341,7 +4343,7 @@ function parkDictation(session, settle) {
 }
 // The send button of the field a listening writes into (the chat's 보내기, the terminal
 // line's 보내기): pressed as the user would, so every rule of that send (nothing to send, a
-// send under way, a word still composing, a locked field) still holds.
+// send under way, a locked field, a word still composing committed first) still holds.
 function dictationSendButton(field) {
   return field === $("chat-input") ? $("chat-send") : field === $("terminal-draft") ? $("draft-paste") : null;
 }
@@ -4958,12 +4960,28 @@ function buildChatComposer(s) {
   input.placeholder = chatPlaceholder(false);
   input.setAttribute("aria-label", "메시지");
   input.value = entry.text;
+  // A send waiting for the input method to commit the word it still composes (see send).
+  let sendCommit = null;
+  const settleSendCommit = () => {
+    const pending = sendCommit;
+    if (!pending || pending.frameQueued) return;
+    pending.frameQueued = true;
+    // compositionend follows the field's update; the frame also takes late input notices.
+    requestAnimationFrame(() => {
+      if (sendCommit !== pending) return;
+      sendCommit = null;
+      clearTimeout(pending.timer);
+      pending.resolve(!entry.composing);
+    });
+  };
   input.addEventListener("input", (event) => {
     dictationTyped(input, event);
     if (!editorCurrent()) return;
     if (input.value) warmChat(entry);
     entry.inputCollapsed = false;
     entry.text = input.value;
+    // After the send's blur, Android may commit with a final input and no compositionend.
+    if (sendCommit && event?.isComposing === false) entry.composing = false;
     // Words landing from the mic keep its "듣는 중" line; typing clears both.
     if (!state.dictation?.applying) entry.notice = entry.dictationNotice = "";
     // Editing the draft answers an input error about it.
@@ -4973,6 +4991,7 @@ function buildChatComposer(s) {
     entry.slashDismissedText = null;
     updateSlashMenu(entry, box, input);
     updateChatComposer(entry);
+    if (sendCommit && !entry.composing) settleSendCommit();
   });
   // Phones fold the bars for typing and return to the reader's choice on blur
   // (hidden stays hidden); mouse layouts show them for the input, as before.
@@ -5004,6 +5023,7 @@ function buildChatComposer(s) {
     entry.revision++;
     updateSlashMenu(entry, box, input);
     updateChatComposer(entry);
+    settleSendCommit();
   });
   input.addEventListener("keydown", (event) => {
     if (!editorCurrent()) return;
@@ -5071,11 +5091,26 @@ function buildChatComposer(s) {
   });
   closeTerm.id = "chat-terminal-close";
   closeTerm.hidden = true;
-  const send = button("보내기", "primary", () => {
-    if (!editorCurrent()) return;
+  // Samsung's keyboard holds the last word composing until a space, so the send key stays
+  // pressable then: like the terminal's paste, a blur asks the input method to commit the word
+  // first, and what the field holds after it is sent. A word never committed is not sent.
+  const send = button("보내기", "primary", async () => {
+    if (!editorCurrent() || sendCommit) return;
     if (entry.composing) {
-      toast("한글 입력을 마친 뒤 보내기를 눌러 주세요.");
-      return;
+      const committed = new Promise((resolve) => { sendCommit = { resolve, frameQueued: false, timer: 0 }; });
+      const pending = sendCommit;
+      pending.timer = setTimeout(() => {
+        if (sendCommit !== pending) return;
+        sendCommit = null;
+        pending.resolve(false);
+      }, 1500);
+      input.blur();
+      const ok = await committed;
+      if (!editorCurrent()) return;
+      if (!ok) {
+        toast("한글 입력을 확정하지 못해 보내지 않았습니다. 입력을 마친 뒤 다시 눌러 주세요.");
+        return;
+      }
     }
     entry.text = input.value;
     sendChat(entry);
@@ -5421,7 +5456,8 @@ function updateChatComposer(entry) {
   input.setAttribute("aria-disabled", String(input.disabled || input.readOnly));
   $("chat-attach").disabled = offline || !chatAttachmentsSupported(entry) || entry.sending || !!entry.pending || !!entry.uploads;
   $("chat-clipboard").disabled = $("chat-attach").disabled;
-  $("chat-send").disabled = blocked || entry.composing || (!entry.text.trim() && !entry.attachments.length);
+  // A word still composing does not lock it: the send commits it first (buildChatComposer).
+  $("chat-send").disabled = blocked || (!entry.text.trim() && !entry.attachments.length);
   // A listening mic always stays pressable, so a locked input can still end it.
   $("chat-mic").disabled = !dictationListening(input) && (input.disabled || input.readOnly || entry.composing);
   for (const id of ["chat-quick", "chat-quick-inline"])

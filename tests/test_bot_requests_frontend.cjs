@@ -521,6 +521,7 @@ test("같은 대화 키의 요청은 카드 하나로 묶여 최신 상태·요�
   assert.doesNotMatch(textOf(cards[1]), /요청 \d+개/, "혼자인 요청에는 개수를 붙이지 않는다");
   assert.equal(c.get("session-category-bot-count").textContent, "2");
   assert.equal(c.get("session-count").textContent, "2개");
+  assert.match(textOf(byClass(c.get("groups"), "bot-list-tools")[0]), /요청 4개 · 대화 2개/, "요청과 대화(카드) 수를 함께 말한다");
   // An older request's words still find its conversation.
   c.state.search = "첫 요청"; c.renderBotRequests();
   cards = byClass(c.get("groups"), "bot-request-card");

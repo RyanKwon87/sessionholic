@@ -7124,7 +7124,8 @@ input.switch:focus-visible {
 .session-categories { display: flex; flex: none; gap: 3px; margin: 0 0 12px; padding: 3px; border-radius: 11px; background: var(--fill); }
 .session-categories > button { display: grid; grid-template-rows: minmax(0, 1fr) auto; align-items: center; justify-items: center; gap: 3px; flex: 1 1 0; min-width: 0; min-height: 44px; padding: 6px 8px; border: 0; border-radius: 8px; background: transparent; color: var(--label-2); font-size: var(--fs-sub); white-space: normal; text-align: center; }
 .session-categories > button > span:first-child { max-width: 100%; overflow-wrap: anywhere; text-wrap: balance; }
-.session-categories > button[aria-selected="true"] { background: var(--surface); color: var(--label); font-weight: 600; box-shadow: var(--shadow-segment); }
+/* The selected segment uses the segment token: --surface would vanish into the dark track. */
+.session-categories > button[aria-selected="true"] { background: var(--segment-on); color: var(--label); font-weight: 600; box-shadow: var(--shadow-segment); }
 .session-category-count { font-variant-numeric: tabular-nums; font-size: var(--fs-cap); }
 .session-category-note { min-height: 16px; margin: -4px 2px 12px; color: var(--label-2); font-size: var(--fs-cap); line-height: 1.4; }
 .session-category-search { margin: 0 0 8px; }

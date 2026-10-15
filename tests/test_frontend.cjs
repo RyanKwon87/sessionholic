@@ -5477,6 +5477,12 @@ test('edge swipes stay off outside an iOS home-screen app and give way to sheets
   assert.equal(pinch.body.contains('edge-peek'), false); assert.equal(pinch.c.context.window.history.backCount, 0);
 });
 
+test('the session category segment marks its choice with the segment token, which stands out in dark mode', () => {
+  const css = styleSheet();
+  assert.match(css, /\.session-categories > button\[aria-selected="true"\] \{[^}]*background: var\(--segment-on\)/);
+  assert.notEqual(cssBlock(css, ':root[data-theme="dark"]')['--segment-on'], cssBlock(css, ':root[data-theme="dark"]')['--surface']);
+});
+
 test('bottom sheets follow the finger, dismiss on a long or fast pull, step between heights and spring back when dismissal is refused', () => {
   const c = client(undefined, noChatTimers);
   const release = (fields) => c.sheetRelease({ height: 600, detent: 'medium', ...fields });

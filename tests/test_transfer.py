@@ -774,10 +774,15 @@ class RuntimeInstallTest(unittest.TestCase):
         self.assertEqual(self.bootstrap(full=False),{'ok':False,'needRuntime':True,'sha256':self.flow.runtime()['sha256']})
         self.bootstrap()
         self.assertEqual(current.read_bytes(),original)
-        # Unused for over an hour: touched (another version's sweep keeps it) and recorded again.
+        # Unused for over an hour and unchanged since its check: not hashed again, but touched
+        # (another version's sweep keeps it) and recorded again.
+        with open(current,'r+b') as out:out.write(b'x'*len(original))
         hours=time.time()-2*3600
         os.utime(current,(hours,hours))
-        self.bootstrap(full=False)
+        info=current.stat()
+        (self.folder()/'.verified').write_text('%d %d %d'%(info.st_ino,info.st_size,info.st_mtime_ns))
+        self.assertEqual(self.bootstrap(full=False)['result'],{'prepared':False,'started':False})
+        self.assertEqual(current.read_bytes(),b'x'*len(original))
         info=current.stat()
         self.assertGreater(info.st_mtime,time.time()-600)
         self.assertEqual((self.folder()/'.verified').read_text(),'%d %d %d'%(info.st_ino,info.st_size,info.st_mtime_ns))

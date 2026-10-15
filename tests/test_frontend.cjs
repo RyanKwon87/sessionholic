@@ -5483,6 +5483,14 @@ test('the session category segment marks its choice with the segment token, whic
   assert.notEqual(cssBlock(css, ':root[data-theme="dark"]')['--segment-on'], cssBlock(css, ':root[data-theme="dark"]')['--surface']);
 });
 
+test('a tapped text field on a touch screen shows its border and caret, not the keyboard focus ring', () => {
+  const css = styleSheet();
+  assert.match(css, /@media \(pointer: coarse\) \{\s*#chat-input:focus-visible,\s*#terminal-draft:focus-visible \{\s*outline: none;\s*\}\s*\.search-wrap:focus-within \{\s*box-shadow: none;\s*\}\s*\}/);
+  assert.match(css, /:focus-visible \{\s*outline: 3px solid var\(--focus-ring\);/, 'every other control keeps the ring');
+  assert.match(css, /\.chat-input:focus \{\s*border-color: var\(--accent\);/, 'the field still marks its focus');
+  assert.match(css, /\.draft-panel textarea:focus \{\s*border-color: var\(--t-blue\);/);
+});
+
 test('bottom sheets follow the finger, dismiss on a long or fast pull, step between heights and spring back when dismissal is refused', () => {
   const c = client(undefined, noChatTimers);
   const release = (fields) => c.sheetRelease({ height: 600, detent: 'medium', ...fields });

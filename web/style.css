@@ -3687,6 +3687,18 @@ li[data-task] {
 .chat-input:focus {
   border-color: var(--accent);
 }
+/* A text field tapped on a touch screen shows its focus by its border (the search
+   field by its caret), as iOS fields do; the keyboard focus ring stays on every
+   other control, and on these fields with a fine pointer. */
+@media (pointer: coarse) {
+  #chat-input:focus-visible,
+  #terminal-draft:focus-visible {
+    outline: none;
+  }
+  .search-wrap:focus-within {
+    box-shadow: none;
+  }
+}
 .chat-input:disabled,
 .chat-input[readonly] {
   background: var(--fill-soft);

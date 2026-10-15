@@ -8940,8 +8940,14 @@ function renderDockToggle() {
     toggle.setAttribute("aria-label", state.docked ? "터미널을 화면 가득 보기" : "터미널을 대화 옆에 보기");
   }
   const back = $("terminal-back");
-  back.textContent = state.docked ? "숨기기" : "보드";
-  const label = state.docked ? "터미널 칸 숨기기" : back.dataset?.boardLabel;
+  // A phone names the screen back returns to, as iOS does: the conversation the terminal
+  // was opened from, or the session list. Wider screens return to the whole board.
+  const entry = window.history.state;
+  const fromChat = !!(entry?.[INSTANCE.historyKey] && entry.view === "terminal" && entry.parentDetailId);
+  const phone = !state.docked && phoneLayout();
+  back.textContent = state.docked ? "숨기기" : phone ? (fromChat ? "대화" : "세션") : "보드";
+  const label = state.docked ? "터미널 칸 숨기기"
+    : phone ? (fromChat ? "대화로 돌아가기" : "세션 목록으로 돌아가기") : back.dataset?.boardLabel;
   if (label) back.setAttribute("aria-label", label);
 }
 // "크게"/"나란히" is remembered for every terminal on this device.

@@ -3199,10 +3199,6 @@ li[data-task] {
     border-radius: 1px;
     transform: rotate(45deg);
   }
-  .back::after {
-    content: "작업";
-    font-size: var(--fs-head);
-  }
   .back:active {
     opacity: 0.5;
   }
@@ -7156,6 +7152,21 @@ input.switch:focus-visible {
   }
   body:not(.dock-solo):not(.goal-has-conversation) .detail-head > .detail-titles {
     grid-column: 1 / 3;
+  }
+}
+/* Phone: ‹ names the screen it returns to (the session list), as iOS does; the
+   chevron keeps its place. Folded bars (reading, typing) show the chevron only. */
+@media (max-width: 700px) {
+  .detail-pane:not(.is-reading):not(.is-typing) .detail-head > .back {
+    grid-column: 1 / 3;
+    justify-self: start;
+    justify-content: flex-start;
+    gap: 6px;
+    padding: 0 10px 0 16px;
+  }
+  .detail-pane:not(.is-reading):not(.is-typing) .detail-head > .back::after {
+    content: "세션";
+    font-size: var(--fs-body);
   }
 }
 .detail-head-actions { grid-column: 4; grid-row: 1; display: flex; align-items: center; gap: 4px; }

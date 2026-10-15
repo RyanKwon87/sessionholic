@@ -5514,6 +5514,25 @@ test('on a phone board the toast drops in under the status bar as a blurred caps
   assert.match(css, /\.terminal-screen:not\(\[hidden\]\) ~ \.toast \{\s*bottom: calc\(var\(--terminal-tools-h/, 'the terminal keeps its toast above the keys');
 });
 
+test('on a phone back buttons name the screen they return to: 세션 from a conversation, 대화 or 세션 from a terminal', async () => {
+  const css = styleSheet();
+  assert.match(css, /@media \(max-width: 700px\) \{\s*\.detail-pane:not\(\.is-reading\):not\(\.is-typing\) \.detail-head > \.back \{[^}]*grid-column: 1 \/ 3;[^}]*\}\s*\.detail-pane:not\(\.is-reading\):not\(\.is-typing\) \.detail-head > \.back::after \{\s*content: "세션";/);
+  assert.doesNotMatch(css, /content: "작업"/, 'no label left from an earlier screen name');
+  const e = edgeClient();
+  const { s } = selectChat(e.c);
+  e.c.select(s.key);
+  await e.c.openTerminal({ id: 'term-1', mode: 'attach' });
+  const back = e.c.get('terminal-back');
+  assert.equal(back.textContent, '대화', 'opened from the conversation');
+  assert.equal(back.attributes['aria-label'], '대화로 돌아가기');
+  e.c.returnToBoard({ selectLaunchedSource: false, animate: false });
+  e.c.setDetailShown(false);
+  e.c.navigateView('list', true);
+  await e.c.openTerminal({ id: 'term-2', mode: 'attach' });
+  assert.equal(back.textContent, '세션', 'opened from the list');
+  assert.equal(back.attributes['aria-label'], '세션 목록으로 돌아가기');
+});
+
 test('bottom sheets follow the finger, dismiss on a long or fast pull, step between heights and spring back when dismissal is refused', () => {
   const c = client(undefined, noChatTimers);
   const release = (fields) => c.sheetRelease({ height: 600, detent: 'medium', ...fields });

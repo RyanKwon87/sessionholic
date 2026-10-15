@@ -275,3 +275,62 @@ class SessionPinned(SessionSeen):
     """Board favorites, shared by devices without modifying native session metadata."""
     NAME, ROW_FIELD, SNAPSHOT_FIELD, CODE = 'session-pinned', 'pinnedAt', 'sessionPinned', 'session_pinned'
     WHAT = '상단 고정 기록'
+
+
+class BoardPreferences(Goals):
+    """Small shared UI preferences; never credentials, drafts or native settings."""
+    def __init__(self, state_dir):
+        super().__init__(state_dir)
+        self.path = self.directory / 'board-preferences.json'
+        self.lock_path = self.directory / 'board-preferences.lock'
+
+    def _unavailable(self):
+        return GoalError('빠른 답장 설정을 읽거나 저장하지 못했습니다. 편집 내용은 유지됩니다.',
+                         'preferences_unavailable', 503)
+
+    @staticmethod
+    def rows(value):
+        if (not isinstance(value, list) or len(value) > 12 or any(
+                not isinstance(row, str) or not row.strip() or len(row) > 200 or
+                any(unicodedata.category(char) in ('Cc', 'Cs') for char in row) for row in value)):
+            raise GoalError('빠른 답장은 한 줄 200자, 최대 12개까지 저장할 수 있습니다.', 'invalid_quick_replies')
+        return [row.strip() for row in value]
+
+    def _read(self):
+        settings.safe_path(self.path, private=True, allow_missing=True)
+        try:
+            fd = os.open(str(self.path), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        except FileNotFoundError:
+            return {'version': 1, 'revision': 0, 'quickReplies': None}
+        try:
+            with os.fdopen(fd, 'rb') as stream:
+                if self._private_file(stream.fileno()).st_size > 16384:
+                    raise ValueError('size')
+                data = json.loads(stream.read(16385))
+            if (not isinstance(data, dict) or set(data) != {'version', 'revision', 'quickReplies'} or
+                    type(data['version']) is not int or data['version'] != 1 or
+                    type(data['revision']) is not int or data['revision'] < 0 or
+                    data['quickReplies'] is not None and self.rows(data['quickReplies']) != data['quickReplies']):
+                raise ValueError('format')
+            return data
+        except (GoalError, ValueError, TypeError, KeyError, UnicodeError, RecursionError):
+            raise self._unavailable() from None
+
+    def snapshot(self):
+        with self._storage():
+            data = self._read()
+            return {'ok': True, 'revision': data['revision'], 'quickReplies': data['quickReplies']}
+
+    def set_quick_replies(self, rows, revision):
+        rows = self.rows(rows)
+        if type(revision) is not int or revision < 0:
+            raise GoalError('저장할 설정 버전을 다시 확인해 주세요.', 'invalid_preferences_revision')
+        with self._storage(write=True):
+            data = self._read()
+            if data['quickReplies'] != rows:
+                if data['revision'] != revision:
+                    raise GoalError('다른 기기에서 문구를 바꿨습니다. 최신 문구를 확인한 뒤 다시 저장해 주세요.',
+                                    'preferences_conflict', 409)
+                data.update(quickReplies=rows, revision=data['revision'] + 1)
+                self._write(data)
+            return {'ok': True, 'revision': data['revision'], 'quickReplies': data['quickReplies']}

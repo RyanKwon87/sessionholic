@@ -8,6 +8,7 @@ Standard library only and Python 3.9 compatible because POSIX host's /usr/bin/py
 from __future__ import annotations
 
 import base64
+from contextvars import ContextVar
 import errno
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
@@ -56,6 +57,7 @@ HOME_KEY = re.compile(r"^\.codex(-[A-Za-z0-9_-]{1,40})?$|^\.codex-router/[0-9a-f
 SESSION_ID = re.compile(r"^[0-9A-Za-z-]{8,64}$")
 EXTRA_PATH = ["/opt/homebrew/bin", str(HOME / ".local/bin"), "/usr/local/bin", "/usr/bin", "/bin"]
 TEXT_LIMIT = 4000
+FULL_MESSAGE_TEXT = ContextVar('full_message_text', default=False)
 MESSAGE_LIMIT = 80
 # Codex history is read newest-first in pages of this many items, at most this many pages.
 HISTORY_PAGE = 100
@@ -124,12 +126,13 @@ def bot_request_text(text):
 
 def text_row(role, text, ts):
     """A clipped message row; only cut rows carry `truncated` and the original `fullLength`."""
-    text = str(text or "")
+    text = re.sub(r'[\ud800-\udfff]', '\ufffd', str(text or ""))
     if role == "user":
         text = bot_request_text(text)
-    row = {"role": role, "text": clip(text), "ts": ts}
-    if len(text) > TEXT_LIMIT:
-        row.update(truncated=True, fullLength=len(text))
+    full = FULL_MESSAGE_TEXT.get()
+    row = {"role": role, "text": text if full else clip(text), "ts": ts}
+    if not full and len(text) > TEXT_LIMIT:
+        row.update(truncated=True, fullLength=len(text), bodyHash=hashlib.sha256(text.encode()).hexdigest())
     return row
 
 
@@ -1814,6 +1817,207 @@ def watch_main(argv):
     os._exit(code)
 
 
+def saved_rollout_rows(entry):
+    payload = entry.get('payload')
+    if entry.get('type') != 'response_item' or not isinstance(payload, dict) or payload.get('type') != 'message':
+        return []
+    role = payload.get('role')
+    if role not in ('user', 'assistant'):
+        return []
+    text = '\n'.join(block.get('text', '') for block in payload.get('content') or []
+                     if isinstance(block, dict) and block.get('type') in ('input_text', 'output_text') and isinstance(block.get('text'), str))
+    if role == 'user': text = text.strip()
+    return [text_row(role, text, to_epoch(entry.get('timestamp')))] if text else []
+
+
+def saved_history_source(source):
+    sid, agent = source.get('id'), source.get('agent')
+    if not isinstance(sid, str) or not SESSION_ID.fullmatch(sid):
+        raise ValueError('저장 대화 식별자가 올바르지 않습니다.')
+    if agent == 'claude':
+        path = claude_transcript(sid)
+        root = HOME / '.claude' / 'projects'
+        if path is None or root.resolve() not in path.resolve().parents:
+            raise ValueError('대화 기록을 찾지 못했습니다.')
+        return settings.safe_path(path, home=HOME), lambda entry: claude_messages([entry])
+    key = source.get('home')
+    if not isinstance(key, str) or not HOME_KEY.fullmatch(key):
+        raise ValueError('계정 홈을 확인해 주세요.')
+    root = next((path.resolve() for name, path, _ in _codex_home_candidates() if name == key), None)
+    if root is None: raise ValueError('등록된 계정 홈을 찾지 못했습니다.')
+    database = state_db(root)
+    if database is None: raise ValueError('저장 대화 목록이 없습니다.')
+    import sqlite3
+    try:
+        connection = _open_read_only(sqlite3, database, immutable=_wal_without_index(database))
+        try:
+            deadline = time.monotonic() + 1
+            connection.set_progress_handler(lambda: int(time.monotonic() >= deadline), 1000)
+            rows = connection.execute('SELECT rollout_path, cwd FROM threads WHERE id=? LIMIT 2', (sid,)).fetchall()
+        finally:
+            connection.close()
+    except sqlite3.Error:
+        raise ValueError('저장 대화 목록을 읽지 못했습니다.') from None
+    if len(rows) != 1 or not isinstance(rows[0][0], str): raise ValueError('정확한 저장 대화를 찾지 못했습니다.')
+    path = settings.safe_path(Path(rows[0][0]), home=HOME)
+    relative = path.resolve().relative_to(root)
+    if path.suffix != '.jsonl' or relative.parts[0] not in ('sessions', 'archived_sessions'):
+        raise ValueError('저장 대화 경로를 확인해 주세요.')
+    header = next((entry.get('payload') for entry in tail_entries_head(path) if entry.get('type') == 'session_meta'), None)
+    if not isinstance(header, dict) or header.get('id') != sid:
+        raise ValueError('저장 대화의 신원이 일치하지 않습니다.')
+    return path, saved_rollout_rows
+
+
+def tail_entries_head(path):
+    yield from history_header(path)
+
+
+def history_header_rows(stream):
+    stream.seek(0)
+    consumed = 0
+    for _ in range(30):
+        remaining = 8 * 1024 * 1024 - consumed
+        if remaining <= 0: break
+        raw = stream.readline(remaining + 1)
+        if not raw or len(raw) > remaining: break
+        consumed += len(raw)
+        try: row = json.loads(raw)
+        except (ValueError, UnicodeError, RecursionError): continue
+        if isinstance(row, dict): yield row
+
+
+def history_header(path):
+    fd = os.open(str(path), os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0))
+    with os.fdopen(fd, 'rb') as stream:
+        yield from history_header_rows(stream)
+
+
+def history_scan(path, parser, request, *, deadline=None):
+    """Bounded saved-ledger read; cursor is a byte boundary, message identity is its full body hash."""
+    offset = request.get('offset', 0)
+    text_offset = request.get('textOffset', 0)
+    query, wanted = request.get('query'), request.get('bodyHash')
+    if type(offset) is not int or offset < 0 or type(text_offset) is not int or text_offset < 0:
+        raise ValueError('기록 위치가 올바르지 않습니다.')
+    if wanted is not None and (not isinstance(wanted, str) or not re.fullmatch(r'[a-f0-9]{64}', wanted)):
+        raise ValueError('메시지 식별자가 올바르지 않습니다.')
+    if query is not None and (not isinstance(query, str) or not 2 <= len(query.strip()) <= 160):
+        raise ValueError('본문 검색은 2~160자로 입력해 주세요.')
+    if (query is None) == (wanted is None):
+        raise ValueError('검색 또는 메시지를 선택해 주세요.')
+    deadline = deadline or time.monotonic() + 4
+    hits, skipped, scanned = [], 0, 0
+    token = FULL_MESSAGE_TEXT.set(True)
+    try:
+        # Path lookup validates its namespace and metadata first; no native runtime is contacted.
+        fd = os.open(str(path), os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0))
+        with os.fdopen(fd, 'rb') as stream:
+            before = os.fstat(stream.fileno())
+            if (not stat.S_ISREG(before.st_mode) or offset > before.st_size or
+                    hasattr(os, 'getuid') and before.st_uid != os.getuid()):
+                raise ValueError('저장 기록 위치를 확인해 주세요.')
+            # Revalidate the opened descriptor as well as the path checked during lookup.
+            header = []
+            for value in history_header_rows(stream):
+                header.append(value)
+                if value.get('type') == 'session_meta' or value.get('sessionId'): break
+            if request.get('agent') == 'codex':
+                identity = next((row.get('payload') for row in header if row.get('type') == 'session_meta'), None)
+                if not isinstance(identity, dict) or identity.get('id') != request.get('id'):
+                    raise ValueError('저장 기록의 세션 신원이 바뀌었습니다.')
+            elif request.get('agent') == 'claude':
+                sid = next((row.get('sessionId') for row in header if row.get('sessionId')), None)
+                if sid and sid != request.get('id'):
+                    raise ValueError('저장 기록의 대화 신원이 바뀌었습니다.')
+            recent = request.get('recent') is True and wanted is not None
+            if recent and offset == 0 and before.st_size > 8 * 1024 * 1024:
+                stream.seek(before.st_size - 8 * 1024 * 1024)
+                stream.readline(8 * 1024 * 1024 + 1)
+                offset = stream.tell()
+            stream.seek(offset)
+            if offset:
+                stream.seek(offset - 1)
+                if stream.read(1) != b'\n':
+                    raise ValueError('기록의 시작 위치가 바뀌었습니다. 검색을 다시 시작해 주세요.')
+            start = stream.tell()
+            while stream.tell() < before.st_size:
+                record_offset = stream.tell()
+                raw = stream.readline(8 * 1024 * 1024 + 1)
+                scanned += len(raw)
+                if len(raw) > 8 * 1024 * 1024:
+                    skipped += 1
+                    # Keep the next cursor on a complete record, with a bounded read deadline.
+                    while raw and not raw.endswith(b'\n'):
+                        if time.monotonic() >= deadline:
+                            return {'hits': hits, 'nextOffset': record_offset, 'complete': False,
+                                    'scannedBytes': scanned, 'skipped': skipped, 'error': '한 기록이 너무 커 읽기를 완료하지 못했습니다.'}
+                        raw = stream.readline(128 * 1024); scanned += len(raw)
+                else:
+                    try:
+                        entry = json.loads(raw)
+                        rows = parser(entry) if isinstance(entry, dict) else []
+                    except (ValueError, TypeError, KeyError, UnicodeError):
+                        skipped += 1; rows = []
+                    for row in rows:
+                        text, role = row.get('text'), row.get('role')
+                        if role not in ('user', 'assistant') or not isinstance(text, str) or not text:
+                            continue
+                        text = re.sub(r'[\ud800-\udfff]', '\ufffd', text)
+                        digest = hashlib.sha256(text.encode()).hexdigest()
+                        if wanted == digest:
+                            if text_offset > len(text):
+                                raise ValueError('본문 위치가 올바르지 않습니다.')
+                            part = text[text_offset:text_offset + 65536]
+                            next_text = text_offset + len(part)
+                            return {'bodyHash': digest, 'role': role, 'text': part, 'textOffset': text_offset,
+                                    'fullLength': len(text), 'nextTextOffset': next_text if next_text < len(text) else None,
+                                    'recordOffset': record_offset, 'complete': True}
+                        if query is not None:
+                            normalized = text.casefold(); position = normalized.find(query.strip().casefold())
+                            if position >= 0:
+                                # Case folding can expand characters: the excerpt is descriptive, not an offset contract.
+                                excerpt_start = max(0, min(position, len(text)) - 70)
+                                snippet = text[excerpt_start:excerpt_start + 240]
+                                hits.append({'bodyHash': digest, 'role': role, 'snippet': snippet,
+                                             'recordOffset': record_offset, 'ts': row.get('ts'), 'fullLength': len(text)})
+                if len(hits) >= 20 or scanned >= 8 * 1024 * 1024 or time.monotonic() >= deadline:
+                    break
+            next_offset = stream.tell()
+            if (os.fstat(stream.fileno()).st_ino != before.st_ino or
+                    os.fstat(stream.fileno()).st_size < before.st_size):
+                raise ValueError('기록이 바뀌었습니다. 다시 읽어 주세요.')
+            complete = next_offset >= before.st_size
+            if recent and wanted and complete:
+                return {'hits': [], 'nextOffset': 0, 'complete': False, 'forwardFallback': True,
+                        'scannedBytes': scanned, 'skipped': skipped}
+            return {'hits': hits, 'nextOffset': None if complete else next_offset, 'complete': complete,
+                    'scannedBytes': scanned, 'skipped': skipped,
+                    **({'error': '이 메시지를 저장 기록에서 찾지 못했습니다.'} if wanted and complete else {})}
+    finally:
+        FULL_MESSAGE_TEXT.reset(token)
+
+
+def history_request(payload, resolve):
+    if (not isinstance(payload, dict) or set(payload) - {'sources', 'query', 'bodyHash', 'textOffset', 'recent'} or
+            not isinstance(payload.get('sources'), list) or not 1 <= len(payload['sources']) <= 5):
+        raise ValueError('읽을 대화 목록이 올바르지 않습니다.')
+    results = []
+    deadline = time.monotonic() + 12
+    for source in payload['sources']:
+        if (not isinstance(source, dict) or set(source) - {'agent', 'id', 'home', 'offset'} or
+                source.get('agent') not in ('codex', 'claude')):
+            raise ValueError('대화 식별자가 올바르지 않습니다.')
+        try:
+            path, parser = resolve(source)
+            result = history_scan(path, parser, {**source, **{key: payload[key] for key in ('query', 'bodyHash', 'textOffset', 'recent') if key in payload}},
+                                  deadline=min(deadline, time.monotonic() + 4))
+        except (OSError, ValueError, KeyError):
+            result = {'error': '저장 대화 기록을 확인하지 못했습니다.', 'complete': True, 'hits': [], 'nextOffset': None}
+        results.append({'source': source, **result})
+    return {'results': results, 'readOnly': True}
+
+
 def main(argv):
     command = argv[0] if argv else "snapshot"
     if command == "watch":
@@ -1823,6 +2027,8 @@ def main(argv):
             result = snapshot(full=argv[1:] == ["--full"])
         elif command == "read" and len(argv) >= 3:
             result = read(argv[1], argv[2], argv[3] if len(argv) > 3 else None)
+        elif command == "history" and len(argv) == 2 and len(argv[1]) <= 16384:
+            result = history_request(json.loads(argv[1]), saved_history_source)
         else:
             raise ValueError("사용법: collector.py snapshot [--full] | watch [--board <id>] | "
                              "read <claude|codex> <id> [codex-home]")

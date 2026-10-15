@@ -9,6 +9,12 @@ const vm = require("node:vm");
 const source = fs.readFileSync(path.join(__dirname, "../web/app.js"), "utf8");
 const messageSource = fs.readFileSync(path.join(__dirname, "../web/message-format.js"), "utf8");
 
+function draftStorage(store = new Map()) {
+  return { getItem: (key) => store.get(key) ?? null, setItem: (key, value) => store.set(key, value),
+    removeItem: (key) => store.delete(key), key: (index) => [...store.keys()][index] ?? null,
+    get length() { return store.size; }, store };
+}
+
 function node() {
   return {
     children: [],
@@ -11175,4 +11181,296 @@ test('last-response model attribution does not claim observed effort and Claude 
   assert.equal(c.get('chat-model-selection-note').hidden, true);
   claude.data.modelSettings = { model: 'sonnet', effort: 'medium' }; controls.updateModelControls(claude);
   assert.equal(c.get('chat-model-control').textContent, 'sonnet');
+});
+
+test('quick reply local storage failure reports the failure and keeps edited choices usable', () => {
+  const c = client(undefined, noChatTimers);
+  c.context.localStorage = { getItem: () => null, setItem() { throw Error('fixture denied'); } };
+  assert.deepEqual([...c.saveQuickReplies('새 문구')], ['새 문구']);
+  assert.deepEqual([...c.quickReplies()], ['새 문구']);
+  assert.match(c.get('quick-replies-status').textContent, /보관하지 못했습니다/);
+});
+
+test('shared quick replies change across devices without replacing edited settings', async () => {
+  const c = client(undefined, noChatTimers); selectChat(c);
+  const p = vm.runInContext('({adoptQuickReplyPreferences})', c.context);
+  p.adoptQuickReplyPreferences({ ok: true, revision: 1, quickReplies: ['공유 문구'] });
+  assert.deepEqual([...c.quickReplies()], ['공유 문구']); c.openSettings(); c.get('quick-replies').value = '수정 중';
+  p.adoptQuickReplyPreferences({ ok: true, revision: 2, quickReplies: ['다른 기기 문구'] });
+  assert.equal(c.get('quick-replies').value, '수정 중'); assert.deepEqual([...c.quickReplies()], ['다른 기기 문구']);
+  assert.match(c.get('quick-replies-status').textContent, /다른 기기/);
+  p.adoptQuickReplyPreferences({ ok: true, revision: 1, quickReplies: ['늦은 응답'] });
+  assert.deepEqual([...c.quickReplies()], ['다른 기기 문구']);
+});
+
+test('shared quick reply save failure preserves edits and duplicate save posts once', async () => {
+  for (const status of [503, 409]) {
+    let resolve; const calls = [];
+    const c = client(async (url) => {
+      calls.push(url);
+      if (url === '/api/preferences/quick-replies') return new Promise((done) => { resolve = done; });
+      return { ok: true, status: 200, json: async () => ({ ok: true, revision: 1, quickReplies: ['saved'] }) };
+    }, noChatTimers); selectChat(c);
+    const p = vm.runInContext('({adoptQuickReplyPreferences,saveSharedQuickReplies})', c.context);
+    p.adoptQuickReplyPreferences({ ok: true, revision: 1, quickReplies: ['saved'] });
+    c.openSettings(); await settle(); c.get('quick-replies').value = 'edited';
+    const first = p.saveSharedQuickReplies(), second = p.saveSharedQuickReplies();
+    assert.equal(first, second); assert.equal(c.get('quick-replies').disabled, true);
+    resolve({ ok: false, status, json: async () => ({ error: 'fixture save failed' }) }); assert.equal(await first, false);
+    assert.equal(calls.filter((url) => url === '/api/preferences/quick-replies').length, 1);
+    assert.equal(c.get('quick-replies').value, 'edited'); assert.deepEqual([...c.quickReplies()], ['saved']);
+    assert.match(c.get('quick-replies-status').textContent, /편집 내용은 유지/);
+  }
+});
+
+test('shared quick reply confirmed save updates choices including an intentionally empty list', async () => {
+  const bodies = [];
+  const c = client(async (url, options) => {
+    if (url === '/api/preferences/quick-replies') {
+      const body = JSON.parse(options.body); bodies.push(body);
+      return { ok: true, status: 200, json: async () => ({ ok: true, revision: body.revision + 1, quickReplies: body.quickReplies }) };
+    }
+    return { ok: true, status: 200, json: async () => ({ ok: true, revision: 0, quickReplies: null }) };
+  }, noChatTimers); c.context.localStorage = draftStorage(); selectChat(c);
+  const p = vm.runInContext('({adoptQuickReplyPreferences,saveSharedQuickReplies})', c.context);
+  p.adoptQuickReplyPreferences({ ok: true, revision: 0, quickReplies: null });
+  c.openSettings(); await settle(); c.get('quick-replies').value = 'first\nsecond';
+  assert.equal(await p.saveSharedQuickReplies(), true); assert.deepEqual([...c.quickReplies()], ['first', 'second']);
+  c.get('quick-replies').value = ''; assert.equal(await p.saveSharedQuickReplies(), true);
+  assert.equal(c.quickReplies().length, 0); assert.equal(bodies[1].revision, 1);
+});
+
+test('drafts recover on this device with exact account session and transcript identity', () => {
+  const storage = draftStorage(); const first = client(undefined, noChatTimers); first.context.localStorage = storage;
+  const { entry } = selectChat(first); entry.text = '보관할 초안'; entry.revision++; first.updateChatComposer(entry);
+  const second = client(undefined, noChatTimers); second.context.localStorage = storage;
+  const restored = selectChat(second).entry;
+  assert.equal(restored.text, '보관할 초안'); assert.match(restored.notice, /복원/);
+  assert.equal(selectChat(second, { home: '.codex-other' }).entry.text, '');
+  assert.equal(selectChat(second, { id: 'other-session' }).entry.text, '');
+  const claude = selectChat(first, { agent: 'claude' }); claude.s.sessionId = 'transcript-first';
+  const initial = first.chatEntry(claude.s); initial.text = 'old transcript'; first.updateChatComposer(initial);
+  claude.s.sessionId = 'transcript-second'; assert.equal(first.chatEntry(claude.s).text, '');
+});
+
+test('recovered unknown sends keep the original receipt id and cannot send a duplicate', async () => {
+  const storage = draftStorage(); const first = client(undefined, noChatTimers); first.context.localStorage = storage;
+  const { entry } = selectChat(first); entry.text = '전송했던 글'; entry.revision = 2;
+  entry.pending = { requestId: 'request-recovery-123', revision: 2, text: entry.text, attachments: [], source: entry.source };
+  first.updateChatComposer(entry);
+  const requests = []; const second = client(async (url) => { requests.push(url); return { ok: true, status: 200, json: async () => ({}) }; }, noChatTimers);
+  second.context.localStorage = storage; const restored = selectChat(second).entry;
+  assert.equal(restored.pending.requestId, entry.pending.requestId); assert.equal(restored.receipt.status, 'unknown');
+  second.updateChatComposer(restored); assert.equal(second.get('chat-input').readOnly, true);
+  await second.sendChat(restored); assert.equal(requests.length, 0);
+  second.applyChatReceipt(restored, { requestId: restored.pending.requestId, status: 'accepted' });
+  assert.equal(restored.text, ''); assert.equal(storage.store.size, 0);
+});
+
+test('draft storage failure before send removes stale text; auth expiry clears it and late work cannot restore it', () => {
+  const storage = draftStorage(); const c = client(undefined, noChatTimers); c.context.localStorage = storage;
+  const { entry } = selectChat(c); entry.text = 'saved'; c.updateChatComposer(entry);
+  const setItem = storage.setItem; storage.setItem = () => { throw Error('fixture quota'); };
+  entry.pending = { requestId: 'request-failed-storage', revision: entry.revision, text: 'saved', attachments: [], source: entry.source };
+  c.updateChatComposer(entry); assert.equal(storage.store.size, 0);
+  storage.setItem = setItem; entry.pending = null; c.updateChatComposer(entry);
+  assert.ok(storage.store.size > 0); c.showLogin(); assert.equal(storage.store.size, 0);
+  c.state.authenticated = true; c.updateChatComposer(entry); assert.equal(storage.store.size, 0);
+});
+
+test('expired oversized corrupt or disabled draft recovery never fills a new editor', () => {
+  const storage = draftStorage(); const c = client(undefined, noChatTimers); c.context.localStorage = storage;
+  const { entry } = selectChat(c); entry.text = 'seed'; c.updateChatComposer(entry);
+  const key = [...storage.store.keys()][0], original = JSON.parse(storage.getItem(key));
+  for (const row of [{ ...original, at: 0 }, { ...original, text: 'x'.repeat(40000) }, { ...original, pending: { requestId: 1 } }]) {
+    storage.setItem(key, JSON.stringify(row)); const next = client(undefined, noChatTimers); next.context.localStorage = storage;
+    assert.equal(selectChat(next).entry.text, '');
+  }
+  storage.setItem(key, JSON.stringify(original)); storage.setItem('sessionholic:ui:draftRecovery', 'false');
+  const next = client(undefined, noChatTimers); next.context.localStorage = storage; assert.equal(selectChat(next).entry.text, '');
+});
+
+test('long messages load the exact saved body in chunks, preserve original rows, and copy full text', async () => {
+  const calls = [], complete = '**전체 답변**\n' + 'x'.repeat(70000), hash = 'a'.repeat(64);
+  const c = client(async (url) => {
+    calls.push(url); const parsed = new URL(url, 'https://fixture.invalid');
+    const offset = Number(parsed.searchParams.get('textOffset') || 0), part = complete.slice(offset, offset + 65536);
+    return { ok: true, status: 200, json: async () => ({ readOnly: true, bodyHash: hash, text: part,
+      textOffset: offset, fullLength: complete.length, recordOffset: 100, nextTextOffset: offset + part.length < complete.length ? offset + part.length : null }) };
+  }, noChatTimers);
+  const { s, entry } = selectChat(c), message = { role: 'assistant', text: complete.slice(0, 4000) + ' …', truncated: true, fullLength: complete.length, bodyHash: hash };
+  c.renderMessages(s, [message]); const item = c.get('messages').conversationRows[0];
+  await item.longLoad.events.click(); assert.equal(item.truncated, true); assert.match(item.longLoad.textContent, /다음 부분/);
+  await item.longLoad.events.click(); assert.equal(item.truncated, false); assert.equal(item.displayMessage.text, complete);
+  assert.equal(message.text.length, 4002); assert.equal(message.truncated, true);
+  c.renderMessages(s, [message]); assert.equal(c.get('messages').conversationRows[0], item);
+  assert.equal(item.displayMessage.text, complete); assert.equal(entry.fullMessages.get(hash).complete, true);
+  let copied; c.context.navigator = { clipboard: { writeText: async (text) => { copied = text; } } };
+  await menuAction(c, item.row, '복사'); assert.ok(copied.includes('x'.repeat(70000)));
+  item.longFold.events.click(); assert.equal(item.displayMessage, null); assert.equal(item.truncated, true);
+  assert.equal(calls.filter((url) => url.startsWith('/api/history/message?')).length, 2);
+});
+
+test('long message lookup follows saved record pages, prevents duplicate reads and discards stale session responses', async () => {
+  let resolve; const calls = [], hash = 'b'.repeat(64);
+  const c = client(async (url) => {
+    calls.push(url); return new Promise((done) => { resolve = done; });
+  }, noChatTimers);
+  const { s } = selectChat(c); c.renderMessages(s, [{ role: 'assistant', text: 'prefix …', truncated: true, bodyHash: hash }]);
+  const item = c.get('messages').conversationRows[0]; const first = item.longLoad.events.click();
+  item.longLoad.events.click(); assert.equal(calls.length, 1);
+  const other = selectChat(c, { id: 'other-session' }); other.entry.text = '다른 초안';
+  resolve({ ok: true, status: 200, json: async () => ({ readOnly: true, bodyHash: hash, text: 'late full body', textOffset: 0,
+    fullLength: 14, recordOffset: 100, nextTextOffset: null }) });
+  await first; assert.equal(item.displayMessage, null); assert.equal(other.entry.text, '다른 초안');
+});
+
+test('long message failures retain preview and a changed body hash cannot reuse an older expanded answer', async () => {
+  const hash = 'c'.repeat(64); let fail = false;
+  const c = client(async () => fail ? { ok: false, status: 503, json: async () => ({ error: 'fixture unavailable' }) }
+    : { ok: true, status: 200, json: async () => ({ readOnly: true, bodyHash: hash, text: 'full answer', textOffset: 0,
+        fullLength: 11, recordOffset: 100, nextTextOffset: null }) }, noChatTimers);
+  const { s } = selectChat(c), initial = { role: 'assistant', text: 'same prefix …', truncated: true, bodyHash: hash };
+  c.renderMessages(s, [initial]); const first = c.get('messages').conversationRows[0]; await first.longLoad.events.click();
+  assert.equal(first.displayMessage.text, 'full answer');
+  c.renderMessages(s, [{ ...initial, bodyHash: 'd'.repeat(64) }]); const second = c.get('messages').conversationRows[0];
+  assert.notEqual(second, first); assert.equal(second.displayMessage, null);
+  fail = true; await second.longLoad.events.click(); assert.equal(second.displayMessage, null);
+  assert.match(second.longStatus.textContent, /fixture unavailable/); assert.ok(textOf(second.row).includes('same prefix'));
+});
+
+test('body search is explicit, pages and deduplicates results, renders them as text, and never sends chat', async () => {
+  const calls = [];
+  const c = client(async (url) => {
+    calls.push(url); const cursor = new URL(url, 'https://fixture.invalid').searchParams.get('cursor');
+    return { ok: true, status: 200, json: async () => ({ readOnly: true, hits: [{ source: c.sourceOf(s), role: 'assistant',
+      bodyHash: 'e'.repeat(64), snippet: '<script>본문 검색 결과</script>', recordOffset: 100, title: 'fixture' }],
+      errors: [], scanned: cursor ? 1 : 0, total: 1, cursor: cursor ? null : 'next-page' }) };
+  }, noChatTimers); const { s } = selectChat(c);
+  const api = vm.runInContext('({startHistorySearch,renderHistorySearch})', c.context);
+  c.state.historySearch.mode = true; c.state.historySearch.query = '본문'; api.renderHistorySearch(); assert.equal(calls.length, 0);
+  await api.startHistorySearch(); assert.equal(calls.length, 2); assert.equal(c.state.historySearch.hits.size, 1);
+  assert.equal(c.get('groups').hidden, true); assert.match(c.get('body-search-status').textContent, /1\/1개 대화 확인/);
+  const row = c.get('body-search-results').children[0]; assert.ok(textOf(row).includes('<script>본문 검색 결과</script>'));
+  assert.equal(byClass(row, 'script').length, 0); assert.ok(!calls.some((url) => url.startsWith('/api/chat/')));
+});
+
+test('body search cancellation and authentication changes discard late results and preserve found content on error', async () => {
+  let resolve; const c = client(async () => new Promise((done) => { resolve = done; }), noChatTimers); selectChat(c);
+  const api = vm.runInContext('({startHistorySearch,cancelHistorySearch})', c.context);
+  c.state.historySearch.mode = true; c.state.historySearch.query = '본문'; const searching = api.startHistorySearch();
+  api.cancelHistorySearch(); resolve({ ok: true, status: 200, json: async () => ({ readOnly: true, hits: [], errors: [], scanned: 99, total: 99, cursor: null }) });
+  await searching; assert.match(c.state.historySearch.status, /멈췄습니다/); assert.equal(c.state.historySearch.busy, false);
+  const next = api.startHistorySearch(); c.showLogin();
+  resolve({ ok: true, status: 200, json: async () => ({ readOnly: true, hits: [], errors: [], scanned: 99, total: 99, cursor: null }) });
+  await next; assert.equal(c.state.historySearch.mode, false); assert.equal(c.state.historySearch.hits.size, 0);
+});
+
+test('cache refresh offers to retain recoverable drafts and explicit discard cannot write them back during unload', async () => {
+  const storage = draftStorage(), c = client(undefined, noChatTimers); c.context.localStorage = storage;
+  const { entry } = selectChat(c); entry.text = 'keep draft'; c.updateChatComposer(entry);
+  let reloads = 0; c.context.window.location = { reload() { reloads++; } };
+  await c.hardReload(); assert.match(textOf(c.get('action-list')), /초안 보관 후 새로고침/);
+  await c.hardReload({ discard: true, preserveDrafts: true }); assert.equal(reloads, 1); assert.ok(storage.store.size > 0);
+  c.state.discardOnReload = false; c.state.hardReloadBusy = false;
+  await c.hardReload({ discard: true }); assert.equal(storage.store.size, 0);
+  c.warnDraftUnload({ preventDefault() {} }); assert.equal(storage.store.size, 0);
+});
+
+test('idle tabs do not overwrite newer recovered drafts or delete another tabs edits after a late receipt', () => {
+  const storage = draftStorage(), first = client(undefined, noChatTimers), second = client(undefined, noChatTimers);
+  first.context.localStorage = second.context.localStorage = storage;
+  const a = selectChat(first).entry, b = selectChat(second).entry;
+  a.text = 'new words'; a.revision++; first.updateChatComposer(a);
+  second.updateChatComposer(b);
+  const third = client(undefined, noChatTimers); third.context.localStorage = storage;
+  assert.equal(selectChat(third).entry.text, 'new words');
+  b.text = 'sent words'; b.revision++;
+  b.pending = { requestId: 'other-tab-request', revision: b.revision, text: b.text, attachments: [], source: b.source };
+  second.updateChatComposer(b);
+  a.text = 'newer draft'; a.revision++; first.updateChatComposer(a);
+  second.applyChatReceipt(b, { requestId: b.pending.requestId, status: 'accepted' });
+  const fourth = client(undefined, noChatTimers); fourth.context.localStorage = storage;
+  assert.equal(selectChat(fourth).entry.text, 'newer draft');
+});
+
+test('an older body-search result opens a separate saved-message preview without adding a native turn', async () => {
+  const hash = 'f'.repeat(64), requests = [];
+  const c = client(async (url, options) => {
+    requests.push(url);
+    return { ok: true, status: 200, json: async () => url.startsWith('/api/history/message?')
+      ? { readOnly: true, bodyHash: hash, text: '오래된 전체 본문', textOffset: 0, fullLength: 10, recordOffset: 123, nextTextOffset: null }
+      : url === '/api/chat/state' ? { route: c.sourceOf(s), capability: { supported: true }, messages: [] }
+      : { ok: true } };
+  }, noChatTimers); const { s, entry } = selectChat(c);
+  const api = vm.runInContext('({openHistoryHit})', c.context);
+  api.openHistoryHit({ source: c.sourceOf(s), bodyHash: hash, recordOffset: 123, role: 'assistant', snippet: '오래된', fullLength: 10 });
+  await settle(6);
+  assert.ok(entry.historyPreview?.item); assert.match(textOf(entry.historyPreview.item.row), /검색한 메시지 · 저장 기록/);
+  assert.equal(entry.historyPreview.item.displayMessage.text, '오래된 전체 본문');
+  assert.ok(requests.some((url) => url.startsWith('/api/history/message?')));
+  assert.ok(!requests.includes('/api/chat/send')); assert.equal(entry.conversation?.messages.length || 0, 0);
+});
+
+test('a first Claude transcript UUID preserves in-flight sends uploads and the mounted draft entry', async () => {
+  const storage = draftStorage(); let resolve; const calls = [];
+  const c = client(async (url) => {
+    calls.push(url);
+    if (url === '/api/chat/send') return new Promise((done) => { resolve = done; });
+    return { ok: true, status: 200, json: async () => ({}) };
+  }, noChatTimers); c.context.localStorage = storage;
+  const { s, entry } = selectChat(c, { agent: 'claude' }); entry.text = 'first message'; entry.revision++;
+  const sending = c.sendChat(entry); const requestId = entry.pending.requestId;
+  s.sessionId = 'first-transcript-123'; assert.equal(c.chatEntry(s), entry);
+  assert.equal(entry.pending.requestId, requestId); assert.equal(entry.sending, true);
+  resolve({ ok: true, status: 200, json: async () => ({ status: 'accepted' }) }); await sending;
+  assert.equal(entry.text, ''); assert.equal(calls.filter((url) => url === '/api/chat/send').length, 1);
+  entry.uploads = 1; entry.attachments = [{ id: 'upload-ref' }]; s.sessionId = 'different-transcript-123';
+  assert.notEqual(c.chatEntry(s), entry); assert.equal(c.chatEntry(s).attachments.length, 0);
+});
+
+test('astral characters in a full saved-text chunk use codepoint counts rather than UTF16 limits', async () => {
+  const hash = 'a'.repeat(64), full = '😀'.repeat(65536);
+  const c = client(async () => ({ ok: true, status: 200, json: async () => ({ readOnly: true, bodyHash: hash,
+    text: full, textOffset: 0, fullLength: 65536, recordOffset: 10, nextTextOffset: null }) }), noChatTimers);
+  const { s } = selectChat(c); c.renderMessages(s, [{ role: 'assistant', text: '😀 …', bodyHash: hash, truncated: true }]);
+  const item = c.get('messages').conversationRows[0]; await item.longLoad.events.click();
+  assert.equal(item.displayMessage.text, full); assert.equal(item.truncated, false);
+});
+
+test('failed shared settings edits can close and reopen while preserving the unsaved editor', async () => {
+  const c = client(async (url) => ({ ok: url !== '/api/preferences/quick-replies', status: url === '/api/preferences/quick-replies' ? 503 : 200,
+    json: async () => url === '/api/preferences/quick-replies' ? { error: 'fixture disk failure' }
+      : { ok: true, revision: 1, quickReplies: ['saved'] } }), noChatTimers);
+  selectChat(c); const api = vm.runInContext('({adoptQuickReplyPreferences})', c.context);
+  api.adoptQuickReplyPreferences({ ok: true, revision: 1, quickReplies: ['saved'] });
+  c.openSettings(); await settle(); c.get('quick-replies').value = 'edited'; await c.closeSettings();
+  assert.equal(c.get('settings-dialog').open, false); assert.deepEqual([...c.quickReplies()], ['saved']);
+  c.openSettings(); await settle(); assert.equal(c.get('quick-replies').value, 'edited');
+  assert.deepEqual([...c.saveQuickReplies('😀'.repeat(200) + '\tend')][0], '😀'.repeat(200));
+});
+
+test('recovered compact commands reuse the original request key and applied commands never return as new drafts', async () => {
+  const storage = draftStorage(); const bodies = [];
+  const first = client(async (url, options) => {
+    if (url === '/api/chat/command') { bodies.push(JSON.parse(options.body)); throw Error('fixture response lost'); }
+    return { ok: true, status: 200, json: async () => ({}) };
+  }, noChatTimers); first.context.localStorage = storage;
+  const { entry } = selectChat(first); entry.text = '/compact'; entry.revision++;
+  await first.sendChat(entry); assert.equal(bodies.length, 1);
+  const second = client(async (url, options) => {
+    if (url === '/api/chat/command') { bodies.push(JSON.parse(options.body)); return { ok: true, status: 200,
+      json: async () => ({ status: 'accepted' }) }; }
+    return { ok: true, status: 200, json: async () => ({}) };
+  }, noChatTimers); second.context.localStorage = storage;
+  const restored = selectChat(second).entry; assert.equal(restored.text, '/compact');
+  await second.sendChat(restored); assert.equal(bodies[0].requestId, bodies[1].requestId); assert.equal(restored.text, '');
+  const third = client(undefined, noChatTimers); third.context.localStorage = storage; assert.equal(selectChat(third).entry.text, '');
+});
+
+test('a locally deleted recovery record is rewritten by an active draft while idle tabs still preserve newer edits', () => {
+  const storage = draftStorage(), c = client(undefined, noChatTimers); c.context.localStorage = storage;
+  const { entry } = selectChat(c); entry.text = 'active draft'; entry.revision++; c.updateChatComposer(entry);
+  const key = [...storage.store.keys()].find((name) => name.includes('draft:v1:')); storage.removeItem(key);
+  c.updateChatComposer(entry); assert.equal(JSON.parse(storage.getItem(key)).text, 'active draft');
 });

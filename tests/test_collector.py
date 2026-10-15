@@ -1193,5 +1193,140 @@ class WatchTest(unittest.TestCase):
         self.assertEqual([json.loads(line)["reason"] for line in out.getvalue().splitlines()], ["usage", "usage"])
 
 
+class SavedHistoryTest(unittest.TestCase):
+    def setUp(self):
+        import windows_collector
+        import uuid
+        self.windows = windows_collector
+        self.temp = tempfile.TemporaryDirectory(); self.addCleanup(self.temp.cleanup)
+        self.home = Path(self.temp.name).resolve(); self.root = self.home / '.codex'; self.root.mkdir()
+        self.sid = str(uuid.uuid4()); self.cwd = str(self.home / 'workspace')
+        self.path = self.root / 'sessions' / (self.sid + '.jsonl'); self.path.parent.mkdir()
+        self.source = {'agent': 'codex', 'id': self.sid, 'home': '.codex'}
+        self.header = {'type': 'session_meta', 'payload': {'id': self.sid, 'cwd': self.cwd}}
+        self.parsers = [(collector, collector.saved_rollout_rows),
+                        (self.windows, lambda entry: self.windows._rollout_messages([entry]))]
+
+    def message(self, text, role='assistant'):
+        return {'type': 'response_item', 'payload': {'type': 'message', 'role': role,
+                'content': [{'type': 'output_text' if role == 'assistant' else 'input_text', 'text': text}]}}
+
+    def write(self, *entries):
+        self.path.write_text('\n'.join(json.dumps(row, ensure_ascii=False) for row in [self.header, *entries]) + '\n')
+
+    def test_full_text_hash_and_chunking_match_mac_windows_preview_without_changing_normal_limits(self):
+        text = '한글 본문\n' + 'x' * 70000
+        self.write(self.message(text))
+        digest = __import__('hashlib').sha256(text.encode()).hexdigest()
+        for module, parser in self.parsers:
+            with self.subTest(platform=module.__name__):
+                preview = collector.text_row('assistant', text, None) if module is collector else module._message('assistant', text)
+                self.assertTrue(preview['truncated']); self.assertEqual(preview['bodyHash'], digest)
+                first = module.history_scan(self.path, parser, {**self.source, 'bodyHash': digest})
+                self.assertEqual(first['text'], text[:65536]); self.assertEqual(first['nextTextOffset'], 65536)
+                second = module.history_scan(self.path, parser, {**self.source, 'bodyHash': digest,
+                    'offset': first['recordOffset'], 'textOffset': 65536})
+                self.assertEqual(first['text'] + second['text'], text); self.assertIsNone(second['nextTextOffset'])
+                self.assertFalse(module.FULL_MESSAGE_TEXT.get())
+
+    def test_search_reads_messages_before_the_recent_window_and_preserves_cursor_boundary(self):
+        self.write(self.message('오래된 검색어 본문'), *[self.message('recent ' + str(index)) for index in range(100)])
+        for module, parser in self.parsers:
+            result = module.history_scan(self.path, parser, {**self.source, 'query': '검색어'})
+            self.assertEqual(len(result['hits']), 1); self.assertIn('오래된', result['hits'][0]['snippet'])
+            self.assertTrue(result['complete'])
+            with self.assertRaises(ValueError): module.history_scan(self.path, parser, {**self.source, 'query': '검색어', 'offset': 1})
+        self.write(*[self.message('검색어 ' + str(index)) for index in range(25)])
+        for module, parser in self.parsers:
+            first = module.history_scan(self.path, parser, {**self.source, 'query': '검색어'})
+            self.assertFalse(first['complete']); self.assertEqual(len(first['hits']), 20)
+            second = module.history_scan(self.path, parser, {**self.source, 'query': '검색어', 'offset': first['nextOffset']})
+            self.assertEqual(len(second['hits']), 5); self.assertTrue(second['complete'])
+
+    def test_wrong_identity_and_hash_unknown_never_return_another_message(self):
+        self.write(self.message('known body'))
+        for module, parser in self.parsers:
+            with self.assertRaises(ValueError): module.history_scan(self.path, parser, {**self.source, 'id': 'wrong-id-123', 'query': 'body'})
+            result = module.history_scan(self.path, parser, {**self.source, 'bodyHash': 'a' * 64})
+            self.assertNotIn('text', result); self.assertIn('error', result)
+            with self.assertRaises(ValueError): module.history_scan(self.path, parser, {**self.source, 'query': 'body', 'offset': True})
+
+    def test_preview_and_saved_body_normalize_unpaired_unicode_without_breaking_the_conversation(self):
+        text = 'prefix ' + 'x' * 5000 + '\ud83d' + ' 😀 suffix'
+        normalized = text.replace('\ud83d', '\ufffd')
+        self.path.write_text('\n'.join(json.dumps(row, ensure_ascii=True) for row in [self.header, self.message(text)]) + '\n')
+        for module, parser in self.parsers:
+            preview = collector.text_row('assistant', text, None) if module is collector else module._message('assistant', text)
+            full = module.history_scan(self.path, parser, {**self.source, 'bodyHash': preview['bodyHash']})
+            self.assertEqual(full['text'], normalized); json.dumps(full, ensure_ascii=False).encode('utf-8')
+
+    def test_large_metadata_header_and_changed_cwd_keep_the_same_saved_conversation_readable(self):
+        self.header['payload']['instructions'] = 'x' * 100000
+        self.header['payload']['cwd'] = None
+        self.write(self.message('large-header searchable body'))
+        for module, parser in self.parsers:
+            result = module.history_scan(self.path, parser, {**self.source, 'query': 'searchable'})
+            self.assertEqual(len(result['hits']), 1)
+
+    def test_recent_full_lookup_reads_the_tail_then_falls_back_for_an_older_exact_hash(self):
+        old, latest = 'old saved body', 'latest saved body'
+        self.write(self.message(old), self.message('x' * (8 * 1024 * 1024)), self.message(latest))
+        for module, parser in self.parsers:
+            digest = __import__('hashlib').sha256(latest.encode()).hexdigest()
+            found = module.history_scan(self.path, parser, {**self.source, 'bodyHash': digest, 'recent': True})
+            self.assertEqual(found['text'], latest); self.assertLess(found.get('scannedBytes', 0), 8 * 1024 * 1024)
+            digest = __import__('hashlib').sha256(old.encode()).hexdigest()
+            fallback = module.history_scan(self.path, parser, {**self.source, 'bodyHash': digest, 'recent': True})
+            self.assertTrue(fallback['forwardFallback']); self.assertEqual(fallback['nextOffset'], 0)
+            found = module.history_scan(self.path, parser, {**self.source, 'bodyHash': digest, 'recent': False})
+            self.assertEqual(found['text'], old)
+
+    def test_normal_codex_read_message_hash_finds_the_same_saved_body(self):
+        user, assistant = 'user prompt ' + 'u' * 5000, 'answer 😀 ' + 'a' * 5000
+        self.write(self.message(user, 'user'), self.message(assistant))
+        socket_path = self.root / collector.SOCKET_REL; socket_path.parent.mkdir(parents=True, exist_ok=True); socket_path.touch()
+        thread = {'id': self.sid, 'status': {'type': 'idle'}, 'turns': [{'id': 'turn-fixture', 'status': 'completed',
+          'items': [{'id': 'user-fixture', 'type': 'userMessage', 'content': [{'type': 'text', 'text': user}]},
+                    {'id': 'answer-fixture', 'type': 'agentMessage', 'text': assistant, 'phase': 'final_answer'}]}]}
+        with patch.object(collector, 'HOME', self.home), patch.object(collector, 'AppServer'), patch.object(collector, 'codex_recent_thread', return_value={'thread': thread}):
+            preview = collector.read('codex', self.sid, '.codex')
+        self.assertEqual(len(preview['messages']), 2)
+        for message, expected in zip(preview['messages'], (user, assistant)):
+            full = collector.history_scan(self.path, collector.saved_rollout_rows, {**self.source, 'bodyHash': message['bodyHash']})
+            self.assertEqual(full['text'], expected)
+
+    def test_saved_source_lookup_uses_exact_database_identity_without_a_native_runtime(self):
+        import sqlite3
+        self.write(self.message('stored'))
+        db = sqlite3.connect(self.root / 'state_5.sqlite')
+        db.execute('CREATE TABLE threads (id TEXT, cwd TEXT, rollout_path TEXT, created_at INTEGER, updated_at INTEGER, archived INTEGER, title TEXT, source TEXT)')
+        db.execute('INSERT INTO threads VALUES (?,?,?,?,?,?,?,?)', (self.sid, self.cwd, str(self.path), 1, 2, 0, 'fixture', 'cli'))
+        db.commit(); db.close()
+        with patch.object(collector, 'HOME', self.home), patch.object(collector, '_codex_home_candidates', return_value=[('.codex', self.root, False)]), patch.object(collector, 'AppServer') as native:
+            path, parser = collector.saved_history_source(self.source)
+            self.assertEqual(path, self.path); native.assert_not_called()
+        reader = self.windows.WindowsCollector(self.home, process_reader=lambda *args: self.fail('process probe'))
+        with patch.object(reader, 'endpoints', side_effect=AssertionError('native endpoints')):
+            path, parser = reader.saved_history_source(self.source)
+            self.assertEqual(path, self.path)
+        self.header['payload']['id'] = 'wrong-identity'; self.write(self.message('stored'))
+        with patch.object(collector, 'HOME', self.home), patch.object(collector, '_codex_home_candidates', return_value=[('.codex', self.root, False)]), self.assertRaises(ValueError):
+            collector.saved_history_source(self.source)
+        with self.assertRaises(ValueError): reader.saved_history_source(self.source)
+
+    def test_claude_saved_lookup_rejects_links_and_harness_body_is_the_only_searchable_request(self):
+        sid = self.sid; folder = self.home / '.claude' / 'projects' / 'fixture'; folder.mkdir(parents=True)
+        path = folder / (sid + '.jsonl')
+        text = '[슬랙 요청]\n- 요청자: Example\n- 작업 번호: 106\n[처리 원칙]\nHARNESS_ONLY_SENTINEL\n[요청]\n실제 요청 검색어\n[마무리 규칙]\nfooter'
+        path.write_text(json.dumps({'type': 'user', 'sessionId': sid, 'message': {'content': text}}, ensure_ascii=False) + '\n')
+        source = {'agent': 'claude', 'id': sid, 'home': '.claude'}
+        for module, parser in [(collector, lambda entry: collector.claude_messages([entry])), (self.windows, lambda entry: self.windows._claude_messages([entry]))]:
+            self.assertEqual(len(module.history_scan(path, parser, {**source, 'query': '검색어'})['hits']), 1)
+            self.assertEqual(module.history_scan(path, parser, {**source, 'query': 'HARNESS_ONLY'})['hits'], [])
+        other = folder / 'private-other.jsonl'; other.write_text('private'); path.unlink(); path.symlink_to(other)
+        with patch.object(collector, 'HOME', self.home), self.assertRaises(ValueError): collector.saved_history_source(source)
+        with self.assertRaises(ValueError): self.windows.WindowsCollector(self.home).saved_history_source(source)
+
+
 if __name__ == "__main__":
     unittest.main()

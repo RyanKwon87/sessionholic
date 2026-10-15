@@ -247,7 +247,15 @@ const state = {
   terminalMomentum: null,
   toastTimer: null,
   chats: new Map(),
-  // Private view state lives in this authenticated tab, never browser storage.
+  draftSavedShapes: new Map(),
+  quickRepliesShared: null,
+  quickRepliesLocal: null,
+  quickRepliesError: "",
+  quickRepliesSaving: null,
+  quickRepliesEditor: null,
+  quickRepliesUnsaved: null,
+  historySearch: { mode: false, query: "", run: 0, busy: false, hits: new Map(), errors: new Map(), cursor: null, status: "", controller: null },
+  // Reading state stays in this tab. Recoverable drafts are stored separately on this device.
   conversationViews: new Map(),
   nativeSessions: new Map(),
   // Session key -> { phase, base }: the phase an open conversation's own read
@@ -630,7 +638,12 @@ function openSettings() {
   if ($("board-status")) $("board-status").open = false;
   applyTheme();
   applyTextSize();
-  if ($("quick-replies")) $("quick-replies").value = quickReplies().join("\n");
+  if ($("draft-recovery")) $("draft-recovery").checked = draftRecoveryEnabled();
+  if ($("quick-replies")) $("quick-replies").value = state.quickRepliesUnsaved?.text ?? quickReplies().join("\n");
+  state.quickRepliesEditor = state.quickRepliesUnsaved ? { value: state.quickRepliesUnsaved.baseValue, revision: state.quickRepliesUnsaved.revision }
+    : { value: $("quick-replies")?.value || "", revision: state.quickRepliesShared?.revision ?? null };
+  renderQuickReplySettings();
+  loadQuickReplyPreferences();
   window.SessionholicPush?.render?.();
   sheet("settings-dialog").open();
 }
@@ -677,7 +690,7 @@ function answerOnOpen(s) {
 // 상단 / 설정 › 캐시 지우고 새로고침: this board's shell caches go, and a worker that receives no
 // notifications is unregistered (one that does keeps its subscription and only updates).
 // Other applications' caches and every stored preference stay.
-async function hardReload({ discard = false } = {}) {
+async function hardReload({ discard = false, preserveDrafts = false } = {}) {
   if (state.hardReloadBusy) return;
   if ($("board-status")) $("board-status").open = false;
   if (networkOffline()) {
@@ -686,8 +699,12 @@ async function hardReload({ discard = false } = {}) {
     return;
   }
   if (!discard && unsavedWork()) {
-    openActionSheet({ title: "새로고침할까요?", preview: "보내지 않은 초안·첨부와 아직 확인 중인 입력이 있습니다. 새로고침하면 이 화면의 초안은 사라집니다. 대화 기록과 실행 중인 세션은 유지됩니다.",
-      actions: [{ label: "돌아가기", run: () => {} }, { label: "초안을 버리고 새로고침", danger: true, run: () => hardReload({ discard: true }) }],
+    const recoverable = persistAllDrafts();
+    openActionSheet({ title: "새로고침할까요?", preview: recoverable
+      ? "초안과 업로드가 끝난 첨부를 이 기기에 보관하고 최신 화면을 불러옵니다. 전송 확인 중인 메시지는 다시 보내지 않습니다."
+      : "보내지 않은 초안·첨부와 아직 확인 중인 입력이 있습니다. 초안을 보관하지 못했거나 업로드가 진행 중입니다. 새로고침하면 복원하지 못한 내용은 사라집니다.",
+      actions: [{ label: "돌아가기", run: () => {} }, { label: recoverable ? "초안 보관 후 새로고침" : "초안을 버리고 새로고침",
+        danger: !recoverable, run: () => hardReload({ discard: true, preserveDrafts: recoverable }) }],
       trigger: document.activeElement });
     return;
   }
@@ -709,6 +726,7 @@ async function hardReload({ discard = false } = {}) {
     // Reload anyway: the fresh page reads everything from the board again.
   }
   state.discardOnReload = discard;
+  if (discard && !preserveDrafts) clearSavedDrafts();
   // Still here (a draft's leave prompt was declined): the button works again.
   setTimeout(() => {
     state.hardReloadBusy = false;
@@ -717,11 +735,14 @@ async function hardReload({ discard = false } = {}) {
   }, 3000);
   window.location.reload();
 }
-function closeSettings() {
+async function closeSettings() {
   if (!$("settings-dialog").open) return;
   // A phrase list edited without leaving the field is kept too.
   const quick = $("quick-replies");
-  if (quick && quick.value !== quickReplies().join("\n")) quick.value = saveQuickReplies(quick.value).join("\n");
+  if (quick && quick.value !== quickReplies().join("\n") && !await saveSharedQuickReplies()) {
+    rememberQuickReplyEdits();
+    toast("저장하지 못한 문구 편집을 이 화면에 보관했습니다. 설정에서 다시 저장할 수 있습니다.");
+  }
   $("settings-dialog").close();
   $("settings")?.focus?.({ preventScroll: true });
 }
@@ -1077,6 +1098,7 @@ function render() {
   const shownSession = chatVisible() && sessions.find((s) => s.key === state.selected);
   if (shownSession && sessionUnread(shownSession, now)) markSeen(shownSession);
   renderSessionList(sessions, now);
+  renderHistorySearch();
   if (state.sessionCategory === "bot" && !sessions.some((s) => s.key === state.selected)) { window.SessionholicGoals?.update?.(sessions); return; }
   const selected = sessions.find((s) => s.key === state.selected);
   if (!state.selected && !$("detail").children.length) {
@@ -3628,11 +3650,34 @@ function submissionRequestIds(entry, lastRequestId) {
 function chatEntry(s) {
   const source = sourceOf(s);
   const key = chatKey(source);
-  if (!state.chats.has(key)) state.chats.set(key, {
+  const draftIdentity = JSON.stringify([source, s.agent === "claude" ? s.sessionId || s.id : s.id]);
+  const previous = state.chats.get(key);
+  if (previous && previous.draftIdentity !== draftIdentity) {
+    if (s.agent === "claude" && s.sessionId && !previous.draftTranscript) {
+      // A first transcript UUID enriches the same worker, including its in-flight sends.
+      const oldKey = draftStorageKey("chat", previous.draftIdentity), oldShape = state.draftSavedShapes.get(oldKey);
+      const oldRow = readSavedDraft(oldKey);
+      previous.draftIdentity = draftIdentity; previous.draftTranscript = s.sessionId;
+      if (persistChatDraft(previous) && oldRow && oldShape === savedDraftShape(oldRow)) {
+        try { localStorage.removeItem(oldKey); } catch { /* keep the older recovery record */ }
+      }
+      state.draftSavedShapes.delete(oldKey);
+    } else {
+      persistChatDraft(previous);
+      state.chats.delete(key);
+    }
+  }
+  if (!state.chats.has(key)) {
+    const entry = {
     source: Object.freeze({ ...source }), text: "", attachments: [], data: null, conversation: null,
+    fullMessages: new Map(), historyPreview: null,
     pending: null, receipt: null, sending: false, uploads: 0, outbox: [], outboxClaims: [], uploadQueue: [], thumbs: new Map(),
     composing: false, editorEpoch: 0, stateEpoch: 0, recheckQueued: false, expanded: false, inputCollapsed: false, checking: false, error: "", notice: "", revision: 0,
-  });
+      draftIdentity, draftAuthEpoch: state.authEpoch, draftTranscript: s.agent === "claude" ? s.sessionId || null : null,
+    };
+    state.chats.set(key, entry);
+    restoreChatDraft(entry);
+  }
   return state.chats.get(key);
 }
 function currentChat(entry) {
@@ -3641,6 +3686,148 @@ function currentChat(entry) {
 }
 function networkOffline() {
   return state.offline || globalThis.navigator?.onLine === false;
+}
+const DRAFT_PREFIX = INSTANCE.storagePrefix + "draft:v1:";
+const DRAFT_TTL = 7 * 24 * 60 * 60 * 1000;
+function draftRecoveryEnabled() { return prefs.get("draftRecovery", true) === true; }
+function savedDraftKeys() {
+  try {
+    return Array.from({ length: Math.min(localStorage.length || 0, 10000) }, (_, index) => localStorage.key(index))
+      .filter((key) => typeof key === "string" && key.startsWith(DRAFT_PREFIX));
+  } catch { return []; }
+}
+function draftStorageKey(kind, identity) { return DRAFT_PREFIX + encodeURIComponent(JSON.stringify([kind, identity])); }
+function clearSavedDrafts() {
+  state.draftSavedShapes.clear();
+  for (const key of savedDraftKeys()) { try { localStorage.removeItem(key); } catch { /* unavailable storage */ } }
+}
+function draftStorageNotice(text) {
+  if ($("draft-recovery-status")) $("draft-recovery-status").textContent = text;
+}
+function readSavedDraft(key) {
+  if (!state.authenticated || !draftRecoveryEnabled()) return null;
+  try {
+    const raw = localStorage.getItem(key);
+    if (!raw || raw.length > 150000) return null;
+    const row = JSON.parse(raw);
+    if (row?.version !== 1 || typeof row.text !== "string" || new TextEncoder().encode(row.text).length > 32768 ||
+        !Number.isFinite(row.at) || row.at > Date.now() + 60000 || Date.now() - row.at > DRAFT_TTL ||
+        !Array.isArray(row.attachments) || row.attachments.length > 8 ||
+        row.attachments.some((item) => !item || typeof item.id !== "string" || item.id.length > 128) ||
+        row.pending && (typeof row.pending.requestId !== "string" || row.pending.requestId.length > 128 ||
+          !Number.isInteger(row.pending.revision) || row.pending.revision < 0 ||
+          typeof row.pending.text !== "string" || new TextEncoder().encode(row.pending.text).length > 32768 ||
+          !Array.isArray(row.pending.attachments) || row.pending.attachments.length > 8 ||
+          row.pending.attachments.some((id) => typeof id !== "string" || id.length > 128)) ||
+        row.commandRequest && (typeof row.commandRequest.requestId !== "string" || row.commandRequest.requestId.length > 128 ||
+          !['model', 'effort', 'compact'].includes(row.commandRequest.command) ||
+          !['pending', 'unknown', 'applied'].includes(row.commandRequest.status) ||
+          row.commandRequest.value !== null && (typeof row.commandRequest.value !== "string" || row.commandRequest.value.length > 128))) return null;
+    return row;
+  } catch { return null; }
+}
+function savedDraftShape(row) {
+  return JSON.stringify({ text: row.text, attachments: row.attachments, pending: row.pending ?? null,
+    revision: row.revision || 0, commandRequest: row.commandRequest ?? null });
+}
+function writeSavedDraft(key, row) {
+  if (!state.authenticated || !draftRecoveryEnabled() || state.discardOnReload) return false;
+  try {
+    if (typeof localStorage.setItem !== "function" || typeof localStorage.removeItem !== "function") return false;
+    const shape = savedDraftShape(row), previousShape = state.draftSavedShapes.get(key);
+    // Status polling in an idle tab must never overwrite another tab's newer edits.
+    if (previousShape === shape && localStorage.getItem(key) !== null) return true;
+    if (!row.text && !row.attachments.length && !row.pending) {
+      const prior = readSavedDraft(key);
+      if (!prior || previousShape === savedDraftShape(prior)) localStorage.removeItem(key);
+      state.draftSavedShapes.set(key, shape); return true;
+    }
+    if (new TextEncoder().encode(row.text).length > 32768) throw new Error("draft size");
+    const raw = JSON.stringify({ ...row, version: 1, at: Date.now() });
+    if (raw.length > 150000) throw new Error("draft size");
+    const prior = readSavedDraft(key);
+    if (prior && JSON.stringify({ ...prior, at: null }) === JSON.stringify({ ...row, version: 1, at: null })) return true;
+    const newKey = localStorage.getItem(key) === null;
+    localStorage.setItem(key, raw);
+    state.draftSavedShapes.set(key, shape);
+    if (newKey || !state.draftPrunedAt || Date.now() - state.draftPrunedAt > 30000) {
+      const keys = savedDraftKeys().map((name) => ({ name, at: readSavedDraft(name)?.at || 0 })).sort((a, b) => b.at - a.at);
+      for (const item of keys.slice(50)) localStorage.removeItem(item.name);
+      state.draftPrunedAt = Date.now();
+    }
+    draftStorageNotice("이 기기에 초안을 보관합니다. 잠그거나 로그인이 만료되면 삭제합니다.");
+    return true;
+  } catch {
+    // A draft saved before this send must not come back as a new, sendable request.
+    state.draftSavedShapes.delete(key);
+    if (row.pending) { try { localStorage.removeItem(key); } catch { /* unavailable storage */ } }
+    draftStorageNotice("초안을 이 기기에 보관하지 못했습니다. 새로고침 전 작성 내용을 복사해 주세요.");
+    return false;
+  }
+}
+function persistChatDraft(entry) {
+  if (!entry?.draftIdentity || entry.draftAuthEpoch !== state.authEpoch) return false;
+  return writeSavedDraft(draftStorageKey("chat", entry.draftIdentity), chatDraftPayload(entry));
+}
+function chatDraftPayload(entry) {
+  const pending = entry.pending ? { requestId: entry.pending.requestId, revision: entry.pending.revision,
+    text: entry.pending.text, attachments: entry.pending.attachments,
+    attachmentDetails: attachmentMetadata(entry.pending.attachmentDetails) } : null;
+  return { text: entry.text || "", attachments: attachmentMetadata(entry.attachments), pending, revision: entry.revision || 0,
+    commandRequest: entry.commandRequest ? { requestId: entry.commandRequest.requestId, command: entry.commandRequest.command,
+      value: entry.commandRequest.value ?? null, status: entry.commandRequest.status } : null };
+}
+function restoreChatDraft(entry) {
+  const key = draftStorageKey("chat", entry.draftIdentity), row = readSavedDraft(key);
+  if (!row) { state.draftSavedShapes.set(key, savedDraftShape(chatDraftPayload(entry))); return; }
+  entry.text = row.text; entry.attachments = attachmentMetadata(row.attachments);
+  entry.revision = Number.isInteger(row.revision) && row.revision >= 0 ? row.revision : 0;
+  if (row.commandRequest) {
+    const command = row.commandRequest;
+    const canonical = `/${command.command}${command.value === null ? "" : " " + command.value}`;
+    if (command.status === "applied") {
+      if (entry.text.trim().replace(/\s+/g, " ") === canonical) { entry.text = ""; entry.revision++; }
+    } else {
+      entry.commandRequest = { ...command, status: "unknown" };
+      entry.notice = "확인 중이던 명령을 복원했습니다. 같은 명령을 다시 확인할 때 기존 요청 번호를 사용합니다.";
+    }
+  }
+  if (row.pending) {
+    entry.pending = { ...row.pending, source: entry.source, attachmentDetails: attachmentMetadata(row.pending.attachmentDetails) };
+    entry.receipt = { requestId: row.pending.requestId, status: "unknown" };
+    entry.outbox = [{ requestId: row.pending.requestId, text: row.pending.text,
+      attachments: entry.pending.attachmentDetails, attachmentObjects: entry.attachments,
+      state: "uncertain", status: "unknown", reason: "", at: row.at }];
+    entry.notice = "전송 확인 중이던 메시지를 복원했습니다. 다시 보내지 않고 전송 상태를 확인합니다.";
+  } else if (!entry.notice) entry.notice = "이 기기에 보관한 초안을 복원했습니다.";
+  state.draftSavedShapes.set(key, savedDraftShape(chatDraftPayload(entry)));
+}
+function terminalDraftIdentity(terminal) { return JSON.stringify([terminal?.id, draftKey(terminal)]); }
+function persistTerminalDraft(terminal) {
+  if (!terminal?.id) return false;
+  // Terminal inputs have a separate idempotent queue; retain a locked marker while it drains.
+  const key = draftStorageKey("terminal", terminalDraftIdentity(terminal));
+  const text = state.drafts.get(draftKey(terminal)) || "";
+  const prior = readSavedDraft(key);
+  const uncertain = state.draftPaste?.id === terminal.id && state.draftPaste.dispatched || prior?.pending && prior.text === text;
+  const pending = uncertain ? { requestId: "terminal-input-pending", revision: 0,
+    text: state.drafts.get(draftKey(terminal)) || "", attachments: [] } : null;
+  return writeSavedDraft(key, {
+    text: state.drafts.get(draftKey(terminal)) || "", attachments: [], pending, revision: 0 });
+}
+function restoreTerminalDraft(terminal) {
+  if (state.drafts.has(draftKey(terminal))) return;
+  const row = readSavedDraft(draftStorageKey("terminal", terminalDraftIdentity(terminal)));
+  if (row && !row.pending) state.drafts.set(draftKey(terminal), row.text);
+  else if (row?.pending) draftStorageNotice("전송 중이던 터미널 입력은 자동 복원하지 않습니다. 터미널에서 반영 여부를 확인해 주세요.");
+}
+function persistAllDrafts() {
+  if (!state.authenticated || !draftRecoveryEnabled()) return false;
+  if (state.terminal) saveDraft();
+  let saved = true;
+  for (const entry of state.chats.values()) saved = persistChatDraft(entry) && saved;
+  for (const terminal of state.terminals) if (state.drafts.has(draftKey(terminal))) saved = persistTerminalDraft(terminal) && saved;
+  return saved && ![...state.chats.values()].some((entry) => entry.uploads || entry.uploadQueue?.length);
 }
 function chatVisible() {
   return !document.hidden && !boardCovered() && (!phoneLayout() || state.detailShown);
@@ -4334,20 +4521,28 @@ async function executeChatCommand(entry, command, value = null) {
   stopDictation({ abort: true, field: $("chat-input") });
   closeQuickReplies();
   entry.stateEpoch++;
+  if (!entry.commandRequest || entry.commandRequest.command !== command || entry.commandRequest.value !== value || entry.commandRequest.status === "applied")
+    entry.commandRequest = { requestId: requestId(), command, value, status: "pending" };
+  const commandRequest = entry.commandRequest;
   entry.commandBusy = true; entry.error = entry.inputError = ""; entry.notice = "명령을 적용하고 있습니다…";
   const epoch = state.authEpoch;
   updateChatComposer(entry); updateModelControls(entry);
   try {
-    const result = await api("/api/chat/command", { method: "POST", body: { source: entry.source, command, value, requestId: requestId() } });
+    const result = await api("/api/chat/command", { method: "POST", body: { source: entry.source, command, value, requestId: commandRequest.requestId } });
     if (epoch !== state.authEpoch) return false;
     entry.stateEpoch++;
     entry.notice = result.reason || "명령을 전달했습니다.";
     if (entry.data && (result.current || result.next)) entry.data.modelSettings = { ...(entry.data.modelSettings || {}), ...(result.current || {}), ...(result.next ? { next: result.next } : {}) };
     if (result.terminalId) refreshTerminals();
-    if (result.status === "unknown" || result.status === "rejected") { entry.error = entry.inputError = entry.notice; entry.notice = ""; return false; }
+    if (result.status === "unknown" || result.status === "rejected") {
+      if (result.status === "rejected") entry.commandRequest = null; else commandRequest.status = "unknown";
+      entry.error = entry.inputError = entry.notice; entry.notice = ""; return false;
+    }
+    commandRequest.status = "applied";
     if (currentChat(entry)) loadChatState(selectedSession(), true);
     return true;
   } catch (error) {
+    if (error.dispatchState === "not_started") entry.commandRequest = null; else commandRequest.status = "unknown";
     if (epoch === state.authEpoch && !error.unauthorized && !error.staleAuth) { entry.error = entry.inputError = error.message; entry.notice = ""; }
     return false;
   } finally {
@@ -4784,6 +4979,7 @@ function listNavigationKeydown(event) {
   if (event.defaultPrevented || boardKeysBlocked() || event.isComposing || event.keyCode === 229 ||
       event.altKey || event.shiftKey) return false;
   const target = event.target;
+  if (target?.id === "search" && state.historySearch.mode) return false;
   if (target?.closest?.("dialog")) return false;
   const key = TERMINAL_KEY_ALIASES[event.key] || event.key;
   const cards = () => [...($("groups")?.querySelectorAll?.(".card") || [])];
@@ -4849,6 +5045,7 @@ function receiptNotice(entry) {
   return chatReceiptCopy(entry.receipt);
 }
 function updateChatComposer(entry) {
+  persistChatDraft(entry);
   if (!currentChat(entry) || $("chat-composer")?.dataset.source !== chatKey(entry.source)) return;
   updateModelControls(entry);
   const supported = chatSupported(entry);
@@ -5097,6 +5294,7 @@ function applyChatReceipt(entry, receipt) {
     }
   }
   entry.pending = null;
+  persistChatDraft(entry);
 }
 const CHAT_RECHECK_RETRY_MS = 3000;
 async function loadChatState(s, manual = false, { join = false } = {}) {
@@ -5705,26 +5903,123 @@ const QUICK_REPLY_LENGTH = 200;
 function quickRepliesKey() {
   return INSTANCE.storagePrefix + "quickReplies";
 }
+function quickReplyLines(text) {
+  return String(text || "").split("\n").map((line) => Array.from(line.replace(/[\x00-\x1f\x7f-\x9f]/g, " ").trim())
+    .map((char) => char.length === 1 && char.charCodeAt(0) >= 0xd800 && char.charCodeAt(0) <= 0xdfff ? "�" : char)
+    .slice(0, QUICK_REPLY_LENGTH).join("")).filter(Boolean).slice(0, QUICK_REPLY_LIMIT);
+}
+function rememberQuickReplyEdits() {
+  if (state.quickRepliesEditor && $("quick-replies")) state.quickRepliesUnsaved = {
+    text: $("quick-replies").value, baseValue: state.quickRepliesEditor.value, revision: state.quickRepliesEditor.revision };
+}
 function quickReplies() {
+  if (Array.isArray(state.quickRepliesShared?.quickReplies)) return state.quickRepliesShared.quickReplies.slice();
+  if (state.quickRepliesLocal) return state.quickRepliesLocal.slice();
   try {
     const saved = JSON.parse(localStorage.getItem(quickRepliesKey()) || "null");
     if (Array.isArray(saved))
       return saved.filter((text) => typeof text === "string" && text.trim())
-        .map((text) => text.trim().slice(0, QUICK_REPLY_LENGTH)).slice(0, QUICK_REPLY_LIMIT);
+        .flatMap((text) => quickReplyLines(text)).slice(0, QUICK_REPLY_LIMIT);
   } catch {
     // Unreadable storage: the defaults.
   }
   return QUICK_REPLIES_DEFAULT.slice();
 }
 function saveQuickReplies(text) {
-  const rows = String(text || "").split("\n").map((line) => line.trim().slice(0, QUICK_REPLY_LENGTH))
-    .filter(Boolean).slice(0, QUICK_REPLY_LIMIT);
+  const rows = quickReplyLines(text);
   try {
     localStorage.setItem(quickRepliesKey(), JSON.stringify(rows));
+    state.quickRepliesError = "";
   } catch {
-    // Not kept in this browser; the list still applies until the page reloads.
+    state.quickRepliesError = state.quickRepliesShared?.quickReplies != null
+      ? "보드에는 저장됐습니다. 이 기기의 임시 복사만 보관하지 못했습니다."
+      : "이 기기에 문구를 보관하지 못했습니다. 현재 화면에서는 사용할 수 있습니다.";
   }
+  state.quickRepliesLocal = rows;
+  renderQuickReplySettings();
   return rows;
+}
+function renderQuickReplySettings(text = "") {
+  const status = $("quick-replies-status");
+  if (status) status.textContent = text || (state.quickRepliesSaving ? "다른 기기와 공유할 문구를 저장하고 있습니다…"
+    : state.quickRepliesError || (state.quickRepliesShared?.quickReplies != null ? "보드에 저장됨 · 모든 기기에서 공유합니다."
+      : "기존 문구입니다. 저장하면 모든 기기에서 공유합니다."));
+  for (const id of ["quick-replies-save", "quick-replies"]) if ($(id)) $(id).disabled = !!state.quickRepliesSaving;
+}
+function adoptQuickReplyPreferences(data) {
+  if (data?.ok !== true || !Number.isInteger(data.revision) || data.revision < 0 ||
+      data.quickReplies !== null && (!Array.isArray(data.quickReplies) || data.quickReplies.length > QUICK_REPLY_LIMIT ||
+        data.quickReplies.some((row) => typeof row !== "string" || !row.trim() || Array.from(row).length > QUICK_REPLY_LENGTH))) {
+    if (data?.ok === false) { state.quickRepliesError = data.error || "공유 문구를 읽지 못했습니다."; renderQuickReplySettings(); }
+    return false;
+  }
+  if (state.quickRepliesShared && data.revision < state.quickRepliesShared.revision) return false;
+  state.quickRepliesShared = { revision: data.revision, quickReplies: data.quickReplies?.slice() ?? null };
+  const editor = state.quickRepliesEditor, input = $("quick-replies");
+  if ($("settings-dialog")?.open && editor && input && !state.quickRepliesSaving) {
+    if (input.value === editor.value) {
+      input.value = quickReplies().join("\n"); editor.value = input.value; editor.revision = data.revision;
+    } else if (editor.revision === null) editor.revision = data.revision;
+    else if (editor.revision !== data.revision)
+      state.quickRepliesError = "다른 기기에서 문구를 바꿨습니다. 편집 내용은 유지됩니다. 최신 문구를 불러온 뒤 다시 편집해 주세요.";
+  }
+  renderQuickReplySettings();
+  return true;
+}
+async function loadQuickReplyPreferences({ replaceEditor = false } = {}) {
+  const authEpoch = state.authEpoch;
+  const editor = state.quickRepliesEditor, text = $("quick-replies")?.value;
+  if (!state.authenticated || networkOffline()) return false;
+  try {
+    const data = await api("/api/preferences", { authEpoch });
+    if (authEpoch !== state.authEpoch || !state.authenticated) return false;
+    const replacing = replaceEditor && state.quickRepliesEditor === editor && $("quick-replies")?.value === text;
+    if (replacing && editor) editor.value = text;
+    state.quickRepliesError = "";
+    const adopted = adoptQuickReplyPreferences(data);
+    if (adopted && replacing) state.quickRepliesUnsaved = null;
+    return adopted;
+  } catch (err) {
+    if (authEpoch === state.authEpoch && !err.unauthorized && !err.staleAuth) {
+      state.quickRepliesError = err.message; renderQuickReplySettings();
+    }
+    return false;
+  }
+}
+function saveSharedQuickReplies() {
+  if (state.quickRepliesSaving) return state.quickRepliesSaving;
+  const input = $("quick-replies"), editor = state.quickRepliesEditor;
+  if (!input || !editor || !state.authenticated) return Promise.resolve(false);
+  const text = input.value, authEpoch = state.authEpoch;
+  const rows = quickReplyLines(text);
+  const revision = editor.revision;
+  if (networkOffline() || revision === null) {
+    state.quickRepliesError = "연결 후 최신 문구를 불러온 뒤 저장해 주세요. 편집 내용은 유지됩니다.";
+    renderQuickReplySettings(); return Promise.resolve(false);
+  }
+  state.quickRepliesError = "";
+  const saving = (async () => {
+    try {
+      const data = await api("/api/preferences/quick-replies", { method: "POST", body: { quickReplies: rows, revision }, authEpoch });
+      if (authEpoch !== state.authEpoch || !state.authenticated || state.quickRepliesEditor !== editor) return false;
+      if (data?.ok !== true || JSON.stringify(data.quickReplies) !== JSON.stringify(rows) || !adoptQuickReplyPreferences(data))
+        throw new Error("저장 결과를 확인하지 못했습니다. 최신 문구를 다시 불러와 확인해 주세요.");
+      saveQuickReplies(rows.join("\n"));
+      input.value = rows.join("\n"); editor.value = input.value; editor.revision = data.revision;
+      state.quickRepliesUnsaved = null;
+      return true;
+    } catch (err) {
+      if (authEpoch === state.authEpoch && !err.unauthorized && !err.staleAuth) {
+        state.quickRepliesError = `${err.message} 편집 내용은 유지됩니다.`;
+      }
+      return false;
+    } finally {
+      if (state.quickRepliesSaving === saving) { state.quickRepliesSaving = null; renderQuickReplySettings(); }
+    }
+  })();
+  state.quickRepliesSaving = saving;
+  renderQuickReplySettings();
+  return saving;
 }
 function openQuickReplies(entry, input, trigger) {
   const ready = () => currentChat(entry) && input === $("chat-input") && !input.disabled && !input.readOnly &&
@@ -6151,6 +6446,224 @@ function userMessageParts(message) {
   if (chips.length && OUTBOX_ATTACHMENT_ONLY.has(body.trim())) body = "";
   return { body, attachments: chips };
 }
+function cancelHistorySearch() {
+  const search = state.historySearch;
+  search.run++; search.controller?.abort(); search.controller = null;
+  if (search.busy) search.status = "검색을 멈췄습니다. 찾은 내용은 유지됩니다.";
+  search.busy = false;
+}
+function renderHistorySearch() {
+  const search = state.historySearch, panel = $("body-search-panel");
+  if (!panel) return;
+  panel.hidden = !search.mode;
+  $("groups").hidden = search.mode;
+  $("search-body")?.setAttribute?.("aria-pressed", String(search.mode));
+  if ($("search")) {
+    $("search").placeholder = search.mode ? "저장 대화 본문 검색 · 2글자 이상" : "세션·프로젝트 검색";
+    $("search").setAttribute("aria-label", search.mode ? "저장 대화 본문 검색" : "세션·프로젝트·기기 검색");
+  }
+  if (!search.mode) return;
+  $("body-search-start").disabled = search.busy || search.hits.size >= 500;
+  $("body-search-start").textContent = search.cursor ? "계속 검색" : "본문 검색";
+  $("body-search-stop").hidden = !search.busy;
+  $("body-search-status").textContent = search.status || "모든 목록의 저장 대화 본문을 검색합니다. 검색어를 2글자 이상 입력해 주세요.";
+  const results = $("body-search-results"), desired = [...search.hits.values()].map((hit) => {
+    if (!hit.row) {
+      hit.row = button("", "body-search-result", () => openHistoryHit(hit));
+      hit.row.append(el("strong", null, hit.title || "제목 없는 대화"),
+        el("span", "body-search-meta", `${hit.hostLabel || hit.source.host} · ${hit.role === "user" ? "나" : "에이전트"}${hit.ts ? " · " + clock(hit.ts) : ""}`),
+        el("span", "body-search-snippet", hit.snippet));
+    }
+    return hit.row;
+  });
+  for (const row of [...results.children]) if (!desired.includes(row)) results.removeChild(row);
+  desired.forEach((row, index) => { if (results.children[index] !== row) results.insertBefore(row, results.children[index] || null); });
+}
+async function startHistorySearch({ more = false } = {}) {
+  const search = state.historySearch;
+  if (search.busy || !search.mode || !state.authenticated) return;
+  const query = search.query.trim();
+  if (query.length < 2 || query.length > 160 || networkOffline()) {
+    search.status = networkOffline() ? "연결 후 본문을 검색해 주세요." : "검색어를 2~160자로 입력해 주세요.";
+    renderHistorySearch(); return;
+  }
+  const authEpoch = state.authEpoch, run = ++search.run;
+  search.busy = true; search.controller = new AbortController();
+  if (!more) { search.hits.clear(); search.errors.clear(); search.cursor = null; search.skipped = 0; }
+  const current = () => authEpoch === state.authEpoch && state.authenticated && search.mode && search.run === run && search.query === query;
+  search.status = "저장 대화 본문을 검색하고 있습니다…"; renderHistorySearch();
+  try {
+    for (let page = 0; page < 60 && current(); page++) {
+      const params = new URLSearchParams({ q: query, includeRemoved: state.showRemoved ? "1" : "0", ...(search.cursor ? { cursor: search.cursor } : {}) });
+      const data = await api(`/api/history/search?${params}`, { authEpoch, signal: search.controller.signal });
+      if (!current()) return;
+      if (data.readOnly !== true || !Array.isArray(data.hits) || data.hits.length > 60 || !Array.isArray(data.errors) ||
+          !Number.isInteger(data.scanned) || !Number.isInteger(data.total) || data.scanned < 0 || data.scanned > data.total ||
+          data.cursor !== null && typeof data.cursor !== "string") throw new Error("본문 검색 응답을 확인하지 못했습니다.");
+      for (const hit of data.hits) {
+        if (!hit?.source || !/^[a-f0-9]{64}$/.test(hit.bodyHash || "") || typeof hit.snippet !== "string" ||
+            !Number.isInteger(hit.recordOffset) || hit.recordOffset < 0) throw new Error("본문 검색 결과가 올바르지 않습니다.");
+        const key = JSON.stringify([hit.source, hit.bodyHash, hit.recordOffset]);
+        if (!search.hits.has(key)) search.hits.set(key, hit);
+        if (search.hits.size >= 500) break;
+      }
+      for (const error of data.errors) search.errors.set(JSON.stringify(error.source), error);
+      search.skipped = (search.skipped || 0) + (data.skipped || 0);
+      search.status = `${data.scanned}/${data.total}개 대화 확인 · ${search.hits.size}개 메시지 찾음` +
+        (search.errors.size ? ` · ${search.errors.size}개 대화는 연결·저장 기록을 확인해야 합니다.` : "") +
+        (search.skipped ? " · 읽지 못한 기록 일부가 있습니다." : "");
+      if (data.cursor && data.cursor === search.cursor) throw new Error("검색 위치가 진행되지 않아 중단했습니다.");
+      search.cursor = data.cursor; renderHistorySearch();
+      if (!search.cursor || search.hits.size >= 500) break;
+    }
+    if (current() && search.hits.size >= 500) search.status += " 결과가 많아 500개까지만 표시합니다. 검색어를 좁혀 주세요.";
+    else if (current() && search.cursor) search.status += " 계속 검색으로 이전 기록을 이어서 확인할 수 있습니다.";
+  } catch (err) {
+    if (current() && !err.unauthorized && !err.staleAuth && err.name !== "AbortError") {
+      if (err.code === "history_catalog_changed") search.cursor = null;
+      search.status = `${err.message} 찾은 내용은 유지됩니다.`;
+    }
+  } finally {
+    if (search.run === run && authEpoch === state.authEpoch) { search.busy = false; renderHistorySearch(); }
+  }
+}
+function openHistoryHit(hit) {
+  if (!state.authenticated) return;
+  const s = allSessions().find((row) => chatKey(sourceOf(row)) === chatKey(hit.source) &&
+    (!hit.source.sessionId || row.sessionId === hit.source.sessionId));
+  if (!s) { toast("이 대화의 목록 정보가 바뀌었습니다. 다시 검색해 주세요."); return; }
+  const entry = chatEntry(s); entry.historyPreview = { ...hit, item: null };
+  prepareSessionListFor(s); select(s.key);
+  queueMicrotask(() => {
+    if (!currentChat(entry) || !entry.historyPreview) return;
+    historyPreviewRow(s, entry); refreshConversationView(entry);
+    loadLongMessage(s, entry.historyPreview.item);
+  });
+}
+function longMessageControls(s, entry, item) {
+  if (!entry || !['user', 'assistant'].includes(item.role) || !item.message.truncated && !item.history) return;
+  const hash = item.message.bodyHash;
+  const identity = conversationIdentity(s);
+  if (item.longEntry && item.longEntry !== entry || item.longIdentity && item.longIdentity !== identity) {
+    item.row.removeChild(item.longControls); item.longControls = null; item.longSignature = null;
+  }
+  item.longEntry = entry;
+  item.longIdentity = identity;
+  if (!item.longControls) {
+    const bar = el("div", "msg-long-controls");
+    item.longStatus = el("span", "msg-long-status"); item.longStatus.setAttribute("role", "status");
+    item.longLoad = button("전체 보기", "secondary", () => loadLongMessage(s, item));
+    item.longFold = button("접기", "secondary", () => {
+      const cached = entry.fullMessages.get(hash);
+      if (!cached) return;
+      cached.controller?.abort(); cached.run++; cached.busy = false; cached.visible = false;
+      longMessageControls(s, entry, item);
+    });
+    bar.append(item.longStatus, item.longLoad, item.longFold); item.row.append(bar); item.longControls = bar;
+  }
+  const full = entry.fullMessages.get(hash);
+  const visible = full?.visible && !!full.text;
+  item.displayMessage = visible ? { ...item.message, text: full.text, truncated: !full.complete } : null;
+  item.truncated = visible ? !full.complete : item.message.truncated === true;
+  item.longLoad.hidden = !!(visible && full.complete);
+  item.longLoad.disabled = !!full?.busy;
+  item.longLoad.textContent = full?.busy ? "불러오는 중…" : full?.text && !full.complete ? "다음 부분 불러오기" : "전체 보기";
+  item.longFold.hidden = !full?.visible && !full?.busy;
+  item.longStatus.textContent = full?.error || (full?.busy ? "저장된 본문을 읽고 있습니다." : visible && !full.complete
+    ? `${Array.from(full.text).length.toLocaleString()}자를 불러왔습니다.` : visible ? "전체 본문" : "");
+  item.longStatus.hidden = !item.longStatus.textContent;
+  if (item.truncatedNote) item.truncatedNote.hidden = !!visible;
+  const signature = JSON.stringify([!!visible, visible ? full.text : null, visible ? full.complete : null]);
+  if (item.longSignature !== signature) {
+    item.longSignature = signature;
+    const message = item.displayMessage || item.message;
+    item.bubble.replaceChildren();
+    if (item.role === "assistant" && typeof MessageFormat !== "undefined")
+      MessageFormat.render(item.bubble, message.text || "", { onCopy: (text) => copyText(text, "코드를 복사했습니다.") });
+    else if (item.role === "user") {
+      const shown = userMessageParts(message);
+      if (shown.attachments.length) {
+        if (shown.body) item.bubble.append(el("span", "msg-body", shown.body));
+        item.bubble.append(attachmentGroup(shown.attachments, `첨부 ${shown.attachments.length}개`, { showCaption: false }));
+      } else item.bubble.textContent = shown.body;
+    }
+    else item.bubble.textContent = message.text || "";
+  }
+}
+async function loadLongMessage(s, item) {
+  const entry = chatEntry(s), hash = item.message.bodyHash, authEpoch = state.authEpoch;
+  if (!currentChat(entry) || networkOffline()) return;
+  if (!/^[a-f0-9]{64}$/.test(hash || "")) {
+    toast("메시지 정보를 갱신합니다. 다시 전체 보기를 눌러 주세요.");
+    loadDetail(s, true); return;
+  }
+  let full = entry.fullMessages.get(hash);
+  if (!full) {
+    full = { text: "", complete: false, visible: true, busy: false, run: 0, scanOffset: item.message.recordOffset || 0,
+      recent: !Number.isInteger(item.message.recordOffset),
+      textOffset: 0, recordOffset: null, error: "", controller: null };
+    entry.fullMessages.set(hash, full);
+  }
+  if (full.busy) return;
+  full.visible = true;
+  if (full.complete) { longMessageControls(s, entry, item); return; }
+  full.busy = true; full.error = ""; const run = ++full.run; full.controller = new AbortController();
+  const current = () => authEpoch === state.authEpoch && state.authenticated && currentChat(entry) &&
+    state.chats.get(chatKey(entry.source)) === entry && full.run === run;
+  longMessageControls(s, entry, item);
+  try {
+    for (let page = 0; page < 32 && current(); page++) {
+      const params = new URLSearchParams({ ...sourceOf(s), ...(s.agent === "claude" && s.sessionId ? { sessionId: s.sessionId } : {}), bodyHash: hash,
+        offset: String(full.recordOffset ?? full.scanOffset), textOffset: String(full.textOffset), recent: full.recent ? "1" : "0" });
+      const data = await api(`/api/history/message?${params}`, { authEpoch, signal: full.controller.signal });
+      if (!current()) return;
+      if (data.readOnly !== true) throw new Error("저장 기록 응답을 확인하지 못했습니다.");
+      if (data.error) throw new Error(data.error);
+      if (data.forwardFallback === true && full.recent) { full.recent = false; full.scanOffset = 0; continue; }
+      if (typeof data.text === "string") {
+        if (data.bodyHash !== hash || data.textOffset !== full.textOffset || !Number.isInteger(data.recordOffset) ||
+            !Number.isInteger(data.fullLength) || data.fullLength < 0 || Array.from(data.text).length > 65536 ||
+            data.nextTextOffset !== null && (!Number.isInteger(data.nextTextOffset) || data.nextTextOffset <= full.textOffset))
+          throw new Error("본문 응답을 확인하지 못했습니다.");
+        if (new TextEncoder().encode(full.text + data.text).length > 2 * 1024 * 1024) throw new Error("이 화면에서 펼칠 수 있는 길이를 넘었습니다. 원본 기록에서 확인해 주세요.");
+        full.text += data.text; full.recordOffset = data.recordOffset; full.fullLength = data.fullLength;
+        full.textOffset = data.nextTextOffset ?? data.fullLength; full.complete = data.nextTextOffset === null;
+        break;
+      }
+      if (!Number.isInteger(data.nextOffset) || data.nextOffset <= full.scanOffset)
+        throw new Error("저장된 본문을 찾지 못했습니다. 대화를 새로고침한 뒤 다시 시도해 주세요.");
+      full.scanOffset = data.nextOffset;
+      if (page === 31) full.error = "긴 기록을 계속 찾으려면 전체 보기를 다시 눌러 주세요.";
+    }
+  } catch (err) {
+    if (current() && !err.unauthorized && !err.staleAuth && err.name !== "AbortError") full.error = err.message;
+  } finally {
+    if (authEpoch === state.authEpoch && full.run === run) {
+      full.busy = false;
+      if (currentChat(entry)) longMessageControls(s, entry, item);
+    }
+  }
+}
+function historyPreviewRow(s, entry) {
+  const preview = entry?.historyPreview;
+  if (!preview) return null;
+  if (!preview.item) {
+    const row = el("section", "history-message-preview");
+    row.setAttribute("aria-label", "검색한 저장 메시지");
+    const heading = el("div", "history-preview-heading");
+    heading.append(el("strong", null, "검색한 메시지 · 저장 기록"), button("닫기", "secondary", () => {
+      if (entry.historyPreview === preview) { entry.historyPreview = null; refreshConversationView(entry); }
+    }));
+    const bubble = el("div", "bubble"); row.append(heading, bubble);
+    preview.item = { row, bubble, role: preview.role, history: true, truncated: true,
+      message: { role: preview.role, text: preview.snippet, bodyHash: preview.bodyHash,
+        recordOffset: preview.recordOffset, truncated: true, fullLength: preview.fullLength } };
+    row.append(button("본문 복사", "secondary", () => copyText(messagePlainText(preview.item),
+      preview.item.truncated ? "불러온 부분을 복사했습니다." : "전체 본문을 복사했습니다.")));
+  }
+  longMessageControls(s, entry, preview.item);
+  return preview.item.row;
+}
 function renderMessages(s, messages, error = "", fresh = false) {
   const list = $("messages");
   if (!list) return;
@@ -6178,7 +6691,7 @@ function renderMessages(s, messages, error = "", fresh = false) {
   const oldWarningHeight = list.conversationError && [...list.children].includes(list.conversationError)
     ? list.conversationError.offsetHeight || 0 : 0;
   const keys = messages.map((message) => JSON.stringify([message.role, message.text, message.ts || null,
-    attachmentMetadata(message.attachments), message.truncated === true]));
+    attachmentMetadata(message.attachments), message.truncated === true, message.bodyHash || null]));
   // The server's 80-row window drops whole rows at its start: the rows on
   // screen are first lined up with the new ones where they overlap most, so
   // two rows with the same key (the same first command of two Codex turns,
@@ -6200,7 +6713,7 @@ function renderMessages(s, messages, error = "", fresh = false) {
   const rows = messages.map((message, index) => {
     const key = keys[index];
     const retained = index < overlap ? previous[shift + index] : available.get(key)?.shift();
-    if (retained) return retained;
+    if (retained) { longMessageControls(s, entry, retained); return retained; }
     const role = ["user", "assistant", "tool", "system"].includes(message.role) ? message.role : "system";
     // A tool record is one line of its group (toolGroupNode), not a row of its own.
     if (role === "tool") return { key, message, row: toolItemNode(message), role, truncated: false, kind: toolKindOf(message) };
@@ -6231,11 +6744,12 @@ function renderMessages(s, messages, error = "", fresh = false) {
     const truncated = message.truncated === true;
     if (truncated) {
       const total = Number.isInteger(message.fullLength) ? ` · 전체 ${message.fullLength.toLocaleString()}자` : "";
-      row.append(el("p", "msg-truncated", `긴 메시지라 앞부분만 표시합니다${total}. 전체 내용은 터미널에서 확인해 주세요.`));
+      row.truncatedNote = el("p", "msg-truncated", `긴 메시지라 앞부분만 표시합니다${total}. 전체 보기로 나머지를 불러올 수 있습니다.`);
+      row.append(row.truncatedNote);
     }
     // Copy, code copy, selection and the terminal live in a menu: long press
     // on touch, right click or this button (shown on hover) with a mouse.
-    const item = { key, message, row, role, truncated };
+    const item = { key, message, row, bubble, role, truncated, truncatedNote: row.truncatedNote };
     row.messageItem = item;
     if (role !== "system") {
       const more = button("", "msg-more", () => openMessageMenu(row));
@@ -6245,10 +6759,13 @@ function renderMessages(s, messages, error = "", fresh = false) {
       row.moreButton = more;
       row.append(more);
     }
+    longMessageControls(s, entry, item);
     return item;
   });
   groupMessageRows(rows);
   const desired = toolGroupRows(list, rows);
+  const preview = historyPreviewRow(s, entry);
+  if (preview) desired.unshift(preview);
   // This board's own sends that the transcript does not show yet, then the
   // working indicator, always after the transcript.
   let tail = [];
@@ -6427,8 +6944,9 @@ async function copyText(text, done) {
   }
 }
 function messagePlainText(item) {
-  const text = item?.message?.text || "";
-  if (item?.role === "user") return userMessageParts(item.message).body;
+  const message = item?.displayMessage || item?.message;
+  const text = message?.text || "";
+  if (item?.role === "user") return userMessageParts(message).body;
   return item?.role === "assistant" && typeof MessageFormat !== "undefined" ? MessageFormat.plainText(text) : text;
 }
 function messageActions(s, item) {
@@ -6438,7 +6956,7 @@ function messageActions(s, item) {
     actions.push({ label: `도구 기록 ${item.items.length}개 모두 복사`, run: () => copyText(text, "도구 실행 기록을 복사했습니다.") });
   } else if (text.trim()) {
     actions.push({ label: item.truncated ? "표시된 부분 복사" : "복사", run: () => copyText(text, item.truncated
-      ? "표시된 부분만 복사했습니다. 전체 내용은 터미널에서 확인해 주세요." : "메시지 본문을 복사했습니다.") });
+      ? "표시된 부분만 복사했습니다. 전체 보기로 나머지를 불러올 수 있습니다." : "메시지 본문을 복사했습니다.") });
   }
   const code = item.role === "assistant" && typeof MessageFormat?.codeBlocks === "function"
     ? MessageFormat.codeBlocks(item.message.text || "") : [];
@@ -7287,8 +7805,10 @@ function stopTerminalReader() {
   state.connected = false;
 }
 function saveDraft() {
-  if (state.terminal)
+  if (state.terminal) {
     state.drafts.set(draftKey(state.terminal), $("terminal-draft").value);
+    persistTerminalDraft(state.terminal);
+  }
 }
 function cancelDraftPaste() {
   const pending = state.draftPaste;
@@ -7711,6 +8231,7 @@ async function openTerminal(terminal, { recordHistory = true } = {}) {
   $("terminal-close").className = `terminal-button terminal-close${copy.danger ? " danger-quiet" : ""}`;
   $("terminal-close").disabled = !state.terminalAlive;
   $("terminal-context").textContent = terminalContextCopy(terminal, copy);
+  restoreTerminalDraft(terminal);
   $("terminal-draft").value = state.drafts.get(draftKey(terminal)) || "";
   state.composing = false;
   state.draftRevision++;
@@ -8500,6 +9021,8 @@ async function pasteDraft(submit = false) {
       return;
     }
     const normalized = text.replace(/\r\n?/g, "\n");
+    pending.dispatched = true;
+    saveDraft();
     await sendInput(bracketed ? `\x1b[200~${normalized}\x1b[201~` : normalized);
     if (pending.cancelled || state.terminal?.id !== pending.id || state.inputEpoch !== pending.epoch) return;
     if (submit) {
@@ -8528,6 +9051,7 @@ async function pasteDraft(submit = false) {
     clearTimeout(pending.compositionTimer);
     if (state.draftPaste === pending) {
       state.draftPaste = null;
+      if (state.terminal?.id === pending.id) saveDraft();
       terminalStatus($("terminal-status").textContent, state.connected);
     }
   }
@@ -9259,6 +9783,7 @@ async function pollOnce(refresh = false, { capabilities = true } = {}) {
     const snapshot = await api(`/api/snapshot${refresh ? "?refresh=1" : ""}`, { authEpoch });
     assertAuthEpoch(authEpoch);
     state.snapshot = snapshot;
+    if (snapshot.quickReplyPreferences) adoptQuickReplyPreferences(snapshot.quickReplyPreferences);
     serverBooted(snapshot?.bootId);
     if (Number.isInteger(snapshot?.version)) state.snapshotVersion = snapshot.version;
     const firstAuthentication = !state.authenticated;
@@ -9487,6 +10012,11 @@ function bindPullToRefresh(root) {
   root.addEventListener("touchcancel", () => { start = null; distance = 0; if (!state.pullRefreshing) showPull(0); }, { passive: true });
 }
 function showLogin() {
+  if (state.historySearch.mode && $("search")) $("search").value = state.search;
+  cancelHistorySearch();
+  state.historySearch.mode = false; state.historySearch.query = ""; state.historySearch.hits.clear();
+  state.historySearch.errors.clear(); state.historySearch.cursor = null; state.historySearch.status = "";
+  clearSavedDrafts();
   if ($("board-status")) $("board-status").open = false;
   closeQuickReplies();
   beginAuthEpoch();
@@ -9513,6 +10043,8 @@ function showLogin() {
   // Object URLs of picked images are released with their drafts.
   for (const entry of state.chats.values()) for (const key of [...(entry.thumbs?.keys() || [])]) revokeThumb(entry, key);
   state.chats.clear();
+  state.quickRepliesShared = null; state.quickRepliesEditor = null; state.quickRepliesSaving = null; state.quickRepliesError = "";
+  state.quickRepliesUnsaved = null;
   state.conversationViews.clear();
   window.SessionholicGoals?.locked?.();
   state.phaseFilter = "";
@@ -9789,6 +10321,8 @@ function unsavedWork() {
     [...state.chats.values()].some((entry) => entry.text || entry.attachments.length || entry.pending || entry.uploads);
 }
 function warnDraftUnload(event) {
+  if (state.discardOnReload) return;
+  persistAllDrafts();
   if (!unsavedWork() || state.discardOnReload) return;
   event.preventDefault();
   event.returnValue = "";
@@ -9864,7 +10398,15 @@ window.addEventListener("DOMContentLoaded", () => {
     if (event.target?.closest?.("button")) $("board-status").open = false;
   });
   $("update-banner")?.addEventListener("click", updateBannerPressed);
-  $("quick-replies")?.addEventListener("change", (event) => { event.target.value = saveQuickReplies(event.target.value).join("\n"); });
+  $("quick-replies-save")?.addEventListener("click", saveSharedQuickReplies);
+  $("quick-replies-reload")?.addEventListener("click", () => loadQuickReplyPreferences({ replaceEditor: true }));
+  $("quick-replies-close")?.addEventListener("click", () => {
+    rememberQuickReplyEdits(); $("settings-dialog").close(); $("settings")?.focus?.({ preventScroll: true });
+  });
+  $("draft-recovery")?.addEventListener("change", (event) => {
+    prefs.set("draftRecovery", event.target.checked);
+    if (!event.target.checked) clearSavedDrafts(); else persistAllDrafts();
+  });
   $("settings-dialog").addEventListener("cancel", (event) => {
     event.preventDefault();
     closeSettings();
@@ -9967,10 +10509,28 @@ window.addEventListener("DOMContentLoaded", () => {
     }
   });
   $("search").addEventListener("input", (event) => {
+    if (state.historySearch.mode) {
+      cancelHistorySearch(); state.historySearch.query = event.target.value.trim();
+      state.historySearch.cursor = null; state.historySearch.hits.clear(); state.historySearch.errors.clear();
+      state.historySearch.status = "검색어를 입력하고 본문 검색을 눌러 주세요."; renderHistorySearch(); return;
+    }
     state.search = event.target.value.trim();
     window.SessionholicGoals?.setQuery?.(state.search);
     render();
   });
+  $("search-body")?.addEventListener("click", () => {
+    cancelHistorySearch(); state.historySearch.mode = !state.historySearch.mode;
+    if (state.historySearch.mode) state.historySearch.query = $("search").value.trim();
+    else $("search").value = state.search;
+    renderHistorySearch();
+  });
+  $("search")?.addEventListener("keydown", (event) => {
+    if (state.historySearch.mode && event.key === "Enter" && !event.isComposing && event.keyCode !== 229 && !event.repeat) {
+      event.preventDefault(); startHistorySearch({ more: !!state.historySearch.cursor });
+    }
+  });
+  $("body-search-start")?.addEventListener("click", () => startHistorySearch({ more: !!state.historySearch.cursor }));
+  $("body-search-stop")?.addEventListener("click", () => { cancelHistorySearch(); renderHistorySearch(); });
   $("show-old").addEventListener("change", (event) => {
     state.showOld = event.target.checked;
     render();
@@ -10092,7 +10652,7 @@ window.addEventListener("DOMContentLoaded", () => {
     }
   });
   // A page restored from the back-forward cache may fire no visibilitychange.
-  window.addEventListener("pagehide", () => { state.pageHidden = true; });
+  window.addEventListener("pagehide", () => { persistAllDrafts(); state.pageHidden = true; });
   window.addEventListener("pageshow", (event) => {
     settleViewport();
     if (event.persisted && !document.hidden) pageShown();

@@ -39,7 +39,7 @@ import instance
 import settings
 from goals import GoalError, Goals
 from work_service import WorkService
-from session_labels import SessionLabels, SessionOpened, SessionPinned, SessionRemoved, SessionSeen, SessionTidied, reference as label_reference
+from session_labels import BoardPreferences, SessionLabels, SessionOpened, SessionPinned, SessionRemoved, SessionSeen, SessionTidied, reference as label_reference
 
 HERE = Path(__file__).resolve().parent
 WEB = HERE / "web"
@@ -2750,6 +2750,16 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 if url.path == "/api/goals":
                     return self.send_json(200, self.server.goals.snapshot())
+                if url.path == "/api/preferences":
+                    return self.send_json(200, self.server.preferences.snapshot())
+                if url.path in ("/api/history/message", "/api/history/search"):
+                    if not self.server.history_gate.acquire(blocking=False):
+                        return self.send_json(429, {"error": "기록을 읽고 있습니다. 잠시 뒤 다시 시도해 주세요."})
+                    try:
+                        result = self.history_message(query) if url.path.endswith('/message') else self.history_search(query)
+                        return self.send_json(200, result)
+                    finally:
+                        self.server.history_gate.release()
                 if url.path == "/api/work":
                     if not getattr(self.server, "work_list", True):
                         # Only a screen from before the work tab was retired asks for this: it is
@@ -2831,6 +2841,121 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_json(404, {"error": "없는 경로입니다."})
         return self.static(url.path, url.query)
 
+    @staticmethod
+    def history_number(value, limit=2 ** 40):
+        if value is None: return 0
+        if not isinstance(value, str) or not re.fullmatch(r'[0-9]{1,13}', value) or int(value) > limit:
+            raise ValueError('대화 기록 위치가 올바르지 않습니다.')
+        return int(value)
+
+    @staticmethod
+    def history_native(source, offset=0):
+        return {"agent": source["agent"], "id": source.get('sessionId') or source['id'] if source['agent'] == 'claude' else source['id'],
+                "home": source.get('home') or ('.claude' if source['agent'] == 'claude' else '.codex'), "offset": offset}
+
+    def history_read(self, source, payload):
+        host = next((host for host in self.server.board.hosts if host['name'] == source['host']), None)
+        if host is None: raise ValueError('등록된 기기를 선택해 주세요.')
+        result = self.server.board.runner(host, ['history', json.dumps(payload, ensure_ascii=True, separators=(',', ':'))], 20)
+        if (not isinstance(result, dict) or result.get('readOnly') is not True or
+                not isinstance(result.get('results'), list) or len(result['results']) != len(payload['sources']) or
+                len(json.dumps(result, ensure_ascii=True)) > 2 * 1024 * 1024):
+            raise RuntimeError('저장 기록 응답을 확인하지 못했습니다.')
+        for expected, row in zip(payload['sources'], result['results']):
+            if not isinstance(row, dict) or row.get('source') != expected:
+                raise RuntimeError('다른 대화의 기록 응답을 거절했습니다.')
+        return scrub_payload(result)['results']
+
+    def history_message(self, query):
+        if set(query) - {'host', 'agent', 'id', 'home', 'sessionId', 'bodyHash', 'offset', 'textOffset', 'recent'}:
+            raise ValueError('메시지 읽기 형식이 올바르지 않습니다.')
+        digest = query.get('bodyHash')
+        if query.get('recent') not in (None, '0', '1'): raise ValueError('메시지 읽기 범위를 확인해 주세요.')
+        if not isinstance(digest, str) or not re.fullmatch(r'[a-f0-9]{64}', digest):
+            raise ValueError('전체 내용을 읽을 메시지를 다시 선택해 주세요.')
+        source = self.listed_source({key: query[key] for key in ('host', 'agent', 'id', 'home', 'sessionId') if key in query})
+        offset, text_offset = self.history_number(query.get('offset')), self.history_number(query.get('textOffset'))
+        result = self.history_read(source, {'sources': [self.history_native(source, offset)], 'bodyHash': digest,
+                                           'textOffset': text_offset, 'recent': query.get('recent') == '1'})[0]
+        if result.get('bodyHash') is not None and (result.get('bodyHash') != digest or result.get('textOffset') != text_offset or
+                not isinstance(result.get('text'), str) or len(result['text']) > 65536):
+            raise RuntimeError('메시지 본문 응답이 일치하지 않습니다.')
+        return {**result, 'readOnly': True}
+
+    def history_search(self, query):
+        if set(query) - {'q', 'cursor', 'includeRemoved'}:
+            raise ValueError('본문 검색 형식이 올바르지 않습니다.')
+        text = query.get('q', '').strip()
+        if (not 2 <= len(text) <= 160 or any(ord(char) < 32 or 0xd800 <= ord(char) <= 0xdfff for char in text) or
+                query.get('includeRemoved') not in (None, '0', '1')):
+            raise ValueError('본문 검색은 2~160자로 입력해 주세요.')
+        snapshot = self.snapshot()
+        sources = []
+        for host in snapshot.get('hosts', []):
+            for agent in ('codex', 'claude'):
+                for row in (host.get('data') or {}).get(agent, []):
+                    sid = row.get('id') or row.get('sessionId')
+                    if not isinstance(sid, str) or not SESSION_ID.fullmatch(sid): continue
+                    if row.get('removedAt') and query.get('includeRemoved') != '1': continue
+                    source = {**row, 'host': host['name'], 'agent': agent, 'id': sid,
+                              'hostLabel': host.get('label') or host['name'], 'online': bool(host.get('ok'))}
+                    if agent == 'codex' and not HOME_KEY.fullmatch(source.get('home') or ''): continue
+                    sources.append(source)
+        sources.sort(key=lambda row: (row['host'], row['agent'], row.get('home') or '', row['id'], row.get('sessionId') or ''))
+        catalog = hashlib.sha256(json.dumps([{**self.history_native(row), 'host': row['host']} for row in sources], sort_keys=True).encode()).hexdigest()[:16]
+        query_hash = hashlib.sha256(text.encode()).hexdigest()[:16]
+        index, offset = 0, 0
+        cursor = query.get('cursor')
+        if cursor:
+            if not re.fullmatch(r'[A-Za-z0-9_-]{1,500}', cursor): raise ValueError('검색 위치가 올바르지 않습니다.')
+            try: position = json.loads(base64.urlsafe_b64decode(cursor + '=' * (-len(cursor) % 4)))
+            except (ValueError, UnicodeError): raise ValueError('검색 위치가 올바르지 않습니다.') from None
+            if (not isinstance(position, dict) or set(position) != {'catalog', 'query', 'index', 'offset'} or
+                    position.get('catalog') != catalog or position.get('query') != query_hash):
+                raise GoalError('대화 목록이나 검색어가 바뀌었습니다. 검색을 다시 시작해 주세요.', 'history_catalog_changed', 409)
+            index, offset = position.get('index'), position.get('offset')
+            if type(index) is not int or not 0 <= index <= len(sources) or type(offset) is not int or not 0 <= offset <= 2 ** 40:
+                raise ValueError('검색 위치가 올바르지 않습니다.')
+        hits, errors, skipped = [], [], 0
+        if index >= len(sources): return {'hits': [], 'errors': [], 'cursor': None, 'scanned': index, 'total': len(sources), 'readOnly': True}
+        first = sources[index]
+        batch = []
+        for row in sources[index:index + 3]:
+            if row['host'] != first['host']: break
+            batch.append(row)
+        refs = [self.history_native(row, offset if at == 0 else 0) for at, row in enumerate(batch)]
+        try:
+            if not first['online']: raise RuntimeError('기기에 연결되지 않았습니다.')
+            results = self.history_read(first, {'query': text, 'sources': refs})
+        except (ValueError, RuntimeError, OSError):
+            results = [{'error': '기기에 연결하거나 저장 기록을 확인한 뒤 다시 검색해 주세요.', 'complete': True, 'hits': []} for _ in batch]
+        advance, next_offset = 0, 0
+        blocked = False
+        for source, result in zip(batch, results):
+            identity = {key: source[key] for key in ('host', 'agent', 'id', 'home', 'sessionId') if key in source}
+            found = result.get('hits')
+            if not isinstance(found, list) or len(found) > 20: raise RuntimeError('검색 결과 형식을 확인하지 못했습니다.')
+            for match in found:
+                if (not isinstance(match, dict) or not re.fullmatch(r'[a-f0-9]{64}', str(match.get('bodyHash') or '')) or
+                        match.get('role') not in ('user', 'assistant') or not isinstance(match.get('snippet'), str) or len(match['snippet']) > 240 or
+                        type(match.get('recordOffset')) is not int or match['recordOffset'] < 0):
+                    raise RuntimeError('검색 결과를 확인하지 못했습니다.')
+                hits.append({**match, 'source': identity, 'title': source.get('displayTitle') or source.get('title') or '제목 없는 대화',
+                             'hostLabel': source['hostLabel']})
+            if result.get('error'):
+                errors.append({'source': identity, 'error': result['error']})
+            skipped += result.get('skipped', 0) if type(result.get('skipped')) is int else 0
+            if not blocked:
+                if result.get('complete') is True or result.get('error'): advance += 1
+                else:
+                    if type(result.get('nextOffset')) is not int or result['nextOffset'] <= refs[advance]['offset']:
+                        raise RuntimeError('검색 위치가 진행되지 않아 중단했습니다.')
+                    next_offset = result['nextOffset']; blocked = True
+        index += advance
+        position = {'catalog': catalog, 'query': query_hash, 'index': index, 'offset': next_offset}
+        encoded = base64.urlsafe_b64encode(json.dumps(position, separators=(',', ':')).encode()).decode().rstrip('=') if index < len(sources) else None
+        return {'hits': hits, 'errors': errors, 'cursor': encoded, 'scanned': index, 'total': len(sources), 'skipped': skipped, 'readOnly': True}
+
     def snapshot(self):
         """The board's snapshot with this server process's bootId."""
         # A "새 세션" terminal's session may have appeared in this snapshot.
@@ -2841,7 +2966,11 @@ class Handler(BaseHTTPRequestHandler):
         snapshot = self.server.session_removed.decorate(snapshot)
         snapshot = self.server.session_opened.decorate(snapshot)
         snapshot = self.server.session_pinned.decorate(snapshot)
-        return {**snapshot, "bootId": self.server.boot_id}
+        try:
+            preferences = self.server.preferences.snapshot()
+        except GoalError as exc:
+            preferences = {"ok": False, **exc.payload}
+        return {**snapshot, "bootId": self.server.boot_id, "quickReplyPreferences": preferences}
 
     def stream_events(self, query):
         """Server-sent events; the same cookie login as other reads, no CSRF for a GET."""
@@ -2994,6 +3123,12 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_json(200, self.server.work.update(work_match[1], data))
             if path in ("/api/session/preview", "/api/session/action", "/api/session/archive"):
                 return self.send_json(200, self.session_control(path, data))
+            if path == "/api/preferences/quick-replies":
+                if set(data) != {"quickReplies", "revision"}:
+                    raise ValueError('빠른 답장과 설정 버전을 확인해 주세요.')
+                result = self.server.preferences.set_quick_replies(data['quickReplies'], data['revision'])
+                self.server.board.changed(force=True)
+                return self.send_json(200, result)
             if path == "/api/session/label":
                 return self.send_json(200, self.session_label(data))
             if path == "/api/session/seen":
@@ -3198,6 +3333,7 @@ def make_server(bind, port, board, token, terminals=None, workflow=None, state_d
     server.hardware = hardware
     server.goals = Goals(state_dir)
     server.session_labels = SessionLabels(state_dir)
+    server.preferences = BoardPreferences(state_dir)
     server.session_seen = SessionSeen(state_dir)
     server.session_pinned = SessionPinned(state_dir)
     server.session_tidied = SessionTidied(state_dir)
@@ -3212,6 +3348,7 @@ def make_server(bind, port, board, token, terminals=None, workflow=None, state_d
     # bootId reads /api/capabilities again instead of sending a token from before a restart.
     server.boot_id = secrets.token_urlsafe(12)
     server.upload_gate = threading.BoundedSemaphore(2)
+    server.history_gate = threading.BoundedSemaphore(2)
     server.assets = StaticAssets(WEB)
     try:
         server.terminals = terminals if terminals is not None else TerminalManager(state_dir=Path(state_dir) / "terminals", max_terminals=max_terminals or MAX_TERMINALS)

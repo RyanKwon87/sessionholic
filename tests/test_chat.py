@@ -267,6 +267,16 @@ class ChatTest(unittest.TestCase):
         with self.assertRaises(ValueError): self.chat.upload({**REF,'host':'evil'},'file',b'X')
         result=self.chat.upload({**REF,'cwd':'/evil'},'safe.txt',b'X')['attachment']
         self.assertTrue(result['path'].startswith(str(self.project.resolve())))
+    def test_a_slow_codex_send_reports_its_host_request_as_one_step(self):
+        import contextlib, io
+        ticks = iter(range(1000))
+        self.chat.clock = lambda: next(ticks) * 1.5
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.chat.send({'source':REF,'requestId':'request-0001','text':'개인 메시지'})
+        lines = [line for line in err.getvalue().splitlines() if ': 느린 전송 ' in line]
+        self.assertEqual(len(lines), 1)
+        self.assertTrue(lines[0].endswith(' codex 4.50s prepare=1.50 send=1.50 rest=1.50'), lines[0])
     def test_cwd_drift_blocks_upload(self):
         self.source['cwd']='/changed'
         self.board.poll(HOST)
@@ -1262,6 +1272,30 @@ class ChatClaudeTest(unittest.TestCase):
         restarted.send({'source': CLAUDE_REF, 'requestId': 'request-0001', 'text': '첫 줄\n둘째 줄'})
         self.assertEqual(len(self.terms.pastes), 1)
         self.assertEqual(self.calls, [('chat', 'capabilities')])
+
+    def test_a_slow_send_leaves_one_line_of_its_step_times_and_nothing_of_the_message(self):
+        import contextlib, io, instance
+        self.kind('interactive')
+        self.terminal()
+        mark = instance.current()['brand']['logPrefix'] + ': 느린 전송 '
+        def sent(text, rid, clock):
+            self.chat.clock = clock
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                self.assertEqual(self.send(rid=rid, text=text)['status'], 'accepted')
+            return [line for line in err.getvalue().splitlines() if line.startswith(mark)]
+        # Each step takes half a second on this clock.
+        ticks = iter(range(1000))
+        lines = sent('개인 메시지 본문', 'request-0001', lambda: next(ticks) * 0.5)
+        self.assertEqual(len(lines), 1)
+        words = lines[0][len(mark):].split(' ')
+        self.assertEqual(words[:2], ['claude', '4.50s'])
+        self.assertEqual([word.split('=')[0] for word in words[2:]],
+                         ['prepare', 'lock', 'capabilities', 'terminal', 'screen', 'paste', 'submit', 'save', 'rest'])
+        for private in ('개인', '본문', self.row['title'], TERMINAL_ID, CLAUDE_REF['id'], CLAUDE_SID, 'local'):
+            self.assertNotIn(private, lines[0])
+        # A send under two seconds says nothing.
+        self.assertEqual(sent('다음 메시지', 'request-0002', lambda: 7.0), [])
 
     def test_a_message_left_in_the_input_box_after_its_enter_gets_enter_once_more(self):
         # Claude Code took the Enter after the paste as a newline: the message sits in the box.

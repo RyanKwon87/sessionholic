@@ -7,8 +7,11 @@ from pathlib import Path
 import re
 import secrets
 import stat
+import sys
 import threading
 import time
+
+import instance
 
 MAX_FILE = 20 * 1024 * 1024
 REQUEST = re.compile(r'[A-Za-z0-9_-]{8,100}\Z')
@@ -89,6 +92,31 @@ WAITING_CONVERSATIONS = 64
 # A reader sharing another reader's remote read waits this long (the RPC itself has 20 s).
 STATE_SHARE_SECONDS = 30
 STATE_UNAVAILABLE = '대화 상태를 확인하지 못했습니다. 잠시 뒤 다시 시도해 주세요.'
+# A send slower than this leaves one stderr line with how long each of its steps took, to tell
+# slow sends' causes apart: the agent kind and seconds only, never text, a title or a token.
+SEND_TIMING_SECONDS = 2.0
+
+
+class SendTiming:
+    """The steps of one send and their seconds; reported only when the whole send was slow."""
+    def __init__(self, agent, clock):
+        self.agent = agent if agent in ('claude', 'codex') else 'other'
+        self.clock = clock
+        self.start = self.last = clock()
+        self.steps = []
+
+    def mark(self, step):
+        now = self.clock()
+        self.steps.append((step, now - self.last))
+        self.last = now
+
+    def report(self):
+        now = self.clock()
+        if now - self.start < SEND_TIMING_SECONDS:
+            return
+        steps = ' '.join('%s=%.2f' % step for step in self.steps + [('rest', now - self.last)])
+        sys.stderr.write('%s: 느린 전송 %s %.2fs %s\n' % (instance.current()['brand']['logPrefix'],
+                                                        self.agent, now - self.start, steps))
 
 
 class StateRead:
@@ -330,6 +358,8 @@ class Chat:
         self.waiting = {}
         # state key -> the newest remote read in progress (StateRead).
         self.reads = {}
+        # Times a send's steps (SendTiming).
+        self.clock = time.monotonic
 
     @staticmethod
     def identity(source):
@@ -1077,10 +1107,13 @@ class Chat:
             return False
         return True
 
-    def _send_claude(self, ref, source, host, request_id, text, ids, manifest):
+    def _send_claude(self, ref, source, host, request_id, text, ids, manifest, timing=None):
         windows = host.get('platform') == 'windows'
+        timing = timing or SendTiming('claude', self.clock)
         turn = self._claude_lock_for(source)
-        if not turn.acquire(timeout=30):
+        acquired = turn.acquire(timeout=30)
+        timing.mark('lock')
+        if not acquired:
             with self.lock:
                 warming = self._warm_key(source) in self.warming
             raise SendRejected('이 세션의 연결을 여는 중입니다. 잠시 뒤 다시 보내 주세요.' if warming else
@@ -1093,12 +1126,14 @@ class Chat:
                 current = self.rpc(host, 'capabilities', source)
             except (RuntimeError, OSError):
                 raise SendRejected('Claude 세션 상태를 확인하지 못해 보내지 않았습니다. 다시 시도해 주세요.', 409) from None
+            timing.mark('capabilities')
             if current.get('phase') == 'done' and source.get('kind') != 'background':
                 raise SendRejected(CLAUDE_EXTERNAL, 409)
             try:
                 terminal = self._board_terminal(source)
             except (RuntimeError, OSError):
                 raise SendRejected('보드 터미널 상태를 확인하지 못해 보내지 않았습니다. 잠시 뒤 다시 시도해 주세요.', 409) from None
+            timing.mark('terminal')
             if terminal is None:
                 if windows and source.get('kind') != 'background':
                     # Resuming a stored PC conversation starts a process: only its terminal button does.
@@ -1114,11 +1149,13 @@ class Chat:
                 except (ValueError, RuntimeError, OSError) as exc:
                     raise SendRejected(str(exc) if isinstance(exc, (ValueError, RuntimeError)) else
                                        'Claude 터미널을 열지 못했습니다.', 409, code='terminal_unavailable') from None
+                timing.mark('open')
                 self._forget_state(source)
             elif terminal['id'] in self.unsettled:
                 # Opened by an earlier send that timed out waiting: never paste into a loading screen.
                 if not self._settled(terminal['id']):
                     raise SendRejected(CLAUDE_NOT_READY, 409, code='terminal_unavailable')
+                timing.mark('settle')
             self.unsettled.discard(terminal['id'])
             try:
                 screen = self.workflow.terminals.capture(terminal['id'])
@@ -1158,14 +1195,18 @@ class Chat:
                       'wordsLength': len(words), 'receipt': unknown}
             with os.fdopen(fd, 'w', encoding='utf-8') as file:
                 json.dump(record, file)
+            # The screen check, the message and its reservation.
+            timing.mark('screen')
             from terminal import InputNotSent
             try:
                 self.workflow.terminals.paste(terminal['id'], body, submit=True)
+                timing.mark('paste')
                 receipt = {**base, 'delivery': 'accepted', 'confirmed': True, 'acknowledged': True,
                            'readbackConfirmed': False,
                            'reason': 'Claude 터미널에 입력했습니다. 대화 기록 반영은 아직 확인되지 않았습니다.'}
                 if self._confirm_submit(terminal['id'], body):
                     receipt['resubmitted'] = True
+                timing.mark('submit')
             except InputNotSent as exc:
                 path.unlink(missing_ok=True)
                 raise SendRejected(str(exc), 409) from None
@@ -1176,6 +1217,7 @@ class Chat:
                 private_json(path, {**record, 'receipt': receipt})
             except (OSError, ValueError):
                 receipt = {**receipt, 'ledgerPending': True}
+            timing.mark('save')
             return {**receipt, 'attachments': manifest}
         finally:
             turn.release()
@@ -1235,6 +1277,14 @@ class Chat:
         return source, host, request_id, text, ids, self.attachment_history(manifest)
 
     def send(self, data):
+        ref = data.get('source') if isinstance(data, dict) else None
+        timing = SendTiming(ref.get('agent') if isinstance(ref, dict) else None, self.clock)
+        try:
+            return self._send(data, timing)
+        finally:
+            timing.report()
+
+    def _send(self, data, timing):
         try:
             source, host, request_id, text, ids, manifest = self._prepare_send(data)
             self._direct_session(source)
@@ -1243,8 +1293,9 @@ class Chat:
         except (ValueError, RuntimeError, OSError, KeyError) as exc:
             reason = str(exc) if isinstance(exc, (ValueError, RuntimeError)) else '메시지와 첨부 정보를 다시 확인해 주세요.'
             raise SendRejected(reason, 409 if isinstance(exc, RuntimeError) else 400) from None
+        timing.mark('prepare')
         if source.get('agent') == 'claude':
-            result = self._send_claude(data.get('source'), source, host, request_id, text, ids, manifest)
+            result = self._send_claude(data.get('source'), source, host, request_id, text, ids, manifest, timing)
         else:
             from transfer import WorkerError
             try:
@@ -1257,6 +1308,7 @@ class Chat:
             except (RuntimeError, OSError):
                 # A broken SSH/HTTP response is not evidence that submission failed.
                 result = {'delivery': 'unknown', 'reason': '전송 결과를 확인하지 못했습니다. 상태를 다시 확인해 주세요.'}
+            timing.mark('send')
         if manifest and not result.get('attachments'):
             result = {**result, 'attachments': manifest}
         receipt = self.receipt(result, request_id)

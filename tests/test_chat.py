@@ -950,7 +950,7 @@ class ChatClaudeTest(unittest.TestCase):
         self.board.poll(HOST)
         self.terms = FakeTerminals()
         self.flow = server.Workflow(self.board, self.terms, self.root)
-        self.phase, self.messages, self.calls = 'idle', [], []
+        self.phase, self.messages, self.calls, self.model_settings = 'idle', [], [], None
         def rpc(host, op, args, timeout):
             self.calls.append((op, args.get('action')))
             if op == 'attachment':
@@ -960,7 +960,7 @@ class ChatClaudeTest(unittest.TestCase):
             if args['action'] == 'capabilities':
                 return {'phase': self.phase, 'kind': self.row['kind'], 'cwd': str(self.project)}
             return {'phase': self.phase, 'cwd': str(self.project), 'messages': list(self.messages),
-                    'requiresNativeTerminal': True,
+                    'requiresNativeTerminal': True, **({'modelSettings': dict(self.model_settings)} if self.model_settings else {}),
                     'capabilities': {'canSend': False, 'reason': 'Claude 입력은 보드가 연결한 터미널로 전달합니다.'}}
         self.flow.transfers.rpc = rpc
         self.chat = chat.Chat(self.board, self.flow, self.root)
@@ -1035,6 +1035,20 @@ class ChatClaudeTest(unittest.TestCase):
         self.assertEqual(chat.terminal_model_settings(footer), {'model': 'opus', 'effort': 'high'})
         self.terminal(); self.terms.screen = footer
         self.assertEqual(self.chat.state({'source': CLAUDE_REF})['modelSettings'], {'model': 'opus', 'effort': 'high', 'observed': 'runtime'})
+
+    def test_model_footer_reads_a_status_line_and_keeps_the_full_model_id(self):
+        # A status line draws "Opus 5.5 · xhigh · 5h 12% · 주간 30%" with no word "effort".
+        line = '──────────\n❯ \n──────────\n  Opus 5.5 · xhigh · 5h 12% · 주간 30%\n'
+        self.assertEqual(chat.terminal_model_settings(line), {'model': 'opus', 'effort': 'xhigh'})
+        self.assertEqual(chat.terminal_model_settings(line.replace('Opus 5.5', 'Fable 5.1').replace('xhigh', 'max')),
+                         {'model': 'fable', 'effort': 'max'})
+        self.assertEqual(chat.terminal_model_settings(line.replace(' · xhigh', '')), {'model': 'opus'})
+        self.terminal(); self.terms.screen = line
+        self.model_settings = {'model': 'claude-opus-5-5', 'effort': 'high', 'observed': 'last_response'}
+        # The screen's newer effort counts; its "opus" does not replace the response's full id.
+        self.assertEqual(self.state()['modelSettings'], {'model': 'claude-opus-5-5', 'effort': 'xhigh', 'observed': 'runtime'})
+        self.terms.screen = line.replace('Opus 5.5', 'Sonnet 5.5')
+        self.assertEqual(self.state()['modelSettings'], {'model': 'sonnet', 'effort': 'xhigh', 'observed': 'runtime'})
 
     def send(self, rid='request-0001', text='안녕하세요', **extra):
         return self.chat.send({'source': CLAUDE_REF, 'requestId': rid, 'text': text, **extra})

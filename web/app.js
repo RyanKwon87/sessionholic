@@ -3832,7 +3832,8 @@ function chatReadSupported(entry, data = entry.data) {
 function rememberConversation(s, messages, data = {}) {
   if (!Array.isArray(messages) || data.error) return;
   chatEntry(s).conversation = { identity: conversationIdentity(s), authEpoch: state.authEpoch,
-    messages, historyNotice: data.historyNotice || null, executionMode: data.executionMode,
+    messages, olderOmitted: data.olderOmitted === true,
+    historyNotice: data.historyNotice || null, executionMode: data.executionMode,
     transcriptAvailability: data.transcriptAvailability, fetchedAt: data.fetchedAt || Date.now() / 1000, stale: !!data.stale };
 }
 function conversationSyncNotice(s, status) {
@@ -6118,10 +6119,11 @@ const OUTBOX_MAX_MS = 15 * 60 * 1000;
 // A transcript may record a message a little before the browser's clock says
 // it was sent (clocks of the phone and the agent host differ slightly).
 const OUTBOX_CLOCK_SLACK_MS = 30 * 1000;
-// Settled messages remembered per conversation (the server shows 80 at most).
-const OUTBOX_CLAIM_LIMIT = 80;
-// How many conversation items (messages and tool records) a read returns at most, newest last.
-const CONVERSATION_WINDOW = 80;
+// A read shows the newest CONVERSATION_MESSAGES questions and answers with every row after
+// the oldest of them (tool records, notes), 400 rows at most (collector.recent_window).
+const CONVERSATION_MESSAGES = 80;
+// Settled messages remembered per conversation: a read shows no more user messages than this.
+const OUTBOX_CLAIM_LIMIT = CONVERSATION_MESSAGES;
 const OUTBOX_ATTACHMENT_LINE = /^첨부 파일:/;
 const OUTBOX_ATTACHMENT_ONLY = new Set(["[이미지 첨부]", "[파일 첨부]"]);
 // Claude Code records a pasted image path as "[Image #1]" in the prompt (before,
@@ -7010,7 +7012,7 @@ function updateToolGroup(row, items) {
 }
 // The conversation's rows with each run of tool records as one group. A group
 // belongs to its first record (the same object while later records join it).
-// When the server's 80-row window moves past that record, the group of a record
+// When the server's window moves past that record, the group of a record
 // still shown carries on, opened or not; one group is never drawn twice.
 function toolGroupRows(list, rows) {
   const desired = [];
@@ -7308,7 +7310,7 @@ function showHistoryPreview(entry) {
 }
 
 // --- 내 질문: the user's own messages in this session's saved record --------------------
-// The conversation shows its newest 80 items only; the questions asked before them stay
+// The conversation shows its newest 80 questions and answers only; the ones asked before stay
 // reachable here. Read when a conversation opens, when the sheet opens and a while after a
 // send from here, never on the conversation's polling. Newest first, 300 a page.
 const QUESTIONS_PAGE = 300;
@@ -7322,6 +7324,25 @@ function questionsSupported(s) {
 function questionsOf(entry, s) {
   const q = entry?.questions;
   return q && q.identity === conversationIdentity(s) && q.authEpoch === state.authEpoch ? q : null;
+}
+// The count on the line above the conversation ("질문 12개", "+" while more remain), or ""
+// before the saved list was read or when it could not be.
+function questionsCount(q) {
+  const total = q?.loaded && !q.failed ? q.items.length : 0;
+  return total ? `질문 ${total}개${q.complete ? "" : "+"}` : "";
+}
+// Whether the conversation on screen is a read that left older rows out (its olderOmitted).
+function conversationOlderOmitted(s, entry) {
+  const cached = entry?.conversation;
+  return cached?.olderOmitted === true && cached.identity === conversationIdentity(s) &&
+    cached.authEpoch === state.authEpoch;
+}
+// What the line above a cut conversation says; where to find the questions before it only
+// while the count that opens them is shown (not for a bot, nor a device whose list is unreadable).
+function conversationWindowText(s, entry) {
+  const count = questionsSupported(s) ? questionsCount(questionsOf(entry, s)) : "";
+  return `최근 질문·답변 ${CONVERSATION_MESSAGES}개까지 보입니다.` +
+    (count ? ` 그보다 앞의 질문은 위의 '${count}'에서 찾을 수 있습니다.` : "");
 }
 function questionSource(s) {
   return { ...sourceOf(s), ...(s.agent === "claude" && s.sessionId ? { sessionId: s.sessionId } : {}) };
@@ -7473,7 +7494,7 @@ function renderQuestionPin(s = selectedSession() || null) {
   if (pin.questionText !== text) pin.expanded = false;
   const expanded = !!last && !!pin.expanded;
   const total = q?.loaded && !q.failed ? q.items.length : 0;
-  const count = total ? `질문 ${total}개${q.complete ? "" : "+"} ›` : "";
+  const count = total ? `${questionsCount(q)} ›` : "";
   const time = last ? clock(last.ts) : "";
   const revision = JSON.stringify([!!last, text, time, count, expanded]);
   if (pin.dataset.revision === revision) return;
@@ -7581,7 +7602,8 @@ function renderMessages(s, messages, error = "", fresh = false) {
     ? list.conversationError.offsetHeight || 0 : 0;
   const keys = messages.map((message) => JSON.stringify([message.role, message.text, message.ts || null,
     attachmentMetadata(message.attachments), message.truncated === true, message.bodyHash || null]));
-  // The server's 80-row window drops whole rows at its start: the rows on
+  // The server's window drops whole rows at its start (a question or answer
+  // with the rows after it, any number at once): the rows on
   // screen are first lined up with the new ones where they overlap most, so
   // two rows with the same key (the same first command of two Codex turns,
   // which have no time) each keep their own row and tool group.
@@ -7722,15 +7744,16 @@ function renderMessages(s, messages, error = "", fresh = false) {
       desired.push(list.conversationEmpty);
     }
   }
-  // The server sends the newest CONVERSATION_WINDOW items: anything before them is not shown.
-  if (messages.length >= CONVERSATION_WINDOW) {
-    list.conversationWindowNotice ||= el("p", "conversation-window-notice",
-      `최근 ${CONVERSATION_WINDOW}개 항목까지만 보입니다. 그보다 앞의 대화는 여기에 나오지 않습니다.`);
-    desired.unshift(list.conversationWindowNotice);
+  // The read left older rows out (the server's olderOmitted): say so above the conversation.
+  if (conversationOlderOmitted(s, entry)) {
+    const notice = list.conversationWindowNotice ||= el("p", "conversation-window-notice");
+    const text = conversationWindowText(s, entry);
+    if (notice.textContent !== text) notice.textContent = text;
+    desired.unshift(notice);
   }
   desired.push(...tail);
   // While reading back, the first row on screen that stays keeps its place:
-  // rows dropped above it (the server's 80-row window moving during a turn) or
+  // rows dropped above it (the server's window moving during a turn) or
   // a grown tool group no longer push the text being read up.
   const keep = new Set(desired);
   let anchor = null;

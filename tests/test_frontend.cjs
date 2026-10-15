@@ -4453,16 +4453,68 @@ test('a hardware keyboard goes from the search field into the list, between card
   assert.deepEqual(press(search, 'Enter'), [true, true]); assert.deepEqual(clicked, [0]);
 });
 
-test('a conversation at the read window says the items before it are not shown', () => {
-  const c = client(undefined, noChatTimers);
+// A read of `count` rows: a question, an answer and three tool records in turn.
+const windowRows = (count) => Array.from({ length: count }, (unused, index) =>
+  ({ role: ['user', 'assistant', 'tool', 'tool', 'tool'][index % 5], text: `항목 ${index}`, ts: index + 1 }));
+
+test('a conversation the server cut says so above it (olderOmitted), and where the earlier questions are once they are listed', async () => {
+  let read = { olderOmitted: true };
+  let questions = () => questionsReply({ questions: [askedQuestion(5), askedQuestion(4)], complete: false, before: 400 });
+  const c = client(async (url, options) => {
+    if (url === '/api/chat/state') return { ok: true, status: 200, json: async () => ({ capability: { supported: true }, phase: 'idle',
+      route: JSON.parse(options.body).source, receipts: [], messages: windowRows(400), ...read }) };
+    if (url.startsWith('/api/history/questions?')) return questions();
+    return { ok: true, status: 200, json: async () => ({}) };
+  }, noChatTimers);
   const { s } = selectChat(c);
-  const items = (count) => Array.from({ length: count }, (unused, index) => ({ role: index % 2 ? 'assistant' : 'user', text: `항목 ${index}`, ts: index + 1 }));
+  c.drawDetail(s);
   const notice = () => c.get('messages').children.find((node) => node.className === 'conversation-window-notice');
-  c.renderMessages(s, items(79));
-  assert.equal(notice(), undefined);
-  c.renderMessages(s, items(80));
-  assert.match(notice().textContent, /최근 80개 항목까지만 보입니다. 그보다 앞의 대화는 여기에 나오지 않습니다/);
+  await c.loadChatState(s, true);
+  assert.equal(notice().textContent, '최근 질문·답변 80개까지 보입니다.', 'no count to point at yet');
   assert.equal(c.get('messages').children[0], notice(), 'above the conversation');
+  // Once the saved questions are listed, the line names the count above that opens them.
+  await vm.runInContext('loadQuestions', c.context)(s);
+  await c.loadChatState(s, true);
+  assert.equal(notice().textContent, "최근 질문·답변 80개까지 보입니다. 그보다 앞의 질문은 위의 '질문 2개+'에서 찾을 수 있습니다.");
+  // Nothing left out: no line, however many rows the read holds.
+  read = { olderOmitted: false };
+  await c.loadChatState(s, true);
+  assert.equal(notice(), undefined);
+  read = {};
+  await c.loadChatState(s, true);
+  assert.equal(notice(), undefined, 'a read that does not say so is not called cut');
+  // A device whose questions cannot be listed, or a bot's conversation: the first sentence only.
+  read = { olderOmitted: true };
+  questions = () => ({ ok: false, status: 400, json: async () => ({ error: '이 기기의 저장 기록은 읽을 수 없습니다.' }) });
+  const other = selectChat(c, { id: 'unlisted-session' });
+  c.drawDetail(other.s);
+  await vm.runInContext('loadQuestions', c.context)(other.s);
+  await c.loadChatState(other.s, true);
+  assert.equal(notice().textContent, '최근 질문·답변 80개까지 보입니다.');
+  const bot = selectChat(c, { id: 'bot-session' });
+  Object.assign(bot.s, { originator: 'hermes' });
+  c.drawDetail(bot.s);
+  await c.loadChatState(bot.s, true);
+  assert.equal(c.sessionCategoryOf(bot.s), 'bot');
+  assert.equal(notice().textContent, '최근 질문·답변 80개까지 보입니다.');
+});
+
+test('a conversation read through /api/read says it was cut by the same field', async () => {
+  const c = client(async (url, options) => {
+    if (url === '/api/chat/state') return { ok: true, status: 200, json: async () => ({ capability: { supported: false }, phase: 'idle',
+      route: JSON.parse(options.body).source, receipts: [] }) };
+    if (url.startsWith('/api/read?')) return { ok: true, status: 200, json: async () => ({ messages: windowRows(120), olderOmitted: true }) };
+    return { ok: true, status: 200, json: async () => ({}) };
+  }, noChatTimers);
+  const { s, entry } = selectChat(c);
+  c.drawDetail(s);
+  await c.loadDetail(s, true);
+  const list = c.get('messages');
+  assert.equal(entry.conversation.olderOmitted, true);
+  assert.equal(list.children[0].className, 'conversation-window-notice');
+  // Drawn again from what is on screen (a bubble's state changed), the line stays.
+  vm.runInContext('refreshConversationView', c.context)(entry);
+  assert.equal(list.children[0].className, 'conversation-window-notice');
 });
 
 test('a session that answered or finished since it was last opened shows unread until it is opened, on every device', async () => {
@@ -6502,6 +6554,71 @@ test('one new message settles one bubble with or without row ids, after the last
   assert.deepEqual(claudePending(), []);
   assert.equal(claude.outboxClaims.length, 80);
   assert.equal(claude.outboxClaims.at(-1).key, JSON.stringify([ts + 3, '끝']));
+});
+
+test('in a 400-row window whose start moves by whole turns, one new message settles one bubble and an earlier one never does', () => {
+  const now = Date.now(); const ts = Math.floor(now / 1000);
+  const c = client(undefined, noChatTimers);
+  const { entry } = selectChat(c, { agent: 'claude', home: '.claude', id: 'claude-session' });
+  // Turns of a question, an answer and 18 tool records (20 rows); the same question every other turn.
+  const turn = (n) => {
+    const at = ts - 10000 + n * 20;
+    return [{ role: 'user', text: n % 2 ? '계속' : `질문 ${n}`, ts: at }, { role: 'assistant', text: `답변 ${n}`, ts: at + 1 },
+      ...Array.from({ length: 18 }, (unused, index) => ({ role: 'tool', text: `Bash · echo ${index}`, ts: at + 2 }))];
+  };
+  const turns = (from, to) => Array.from({ length: to - from }, (unused, index) => turn(from + index)).flat();
+  const seen = turns(0, 20);
+  assert.equal(seen.length, 400);
+  const bubble = (requestId) => ({ requestId, text: '계속', attachments: [], state: 'sent', status: 'accepted', reason: '',
+    at: now, ...c.outboxOrigin(seen) });
+  entry.outbox = [bubble('req-claude-w001'), bubble('req-claude-w002')];
+  const pending = () => entry.outbox.map((item) => item.requestId);
+  // "계속" asked before the send, all over the window: never one of these.
+  c.settleOutbox(entry, seen);
+  assert.deepEqual(pending(), ['req-claude-w001', 'req-claude-w002']);
+  // The window moved on by two whole turns (40 rows) before the message was recorded.
+  c.settleOutbox(entry, [...turns(2, 20), ...turn(20).slice(1)]);
+  assert.deepEqual(pending(), ['req-claude-w001', 'req-claude-w002']);
+  // The new message arrives with tool records after it, while three more turns leave the top.
+  const mine = { role: 'user', text: '계속', ts: ts + 1 };
+  const tools = Array.from({ length: 30 }, (unused, index) => ({ role: 'tool', text: `Read · f${index}`, ts: ts + 2 }));
+  const next = [...turns(5, 20), mine, ...tools];
+  c.settleOutbox(entry, next);
+  assert.deepEqual(pending(), ['req-claude-w002'], 'one new row, one bubble');
+  // Later reads keep it claimed wherever the window starts.
+  for (const later of [next, next.slice(60), next.slice(next.indexOf(mine))]) {
+    c.settleOutbox(entry, later);
+    assert.deepEqual(pending(), ['req-claude-w002']);
+  }
+  c.settleOutbox(entry, [...next.slice(100), { role: 'user', text: '계속', ts: ts + 5 }]);
+  assert.deepEqual(pending(), []);
+  assert.equal(entry.outboxClaims.length, 2);
+});
+
+test('a 400-row conversation keeps the row being read in place (0px) when whole turns leave its start', () => {
+  const c = client(undefined, noChatTimers); const { s } = selectChat(c);
+  const list = c.get('messages');
+  const turns = (from, to) => Array.from({ length: to - from }, (unused, i) => {
+    const n = from + i;
+    return [{ role: 'user', text: `질문 ${n}`, ts: 1000 + n * 600 }, { role: 'assistant', text: `답변 ${n}`, ts: 1001 + n * 600 },
+      ...Array.from({ length: 18 }, (unused2, index) => ({ role: 'tool', text: `Bash · echo ${n}-${index}`, ts: 1002 + n * 600 }))];
+  }).flat();
+  c.renderMessages(s, turns(0, 20));
+  const layout = (node) => Object.defineProperties(node, {
+    offsetTop: { configurable: true, get: () => list.children.indexOf(node) * 100 },
+    offsetHeight: { configurable: true, get: () => 100 } });
+  // 20 turns: a question, an answer and one tool group each.
+  assert.equal(list.children.length, 60);
+  list.children.forEach(layout);
+  Object.assign(list, { scrollHeight: 6000, clientHeight: 600, scrollTop: 3050 });
+  const reading = list.children[30];
+  assert.match(textOf(reading), /질문 10/);
+  // Three turns leave the start and two arrive below, with the reader on "질문 10".
+  c.renderMessages(s, turns(3, 22));
+  list.children.forEach(layout);
+  assert.equal(list.children.indexOf(reading), 21);
+  assert.equal(reading.offsetTop - list.scrollTop, 3000 - 3050, 'the row stays 50px above the top edge');
+  assert.equal(list.unread, 4);
 });
 
 test('a Claude image message recorded as "[Image #1]본문" settles its bubble, so neither "작업 중" nor the receipt note stays', async () => {

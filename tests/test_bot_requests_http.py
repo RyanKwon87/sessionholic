@@ -70,11 +70,11 @@ class BotRequestsHTTPTest(unittest.TestCase):
 
     def test_bot_codex_part_is_read_like_any_session_without_observing_work(self):
         handler = SimpleNamespace(server=self.httpd)
-        with patch.object(self.board, 'read', return_value={'messages': [{'role': 'user', 'text': '요청'}]}) as read, \
+        with patch.object(self.board, 'read', return_value={'messages': [{'role': 'user', 'text': '요청'}], 'olderOmitted': True}) as read, \
                 patch.object(self.httpd.work, 'observe', side_effect=AssertionError('work observed')):
             from server import Handler
             messages = Handler.bot_native_messages(handler, self.host['name'], self.ref)
-            self.assertEqual(messages, [{'role': 'user', 'text': '요청'}])
+            self.assertEqual(messages, {'messages': [{'role': 'user', 'text': '요청'}], 'olderOmitted': True})
             read.assert_called_once_with(self.host['name'], 'codex', self.ref['id'], '.codex')
             read.return_value = {'error': 'PRIVATE'}
             with self.assertRaises(RuntimeError):

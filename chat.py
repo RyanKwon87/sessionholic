@@ -682,6 +682,8 @@ class Chat:
         response = {'route': identity, 'phase': phase,
                     'capability': capability,
                     'messages': messages,
+                    # Rows before these were left out (collector.recent_window, the read's range).
+                    'olderOmitted': result.get('olderOmitted') is True,
                     'modelSettings': self.model_settings(result.get('modelSettings')),
                     'receipts': receipts, 'maxAttachmentBytes': MAX_FILE,
                     'requiresNativeTerminal': phase == 'needs_input' if claude else

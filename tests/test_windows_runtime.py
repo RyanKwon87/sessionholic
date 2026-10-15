@@ -161,6 +161,15 @@ class WindowsRuntimeTest(unittest.TestCase):
         self.assertFalse(self.runtime.store.root.exists())
         self.assertEqual(self.reader.send_calls, 0)
 
+    def test_live_read_keeps_the_boards_window(self):
+        self.assertIs(self.runtime.chat({'action': 'read', 'source': self.source})['olderOmitted'], False)
+        self.reader.thread['turns'] = [{'id': 'turn-%d' % number, 'status': 'completed', 'items': [
+            {'id': 'input-%d' % number, 'type': 'userMessage', 'content': [{'type': 'text', 'text': '합성 입력 %d' % number}]},
+            {'id': 'command-%d' % number, 'type': 'commandExecution', 'command': 'dir'},
+            {'id': 'answer-%d' % number, 'type': 'agentMessage', 'text': '합성 답변 %d' % number}]} for number in range(100)]
+        value = self.runtime.chat({'action': 'read', 'source': self.source})
+        self.assertEqual((len(value['messages']), value['messages'][0]['text'], value['olderOmitted']), (120, '합성 입력 60', True))
+
     def test_stored_or_unloaded_session_remains_readable_without_execution(self):
         self.reader.loaded = []
         value = self.runtime.chat({'action': 'read', 'source': self.source})

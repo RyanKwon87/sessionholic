@@ -513,6 +513,13 @@ class NativeChatTests(unittest.TestCase):
             rows = self.handle(FakeClient(thread), {'action': 'read', 'source': self.source})['messages']
         self.assertEqual(lookup.call_count, collector.MESSAGE_LIMIT)
         self.assertEqual([r['text'] for r in rows], [str(i) for i in range(200 - collector.MESSAGE_LIMIT, 200)])
+        # One turn of commands longer than the window reads none of the rows it leaves out.
+        thread['turns'] = [{'id': 'long', 'status': 'completed', 'items': [
+            {'type': 'userMessage', 'clientId': 'fixture-request-long', 'content': [{'type': 'text', 'text': 'ask'}]}]
+            + [{'type': 'commandExecution', 'command': 'ls'}] * 1000}]
+        with patch.object(chat, '_history_attachments', return_value=[]) as lookup:
+            result = self.handle(FakeClient(thread), {'action': 'read', 'source': self.source})
+        self.assertEqual((lookup.call_count, len(result['messages']), result['olderOmitted']), (0, collector.ROW_LIMIT, True))
 
     def test_idle_send_starts_new_turn_with_exact_client_id(self):
         client = FakeClient(self.thread())
@@ -893,6 +900,32 @@ class NativeChatTests(unittest.TestCase):
             self.assertEqual(read.get('workingSinceApprox'), True if expected else None)
             self.assertEqual([m['role'] for m in read['messages']], ['user', 'tool'])
 
+    def test_claude_read_shows_80_questions_and_answers_past_tool_rows_and_large_results(self):
+        source = {'agent': 'claude', 'home': '.claude', 'id': 'back1234'}
+        sid = 'session-12345'
+        folder = self.home / '.claude/projects/p'
+        folder.mkdir(parents=True)
+        lines = []
+        for number in range(100):
+            lines += [{'type': 'user', 'message': {'content': '질문 %d' % number}},
+                      {'type': 'assistant', 'message': {'content': [{'type': 'text', 'text': '답변 %d' % number}] + [
+                          {'type': 'tool_use', 'name': 'Bash', 'input': {'command': 'ls'}}] * 5}},
+                      # A tool result as large as an image: 2 MB holds about 34 turns.
+                      {'type': 'user', 'message': {'content': [{'type': 'tool_result', 'content': 'x' * 60 * 1024}]}}]
+        (folder / (sid + '.jsonl')).write_text(''.join(json.dumps(line) + '\n' for line in lines))
+        row = {'id': source['id'], 'sessionId': sid, 'kind': 'background', 'state': 'idle', 'status': 'idle', 'cwd': str(self.cwd)}
+        with patch.object(chat.native, '_claude_binary', return_value='/fixture/claude'), \
+                patch.object(chat.native, '_claude_run', return_value=json.dumps([row]).encode()):
+            read = chat.handle({'action': 'read', 'source': source}, home=self.home)
+        self.assertEqual(collector.conversation_count(read['messages']), collector.MESSAGE_LIMIT)
+        self.assertEqual((len(read['messages']), read['messages'][0]['text']), (280, '질문 60'))
+        self.assertIs(read['olderOmitted'], True)
+        (folder / (sid + '.jsonl')).write_text(''.join(json.dumps(line) + '\n' for line in lines[:6]))
+        with patch.object(chat.native, '_claude_binary', return_value='/fixture/claude'), \
+                patch.object(chat.native, '_claude_run', return_value=json.dumps([row]).encode()):
+            read = chat.handle({'action': 'read', 'source': source}, home=self.home)
+        self.assertEqual((len(read['messages']), read['olderOmitted']), (14, False))
+
     def test_claude_read_takes_model_and_effort_from_the_newest_main_response(self):
         source = {'agent': 'claude', 'home': '.claude', 'id': 'back1234'}
         sid = 'session-12345'
@@ -957,13 +990,28 @@ class RecentHistoryTests(unittest.TestCase):
         client = FakeClient(self.thread([self.turn(number, 30) for number in range(1, 41)]))
         result = self.read(client, requestId='request-0040')
         self.assertNotIn(True, [params.get('includeTurns') for method, params in client.calls if method == 'thread/read'])
-        self.assertEqual(len(result['messages']), collector.MESSAGE_LIMIT)
+        self.assertEqual(len(result['messages']), collector.ROW_LIMIT)
         self.assertEqual(result['messages'][-1]['text'], 'answer 40')
         self.assertEqual(result['receipts'][0]['delivery'], 'completed')
-        # 32 rows per turn: the 80th newest row is in turn 38, whose user message is on page one.
-        self.assertEqual(len([m for m, _ in client.calls if m == 'thread/items/list']), 1)
-        self.assertEqual([turn['id'] for turn in result['turns']], ['turn-37', 'turn-38', 'turn-39', 'turn-40'])
-        self.assertEqual((result['messages'][0]['role'], result['messages'][0]['turnId']), ('tool', 'turn-38'))
+        # 32 rows per turn: the 400th newest row is in turn 28, whose user message is on page five.
+        self.assertEqual(len([m for m, _ in client.calls if m == 'thread/items/list']), 5)
+        self.assertEqual([turn['id'] for turn in result['turns']], ['turn-%d' % number for number in range(25, 41)])
+        self.assertEqual((result['messages'][0]['role'], result['messages'][0]['turnId']), ('tool', 'turn-28'))
+        self.assertIs(result['olderOmitted'], True)
+
+    def test_paging_counts_questions_and_answers_not_rows(self):
+        # 5 rows a turn: 80 rows fill page one, 80 questions and answers take two pages.
+        client = FakeClient(self.thread([self.turn(number, 3) for number in range(1, 61)]))
+        result = self.read(client)
+        self.assertEqual(len([m for m, _ in client.calls if m == 'thread/items/list']), 2)
+        self.assertEqual(collector.conversation_count(result['messages']), collector.MESSAGE_LIMIT)
+        self.assertEqual((len(result['messages']), result['messages'][0]['text']), (200, 'ask 21'))
+        self.assertIs(result['olderOmitted'], True, 'older items were left unread')
+        # A thread read to its start leaves nothing out.
+        client = FakeClient(self.thread([self.turn(number, 3) for number in range(1, 4)]))
+        result = self.read(client)
+        self.assertEqual((len(result['messages']), result['olderOmitted']), (15, False))
+        self.assertEqual(collector.codex_window_edge([{'item': {'type': 'agentMessage', 'text': ' '}, 'turnId': 't'}] * 500), None)
 
     def test_kept_turn_reaches_back_to_its_user_message(self):
         # One turn longer than a page: its request is still found, its start time kept.
@@ -984,7 +1032,8 @@ class RecentHistoryTests(unittest.TestCase):
         client = FakeClient(self.thread([self.turn(1, 5000)]))
         result = self.read(client)
         self.assertEqual(len([m for m, _ in client.calls if m == 'thread/items/list']), collector.HISTORY_PAGES)
-        self.assertEqual(len(result['messages']), collector.MESSAGE_LIMIT)
+        self.assertEqual(len(result['messages']), collector.ROW_LIMIT)
+        self.assertIs(result['olderOmitted'], True)
 
     def test_daemon_without_paged_history_is_read_whole(self):
         unknown = chat.NativeRejected({'code': -32600, 'message': 'Invalid request: unknown variant `thread/items/list`, '

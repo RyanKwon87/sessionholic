@@ -561,5 +561,167 @@ class SessionLabelsHTTPTest(unittest.TestCase):
         self.assertEqual(self.save('x' * 65536)[0].status, 400)
 
 
+class BoardPreferencesTest(unittest.TestCase):
+    def setUp(self):
+        from session_labels import BoardPreferences
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.store = BoardPreferences(self.temp.name)
+
+    def test_empty_store_preserves_browser_defaults_then_persists_shared_empty_or_custom_list(self):
+        from session_labels import BoardPreferences
+        self.assertEqual(self.store.snapshot(), {'ok': True, 'revision': 0, 'quickReplies': None})
+        result = self.store.set_quick_replies([' 계속 진행 '], 0)
+        self.assertEqual(result, {'ok': True, 'revision': 1, 'quickReplies': ['계속 진행']})
+        self.assertEqual(BoardPreferences(self.temp.name).snapshot(), result)
+        self.assertEqual(self.store.set_quick_replies([], 1)['quickReplies'], [])
+        self.assertEqual(self.store.path.stat().st_mode & 0o777, 0o600)
+
+    def test_two_devices_conflict_without_overwriting_and_same_value_retry_is_idempotent(self):
+        from session_labels import BoardPreferences
+        second = BoardPreferences(self.temp.name)
+        self.store.set_quick_replies(['first'], 0)
+        with self.assertRaises(GoalError) as caught:
+            second.set_quick_replies(['second'], 0)
+        self.assertEqual(caught.exception.status, 409)
+        self.assertEqual(second.snapshot()['quickReplies'], ['first'])
+        self.assertEqual(second.set_quick_replies(['first'], 0)['revision'], 1)
+
+    def test_validation_and_corrupt_store_never_replace_saved_content(self):
+        for rows, revision in [(['x'] * 13, 0), (['x' * 201], 0), (['\n'], 0),
+                               (['bad\x00'], 0), (['bad\ud800'], 0), ([], True), ([], -1)]:
+            with self.subTest(rows=repr(rows)), self.assertRaises(GoalError):
+                self.store.set_quick_replies(rows, revision)
+        self.store.set_quick_replies(['safe'], 0)
+        raw = b'PRIVATE_CORRUPT_CONTENT'; self.store.path.write_bytes(raw)
+        with self.assertRaises(GoalError): self.store.snapshot()
+        with self.assertRaises(GoalError): self.store.set_quick_replies(['replacement'], 1)
+        self.assertEqual(self.store.path.read_bytes(), raw)
+
+    def test_atomic_failure_preserves_previous_list(self):
+        self.store.set_quick_replies(['old'], 0)
+        with patch('goals.os.replace', side_effect=OSError('fixture disk failure')), self.assertRaises(GoalError):
+            self.store.set_quick_replies(['new'], 1)
+        self.assertEqual(self.store.snapshot()['quickReplies'], ['old'])
+        self.assertFalse(list(Path(self.temp.name).glob('*.tmp')))
+
+    def test_unsafe_storage_is_not_read_or_written(self):
+        target = Path(self.temp.name) / 'unrelated.json'; target.write_text('private'); target.chmod(0o600)
+        for linked in ('symlink', 'hardlink'):
+            if linked == 'symlink': self.store.path.symlink_to(target)
+            else: os.link(target, self.store.path)
+            with self.assertRaises(GoalError): self.store.snapshot()
+            with self.assertRaises(GoalError): self.store.set_quick_replies(['replacement'], 0)
+            self.assertEqual(target.read_text(), 'private'); self.store.path.unlink()
+
+
+class BoardPreferencesHTTPTest(unittest.TestCase):
+    setUp = SessionLabelsHTTPTest.setUp
+    tearDown = SessionLabelsHTTPTest.tearDown
+    request = SessionLabelsHTTPTest.request
+    def test_shared_preferences_auth_csrf_origin_and_snapshot_updates(self):
+        self.assertEqual(self.request('GET', '/api/preferences', auth=False)[0].status, 401)
+        body = {'quickReplies': ['shared'], 'revision': 0}
+        for changes in ({'auth': False}, {'csrf': False}, {'extra': {'Origin': 'https://other.invalid'}}):
+            self.assertIn(self.request('POST', '/api/preferences/quick-replies', body, **changes)[0].status, (401, 403))
+        response, result = self.request('POST', '/api/preferences/quick-replies', body)
+        self.assertEqual(response.status, 200)
+        self.assertEqual(self.request('GET', '/api/preferences')[1], result)
+        self.assertEqual(self.request('GET', '/api/snapshot')[1]['quickReplyPreferences'], result)
+        response, result = self.request('POST', '/api/preferences/quick-replies', {**body, 'quickReplies': ['conflict']})
+        self.assertEqual((response.status, result['code']), (409, 'preferences_conflict'))
+
+
+class HistoryHTTPTest(unittest.TestCase):
+    setUp = SessionLabelsHTTPTest.setUp
+    tearDown = SessionLabelsHTTPTest.tearDown
+    request = SessionLabelsHTTPTest.request
+
+    def test_claude_message_identity_includes_the_transcript_and_refuses_reused_worker_ids(self):
+        from urllib.parse import urlencode
+        sid, worker = str(uuid.uuid4()), 'claude-worker-123'
+        source = {'host': self.host['name'], 'agent': 'claude', 'id': worker, 'home': '.claude', 'sessionId': sid}
+        self.board.state[self.host['name']]['data']['claude'] = [{**source, 'kind': 'background', 'cwd': '/example/claude'}]
+        calls = []
+        def run(host, args, timeout):
+            calls.append(json.loads(args[1])); native = calls[-1]['sources'][0]
+            self.assertEqual(native['id'], sid)
+            return {'readOnly': True, 'results': [{'source': native, 'error': 'fixture no saved body', 'complete': True}]}
+        self.board.runner = run
+        params = {**source, 'bodyHash': 'a' * 64}
+        self.assertEqual(self.request('GET', '/api/history/message?' + urlencode(params))[0].status, 200)
+        self.assertEqual(self.request('GET', '/api/history/message?' + urlencode({**params, 'sessionId': str(uuid.uuid4())}))[0].status, 400)
+        self.assertEqual(len(calls), 1)
+
+    def test_message_read_is_authenticated_bound_to_listed_source_and_read_only(self):
+        from urllib.parse import urlencode
+        calls = []
+        def run(host, args, timeout):
+            calls.append(args); self.assertEqual(args[0], 'history')
+            payload = json.loads(args[1]); native = payload['sources'][0]
+            return {'readOnly': True, 'results': [{'source': native, 'bodyHash': payload['bodyHash'],
+                    'text': 'full saved body', 'role': 'assistant', 'textOffset': 0,
+                    'fullLength': 15, 'nextTextOffset': None, 'recordOffset': 100, 'complete': True}]}
+        self.board.runner = run
+        params = {**self.source, 'bodyHash': 'a' * 64}
+        route = '/api/history/message?' + urlencode(params)
+        self.assertEqual(self.request('GET', route, auth=False)[0].status, 401); self.assertEqual(calls, [])
+        self.assertEqual(self.request('GET', '/api/history/message?' + urlencode({**params, 'id': str(uuid.uuid4())}))[0].status, 400)
+        self.assertEqual(calls, [])
+        response, data = self.request('GET', route)
+        self.assertEqual(response.status, 200); self.assertTrue(data['readOnly']); self.assertEqual(data['text'], 'full saved body')
+        self.assertEqual(len(calls), 1)
+        for changed in ({'bodyHash': 'invalid'}, {'offset': '-1'}, {'textOffset': 'true'}, {'path': '/private'}):
+            self.assertEqual(self.request('GET', '/api/history/message?' + urlencode({**params, **changed}))[0].status, 400)
+        self.assertEqual(len(calls), 1)
+
+    def test_mismatched_history_source_or_body_never_returns_content(self):
+        from urllib.parse import urlencode
+        route = '/api/history/message?' + urlencode({**self.source, 'bodyHash': 'a' * 64})
+        for mismatch in ('source', 'bodyHash'):
+            def run(host, args, timeout):
+                payload = json.loads(args[1]); native = payload['sources'][0]
+                row = {'source': native, 'bodyHash': 'a' * 64, 'text': 'WRONG_CONTENT', 'textOffset': 0}
+                row[mismatch] = {**native, 'id': 'different-id'} if mismatch == 'source' else 'b' * 64
+                return {'readOnly': True, 'results': [row]}
+            self.board.runner = run
+            response, data = self.request('GET', route)
+            self.assertNotEqual(response.status, 200); self.assertNotIn('WRONG_CONTENT', json.dumps(data))
+
+    def test_search_cursor_query_and_catalog_scope_preserve_progress_and_skip_hidden_or_offline(self):
+        from urllib.parse import urlencode
+        calls = []; self.board.state[self.host['name']]['ok'] = True
+        def run(host, args, timeout):
+            calls.append(args); self.assertEqual(args[0], 'history'); payload = json.loads(args[1]); native = payload['sources'][0]
+            return {'readOnly': True, 'results': [{'source': native, 'complete': native['offset'] > 0,
+                'nextOffset': 100 if native['offset'] == 0 else None, 'hits': [{'bodyHash': 'a' * 64, 'role': 'assistant',
+                'snippet': '<script>matching text</script>', 'recordOffset': 12, 'fullLength': 10000}]}]}
+        self.board.runner = run
+        route = '/api/history/search?q=matching'
+        self.assertEqual(self.request('GET', route, auth=False)[0].status, 401); self.assertEqual(calls, [])
+        response, first = self.request('GET', route)
+        self.assertEqual(response.status, 200); self.assertEqual(first['scanned'], 0); self.assertIsNotNone(first['cursor'])
+        response, second = self.request('GET', route + '&' + urlencode({'cursor': first['cursor']}))
+        self.assertEqual(response.status, 200); self.assertEqual(second['scanned'], 1); self.assertIsNone(second['cursor'])
+        self.assertEqual(first['hits'][0]['source']['id'], self.source['id'])
+        self.assertEqual(self.request('GET', '/api/history/search?' + urlencode({'q': 'changed', 'cursor': first['cursor']}))[0].status, 409)
+        for query in ('q=x', 'q=matching&cursor=bad', 'q=matching&path=/private'):
+            self.assertEqual(self.request('GET', '/api/history/search?' + query)[0].status, 400)
+        before = len(calls); self.board.state[self.host['name']]['ok'] = False
+        response, data = self.request('GET', route); self.assertEqual(response.status, 200)
+        self.assertEqual(len(calls), before); self.assertEqual(len(data['errors']), 1)
+        self.httpd.session_removed.mark(self.source, 123)
+        response, data = self.request('GET', route); self.assertEqual(data['total'], 0)
+        response, data = self.request('GET', route + '&includeRemoved=1'); self.assertEqual(data['total'], 1)
+
+    def test_history_parallel_limit_is_reported_without_native_execution(self):
+        self.httpd.history_gate.acquire(); self.httpd.history_gate.acquire()
+        try:
+            response, result = self.request('GET', '/api/history/search?q=matching')
+            self.assertEqual(response.status, 429)
+        finally:
+            self.httpd.history_gate.release(); self.httpd.history_gate.release()
+
+
 if __name__ == '__main__':
     unittest.main()

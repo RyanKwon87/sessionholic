@@ -208,6 +208,7 @@
                 aria-label="세션·프로젝트·기기 검색"
                 autocomplete="off"
             /></label>
+            <button id="search-body" class="filter-button" type="button" aria-pressed="false" aria-controls="body-search-panel">본문</button>
             <button
               id="filter-open"
               class="filter-button"
@@ -228,6 +229,14 @@
               <span id="filter-count" class="filter-count"></span>
             </button>
           </div>
+          <section id="body-search-panel" class="body-search-panel" aria-label="저장 대화 본문 검색" hidden>
+            <div class="body-search-actions">
+              <button id="body-search-start" class="secondary" type="button">본문 검색</button>
+              <button id="body-search-stop" class="secondary" type="button" hidden>중지</button>
+            </div>
+            <p id="body-search-status" class="plan-preserve" role="status" aria-live="polite">검색어를 2글자 이상 입력하고 본문 검색을 눌러 주세요.</p>
+            <div id="body-search-results"></div>
+          </section>
           <div id="session-category-search" class="session-category-search" hidden><button id="session-category-search-action" type="button"></button></div>
           <div id="groups" class="groups" role="tabpanel" aria-labelledby="session-category-general" aria-busy="true">
             <div class="skeleton-list" aria-hidden="true">
@@ -490,14 +499,23 @@
           보드의 글자 크기입니다. 터미널 글자 크기는 터미널 설정에서 따로
           바꿉니다. 이 선택들은 이 브라우저에만 저장됩니다.
         </p>
+        <p class="theme-label settings-section">초안 복원</p>
+        <label class="draft-recovery-option"><input id="draft-recovery" type="checkbox" checked> 이 기기에 초안 보관</label>
+        <p id="draft-recovery-status" class="plan-preserve" role="status">새로고침·탭 닫기 뒤 복원합니다. 잠그거나 로그인이 만료되면 삭제합니다.</p>
         <p id="quick-replies-label" class="theme-label settings-section">빠른 답장</p>
         <textarea id="quick-replies" class="quick-replies" rows="5" spellcheck="false"
           aria-labelledby="quick-replies-label" aria-describedby="quick-replies-help"></textarea>
         <p id="quick-replies-help" class="plan-preserve">
           대화 입력창의 도구 › 빠른 답장에 보일 문구입니다. 한 줄에 하나씩, 12개까지
           적습니다. 선택하면 문구를 입력창에 넣고 바로 보냅니다. 작성 중인 내용과 첨부도
-          함께 보냅니다. 문구 목록은 이 브라우저에만 저장됩니다.
+          함께 보냅니다. 저장한 문구는 이 보드의 모든 기기에서 공유합니다.
         </p>
+        <p id="quick-replies-status" class="plan-preserve" role="status" aria-live="polite"></p>
+        <div class="push-actions">
+          <button id="quick-replies-save" class="push-button" type="button">문구 저장</button>
+          <button id="quick-replies-reload" class="push-button" type="button">최신 문구 불러오기</button>
+          <button id="quick-replies-close" class="push-button" type="button">편집 보관하고 닫기</button>
+        </div>
         <p id="push-label" class="theme-label settings-section">알림</p>
         <p id="push-status" class="plan-preserve" role="status" aria-live="polite"></p>
         <div class="push-actions">

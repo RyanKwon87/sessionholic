@@ -7146,3 +7146,22 @@ body.terminal-docked .detail-head > .chat-model-controls { grid-column: 1 / -1; 
 @media (max-width: 380px) {
   .quick-reload svg { display: none; }
 }
+
+.draft-recovery-option { display: flex; align-items: center; gap: 10px; min-height: 44px; margin: 12px 0 4px; font-size: var(--fs-sub); }
+.draft-recovery-option input { width: 20px; height: 20px; flex: none; accent-color: var(--accent); }
+.body-search-panel { padding: 12px 0 16px; }
+.body-search-actions, .msg-long-controls, .history-preview-heading { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; }
+.body-search-actions button, .msg-long-controls button, .history-message-preview button { min-height: 44px; padding: 8px 12px; border-radius: var(--radius-s); }
+#search-body { flex: none; min-width: 52px; min-height: 44px; font-size: var(--fs-sub); }
+#search-body[aria-pressed="true"] { color: var(--accent-strong); background: var(--accent-tint); }
+.body-search-result { display: flex; flex-direction: column; align-items: stretch; gap: 6px; width: 100%; min-width: 0; margin: 8px 0; padding: 14px; border: 1px solid var(--separator); border-radius: var(--radius); color: var(--label); background: var(--surface); text-align: left; overflow-wrap: anywhere; }
+.body-search-result strong { font-size: var(--fs-body); }
+.body-search-meta, .msg-long-status { color: var(--label-2); font-size: var(--fs-cap); }
+.body-search-snippet { white-space: pre-wrap; font-size: var(--fs-sub); line-height: 1.5; }
+.msg-long-controls { margin: 8px 0; }
+.msg-long-status { flex: 1 1 180px; overflow-wrap: anywhere; }
+.history-message-preview { margin: 12px 0 16px; padding: 14px; border: 1px solid var(--accent-tint); border-radius: var(--radius); background: var(--fill-soft); }
+.history-preview-heading { justify-content: space-between; margin-bottom: 10px; font-size: var(--fs-sub); }
+.history-message-preview > .bubble { white-space: pre-wrap; overflow-wrap: anywhere; }
+.history-message-preview > .bubble:has(pre) { white-space: normal; }
+.body-search-result:focus-visible, .msg-long-controls button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }

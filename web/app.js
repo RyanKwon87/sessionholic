@@ -9838,9 +9838,13 @@ function renderTerminalTidy(list) {
     box.dataset.terminalId = row.terminal.id;
     box.addEventListener("change", () => { tidy.choices.set(row.terminal.id, !!box.checked); updateGo(); });
     const copy = el("span", "running-tidy-copy");
-    copy.append(el("strong", "running-terminal-title", terminalTitle(row.terminal)),
-      el("span", "running-terminal-meta", [row.session ? `세션 · ${row.session.title || "제목 없는 작업"}` : "연결된 세션 없음",
-        targetLabel(terminalInfo(row.terminal))].filter(Boolean).join(" · ")),
+    const info = terminalInfo(row.terminal);
+    const title = terminalTitle(row.terminal);
+    // The title already names a known session; the kind tells a run from a second view of it.
+    const kind = info.nativeSource?.host ? (row.runs ? "세션 실행" : "세션 연결") : "";
+    const named = row.session && !title.includes(row.session.title || "\u0000") ? `세션 · ${row.session.title || "제목 없는 작업"}` : "";
+    copy.append(el("strong", "running-terminal-title", title),
+      el("span", "running-terminal-meta", [kind, named, targetLabel(info)].filter(Boolean).join(" · ")),
       el("span", "running-tidy-reason", [row.reason, terminalIdleLabel(row.idle)].filter(Boolean).join(" · ")));
     item.append(box, copy);
     list.append(item);

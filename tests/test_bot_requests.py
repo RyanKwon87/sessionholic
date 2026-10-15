@@ -348,6 +348,216 @@ class BotRequestsTest(unittest.TestCase):
         with patch.object(api, '_collect', return_value=result):
             self.assertNotIn('DO_NOT_EXPOSE', json.dumps(api.snapshot(force=True)))
 
+    # Hermes conversations: synthetic sessions and messages only.
+    ENVELOPE = ('[슬랙 요청]\n- 요청자: 예시 요청자\n- 작업 번호: 7\n[처리 원칙]\n- 합성 원칙\n'
+                '[요청]\n재고 수량을 알려 주세요\n\n[마무리 규칙] 최종 답변만 Slack에 올라간다.')
+
+    def hermes_store(self, path, sessions):
+        """sessions: {session id: [(role, content, tool_calls, timestamp)]}."""
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with closing(sqlite3.connect(path)) as db, db:
+            db.executescript('''CREATE TABLE IF NOT EXISTS messages(id INTEGER PRIMARY KEY,session_id TEXT,role TEXT,
+                content TEXT,tool_calls TEXT,reasoning TEXT,timestamp REAL);
+                CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id,timestamp);''')
+            for session, rows in sessions.items():
+                for role, content, calls, ts in rows:
+                    db.execute('INSERT INTO messages(session_id,role,content,tool_calls,reasoning,timestamp) VALUES(?,?,?,?,?,?)',
+                               (session, role, content, calls, 'REASONING_PRIVATE', ts))
+        return path
+
+    def hermes_ledger(self, refs):
+        """A request ledger under <bot>/slack/ whose tasks name these Hermes references."""
+        self.source = {**self.source, 'path': 'bot/slack/ledger.sqlite3'}
+        path = self.ledger(len(refs))
+        with closing(sqlite3.connect(path)) as db, db:
+            for number, ref in enumerate(refs, 1):
+                db.execute('UPDATE tasks SET codex_thread=? WHERE id=?', (ref, number))
+        return path
+
+    def test_ledger_hermes_reference_gives_an_alias_and_the_board_keeps_the_session(self):
+        session = '20990101_000000_abc123'
+        self.hermes_ledger(['hermes:' + session + '#a1b2c3d4', 'hermes:../escape#x', '--last'])
+        rows = bots.read_source(self.source, self.home)['requests']
+        by_id = {row['id']: row for row in rows}
+        linked = by_id[bots._opaque(self.source, 1)]
+        self.assertIsNone(linked['nativeRef'])
+        self.assertEqual(linked['conversationRef'], {'kind': 'hermes', 'id': bots._opaque(self.source, 'hermes:' + session)})
+        self.assertEqual(linked['_conversation'], session)
+        for number in (2, 3):
+            self.assertIsNone(by_id[bots._opaque(self.source, number)]['conversationRef'])
+        api = self.configure()
+        listed = api.snapshot()
+        self.assertNotIn(session, json.dumps(listed))
+        self.assertNotIn('_conversation', json.dumps(listed))
+        self.assertEqual(api._source_cache[self.source['id']]['sessions'], {linked['id']: session})
+
+    def test_conversation_reads_user_and_assistant_text_read_only_and_never_tools(self):
+        session, other = '20990101_000000_abc123', '20990101_000001_def456'
+        self.hermes_ledger(['hermes:' + session + '#a1b2c3d4'])
+        store = self.hermes_store(self.home / 'bot/hermes/state.db', {
+            session: [('user', self.ENVELOPE, None, 1700000001),
+                      ('assistant', '', '[{"name":"TOOL_CALL_PRIVATE"}]', 1700000002),
+                      ('tool', 'TOOL_RESULT_PRIVATE', None, 1700000003),
+                      ('assistant', '확인했습니다.\n\n```\n수량 = 3\n```\n토큰 xoxb-example-secret-value', None, 1700000004)],
+            other: [('user', 'OTHER_SESSION_PRIVATE', None, 1700000005)]})
+        before = hashlib.sha256(store.read_bytes()).hexdigest()
+        api = self.configure()
+        request = api.snapshot()['requests'][0]
+        result = api.conversation(self.source['id'], request['id'])
+        [segment] = result['segments']
+        self.assertEqual((segment['kind'], segment['requests'], segment['error'], segment['more']), ('hermes', 1, None, False))
+        self.assertEqual([m['role'] for m in segment['messages']], ['user', 'assistant'])
+        self.assertEqual(segment['messages'][0]['text'], '재고 수량을 알려 주세요')
+        self.assertEqual(segment['messages'][0]['ts'], 1700000001)
+        self.assertIn('```\n수량 = 3\n```', segment['messages'][1]['text'])
+        body = json.dumps(result, ensure_ascii=False)
+        for private in ('xoxb-example', 'TOOL_CALL_PRIVATE', 'TOOL_RESULT_PRIVATE', 'REASONING_PRIVATE',
+                        'OTHER_SESSION_PRIVATE', session, '작업 번호', str(self.home)):
+            self.assertNotIn(private, body)
+        self.assertEqual(hashlib.sha256(store.read_bytes()).hexdigest(), before)
+        self.assertFalse(Path(str(store) + '-wal').exists())
+        self.assertFalse(Path(str(store) + '-shm').exists())
+
+    def test_conversation_is_bounded_to_the_newest_rows_and_cut_bodies_say_so(self):
+        session = '20990101_000000_abc123'
+        self.hermes_ledger(['hermes:' + session])
+        rows = [('user' if n % 2 else 'assistant', '메시지 %d' % n, None, 1700000000 + n) for n in range(1, 101)]
+        rows.append(('assistant', '가' * (bots.BODY_LIMIT + 10), None, 1700000200))
+        self.hermes_store(self.home / 'bot/hermes/state.db', {session: rows})
+        api = self.configure()
+        [segment] = api.conversation(self.source['id'], api.snapshot()['requests'][0]['id'])['segments']
+        self.assertEqual(len(segment['messages']), bots.CONVERSATION_ROWS)
+        self.assertTrue(segment['more'])
+        self.assertEqual(segment['messages'][0]['text'], '메시지 22')
+        last = segment['messages'][-1]
+        self.assertTrue(last['truncated'])
+        self.assertNotIn('fullLength', last, 'the reader cut it: its full length is not known here')
+        self.assertLessEqual(len(last['text']), 4002)
+
+    def test_gateway_session_conversation_reads_its_own_database(self):
+        source = {**self.source, 'kind': 'hermes_sqlite', 'path': '.hermes/state.db'}
+        path = self.database(source)
+        with closing(sqlite3.connect(path)) as db, db:
+            db.executescript('''CREATE TABLE sessions(id TEXT PRIMARY KEY,source TEXT,session_key TEXT,user_id TEXT,chat_id TEXT,
+                started_at REAL,ended_at REAL,origin_json TEXT);
+                CREATE INDEX idx_started ON sessions(started_at);''')
+            db.execute("INSERT INTO sessions VALUES('gateway-1','slack','key','user','chat',1700000000,NULL,'{}')")
+        self.hermes_store(path, {'gateway-1': [('user', '안녕하세요', None, 1700000001), ('assistant', '반갑습니다', None, 1700000002)]})
+        api = self.configure([source])
+        row = api.snapshot()['requests'][0]
+        self.assertEqual(row['conversationRef']['kind'], 'hermes')
+        result = api.conversation(source['id'], row['id'])
+        self.assertEqual([m['text'] for m in result['segments'][0]['messages']], ['안녕하세요', '반갑습니다'])
+
+    def test_unreadable_conversation_is_a_segment_error_and_bad_targets_are_refused(self):
+        session = '20990101_000000_abc123'
+        self.hermes_ledger(['hermes:' + session])
+        api = self.configure()
+        request = api.snapshot()['requests'][0]
+        # No database beside the ledger yet, then one without the session index.
+        [segment] = api.conversation(self.source['id'], request['id'])['segments']
+        self.assertEqual(segment['messages'], [])
+        self.assertIn('읽지 못했습니다', segment['error'])
+        store = self.home / 'bot/hermes/state.db'
+        store.parent.mkdir(parents=True)
+        with closing(sqlite3.connect(store)) as db, db:
+            db.execute('CREATE TABLE messages(id INTEGER PRIMARY KEY,session_id TEXT,role TEXT,content TEXT,timestamp REAL)')
+        self.assertIn('읽지 못했습니다', api.conversation(self.source['id'], request['id'])['segments'][0]['error'])
+        for source_id, request_id in ((self.source['id'], self.source['id'] + ':' + '0' * 24), ('../x', request['id']),
+                                      (self.source['id'], 'other:' + '0' * 24), (None, None)):
+            with self.subTest(source_id=source_id, request_id=request_id), self.assertRaises(ValueError):
+                api.conversation(source_id, request_id)
+        # A source no longer configured is not read for its old requests.
+        self.config.write_text(json.dumps({'version': 1, 'sources': [{**self.source, 'id': 'other'}]}))
+        with self.assertRaises(ValueError):
+            api.conversation(self.source['id'], request['id'])
+
+    def test_a_ledger_without_a_bot_folder_has_no_derived_conversation_store(self):
+        self.assertIsNone(bots._hermes_store(self.source))
+        self.assertEqual(bots._hermes_store({**self.source, 'path': 'bot/slack/ledger.sqlite3'}), 'bot/hermes/state.db')
+        self.assertIsNone(bots._hermes_store({**self.source, 'kind': 'holicii_sqlite', 'path': 'bot/slack/inbox.db'}))
+        with self.assertRaisesRegex(bots.SourceError, '대화 기록'):
+            bots.read_conversation(self.source, ['20990101_000000_abc123'], self.home)
+        for sessions in ([], ['../escape'], ['a'] * 2, ['a'] * (bots.CONVERSATION_SESSIONS + 1), 'a'):
+            with self.subTest(sessions=sessions), self.assertRaisesRegex(bots.SourceError, '식별자'):
+                bots.read_conversation({**self.source, 'path': 'bot/slack/ledger.sqlite3'}, sessions, self.home)
+
+    def test_codex_part_is_read_through_the_board_and_keeps_only_the_conversation(self):
+        self.ledger()
+        self.native()
+        api = self.configure()
+        request = api.snapshot()['requests'][0]
+        read = Mock(return_value=[{'role': 'user', 'text': '요청', 'ts': 1700000001, 'attachments': ['x']},
+                                  {'role': 'tool', 'text': 'TOOL_PRIVATE'},
+                                  {'role': 'assistant', 'text': '답변', 'ts': 1700000002, 'truncated': True, 'fullLength': 9000}])
+        [segment] = api.conversation(self.source['id'], request['id'], read_native=read)['segments']
+        read.assert_called_once_with('mini', {'agent': 'codex', 'id': self.sid, 'home': '.codex'})
+        self.assertEqual(segment['kind'], 'codex')
+        self.assertEqual(segment['messages'], [{'role': 'user', 'text': '요청', 'ts': 1700000001},
+                                               {'role': 'assistant', 'text': '답변', 'ts': 1700000002, 'truncated': True, 'fullLength': 9000}])
+        read.side_effect = RuntimeError('PRIVATE_REMOTE_DETAILS')
+        [segment] = api.conversation(self.source['id'], request['id'], read_native=read)['segments']
+        self.assertIn('읽지 못했습니다', segment['error'])
+        self.assertNotIn('PRIVATE_REMOTE_DETAILS', json.dumps(segment))
+
+    def test_remote_conversation_is_checked_and_cannot_add_rows_or_roles(self):
+        session = '20990101_000000_abc123'
+        for bad in ({'conversations': [{'id': 'other', 'messages': []}]},
+                    {'conversations': [{'id': session, 'messages': [{'role': 'tool', 'text': 'x'}]}]},
+                    {'conversations': [{'id': session, 'messages': [{'role': 'user', 'text': 'x' * (bots.BODY_LIMIT + 1)}]}]},
+                    {'conversations': [{'id': session, 'messages': [{'role': 'user'}] * (bots.CONVERSATION_ROWS + 1)}]},
+                    {'conversations': [{'id': session, 'messages': []}, {'id': session, 'messages': []}]},
+                    {'conversations': 'x'}, None):
+            with self.subTest(bad=bad), self.assertRaises(bots.SourceError):
+                bots.BotRequests._checked_conversations([session], bad)
+        def listed(source, **extra):
+            return {'requests': [{'id': bots._opaque(source, 1), 'sourceId': source['id'], 'host': 'mini',
+                                  'nativeRef': None, **extra}]}
+        holicii = {**self.source, 'kind': 'holicii_sqlite'}
+        for source, extra in ((holicii, {'_conversation': session, 'conversationRef': bots._conversation_ref(holicii, session)}),
+                              (self.source, {'_conversation': session, 'conversationRef': {'kind': 'hermes', 'id': self.source['id'] + ':' + '0' * 24}}),
+                              (self.source, {'_conversation': '../x', 'conversationRef': bots._conversation_ref(self.source, '../x')}),
+                              (self.source, {'conversationRef': bots._conversation_ref(self.source, session)})):
+            with self.subTest(extra=extra), self.assertRaises(bots.SourceError):
+                bots.BotRequests._checked(source, listed(source, **extra))
+        rows, sessions = bots.BotRequests._checked(self.source, listed(
+            self.source, _conversation=session, conversationRef=bots._conversation_ref(self.source, session)))
+        self.assertEqual(sessions, {rows[0]['id']: session})
+        self.assertNotIn('_conversation', rows[0])
+
+    def test_remote_conversation_runs_the_same_stdin_reader_with_its_sessions(self):
+        session = '20990101_000000_abc123'
+        source = {**self.source, 'host': 'pc', 'path': 'bot/slack/ledger.sqlite3'}
+        expected = {'conversations': [{'id': session, 'messages': [{'role': 'user', 'text': '요청', 'ts': 1, 'size': 2}], 'more': False}]}
+        api = self.configure([source])
+        api._source_cache[source['id']] = {'signature': json.dumps(source, sort_keys=True), 'source': source,
+                                           'rows': [{'id': bots._opaque(source, 1), 'updatedAt': None, 'nativeRef': None}],
+                                           'sessions': {bots._opaque(source, 1): session}, 'status': {}, 'failed': False,
+                                           'fetched': bots.time.monotonic()}
+        command = Mock(return_value=['ssh', 'example-pc', 'python-stdin'])
+        done = subprocess.CompletedProcess([], 0, json.dumps(expected).encode())
+        with patch.dict(sys.modules, {'server': types.SimpleNamespace(collector_command=command)}), \
+                patch.object(api, 'snapshot'), patch.object(subprocess, 'run', return_value=done) as run:
+            result = api.conversation(source['id'], bots._opaque(source, 1))
+        self.assertEqual(result['segments'][0]['messages'][0]['text'], '요청')
+        program = run.call_args.kwargs['input']
+        self.assertIn(b'BOT_REQUEST = ', program)
+        self.assertIn(b"BOT_CONVERSATION = ['" + session.encode() + b"']", program)
+        self.assertEqual(run.call_args.kwargs['timeout'], 20)
+
+    def test_standalone_conversation_reader_executes_with_only_stdlib(self):
+        session = '20990101_000000_abc123'
+        self.source = {**self.source, 'path': 'bot/slack/ledger.sqlite3'}
+        self.hermes_store(self.home / 'bot/hermes/state.db', {session: [('user', '요청', None, 1700000001)]})
+        program = ('BOT_REQUEST = ' + ascii(self.source) + '\nBOT_CONVERSATION = ' + ascii([session]) + '\n').encode() \
+            + Path(bots.__file__).read_bytes()
+        done = subprocess.run([sys.executable, '-I', '-'], input=program, stdout=subprocess.PIPE,
+                              stderr=subprocess.PIPE, env={'HOME': str(self.home), 'PATH': '/usr/bin:/bin'}, timeout=5)
+        self.assertEqual(done.returncode, 0, done.stderr.decode())
+        result = json.loads(done.stdout)
+        self.assertEqual(result['conversations'][0]['messages'][0]['text'], '요청')
+        self.assertEqual(done.stderr, b'')
+
     def test_missing_configuration_is_empty_and_never_discovers_unregistered_databases(self):
         with patch.object(Path, 'home', return_value=self.home):
             api = bots.BotRequests(self.hosts, self.config, self.home/'state')

@@ -413,3 +413,87 @@ test("세 분류의 방향키·Home·End와 휴대폰 뒤로·앞으로가 봇 �
   assert.equal(c.state.detailShown, false);
   assert.equal(c.history.state.view, "list");
 });
+
+function conversationCalls(c) { return c.calls.filter((call) => call.url.startsWith("/api/bot-requests/conversation?")); }
+function conversationRequest(overrides = {}) {
+  return request({ id: "source-alpha:" + "b".repeat(24), conversationRef: { kind: "hermes", id: "source-alpha:" + "a".repeat(24) }, ...overrides });
+}
+
+test("대화가 연결된 봇 요청은 상세 아래 말풍선으로 대화를 GET 한 번에 읽어 보이고, 입력·관리 화면은 없다", async () => {
+  const replies = [];
+  const c = client((url) => {
+    if (!url.startsWith("/api/bot-requests/conversation?")) throw new Error(`Unexpected fixture route: ${url}`);
+    const next = deferred(); replies.push(next); return next.promise;
+  });
+  const row = conversationRequest(); cache(c, [row]);
+  c.selectBotRequest(c.botRequestKey(row));
+  const detail = c.get("detail");
+  assert.match(textOf(detail), /대화 기록.*대화를 불러오고 있습니다/);
+  assert.equal(conversationCalls(c).length, 1);
+  assert.equal(conversationCalls(c)[0].method, "GET");
+  const params = new URL(conversationCalls(c)[0].url, "http://fixture.invalid").searchParams;
+  assert.deepEqual([params.get("source"), params.get("request")], ["source-alpha", row.id]);
+  replies[0].resolve(response({ fetchedAt: "2033-05-18T03:33:20Z", segments: [{ kind: "hermes", requests: 1, more: true, error: null, messages: [
+    { role: "user", text: "재고 수량을 알려 주세요", ts: 2000000000 },
+    { role: "assistant", text: "확인했습니다.\n\n```\n수량 = 3\n```", ts: 2000000001 },
+    { role: "assistant", text: "<img src=x onerror=unsafe()>", truncated: true, fullLength: 9000 }] }] }));
+  await c.state.botConversations.get(c.botRequestKey(row)).promise;
+  const rows = byClass(detail, "msg");
+  assert.deepEqual(rows.map((item) => item.className), ["msg user", "msg assistant", "msg assistant"]);
+  assert.match(textOf(rows[0]), /요청자.*재고 수량을 알려 주세요/);
+  assert.match(textOf(rows[1]), /자동홀릭.*수량 = 3/);
+  assert.match(textOf(rows[2]), /<img src=x onerror=unsafe\(\)>/);
+  assert.match(textOf(rows[2]), /앞부분만 표시합니다 · 전체 9,000자/);
+  assert.match(textOf(detail), /앞부분 일부는 여기에 나오지 않습니다/);
+  assert.match(textOf(detail), /원래 봇에서 이어가세요/);
+  assert.equal(descendants(detail).filter((item) => ["INPUT", "TEXTAREA", "SELECT", "IMG"].includes(item.tagName)).length, 0);
+  assert.doesNotMatch(textOf(detail), /세션 관리|터미널 열기|메시지 보내기/);
+  // Drawn again or opened again within a minute: no second read.
+  c.renderBotRequests(); c.selectBotRequest(c.botRequestKey(row)); c.render();
+  assert.equal(conversationCalls(c).length, 1);
+  assert.equal(byClass(c.get("detail"), "msg").length, 3, "다시 열어도 읽은 대화를 바로 보인다");
+  // The request changed (a newer answer): it is read again.
+  const changed = { ...row, updatedAt: 2000000100, status: "completed" }; cache(c, [changed]); c.renderBotRequests();
+  assert.equal(conversationCalls(c).length, 2);
+  replies[1].resolve(response({ segments: [{ kind: "hermes", messages: [{ role: "assistant", text: "새 답변" }] }] }));
+  await c.state.botConversations.get(c.botRequestKey(row)).promise;
+  assert.match(textOf(c.get("detail")), /새 답변/);
+  assert.ok(c.calls.every((call) => call.method === "GET" && call.url.startsWith("/api/bot-requests/conversation?")),
+    "대화 보기는 읽기만 한다");
+});
+
+test("대화 읽기 실패는 자동 재시도 없이 다시 불러오기로만 다시 읽고, 구간 오류·빈 대화를 알리며 잠금 뒤 늦은 응답은 그리지 않는다", async () => {
+  const replies = [];
+  const c = client((url) => {
+    if (url === "/logout") return response({ ok: true });
+    if (!url.startsWith("/api/bot-requests/conversation?")) throw new Error(`Unexpected fixture route: ${url}`);
+    const next = deferred(); replies.push(next); return next.promise;
+  });
+  // A Codex session that is not listed here is read through the same watch-only view.
+  const row = request({ nativeRef: { agent: "codex", id: "unlisted", home: ".codex" } }); cache(c, [row]);
+  c.selectBotRequest(c.botRequestKey(row));
+  assert.equal(c.state.selected, null);
+  replies[0].resolve(response({ error: "봇 대화를 읽지 못했습니다." }, 503));
+  await c.state.botConversations.get(c.botRequestKey(row)).promise;
+  const detail = c.get("detail");
+  assert.match(textOf(detail), /봇 대화를 읽지 못했습니다/);
+  c.advance(120000); c.renderBotRequests(); c.render();
+  assert.equal(conversationCalls(c).length, 1, "실패해도 스스로 다시 읽지 않는다");
+  const retry = detail.querySelectorAll("button").find((node) => node.textContent === "대화 다시 불러오기");
+  retry.events.click();
+  assert.equal(conversationCalls(c).length, 2);
+  replies[1].resolve(response({ segments: [
+    { kind: "codex", messages: [], error: "이 대화 기록을 읽지 못했습니다. 잠시 뒤 다시 확인해 주세요." },
+    { kind: "hermes", messages: [], error: null }] }));
+  await c.state.botConversations.get(c.botRequestKey(row)).promise;
+  assert.match(textOf(detail), /이 대화 기록을 읽지 못했습니다.*저장된 대화를 찾지 못했습니다/);
+  assert.equal(byClass(detail, "msg").length, 0);
+  // A read still on its way when the board locks draws nothing afterwards.
+  cache(c, [{ ...row, updatedAt: 2000000200 }]); c.renderBotRequests();
+  assert.equal(conversationCalls(c).length, 3);
+  await c.lock();
+  replies[2].resolve(response({ segments: [{ kind: "codex", messages: [{ role: "assistant", text: "잠금 뒤 도착" }] }] }));
+  await new Promise(setImmediate);
+  assert.equal(c.state.botConversations.size, 0);
+  assert.doesNotMatch(textOf(c.get("detail")), /잠금 뒤 도착/);
+});

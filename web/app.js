@@ -170,6 +170,8 @@ const state = {
   sessionCategory: "general",
   selectedBotRequest: null,
   botRequests: emptyBotRequests(),
+  // A bot request's conversation, watch-only: one read per open, kept briefly by request.
+  botConversations: new Map(),
   accountFilterRoutes: null,
   search: "",
   showOld: false,
@@ -854,7 +856,7 @@ const UPDATE_RETURN_MS = 15000;
 const API_TIMEOUT_MS = { GET: 30000, POST: 45000 };
 // Each is longer than the server's own bound for that route.
 const API_PATH_TIMEOUT_MS = {
-  "/api/capabilities": 90000, "/api/read": 45000, "/api/chat/send": 90000, "/api/chat/prompt": 60000,
+  "/api/capabilities": 90000, "/api/read": 45000, "/api/bot-requests/conversation": 90000, "/api/chat/send": 90000, "/api/chat/prompt": 60000,
   "/api/plan": 120000, "/api/new-session": 120000, "/api/app-server": 200000, "/api/launch": 660000,
 };
 const API_TIMEOUT_MESSAGE = "응답이 늦어 기다리기를 멈췄습니다. 연결을 확인한 뒤 다시 시도해 주세요.";
@@ -1707,7 +1709,92 @@ function drawBotRequest(request) {
   }
   detail.append(metadata);
   if (request.nativeRef) detail.append(el("p", "bot-native-note", "연결된 세션 기록이 있습니다. 입력과 실행 관리는 원래 봇에서 진행해 주세요."));
+  // Its conversation below the details, watch-only (no composer, no session control).
+  const readable = botConversationReadable(request);
+  if (readable) {
+    const conversation = el("section", "bot-conversation"); conversation.id = "bot-conversation";
+    conversation.setAttribute("aria-label", "봇 대화 기록");
+    conversation.dataset.conversationKey = botConversationKey(request);
+    detail.append(conversation);
+  }
   pane.append(head, detail);
+  if (readable) loadBotConversation(request);
+}
+// A request whose bot kept its conversation (a Hermes session, or a Codex one not listed
+// here): read on opening, once a minute at most unless the request changed or asked again.
+const BOT_CONVERSATION_MS = 60000;
+function botConversationReadable(request) { return !!(request?.conversationRef || request?.nativeRef); }
+function botConversationKey(request) { return botRequestKey(request); }
+async function loadBotConversation(request, { force = false } = {}) {
+  if (!state.authenticated || !botConversationReadable(request)) return;
+  const key = botConversationKey(request), revision = String(request.updatedAt ?? "");
+  let entry = state.botConversations.get(key);
+  if (entry?.promise) return entry.promise;
+  if (entry && !force && !entry.error && entry.revision === revision && Date.now() - entry.readAt < BOT_CONVERSATION_MS) {
+    renderBotConversation(request); return;
+  }
+  if (!entry) { entry = { data: null, error: "", readAt: 0, revision, promise: null }; state.botConversations.set(key, entry); }
+  if (networkOffline()) { entry.error = "오프라인입니다. 연결 후 대화를 다시 불러와 주세요."; renderBotConversation(request); return; }
+  const authEpoch = state.authEpoch;
+  entry.error = "";
+  entry.promise = (async () => {
+    try {
+      const params = new URLSearchParams({ source: request.sourceId, request: request.id });
+      const data = await api(`/api/bot-requests/conversation?${params}`, { authEpoch });
+      if (!data || !Array.isArray(data.segments) || data.segments.some((segment) => !segment || !Array.isArray(segment.messages)))
+        throw new Error("봇 대화 형식을 확인하지 못했습니다. 잠시 후 다시 확인해 주세요.");
+      if (state.botConversations.get(key) === entry) Object.assign(entry, { data, readAt: Date.now(), revision });
+    } catch (err) {
+      if (authEpoch === state.authEpoch && state.botConversations.get(key) === entry && !err.staleAuth && !err.unauthorized)
+        entry.error = err.message || "봇 대화를 읽지 못했습니다. 다시 확인해 주세요.";
+    } finally {
+      if (state.botConversations.get(key) === entry) { entry.promise = null; renderBotConversation(request); }
+    }
+  })();
+  renderBotConversation(request);
+  return entry.promise;
+}
+function renderBotConversation(request) {
+  const key = botConversationKey(request), box = $("bot-conversation");
+  if (!box || box.dataset.conversationKey !== key) return;
+  const entry = state.botConversations.get(key);
+  const segments = entry?.data?.segments || [];
+  const nodes = [el("h2", "bot-conversation-title", "대화 기록")];
+  if (entry?.promise && !entry.data) nodes.push(el("p", "bot-conversation-status", "대화를 불러오고 있습니다…"));
+  if (entry?.error) {
+    const notice = el("div", "bot-source-notice"); notice.setAttribute("role", "status");
+    notice.append(el("p", "", entry.data ? `${entry.error} 마지막으로 읽은 대화를 표시합니다.` : entry.error),
+      button("대화 다시 불러오기", "secondary", () => loadBotConversation(request, { force: true })));
+    nodes.push(notice);
+  }
+  for (const segment of segments) {
+    if (segment.error) nodes.push(el("p", "bot-source-notice", segment.error));
+    if (segment.more) nodes.push(el("p", "conversation-window-notice", "이 대화의 앞부분 일부는 여기에 나오지 않습니다."));
+    for (const message of segment.messages) nodes.push(botMessageRow(message, request));
+    if (!segment.error && !segment.messages.length) nodes.push(el("p", "group-empty", "저장된 대화를 찾지 못했습니다."));
+  }
+  if (entry?.data && !segments.length) nodes.push(el("p", "group-empty", "이 요청에서 읽을 수 있는 대화가 없습니다."));
+  box.replaceChildren(...nodes);
+  box.setAttribute("aria-busy", String(!!entry?.promise));
+}
+// One message, in the same bubbles as a session's conversation; nothing here sends or acts.
+function botMessageRow(message, request) {
+  const role = message?.role === "user" ? "user" : "assistant";
+  const text = typeof message?.text === "string" ? message.text : "";
+  const row = el("article", `msg ${role}`);
+  const label = el("div", "msg-label");
+  label.append(el("strong", null, role === "user" ? "요청자" : botLabel(request.botName)));
+  if (typeof message.ts === "number" && message.ts > 0) label.append(el("span", null, clock(message.ts)));
+  const bubble = el("div", "bubble");
+  if (role === "assistant" && typeof MessageFormat !== "undefined")
+    MessageFormat.render(bubble, text, { onCopy: (value) => copyText(value, "코드를 복사했습니다.") });
+  else bubble.textContent = text;
+  row.append(label, bubble);
+  if (message.truncated === true) {
+    const total = Number.isInteger(message.fullLength) ? ` · 전체 ${message.fullLength.toLocaleString()}자` : "";
+    row.append(el("p", "msg-truncated", `긴 메시지라 앞부분만 표시합니다${total}.`));
+  }
+  return row;
 }
 const SESSION_CATEGORIES = { general: "일반 세션", agent: "에이전트 세션", bot: "봇 요청" };
 function sessionCategoryOf(session) {
@@ -10187,7 +10274,7 @@ function showLogin() {
   window.SessionholicGoals?.locked?.();
   state.phaseFilter = "";
   state.sessionCategory = "general"; state.filters.initiator = "";
-  state.selectedBotRequest = null; state.botRequests = emptyBotRequests();
+  state.selectedBotRequest = null; state.botRequests = emptyBotRequests(); state.botConversations = new Map();
   renderSessionCategories([], Date.now() / 1000);
   state.swipeOpen = null;
   state.pollFailures = 0;

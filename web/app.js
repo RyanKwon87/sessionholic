@@ -3994,6 +3994,41 @@ function renderDictation() {
     node.title = label;
     setClass(node, "is-listening", listening);
   }
+  renderDictationOverlay();
+}
+// The mic's own screen while it listens, over everything but toasts: that it listens, and
+// the words it heard in this listening, large enough to read at a glance on the move (the
+// end of what the field held before stays small in front). Its 끝내기 does what the mic does.
+const DICTATION_OVERLAY_BEFORE = 120;
+function renderDictationOverlay() {
+  const overlay = $("dictation-overlay");
+  if (!overlay) return;
+  const session = state.dictation;
+  overlay.hidden = !session;
+  if (!session) return;
+  const stop = $("dictation-overlay-stop");
+  if (stop && !stop.dataset.bound) {
+    // 끝내기: as the mic pressed again (the last words land, then it parks or ends).
+    stop.dataset.bound = "1";
+    stop.addEventListener("click", () => {
+      if (state.dictation) stopDictation({ field: state.dictation.field });
+    });
+  }
+  setClass(overlay, "is-listening", !!session.started && !session.stopping);
+  const status = $("dictation-overlay-status");
+  const said = !session.started ? DICTATION_PREPARING : session.stopping ? DICTATION_ENDING : "듣는 중";
+  if (status.textContent !== said) status.textContent = said;
+  const value = String(session.field?.value || "");
+  const base = Math.max(0, Math.min(Number.isInteger(session.base) ? session.base : value.length, value.length));
+  const end = Math.max(base, value.length - String(session.suffix || "").length);
+  const heard = value.slice(base, end).trim();
+  const before = value.slice(Math.max(0, base - DICTATION_OVERLAY_BEFORE), base).trimStart();
+  const parts = [];
+  if (before.trim()) parts.push(el("span", "dictation-before", (base > DICTATION_OVERLAY_BEFORE ? "…" : "") + before));
+  parts.push(heard ? el("strong", "dictation-heard", heard) : el("span", "dictation-placeholder", "말씀하세요…"));
+  const text = $("dictation-overlay-text");
+  text.replaceChildren(...parts);
+  text.scrollTop = text.scrollHeight;
 }
 // The mic's trace: what the device's recognition did and what the board made of it, sent to
 // the board a moment after each listening (event names, timings, counts, lengths and codes;
@@ -4172,7 +4207,7 @@ function resumeDictation(session, field, { report, active, releaseKeyboard }) {
   const parkedMs = Math.min(Date.now() - (session.parkedAt || Date.now()), 1e9);
   Object.assign(session, { field, reportTo: report, active, prefix: press.value.slice(0, press.start), suffix: press.value.slice(press.end),
     written: press.value, wrote: false, results: [], finals: [], finalText: "", restarts: 0, heard: false, started: true,
-    silent: false, error: "", applying: false, stopping: false, ticks: 0, idle: 0,
+    silent: false, error: "", applying: false, stopping: false, ticks: 0, idle: 0, base: press.start,
     trace: dictationTraceFor(field, press, { resumed: true, parkedMs }) });
   state.dictation = session;
   session.timer = dictationTimer(session);
@@ -4210,10 +4245,12 @@ function startDictation(field, { report, active, releaseKeyboard = false }) {
   }
   const session = { field, recognition, reportTo: report, active, prefix: press.value.slice(0, press.start), suffix: press.value.slice(press.end),
     written: press.value, wrote: false, results: [], finals: [], finalText: "", restarts: 0, heard: false, started: false, silent: false, error: "", applying: false, stopping: false,
-    ticks: 0, idle: 0, timer: null, stopTimer: null, parkTimer: null, beganAt: 0, endNoted: false, seen: 0, skip: 0, trace };
+    ticks: 0, idle: 0, timer: null, stopTimer: null, parkTimer: null, beganAt: 0, endNoted: false, seen: 0, skip: 0, trace,
+    base: press.start };
   session.report = (text) => {
     session.reportTo(text);
     dictationTrace(session, "say", { why: dictationReportCode(text), ...dictationInputState(session.field) });
+    if (state.dictation === session) renderDictationOverlay();
   };
   // A recognition replaced by another is over: what it still reports is traced, never applied.
   const replaced = (rec, name) => {
@@ -4385,6 +4422,7 @@ function applyDictation(session) {
   } finally {
     session.applying = false;
   }
+  if (state.dictation === session) renderDictationOverlay();
 }
 // What the field's status line says when a listening ends ("" for a plain end after words).
 // Our own aborts never reach the end handler, so an "aborted" there is the platform's (or its
@@ -4486,7 +4524,7 @@ function rebaseDictation(session) {
   const value = String(field.value || "");
   const start = Number.isInteger(field.selectionStart) ? Math.min(field.selectionStart, value.length) : value.length;
   const end = Number.isInteger(field.selectionEnd) ? Math.min(Math.max(start, field.selectionEnd), value.length) : start;
-  Object.assign(session, { prefix: value.slice(0, start), suffix: value.slice(end), written: value });
+  Object.assign(session, { prefix: value.slice(0, start), suffix: value.slice(end), written: value, base: start });
   return true;
 }
 function draftDictationNote(text) {

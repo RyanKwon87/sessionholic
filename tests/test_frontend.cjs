@@ -5239,6 +5239,244 @@ test('Android back keeps one history step per phone screen while list and conver
   await settle();
 });
 
+// Edge swipes: an iPhone or iPad home-screen app (navigator.standalone) with a touch screen.
+// Timers run only when the test settles a released swipe; the clock moves with each step.
+function edgeClient({ standalone = true, coarse = true, phone = true, width = 390, media = {} } = {}) {
+  const pending = [];
+  const timers = { setTimeout: (fn, ms) => { pending.push({ fn, ms }); return pending.length; },
+    clearTimeout: (id) => { if (pending[id - 1]) pending[id - 1].fn = null; } };
+  const c = client(undefined, timers);
+  c.context.navigator = { onLine: false, standalone };
+  c.context.window.innerWidth = width;
+  c.state.authenticated = true;
+  const matches = { '(pointer: coarse)': coarse, '(max-width: 700px)': phone, ...media };
+  c.context.window.matchMedia = (query) => ({ matches: !!matches[query] });
+  const root = c.context.document.documentElement;
+  root.dataset = {};
+  const vars = {};
+  root.style.setProperty = (name, value) => { vars[name] = value; };
+  root.style.removeProperty = (name) => { delete vars[name]; };
+  const body = classes();
+  c.context.document.body.classList = body;
+  c.windowEvents.DOMContentLoaded();
+  // Slides end at once here, so a swipe may follow right away.
+  const slides = [];
+  c.context.document.startViewTransition = (update) => { slides.push(root.dataset.nav); update(); return { finished: { then: (done) => done() } }; };
+  let now = 1e6;
+  c.context.Date = class extends Date { static now() { return now; } };
+  const plain = { closest: () => null };
+  const touch = (type, x, y, { target = plain, fingers = 1 } = {}) => {
+    const done = { prevented: 0, stopped: 0 };
+    const lifted = type === 'touchend' || type === 'touchcancel';
+    const touches = lifted ? [] : Array.from({ length: fingers }, (_, i) => ({ clientX: x + i * 40, clientY: y }));
+    c.documentEvents[type]?.({ type, target, touches, changedTouches: [{ clientX: x, clientY: y }], cancelable: true,
+      preventDefault() { done.prevented++; }, stopPropagation() { done.stopped++; } });
+    return done;
+  };
+  // A drag from x0 to x1 in six steps over `ms`; returns the last move's handling.
+  const drag = (x0, x1, { y = 400, dy = 1, ms = 300, target, lift = true } = {}) => {
+    touch('touchstart', x0, y, { target });
+    let last;
+    for (let i = 1; i <= 6; i++) { now += ms / 6; last = touch('touchmove', x0 + ((x1 - x0) * i) / 6, y + dy * i, { target }); }
+    if (lift) touch('touchend', x1, y + dy * 6, { target });
+    return last;
+  };
+  // Runs the release slide's end (GESTURE.edgeSettleMs) registered so far.
+  const settleSwipe = () => {
+    for (const timer of pending.splice(0)) if (timer.fn && timer.ms === c.GESTURE.edgeSettleMs) timer.fn();
+  };
+  const fn = (name) => vm.runInContext(name, c.context);
+  const pop = (entry) => { c.context.window.history.state = entry; c.windowEvents.popstate({ state: entry }); };
+  return { c, body, vars, slides, touch, drag, settleSwipe, fn, pop, advance: (ms) => { now += ms; } };
+}
+
+test('edge swipes start at the screen edges, need a sideways drag and settle on distance or a flick', () => {
+  const { c, fn } = edgeClient();
+  const start = (x, extra = {}) => fn('edgeSwipeStart')({ x, width: 390, back: true, forward: true, ...extra });
+  assert.equal(start(8), 'back');
+  assert.equal(start(c.GESTURE.edgeBackPx + 1), null, 'past the left edge zone');
+  assert.equal(start(382), 'forward');
+  assert.equal(start(390 - c.GESTURE.edgeForwardPx - 1), null, 'before the right edge zone');
+  assert.equal(start(8, { back: false }), null, 'no screen to go back to');
+  assert.equal(start(382, { forward: false }), null, 'no screen to go forward to');
+  const intent = fn('edgeSwipeIntent');
+  assert.equal(intent(6, 2, 'back'), null, 'inside the slop nothing is decided');
+  assert.equal(intent(30, 10, 'back'), 'swipe');
+  assert.equal(intent(24, 21, 'back'), 'cancel', 'steeper drags are left to scrolling');
+  assert.equal(intent(-30, 2, 'back'), 'cancel', 'back only drags to the right');
+  assert.equal(intent(-30, 2, 'forward'), 'swipe');
+  assert.equal(intent(30, 2, 'forward'), 'cancel');
+  const release = (fields) => fn('edgeSwipeRelease')({ width: 390, ...fields });
+  assert.equal(release({ distance: 100, velocity: 0.1 }), 'cancel', 'a short slow drag springs back');
+  assert.equal(release({ distance: 200, velocity: 0 }), 'commit', 'past half the screen it goes');
+  assert.equal(release({ distance: 60, velocity: 0.8 }), 'commit', 'a flick goes');
+  assert.equal(release({ distance: 300, velocity: -0.8 }), 'cancel', 'a flick back to the edge cancels');
+  assert.equal(release({ distance: 4, velocity: 0.9 }), 'cancel', 'a flick inside the slop is a tap');
+  const offsets = (...args) => ({ ...fn('edgeSwipeOffsets')(...args) });
+  assert.deepEqual(offsets('back', 0, 400), { over: 0, under: -112 }, 'the screen below waits 28% to the left');
+  assert.deepEqual(offsets('back', 200, 400), { over: 200, under: -56 });
+  assert.deepEqual(offsets('back', 900, 400), { over: 400, under: 0 });
+  assert.deepEqual(offsets('forward', 100, 400), { over: 300, under: -28 });
+  assert.deepEqual(offsets('forward', 400, 400), { over: 0, under: -112 });
+});
+
+test('a home-screen app goes back from a phone conversation by an edge swipe that follows the finger, without a second slide', () => {
+  const { c, body, vars, slides, touch, settleSwipe, fn, pop } = edgeClient();
+  const { s } = selectChat(c);
+  c.select(s.key);
+  const detail = c.context.window.history.state;
+  assert.equal(detail.view, 'detail'); assert.equal(detail.listDepth, 1);
+  slides.length = 0;
+  assert.equal(touch('touchstart', 8, 400).prevented, 0, 'a touch on the back button stays a tap');
+  const first = touch('touchmove', 60, 404);
+  assert.equal(first.prevented, 1, 'the page does not scroll under the swipe');
+  assert.equal(first.stopped, 1, 'nor do the terminal, the pull to refresh or the list see it');
+  assert.equal(body.contains('edge-peek'), true); assert.equal(body.contains('edge-over-detail'), true);
+  assert.equal(body.contains('show-detail'), false, 'the list shows beneath the conversation');
+  assert.equal(vars['--edge-over-x'], '52px');
+  assert.equal(vars['--edge-under-x'], `${fn('edgeSwipeOffsets')('back', 52, 390).under}px`);
+  touch('touchmove', 280, 410);
+  touch('touchend', 280, 410);
+  assert.equal(c.context.window.history.backCount, 0, 'the slide finishes first');
+  assert.equal(body.contains('edge-settling'), true);
+  settleSwipe();
+  assert.equal(c.context.window.history.backCount, 1, 'back uses the browser history');
+  assert.equal(body.contains('edge-peek'), true, 'the finished slide stays until the history moves');
+  let clicked = 0;
+  c.documentEvents.click({ preventDefault() { clicked++; }, stopPropagation() {} });
+  assert.equal(clicked, 1, 'the lifted finger makes no tap');
+  pop({ sessionholic: true, view: 'list', listDepth: 0, navigationId: 'list-entry' });
+  assert.deepEqual(slides, [], 'no second slide after the swipe');
+  assert.equal(c.state.detailShown, false); assert.equal(body.contains('show-detail'), false);
+  for (const name of ['edge-peek', 'edge-settling', 'edge-over-detail']) assert.equal(body.contains(name), false, name);
+  assert.equal(vars['--edge-over-x'], undefined); assert.equal(vars['--edge-under-x'], undefined);
+  c.select(s.key);
+  assert.deepEqual(slides, ['push'], 'the next screen change slides as usual');
+});
+
+test('an edge swipe from the right goes forward only to a screen this board left by going back', () => {
+  const { c, body, slides, touch, drag, settleSwipe, pop } = edgeClient();
+  const { s } = selectChat(c);
+  let forwards = 0;
+  c.context.window.history.forward = () => { forwards++; };
+  assert.equal(drag(384, 120).prevented, 0, 'nothing to go forward to');
+  c.select(s.key);
+  const detail = c.context.window.history.state;
+  c.backToList();
+  const list = { sessionholic: true, view: 'list', listDepth: 0, navigationId: 'list-entry' };
+  pop(list);
+  assert.equal(c.state.detailShown, false);
+  slides.length = 0;
+  touch('touchstart', 384, 400);
+  assert.equal(touch('touchmove', 300, 402).prevented, 1);
+  assert.equal(body.contains('edge-over-detail'), true, 'the conversation comes in over the list');
+  assert.equal(body.contains('show-detail'), false);
+  touch('touchmove', 120, 404); touch('touchend', 120, 404);
+  settleSwipe();
+  assert.equal(forwards, 1);
+  pop(detail);
+  assert.deepEqual(slides, [], 'no second slide');
+  assert.equal(c.state.detailShown, true); assert.equal(body.contains('show-detail'), true);
+  assert.equal(body.contains('edge-peek'), false);
+  // Used up: nothing further forward, while back still works (a cancelled one stays put).
+  assert.equal(drag(384, 120).prevented, 0, 'nothing further forward');
+  assert.equal(forwards, 1);
+  assert.equal(drag(8, 300, { lift: false }).prevented, 1, 'back still works');
+  touch('touchcancel', 300, 400); settleSwipe();
+  assert.equal(body.contains('show-detail'), true, 'a cancelled swipe leaves the conversation');
+  assert.equal(body.contains('edge-peek'), false);
+  assert.equal(c.context.window.history.backCount, 1);
+  // Back again remembers it; any new screen forgets it, as the browser does.
+  c.backToList(); pop(list);
+  assert.equal(c.state.forwardEntries.length, 1);
+  c.navigateView('terminal');
+  assert.equal(c.state.forwardEntries.length, 0, 'a new screen drops the way forward');
+});
+
+test('an edge swipe takes a covering terminal back on a phone and an upright iPad, never a docked one', async () => {
+  for (const width of [390, 834]) {
+    const e = edgeClient({ phone: width < 700, width });
+    await e.c.openTerminal({ id: 'term-1', mode: 'attach' });
+    assert.equal(e.c.boardCovered(), true);
+    const terminal = e.c.context.window.history.state;
+    assert.equal(terminal.view, 'terminal'); assert.equal(terminal.listDepth, 1);
+    e.slides.length = 0;
+    e.touch('touchstart', 8, 400);
+    assert.equal(e.touch('touchmove', 80, 402).prevented, 1);
+    assert.equal(e.body.contains('edge-over-terminal'), true, `${width}: the board shows beneath the terminal`);
+    e.touch('touchmove', 300, 404); e.touch('touchend', 300, 404); e.settleSwipe();
+    assert.equal(e.c.context.window.history.backCount, 1);
+    e.pop({ sessionholic: true, view: 'list', listDepth: 0, navigationId: 'list-entry' });
+    assert.equal(e.c.state.terminalVisible, false); assert.deepEqual(e.slides, [], 'no second slide');
+    assert.equal(e.body.contains('edge-peek'), false); assert.equal(e.body.contains('edge-over-terminal'), false);
+    // The terminal is still open: a forward swipe brings it back.
+    let forwards = 0;
+    e.c.context.window.history.forward = () => { forwards++; };
+    e.drag(width - 6, 60); e.settleSwipe();
+    assert.equal(forwards, 1);
+    e.pop(terminal);
+    assert.equal(e.c.state.terminalVisible, true); assert.deepEqual(e.slides, []);
+    assert.equal(e.body.contains('edge-peek'), false);
+  }
+  const wide = edgeClient({ phone: false, width: 1180 });
+  await wide.c.openTerminal({ id: 'term-1', mode: 'attach' });
+  assert.equal(wide.c.state.docked, true);
+  assert.equal(wide.drag(8, 400).prevented, 0, 'a docked terminal keeps its own back button');
+  assert.equal(wide.body.contains('edge-peek'), false);
+});
+
+test('edge swipes stay off outside an iOS home-screen app and give way to sheets, text, pinches, scrolling and short drags', () => {
+  // Each case opens a phone conversation, adjusts one thing, then drags from the left edge.
+  const tryBack = (options, adjust = () => {}, dragOptions = {}) => {
+    const e = edgeClient(options);
+    const { s } = selectChat(e.c);
+    e.c.select(s.key);
+    adjust(e);
+    const move = e.drag(8, 300, dragOptions);
+    e.settleSwipe();
+    return { prevented: move?.prevented || 0, backs: e.c.context.window.history.backCount, e };
+  };
+  assert.equal(tryBack({}).backs, 1, 'the home-screen app goes back');
+  assert.equal(tryBack({ standalone: false }).backs, 0, 'a Safari tab keeps its own edge swipe');
+  const android = tryBack({ media: { '(display-mode: standalone)': true } }, (e) => { delete e.c.context.navigator.standalone; });
+  assert.equal(android.backs, 0, 'an installed Android app has its back button');
+  assert.equal(tryBack({ coarse: false }).backs, 0, 'a mouse does not swipe');
+  const forced = tryBack({ standalone: false, coarse: false }, (e) => { e.c.state.edgeSwipe = true; });
+  assert.equal(forced.backs, 1, 'the developer switch turns it on anywhere');
+  const blocked = {
+    'an open sheet': (e) => { e.c.context.document.querySelector = (selector) => (selector === 'dialog[open]' ? {} : null); },
+    'typing': (e) => { e.c.context.document.activeElement = { tagName: 'TEXTAREA' }; },
+    'a text selection': (e) => { e.c.context.window.getSelection = () => ({ isCollapsed: false, rangeCount: 1 }); },
+    'a running slide': (e) => { e.c.context.document.documentElement.dataset.nav = 'push'; },
+    'an open card swipe': (e) => { e.c.state.swipeOpen = {}; },
+    'the first screen of this page': (e) => { e.c.context.window.history.state = { ...e.c.context.window.history.state, listDepth: 0 }; },
+  };
+  for (const [name, adjust] of Object.entries(blocked)) {
+    const result = tryBack({}, adjust);
+    assert.equal(result.backs, 0, name); assert.equal(result.prevented, 0, `${name}: the touch is left alone`);
+  }
+  const field = { closest: (selector) => (/textarea/.test(selector) ? {} : null) };
+  assert.equal(tryBack({}, () => {}, { target: field }).backs, 0, 'a drag that starts in a text field edits it');
+  assert.equal(tryBack({}, () => {}, { dy: 60 }).backs, 0, 'a steep drag scrolls');
+  assert.equal(tryBack({}, () => {}, { ms: 900 }).backs, 1, 'a slow drag past half the screen goes');
+  const tiny = edgeClient();
+  const { s } = selectChat(tiny.c); tiny.c.select(s.key);
+  tiny.drag(8, 80, { ms: 900 }); tiny.settleSwipe();
+  assert.equal(tiny.c.context.window.history.backCount, 0, 'a short slow drag springs back');
+  assert.equal(tiny.body.contains('show-detail'), true); assert.equal(tiny.body.contains('edge-peek'), false);
+  // Two fingers: no swipe at the start, and a second finger mid-swipe springs it back.
+  const pinch = edgeClient();
+  const chat = selectChat(pinch.c); pinch.c.select(chat.s.key);
+  pinch.touch('touchstart', 8, 400, { fingers: 2 });
+  assert.equal(pinch.touch('touchmove', 200, 400, { fingers: 2 }).prevented, 0);
+  pinch.touch('touchend', 200, 400);
+  pinch.touch('touchstart', 8, 400); pinch.touch('touchmove', 200, 402);
+  assert.equal(pinch.body.contains('edge-peek'), true);
+  pinch.touch('touchstart', 200, 402, { fingers: 2 });
+  pinch.settleSwipe();
+  assert.equal(pinch.body.contains('edge-peek'), false); assert.equal(pinch.c.context.window.history.backCount, 0);
+});
+
 test('bottom sheets follow the finger, dismiss on a long or fast pull, step between heights and spring back when dismissal is refused', () => {
   const c = client(undefined, noChatTimers);
   const release = (fields) => c.sheetRelease({ height: 600, detent: 'medium', ...fields });

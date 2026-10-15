@@ -155,6 +155,7 @@
   --dur: 240ms;
   --dur-sheet: 460ms;
   --dur-nav: 440ms;
+  --dur-edge: 250ms; /* app.js GESTURE.edgeSettleMs */
   --press-scale: 0.97;
   --press-scale-card: 0.985;
   --press-scale-key: 0.98;
@@ -5140,6 +5141,52 @@ body.dock-solo .settings-lock { display: flex; }
 }
 @keyframes nav-dismiss-new {
   from { transform: scale(0.96); filter: brightness(0.82); }
+}
+
+/* Edge swipes (app.js bindEdgeSwipe, iOS home-screen app): while a finger drags
+   from a screen edge, the screen on top follows it (--edge-over-x, px from rest)
+   over the one beneath (--edge-under-x, the same 28% parallax as the slides).
+   On release edge-settling finishes the slide; app.js then navigates and drops
+   these classes in the same frame as the real screen change. */
+/* A terminal covering the board: the board shows again beneath it. */
+body.edge-peek.edge-over-terminal .app {
+  transform: translate(var(--edge-under-x, 0px), var(--app-shift, 0px));
+}
+body.edge-peek.edge-over-terminal .app[hidden] {
+  display: flex !important;
+}
+body.edge-peek.edge-over-terminal .terminal-screen,
+body.edge-peek.edge-over-terminal .terminal-screen[hidden] {
+  display: flex !important;
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  box-shadow: var(--shadow-nav);
+  transform: translate(var(--edge-over-x, 0px), var(--app-shift, 0px));
+}
+/* A phone conversation leaves the layout and floats over the list (the body drops
+   show-detail meanwhile, so the list lays out as it will after going back). The
+   list's parts move, not .app: a moved .app would hold and clip the fixed pane. */
+@media (max-width: 700px) {
+  body.edge-peek.edge-over-detail .app > :not(.layout):not(.pull-refresh),
+  body.edge-peek.edge-over-detail .list-pane {
+    transform: translateX(var(--edge-under-x, 0px));
+  }
+  body.edge-peek.edge-over-detail .detail-pane {
+    display: flex;
+    position: fixed;
+    top: 0;
+    left: 0;
+    z-index: 45;
+    width: 100%;
+    height: var(--app-height, 100dvh);
+    border-top: var(--top-inset) solid var(--surface);
+    box-shadow: var(--shadow-nav);
+    transform: translate(var(--edge-over-x, 0px), var(--app-shift, 0px));
+  }
+}
+body.edge-settling :is(.app, .app > *, .list-pane, .detail-pane, .terminal-screen) {
+  transition: transform var(--dur-edge) var(--ease-out);
 }
 
 /* Bottom sheet (phones). <dialog class="plan-dialog sheet"> gets a grab

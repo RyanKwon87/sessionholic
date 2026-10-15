@@ -332,6 +332,19 @@ const MessageFormat = (() => {
   }
   function quote(line) { return line.match(/^ {0,3}>[ \t]?(.*)$/); }
   function heading(line) { return line.match(/^ {0,3}(#{1,6})[ \t]+(.*)$/); }
+  // A heading's closing hashes (" ##"), cut from the end by a scan: a regex for them retries at
+  // every blank of a long run (quadratic), and the parser's work budget does not cover regexes.
+  function withoutClosingHashes(text) {
+    const blank = (index) => text[index] === " " || text[index] === "\t";
+    let end = text.length;
+    while (end && blank(end - 1)) end--;
+    let hashes = end;
+    while (hashes && text[hashes - 1] === "#") hashes--;
+    if (hashes === end) return text;
+    let space = hashes;
+    while (space && blank(space - 1)) space--;
+    return space === hashes ? text : text.slice(0, space);
+  }
   // "2026. 10. 10. 회의" is a Korean date, not the 2026th item of a list.
   const DATE_LINE = /^[ \t]*\d{4}\.[ \t]+\d{1,2}\.(?:[ \t]|$)/;
   function listItem(line) {
@@ -508,7 +521,7 @@ const MessageFormat = (() => {
       const title = heading(line.text);
       if (title) {
         out.push(make(budget, "heading", { level: title[1].length,
-          children: inline(title[2].replace(/[ \t]+#+[ \t]*$/, ""), budget), eol: line.eol })); index++; continue;
+          children: inline(withoutClosingHashes(title[2]), budget), eol: line.eol })); index++; continue;
       }
       if (listItem(line.text)) {
         const list = parseList(lines, index, budget, depth); out.push(list.node); index = list.next; continue;

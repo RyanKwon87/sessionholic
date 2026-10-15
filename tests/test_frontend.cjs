@@ -1469,6 +1469,7 @@ test('a word the input method never commits is not sent and stays in the field',
   const { s, entry } = selectChat(c);
   const composer = c.buildChatComposer(s);
   const input = findId(composer, 'chat-input');
+  c.context.document.activeElement = input;
   input.value = '조합 중'; input.events.compositionstart(); input.events.input({ isComposing: true });
   input.blur = () => {};
   const clicked = findId(composer, 'chat-send').events.click();
@@ -1479,6 +1480,31 @@ test('a word the input method never commits is not sent and stays in the field',
   assert.equal(entry.composing, true);
   assert.equal(input.value, '조합 중');
   assert.match(c.get('toast').textContent, /한글 입력을 확정하지 못해 보내지 않았습니다/);
+});
+
+test('a composing mark left without the focus, or ended by a final input, never holds the send back', async () => {
+  for (const ending of ['unfocused', 'final input']) {
+    const sent = [];
+    const c = client(async (url, options) => {
+      if (url === '/api/chat/send') sent.push(JSON.parse(options.body).text);
+      return { ok: true, status: 200, json: async () => ({ status: 'accepted', receipt: {} }) };
+    }, noChatTimers);
+    const { s, entry } = selectChat(c);
+    const composer = c.buildChatComposer(s);
+    const input = findId(composer, 'chat-input');
+    c.context.document.activeElement = input;
+    input.value = '남은 표시'; input.events.compositionstart(); input.events.input({ isComposing: true });
+    // The keyboard let go of the field and said nothing more (Android may skip compositionend).
+    if (ending === 'unfocused') c.context.document.activeElement = null;
+    else input.events.input({ isComposing: false });
+    let blurs = 0;
+    input.blur = () => { blurs++; };
+    await findId(composer, 'chat-send').events.click();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(blurs, 0, ending);
+    assert.equal(entry.composing, false, ending);
+    assert.deepEqual(sent, ['남은 표시'], ending);
+  }
 });
 
 test('native attachment upload binds raw bytes to its exact source and rejects oversized files locally', async () => {
@@ -11757,4 +11783,145 @@ test('a locally deleted recovery record is rewritten by an active draft while id
   const { entry } = selectChat(c); entry.text = 'active draft'; entry.revision++; c.updateChatComposer(entry);
   const key = [...storage.store.keys()].find((name) => name.includes('draft:v1:')); storage.removeItem(key);
   c.updateChatComposer(entry); assert.equal(JSON.parse(storage.getItem(key)).text, 'active draft');
+});
+
+test('보내기 뒤 "보내지 않고 끝내기"를 누르면 보내지 않는다 (마무리 중·iPad 대기 모두)', async () => {
+  const { c, recognitions, result, settle, timeouts } = dictationClient();
+  // stop() 뒤 onend가 바로 오지 않는 인식기(실제 브라우저처럼)
+  class SlowStop { constructor() { recognitions.push(this); this.started = 0; this.stopped = 0; this.aborted = 0; }
+    start() { this.started++; } stop() { this.stopped++; } abort() { this.aborted++; } }
+  c.context.webkitSpeechRecognition = SlowStop;
+  const { s } = selectChat(c); const composer = c.buildChatComposer(s);
+  let sent = 0; findId(composer, 'chat-send').click = () => { sent++; };
+  findId(composer, 'chat-mic').events.click();
+  const rec = recognitions.at(-1); rec.onstart(); rec.onresult(result('보낼까 말까'));
+  c.get('dictation-overlay-send').events.click();
+  assert.equal(c.state.dictation.stopping, true);
+  c.get('dictation-overlay-stop').events.click();
+  await settle();
+  for (const t of timeouts.filter((i) => i.ms === 0 && !i.ran)) { t.ran = true; t.callback(); }
+  assert.equal(sent, 0);
+  const ipad = ipadDictation();
+  let ipadSent = 0;
+  ipad.listen('보낼까');
+  ipad.c.context.document.getElementById('chat-send').click = () => { ipadSent++; };
+  ipad.c.get('dictation-overlay-send').events.click();
+  ipad.c.get('dictation-overlay-stop').events.click();
+  for (const t of ipad.timeouts.filter((i) => i.ms === 0)) t.callback();
+  assert.equal(ipadSent, 0);
+  assert.ok(ipad.c.state.dictationParked, '끝내기는 마이크를 다시 누른 것과 같다(대기)');
+});
+
+test('보내기를 누른 듣기가 오류나 화면 이탈로 끝나면 보내지 않고, 들은 말 없이 끝나도 보낸다', async () => {
+  for (const [ending, expected] of [['error', 0], ['inactive', 0], ['no-speech', 1]]) {
+    const { c, recognitions, FakeRecognition, result, settle, timeouts } = dictationClient();
+    c.context.webkitSpeechRecognition = FakeRecognition;
+    const { s } = selectChat(c); const composer = c.buildChatComposer(s);
+    let sent = 0; findId(composer, 'chat-send').click = () => { sent++; };
+    findId(composer, 'chat-mic').events.click();
+    const rec = recognitions.at(-1); rec.onstart();
+    if (ending !== 'no-speech') rec.onresult(result('들은 말'));
+    c.get('dictation-overlay-send').events.click();
+    if (ending === 'error') rec.onerror({ error: 'network' });
+    if (ending === 'inactive') c.state.dictation.active = () => false;
+    rec.onend();
+    await settle();
+    for (const t of timeouts.filter((i) => i.ms === 0 && !i.ran)) { t.ran = true; t.callback(); }
+    assert.equal(sent, expected, ending);
+  }
+});
+
+test('iPad 대기 뒤 WebKit이 결과 목록을 새로 시작해도 새로 말한 첫 문장이 들어간다', () => {
+  const { c, input, mic, timeouts, listen } = ipadDictation();
+  const final = (text) => Object.assign([{ transcript: text }], { isFinal: true });
+  const rec = listen();
+  rec.onresult({ results: [final('첫 문장')] });
+  assert.equal(input.value, '첫 문장');
+  mic.events.click();
+  timeouts.filter((t) => t.ms === 800).at(-1).callback();
+  assert.ok(c.state.dictationParked);
+  mic.events.click();
+  // 쉬었다 말해 목록이 새로 시작됨(길이는 그대로 1)
+  rec.onresult({ results: [final('두 번째 문장')] });
+  assert.match(input.value, /첫 문장 ?두 번째 문장/);
+  rec.onresult({ results: [final('두 번째 문장'), final('세 번째 문장')] });
+  assert.match(input.value, /첫 문장 ?두 번째 문장 ?세 번째 문장/);
+  // 목록이 이어지면(앞 결과가 같으면) 앞의 말은 다시 들어가지 않는다
+  mic.events.click();
+  timeouts.filter((t) => t.ms === 800).at(-1).callback();
+  mic.events.click();
+  rec.onresult({ results: [final('두 번째 문장'), final('세 번째 문장'), final('네 번째')] });
+  assert.equal(input.value.split('두 번째 문장').length, 2, '이어지는 목록의 앞 결과를 다시 넣지 않는다');
+  assert.match(input.value, /세 번째 문장 ?네 번째$/);
+});
+
+test('원본 세션의 "터미널 열기"는 그 세션에서 인계·이전한 다른 세션의 터미널을 열지 않는다', () => {
+  const c = client(undefined, noChatTimers);
+  const { s } = selectChat(c);
+  vm.runInContext('openTerminal = (terminal) => { globalThis.openedTerminal = terminal; };'
+    + 'preparePlan = () => { globalThis.planned = (globalThis.planned || 0) + 1; };', c.context);
+  const src = c.sourceOf(s);
+  const launchedFrom = JSON.stringify({ agent: src.agent, home: src.home, host: src.host, id: src.id });
+  const handoff = { id: 'h'.repeat(32), alive: true, closed: false, mode: 'handoff', host: 'workstation', agent: 'claude',
+    sourceKey: launchedFrom, nativeSource: { host: 'workstation', agent: 'claude', id: 'new-claude-session', home: null, cwd: '/w' } };
+  c.state.terminals = [handoff];
+  assert.equal(c.terminalForSession(s), null, '다른 세션을 실행 중인 터미널은 그 세션의 것');
+  c.openChatTerminal(s);
+  assert.equal(c.context.openedTerminal, undefined);
+  assert.equal(c.context.planned, 1);
+  // 실행 중인 세션을 아직 모르는(같은 세션으로 연) 터미널은 그대로 그 세션의 것
+  const resumed = { ...handoff, id: 'r'.repeat(32), mode: 'resume', nativeSource: null };
+  c.state.terminals = [handoff, resumed];
+  assert.equal(c.terminalForSession(s), resumed);
+});
+
+test('iPad 대기 엔진은 잠금에서 끝나고, 대기 중 오류가 난 엔진은 다시 쓰지 않는다', () => {
+  const ipad = ipadDictation();
+  const rec = ipad.listen('말');
+  ipad.c.stopDictation({ abort: true, park: true, field: ipad.input });
+  assert.ok(ipad.c.state.dictationParked);
+  ipad.c.showLogin();
+  assert.equal(ipad.c.state.dictationParked, null);
+  assert.equal(rec.aborted, 1);
+  const again = ipadDictation();
+  const first = again.listen('말');
+  again.c.stopDictation({ abort: true, park: true, field: again.input });
+  first.onerror({ error: 'audio-capture' });
+  assert.ok(again.c.state.dictationParked, '오류만으로는 바로 끝내지 않는다');
+  again.mic.events.click();
+  assert.equal(first.aborted, 1, '오류난 대기 엔진은 버린다');
+  assert.notEqual(again.recognitions.at(-1), first, '다음 누름은 새 인식으로 시작한다');
+});
+
+test('폰에서 목록으로 돌아갔다 같은 대화를 다시 열면 대화 상태를 다시 읽는다', async () => {
+  const calls = [];
+  const c = client(async (url, options) => {
+    calls.push(url);
+    return { ok: true, status: 200, json: async () => (url === '/api/chat/state'
+      ? { capability: { supported: true }, phase: 'idle', route: JSON.parse(options.body).source } : { messages: [] }) };
+  }, noChatTimers);
+  const { s } = selectChat(c);
+  c.select(s.key);
+  await new Promise((resolve) => setImmediate(resolve));
+  c.backToList();
+  await new Promise((resolve) => setImmediate(resolve));
+  const before = calls.filter((url) => url === '/api/chat/state').length;
+  c.select(s.key);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(c.state.detailShown, true);
+  assert.ok(calls.filter((url) => url === '/api/chat/state').length > before, '다시 연 대화를 읽는다');
+});
+
+test('긴 터미널 읽기처럼 같은 신호를 오래 쓰는 요청도 끝나면 abort 리스너를 남기지 않는다', async () => {
+  const c = client(async () => ({ ok: true, status: 200, json: async () => ({}) }), noChatTimers);
+  const listeners = new Set();
+  const signal = { aborted: false, addEventListener(type, fn) { listeners.add(fn); }, removeEventListener(type, fn) { listeners.delete(fn); } };
+  const timeoutSignal = () => ({ aborted: false, addEventListener() {}, removeEventListener() {} });
+  c.context.AbortSignal = { timeout: timeoutSignal };
+  for (let i = 0; i < 10; i++) await c.api('/api/terminal/x/events', { signal, timeout: 1000 });
+  assert.equal(listeners.size, 0);
+  const failing = client(async () => { throw new Error('network'); }, noChatTimers);
+  failing.context.AbortSignal = { timeout: timeoutSignal };
+  await assert.rejects(failing.api('/api/x', { signal, timeout: 1000 }));
+  assert.equal(listeners.size, 0);
 });

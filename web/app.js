@@ -874,15 +874,19 @@ function apiTimeout(path, method) {
 function apiSignal(signal, timeout) {
   const limit = timeout > 0 && typeof AbortSignal !== "undefined" && typeof AbortSignal.timeout === "function"
     ? AbortSignal.timeout(timeout) : null;
-  if (!limit) return { signal, limit: null };
-  if (!signal) return { signal: limit, limit };
+  if (!limit) return { signal, limit: null, release() {} };
+  if (!signal) return { signal: limit, limit, release() {} };
   const controller = new AbortController();
   const abort = () => controller.abort();
   for (const source of [signal, limit]) {
     if (source.aborted) abort();
     else source.addEventListener("abort", abort, { once: true });
   }
-  return { signal: controller.signal, limit };
+  // A caller's signal outlives many requests (a terminal reader's): each takes its listener back.
+  const release = () => {
+    for (const source of [signal, limit]) source.removeEventListener?.("abort", abort);
+  };
+  return { signal: controller.signal, limit, release };
 }
 function apiTimedOut(limit, path = "") {
   if (!limit?.aborted) return null;
@@ -896,22 +900,27 @@ async function api(path, { method = "GET", body, signal: callerSignal, authEpoch
   const headers = {};
   if (body !== undefined) headers["Content-Type"] = "application/json";
   if (method !== "GET" && state.csrf) headers["X-CSRF-Token"] = state.csrf;
-  const { signal, limit } = apiSignal(callerSignal, timeout);
-  let response;
+  const { signal, limit, release } = apiSignal(callerSignal, timeout);
+  let response, data;
+  // The signal serves the request and its body; past them its listeners go (apiSignal).
   try {
-    response = await fetch(path, {
-      method, headers, body: body === undefined ? undefined : JSON.stringify(body),
-      credentials: "same-origin", cache: "no-store", signal,
-    });
-  } catch (err) { assertAuthEpoch(authEpoch); throw apiTimedOut(limit, path) || err; }
-  assertAuthEpoch(authEpoch);
-  if (response.status === 401) {
-    showLogin();
-    const err = new Error("로그인이 필요합니다.");
-    err.unauthorized = true;
-    throw err;
+    try {
+      response = await fetch(path, {
+        method, headers, body: body === undefined ? undefined : JSON.stringify(body),
+        credentials: "same-origin", cache: "no-store", signal,
+      });
+    } catch (err) { assertAuthEpoch(authEpoch); throw apiTimedOut(limit, path) || err; }
+    assertAuthEpoch(authEpoch);
+    if (response.status === 401) {
+      showLogin();
+      const err = new Error("로그인이 필요합니다.");
+      err.unauthorized = true;
+      throw err;
+    }
+    data = await response.json().catch(() => ({}));
+  } finally {
+    release();
   }
-  const data = await response.json().catch(() => ({}));
   assertAuthEpoch(authEpoch);
   // A body cut off by the limit is not an empty answer.
   const late = apiTimedOut(limit, path);
@@ -1575,9 +1584,26 @@ function botGroupSession(group) {
 }
 function botLabel(value) { return typeof value === "string" && value.trim() && !["unknown", "unconfirmed"].includes(value.trim().toLowerCase()) ? value.trim() : "미확인"; }
 function botRequestStale(request) { return !!(request.stale || state.botRequests.error || state.botRequests.sources.some((source) => source.id === request.sourceId && source.stale)); }
+// Listed requests by the session they ran in, built once per list: a list draw looks one up for
+// every card (its category, origin and filters), which a scan of every request made slow.
+const botNativeIndex = { requests: null, sessions: new Map() };
+function botNativeCandidates(host, agent, id) {
+  const requests = state.botRequests.requests;
+  if (botNativeIndex.requests !== requests) {
+    botNativeIndex.requests = requests;
+    botNativeIndex.sessions = new Map();
+    for (const request of requests) {
+      if (!request.nativeRef) continue;
+      const key = JSON.stringify([request.host, request.nativeRef.agent, request.nativeRef.id]);
+      if (!botNativeIndex.sessions.has(key)) botNativeIndex.sessions.set(key, []);
+      botNativeIndex.sessions.get(key).push(request);
+    }
+  }
+  return botNativeIndex.sessions.get(JSON.stringify([host, agent, id])) || [];
+}
 function botRequestForNative(source) {
-  return state.botRequests.requests.find((request) => request.nativeRef && request.host === source.host &&
-    request.nativeRef.agent === source.agent && request.nativeRef.id === source.id && request.nativeRef.home === source.home);
+  // The first listed one, its home compared as before (exactly).
+  return botNativeCandidates(source.host, source.agent, source.id).find((request) => request.nativeRef.home === source.home);
 }
 function botRequestMatches(request) {
   const query = state.search.trim().toLocaleLowerCase();
@@ -2462,10 +2488,14 @@ function terminalForSession(s) {
       return "";
     }
   };
+  // One launched from it that runs another session (a handoff, a transfer) is that session's.
   return alive.find((terminal) => {
     const native = terminalInfo(terminal).nativeSource;
     return native?.host && chatKey(native) === key;
-  }) || alive.find((terminal) => launchedFrom(terminalInfo(terminal)) === key) || null;
+  }) || alive.find((terminal) => {
+    const info = terminalInfo(terminal);
+    return launchedFrom(info) === key && !info.nativeSource?.host;
+  }) || null;
 }
 // "터미널 열림": the list chip's terminal glyph with a green dot. Hidden until the
 // session has a live board terminal (terminalForSession).
@@ -2999,6 +3029,8 @@ function select(key) {
   const entering = mobile && !state.detailShown;
   if (entering) navigateView("detail");
   if (state.selected === key) {
+    // Reopened after going back to the list (which stopped its polling): read it again.
+    const reopening = !state.detailShown;
     // Moving this retained DOM through a hidden goal/session pane can reset its
     // scrollTop. Reapply the saved view only when reopening, not on a live click.
     if (!state.detailShown) {
@@ -3012,6 +3044,8 @@ function select(key) {
       }
     }
     setDetailShown(true, { direction: entering ? "push" : null, focus: mobile });
+    const session = reopening && selectedSession();
+    if (session && chatVisible()) loadChatState(session, true);
     return;
   }
   haptic("select");
@@ -4156,7 +4190,10 @@ function renderDictationOverlay() {
     // 보내지 않고 끝내기: as the mic pressed again (the last words land, then it parks or ends).
     stop.dataset.bound = "1";
     stop.addEventListener("click", () => {
-      if (state.dictation) stopDictation({ field: state.dictation.field });
+      if (!state.dictation) return;
+      // Also after 보내기 while its last words land: nothing is sent.
+      state.dictation.sendWhenDone = null;
+      stopDictation({ field: state.dictation.field });
     });
   }
   const send = $("dictation-overlay-send");
@@ -4331,6 +4368,7 @@ function parkDictation(session, settle) {
   session.stopping = false;
   session.parkedAt = Date.now();
   session.skip = session.seen;
+  session.skipped = dictationSkipped(session.lastResults, session.skip);
   dictationTrace(session, "park");
   session.report(DICTATION_PARKED);
   renderDictation();
@@ -4341,18 +4379,34 @@ function parkDictation(session, settle) {
     if (state.dictationParked === session) dropParkedDictation("expired");
   }, DICTATION_PARK_MS);
 }
+// The words of the results a park sets aside: a list that no longer begins with them started
+// over (WebKit after a pause), even as long as the old one.
+function dictationSkipped(results, count) {
+  return Array.from(results || []).slice(0, count).map((result) => String(result?.[0]?.transcript || ""));
+}
 // The send button of the field a listening writes into (the chat's 보내기, the terminal
 // line's 보내기): pressed as the user would, so every rule of that send (nothing to send, a
 // send under way, a locked field, a word still composing committed first) still holds.
 function dictationSendButton(field) {
   return field === $("chat-input") ? $("chat-send") : field === $("terminal-draft") ? $("draft-paste") : null;
 }
+// A listening that failed, left the screen or lost its words to other text sends nothing (an
+// end with nothing heard still sends what the field holds). Our stop answered with "aborted"
+// is a plain end (dictationOutcome).
+function dictationFailed(session, message = "") {
+  return !session.active() || message === DICTATION_CHANGED
+    || (!!session.error && !(session.error === "aborted" && session.stopping));
+}
 // The mic screen's 보내기 was pressed: now that the listening is done (parked or ended, its
-// last words in the field), its field's send runs once.
-function dictationSendIfAsked(session) {
+// last words in the field), its field's send runs once, unless it failed (dictationFailed).
+function dictationSendIfAsked(session, failed = false) {
   const send = session.sendWhenDone;
   if (!send) return;
   session.sendWhenDone = null;
+  if (failed) {
+    dictationTrace(session, "send-dropped");
+    return;
+  }
   dictationTrace(session, "send");
   setTimeout(() => send.click?.(), 0);
 }
@@ -4396,6 +4450,7 @@ function startDictation(field, { report, active, releaseKeyboard = false }) {
   if (!Recognition || !field || field.disabled || field.readOnly) return false;
   // One listening at a time: another field's is parked (or aborted), then this one goes on.
   stopDictation({ abort: true, park: true });
+  if (state.dictationParked?.parkError) dropParkedDictation("error");
   if (state.dictationParked) return resumeDictation(state.dictationParked, field, { report, active, releaseKeyboard });
   const press = dictationPress(field, releaseKeyboard);
   const trace = dictationTraceFor(field, press);
@@ -4473,12 +4528,17 @@ function startDictation(field, { report, active, releaseKeyboard = false }) {
   recognition.onresult = (event) => {
     if (replaced(recognition, "result")) return;
     const all = Array.from(event?.results || []);
-    // A list shorter than what was set aside started over (WebKit after a pause): all of it is new.
-    if (all.length < session.skip) session.skip = 0;
+    // A list shorter than what was set aside, or not beginning with its words, started over
+    // (WebKit after a pause): all of it is new.
+    const restarted = all.length < session.skip || (session.skipped || [])
+      .some((text, index) => index < session.skip && text !== String(all[index]?.[0]?.transcript || ""));
+    if (restarted) Object.assign(session, { skip: 0, skipped: null });
     session.seen = all.length;
+    session.lastResults = all;
     if (state.dictationParked === session) {
       // Parked: what it hears is not written; a resume starts after it.
       session.skip = all.length;
+      session.skipped = dictationSkipped(all, all.length);
       return;
     }
     const list = all.slice(session.skip);
@@ -4528,6 +4588,9 @@ function startDictation(field, { report, active, releaseKeyboard = false }) {
     if (state.dictation === session) {
       session.error = String(event?.error || "unknown");
       session.errorMessage = String(event?.message || "").trim();
+    } else if (state.dictationParked === session) {
+      // A parked engine that failed (WebKit may not end it) is not resumed: the next press starts anew.
+      session.parkError = String(event?.error || "unknown");
     }
   };
   recognition.onend = () => {
@@ -4627,7 +4690,7 @@ function finishDictation(session) {
   const outcome = dictationOutcome(session);
   session.report(outcome);
   renderDictation();
-  dictationSendIfAsked(session);
+  dictationSendIfAsked(session, dictationFailed(session));
   sendDictationTrace(session, outcome);
 }
 // stop: the last words still arrive (onend finishes); pressed again while it ends, or not
@@ -4673,7 +4736,7 @@ function stopDictation({ abort = false, field = null, message = "", park = false
   }
   session.report(message);
   renderDictation();
-  dictationSendIfAsked(session);
+  dictationSendIfAsked(session, dictationFailed(session, message));
   sendDictationTrace(session, message);
 }
 // The text changed by the user (typed, or an input method's word): their words win. An
@@ -4980,8 +5043,9 @@ function buildChatComposer(s) {
     if (input.value) warmChat(entry);
     entry.inputCollapsed = false;
     entry.text = input.value;
-    // After the send's blur, Android may commit with a final input and no compositionend.
-    if (sendCommit && event?.isComposing === false) entry.composing = false;
+    // A final input outside a composition commits it: Android may send one and no compositionend
+    // (after a blur, the send's or the keyboard's own).
+    if (entry.composing && event?.isComposing === false) entry.composing = false;
     // Words landing from the mic keep its "듣는 중" line; typing clears both.
     if (!state.dictation?.applying) entry.notice = entry.dictationNotice = "";
     // Editing the draft answers an input error about it.
@@ -5096,6 +5160,12 @@ function buildChatComposer(s) {
   // first, and what the field holds after it is sent. A word never committed is not sent.
   const send = button("보내기", "primary", async () => {
     if (!editorCurrent() || sendCommit) return;
+    // A field without the focus composes nothing: a mark left from an input method that never
+    // said it ended is cleared (a blur would bring no word to wait for).
+    if (entry.composing && document.activeElement !== input) {
+      entry.composing = false;
+      updateChatComposer(entry);
+    }
     if (entry.composing) {
       const committed = new Promise((resolve) => { sendCommit = { resolve, frameQueued: false, timer: 0 }; });
       const pending = sendCommit;
@@ -10406,6 +10476,9 @@ function showLogin() {
   clearSavedDrafts();
   if ($("board-status")) $("board-status").open = false;
   closeQuickReplies();
+  // A locked board does not keep the microphone open, listening or parked.
+  stopDictation({ abort: true });
+  dropParkedDictation("locked");
   beginAuthEpoch();
   state.pinnedLocal.clear();
   window.SessionholicLabels?.locked?.();

@@ -12872,7 +12872,8 @@ test('질문을 누르면 시트를 닫고 저장 기록 미리보기를 대화 
   assert.equal(list.children[0], preview.item.row);
 });
 
-test('질문 읽기가 진행 중이면 질문 본문 읽기는 그 뒤에 이어서 보낸다(기록 읽기는 한 번에 하나)', async () => {
+test('질문 목록을 다시 읽는 중에도 질문 본문 읽기는 기다리지 않는다(서버가 따로 허용)', async () => {
+  // A questions read of a rollout of many GB may take seconds; 전체 보기 never waits behind it.
   let release = null;
   const { c, s, calls, q, count } = questionsConversation(() => release === false
     ? new Promise((resolve) => { release = () => resolve(questionsReply({ questions: [askedQuestion(7)] })); })
@@ -12883,7 +12884,7 @@ test('질문 읽기가 진행 중이면 질문 본문 읽기는 그 뒤에 이�
   count.events.click();
   c.get('questions-list').children[0].events.click();
   await settle();
-  assert.equal(calls.filter((url) => url.startsWith('/api/history/message?')).length, 0, 'it waits for the questions read');
+  assert.equal(calls.filter((url) => url.startsWith('/api/history/message?')).length, 1, 'the full text is read at once');
   release(); await settle(6);
   assert.equal(calls.filter((url) => url.startsWith('/api/history/message?')).length, 1);
 });

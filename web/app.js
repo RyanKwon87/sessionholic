@@ -274,8 +274,6 @@ const state = {
   quickRepliesEditor: null,
   quickRepliesUnsaved: null,
   historySearch: { mode: false, query: "", run: 0, busy: false, hits: new Map(), errors: new Map(), cursor: null, status: "", controller: null },
-  // The saved-record read in flight (historyRead): the next one waits for it.
-  historyRead: null,
   // Reading state stays in this tab. Recoverable drafts are stored separately on this device.
   conversationViews: new Map(),
   nativeSessions: new Map(),
@@ -7077,16 +7075,6 @@ function userMessageParts(message) {
   if (chips.length && OUTBOX_ATTACHMENT_ONLY.has(body.trim())) body = "";
   return { body, attachments: chips };
 }
-// The server reads one saved record at a time and refuses another meanwhile (429): this
-// board's own reads of them (questions, full messages, body search) take turns instead.
-function historyRead(path, options) {
-  const previous = state.historyRead;
-  const run = previous ? previous.then(() => api(path, options)) : api(path, options);
-  const settled = run.then(() => {}, () => {});
-  state.historyRead = settled;
-  settled.then(() => { if (state.historyRead === settled) state.historyRead = null; });
-  return run;
-}
 function cancelHistorySearch() {
   const search = state.historySearch;
   search.run++; search.controller?.abort(); search.controller = null;
@@ -7136,7 +7124,7 @@ async function startHistorySearch({ more = false } = {}) {
   try {
     for (let page = 0; page < 60 && current(); page++) {
       const params = new URLSearchParams({ q: query, includeRemoved: state.showRemoved ? "1" : "0", ...(search.cursor ? { cursor: search.cursor } : {}) });
-      const data = await historyRead(`/api/history/search?${params}`, { authEpoch, signal: search.controller.signal });
+      const data = await api(`/api/history/search?${params}`, { authEpoch, signal: search.controller.signal });
       if (!current()) return;
       if (data.readOnly !== true || !Array.isArray(data.hits) || data.hits.length > 60 || !Array.isArray(data.errors) ||
           !Number.isInteger(data.scanned) || !Number.isInteger(data.total) || data.scanned < 0 || data.scanned > data.total ||
@@ -7256,7 +7244,7 @@ async function loadLongMessage(s, item) {
     for (let page = 0; page < 32 && current(); page++) {
       const params = new URLSearchParams({ ...sourceOf(s), ...(s.agent === "claude" && s.sessionId ? { sessionId: s.sessionId } : {}), bodyHash: hash,
         offset: String(full.recordOffset ?? full.scanOffset), textOffset: String(full.textOffset), recent: full.recent ? "1" : "0" });
-      const data = await historyRead(`/api/history/message?${params}`, { authEpoch, signal: full.controller.signal });
+      const data = await api(`/api/history/message?${params}`, { authEpoch, signal: full.controller.signal });
       if (!current()) return;
       if (data.readOnly !== true) throw new Error("저장 기록 응답을 확인하지 못했습니다.");
       if (data.error) throw new Error(data.error);
@@ -7357,7 +7345,7 @@ async function loadQuestions(s, { more = false } = {}) {
   const entry = chatEntry(s);
   if (!currentChat(entry) || !questionsSupported(s) || networkOffline()) return;
   let q = questionsOf(entry, s);
-  // One read at a time: a second one would only be refused by the server.
+  // One read of a conversation's questions at a time: a second ask joins the one going.
   if (q?.loading) return q.loading;
   if (more && (!q || q.complete || !Number.isInteger(q.before))) return;
   const identity = conversationIdentity(s), authEpoch = state.authEpoch;
@@ -7370,7 +7358,8 @@ async function loadQuestions(s, { more = false } = {}) {
   q.error = "";
   q.loading = (async () => {
     try {
-      const data = await historyRead(`/api/history/questions?${params}`, { authEpoch });
+      // The server allows questions reads apart from 전체 보기 and body search (its own limit).
+      const data = await api(`/api/history/questions?${params}`, { authEpoch });
       if (!current()) return;
       const items = validQuestions(data);
       // A page that says there is more but not where it ends is the last one: no dead button.

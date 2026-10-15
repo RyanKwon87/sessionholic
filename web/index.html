@@ -631,6 +631,17 @@
       </div>
     </dialog>
     <div id="goal-undo" class="goal-undo" role="status" hidden><span id="goal-undo-label"></span><button id="goal-undo-action" type="button">실행 취소</button><button id="goal-undo-close" type="button" aria-label="실행 취소 안내 닫기">닫기</button></div>
+    <div id="dictation-overlay" class="dictation-overlay" role="dialog" aria-modal="false" aria-labelledby="dictation-overlay-status" hidden>
+      <div class="dictation-panel">
+        <div class="dictation-mic" aria-hidden="true">
+          <span class="dictation-ring"></span>
+          <svg viewBox="0 0 20 20" width="40" height="40" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><rect x="7" y="2.5" width="6" height="10" rx="3"/><path d="M4.5 9.5a5.5 5.5 0 0 0 11 0M10 15v2.5"/></svg>
+        </div>
+        <p id="dictation-overlay-status" class="dictation-status" role="status" aria-live="polite"></p>
+        <div id="dictation-overlay-text" class="dictation-text"></div>
+        <button id="dictation-overlay-stop" class="dictation-stop" type="button">끝내기</button>
+      </div>
+    </div>
     <div id="toast" class="toast" role="status" hidden></div>
   </body>
 </html>

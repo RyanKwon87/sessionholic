@@ -9366,6 +9366,44 @@ test('the terminal button opens the session terminal already open instead of pla
   assert.equal(c.context.planned, 1);
 });
 
+test('a listening shows the mic screen with the words it heard, large, and its 끝내기 ends it as the mic does', async () => {
+  const { c, FakeRecognition, recognitions, result, settle } = dictationClient();
+  c.context.webkitSpeechRecognition = FakeRecognition;
+  const { s } = selectChat(c); const composer = c.buildChatComposer(s);
+  const input = findId(composer, 'chat-input'); const mic = findId(composer, 'chat-mic');
+  const overlay = c.get('dictation-overlay'); overlay.hidden = true;
+  const words = () => c.get('dictation-overlay-text').children.map((node) => node.textContent).join('|');
+  input.value = '앞에 쓴 글';
+  mic.events.click();
+  const rec = recognitions.at(-1);
+  assert.equal(overlay.hidden, false);
+  assert.equal(c.get('dictation-overlay-status').textContent, c.DICTATION_PREPARING);
+  assert.equal(words(), '앞에 쓴 글|말씀하세요…');
+  rec.onstart();
+  assert.equal(c.get('dictation-overlay-status').textContent, '듣는 중');
+  rec.onresult(result('지금 하는 말'));
+  assert.equal(input.value, '앞에 쓴 글 지금 하는 말');
+  assert.equal(words(), '앞에 쓴 글|지금 하는 말');
+  assert.equal(c.get('dictation-overlay-text').children.at(-1).tagName, 'STRONG');
+  // 끝내기 ends it as the mic does: the last words still land, then the screen goes.
+  c.get('dictation-overlay-stop').events.click();
+  assert.equal(c.get('dictation-overlay-status').textContent, c.DICTATION_ENDING);
+  await settle();
+  assert.equal(c.state.dictation, null);
+  assert.equal(overlay.hidden, true);
+  // On an iPad the engine parks: the screen goes with the listening and comes back with the next.
+  const ipad = ipadDictation();
+  ipad.listen('말');
+  assert.equal(ipad.c.get('dictation-overlay').hidden, false);
+  ipad.mic.events.click();
+  ipad.timeouts.filter((timer) => timer.ms === 800).at(-1).callback();
+  assert.ok(ipad.c.state.dictationParked);
+  assert.equal(ipad.c.get('dictation-overlay').hidden, true);
+  ipad.mic.events.click();
+  assert.equal(ipad.c.get('dictation-overlay').hidden, false);
+  assert.equal(ipad.c.get('dictation-overlay-status').textContent, '듣는 중');
+});
+
 test('a browser without speech recognition shows no mic', () => {
   const { c } = dictationClient();
   const { s } = selectChat(c);

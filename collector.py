@@ -969,6 +969,14 @@ def codex_login(server, path):
     return login
 
 
+def with_login(rows, path):
+    """Each row of a home carries the account it is signed in to, once known (codex_login)."""
+    login = (CODEX_LOGINS.get(path) or (0, None))[1]
+    for row in rows if login else []:
+        row["login"] = dict(login)
+    return rows
+
+
 def codex_home_threads(path, full=False):
     """One home's thread list over its own daemon connection: (listed, loaded, failure).
     Its signed-in account is noted on the way (codex_login)."""
@@ -1083,10 +1091,7 @@ def codex_threads(errors, projects, full=False):
         if fallback:
             reply = codex_db_threads(path)
         rows, failures = codex_home_rows(key, project_id, account, reply, projects, offline=fallback)
-        login = (CODEX_LOGINS.get(path) or (0, None))[1]
-        for row in rows if login else []:
-            row["login"] = dict(login)
-        out.extend(rows)
+        out.extend(with_login(rows, path))
         errors.extend(failures)
     for (key, path), (project_id, account) in zip(offline, codex_labels(offline)):
         rows, failures = codex_home_rows(key, project_id, account, codex_db_threads(path), projects, offline=True)
@@ -1499,7 +1504,7 @@ class CodexHome:
     def publish(self, reply):
         project_id, account = self.label
         rows, errors = codex_home_rows(self.key, project_id, account, reply, self.watch.projects)
-        self.watch.publish(("codex", self.key), rows, errors)
+        self.watch.publish(("codex", self.key), with_login(rows, self.path), errors)
 
     def run(self):
         failures = 0
@@ -1550,7 +1555,9 @@ class CodexHome:
                     # A refusal (an older daemon, or a state DB it cannot use now) is asked
                     # again only after a while; meanwhile each list scans as before.
                     quick_retry = None if used else now + WATCH_QUICK_RETRY
-                self.publish((result, loaded_threads(client), None))
+                loaded = loaded_threads(client)
+                codex_login(client, self.path)  # Asked again only every CODEX_LOGIN_SECONDS.
+                self.publish((result, loaded, None))
                 listed[0] = True
                 now = clock()
                 next_poll = now + WATCH_CODEX_POLL

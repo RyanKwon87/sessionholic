@@ -5350,16 +5350,17 @@ test('live updates follow the open conversation, reread only on newer events, sl
 
 // --- UI round 2: list header, sending, gestures, attachments, states, text size ---
 
-test('status chips filter the list to answers or running work, keep both counts, and clear on a second tap', () => {
+test('status chips filter the list to each of its groups, keep every count, and clear on a second tap', () => {
   const c = client(undefined, noChatTimers);
   const rows = [recentSession('wait-a', { phase: 'needs_input', updatedAt: 1090 }), recentSession('wait-b', { phase: 'needs_input', updatedAt: 1080 }),
     recentSession('run', { phase: 'working', updatedAt: 1070 }), recentSession('idle', { updatedAt: 1060 })];
   setRecentSnapshot(c, rows);
   vm.runInContext('render()', c.context);
   const chips = c.get('counts').children;
-  assert.deepEqual(chips.map((chip) => chip.tagName), ['BUTTON', 'BUTTON']);
-  assert.deepEqual(chips.map((chip) => chip.chipLabel.textContent), ['답 필요 2', '작업 중 1']);
-  assert.deepEqual(chips.map((chip) => chip.attributes['aria-pressed']), ['false', 'false']);
+  assert.deepEqual(chips.map((chip) => chip.tagName), ['BUTTON', 'BUTTON', 'BUTTON', 'BUTTON']);
+  assert.deepEqual(chips.map((chip) => chip.chipLabel.textContent), ['답 필요 2', '작업 중 1', '최근 끝남 1', '이전 0']);
+  assert.deepEqual(chips.map((chip) => chip.attributes['aria-pressed']), ['false', 'false', 'false', 'false']);
+  assert.deepEqual(chips.map((chip) => chip.className), ['count red', 'count amber', 'count green', 'count gray zero']);
   assert.equal(byClass(c.get('groups'), 'card').length, 4);
   chips[0].events.click();
   assert.equal(c.state.phaseFilter, 'needs_input');
@@ -5378,6 +5379,22 @@ test('status chips filter the list to answers or running work, keep both counts,
   assert.equal(c.state.phaseFilter, '');
   assert.equal(byClass(c.get('groups'), 'card').length, 4);
   assert.equal(c.matches(rows[3], 1100), true);
+  // 최근 끝남 and 이전 filter the same way, one chip at a time.
+  after[2].events.click();
+  assert.equal(c.state.phaseFilter, 'finished');
+  assert.deepEqual(byClass(c.get('groups'), 'card').map((card) => card.dataset.sessionKey), [rows[3].key]);
+  assert.equal(after[2].className, 'count green is-active');
+  assert.equal(after[2].attributes['aria-pressed'], 'true');
+  assert.equal(after[2].attributes['aria-label'], '최근 끝남 1개, 이것만 보는 중');
+  assert.deepEqual(after.map((chip) => chip.attributes['aria-pressed']), ['false', 'false', 'true', 'false']);
+  assert.equal(c.get('session-count').textContent, '1개');
+  after[3].events.click();
+  assert.equal(c.state.phaseFilter, 'rest');
+  assert.equal(after[3].className, 'count gray zero is-active');
+  assert.match(textOf(c.get('groups')), /이전 세션이 없습니다.*3일 지난 대화는 제외되어 있습니다/);
+  after[3].events.click();
+  assert.equal(c.state.phaseFilter, '');
+  assert.equal(byClass(c.get('groups'), 'card').length, 4);
   // A filter that leaves nothing explains itself and clears with one tap.
   c.state.snapshot.hosts[0].data.codex = rows.filter((s) => s.phase !== 'working');
   after[1].events.click();

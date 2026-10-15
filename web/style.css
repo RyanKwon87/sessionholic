@@ -7048,6 +7048,9 @@ input.switch:focus-visible {
 .bot-conversation-status { margin: 0; color: var(--label-2); font-size: var(--fs-sub); }
 .bot-conversation .bot-source-notice { margin: 0; }
 .bot-conversation .bot-source-notice p { margin: 0 0 8px; }
+/* A long bot conversation (hundreds of messages) lays out only what scrolls near; the rest keeps
+   its last or estimated size. Browsers without it draw everything, as before. */
+.bot-conversation > .msg { content-visibility: auto; contain-intrinsic-size: auto 240px; }
 .bot-conversation .group-empty, .bot-conversation .conversation-window-notice { margin: 0; }
 /* One conversation of several sessions: a line where one session ends and the next begins. */
 .bot-conversation-break { display: flex; align-items: center; gap: 10px; margin: 6px 0 0; color: var(--label-2); font-size: var(--fs-cap); line-height: 1.5; }

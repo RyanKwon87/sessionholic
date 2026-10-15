@@ -41,6 +41,19 @@ test('paragraphs, line breaks, headings and emphasis use native elements and cop
   assert.doesNotMatch(visibleText(root), /\*\*|__|# 요약/);
 });
 
+test('a heading drops its closing hashes as before, and a long run of blanks stays linear', { timeout: 1000 }, () => {
+  const format = formatter();
+  for (const [text, shown] of [['## 제목 ##', '제목'], ['# 제목 #  ', '제목'], ['# 제목##', '제목##'], ['# C#', 'C#'],
+    ['# a # b', 'a # b'], ['# 제목\t##\t', '제목']]) {
+    const root = element(); format.render(root, text);
+    assert.equal(visibleText(byTag(root, text.startsWith('##') ? 'h2' : 'h1')[0]), shown, text);
+  }
+  const root = element(); const started = Date.now();
+  format.render(root, '# 제목' + ' '.repeat(60000) + 'x');
+  assert.ok(Date.now() - started < 300, '공백이 길어도 오래 걸리지 않는다');
+  assert.equal(byTag(root, 'h1').length, 1);
+});
+
 test('nested emphasis and inline code retain every code character, including comment and comparison symbols', () => {
   const format = formatter(); const root = element();
   const text = '**굵게와 *기울임*** / *기울임과 **굵게*** / ***둘 다*** / **`a>b**c`** / *`a/*b*/c`*';

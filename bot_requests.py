@@ -316,6 +316,118 @@ def _seconds(value):
     return round(float(value) / (1000 if value > 100_000_000_000 else 1), 3)
 
 
+# A Hermes gateway stores a user turn with the model's framing around the person's words: the
+# sender's label, the thread's or channel's earlier messages, the message it replies to, notes
+# on attachments, a skill's whole body, or a notice of its own. The markers are the gateway's
+# own, byte for byte (gateway/run.py or run_inbound.py, its Slack adapter, agent/skill_commands.py).
+HERMES_NOTICE = "[IMPORTANT:"
+HERMES_SKILL = "[IMPORTANT: The user has invoked the "
+HERMES_SKILL_NAME = re.compile(re.escape(HERMES_SKILL) + r'"([^"]*)"')
+HERMES_SKILL_LOADED = "The full skill content is loaded below.]"
+HERMES_SKILL_INSTRUCTION = "The user has provided the following instruction alongside the skill invocation: "
+HERMES_SKILL_RUNTIME = "\n\n[Runtime note:"
+HERMES_BUNDLE = " skill bundle,"
+HERMES_BUNDLE_INSTRUCTION = "\nUser instruction: "
+HERMES_BUNDLE_FIRST = "\n\n[Loaded as part of the "
+HERMES_THREAD = "[Thread context — prior messages in this thread"
+HERMES_THREAD_END = "\n[End of thread context]"
+HERMES_NEW = "[New message]\n"
+HERMES_SENDER = re.compile(r"\[[^\]\n]{0,200} \| Slack user <@[UW][A-Z0-9]+>\] ?")
+HERMES_REPLY = re.compile(r'\[Replying to(?: your previous message)?: "')
+HERMES_NOTE = "[The user sent "
+HERMES_ATTACHED = "(첨부 파일)"
+
+
+def _hermes_framed(text):
+    """Whether a stored user turn starts with the gateway's framing, the person's words after it."""
+    head = text.lstrip()
+    return (head.startswith((HERMES_NOTICE, HERMES_THREAD, HERMES_NOTE, HERMES_NEW))
+            or bool(HERMES_REPLY.match(head)) or "\n" + HERMES_NEW in head)
+
+
+def _hermes_skill(head, tail):
+    """A skill turn as it was typed: "/name instruction" (or "/name" alone)."""
+    match = HERMES_SKILL_NAME.match(head)
+    name = (match.group(1) if match else "").strip()
+    label = name if name.startswith("/") else "/" + name if name else ""
+    instruction = None
+    if HERMES_BUNDLE in head:
+        # A bundle names the instruction before the skills it loads.
+        start = head.find(HERMES_BUNDLE_INSTRUCTION)
+        if start >= 0:
+            instruction = head[start + len(HERMES_BUNDLE_INSTRUCTION):]
+            end = instruction.find(HERMES_BUNDLE_FIRST)
+            instruction = instruction[:end] if end >= 0 else instruction
+    elif HERMES_SKILL_LOADED in head:
+        # A single skill puts it after its body: the last one is the person's (the body may quote it).
+        text = tail if tail is not None else head
+        start = text.rfind(HERMES_SKILL_INSTRUCTION)
+        if start >= 0:
+            instruction = text[start + len(HERMES_SKILL_INSTRUCTION):]
+            end = instruction.find(HERMES_SKILL_RUNTIME)
+            instruction = instruction[:end] if end >= 0 else instruction
+    instruction = (instruction or "").strip()
+    typed = (label + " " + instruction).strip() if label else instruction
+    return typed or None
+
+
+def _hermes_typed(head, tail=None):
+    """The words the person typed in a Hermes gateway's stored user turn, and whether they are
+    whole; None for a turn the gateway wrote itself (a background job's end, a reload).
+
+    `tail` is the end of a turn longer than the read: the framing comes first, so the words
+    are there. An attachment alone shows as (첨부 파일)."""
+    if head.startswith(HERMES_SKILL):
+        typed = _hermes_skill(head, tail)
+        return (typed, True) if typed else None
+    if head.startswith(HERMES_NOTICE):
+        return None
+    # A long turn without a block before the words is the person's own long text: its start, cut.
+    rest, whole = head, tail is None
+    if tail is not None and _hermes_framed(head):
+        # Past the last context block the tail reaches; the words follow it.
+        cut = max(tail.rfind(HERMES_THREAD_END), tail.rfind("\n" + HERMES_NEW))
+        if cut >= 0:
+            rest, whole = tail[cut + 1:], True
+            rest = rest[rest.find("\n") + 1:] if rest.startswith(HERMES_THREAD_END.lstrip("\n")) else rest
+        else:
+            rest = tail
+    framed = attached = False
+    while True:
+        current = rest.lstrip()
+        if current.startswith(HERMES_THREAD):
+            end = current.find(HERMES_THREAD_END)
+            if end < 0:
+                break
+            rest = current[end + len(HERMES_THREAD_END):]
+        elif current.startswith(HERMES_NEW):
+            rest = current[len(HERMES_NEW):]
+        elif HERMES_REPLY.match(current):
+            end = current.find('"]\n')
+            if end < 0:
+                break
+            rest = current[end + 3:]
+        elif current.startswith(HERMES_NOTE):
+            end = current.find("]\n")
+            if end < 0:
+                break
+            rest, attached = current[end + 2:], True
+        elif HERMES_SENDER.match(current):
+            rest = current[HERMES_SENDER.match(current).end():]
+        elif current.startswith("[") and "\n\n" + HERMES_NEW in current:
+            # A channel's earlier messages, then the new one.
+            rest = current[current.find("\n\n" + HERMES_NEW) + 2:]
+        else:
+            break
+        framed = True
+    if not framed and tail is None:
+        return head, True
+    typed = rest.strip()
+    if not typed:
+        return (HERMES_ATTACHED, whole) if attached else None
+    return typed, whole
+
+
 def read_conversation(source, sessions, home=None):
     """The newest user and assistant text of these Hermes sessions (newest session first),
     read-only and bounded. Tool calls, tool results and reasoning are never selected."""
@@ -340,22 +452,34 @@ def read_conversation(source, sessions, home=None):
         index = _index_on(connection, "messages", ("session_id", "timestamp"))
         if index is None:
             raise SourceError("봇 대화의 세션 인덱스를 확인하지 못했습니다.")
-        query = ("SELECT role,substr(content,1,?) AS body,length(content) AS size,timestamp "
+        # A user turn longer than the read also gives its end: the gateway's framing comes first.
+        query = ("SELECT role,substr(content,1,?) AS body,"
+                 "CASE WHEN role='user' AND length(content)>? THEN substr(content,-?) END AS tail,"
+                 "length(content) AS size,timestamp "
                  'FROM messages INDEXED BY "' + index.replace('"', '""') + '" '
                  "WHERE session_id=? AND role IN ('user','assistant') ORDER BY timestamp DESC LIMIT ?")
         for session in sessions:
             rows, more = [], False
-            for row in connection.execute(query, (BODY_LIMIT, session, SCAN_ROWS)):
+            for row in connection.execute(query, (BODY_LIMIT, BODY_LIMIT, BODY_LIMIT, session, SCAN_ROWS)):
                 body = row["body"] if isinstance(row["body"], str) else ""
                 if not body.strip():
                     continue  # a turn that only called tools (its calls are never read)
+                size = row["size"] if isinstance(row["size"], int) and not isinstance(row["size"], bool) else len(body)
+                whole = size <= len(body)
+                if row["role"] == "user":
+                    # Only what the person typed; a notice the gateway wrote itself is not shown.
+                    typed = _hermes_typed(body, row["tail"] if isinstance(row["tail"], str) else None)
+                    if typed is None:
+                        continue
+                    body, whole = typed
                 if len(rows) >= CONVERSATION_ROWS or len(body) > budget:
                     more = True
                     break
                 budget -= len(body)
-                size = row["size"]
-                rows.append({"role": row["role"], "text": _body(body), "ts": _seconds(row["timestamp"]),
-                             "size": size if isinstance(size, int) and not isinstance(size, bool) else len(body)})
+                text = _body(body)
+                # Its length as shown when whole (masking changes it), else longer: the board says cut.
+                rows.append({"role": row["role"], "text": text, "ts": _seconds(row["timestamp"]),
+                             "size": len(text) if whole else max(size, len(text) + 1)})
             rows.reverse()
             result.append({"id": session, "messages": rows, "more": more})
     finally:

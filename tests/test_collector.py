@@ -380,6 +380,22 @@ class MessageTest(unittest.TestCase):
         self.assertIs(pairs[4][0], turn["items"][4])
         self.assertEqual(pairs[4][1][0]["ts"], 2500)
 
+    def test_codex_harness_blocks_in_a_user_turn_are_not_the_persons_words(self):
+        # A bot that starts Codex may pass Codex's own AGENTS.md and environment blocks as the turn.
+        agents = "# AGENTS.md instructions for /work/repo\n\n<INSTRUCTIONS>\n# 봇 지침\n- 합성 규칙\n</INSTRUCTIONS>"
+        env = "<environment_context>\n  <cwd>/work/repo</cwd>\n</environment_context>"
+        turn = {"startedAt": 1000, "completedAt": 2000, "status": "completed", "items": [
+            {"type": "userMessage", "content": [{"type": "text", "text": agents}, {"type": "text", "text": env}]},
+            {"type": "userMessage", "content": [{"type": "text", "text": agents + "\n\n재고 알려 줘"}]},
+            {"type": "userMessage", "content": [{"type": "text", "text": env}, {"type": "text", "text": "추가 지시"}]},
+            {"type": "agentMessage", "text": "답", "phase": "final_answer"}]}
+        # The first row shown carries the turn's start, though a harness-only item came first.
+        self.assertEqual([(m["role"], m["text"], m["ts"]) for m in collector.codex_messages([turn])],
+                         [("user", "재고 알려 줘", 1000), ("user", "추가 지시", None), ("assistant", "답", 2000)])
+        self.assertIsNone(collector.codex_user_text("# AGENTS.md instructions for /x\n<INSTRUCTIONS>\n끝나지 않음"))
+        self.assertEqual(collector.codex_user_text("AGENTS.md를 고쳐 줘"), "AGENTS.md를 고쳐 줘")
+        self.assertEqual(collector.codex_user_text("  그대로 둔 공백  "), "  그대로 둔 공백  ")
+
     def test_claude_harness_lines_are_notes_not_user_bubbles(self):
         entries = [
             {"type": "user", "isCompactSummary": True, "timestamp": 1791334800,
@@ -1213,6 +1229,20 @@ class SavedHistoryTest(unittest.TestCase):
 
     def write(self, *entries):
         self.path.write_text('\n'.join(json.dumps(row, ensure_ascii=False) for row in [self.header, *entries]) + '\n')
+
+    def test_codex_harness_blocks_are_dropped_from_mac_and_windows_user_rows(self):
+        agents = '# AGENTS.md instructions for /work/repo\n\n<INSTRUCTIONS>\n# 봇 지침\n</INSTRUCTIONS>'
+        for module, parser in self.parsers:
+            with self.subTest(platform=module.__name__):
+                self.assertEqual(parser(self.message(agents, role='user')), [])
+                [row] = parser(self.message(agents + '\n\n요청 본문', role='user'))
+                self.assertEqual(row['text'], '요청 본문')
+                [row] = parser(self.message(agents))  # an answer is never cut
+                self.assertEqual(row['text'], agents)
+        turns = [{'startedAt': 1000, 'items': [
+            {'type': 'userMessage', 'content': [{'type': 'text', 'text': agents}]},
+            {'type': 'userMessage', 'content': [{'type': 'text', 'text': agents}, {'type': 'text', 'text': '요청 본문'}]}]}]
+        self.assertEqual([row['text'] for row in self.windows._codex_messages(turns)], ['요청 본문'])
 
     def test_full_text_hash_and_chunking_match_mac_windows_preview_without_changing_normal_limits(self):
         text = '한글 본문\n' + 'x' * 70000

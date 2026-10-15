@@ -1149,6 +1149,28 @@ def _bot_request_text(text):
     return body if body.strip() else text
 
 
+# As collector.codex_user_text (this reader runs on its own): harness blocks in a Codex user turn.
+CODEX_HARNESS = (('# AGENTS.md instructions for ', '</INSTRUCTIONS>'),
+                 ('<environment_context>', '</environment_context>'),
+                 ('<user_instructions>', '</user_instructions>'))
+
+
+def _codex_user_text(text):
+    rest, cut = text, False
+    while True:
+        head = rest.lstrip()
+        block = next((pair for pair in CODEX_HARNESS if head.startswith(pair[0])), None)
+        if block is None:
+            break
+        end = head.find(block[1])
+        if end < 0:
+            return None
+        rest, cut = head[end + len(block[1]):], True
+    if not cut:
+        return text
+    return rest.strip() or None
+
+
 def _message(role, text, ts=None, **metadata):
     text = re.sub(r'[\ud800-\udfff]', '\ufffd', str(text or ''))
     if role == 'user' and isinstance(text, str):
@@ -1172,7 +1194,8 @@ def _codex_messages(turns):
             metadata = {'turnId': turn.get('id'), 'turnStatus': turn.get('status'), 'messageId': item.get('id')}
             if item.get('type') == 'userMessage':
                 content = item.get('content') if isinstance(item.get('content'), list) else []
-                text = '\n'.join(block.get('text', '') for block in content if isinstance(block, dict) and block.get('type') == 'text' and isinstance(block.get('text'), str))
+                texts = (_codex_user_text(block.get('text', '')) for block in content if isinstance(block, dict) and block.get('type') == 'text' and isinstance(block.get('text'), str))
+                text = '\n'.join(value for value in texts if value is not None)
                 if text:
                     result.append(_message('user', text, turn.get('startedAt'), **metadata))
             elif item.get('type') == 'agentMessage' and item.get('text'):
@@ -1210,8 +1233,11 @@ def _rollout_messages(entries):
             if role not in ('user', 'assistant'):
                 continue
             content = payload.get('content') if isinstance(payload.get('content'), list) else []
-            text = '\n'.join(block.get('text', '') for block in content
-                             if isinstance(block, dict) and block.get('type') in ('input_text', 'output_text') and isinstance(block.get('text'), str))
+            texts = (block.get('text', '') for block in content
+                     if isinstance(block, dict) and block.get('type') in ('input_text', 'output_text') and isinstance(block.get('text'), str))
+            if role == 'user':
+                texts = (_codex_user_text(value) for value in texts)
+            text = '\n'.join(value for value in texts if value is not None)
             if text:
                 result.append(_message(role, text, entry.get('timestamp'), turnId=turn, messageId=payload.get('id'), phase=payload.get('phase')))
     return result[-MESSAGE_LIMIT:]

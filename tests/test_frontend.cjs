@@ -9825,6 +9825,18 @@ test('typing, a paste, sending, an error or the input leaving the screen ends th
     rec.onend();
     assert.match(c.get('chat-status').textContent, words, code);
   }
+  // WebKit's refusals say where to allow it again: which check refused is only in its message.
+  for (const [message, code, words] of [
+    ['User permission check has failed', 'not-allowed', /사이트의 마이크 사용이 거부로 기억되어.*웹 사이트 설정 > 마이크.*\(not-allowed\)$/],
+    ['Microphone permission check has failed', 'not-allowed', /마이크 접근이 꺼져 있습니다.*\(not-allowed\)$/],
+    ['Speech recognition service permission check has failed', 'service-not-allowed', /음성 인식 권한이 꺼져 있습니다.*\(service-not-allowed\)$/],
+    ['Some other reason', 'not-allowed', /^마이크 사용이 허용되지 않았습니다.*\(not-allowed\)$/],
+    ['toString', 'network', /^음성 인식 서비스에 연결/]]) {
+    rec = begin();
+    rec.onerror({ error: code, message });
+    rec.onend();
+    assert.match(c.get('chat-status').textContent, words, message);
+  }
   // A send clears what a finished dictation said.
   entry.text = input.value = '보낼 초안';
   await c.sendChat(entry);

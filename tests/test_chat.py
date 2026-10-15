@@ -517,6 +517,24 @@ class ChatTest(unittest.TestCase):
         self.chat.state({'source':REF,'requestIds':['request-000a']})
         self.assertEqual(len(self.calls),reads+2)
 
+    def test_clients_share_a_read_for_three_seconds_while_the_watcher_reads_again_after_two(self):
+        key=chat.Chat.state_key(self.source)
+        def age(seconds):
+            cached=self.chat.cache[key]
+            self.chat.cache[key]=(cached[0]-seconds,)+cached[1:]
+        self.chat.state({'source':REF},watching=True)
+        reads=len(self.calls)
+        age(2.5)
+        # A client polling every 3 s takes the watcher's newest read.
+        self.chat.state({'source':REF})
+        self.assertEqual(len(self.calls),reads)
+        # The watcher's own next read (2 s after its last ended) asks the host again.
+        self.chat.state({'source':REF},watching=True)
+        self.assertEqual(len(self.calls),reads+1)
+        age(3.01)
+        self.chat.state({'source':REF})
+        self.assertEqual(len(self.calls),reads+2)
+
     def test_waiting_ids_expire_are_bounded_and_only_valid(self):
         key=chat.Chat.state_key(self.source)
         with patch.object(chat,'WAITING_SECONDS',-1):

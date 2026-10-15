@@ -71,8 +71,16 @@ PROMPT_NO_TERMINAL = ('이 세션에는 보드가 연결한 터미널이 없어 
                       '실행 중인 터미널에서 직접 선택해 주세요.')
 PROMPT_BUSY = '다른 입력을 전달하고 있습니다. 잠시 뒤 다시 시도해 주세요.'
 TERMINAL_STATE = '보드 터미널 상태를 확인하지 못했습니다. 잠시 뒤 다시 시도해 주세요.'
-# Conversation state reads are shared for this many seconds.
-STATE_CACHE_SECONDS = 2
+# Conversation state reads are shared with clients for this many seconds. While the agent works
+# a conversation watcher (events.py) reads again 2 s after its last read ended, so a client
+# polling every 3 s (web/app.js) is answered from the watcher's newest read, whose changes the
+# watcher announces anyway. A lone client's own polls are more than 3 s apart (3 s after its
+# last answer), so each of them still reads the host: never a view older than it asked for.
+STATE_CACHE_SECONDS = 3
+# The watcher's own reads: its last result is then just over 2 s old, so each read asks the
+# host again and a change is noticed as soon as before (a longer window would skip every
+# other read). A client's read under 2 s old still serves it.
+WATCH_CACHE_SECONDS = 2
 # Message ids a client recently asked receipts for, per conversation: a conversation
 # watcher reads them along, so the client's next read is answered from the cache.
 WAITING_SECONDS = 60
@@ -418,7 +426,8 @@ class Chat:
                 # read and other clients' reads can share it.
                 carried = list(dict.fromkeys(request_ids + self._waiting_ids(key, now)))
             cached = self.cache.get(key)
-            if (cached and cached[3] == source.get('cwd') and now - cached[0] < STATE_CACHE_SECONDS
+            fresh = WATCH_CACHE_SECONDS if watching else STATE_CACHE_SECONDS
+            if (cached and cached[3] == source.get('cwd') and now - cached[0] < fresh
                     and cached[4].issuperset(request_ids)):
                 return self._cached_view(cached[1], request_ids)
             shared = self.reads.get(key)

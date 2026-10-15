@@ -335,13 +335,45 @@ HERMES_NEW = "[New message]\n"
 HERMES_SENDER = re.compile(r"\[[^\]\n]{0,200} \| Slack user <@[UW][A-Z0-9]+>\] ?")
 HERMES_REPLY = re.compile(r'\[Replying to(?: your previous message)?: "')
 HERMES_NOTE = "[The user sent "
+# A note the gateway puts before the person's words (a restart, a reset, a first message).
+HERMES_SYSTEM_NOTE = "[System note:"
+# Turns that carry no words of the person's, as Hermes itself tells them
+# (agent/context_compressor.py _synthetic_user_row; compaction summaries are unwrapped).
+HERMES_SYNTHETIC = ("[System:", "[Your active task list", "[Planning state preserved", "[ASYNC DELEGATION",
+                    "[OUT-OF-BAND", "Cronjob Response:")
 HERMES_ATTACHED = "(첨부 파일)"
+# Its context compaction writes a summary as a turn of either side, alone (its own words may
+# follow it) or merged after a turn's own words (agent/context_compressor.py).
+HERMES_SUMMARY = ("[CONTEXT COMPACTION", "[CONTEXT SUMMARY]:")
+HERMES_SUMMARY_END = "--- END OF CONTEXT SUMMARY — respond to the message below, not the summary above ---"
+HERMES_PRIOR = "[PRIOR CONTEXT — for reference only; not a new message]"
+HERMES_PRIOR_END = "[END OF PRIOR CONTEXT — COMPACTION SUMMARY BELOW]"
+
+
+def _hermes_unsummarized(head, tail=None):
+    """A turn without the summary a compaction put in it, as (head, tail) to read on, or None
+    for the summary alone (Hermes's own unwrap: the words merged before it, or after its end)."""
+    if head.startswith(HERMES_PRIOR):
+        end = head.find(HERMES_PRIOR_END)
+        if end < 0:
+            return head[len(HERMES_PRIOR):].lstrip(), tail  # its words run past the read
+        prior = head[len(HERMES_PRIOR):end].strip()
+        return (prior, None) if prior else None
+    if not head.startswith(HERMES_SUMMARY):
+        return head, tail
+    end = head.find(HERMES_SUMMARY_END)
+    if end >= 0:
+        rest = head[end + len(HERMES_SUMMARY_END):].lstrip()
+        return (rest, tail) if rest else None
+    end = tail.find(HERMES_SUMMARY_END) if tail is not None else -1
+    rest = tail[end + len(HERMES_SUMMARY_END):].lstrip() if end >= 0 else ""
+    return (rest, None) if rest else None
 
 
 def _hermes_framed(text):
     """Whether a stored user turn starts with the gateway's framing, the person's words after it."""
     head = text.lstrip()
-    return (head.startswith((HERMES_NOTICE, HERMES_THREAD, HERMES_NOTE, HERMES_NEW))
+    return (head.startswith((HERMES_NOTICE, HERMES_THREAD, HERMES_NOTE, HERMES_NEW, HERMES_SYSTEM_NOTE))
             or bool(HERMES_REPLY.match(head)) or "\n" + HERMES_NEW in head)
 
 
@@ -377,10 +409,17 @@ def _hermes_typed(head, tail=None):
 
     `tail` is the end of a turn longer than the read: the framing comes first, so the words
     are there. An attachment alone shows as (첨부 파일)."""
+    unwrapped = _hermes_unsummarized(head, tail)
+    if unwrapped is None:
+        return None
+    if unwrapped != (head, tail):
+        head, tail = unwrapped
+        if not head.strip():
+            return None
     if head.startswith(HERMES_SKILL):
         typed = _hermes_skill(head, tail)
         return (typed, True) if typed else None
-    if head.startswith(HERMES_NOTICE):
+    if head.startswith((HERMES_NOTICE,) + HERMES_SYNTHETIC):
         return None
     # A long turn without a block before the words is the person's own long text: its start, cut.
     rest, whole = head, tail is None
@@ -412,6 +451,9 @@ def _hermes_typed(head, tail=None):
             if end < 0:
                 break
             rest, attached = current[end + 2:], True
+        elif current.startswith(HERMES_SYSTEM_NOTE):
+            end = current.find("]\n\n")
+            rest = current[end + 3:] if end >= 0 else ""  # a note alone carries no words
         elif HERMES_SENDER.match(current):
             rest = current[HERMES_SENDER.match(current).end():]
         elif current.startswith("[") and "\n\n" + HERMES_NEW in current:
@@ -422,6 +464,14 @@ def _hermes_typed(head, tail=None):
         framed = True
     if not framed and tail is None:
         return head, True
+    # The gateway frames its own events too (a background job's end in a thread gets the thread's
+    # context): after the framing, a notice is still the gateway's and a skill is still typed so.
+    current = rest.lstrip()
+    if current.startswith(HERMES_SKILL):
+        typed = _hermes_skill(current, None)
+        return (typed, whole) if typed else None
+    if current.startswith((HERMES_NOTICE,) + HERMES_SYNTHETIC):
+        return None
     typed = rest.strip()
     if not typed:
         return (HERMES_ATTACHED, whole) if attached else None
@@ -452,9 +502,11 @@ def read_conversation(source, sessions, home=None):
         index = _index_on(connection, "messages", ("session_id", "timestamp"))
         if index is None:
             raise SourceError("봇 대화의 세션 인덱스를 확인하지 못했습니다.")
-        # A user turn longer than the read also gives its end: the gateway's framing comes first.
+        # A user turn (or a compaction's) longer than the read also gives its end: the gateway's
+        # framing and a summary come first.
         query = ("SELECT role,substr(content,1,?) AS body,"
-                 "CASE WHEN role='user' AND length(content)>? THEN substr(content,-?) END AS tail,"
+                 "CASE WHEN (role='user' OR substr(content,1,1)='[') AND length(content)>? "
+                 "THEN substr(content,-?) END AS tail,"
                  "length(content) AS size,timestamp "
                  'FROM messages INDEXED BY "' + index.replace('"', '""') + '" '
                  "WHERE session_id=? AND role IN ('user','assistant') ORDER BY timestamp DESC LIMIT ?")
@@ -472,6 +524,16 @@ def read_conversation(source, sessions, home=None):
                     if typed is None:
                         continue
                     body, whole = typed
+                else:
+                    # An answer a compaction merged its summary into keeps only the answer.
+                    tail = row["tail"] if isinstance(row["tail"], str) else None
+                    kept = _hermes_unsummarized(body, tail)
+                    if kept is None:
+                        continue
+                    if kept != (body, tail):
+                        body, whole = kept[0], kept[1] is None
+                        if not body.strip():
+                            continue
                 if len(rows) >= CONVERSATION_ROWS or len(body) > budget:
                     more = True
                     break

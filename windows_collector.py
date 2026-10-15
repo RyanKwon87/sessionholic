@@ -273,6 +273,9 @@ def _parents(deadline):
 def _claude_options(arguments):
     """Conservative option-prefix parser; prompt/unknown options end observation."""
     flags = {'print': False, 'noSessionPersistence': False}
+    if len(arguments) > 1 and arguments[1] == '--bg-pty-host':
+        # Claude's own background PTY host runs the session; it is not a separate initiator.
+        return {**flags, 'bgPtyHost': True}
     values = {'--model', '--output-format', '--input-format', '--name', '-n', '--agent',
               '--system-prompt', '--append-system-prompt', '--system-prompt-file',
               '--append-system-prompt-file', '--session-id', '--permission-mode',
@@ -301,7 +304,7 @@ def _claude_options(arguments):
 
 
 def _query_claude_flags(kernel, handle):
-    """Read one handle's bounded command line, returning only two booleans.
+    """Read one handle's bounded command line, returning only a few booleans.
 
     ProcessCommandLineInformation is optional: unsupported Windows versions fail
     closed. No PEB/environment read or PowerShell/CIM fallback is performed.
@@ -874,6 +877,12 @@ class WindowsCollector:
             chain.append(parent)
             seen.add(pid)
             name = self._agent_executable(parent['exe'])
+            if name == 'Claude Code':
+                flags = self.flags_reader(parent, deadline)
+                if isinstance(flags, dict) and flags.get('bgPtyHost') is True:
+                    # `claude --bg` sessions always run under Claude's own PTY host. It shows how the
+                    # session runs, not who started it, so it is no agent evidence.
+                    return None
             if name:
                 break
             if not self._shell_executable(parent['exe']):

@@ -128,6 +128,48 @@ class ClaudeProcessOriginTest(unittest.TestCase):
         self.processes[100]['exe'] = str(self.child)
         self.assertEqual(self.reader.claude_rows()[0]['initiatorName'], 'Claude Code')
 
+    def test_claude_background_pty_host_parent_is_not_an_agent(self):
+        """A `claude --bg` session runs under Claude's own `--bg-pty-host`, started by Claude's daemon.
+
+        The original caller is not in that lineage, so the host is no agent evidence and the
+        session keeps the background policy (general). The daemon above the host is not used.
+        """
+        self.parents = {300: 150, 150: 120}
+        self.processes[150] = {'pid': 150, 'start': str(self.stamp - 50), 'exe': str(self.child)}
+        self.processes[120] = {'pid': 120, 'start': str(self.stamp - 80), 'exe': str(self.child)}  # daemon
+        self.row['kind'] = 'bg'
+        self.registry.write_text(json.dumps(self.row), encoding='utf-8')
+        host = ['claude.exe', '--bg-pty-host', r'\\.\pipe\cc-daemon-pty', '44', '8', '--', 'claude.exe', '--session-id', self.sid]
+        self.reader.flags_reader = lambda expected, deadline: (
+            wc._claude_options(host) if expected['pid'] == 150 else {'print': False, 'noSessionPersistence': False})
+        row = self.reader.claude_rows()[0]
+        self.assertEqual(row.get('initiator', 'unknown'), 'unknown')
+        self.assertNotEqual(row.get('initiatorEvidence'), 'process_ancestry')
+        import collector
+        self.assertEqual(collector.session_category({**row, 'agent': 'claude'}), 'general')
+
+    def test_unreadable_pty_host_command_line_stays_an_agent(self):
+        """Failing closed: without the host flag the Claude parent is still agent evidence."""
+        self.parents = {300: 150}
+        self.processes[150] = {'pid': 150, 'start': str(self.stamp - 50), 'exe': str(self.child)}
+        self.row['kind'] = 'bg'
+        self.registry.write_text(json.dumps(self.row), encoding='utf-8')
+        self.reader.flags_reader = lambda expected, deadline: {}
+        row = self.reader.claude_rows()[0]
+        self.assertEqual((row['initiator'], row['initiatorEvidence']), ('agent', 'process_ancestry'))
+
+    def test_claude_parent_without_background_host_flag_stays_an_agent(self):
+        self.parents = {300: 150}
+        self.processes[150] = {'pid': 150, 'start': str(self.stamp - 50), 'exe': str(self.child)}
+        self.reader.flags_reader = lambda expected, deadline: {'print': True, 'noSessionPersistence': False}
+        row = self.reader.claude_rows()[0]
+        self.assertEqual((row['initiator'], row['initiatorName']), ('agent', 'Claude Code'))
+
+    def test_background_pty_host_option_is_recognized_only_as_the_first_option(self):
+        self.assertTrue(wc._claude_options(['claude.exe', '--bg-pty-host', 'pipe', '--', 'claude.exe'])['bgPtyHost'])
+        self.assertNotIn('bgPtyHost', wc._claude_options(['claude.exe', '-p', '--bg-pty-host']))
+        self.assertEqual(wc._claude_options(['claude.exe', '--print']), {'print': True, 'noSessionPersistence': False})
+
     def test_same_named_untrusted_native_parent_is_not_an_agent(self):
         for name in ('codex.exe', 'claude.exe', 'other.exe'):
             executable = self.home / 'Projects' / name

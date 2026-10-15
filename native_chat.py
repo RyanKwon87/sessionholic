@@ -620,12 +620,19 @@ def _claude(identity, action, home, deadline, args):
             raise ValueError("정확한 원본 Claude 대화 기록을 확인하지 못했습니다.")
         entries = list(collector.tail_entries(paths[0], 2 * 1024 * 1024))
         result["messages"] = collector.claude_messages(entries)
-        if not result['modelSettings']['model']:
+        # `claude agents` names neither: each response records its model and effort. The newest
+        # main-thread one counts (a subagent's or a <synthetic> one says nothing of the session).
+        if not (result['modelSettings']['model'] and result['modelSettings']['effort']):
             for entry in reversed(entries):
-                model = (entry.get('message') or {}).get('model') if entry.get('type') == 'assistant' and isinstance(entry.get('message'), dict) else None
-                if isinstance(model, str) and MODEL_ID.fullmatch(model):
-                    result['modelSettings'].update(model=model, observed='last_response')
-                    break
+                message = entry.get('message') if entry.get('type') == 'assistant' and not entry.get('isSidechain') else None
+                model = message.get('model') if isinstance(message, dict) else None
+                if not isinstance(model, str) or not MODEL_ID.fullmatch(model):
+                    continue
+                effort = entry.get('effort') or entry.get('perTurnEffort')
+                result['modelSettings'] = {'model': result['modelSettings']['model'] or model,
+                                           'effort': result['modelSettings']['effort'] or (effort if effort in EFFORTS else None),
+                                           'observed': 'last_response'}
+                break
         if result["phase"] == "working":
             # Claude Code records no turn start: "작업 중" counts from the newest user prompt
             # in the transcript, an approximation the board labels as such (workingSinceApprox).

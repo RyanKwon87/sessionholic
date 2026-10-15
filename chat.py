@@ -181,8 +181,10 @@ def terminal_model_settings(screen):
     rows = str(screen).replace('\r', '').split('\n')[-INPUT_TAIL:]
     borders = [i for i, row in enumerate(rows) if row.strip() and all('─' <= c <= '▟' or c.isspace() for c in row.strip())]
     footer = '\n'.join(rows[borders[-1] + 1:]) if borders else ''
-    model = re.search(r'\b(Opus|Sonnet|Haiku)\b', footer, re.I)
-    effort = re.search(r'\b(low|medium|high|xhigh|max)\s+effort\b', footer, re.I)
+    model = re.search(r'\b(Opus|Sonnet|Haiku|Fable)\b', footer, re.I)
+    # "high effort", or a status line's "Opus 5.5 · xhigh" (the level right after the model).
+    effort = (re.search(r'\b(low|medium|high|xhigh|max)\s+effort\b', footer, re.I)
+              or re.search(r'\b(?:Opus|Sonnet|Haiku|Fable)\b[^·\n]{0,24}·\s*(low|medium|high|xhigh|max)\b', footer, re.I))
     return {**({'model': model[1].lower()} if model else {}), **({'effort': effort[1].lower()} if effort else {})}
 
 
@@ -526,8 +528,12 @@ class Chat:
         if claude and terminal:
             try:
                 live = terminal_model_settings(self.workflow.terminals.capture(terminal['id']))
+                read = result.get('modelSettings') or {}
+                # The screen's "opus" does not replace the "claude-opus-5-5" a response recorded.
+                if live.get('model') and live['model'] in str(read.get('model') or '').lower():
+                    live.pop('model')
                 if live:
-                    result['modelSettings'] = {**(result.get('modelSettings') or {}), **live, 'observed': 'runtime'}
+                    result['modelSettings'] = {**read, **live, 'observed': 'runtime'}
             except (RuntimeError, ValueError, KeyError, OSError):
                 pass
         action = None
@@ -1262,7 +1268,7 @@ class Chat:
             current = self.state({'source': data['source']}).get('modelSettings') or {}
             return {'current': current, 'models': [
                 {'model': 'opus', 'label': 'Opus', 'efforts': ['low', 'medium', 'high', 'xhigh', 'max']},
-                {'model': 'sonnet', 'label': 'Sonnet', 'efforts': ['low', 'medium', 'high']},
+                {'model': 'sonnet', 'label': 'Sonnet', 'efforts': ['low', 'medium', 'high', 'xhigh', 'max']},
                 {'model': 'haiku', 'label': 'Haiku', 'efforts': []}], 'next': {}}
         request_id = data.get('requestId')
         if not isinstance(request_id, str) or not REQUEST.fullmatch(request_id):

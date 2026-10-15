@@ -11642,14 +11642,18 @@ test('saved model selection becomes the primary badge immediately and failed cha
 });
 
 
-test('last-response model attribution does not claim observed effort and Claude uses confirmed settings only', () => {
+test('last-response settings say both came from the newest response and Claude uses confirmed settings only', () => {
   const c = client(undefined, noChatTimers); const { entry } = selectChat(c);
   const controls = vm.runInContext('({ updateModelControls })', c.context);
   entry.data.modelSettings = { model: 'example-one', effort: 'low', observed: 'last_response', next: { effort: 'high' } };
   controls.updateModelControls(entry);
   assert.equal(c.get('chat-effort-control').textContent, 'high');
-  assert.match(c.get('chat-model-selection-note').textContent, /모델\(마지막 응답\): example-one.*에포트\(세션에서 확인\): low/);
-  assert.ok(!c.get('chat-effort-control').title.includes('마지막 응답'));
+  assert.match(c.get('chat-model-selection-note').textContent, /마지막 응답에서 확인: example-one · low/);
+  assert.match(c.get('chat-effort-control').title, /다음 메시지에 사용 · 마지막 응답: low/);
+  entry.data.modelSettings = { model: 'example-one', effort: 'low', observed: 'last_response' };
+  controls.updateModelControls(entry);
+  assert.match(c.get('chat-effort-control').title, /마지막 응답에서 확인한 에포트/);
+  assert.match(c.get('chat-model-summary').title, /마지막 응답에서 확인: example-one · low/);
   const { entry: claude } = selectChat(c, { agent: 'claude' });
   claude.data.modelSettings = { model: 'opus', effort: 'high', next: { model: 'sonnet', effort: 'medium' } };
   controls.updateModelControls(claude);

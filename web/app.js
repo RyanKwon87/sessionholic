@@ -4886,9 +4886,9 @@ function updateModelControls(entry) {
   const changed = ["model", "effort"].some((kind) => next[kind] && next[kind] !== settings[kind]);
   const observedLabel = settings.observed === "last_response" ? "마지막 응답" : "세션에서 확인";
   const observedValues = [settings.model || "모델 미확인", settings.effort || "에포트 미확인"];
-  const observed = settings.observed === "last_response"
-    ? `모델(마지막 응답): ${observedValues[0]} · 에포트(세션에서 확인): ${observedValues[1]}`
-    : `세션에서 확인: ${observedValues.join(" · ")}`;
+  // A Claude conversation's model and effort come from its newest response (last_response),
+  // or from its terminal's status line (runtime).
+  const observed = `${settings.observed === "last_response" ? "마지막 응답에서 확인" : "세션에서 확인"}: ${observedValues.join(" · ")}`;
   const note = $("chat-model-selection-note");
   const noteText = changed ? `다음 메시지에 사용 · ${observed}` : "";
   const summary = $("chat-model-summary");
@@ -4912,7 +4912,7 @@ function updateModelControls(entry) {
       const actual = settings[kind], pending = next[kind] && next[kind] !== actual ? next[kind] : null;
       if (control.textContent !== controlText(kind)) control.textContent = controlText(kind);
       const label = kind === "model" ? "모델" : "에포트";
-      const explanation = pending ? `다음 메시지에 사용 · ${kind === "model" ? observedLabel : "세션에서 확인"}: ${actual || "미확인"}` : settings.observed === "last_response" && kind === "model" ? "마지막 응답에서 확인한 모델" : `${label} 선택`;
+      const explanation = pending ? `다음 메시지에 사용 · ${observedLabel}: ${actual || "미확인"}` : settings.observed === "last_response" ? `마지막 응답에서 확인한 ${label}` : `${label} 선택`;
       control.title = `${label}: ${control.textContent} · ${explanation}`;
       control.setAttribute("aria-label", `${label}: ${control.textContent} · 선택하기`);
       control.disabled = !chatSupported(entry) || entry.sending || !!entry.pending || !!entry.commandBusy || networkOffline();
@@ -4956,6 +4956,8 @@ async function openChatSettings(entry, kind) {
     const select = el("select"); select.id = "chat-setting-choice";
     for (const item of values) { const option = el("option", "", item.label); option.value = item.value; select.append(option); }
     if (values.some((item) => item.value === current[kind])) select.value = current[kind];
+    // A full model id ("claude-opus-5-5") picks its family ("opus").
+    else if (kind === "model" && model) select.value = model.model;
     else if (values.length) select.value = values[0].value;
     const apply = button("적용", "primary", async () => {
       if (!select.value || !currentChat(entry) || entry.commandBusy) return;

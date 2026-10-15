@@ -856,6 +856,31 @@ class NativeChatTests(unittest.TestCase):
             self.assertEqual(read.get('workingSinceApprox'), True if expected else None)
             self.assertEqual([m['role'] for m in read['messages']], ['user', 'tool'])
 
+    def test_claude_read_takes_model_and_effort_from_the_newest_main_response(self):
+        source = {'agent': 'claude', 'home': '.claude', 'id': 'back1234'}
+        sid = 'session-12345'
+        folder = self.home / '.claude/projects/p'
+        folder.mkdir(parents=True)
+        row = {'id': source['id'], 'sessionId': sid, 'kind': 'background', 'state': 'idle', 'status': 'idle', 'cwd': str(self.cwd)}
+        answer = lambda model, **fields: {'type': 'assistant', 'message': {'model': model, 'content': [{'type': 'text', 'text': 'ok'}]}, **fields}
+
+        def read(lines):
+            (folder / (sid + '.jsonl')).write_text(''.join(json.dumps(line) + '\n' for line in lines))
+            with patch.object(chat.native, '_claude_binary', return_value='/fixture/claude'), \
+                    patch.object(chat.native, '_claude_run', return_value=json.dumps([row]).encode()):
+                return chat.handle({'action': 'read', 'source': source}, home=self.home)['modelSettings']
+
+        # A subagent's response and a <synthetic> one come later but say nothing of the session.
+        self.assertEqual(read([answer('claude-opus-5-5', effort='xhigh', perTurnEffort='xhigh'),
+                               answer('claude-haiku-5-5', effort='low', isSidechain=True),
+                               answer('<synthetic>', effort=None, perTurnEffort='max')]),
+                         {'model': 'claude-opus-5-5', 'effort': 'xhigh', 'observed': 'last_response'})
+        self.assertEqual(read([answer('claude-opus-5-5', perTurnEffort='max')])['effort'], 'max')
+        # A model without effort levels records none: the older response's effort is not carried.
+        self.assertEqual(read([answer('claude-opus-5-5', effort='high'), answer('claude-haiku-5-5', effort=None)]),
+                         {'model': 'claude-haiku-5-5', 'effort': None, 'observed': 'last_response'})
+        self.assertEqual(read([answer('claude-opus-5-5', effort='turbo')])['effort'], None)
+
 
 class StoppedOnErrorTest(unittest.TestCase):
     def test_a_codex_stopped_on_an_error_reads_as_waiting_and_says_why_input_is_locked(self):

@@ -32,6 +32,7 @@
   --backdrop: rgba(0, 0, 0, 0.32);
   --toast-bg: rgba(28, 28, 30, 0.92);
   --toast-text: #ffffff;
+  --toast-banner-bg: rgba(28, 28, 30, 0.8); /* the phone's top capsule, over a blur */
   --edge-shade: rgba(0, 0, 0, 0.1);
 
   /* --accent colors text and outlines; --accent-fill sits under white text. */
@@ -82,6 +83,7 @@
   --shadow-dialog: 0 24px 64px rgba(0, 0, 0, 0.2), 0 0 0 0.5px rgba(0, 0, 0, 0.08);
   --shadow-toast: 0 8px 30px rgba(0, 0, 0, 0.2);
   --shadow-nav: -8px 0 28px rgba(0, 0, 0, 0.12);
+  --shadow-lift: 0 10px 30px rgba(0, 0, 0, 0.16);
   --sheet-handle: rgba(60, 60, 67, 0.3);
   --segment-on: #ffffff;
   --terminal-tile: #1c1c1e;
@@ -155,9 +157,11 @@
   --dur: 240ms;
   --dur-sheet: 460ms;
   --dur-nav: 440ms;
+  --dur-edge: 250ms; /* app.js GESTURE.edgeSettleMs */
   --press-scale: 0.97;
   --press-scale-card: 0.985;
   --press-scale-key: 0.98;
+  --press-scale-lift: 1.03;
 
   --font:
     -apple-system, BlinkMacSystemFont, system-ui, "Apple SD Gothic Neo",
@@ -204,6 +208,7 @@
     --backdrop: rgba(0, 0, 0, 0.56);
     --toast-bg: rgba(72, 72, 74, 0.96);
     --toast-text: #ffffff;
+    --toast-banner-bg: rgba(72, 72, 74, 0.82);
     --edge-shade: rgba(0, 0, 0, 0.5);
     --accent: #409cff;
     --accent-fill: #0a6cdc;
@@ -244,6 +249,7 @@
     --shadow-dialog: 0 24px 64px rgba(0, 0, 0, 0.6), 0 0 0 0.5px rgba(255, 255, 255, 0.1);
     --shadow-toast: 0 8px 30px rgba(0, 0, 0, 0.5);
     --shadow-nav: -8px 0 28px rgba(0, 0, 0, 0.5);
+    --shadow-lift: 0 10px 30px rgba(0, 0, 0, 0.6);
     --sheet-handle: rgba(235, 235, 245, 0.3);
     --segment-on: #636366;
     --terminal-tile: #3a3a3c;
@@ -283,6 +289,7 @@
   --backdrop: rgba(0, 0, 0, 0.56);
   --toast-bg: rgba(72, 72, 74, 0.96);
   --toast-text: #ffffff;
+  --toast-banner-bg: rgba(72, 72, 74, 0.82);
   --edge-shade: rgba(0, 0, 0, 0.5);
   --accent: #409cff;
   --accent-fill: #0a6cdc;
@@ -323,6 +330,7 @@
   --shadow-dialog: 0 24px 64px rgba(0, 0, 0, 0.6), 0 0 0 0.5px rgba(255, 255, 255, 0.1);
   --shadow-toast: 0 8px 30px rgba(0, 0, 0, 0.5);
   --shadow-nav: -8px 0 28px rgba(0, 0, 0, 0.5);
+  --shadow-lift: 0 10px 30px rgba(0, 0, 0, 0.6);
   --sheet-handle: rgba(235, 235, 245, 0.3);
   --segment-on: #636366;
   --terminal-tile: #3a3a3c;
@@ -2333,6 +2341,24 @@ li[data-task] {
     transparent 15.5px
   );
 }
+/* Sheets whose changes apply at once (settings, filter) close from one 완료 at the
+   top right, as iOS sheets do. */
+.dialog-top .sheet-done {
+  flex: none;
+  min-height: var(--tap);
+  margin-left: auto;
+  margin-right: 4px;
+  padding: 0 12px;
+  border: 0;
+  border-radius: var(--radius-s);
+  background: transparent;
+  color: var(--accent);
+  font-size: var(--fs-body);
+  font-weight: 600;
+}
+.dialog-top .sheet-done:active:not(:disabled) {
+  opacity: 0.5;
+}
 .plan-dialog h2 {
   flex: none;
   margin-bottom: 14px;
@@ -3195,10 +3221,6 @@ li[data-task] {
     border-radius: 1px;
     transform: rotate(45deg);
   }
-  .back::after {
-    content: "작업";
-    font-size: var(--fs-head);
-  }
   .back:active {
     opacity: 0.5;
   }
@@ -3271,6 +3293,10 @@ li[data-task] {
     flex-direction: column-reverse;
     gap: 8px;
     padding: 16px var(--sheet-pad) max(16px, env(safe-area-inset-bottom));
+  }
+  /* With no button row below, a sheet's last lines clear the home indicator. */
+  .sheet > .dialog-body:last-child {
+    padding-bottom: max(16px, env(safe-area-inset-bottom));
   }
   .dialog-actions button {
     width: 100%;
@@ -3509,6 +3535,7 @@ li[data-task] {
     --press-scale: 1;
     --press-scale-card: 1;
     --press-scale-key: 1;
+    --press-scale-lift: 1;
   }
   * {
     transition: none !important;
@@ -3685,6 +3712,18 @@ li[data-task] {
 }
 .chat-input:focus {
   border-color: var(--accent);
+}
+/* A text field tapped on a touch screen shows its focus by its border (the search
+   field by its caret), as iOS fields do; the keyboard focus ring stays on every
+   other control, and on these fields with a fine pointer. */
+@media (pointer: coarse) {
+  #chat-input:focus-visible,
+  #terminal-draft:focus-visible {
+    outline: none;
+  }
+  .search-wrap:focus-within {
+    box-shadow: none;
+  }
 }
 .chat-input:disabled,
 .chat-input[readonly] {
@@ -5080,8 +5119,9 @@ body.dock-solo .settings-lock { display: flex; }
 }
 
 /* Screen changes slide like iOS navigation. app.js sets data-nav on <html>
-   only while a view transition runs: push/pop between the list and a
-   conversation, present/dismiss for the terminal. */
+   only while a view transition runs: push/pop between a phone's screens (the
+   list, a conversation, a terminal), present/dismiss for a terminal covering
+   a wider board. */
 :root[data-nav]::view-transition-old(root),
 :root[data-nav]::view-transition-new(root) {
   animation-duration: var(--dur-nav);
@@ -5140,6 +5180,52 @@ body.dock-solo .settings-lock { display: flex; }
 }
 @keyframes nav-dismiss-new {
   from { transform: scale(0.96); filter: brightness(0.82); }
+}
+
+/* Edge swipes (app.js bindEdgeSwipe, iOS home-screen app): while a finger drags
+   from a screen edge, the screen on top follows it (--edge-over-x, px from rest)
+   over the one beneath (--edge-under-x, the same 28% parallax as the slides).
+   On release edge-settling finishes the slide; app.js then navigates and drops
+   these classes in the same frame as the real screen change. */
+/* A terminal covering the board: the board shows again beneath it. */
+body.edge-peek.edge-over-terminal .app {
+  transform: translate(var(--edge-under-x, 0px), var(--app-shift, 0px));
+}
+body.edge-peek.edge-over-terminal .app[hidden] {
+  display: flex !important;
+}
+body.edge-peek.edge-over-terminal .terminal-screen,
+body.edge-peek.edge-over-terminal .terminal-screen[hidden] {
+  display: flex !important;
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  box-shadow: var(--shadow-nav);
+  transform: translate(var(--edge-over-x, 0px), var(--app-shift, 0px));
+}
+/* A phone conversation leaves the layout and floats over the list (the body drops
+   show-detail meanwhile, so the list lays out as it will after going back). The
+   list's parts move, not .app: a moved .app would hold and clip the fixed pane. */
+@media (max-width: 700px) {
+  body.edge-peek.edge-over-detail .app > :not(.layout):not(.pull-refresh),
+  body.edge-peek.edge-over-detail .list-pane {
+    transform: translateX(var(--edge-under-x, 0px));
+  }
+  body.edge-peek.edge-over-detail .detail-pane {
+    display: flex;
+    position: fixed;
+    top: 0;
+    left: 0;
+    z-index: 45;
+    width: 100%;
+    height: var(--app-height, 100dvh);
+    border-top: var(--top-inset) solid var(--surface);
+    box-shadow: var(--shadow-nav);
+    transform: translate(var(--edge-over-x, 0px), var(--app-shift, 0px));
+  }
+}
+body.edge-settling :is(.app, .app > *, .list-pane, .detail-pane, .terminal-screen) {
+  transition: transform var(--dur-edge) var(--ease-out);
 }
 
 /* Bottom sheet (phones). <dialog class="plan-dialog sheet"> gets a grab
@@ -5732,6 +5818,26 @@ body.dock-solo .settings-lock { display: flex; }
 .card-row.is-swiping > .card:active,
 .card-row.is-open > .card:active {
   transform: translateX(var(--swipe-x, 0px));
+}
+/* A card held for its menu lifts like an iOS context menu (app.js bindCardGestures):
+   a tap only dips it; held on, it grows and casts a shadow just as the menu opens
+   (450ms: GESTURE.longPressMs). The row is lifted, as it clips the card. */
+.card-row.is-pressing {
+  z-index: 2;
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-lift);
+  animation: card-lift 450ms var(--ease-out) both;
+}
+@keyframes card-lift {
+  0%,
+  40% {
+    transform: none;
+    box-shadow: 0 0 0 0 transparent;
+  }
+  100% {
+    transform: scale(var(--press-scale-lift));
+    box-shadow: var(--shadow-lift);
+  }
 }
 .card-title {
   grid-area: title;
@@ -6926,6 +7032,37 @@ input.switch:focus-visible {
     top: calc(var(--top-inset) + 8px);
   }
 }
+/* Phone board: the toast drops in under the status bar as a blurred capsule, as
+   iOS banners do, clear of the conversation's input and the open-terminal bar at
+   the bottom. Offline in a conversation, the offline banner holds that place. */
+@media (max-width: 700px) {
+  .terminal-screen[hidden] ~ .toast {
+    top: calc(var(--top-inset) + 8px);
+    bottom: auto;
+    /* As wide as its words up to the screen (left: 50% alone would halve the room). */
+    width: max-content;
+    max-width: calc(100% - 48px);
+    padding: 10px 18px;
+    border-radius: 22px;
+    background: var(--toast-banner-bg);
+    -webkit-backdrop-filter: saturate(180%) blur(20px);
+    backdrop-filter: saturate(180%) blur(20px);
+  }
+  body.show-detail .offline-banner:not([hidden]) ~ .terminal-screen[hidden] ~ .toast {
+    top: calc(var(--top-inset) + 56px);
+  }
+}
+@media (max-width: 700px) and (prefers-reduced-motion: no-preference) {
+  .terminal-screen[hidden] ~ .toast {
+    animation: toast-drop var(--dur) var(--ease-out);
+  }
+}
+@keyframes toast-drop {
+  from {
+    opacity: 0;
+    transform: translate(-50%, -12px);
+  }
+}
 
 /* --- Keyboard open on touch: the floating bar steps aside -------------------- */
 @media (pointer: coarse) {
@@ -7054,6 +7191,32 @@ input.switch:focus-visible {
 }
 .detail-head > .back { grid-column: 1; grid-row: 1; }
 .detail-head > .detail-titles { grid-column: 2; grid-row: 1; }
+/* Beside the list (wider than a phone) a conversation has no screen to go back to:
+   no ‹, and the title takes its room. Where the list stepped aside for a docked
+   terminal (dock-solo) or in a work item's conversation, ‹ still goes back. */
+@media (min-width: 701px) {
+  body:not(.dock-solo):not(.goal-has-conversation) .detail-head > .back {
+    display: none;
+  }
+  body:not(.dock-solo):not(.goal-has-conversation) .detail-head > .detail-titles {
+    grid-column: 1 / 3;
+  }
+}
+/* Phone: ‹ names the screen it returns to (the session list), as iOS does; the
+   chevron keeps its place. Folded bars (reading, typing) show the chevron only. */
+@media (max-width: 700px) {
+  .detail-pane:not(.is-reading):not(.is-typing) .detail-head > .back {
+    grid-column: 1 / 3;
+    justify-self: start;
+    justify-content: flex-start;
+    gap: 6px;
+    padding: 0 10px 0 16px;
+  }
+  .detail-pane:not(.is-reading):not(.is-typing) .detail-head > .back::after {
+    content: "세션";
+    font-size: var(--fs-body);
+  }
+}
 .detail-head-actions { grid-column: 4; grid-row: 1; display: flex; align-items: center; gap: 4px; }
 .detail-head-actions .focus-toggle { white-space: nowrap; padding-inline: 10px; border-radius: 10px; }
 .detail-head-actions .detail-reload { border-radius: 10px; }
@@ -7077,7 +7240,8 @@ input.switch:focus-visible {
 .session-categories { display: flex; flex: none; gap: 3px; margin: 0 0 12px; padding: 3px; border-radius: 11px; background: var(--fill); }
 .session-categories > button { display: grid; grid-template-rows: minmax(0, 1fr) auto; align-items: center; justify-items: center; gap: 3px; flex: 1 1 0; min-width: 0; min-height: 44px; padding: 6px 8px; border: 0; border-radius: 8px; background: transparent; color: var(--label-2); font-size: var(--fs-sub); white-space: normal; text-align: center; }
 .session-categories > button > span:first-child { max-width: 100%; overflow-wrap: anywhere; text-wrap: balance; }
-.session-categories > button[aria-selected="true"] { background: var(--surface); color: var(--label); font-weight: 600; box-shadow: var(--shadow-segment); }
+/* The selected segment uses the segment token: --surface would vanish into the dark track. */
+.session-categories > button[aria-selected="true"] { background: var(--segment-on); color: var(--label); font-weight: 600; box-shadow: var(--shadow-segment); }
 .session-category-count { font-variant-numeric: tabular-nums; font-size: var(--fs-cap); }
 .session-category-note { min-height: 16px; margin: -4px 2px 12px; color: var(--label-2); font-size: var(--fs-cap); line-height: 1.4; }
 .session-category-search { margin: 0 0 8px; }

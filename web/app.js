@@ -133,6 +133,13 @@ const GESTURE = Object.freeze({
   sheetFarSpeed: 1.4,
   sheetExpandPx: 48, // a medium sheet dragged up this far (or flicked) grows
   sheetExpandSpeed: 0.5,
+  edgeBackPx: 20, // an iOS home-screen app goes back from a drag that starts this close to the left edge
+  edgeForwardPx: 16, // and forward from the right edge
+  edgeRatio: 1.2, // |dx| ≥ |dy| × this makes it an edge swipe; steeper drags scroll
+  edgeCommitRatio: 0.5, // released past this share of the screen it navigates
+  edgeFlickSpeed: 0.5, // or flicked this fast toward it (a flick back cancels)
+  edgeParallax: 0.28, // the screen below moves this share of the width (as the slides do)
+  edgeSettleMs: 250, // a released swipe finishes its slide in this time (style.css --dur-edge)
 });
 const INPUT_CLEANUP_NOTICE = "터미널은 닫혔지만 입력 기록 정리가 남았습니다. 목록을 새로고침해 다시 확인해 주세요.";
 const $ = (id) => document.getElementById(id);
@@ -233,6 +240,14 @@ const state = {
   docked: false,
   dockSolo: false,
   dockWidth: 0,
+  // Edge swipes (bindEdgeSwipe): on in an iOS home-screen app; this stored switch turns them
+  // on anywhere for development. edge: the swipe on screen; forwardEntries: entries this page
+  // left by going back (a forward swipe returns to the last); historyCursor: the current entry.
+  edgeSwipe: prefs.get("edgeSwipe", false) === true,
+  edge: null,
+  edgeClickUntil: 0,
+  forwardEntries: [],
+  historyCursor: null,
   dockSide: "terminal",
   screenReaderMode: prefs.get("screenReaderMode", false) === true,
   directTerminalInput: prefs.get("directTerminalInput", null),
@@ -426,7 +441,9 @@ function compactChrome() {
 let navToken = 0;
 function navTransition(direction, update) {
   const root = document.documentElement;
-  if (typeof document.startViewTransition !== "function" || prefersReducedMotion() || document.hidden || !root?.dataset) {
+  // A committed edge swipe already slid the screens (bindEdgeSwipe).
+  if (state.edge?.phase === "commit" ||
+      typeof document.startViewTransition !== "function" || prefersReducedMotion() || document.hidden || !root?.dataset) {
     update();
     return null;
   }
@@ -2725,6 +2742,14 @@ function openCardMenu(row, at = null) {
 }
 function bindCardGestures(root) {
   let drag = null;
+  // The card a finger holds still lifts toward its menu, as iOS context menus do
+  // (style.css .card-row.is-pressing waits past a tap); any move or lift drops it.
+  let pressed = null;
+  const lift = (row, event = null) => {
+    if (pressed) setClass(pressed.row, "is-pressing", false);
+    pressed = row ? { row, id: event.pointerId, x: event.clientX, y: event.clientY } : null;
+    if (pressed) setClass(row, "is-pressing", true);
+  };
   const rowOf = (target) => {
     const row = target?.closest?.(".card-row");
     return row?.card ? row : null;
@@ -2734,12 +2759,16 @@ function bindCardGestures(root) {
       const row = rowOf(event.target);
       if (state.swipeOpen && state.swipeOpen !== row) closeSwipe();
       drag = null;
+      lift(null);
       if (!row || event.pointerType === "mouse" || event.target?.closest?.(".card-swipe-action")) return;
       drag = { row, id: event.pointerId, x: event.clientX, y: event.clientY, intent: null, offset: 0,
         base: state.swipeOpen === row ? -GESTURE.swipeRevealPx : 0, samples: [[Date.now(), event.clientX]] };
+      if (event.isPrimary !== false && state.swipeOpen !== row) lift(row, event);
     },
     // Returns true once the drag is a swipe, which ends the long press.
     onMove(event) {
+      if (pressed && event.pointerId === pressed.id &&
+          Math.hypot((event.clientX || 0) - pressed.x, (event.clientY || 0) - pressed.y) > GESTURE.pressSlopPx) lift(null);
       if (!drag || event.pointerId !== drag.id) return false;
       const dx = event.clientX - drag.x;
       const dy = event.clientY - drag.y;
@@ -2764,6 +2793,7 @@ function bindCardGestures(root) {
       return true;
     },
     onUp(event, cancelled) {
+      if (pressed && event.pointerId === pressed.id) lift(null);
       const current = drag;
       if (!current || event.pointerId !== current.id) return;
       drag = null;
@@ -7633,6 +7663,9 @@ function navigateView(view, replace = false, extra = {}) {
     { ...kept, ...extra, [INSTANCE.historyKey]: true, view, listDepth: depth, navigationId, parentDetailId },
     "",
   );
+  // A new entry drops the entries ahead of it, in the browser and for forward swipes.
+  if (!replace) state.forwardEntries.length = 0;
+  state.historyCursor = window.history.state;
 }
 function backToList() {
   // The list stepped aside for a docked terminal: back brings it, the terminal steps aside.
@@ -7663,6 +7696,247 @@ function backFromTerminal() {
   )
     window.history.back();
   else returnToBoard();
+}
+// Forward swipes need the entries this page left by going back (the browser lists none):
+// one step back remembers the entry it left, one step forward to it forgets it, and
+// anything else (a jump, a closed terminal, an entry the board did not make) starts over.
+function noteHistoryMove(next) {
+  const previous = state.historyCursor;
+  const entries = state.forwardEntries;
+  const ours = (entry) => !!entry?.[INSTANCE.historyKey] && Number.isInteger(entry.listDepth);
+  if (!ours(previous) || !ours(next)) entries.length = 0;
+  else if (next.listDepth === previous.listDepth - 1 && !state.closedTerminalNavigation &&
+      !state.closedHistory?.has(previous.navigationId)) entries.push(previous);
+  else if (next.listDepth === previous.listDepth + 1 && entries[entries.length - 1]?.navigationId === next.navigationId)
+    entries.pop();
+  else entries.length = 0;
+}
+
+// --- Edge swipes: back and forward from the screen's edges ---------------------
+// An iOS home-screen app has no browser swipe: a drag from the left edge goes back (a
+// phone conversation to the list, a terminal covering the board to what it covered) and
+// one from the right edge goes forward to a screen this page left by going back. The
+// screen on top follows the finger over the one beneath (style.css "Edge swipes");
+// released past half the screen or flicked, the slide finishes and the usual back
+// (backToList, backFromTerminal) or history.forward() runs without a second slide.
+// Safari tabs keep their own edge swipe and Android its back button.
+function edgeSwipeEnabled() {
+  return state.edgeSwipe === true || (globalThis.navigator?.standalone === true && touchDevice());
+}
+// The swipe a touch at x on a screen `width` wide starts: "back" at the left edge, "forward"
+// at the right one, or null. back/forward: whether this screen has somewhere to go.
+function edgeSwipeStart({ x = 0, width = 0, back = false, forward = false } = {}) {
+  if (back && x >= 0 && x <= GESTURE.edgeBackPx) return "back";
+  if (forward && width > 0 && x >= width - GESTURE.edgeForwardPx && x <= width) return "forward";
+  return null;
+}
+// What a drag from an edge is once past the slop: "swipe" (sideways, away from its edge),
+// "cancel" (steeper, or toward the edge), or null while undecided.
+function edgeSwipeIntent(dx, dy, direction) {
+  const ax = Math.abs(dx);
+  const ay = Math.abs(dy);
+  if (Math.max(ax, ay) < GESTURE.pressSlopPx) return null;
+  if (ax < ay * GESTURE.edgeRatio) return "cancel";
+  return (direction === "back" ? dx > 0 : dx < 0) ? "swipe" : "cancel";
+}
+// Where a released swipe ends: "commit" or "cancel". distance: px dragged away from the
+// edge; velocity: px/ms away from it (negative: back toward the edge).
+function edgeSwipeRelease({ distance = 0, velocity = 0, width = 0 } = {}) {
+  if (velocity <= -GESTURE.edgeFlickSpeed || distance <= GESTURE.pressSlopPx) return "cancel";
+  if (velocity >= GESTURE.edgeFlickSpeed) return "commit";
+  return distance >= Math.max(1, width) * GESTURE.edgeCommitRatio ? "commit" : "cancel";
+}
+// Px from rest of the screen on top ("over") and the one beneath ("under") once a swipe went
+// `distance` of `width`: back moves the top one out to the right, forward brings the next one
+// in from there; the one beneath shifts by edgeParallax, as in a slide.
+function edgeSwipeOffsets(direction, distance, width) {
+  const size = Math.max(1, width);
+  const progress = Math.min(1, Math.max(0, distance / size));
+  const back = direction === "back";
+  const over = (back ? progress : 1 - progress) * size;
+  const under = -(back ? 1 - progress : progress) * size * GESTURE.edgeParallax;
+  return { over: Math.round(over) || 0, under: Math.round(under) || 0 };
+}
+function goalsShown() {
+  return !!document.body?.classList?.contains?.("goals-active");
+}
+// The screen a back swipe leaves ("detail": a phone conversation; "terminal": a terminal
+// covering the board) or null. Never past this page's first entry, nor beside a docked
+// terminal; a work item's conversation sits inside its board, with no list beneath.
+function edgeBackLayer() {
+  const entry = window.history.state;
+  if (!entry?.[INSTANCE.historyKey] || !(entry.listDepth > 0)) return null;
+  if (state.terminalVisible) return boardCovered() ? "terminal" : null;
+  return phoneLayout() && state.detailShown && !goalsShown() ? "detail" : null;
+}
+// The screen a forward swipe brings back: the last entry left by going back, when it is the
+// next one and shows as it did (a phone conversation, a still open terminal that covers the
+// board); null otherwise.
+function edgeForwardLayer() {
+  const next = state.forwardEntries[state.forwardEntries.length - 1];
+  const entry = window.history.state;
+  if (!next || !entry?.[INSTANCE.historyKey] || next.listDepth !== entry.listDepth + 1 || state.terminalVisible ||
+      state.closedHistory?.has(next.navigationId) || typeof window.history.forward !== "function") return null;
+  if (next.view === "terminal") return state.terminal && dockWidth() === 0 ? "terminal" : null;
+  if (next.view !== "detail") return null;
+  return phoneLayout() && !state.detailShown && !goalsShown() && (state.selected || state.selectedBotRequest) ? "detail" : null;
+}
+// Touches the board leaves alone: a sheet or menu is open, text is edited or selected, a
+// screen is still sliding, a card's swipe is open, or a swipe is still settling.
+function edgeSwipeBlocked(event) {
+  if (state.edge || state.swipeOpen || document.documentElement?.dataset?.nav) return true;
+  if (document.querySelector?.("dialog[open]")) return true;
+  if (editingText() || event?.target?.closest?.("input, textarea, select, [contenteditable]")) return true;
+  try {
+    const selection = window.getSelection?.();
+    return !!selection && selection.isCollapsed === false;
+  } catch {
+    return false;
+  }
+}
+const EDGE_CLASSES = ["edge-peek", "edge-settling", "edge-over-detail", "edge-over-terminal"];
+function showEdgeSwipe(swipe, distance) {
+  swipe.distance = distance;
+  const { over, under } = edgeSwipeOffsets(swipe.direction, distance, swipe.width);
+  const style = document.documentElement?.style;
+  style?.setProperty?.("--edge-over-x", `${over}px`);
+  style?.setProperty?.("--edge-under-x", `${under}px`);
+}
+function startEdgePeek(swipe) {
+  state.edge = swipe;
+  swipe.phase = "drag";
+  const classes = document.body?.classList;
+  classes?.add("edge-peek");
+  classes?.add(`edge-over-${swipe.layer}`);
+  // The list beneath a phone conversation shows as it will after going back; the
+  // conversation floats over it until the swipe ends.
+  if (swipe.layer === "detail") classes?.remove("show-detail");
+  showEdgeSwipe(swipe, 0);
+}
+function endEdgePeek() {
+  const swipe = state.edge;
+  if (!swipe) return;
+  state.edge = null;
+  clearTimeout(swipe.timer);
+  const classes = document.body?.classList;
+  for (const name of EDGE_CLASSES) classes?.remove(name);
+  if (swipe.layer === "detail" && state.detailShown) classes?.add("show-detail");
+  const style = document.documentElement?.style;
+  style?.removeProperty?.("--edge-over-x");
+  style?.removeProperty?.("--edge-under-x");
+}
+// A released swipe finishes its slide either way; a committed one then navigates.
+function settleEdgeSwipe(swipe, outcome) {
+  if (state.edge !== swipe) return;
+  swipe.phase = "settle";
+  clearTimeout(swipe.timer);
+  document.body?.classList?.add("edge-settling");
+  showEdgeSwipe(swipe, outcome === "commit" ? swipe.width : 0);
+  const done = () => {
+    if (state.edge !== swipe) return;
+    if (outcome === "commit") commitEdgeSwipe(swipe);
+    else endEdgePeek();
+  };
+  if (prefersReducedMotion()) done();
+  else swipe.timer = setTimeout(done, GESTURE.edgeSettleMs);
+}
+// Navigates with the screens already in place: popstate (or a change made at once) shows
+// the new screen without a slide and ends the swipe. With no entry to go to (no popstate),
+// the screens slide back.
+const EDGE_HISTORY_WAIT_MS = 1000;
+function commitEdgeSwipe(swipe) {
+  swipe.phase = "commit";
+  swipe.timer = setTimeout(() => {
+    if (state.edge !== swipe) return;
+    state.forwardEntries.length = 0;
+    settleEdgeSwipe(swipe, "cancel");
+  }, EDGE_HISTORY_WAIT_MS);
+  if (swipe.direction === "forward") window.history.forward();
+  else if (swipe.layer === "terminal") backFromTerminal();
+  else backToList();
+  if (state.edge === swipe && swipe.direction === "back" &&
+      !(swipe.layer === "terminal" ? state.terminalVisible : state.detailShown)) endEdgePeek();
+}
+// Document listeners in the capture phase, before the terminal's scroll, the pull to refresh
+// and the lists. A touch only becomes a swipe in touchmove (its start stays a tap for the back
+// button or a bubble under it); from then on the page does not scroll and nothing else sees it.
+function bindEdgeSwipe(root) {
+  let drag = null;
+  const screenWidth = () => window.innerWidth || document.documentElement?.clientWidth || 0;
+  // A swipe on screen springs back; one still undecided is forgotten.
+  const drop = () => {
+    const current = drag;
+    drag = null;
+    if (current && state.edge === current && current.phase === "drag") settleEdgeSwipe(current, "cancel");
+  };
+  root.addEventListener("touchstart", (event) => {
+    // A second finger (a pinch) ends the swipe.
+    if (drag) {
+      drop();
+      return;
+    }
+    if (event.touches?.length !== 1 || !edgeSwipeEnabled() || edgeSwipeBlocked(event)) return;
+    const { clientX: x, clientY: y } = event.touches[0];
+    const width = screenWidth();
+    const back = x <= GESTURE.edgeBackPx ? edgeBackLayer() : null;
+    const forward = x >= width - GESTURE.edgeForwardPx ? edgeForwardLayer() : null;
+    const direction = edgeSwipeStart({ x, width, back: !!back, forward: !!forward });
+    if (!direction) return;
+    drag = { direction, layer: direction === "back" ? back : forward, x, y, width, distance: 0, phase: null,
+      samples: [[Date.now(), x]] };
+  }, { capture: true, passive: true });
+  root.addEventListener("touchmove", (event) => {
+    if (!drag) return;
+    if (event.touches?.length !== 1) {
+      drop();
+      return;
+    }
+    // Ended by a history change meanwhile.
+    if (drag.phase && state.edge !== drag) {
+      drag = null;
+      return;
+    }
+    const touch = event.touches[0];
+    const dx = touch.clientX - drag.x;
+    if (!drag.phase) {
+      const intent = edgeSwipeIntent(dx, touch.clientY - drag.y, drag.direction);
+      if (!intent) return;
+      // Steeper, the wrong way, or already a scroll (no longer cancelable): not a swipe.
+      if (intent === "cancel" || event.cancelable === false || edgeSwipeBlocked(event)) {
+        drag = null;
+        return;
+      }
+      startEdgePeek(drag);
+    }
+    drag.samples.push([Date.now(), touch.clientX]);
+    if (drag.samples.length > 6) drag.samples.shift();
+    showEdgeSwipe(drag, Math.max(0, drag.direction === "back" ? dx : -dx));
+    if (event.cancelable) event.preventDefault();
+    event.stopPropagation?.();
+  }, { capture: true, passive: false });
+  const lift = (event, cancelled) => {
+    const current = drag;
+    if (!current || event?.touches?.length) return;
+    drag = null;
+    if (state.edge !== current || current.phase !== "drag") return;
+    // The lifted finger does not also tap what is under it.
+    state.edgeClickUntil = Date.now() + 400;
+    const now = Date.now();
+    const recent = current.samples.filter(([time]) => now - time < 100);
+    const moved = recent.length >= 2
+      ? (recent[recent.length - 1][1] - recent[0][1]) / Math.max(1, recent[recent.length - 1][0] - recent[0][0]) : 0;
+    const velocity = current.direction === "back" ? moved : -moved;
+    settleEdgeSwipe(current, cancelled ? "cancel"
+      : edgeSwipeRelease({ distance: current.distance, velocity, width: current.width }));
+  };
+  root.addEventListener("touchend", (event) => lift(event, false), { capture: true, passive: true });
+  root.addEventListener("touchcancel", (event) => lift(event, true), { capture: true, passive: true });
+  root.addEventListener("click", (event) => {
+    if (Date.now() >= state.edgeClickUntil) return;
+    state.edgeClickUntil = 0;
+    event.preventDefault();
+    event.stopPropagation();
+  }, true);
 }
 
 function capsHost(name) {
@@ -8679,8 +8953,14 @@ function renderDockToggle() {
     toggle.setAttribute("aria-label", state.docked ? "터미널을 화면 가득 보기" : "터미널을 대화 옆에 보기");
   }
   const back = $("terminal-back");
-  back.textContent = state.docked ? "숨기기" : "보드";
-  const label = state.docked ? "터미널 칸 숨기기" : back.dataset?.boardLabel;
+  // A phone names the screen back returns to, as iOS does: the conversation the terminal
+  // was opened from, or the session list. Wider screens return to the whole board.
+  const entry = window.history.state;
+  const fromChat = !!(entry?.[INSTANCE.historyKey] && entry.view === "terminal" && entry.parentDetailId);
+  const phone = !state.docked && phoneLayout();
+  back.textContent = state.docked ? "숨기기" : phone ? (fromChat ? "대화" : "세션") : "보드";
+  const label = state.docked ? "터미널 칸 숨기기"
+    : phone ? (fromChat ? "대화로 돌아가기" : "세션 목록으로 돌아가기") : back.dataset?.boardLabel;
   if (label) back.setAttribute("aria-label", label);
 }
 // "크게"/"나란히" is remembered for every terminal on this device.
@@ -8795,7 +9075,10 @@ async function openTerminal(terminal, { recordHistory = true } = {}) {
   state.terminalVisible = true;
   state.dockSide = "terminal";
   renderConnectivity();
-  const shown = presenting && !docking ? navTransition("present", () => showTerminalScreen(true)) : (showTerminalScreen(true), null);
+  // A phone pushes the terminal like its other screens (and an edge swipe pops it); a wider
+  // screen presents it over the board.
+  const shown = presenting && !docking
+    ? navTransition(phoneLayout() ? "push" : "present", () => showTerminalScreen(true)) : (showTerminalScreen(true), null);
   releaseBoardFocus();
   updateThemeColor();
   if (boardCovered()) closeEvents();
@@ -9070,7 +9353,7 @@ function returnToBoard({ selectLaunchedSource = true, animate = true, loadChat =
   state.dockBeside = null;
   state.terminalVisible = false;
   renderConnectivity();
-  if (animate && !wasDocked) navTransition("dismiss", () => showTerminalScreen(false));
+  if (animate && !wasDocked) navTransition(phoneLayout() ? "pop" : "dismiss", () => showTerminalScreen(false));
   else showTerminalScreen(false);
   updateThemeColor();
   renderTerminalReturn();
@@ -11091,6 +11374,49 @@ function warnDraftUnload(event) {
   event.returnValue = "";
 }
 
+// Shows the screen a history entry names (popstate).
+function showHistoryEntry(event, swiped = false) {
+  let view = event.state?.[INSTANCE.historyKey] ? event.state.view : "list";
+  if (state.closedTerminalNavigation || state.closedHistory?.has(event.state?.navigationId) || view === "terminal" && !state.terminal) {
+    state.closedTerminalNavigation = false;
+    view = "list";
+    navigateView("list", true);
+    event = { ...event, state: window.history.state };
+  }
+  if (!state.authenticated) {
+    navigateView("list", true);
+    return;
+  }
+  if (view === "terminal" && state.terminal) {
+    if (!state.terminalVisible)
+      openTerminal(state.terminal, { recordHistory: false });
+    return;
+  }
+  // A browser that already animated its own back swipe, or an edge swipe that slid the
+  // screens itself, gets no second slide.
+  const animate = !event.hasUAVisualTransition && !swiped;
+  const fromTerminal = state.terminalVisible;
+  const reopen = fromTerminal ? state.reopenOnReturn : null;
+  state.reopenOnReturn = null;
+  // An ended terminal's 이 세션 다시 열기 (reopenEndedTerminal), once the board is shown.
+  const reopenSession = () => {
+    const target = reopen && allSessions().find((item) => item.key === reopen);
+    if (target) openSessionTerminal(target);
+  };
+  // Forward again to a notification's conversation shows it, not the terminal's launch.
+  if (fromTerminal) returnToBoard({ animate, selectLaunchedSource: !event.state?.notice });
+  if (window.SessionholicGoals?.handleHistory?.(event)) {
+    reopenSession();
+    return;
+  }
+  const detail = view === "detail" && !!(state.selected || state.selectedBotRequest);
+  stopChatPolling();
+  setDetailShown(detail, { direction: animate && !fromTerminal ? (detail ? "push" : "pop") : null, focus: true });
+  const selected = selectedSession();
+  if (selected && chatVisible()) loadChatState(selected, true);
+  reopenSession();
+}
+
 window.addEventListener("DOMContentLoaded", () => {
   navigateView("list", true);
   window.SessionholicLabels?.init?.({ api, sourceOf, getAuthEpoch: () => state.authEpoch,
@@ -11113,48 +11439,21 @@ window.addEventListener("DOMContentLoaded", () => {
   document.addEventListener("pointerdown", closeChatToolsOutside);
   document.addEventListener("keydown", documentKeydown);
   window.addEventListener("popstate", (event) => {
-    let view = event.state?.[INSTANCE.historyKey] ? event.state.view : "list";
-    if (state.closedTerminalNavigation || state.closedHistory?.has(event.state?.navigationId) || view === "terminal" && !state.terminal) {
-      state.closedTerminalNavigation = false;
-      view = "list";
-      navigateView("list", true);
-      event = { ...event, state: window.history.state };
+    // A committed edge swipe already slid the screens: the change shows at once and ends it.
+    // Any other swipe on screen gives way to the history change.
+    const swipe = state.edge;
+    const swiped = swipe?.phase === "commit";
+    if (swipe && !swiped) endEdgePeek();
+    noteHistoryMove(event.state);
+    try {
+      showHistoryEntry(event, swiped);
+    } finally {
+      if (swiped && state.edge === swipe) endEdgePeek();
+      state.historyCursor = window.history.state;
     }
-    if (!state.authenticated) {
-      navigateView("list", true);
-      return;
-    }
-    if (view === "terminal" && state.terminal) {
-      if (!state.terminalVisible)
-        openTerminal(state.terminal, { recordHistory: false });
-      return;
-    }
-    // A browser that already animated its own back swipe gets no second slide.
-    const animate = !event.hasUAVisualTransition;
-    const fromTerminal = state.terminalVisible;
-    const reopen = fromTerminal ? state.reopenOnReturn : null;
-    state.reopenOnReturn = null;
-    // An ended terminal's 이 세션 다시 열기 (reopenEndedTerminal), once the board is shown.
-    const reopenSession = () => {
-      const target = reopen && allSessions().find((item) => item.key === reopen);
-      if (target) openSessionTerminal(target);
-    };
-    // Forward again to a notification's conversation shows it, not the terminal's launch.
-    if (fromTerminal) returnToBoard({ animate, selectLaunchedSource: !event.state?.notice });
-    if (window.SessionholicGoals?.handleHistory?.(event)) {
-      reopenSession();
-      return;
-    }
-    const detail = view === "detail" && !!(state.selected || state.selectedBotRequest);
-    stopChatPolling();
-    setDetailShown(detail, { direction: animate && !fromTerminal ? (detail ? "push" : "pop") : null, focus: true });
-    const selected = selectedSession();
-    if (selected && chatVisible()) loadChatState(selected, true);
-    reopenSession();
   });
   $("settings").addEventListener("click", openSettings);
   $("settings-close").addEventListener("click", closeSettings);
-  $("settings-done").addEventListener("click", closeSettings);
   $("hard-reload")?.addEventListener("click", hardReload);
   $("quick-reload")?.addEventListener("click", hardReload);
   $("board-status-panel")?.addEventListener("click", (event) => {
@@ -11198,7 +11497,6 @@ window.addEventListener("DOMContentLoaded", () => {
   $("hardware-close").addEventListener("click", () => closeSheet("hardware-dialog", "hardware"));
   $("filter-open").addEventListener("click", () => sheet("filter-dialog").open());
   $("filter-close").addEventListener("click", () => closeSheet("filter-dialog", "filter-open"));
-  $("filter-done").addEventListener("click", () => closeSheet("filter-dialog", "filter-open"));
   $("filter-reset").addEventListener("click", resetFilters);
   for (const category of Object.keys(SESSION_CATEGORIES))
     $(`session-category-${category}`).addEventListener("click", () => setSessionCategory(category));
@@ -11357,6 +11655,7 @@ window.addEventListener("DOMContentLoaded", () => {
   bindPullToRefresh($("app"));
   $("task-list-pane").addEventListener("scroll", (event) => listScroll(event.currentTarget || $("task-list-pane")), { passive: true });
   bindTerminalTouchScroll($("terminal-viewport"));
+  bindEdgeSwipe(document);
   $("terminal-copy").addEventListener("click", async () => {
     const text = state.term?.getSelection();
     if (!text) {

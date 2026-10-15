@@ -249,6 +249,8 @@ const state = {
   terminalMomentum: null,
   toastTimer: null,
   chats: new Map(),
+  // Counts conversation opens: an entry's usedAt says which ones were used last (trimChatMemory).
+  chatUse: 0,
   draftSavedShapes: new Map(),
   quickRepliesShared: null,
   quickRepliesLocal: null,
@@ -1000,8 +1002,9 @@ function allSessions() {
 // The open conversation's own read says what its session does now; the list
 // may say so only a minute later (a host without a resident collector). Its
 // card, header and counts follow the read until the list's phase changes.
-function noteLivePhase(s, data) {
-  const listed = allSessions().find((value) => value.key === s?.key);
+function noteLivePhase(s, data, selected = null) {
+  // The selected session's row, when the caller just found it, is this one.
+  const listed = selected && selected.key === s?.key ? selected : allSessions().find((value) => value.key === s?.key);
   if (!listed || listed.runtimeKnown === false || listed.listedPhase === undefined && listed.nativeSource || !BADGES[data?.phase] ||
       chatKey(data.route || {}) !== chatKey(sourceOf(listed))) return;
   if (data.phase === listed.listedPhase) state.livePhases.delete(listed.key);
@@ -1014,7 +1017,9 @@ function noteLivePhase(s, data) {
     state.detailRevision = detailRevision(shown);
     patchDetailMetadata(shown);
     render();
+    return true;
   }
+  return false;
 }
 function sourceOf(s) {
   const source = {
@@ -1796,7 +1801,7 @@ async function loadBotConversation(group, { force = false } = {}) {
   if (entry && !force && !entry.error && entry.revision === revision && Date.now() - entry.readAt < BOT_CONVERSATION_MS) {
     renderBotConversation(group); return;
   }
-  if (!entry) { entry = { data: null, error: "", readAt: 0, revision, promise: null }; state.botConversations.set(key, entry); }
+  if (!entry) { entry = { data: null, error: "", readAt: 0, revision, promise: null }; state.botConversations.set(key, entry); trimBotConversations(key); }
   if (networkOffline()) { entry.error = "오프라인입니다. 연결 후 대화를 다시 불러와 주세요."; renderBotConversation(group); return; }
   const authEpoch = state.authEpoch;
   entry.error = "";
@@ -1816,6 +1821,16 @@ async function loadBotConversation(group, { force = false } = {}) {
   })();
   renderBotConversation(group);
   return entry.promise;
+}
+// The bot conversations read last stay (as many as chats keep); an older one is read again
+// when opened. The one opening, the one on screen and one being read always stay.
+function trimBotConversations(opening) {
+  const conversations = state.botConversations;
+  if (conversations.size <= CHAT_MEMORY_KEEP) return;
+  const shown = $("bot-conversation")?.dataset?.conversationKey;
+  const idle = [...conversations].filter(([key, entry]) => key !== opening && key !== shown && !entry.promise)
+    .sort((a, b) => (b[1].readAt || 0) - (a[1].readAt || 0));
+  for (const [key] of idle.slice(Math.max(0, CHAT_MEMORY_KEEP - (conversations.size - idle.length)))) conversations.delete(key);
 }
 function renderBotConversation(group) {
   const { key, latest: request } = group, box = $("bot-conversation");
@@ -3099,6 +3114,8 @@ function refreshDetail(s) {
   state.detailRevision = revision;
   if (fresh) drawDetail(s);
   else patchDetailMetadata(s);
+  // A conversation opened: the ones not used for a while give back what was read for them.
+  if (fresh) trimChatMemory(chatEntry(s));
   loadDetail(s, fresh);
 }
 function detailMetaChildren(s) {
@@ -3336,9 +3353,9 @@ function drawDetail(s) {
 // second, explicit tap, and the server rechecks the exact menu first.
 const AGENT_NAMES = { claude: "Claude", codex: "Codex" };
 const PROMPT_INLINE_OPTIONS = 4;
-function renderPrompt(s, data) {
+function renderPrompt(s, data, selected = selectedSession() || null) {
   const card = $("chat-prompt");
-  if (!card || !currentChat(chatEntry(s))) return;
+  if (!card || !currentChat(chatEntry(s), selected)) return;
   const entry = chatEntry(s);
   const prompt = data?.prompt && Array.isArray(data.prompt.options) && data.prompt.options.length ? data.prompt : null;
   const openable = !prompt && data?.promptOpenable === true && data?.phase === "needs_input";
@@ -3889,9 +3906,40 @@ function chatEntry(s) {
   }
   return state.chats.get(key);
 }
-function currentChat(entry) {
-  const selected = selectedSession();
+// `selected` lets a caller that already found the selected session pass it down:
+// allSessions() rebuilds every row, so one composer update finds it once.
+function currentChat(entry, selected = selectedSession() || null) {
   return !!selected && chatEntry(selected) === entry && state.authenticated;
+}
+// Every conversation opened since the board was unlocked keeps an entry (its draft and send
+// state). What was read for it (state, transcript, full messages) stays for the ones used
+// last; an older one reads it again when opened. An entry in use keeps everything and takes
+// its place among them first: a draft or files, a send, an upload, a word being composed or
+// heard, a read or command in flight, or the conversation on screen.
+const CHAT_MEMORY_KEEP = 12;
+function chatMemoryHeld(entry) {
+  return !!(entry.data || entry.conversation || entry.fullMessages?.size || entry.historyPreview);
+}
+function chatEntryInUse(entry, shown) {
+  return !!(entry.text || entry.attachments?.length || entry.pending || entry.sending || entry.uploads ||
+    entry.uploadQueue?.length || entry.outbox?.length || entry.composing || entry.checking || entry.commandBusy ||
+    entry.recovering || entry.promptBusy) || shown.has(chatKey(entry.source));
+}
+function trimChatMemory(opened = null) {
+  if (opened) opened.usedAt = ++state.chatUse;
+  // The one opening counts already: its read is on the way.
+  const held = [...state.chats.values()].filter((entry) => entry === opened || chatMemoryHeld(entry));
+  if (held.length <= CHAT_MEMORY_KEEP) return;
+  // On screen: the composer and the conversation (a listening mic is in that composer).
+  const shown = new Set([$("chat-composer")?.dataset?.source, $("messages")?.conversationSource].filter(Boolean));
+  if (opened) shown.add(chatKey(opened.source));
+  const idle = held.filter((entry) => !chatEntryInUse(entry, shown)).sort((a, b) => (b.usedAt || 0) - (a.usedAt || 0));
+  for (const entry of idle.slice(Math.max(0, CHAT_MEMORY_KEEP - (held.length - idle.length)))) {
+    entry.data = null;
+    entry.conversation = null;
+    entry.fullMessages = new Map();
+    entry.historyPreview = null;
+  }
 }
 function networkOffline() {
   return state.offline || globalThis.navigator?.onLine === false;
@@ -4041,16 +4089,17 @@ function persistAllDrafts() {
 function chatVisible() {
   return !document.hidden && !boardCovered() && (!phoneLayout() || state.detailShown);
 }
-function chatHostOffline(entry) {
-  const session = selectedSession();
+function chatHostOffline(entry, session = selectedSession() || null) {
   return state.snapshot?.hosts?.find((host) => host.name === entry.source.host)?.ok === false ||
     capsHost(entry.source.host)?.online === false ||
     (session && chatKey(sourceOf(session)) === chatKey(entry.source) && session.online === false);
 }
-function chatOneShot(entry) {
+// Asked only about the conversation on screen (every caller checks currentChat first):
+// its own row says so, found by its chatKey, not by a scan of every session.
+function chatOneShot(entry, session = selectedSession() || null) {
   if (chatKey(entry.data?.route || {}) === chatKey(entry.source) && sessionOneShot(entry.data)) return true;
-  return allSessions().some((session) => chatKey(sourceOf(session)) === chatKey(entry.source) &&
-    (sessionOneShot(session) || entry.conversation?.identity === conversationIdentity(session) && sessionOneShot(entry.conversation)));
+  return !!session && chatKey(sourceOf(session)) === chatKey(entry.source) &&
+    (sessionOneShot(session) || entry.conversation?.identity === conversationIdentity(session) && sessionOneShot(entry.conversation));
 }
 function conversationHistoryNotice(s, entry) {
   const data = entry?.data && chatKey(entry.data.route || {}) === chatKey(sourceOf(s)) ? entry.data : null;
@@ -4061,26 +4110,26 @@ function conversationHistoryNotice(s, entry) {
   if (notice?.code === "not_persisted") return typeof notice.message === "string" && notice.message.trim() ? notice.message : ONE_SHOT_HISTORY;
   return "";
 }
-function chatRecovery(entry) {
+function chatRecovery(entry, selected = selectedSession() || null) {
   if (botRequestForNative(entry.source)) return null;
-  if (chatHostOffline(entry)) return { supported: true, action: "refresh_host",
-    reason: chatOneShot(entry) ? "기기에 연결되지 않았습니다. 연결을 확인한 뒤 실행 상태를 확인해 주세요." : "기기에 연결되지 않았습니다. 연결을 확인한 뒤 같은 세션을 이어갈 수 있습니다." };
-  if (chatOneShot(entry)) return null;
+  if (chatHostOffline(entry, selected)) return { supported: true, action: "refresh_host",
+    reason: chatOneShot(entry, selected) ? "기기에 연결되지 않았습니다. 연결을 확인한 뒤 실행 상태를 확인해 주세요." : "기기에 연결되지 않았습니다. 연결을 확인한 뒤 같은 세션을 이어갈 수 있습니다." };
+  if (chatOneShot(entry, selected)) return null;
   if (chatKey(entry.data?.route || {}) !== chatKey(entry.source)) return null;
   const recovery = entry.data?.recovery;
   if (recovery?.supported !== true || recovery.closedByBoard === true) return null;
   return ["resume_session", "refresh_host"].includes(recovery.action) ? recovery : null;
 }
-function chatSupported(entry) {
-  return !botRequestForNative(entry.source) && !chatOneShot(entry) && !chatHostOffline(entry) && entry.data?.capability?.supported === true &&
+function chatSupported(entry, selected = selectedSession() || null) {
+  return !botRequestForNative(entry.source) && !chatOneShot(entry, selected) && !chatHostOffline(entry, selected) && entry.data?.capability?.supported === true &&
     chatKey(entry.data.route || {}) === chatKey(entry.source);
 }
 // The server's capability says sending needs a board terminal the user opens.
-function terminalRequired(entry) {
-  return !chatOneShot(entry) && entry.data?.capability?.action === "open_terminal" && chatKey(entry.data.route || {}) === chatKey(entry.source);
+function terminalRequired(entry, selected = selectedSession() || null) {
+  return !chatOneShot(entry, selected) && entry.data?.capability?.action === "open_terminal" && chatKey(entry.data.route || {}) === chatKey(entry.source);
 }
-function chatAttachmentsSupported(entry) {
-  return !botRequestForNative(entry.source) && !chatOneShot(entry) && !!entry.data && chatKey(entry.data.route || {}) === chatKey(entry.source) &&
+function chatAttachmentsSupported(entry, selected = selectedSession() || null) {
+  return !botRequestForNative(entry.source) && !chatOneShot(entry, selected) && !!entry.data && chatKey(entry.data.route || {}) === chatKey(entry.source) &&
     entry.data.phase !== "unavailable" && entry.data.capability?.attachments !== false;
 }
 // ---------- 음성 입력 ----------
@@ -4878,8 +4927,9 @@ function slashKeydown(entry, event, input) {
   } else chooseSlash(entry, entry.slashIndex || 0, input);
   return true;
 }
-function updateModelControls(entry) {
-  if (!currentChat(entry)) return;
+function updateModelControls(entry, session = selectedSession() || null) {
+  if (!currentChat(entry, session)) return;
+  const supported = chatSupported(entry, session);
   const settings = entry.data?.modelSettings || {};
   const next = entry.source.agent === "codex" ? settings.next || {} : {};
   const selected = { model: next.model || settings.model, effort: next.effort || settings.effort };
@@ -4915,7 +4965,7 @@ function updateModelControls(entry) {
       const explanation = pending ? `다음 메시지에 사용 · ${observedLabel}: ${actual || "미확인"}` : settings.observed === "last_response" ? `마지막 응답에서 확인한 ${label}` : `${label} 선택`;
       control.title = `${label}: ${control.textContent} · ${explanation}`;
       control.setAttribute("aria-label", `${label}: ${control.textContent} · 선택하기`);
-      control.disabled = !chatSupported(entry) || entry.sending || !!entry.pending || !!entry.commandBusy || networkOffline();
+      control.disabled = !supported || entry.sending || !!entry.pending || !!entry.commandBusy || networkOffline();
     }
   };
   // Another model name can wrap the header's text: only then is the reader's place kept.
@@ -5335,8 +5385,8 @@ function buildChatComposer(s) {
   });
   return box;
 }
-function resizeChatInput(entry) {
-  if (!currentChat(entry) || $("chat-composer")?.dataset.source !== chatKey(entry.source)) return;
+function resizeChatInput(entry, selected = selectedSession() || null) {
+  if (!currentChat(entry, selected) || $("chat-composer")?.dataset.source !== chatKey(entry.source)) return;
   const input = $("chat-input");
   const style = window.getComputedStyle?.(input);
   const line = parseFloat(style?.lineHeight) || 22;
@@ -5552,12 +5602,12 @@ function receiptNotice(entry) {
   if (["completed", "interrupted"].includes(status) && phase === "working") return "";
   return chatReceiptCopy(entry.receipt);
 }
-function updateChatComposer(entry) {
+function updateChatComposer(entry, selected = selectedSession() || null) {
   persistChatDraft(entry);
-  if (!currentChat(entry) || $("chat-composer")?.dataset.source !== chatKey(entry.source)) return;
-  updateModelControls(entry);
-  const supported = chatSupported(entry);
-  const oneShot = chatOneShot(entry);
+  if (!currentChat(entry, selected) || $("chat-composer")?.dataset.source !== chatKey(entry.source)) return;
+  updateModelControls(entry, selected);
+  const supported = chatSupported(entry, selected);
+  const oneShot = chatOneShot(entry, selected);
   $("chat-composer").classList.toggle?.("is-busy", entry.data?.phase === "working" || entry.sending || !!entry.uploads);
   $("chat-composer").classList.toggle?.("is-error", !!entry.error || entry.receipt?.status === "failed");
   $("chat-composer").classList.toggle?.("is-unknown", !!entry.pending && !entry.sending);
@@ -5566,8 +5616,8 @@ function updateChatComposer(entry) {
   const blocked = offline || !supported || entry.sending || !!entry.pending || !!entry.uploads || !!entry.commandBusy;
   // No board terminal yet (Claude background): the draft can be written now and
   // sent once the user opened the terminal from the gate.
-  const recovery = chatRecovery(entry);
-  const gateOn = !supported && !recovery && terminalRequired(entry);
+  const recovery = chatRecovery(entry, selected);
+  const gateOn = !supported && !recovery && terminalRequired(entry, selected);
   $("chat-recovery").hidden = !recovery;
   $("chat-recovery-text").textContent = recovery?.reason || (recovery?.action === "resume_session" ? "대화 기록과 초안을 유지하고 같은 세션을 다시 엽니다." : "");
   $("chat-recover").textContent = entry.recovering ? "연결 확인 중…" : recovery?.action === "refresh_host" ? "기기 연결 다시 확인" : "세션 다시 열기";
@@ -5584,7 +5634,7 @@ function updateChatComposer(entry) {
   input.disabled = !supported && !gateOn && recovery?.action !== "resume_session";
   input.readOnly = !input.disabled && (entry.sending || !!entry.pending || !!entry.commandBusy);
   input.setAttribute("aria-disabled", String(input.disabled || input.readOnly));
-  $("chat-attach").disabled = offline || !chatAttachmentsSupported(entry) || entry.sending || !!entry.pending || !!entry.uploads;
+  $("chat-attach").disabled = offline || !chatAttachmentsSupported(entry, selected) || entry.sending || !!entry.pending || !!entry.uploads;
   $("chat-clipboard").disabled = $("chat-attach").disabled;
   // A word still composing does not lock it: the send commits it first (buildChatComposer).
   $("chat-send").disabled = blocked || (!entry.text.trim() && !entry.attachments.length);
@@ -5603,12 +5653,12 @@ function updateChatComposer(entry) {
   if (continuation) continuation.hidden = oneShot;
   const native = terminalInfo(state.terminal).nativeSource;
   $("chat-native-open").hidden = !native || chatKey(native) === chatKey(entry.source) || !state.terminalAlive;
-  const openTerminalRow = terminalForSession(selectedSession());
+  const openTerminalRow = terminalForSession(selected);
   $("chat-terminal-close").hidden = !openTerminalRow;
   if (openTerminalRow) $("chat-terminal-close").textContent = terminalCloseCopy(openTerminalRow).action;
   const phase = entry.data?.phase;
   const phaseCopy = phase === "working" ? "작업 중 · 지금 보내도 CLI가 이어서 반영합니다." : phase === "needs_input" ? (entry.data?.prompt ? "답변·승인 필요 · 위 카드에서 답해 주세요." : "답변·승인 필요 · 터미널에서 처리해 주세요.") : entry.expanded ? "위의 실제 세션에 메시지를 전달합니다." : "";
-  const budgetNote = state.chatPollCount >= CHAT_POLL_MAX ? " 자동 상태 확인을 잠시 멈췄습니다. 상태 다시 확인을 눌러 주세요." : "";
+  const budgetNote = state.chatPollCount >= CHAT_POLL_MAX ? CHAT_CHECKS_PAUSED : "";
   // The gate itself says what to do; the status line only adds that a refused
   // message was not sent.
   const unsupportedCopy = oneShot ? ONE_SHOT_NO_INPUT : (gateOn || recovery) ? (entry.receipt?.dispatchState === "not_started"
@@ -5616,10 +5666,10 @@ function updateChatComposer(entry) {
     ? "첨부는 이 작업 폴더에 저장됐습니다. 첨부의 ‘경로’를 복사해 터미널에 붙여넣으세요."
     : entry.data?.capability?.reason || "직접 입력을 지원하지 않습니다. 터미널을 사용해 주세요.";
   const dictating = state.dictation?.field === input;
-  const statusCopy = offline ? "오프라인입니다. 초안은 유지됩니다. 연결 후 상태를 확인하고 보내 주세요." : (dictating && entry.dictationNotice) || entry.error || (oneShot ? ONE_SHOT_NO_INPUT : entry.dictationNotice || entry.notice || (entry.uploads ? `첨부 ${entry.uploads}개를 올리고 있습니다…` : !entry.data ? (claudeWithoutId(selectedSession()) ? CLAUDE_NO_SEND : "메시지 전송 환경을 확인하고 있습니다…") : !supported ? unsupportedCopy : receiptNotice(entry) || phaseCopy));
+  const statusCopy = offline ? "오프라인입니다. 초안은 유지됩니다. 연결 후 상태를 확인하고 보내 주세요." : (dictating && entry.dictationNotice) || entry.error || (oneShot ? ONE_SHOT_NO_INPUT : entry.dictationNotice || entry.notice || (entry.uploads ? `첨부 ${entry.uploads}개를 올리고 있습니다…` : !entry.data ? (claudeWithoutId(selected) ? CLAUDE_NO_SEND : "메시지 전송 환경을 확인하고 있습니다…") : !supported ? unsupportedCopy : receiptNotice(entry) || phaseCopy));
   // The paused-check note adds only what the line does not say yet ("상태 다시 확인" twice was).
-  $("chat-status").textContent = statusCopy + (budgetNote && !statusCopy.includes("상태 다시 확인") ? budgetNote : budgetNote ? " 자동 상태 확인을 잠시 멈췄습니다." : "");
-  $("chat-status").setAttribute("data-attention", String(!!(offline || chatHostOffline(entry) || entry.error || entry.receipt?.status === "unknown")));
+  $("chat-status").textContent = statusCopy + (budgetNote && !statusCopy.includes("상태 다시 확인") ? budgetNote : budgetNote ? CHAT_CHECKS_PAUSED_SHORT : "");
+  $("chat-status").setAttribute("data-attention", String(!!(offline || chatHostOffline(entry, selected) || entry.error || entry.receipt?.status === "unknown")));
   const deliveryVisible = updateChatDeliveryEvidence(entry);
   const chips = $("chat-attachments");
   // While a bubble resends its own message, another draft's files stay as they are.
@@ -5633,7 +5683,7 @@ function updateChatComposer(entry) {
   attachmentsLabel.textContent = selectedCaption;
   chips.setAttribute("aria-label", selectedCaption);
   renderAttachmentTiles(entry, chips);
-  resizeChatInput(entry);
+  resizeChatInput(entry, selected);
 }
 // Attachment tiles: a row that scrolls sideways. Images show a local preview
 // (an object URL of the picked file, memory only, revoked once the tile is
@@ -5764,18 +5814,23 @@ function stopChatPolling() {
   state.chatPollCount = 0;
 }
 const CHAT_POLL_MAX = 240;
+// Phone status lines hold two lines with the keyboard up; a timed-out read with the checks
+// paused said "다시 시도" and "상태 다시 확인" both and took three at the large text size.
+const CHAT_CHECKS_PAUSED = " 자동 상태 확인을 잠시 멈췄습니다. 상태 다시 확인을 눌러 주세요.";
+const CHAT_CHECKS_PAUSED_SHORT = " 자동 확인은 멈췄습니다.";
+const CHAT_STATE_TIMEOUT = "응답이 늦어 기다리기를 멈췄습니다. 연결을 확인한 뒤 상태 다시 확인을 눌러 주세요.";
 function chatPollDelay(count) {
   // Live updates announce changes; polling is then only a safety net.
   if (eventsHealthy()) return EVENTS_SAFETY_MS.chat;
   // Fast while a reply is likely, then slower; long turns keep being followed.
   return count < 10 ? 3000 : count < 30 ? 5000 : count < 90 ? 10000 : 20000;
 }
-function scheduleChatPoll(s, entry) {
-  if (!currentChat(entry)) return;
+function scheduleChatPoll(s, entry, selected = selectedSession() || null) {
+  if (!currentChat(entry, selected)) return;
   clearTimeout(state.chatPollTimer);
   // A bubble still waiting for its message keeps the conversation followed, so it
   // goes when the message (or an answer after it) shows, or when it times out.
-  if (networkOffline() || !currentChat(entry) || !chatVisible() || state.chatPollCount >= CHAT_POLL_MAX ||
+  if (networkOffline() || !chatVisible() || state.chatPollCount >= CHAT_POLL_MAX ||
       (!entry.pending && !(entry.error && entry.error !== entry.inputError) && !entry.data?.prompt &&
        !["working", "needs_input"].includes(entry.data?.phase) &&
        !(entry.outbox || []).some(outboxAwaitsAgent))) return;
@@ -5786,7 +5841,7 @@ function scheduleChatPoll(s, entry) {
     loadChatState(s, false);
   }, chatPollDelay(state.chatPollCount));
 }
-function applyChatReceipt(entry, receipt) {
+function applyChatReceipt(entry, receipt, selected) {
   if (!receipt || (entry.pending && receipt.requestId !== entry.pending.requestId)) return;
   const fallback = entry.pending?.attachmentDetails ||
     (entry.receipt?.requestId === receipt.requestId ? entry.receipt.attachments : []);
@@ -5799,9 +5854,9 @@ function applyChatReceipt(entry, receipt) {
       draftIsPending(entry)) {
     entry.text = "";
     entry.attachments = [];
-    if (currentChat(entry)) {
+    if (currentChat(entry, selected)) {
       $("chat-input").value = "";
-      resizeChatInput(entry);
+      resizeChatInput(entry, selected);
     }
   }
   entry.pending = null;
@@ -5810,7 +5865,9 @@ function applyChatReceipt(entry, receipt) {
 const CHAT_RECHECK_RETRY_MS = 3000;
 async function loadChatState(s, manual = false, { join = false } = {}) {
   const entry = chatEntry(s);
-  if (!currentChat(entry) || !chatVisible() || networkOffline()) return;
+  // Found once before the read and once after it (the selection may change meanwhile).
+  let selected = selectedSession() || null;
+  if (!currentChat(entry, selected) || !chatVisible() || networkOffline()) return;
   // Without an id the session has no chat state; its transcript (if named) is read directly.
   if (claudeWithoutId(s)) return { status: "skipped" };
   const identity = conversationIdentity(s);
@@ -5837,7 +5894,7 @@ async function loadChatState(s, manual = false, { join = false } = {}) {
   // large, too many files, too long a message) stays until the user acts again.
   const clearError = () => { if (entry.error !== entry.inputError) entry.error = ""; };
   if (manual) { state.chatPollCount = 0; clearError(); }
-  updateChatComposer(entry);
+  updateChatComposer(entry, selected);
   try {
     const lastRequestId = entry.pending?.requestId ||
       (entry.receipt?.dispatchState === "not_started" || ["completed", "interrupted", "failed"].includes(entry.receipt?.status) ? null : entry.receipt?.requestId);
@@ -5846,45 +5903,48 @@ async function loadChatState(s, manual = false, { join = false } = {}) {
       source: entry.source, ...(lastRequestId ? { requestId: lastRequestId } : {}),
       ...(requestIds.length ? { requestIds } : {}),
     } });
+    selected = selectedSession() || null;
     if (!state.authenticated || state.chats.get(chatKey(entry.source)) !== entry) return;
-    if (epoch !== entry.stateEpoch || currentChat(entry) && conversationIdentity(selectedSession()) !== identity) return;
+    if (epoch !== entry.stateEpoch || currentChat(entry, selected) && conversationIdentity(selected) !== identity) return;
     entry.data = data;
     outcome = { status: "success", data };
     clearError();
     for (const receipt of data.receipts || []) {
       if (receipt.requestId === entry.pending?.requestId ||
           (entry.receipt?.dispatchState !== "not_started" && receipt.requestId === entry.receipt?.requestId))
-        applyChatReceipt(entry, receipt);
+        applyChatReceipt(entry, receipt, selected);
     }
-    renderPrompt(s, data);
+    renderPrompt(s, data, selected);
     if (chatReadSupported(entry, data)) {
       rememberConversation(s, data.messages, data);
-      if (currentChat(entry)) {
+      if (currentChat(entry, selected)) {
         renderMessages(s, data.messages);
         conversationSyncNotice(s, data.stale ? "stale" : "");
       }
     }
-    noteLivePhase(s, data);
-    scheduleChatPoll(s, entry);
+    // A phase the read changed redraws the board: the selected row is found again after it.
+    if (noteLivePhase(s, data, selected)) selected = selectedSession() || null;
+    scheduleChatPoll(s, entry, selected);
   } catch (err) {
+    selected = selectedSession() || null;
     readFailed = true;
     outcome = { status: "failed", error: err };
     if (!err.unauthorized && !err.staleAuth && epoch === entry.stateEpoch &&
-        currentChat(entry) && conversationIdentity(selectedSession()) === identity)
+        currentChat(entry, selected) && conversationIdentity(selected) === identity)
       conversationSyncNotice(s, "failed");
     if (!err.unauthorized && !err.staleAuth && epoch === entry.stateEpoch) {
       // A connection problem that just started shows the bars (its notice is in them).
-      if (!entry.error && currentChat(entry)) revealChrome();
-      entry.error = `${err.message} 상태 다시 확인을 눌러 주세요.`;
+      if (!entry.error && currentChat(entry, selected)) revealChrome();
+      entry.error = err.timeout ? CHAT_STATE_TIMEOUT : `${err.message} 상태 다시 확인을 눌러 주세요.`;
     }
     // A transient failure keeps following the session with the same backoff (also when the
     // polling stopped meanwhile: scheduleChatPoll follows only the conversation on screen).
-    if (currentChat(entry) && !err.unauthorized && !err.staleAuth) scheduleChatPoll(s, entry);
+    if (currentChat(entry, selected) && !err.unauthorized && !err.staleAuth) scheduleChatPoll(s, entry, selected);
   } finally {
     entry.checking = false;
     complete(outcome);
     entry.stateReadPromise = null;
-    updateChatComposer(entry);
+    updateChatComposer(entry, selected);
     const recheck = entry.recheckQueued || epoch !== entry.stateEpoch;
     entry.recheckQueued = false;
     // A read asked for while this one ran (a return to the screen, a live update) still
@@ -10872,13 +10932,21 @@ function renderAppShift() {
 }
 // The keyboard's room as this device reports it (sizes and offsets, never content), sent to
 // the board like the mic's trace when an on-screen keyboard opens: at once, once it settled
-// and a second later. A few per page.
-const KEYBOARD_TRACES = 12;
+// and a second later. A few per page, each saying something new: every opening in the same
+// field with the same room gave the same rows and filled half the mic's trace file.
+const KEYBOARD_TRACES = 4;
+// Sizes within this many px of a trace already sent are the same room.
+const KEYBOARD_TRACE_SLACK = 4;
+function keyboardTraceSeen(shape, values) {
+  return (state.keyboardTraceShapes || []).some((seen) => seen.shape === shape && seen.values.length === values.length &&
+    seen.values.every((value, index) => value === values[index] ||
+      value != null && values[index] != null && Math.abs(value - values[index]) <= KEYBOARD_TRACE_SLACK));
+}
 function traceKeyboardRoom() {
   const open = touchDevice() && editingText() && keyboardOpen();
   if (open === !!state.keyboardTraced) return;
   state.keyboardTraced = open;
-  if (!open || (state.keyboardTraces = (state.keyboardTraces || 0) + 1) > KEYBOARD_TRACES) return;
+  if (!open || (state.keyboardTraces || 0) >= KEYBOARD_TRACES) return;
   const t0 = Date.now();
   const events = [];
   const env = { kind: "viewport", field: String(document.activeElement?.id || ""), touch: true,
@@ -10898,6 +10966,11 @@ function traceKeyboardRoom() {
   setTimeout(() => snap("settled"), 400);
   setTimeout(() => snap("later"), 1500);
   setTimeout(() => {
+    const shape = JSON.stringify([env.field, env.standalone, env.phone, env.width, env.docked]);
+    const values = events.flatMap(({ t, e, ...sizes }) => [e, ...Object.values(sizes)]);
+    if ((state.keyboardTraces || 0) >= KEYBOARD_TRACES || keyboardTraceSeen(shape, values)) return;
+    state.keyboardTraces = (state.keyboardTraces || 0) + 1;
+    (state.keyboardTraceShapes ||= []).push({ shape, values });
     api("/api/diagnostics/dictation", { method: "POST", body: { env, outcome: "viewport", events } }).catch(() => {});
   }, 1700);
 }

@@ -4934,6 +4934,69 @@ test('an input error (a file too large) stays until the user acts again; a state
   assert.doesNotMatch(status(), /확인하지 못했습니다/);
 });
 
+test('a timed-out chat read with the checks paused says what to do once, in two phone lines', async () => {
+  const limits = [];
+  const c = client((path, options) => new Promise((resolve, reject) => {
+    options.signal.addEventListener('abort', () => reject(Object.assign(new Error('The operation was aborted.'), { name: 'AbortError' })));
+  }), noChatTimers);
+  c.context.AbortSignal = { timeout(ms) { const controller = new AbortController(); limits.push({ ms, controller }); return controller.signal; } };
+  const { s, entry } = selectChat(c);
+  wireTree(c, c.buildChatComposer(s));
+  c.state.chatPollCount = 240;
+  const read = c.loadChatState(s, false);
+  limits.at(-1).controller.abort();
+  assert.equal((await read).status, 'failed');
+  const status = c.get('chat-status').textContent;
+  // It was "…다시 시도해 주세요. 상태 다시 확인을 눌러 주세요. 자동 상태 확인을 잠시 멈췄습니다." (79 characters,
+  // three lines at the large text size on a phone with its keyboard up, scrolled inside a two-line box).
+  assert.equal(status, '응답이 늦어 기다리기를 멈췄습니다. 연결을 확인한 뒤 상태 다시 확인을 눌러 주세요. 자동 확인은 멈췄습니다.');
+  assert.equal(status.split('상태 다시 확인').length - 1, 1);
+  assert.equal(c.get('chat-status').attributes['data-attention'], 'true');
+  // Another failure keeps its own words and the same short note.
+  entry.error = '연결이 끊겼습니다. 상태 다시 확인을 눌러 주세요.';
+  c.updateChatComposer(entry);
+  assert.equal(c.get('chat-status').textContent, '연결이 끊겼습니다. 상태 다시 확인을 눌러 주세요. 자동 확인은 멈췄습니다.');
+  // A line without the button's name still names it.
+  entry.error = '';
+  entry.data = { ...entry.data, phase: 'working' };
+  c.updateChatComposer(entry);
+  assert.match(c.get('chat-status').textContent, /자동 상태 확인을 잠시 멈췄습니다\. 상태 다시 확인을 눌러 주세요\.$/);
+});
+
+test('a composer update, a keystroke and a chat read find the selected session a few times, not once per check', async () => {
+  // allSessions() rebuilds every row of every device; it ran 15 times per composer update,
+  // 16 per keystroke and 38 per read (11 ms and 40 ms on a board with 600 to 1000 sessions).
+  const c = client(async (url, opts) => ({ ok: true, status: 200, json: async () => url === '/api/chat/state'
+    ? { route: JSON.parse(opts.body).source, capability: { supported: true, attachments: true }, phase: 'working', receipts: [],
+      messages: [{ role: 'assistant', text: '진행 중입니다.' }], modelSettings: { model: 'sample-model', effort: 'high' } }
+    : { ok: true } }), noChatTimers);
+  const { s, entry } = selectChat(c);
+  const others = Array.from({ length: 30 }, (_, i) => ({ host: 'workstation', agent: 'codex', home: '.codex-example', id: `other-${i}` }));
+  c.state.snapshot.hosts[0].data.codex.push(...others);
+  wireTree(c, c.buildChatComposer(s)); await settle();
+  await c.loadChatState(s, false);
+  vm.runInContext('var __rows = 0; var __allSessionsOriginal = allSessions; allSessions = function () { __rows++; return __allSessionsOriginal(); };', c.context);
+  const rows = () => { const n = vm.runInContext('__rows', c.context); vm.runInContext('__rows = 0', c.context); return n; };
+  c.updateChatComposer(entry);
+  assert.ok(rows() <= 2, 'one composer update');
+  const input = c.get('chat-input'); input.value = '확인'; input.events.input({ isComposing: false });
+  assert.equal(entry.text, '확인');
+  assert.ok(rows() <= 2, 'one keystroke');
+  const read = await c.loadChatState(s, false);
+  assert.equal(read.status, 'success');
+  assert.ok(rows() <= 4, 'one chat read that changes nothing');
+  // Passing the selected session down keeps every check on the conversation on screen.
+  assert.equal(c.get('chat-send').disabled, false);
+  assert.equal(c.get('chat-attach').disabled, false);
+  assert.equal(c.chatSupported(entry), true);
+  // A one-shot run is still told by its own row (chatKey), without a scan of every session.
+  c.state.snapshot.hosts[0].data.codex[0].executionMode = 'one-shot';
+  c.updateChatComposer(entry);
+  assert.equal(c.chatSupported(entry), false);
+  assert.equal(c.get('chat-input').disabled, true);
+  assert.equal(c.get('chat-terminal').hidden, true);
+});
+
 test('the machines chip says how many answer and the sheet shows each one\'s CPU, memory, disk, battery and uptime', async () => {
   const c = client(undefined, noChatTimers);
   const box = c.get('hardware');
@@ -9331,6 +9394,55 @@ test('작업에서 대화를 직접 열면 대상 분류와 목록 조건을 맞
   c.select(human.key); assert.equal(c.state.sessionCategory, 'general'); assert.equal(c.chatEntry(human).text, '보내지 않은 초안');
 });
 
+test('opened conversations keep what was read only for the 12 used last, never drop a draft, and read an older one again', async () => {
+  const reads = [];
+  const c = client(async (url, opts) => {
+    if (url === '/api/chat/state') {
+      const source = JSON.parse(opts.body).source; reads.push(source.id);
+      return { ok: true, status: 200, json: async () => ({ route: source, capability: { supported: true }, phase: 'idle', receipts: [],
+        messages: [{ role: 'user', text: `질문 ${source.id}` }, { role: 'assistant', text: `답변 ${source.id}` }] }) };
+    }
+    if (String(url).startsWith('/api/bot-requests/conversation'))
+      return { ok: true, status: 200, json: async () => ({ segments: [{ messages: [{ role: 'assistant', text: '봇 답변' }] }] }) };
+    return { ok: true, status: 200, json: async () => ({ ok: true }) };
+  }, noChatTimers);
+  const sessions = Array.from({ length: 20 }, (_, i) => recentSession(`memory-${i}`, { updatedAt: 1000 + i }));
+  setRecentSnapshot(c, sessions);
+  const held = () => [...c.state.chats.values()].filter((e) => e.data || e.conversation || e.fullMessages.size || e.historyPreview);
+  const file = { id: 'file-1', name: 'notes.txt', size: 4, type: 'text/plain' };
+  for (const [i, s] of sessions.entries()) {
+    c.select(s.key); await settle();
+    const entry = c.chatEntry(s);
+    assert.ok(entry.data && entry.conversation, `${s.id} is read when opened`);
+    if (i === 1) entry.text = '보내지 않은 초안';
+    if (i === 2) entry.attachments = [file];
+    if (i === 3) entry.outbox = [{ requestId: 'request-0001', text: '보낸 글', state: 'uncertain', at: 1 }];
+    assert.ok(held().length <= 12, `at most 12 conversations keep what was read (${held().length} after ${i + 1})`);
+  }
+  const entryOf = (i) => c.chatEntry(sessions[i]);
+  assert.equal(entryOf(1).text, '보내지 않은 초안');
+  assert.deepEqual(entryOf(2).attachments, [file]);
+  for (const i of [1, 2, 3]) assert.ok(entryOf(i).data && entryOf(i).conversation, `an entry in use (${i}) keeps everything`);
+  assert.ok(entryOf(19).data, 'the conversation on screen keeps it');
+  assert.equal(entryOf(0).data, null); assert.equal(entryOf(0).conversation, null);
+  assert.equal(entryOf(0).fullMessages.size, 0);
+  // Reopened, a conversation that gave it back reads it again and shows it.
+  const before = reads.filter((id) => id === 'memory-0').length;
+  c.select(sessions[0].key); await settle();
+  assert.equal(reads.filter((id) => id === 'memory-0').length, before + 1);
+  assert.ok(entryOf(0).data && entryOf(0).conversation);
+  assert.match(textOf(c.get('messages')), /답변 memory-0/);
+  assert.ok(held().length <= 12);
+  // Bot conversations read on opening keep as many.
+  const loadBotConversation = vm.runInContext('loadBotConversation', c.context);
+  for (let i = 0; i < 20; i++) {
+    const request = { id: `bot-${i}`, sourceId: 'sample-bot', updatedAt: i, conversationRef: `conversation-${i}` };
+    await loadBotConversation({ key: `bot-${i}`, latest: request, requests: [request] });
+  }
+  assert.ok(c.state.botConversations.size <= 12, `bot conversations kept: ${c.state.botConversations.size}`);
+  assert.ok(c.state.botConversations.has('bot-19'));
+});
+
 test('잠금은 분류 선택과 시작 주체 조건을 일반 세션으로 초기화한다', () => {
   const c = client(undefined, noChatTimers);
   c.state.sessionCategory = 'agent'; c.state.filters.initiator = 'agent'; c.showLogin();
@@ -10747,6 +10859,51 @@ test('with an on-screen keyboard up, the app follows what iOS scrolled on screen
   c.context.window.visualViewport = { height: 420, scale: 1, offsetTop: 0, pageTop: 400 };
   c.updateViewport();
   assert.equal(classes.has('app-shifted'), false);
+});
+
+test('the keyboard room is traced only when it says something new, and a few times per page', async () => {
+  const timers = [];
+  const posts = [];
+  const c = client(async (url, opts) => {
+    if (String(url).includes('/api/diagnostics/dictation')) posts.push(JSON.parse(opts.body));
+    return { ok: true, status: 200, json: async () => ({ ok: true }) };
+  }, { setTimeout: (callback, ms) => { timers.push({ callback, ms }); return timers.length; }, clearTimeout() {} });
+  c.context.document.body.classList = { add() {}, remove() {}, contains: () => false };
+  c.context.document.documentElement.style = { setProperty() {} };
+  c.context.window.matchMedia = (query) => ({ matches: query === '(pointer: coarse)' });
+  c.context.window.innerWidth = 1180;
+  c.context.window.innerHeight = 820;
+  const field = (id, top) => ({ tagName: 'TEXTAREA', id, getBoundingClientRect: () => ({ top, bottom: top + 32 }) });
+  // The keyboard opens over a field (its trace's three rows, then the send) and closes again.
+  const typeIn = async (node, height) => {
+    c.context.document.activeElement = node;
+    c.context.window.visualViewport = { height, scale: 1, offsetTop: 0, pageTop: 0 };
+    c.updateViewport();
+    const queued = timers.splice(0);
+    for (const timer of queued.filter((t) => [400, 1500].includes(t.ms))) timer.callback();
+    queued.find((t) => t.ms === 1700)?.callback();
+    await new Promise((resolve) => setImmediate(resolve));
+    c.context.document.activeElement = null;
+    c.context.window.visualViewport = { height: 820, scale: 1, offsetTop: 0, pageTop: 0 };
+    c.updateViewport();
+    timers.splice(0);
+  };
+  const chat = field('chat-input', 380);
+  await typeIn(chat, 420);
+  assert.equal(posts.length, 1);
+  assert.deepEqual(posts[0].events.map((event) => event.e), ['open', 'settled', 'later']);
+  // The same room again (or a px off) says nothing new.
+  await typeIn(chat, 420);
+  await typeIn(chat, 422);
+  assert.equal(posts.length, 1, 'the same room is traced once');
+  // Another room (a taller keyboard) or another field is.
+  await typeIn(chat, 360);
+  await typeIn(field('terminal-draft', 300), 420);
+  assert.equal(posts.length, 3);
+  assert.deepEqual(posts.map((post) => [post.env.field, post.events[0].vh]), [['chat-input', 420], ['chat-input', 360], ['terminal-draft', 420]]);
+  // A few per page, however many rooms.
+  for (const height of [300, 320, 340, 380, 400]) await typeIn(chat, height);
+  assert.equal(posts.length, 4);
 });
 
 test('a menu whose taps iPadOS kept for its own selection still works once the opening finger is long gone', () => {

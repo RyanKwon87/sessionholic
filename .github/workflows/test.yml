@@ -1,6 +1,9 @@
 name: Test
 on:
+  # A pull request's commits run once (as the pull request), main once after each merge: a
+  # branch push as well ran every commit twice, and a failure mailed twice.
   push:
+    branches: [main]
   pull_request:
 permissions:
   contents: read

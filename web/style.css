@@ -4575,6 +4575,141 @@ li[data-task] {
   font-size: var(--fs-cap);
   line-height: 1.4;
 }
+/* 내 질문: the user's last question in one low line right above the conversation (also in
+   집중 모드); a tap unfolds it to four lines, its count opens the sheet of all of them. */
+.question-pin {
+  display: flex;
+  flex: none;
+  align-items: flex-start;
+  gap: 8px;
+  min-width: 0;
+  padding: 0 var(--detail-pad);
+  border-bottom: 0.5px solid var(--sep);
+  font-size: var(--fs-sub);
+  line-height: 1.4;
+}
+.question-pin-summary {
+  display: flex;
+  flex: 1 1 auto;
+  align-items: baseline;
+  gap: 6px;
+  min-width: 0;
+  min-height: 30px;
+  padding: 6px 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  color: var(--label);
+  font-size: var(--fs-sub);
+  text-align: left;
+}
+.question-pin-label,
+.question-pin-time {
+  flex: none;
+  color: var(--label-2);
+  font-size: var(--fs-cap);
+  white-space: nowrap;
+}
+.question-pin-label {
+  font-weight: 600;
+}
+.question-pin-time {
+  font-variant-numeric: tabular-nums;
+}
+.question-pin-text {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+.question-pin.is-expanded .question-pin-text {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 4;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+.question-pin-count {
+  flex: none;
+  min-height: 30px;
+  padding: 0 0 0 4px;
+  border: 0;
+  background: transparent;
+  color: var(--accent);
+  font-size: var(--fs-cap);
+  font-weight: 600;
+  white-space: nowrap;
+}
+.question-pin-summary:active:not(:disabled),
+.question-pin-count:active:not(:disabled) {
+  opacity: 0.5;
+}
+/* Typing on a phone: the keyboard leaves little room, the line gives way. */
+@media (max-width: 700px) {
+  .detail-pane.is-typing .question-pin {
+    display: none;
+  }
+}
+/* The sheet of 내 질문: newest first, a time and two lines each. */
+.questions-status {
+  margin: 0 0 10px;
+  color: var(--label-2);
+  font-size: var(--fs-cap);
+  overflow-wrap: anywhere;
+}
+.questions-list {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  border-radius: var(--radius);
+  background: var(--fill-soft);
+}
+.questions-list:empty {
+  display: none;
+}
+.questions-row {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 2px;
+  width: 100%;
+  min-width: 0;
+  min-height: var(--tap);
+  padding: 10px 14px;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  color: var(--label);
+  text-align: left;
+}
+.questions-row + .questions-row {
+  box-shadow: inset 0 0.5px 0 var(--sep-strong);
+}
+.questions-row:active:not(:disabled) {
+  background: var(--fill-press);
+}
+.questions-row:focus-visible {
+  outline-offset: -3px;
+}
+.questions-row-time {
+  color: var(--label-2);
+  font-size: var(--fs-cap);
+  font-variant-numeric: tabular-nums;
+}
+.questions-row-text {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  overflow: hidden;
+  font-size: var(--fs-body);
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+}
+.questions-more {
+  width: 100%;
+  margin: 12px 0 4px;
+}
 .msg-attachments {
   display: flex;
   flex-direction: column;

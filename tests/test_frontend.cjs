@@ -3417,7 +3417,8 @@ test('selecting readable Codex, closed Codex and native Claude uses one state re
     if (mode === 'native-claude') s.nativeSource = true;
     c.refreshDetail(s);
     await new Promise((resolve) => setImmediate(resolve));
-    assert.deepEqual(calls, ['/api/chat/state'], mode);
+    // The 내 질문 read that follows the conversation's own is counted by its own tests.
+    assert.deepEqual(calls.filter((url) => !url.startsWith('/api/history/questions?')), ['/api/chat/state'], mode);
     assert.doesNotMatch(textOf(c.get('messages')), /불러오고 있습니다/);
     assert.match(textOf(c.get('messages')), mode === 'empty-codex' ? /저장된 대화를 아직/ : /readable transcript/);
     if (mode === 'closed-codex' || mode === 'native-claude') assert.equal(c.get('chat-input').disabled, true);
@@ -3427,6 +3428,7 @@ test('selecting readable Codex, closed Codex and native Claude uses one state re
 test('reselecting a conversation renders current memory before transport and preserves reading position and Korean draft during refresh', async () => {
   let defer = false; let release; let calls = 0;
   const c = client(async (url, options) => {
+    if (url.startsWith('/api/history/questions?')) return questionsReply();
     calls++; assert.equal(url, '/api/chat/state');
     if (defer) await new Promise((resolve) => { release = resolve; });
     return { ok: true, status: 200, json: async () => ({ route: JSON.parse(options.body).source,
@@ -3554,6 +3556,7 @@ test('memory transcripts do not cross auth epochs, cwd changes, account homes or
 test('canonical detail loads join a current state read without queuing duplicate readback', async () => {
   let release; const calls = [];
   const c = client(async (url, options) => {
+    if (url.startsWith('/api/history/questions?')) return questionsReply();
     calls.push(url); await new Promise((resolve) => { release = resolve; });
     return { ok: true, status: 200, json: async () => ({ route: JSON.parse(options.body).source,
       capability: { supported: true }, phase: 'idle', messages: [{ role: 'assistant', text: 'joined reply' }] }) };
@@ -3626,6 +3629,7 @@ test('legacy fallback responses and native memory reads from a locked epoch cann
 test('a cwd change during an in-flight read fetches the new view once and keeps its mounted Korean editor', async () => {
   let release; const calls = [];
   const c = client(async (url, options) => {
+    if (url.startsWith('/api/history/questions?')) return questionsReply();
     calls.push(url); const ordinal = calls.length;
     if (ordinal === 1) await new Promise((resolve) => { release = resolve; });
     return { ok: true, status: 200, json: async () => ({ route: JSON.parse(options.body).source,
@@ -12634,4 +12638,343 @@ test('긴 터미널 읽기처럼 같은 신호를 오래 쓰는 요청도 끝나
   failing.context.AbortSignal = { timeout: timeoutSignal };
   await assert.rejects(failing.api('/api/x', { signal, timeout: 1000 }));
   assert.equal(listeners.size, 0);
+});
+
+// --- 내 질문: the last question pinned above the conversation and the sheet of all of them ---
+
+function questionsReply({ questions = [], complete = true, before = null } = {}) {
+  return { ok: true, status: 200, json: async () => ({ questions, complete, before, readOnly: true }) };
+}
+function askedQuestion(n, fields = {}) {
+  return { bodyHash: n.toString(16).padStart(64, '0'), snippet: `질문 ${n}번 내용`, recordOffset: n * 100,
+    ts: 1800000000 + n * 60, fullLength: 9, ...fields };
+}
+const questionReads = (calls) => calls.filter((url) => url.startsWith('/api/history/questions?'));
+// A drawn conversation whose /api/history/questions answers come from `answer(url)`.
+function questionsConversation(answer = () => questionsReply(), { session = {}, timers = noChatTimers, select = {} } = {}) {
+  const calls = [];
+  const c = client(async (url, options) => {
+    calls.push(url);
+    if (url.startsWith('/api/history/questions?')) return answer(url);
+    if (url.startsWith('/api/history/message?')) {
+      const hash = new URL(url, 'https://fixture.invalid').searchParams.get('bodyHash');
+      return { ok: true, status: 200, json: async () => ({ readOnly: true, bodyHash: hash, text: '저장된 질문 전체 본문',
+        textOffset: 0, fullLength: 11, recordOffset: 400, nextTextOffset: null }) };
+    }
+    if (url === '/api/chat/send')
+      return { ok: true, status: 200, json: async () => ({ status: 'accepted', receipt: { requestId: JSON.parse(options.body).requestId } }) };
+    return { ok: true, status: 200, json: async () => ({}) };
+  }, timers);
+  const { s, entry } = selectChat(c, select);
+  Object.assign(s, session);
+  c.drawDetail(s);
+  const q = vm.runInContext('({loadQuestions,renderQuestionPin,openQuestions,closeQuestions,queueQuestionsRefresh})', c.context);
+  return { c, s, entry, calls, q, pin: c.get('question-pin'), count: c.get('question-pin-count'), text: c.get('question-pin-text') };
+}
+
+test('내 질문 줄은 질문을 알기 전엔 숨고, 읽은 뒤 마지막 질문·시각·개수(더 있으면 +)를 보인다', async () => {
+  const { c, s, calls, q, pin, count, text } = questionsConversation(() =>
+    questionsReply({ questions: [askedQuestion(3), askedQuestion(2)], complete: false, before: 200 }));
+  assert.equal(pin.hidden, true, 'nothing known yet');
+  assert.equal(count.hidden, true);
+  assert.equal(questionReads(calls).length, 0, 'drawing alone reads nothing');
+  await q.loadQuestions(s);
+  assert.equal(pin.hidden, false);
+  assert.equal(text.textContent, '질문 3번 내용', 'the first (newest) of the list');
+  assert.equal(c.get('question-pin-time').textContent, seoulClock(askedQuestion(3).ts));
+  assert.equal(count.hidden, false);
+  assert.equal(count.textContent, '질문 2개+ ›', 'more remain before them');
+  assert.match(count.attributes['aria-label'], /2개 이상/);
+  // The same source as a full-message read, no other key.
+  const sent = new URL(questionReads(calls)[0], 'https://fixture.invalid').searchParams;
+  assert.deepEqual(Object.fromEntries(sent), { host: 'workstation', agent: 'codex', id: 'native-session', home: '.codex-example' });
+  // Read to the record's start: no "+".
+  const done = questionsConversation(() => questionsReply({ questions: [askedQuestion(1)], complete: true }));
+  await done.q.loadQuestions(done.s);
+  assert.equal(done.count.textContent, '질문 1개 ›');
+  // A Claude transcript is named by its sessionId.
+  const claude = questionsConversation(() => questionsReply(), { select: { agent: 'claude' }, session: { sessionId: 'transcript-0001' } });
+  await claude.q.loadQuestions(claude.s);
+  const claudeParams = new URL(questionReads(claude.calls)[0], 'https://fixture.invalid').searchParams;
+  assert.equal(claudeParams.get('sessionId'), 'transcript-0001');
+  assert.equal(claudeParams.has('before'), false);
+});
+
+test('대화가 열리면 대화 읽기가 끝난 뒤 질문을 한 번 읽고, 대화 상태 폴링은 질문을 다시 읽지 않는다', async () => {
+  const { c, s, calls } = questionsConversation(() => questionsReply({ questions: [askedQuestion(1)] }));
+  c.state.detailFor = null;
+  c.refreshDetail(s);
+  assert.equal(questionReads(calls).length, 0, 'the conversation is read first');
+  await settle(6);
+  assert.equal(questionReads(calls).length, 1);
+  for (let i = 0; i < 3; i++) await c.loadChatState(s, false);
+  c.refreshDetail({ ...s, updatedAt: 123 }); await settle(6);
+  assert.equal(questionReads(calls).length, 1, 'polls and a re-read of the same conversation do not read them');
+});
+
+test('마지막 질문은 저장 목록의 첫 질문과 화면 대화의 최근 사용자 행 중 더 최근 것이다', async () => {
+  const latest = askedQuestion(3);
+  const { c, s, entry, q, count, text } = questionsConversation(() => questionsReply({ questions: [latest, askedQuestion(2)] }));
+  await q.loadQuestions(s);
+  // The conversation has the same question (spaces aside): the line stays as it was.
+  c.renderMessages(s, [{ role: 'user', text: '질문  3번\n내용', ts: latest.ts }, { role: 'assistant', text: '답', ts: latest.ts + 5 }]);
+  assert.equal(text.textContent, '질문 3번 내용');
+  // A newer question of the user's in the conversation wins; the count stays the saved list's.
+  c.renderMessages(s, [{ role: 'user', text: '질문 3번 내용', ts: latest.ts }, { role: 'user', text: '방금 보낸\n새 질문', ts: latest.ts + 30 }]);
+  assert.equal(text.textContent, '방금 보낸 새 질문');
+  assert.equal(c.get('question-pin-time').textContent, seoulClock(latest.ts + 30));
+  assert.equal(count.textContent, '질문 2개 ›');
+  // A send from here not in the transcript yet is the newest; a failed one is not.
+  entry.outbox = [{ requestId: 'request-question-1', text: '전송 중인 질문', attachments: [], state: 'sending', at: Date.now() }];
+  c.renderMessages(s, [{ role: 'user', text: '방금 보낸\n새 질문', ts: latest.ts + 30 }]);
+  assert.equal(text.textContent, '전송 중인 질문');
+  entry.outbox = [{ requestId: 'request-question-2', text: '보내지 못한 질문', attachments: [], state: 'failed', at: Date.now() }];
+  c.renderMessages(s, [{ role: 'user', text: '방금 보낸\n새 질문', ts: latest.ts + 30 }]);
+  assert.equal(text.textContent, '방금 보낸 새 질문');
+  entry.outbox = [];
+  // A conversation older than the list (both timed) gives way to the list.
+  c.renderMessages(s, [{ role: 'user', text: '예전 질문', ts: latest.ts - 600 }]);
+  assert.equal(text.textContent, '질문 3번 내용');
+});
+
+test('내 질문 줄은 눌러 4줄까지 펼치고 다시 눌러 접으며, 다른 질문이 오면 접힌다', async () => {
+  const { c, s, q, pin } = questionsConversation(() => questionsReply({ questions: [askedQuestion(4)] }));
+  await q.loadQuestions(s);
+  const summary = c.get('question-pin-summary');
+  summary.events.click();
+  assert.match(pin.className, /\bis-expanded\b/);
+  assert.equal(summary.attributes['aria-expanded'], 'true');
+  summary.events.click();
+  assert.doesNotMatch(pin.className, /\bis-expanded\b/);
+  summary.events.click();
+  c.renderMessages(s, [{ role: 'user', text: '그다음 질문', ts: askedQuestion(4).ts + 60 }]);
+  assert.doesNotMatch(pin.className, /\bis-expanded\b/, 'another question folds it');
+  assert.equal(summary.attributes['aria-expanded'], 'false');
+  const css = styleSheet();
+  assert.match(css, /\.question-pin\.is-expanded \.question-pin-text \{[^}]*-webkit-line-clamp: 4;[^}]*white-space: normal;/);
+  assert.match(css, /\.question-pin-text \{[^}]*white-space: nowrap;[^}]*text-overflow: ellipsis;/);
+});
+
+test('내 질문 줄은 동기화 안내와 대화 사이에 있고 집중 모드에서도 보이며, 폰에서 입력 중일 때만 숨는다', async () => {
+  const { c, s, q, pin } = questionsConversation(() => questionsReply({ questions: [askedQuestion(1)] }));
+  const children = c.get('detail').children;
+  const at = (id) => children.findIndex((node) => node.id === id);
+  assert.equal(at('question-pin'), at('conversation-sync-notice') + 1);
+  assert.equal(at('messages'), at('question-pin') + 1);
+  await q.loadQuestions(s);
+  c.get('detail').classList = classes();
+  c.setChromeVisible(false);
+  assert.equal(c.get('detail').classList.contains('is-reading'), true);
+  assert.equal(pin.hidden, false, 'focus mode keeps it');
+  const css = styleSheet().replace(/\/\*[\s\S]*?\*\//g, '');
+  assert.doesNotMatch(css, /is-reading[^{]*question-pin/, 'no focus-mode rule hides it');
+  // Typing hides it on a phone only: the one rule sits in the phone-width block.
+  const typing = /@media \(max-width: 700px\) \{\s*\.detail-pane\.is-typing \.question-pin \{\s*display: none;\s*\}\s*\}/;
+  assert.match(css, typing);
+  assert.doesNotMatch(css.replace(typing, ''), /is-typing[^{]*question-pin/);
+});
+
+test('내 질문 줄이 생기거나 펼쳐질 때 읽던 위치를 keepReadingPlace로 지킨다', async () => {
+  const { c, s, q, pin } = questionsConversation(() => questionsReply({ questions: [askedQuestion(2)] }));
+  const list = c.get('messages');
+  Object.assign(list, { scrollHeight: 3000, clientHeight: 600, scrollTop: 1000, lastScrollTop: 1000, pinned: false });
+  // The list moves down by the line's height when it shows, and by three more lines unfolded.
+  let shown = false, unfolded = false, name = pin.className;
+  list.getBoundingClientRect = () => ({ top: 200 + (shown ? 31 : 0) + (unfolded ? 54 : 0), height: 600 });
+  Object.defineProperty(pin, 'hidden', { configurable: true, get: () => !shown, set: (value) => { shown = !value; } });
+  Object.defineProperty(pin, 'className', { configurable: true, get: () => name,
+    set: (value) => { name = value; unfolded = /\bis-expanded\b/.test(value); } });
+  await q.loadQuestions(s);
+  assert.equal(shown, true);
+  assert.equal(list.scrollTop, 1031, 'the line being read stays where it was');
+  c.get('question-pin-summary').events.click();
+  assert.equal(list.scrollTop, 1085);
+  c.get('question-pin-summary').events.click();
+  assert.equal(list.scrollTop, 1031);
+  // The same answer again changes nothing on screen and moves nothing.
+  await q.loadQuestions(s);
+  assert.equal(list.scrollTop, 1031);
+});
+
+test('내 질문 시트는 최신순으로 시각과 요약을 보이고, 더 이전 질문을 before로 이어 읽어 뒤에 붙인다', async () => {
+  const first = questionsReply({ questions: [askedQuestion(5), askedQuestion(4)], complete: false, before: 400 });
+  const older = questionsReply({ questions: [askedQuestion(3), askedQuestion(2)], complete: true, before: null });
+  const { c, s, calls, q, count } = questionsConversation((url) =>
+    new URL(url, 'https://fixture.invalid').searchParams.get('before') === '400' ? older : first);
+  // The page's own wiring (offline: no board read starts), then back online.
+  c.context.navigator = { onLine: false };
+  c.windowEvents.DOMContentLoaded();
+  c.context.navigator = { onLine: true };
+  await q.loadQuestions(s);
+  count.events.click();
+  const dialog = c.get('questions-dialog');
+  assert.equal(dialog.open, true);
+  assert.equal(questionReads(calls).length, 2, 'the sheet reads them again as it opens');
+  await settle();
+  const rows = () => c.get('questions-list').children;
+  assert.deepEqual(rows().map((row) => row.children[1].textContent), ['질문 5번 내용', '질문 4번 내용']);
+  assert.equal(rows()[0].children[0].textContent, seoulClock(askedQuestion(5).ts));
+  assert.match(c.get('questions-status').textContent, /최신순 · 2개\+/);
+  const more = c.get('questions-more');
+  assert.equal(more.hidden, false);
+  assert.equal(more.textContent, '더 이전 질문 불러오기');
+  const kept = rows()[0];
+  more.events.click();
+  assert.equal(more.disabled, true);
+  await settle();
+  assert.equal(new URL(questionReads(calls).at(-1), 'https://fixture.invalid').searchParams.get('before'), '400');
+  assert.deepEqual(rows().map((row) => row.children[1].textContent), ['질문 5번 내용', '질문 4번 내용', '질문 3번 내용', '질문 2번 내용']);
+  assert.equal(rows()[0], kept, 'rows already shown stay mounted');
+  assert.equal(more.hidden, true, 'read to the start');
+  assert.equal(count.textContent, '질문 4개 ›');
+  // 완료 at the top right closes it and gives the focus back to the count.
+  assert.match(indexPage(), /<dialog id="questions-dialog" class="plan-dialog sheet questions-dialog" aria-labelledby="questions-title">/);
+  assert.match(indexPage(), /<button id="questions-close" class="sheet-done" type="button">완료<\/button>\s*<\/div>\s*<h2 id="questions-title">내 질문<\/h2>/);
+  const focus = count.focusCount || 0;
+  c.get('questions-close').events.click();
+  assert.equal(dialog.open, false);
+  assert.equal(count.focusCount, focus + 1);
+});
+
+test('질문을 누르면 시트를 닫고 저장 기록 미리보기를 대화 맨 위에 보이며 끝 고정을 푼다', async () => {
+  const { c, s, entry, calls, q, count } = questionsConversation(() => questionsReply({ questions: [askedQuestion(5), askedQuestion(4)] }));
+  c.renderMessages(s, [{ role: 'assistant', text: '최근 답', ts: 1 }]);
+  const list = c.get('messages');
+  Object.assign(list, { scrollHeight: 3000, clientHeight: 600, scrollTop: 2400, lastScrollTop: 2400, pinned: true });
+  await q.loadQuestions(s);
+  count.events.click(); await settle();
+  const opening = c.get('questions-list').children[1].events.click();
+  assert.equal(c.get('questions-dialog').open, false);
+  const preview = entry.historyPreview;
+  assert.equal(preview.label, '내 질문 · 저장 기록');
+  assert.equal(preview.bodyHash, askedQuestion(4).bodyHash);
+  assert.equal(preview.role, 'user');
+  assert.equal(preview.recordOffset, 400);
+  assert.deepEqual({ ...preview.source }, { host: 'workstation', agent: 'codex', id: 'native-session', home: '.codex-example' });
+  assert.ok(list.children.includes(preview.item.row), 'refreshConversationView put it in the conversation');
+  assert.match(textOf(preview.item.row), /내 질문 · 저장 기록/);
+  assert.doesNotMatch(textOf(preview.item.row), /검색한 메시지/);
+  assert.equal(preview.item.row.attributes['aria-label'], '내 질문 · 저장 기록');
+  assert.equal(list.scrollTop, 0, 'brought into view at the top');
+  assert.equal(list.pinned, false);
+  await opening; await settle();
+  const read = calls.find((url) => url.startsWith('/api/history/message?'));
+  assert.ok(read, 'loadLongMessage read the saved body');
+  assert.equal(new URL(read, 'https://fixture.invalid').searchParams.get('bodyHash'), askedQuestion(4).bodyHash);
+  assert.equal(new URL(read, 'https://fixture.invalid').searchParams.get('offset'), '400');
+  assert.equal(preview.item.displayMessage.text, '저장된 질문 전체 본문');
+  // The next read of the conversation does not carry the reader back to its end.
+  c.renderMessages(s, [{ role: 'assistant', text: '최근 답', ts: 1 }, { role: 'assistant', text: '새 답', ts: 2 }]);
+  assert.equal(list.scrollTop, 0);
+  assert.equal(list.children[0], preview.item.row);
+});
+
+test('질문 읽기가 진행 중이면 질문 본문 읽기는 그 뒤에 이어서 보낸다(기록 읽기는 한 번에 하나)', async () => {
+  let release = null;
+  const { c, s, calls, q, count } = questionsConversation(() => release === false
+    ? new Promise((resolve) => { release = () => resolve(questionsReply({ questions: [askedQuestion(7)] })); })
+    : questionsReply({ questions: [askedQuestion(7)] }));
+  c.renderMessages(s, [{ role: 'assistant', text: '최근 답', ts: 1 }]);
+  await q.loadQuestions(s);
+  release = false;
+  count.events.click();
+  c.get('questions-list').children[0].events.click();
+  await settle();
+  assert.equal(calls.filter((url) => url.startsWith('/api/history/message?')).length, 0, 'it waits for the questions read');
+  release(); await settle(6);
+  assert.equal(calls.filter((url) => url.startsWith('/api/history/message?')).length, 1);
+});
+
+test('봇 세션은 내 질문 줄과 시트를 쓰지 않고 질문을 읽지 않는다', async () => {
+  const { c, s, calls, q } = questionsConversation(() => questionsReply({ questions: [askedQuestion(1)] }), { session: { originator: 'hermes' } });
+  assert.equal(c.sessionCategoryOf(s), 'bot');
+  assert.equal(findId(c.get('detail'), 'question-pin'), null);
+  await q.loadQuestions(s);
+  c.renderMessages(s, [{ role: 'user', text: 'Slack의 다른 사람 글', ts: 1 }]);
+  q.openQuestions();
+  assert.equal(c.get('questions-dialog').open, undefined);
+  c.state.detailFor = null; c.refreshDetail(s); await settle(6);
+  assert.equal(questionReads(calls).length, 0);
+});
+
+test('질문을 읽지 못하면(Windows 기기 등) 토스트 없이 개수 단추를 숨기고, 화면 대화의 질문이 있으면 줄만 보인다', async () => {
+  const { c, s, calls, q, pin, count, text } = questionsConversation(() =>
+    ({ ok: false, status: 400, json: async () => ({ error: '이 기기의 저장 기록은 읽을 수 없습니다.' }) }));
+  await q.loadQuestions(s);
+  assert.equal(pin.hidden, true);
+  assert.equal(count.hidden, true);
+  assert.equal(c.get('toast').textContent, '');
+  c.renderMessages(s, [{ role: 'user', text: '화면에 있는 질문', ts: 100 }]);
+  assert.equal(pin.hidden, false);
+  assert.equal(text.textContent, '화면에 있는 질문');
+  assert.equal(count.hidden, true, 'no sheet to open');
+  await settle(6);
+  assert.equal(questionReads(calls).length, 1, 'never retried by itself');
+  // A list read once stays when a later read is refused (another record read, 429).
+  const busy = { first: true };
+  const later = questionsConversation(() => busy.first ? (busy.first = false, questionsReply({ questions: [askedQuestion(2)] }))
+    : { ok: false, status: 429, json: async () => ({ error: '기록을 읽고 있습니다. 잠시 뒤 다시 시도해 주세요.' }) });
+  await later.q.loadQuestions(later.s);
+  await later.q.loadQuestions(later.s);
+  assert.equal(later.count.hidden, false);
+  assert.equal(later.count.textContent, '질문 1개 ›');
+  // A malformed answer is not shown.
+  const odd = questionsConversation(() => ({ ok: true, status: 200, json: async () => ({ questions: [{ snippet: 'x' }], complete: true, readOnly: true }) }));
+  await odd.q.loadQuestions(odd.s);
+  assert.equal(odd.pin.hidden, true);
+  assert.equal(odd.count.hidden, true);
+});
+
+test('늦게 온 질문 목록은 다른 대화로 바뀌었거나 다시 로그인했으면 버린다', async () => {
+  let release;
+  const { c, s, entry, q } = questionsConversation(() => new Promise((resolve) => {
+    release = () => resolve(questionsReply({ questions: [askedQuestion(9)] })); }));
+  const reading = q.loadQuestions(s);
+  const other = selectChat(c, { id: 'other-session' });
+  c.drawDetail(other.s);
+  release(); await reading;
+  assert.equal(entry.questions.loaded, false);
+  assert.equal(entry.questions.items.length, 0);
+  assert.equal(c.get('question-pin').hidden, true, 'the conversation now open shows nothing of it');
+  // Locked and unlocked meanwhile: the old epoch's answer is dropped as well.
+  const again = questionsConversation(() => new Promise((resolve) => {
+    release = () => resolve(questionsReply({ questions: [askedQuestion(9)] })); }));
+  const pending = again.q.loadQuestions(again.s);
+  again.c.showLogin();
+  const back = selectChat(again.c);
+  again.c.drawDetail(back.s);
+  release(); await pending;
+  assert.equal(back.entry.questions ?? null, null);
+  assert.equal(again.c.get('question-pin').hidden, true);
+});
+
+test('보드에서 보낸 뒤에는 몇 초 뒤(마지막 읽기에서 15초 이상) 한 번만 다시 읽는다', async () => {
+  const armed = [];
+  const timers = { setTimeout: (callback, ms) => { armed.push({ callback, ms }); return armed.length; },
+    clearTimeout: (id) => { if (armed[id - 1]) armed[id - 1].cleared = true; } };
+  const { c, s, entry, calls, q } = questionsConversation(() => questionsReply({ questions: [askedQuestion(1)] }), { timers });
+  await q.loadQuestions(s);
+  entry.text = '새 질문'; entry.revision++;
+  await c.sendChat(entry);
+  const first = entry.questionsTimer;
+  assert.ok(first, 'a read is queued after the send');
+  assert.ok(armed[first - 1].ms > 4000 && armed[first - 1].ms <= 15000, `waits for the gap (${armed[first - 1].ms}ms)`);
+  entry.text = '이어서 한 질문'; entry.revision++;
+  await c.sendChat(entry);
+  assert.equal(armed[first - 1].cleared, true, 'a burst of sends reads once');
+  assert.equal(questionReads(calls).length, 1);
+  armed[entry.questionsTimer - 1].callback(); await settle();
+  assert.equal(questionReads(calls).length, 2);
+  // Long after the last read, the wait is the short one.
+  entry.questions.readAt = Date.now() - 60000;
+  q.queueQuestionsRefresh(entry);
+  assert.equal(armed[entry.questionsTimer - 1].ms, 4000);
+  // A send refused before it started does not read them again.
+  const refused = questionsConversation(() => questionsReply(), { timers });
+  refused.c.context.fetch = async (url) => url === '/api/chat/send'
+    ? { ok: false, status: 409, json: async () => ({ error: '터미널이 닫혀 있습니다.', dispatchState: 'not_started' }) }
+    : { ok: true, status: 200, json: async () => ({}) };
+  refused.entry.text = '안 간 질문'; refused.entry.revision++;
+  await refused.c.sendChat(refused.entry);
+  assert.equal(refused.entry.questionsTimer, undefined);
 });

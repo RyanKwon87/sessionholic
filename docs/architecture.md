@@ -106,7 +106,7 @@ Codex RPC의 `source.subAgent`와 DB의 `source.subagent` 구조를 보존하고
 - `agentRouter`: `{projectsFile, workspacesRoot, accountPolicy}`. 수집기의 프로젝트 이름표, 작업공간 루트, `.codex-router/<hash>` 홈의 (프로젝트, 계정) 이름표와 중단 계정 실행 정책에 씁니다. 계정 정책의 계정 이름·`suspended_accounts`만 사용하며 이메일 등 계정 값을 응답에 복사하지 않습니다. 중단 계정은 프로필을 남기되 실행 불가로 표시합니다. `excludeSuspended`를 켜지 않았다면 이 정책만으로 이전 기록을 숨기지 않습니다.
 - `tmux`: `{titleOption, taskOption}`. 기존 tmux 세션의 사용자 옵션을 제목·작업으로 표시합니다.
 - `transfer.agentConfig`: `"exclude-private"`(기본, `.claude`·`.codex*`의 개인 상태만 제외) 또는 `"exclude-all"`(이 이름의 폴더·파일 전체 제외).
-- `attachments.gitExclude`: 기본 `true`. `false`면 업로드 때 저장소의 `.git/info/exclude`를 쓰지 않습니다.
+- `attachments.gitExclude`: 기본 `true`. `false`면 업로드 때 저장소의 `.git/info/exclude`를 쓰지 않습니다. Windows PC는 이 설정 파일을 읽지 않으므로 PC 세션의 첨부는 항상 추가를 시도합니다.
 - `usage`: 보드 호스트의 사용량 도우미(`usage.py`). `provider: "helper"`, `resources`·`python`·`path`, Codex(`codex`, `codexHelper`, `codexAccounts: [{key, label}]`)·Claude(`claude`, `claudeHelper`) 중 하나 이상, `intervalSeconds`(기본 300)·`manualIntervalSeconds`(기본 20). 없으면 `/api/usage`는 404이고 화면은 사용량을 숨깁니다.
 - `hardware`: `{intervalSeconds, manualIntervalSeconds}`(기본 30·10초, 최소 30·5초). 켜면 맨 위 헤더(기기 연결 칩 옆)의 "기기" 칩과 창이 보드가 아는 모든 기기의 CPU·메모리·디스크·배터리·가동 시간을 보여 줍니다. 값은 `hardware.py`가 읽습니다. 보드 기기에서는 직접 실행하고, 원격 기기에는 수집기와 같은 방식으로 SSH stdin에 보내므로 원격에 파일을 남기지 않습니다. 맥은 커널 CPU tick·`vm_stat`·`pmset`·`kern.boottime`, Windows는 kernel32(GlobalMemoryStatusEx·GetSystemTimes·GetSystemPowerStatus·GetTickCount64)를 씁니다. CPU 사용률은 두 번 읽은 사이의 차이이고, 맥은 1분 평균 부하도 보여 줍니다. 화면이 열려 있을 때만 읽고, 실패한 기기는 마지막 값을 "이전 값"으로 남긴 채 간격을 늘립니다(최대 8배). 없으면 `/api/hardware`는 404이고 칩은 숨겨집니다.
 

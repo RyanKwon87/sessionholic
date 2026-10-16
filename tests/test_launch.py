@@ -466,6 +466,49 @@ class LaunchTest(unittest.TestCase):
         self.assertIn("row-099", data["messages"][-1]["text"])
         self.assertNotIn("row-000", text)
 
+    def handoff_record(self, messages):
+        result = self.build(self.profile("claude", ".claude"), messages=messages)
+        path = Path(result["handoffPath"])
+        text = path.read_text()
+        return path, json.loads(text[text.index("{\n"):])
+
+    def test_handoff_keeps_the_questions_a_tool_heavy_turn_would_push_out(self):
+        # 30 turns of one question, ten tool records and one answer: 360 rows, 60 of them
+        # conversation. The last 80 rows held only the last seven turns.
+        messages = []
+        for turn in range(30):
+            messages.append({"role": "user", "text": "q-%03d" % turn})
+            messages.extend({"role": "tool", "text": "tool %d.%d" % (turn, step)} for step in range(10))
+            messages.append({"role": "assistant", "text": "a-%03d" % turn})
+        _, data = self.handoff_record(messages)
+        talk = [row["text"] for row in data["messages"] if row["role"] in ("user", "assistant")]
+        self.assertEqual(len(talk), 60)
+        self.assertEqual(talk[0], "q-000")
+        self.assertEqual(len(data["messages"]), 360)
+        self.assertFalse(data["truncated"])
+        self.assertEqual(data["omittedMessages"], 0)
+
+    def test_handoff_trims_tool_output_before_the_conversation(self):
+        # 80 questions and answers of 3 KB with a long tool record after each question: over
+        # the byte budget, the tool records go first and every question and answer stays.
+        messages = []
+        for turn in range(40):
+            messages.append({"role": "user", "text": "q-%03d " % turn + "한" * 1000})
+            messages.append({"role": "tool", "text": "t-%03d " % turn + "x" * 30000})
+            messages.append({"role": "assistant", "text": "a-%03d " % turn + "한" * 1000})
+        path, data = self.handoff_record(messages)
+        self.assertLessEqual(path.stat().st_size, launch.MAX_HANDOFF_BYTES)
+        talk = [row["text"] for row in data["messages"] if row["role"] in ("user", "assistant")]
+        tools = [row["text"] for row in data["messages"] if row["role"] == "tool"]
+        self.assertEqual(len(talk), 80)
+        self.assertTrue(talk[0].startswith("q-000 "))
+        self.assertTrue(all(len(text.encode("utf-8")) <= launch.TOOL_TEXT_BYTES for text in tools))
+        self.assertLess(len(tools), 40)
+        if tools:
+            self.assertTrue(tools[-1].startswith("t-039 "), "the newest tool records stay")
+        self.assertTrue(data["truncated"])
+        self.assertEqual(data["omittedMessages"], 40 - len(tools))
+
     def test_default_environment_profile_is_a_environment_boundary(self):
         source = dict(self.source, home=".codex-isolated")
         with self.assertRaisesRegex(ValueError, "환경"):

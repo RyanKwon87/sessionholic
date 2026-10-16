@@ -27,8 +27,11 @@ HOME_KEY = re.compile(r"(?:\.codex(?:-[A-Za-z0-9_-]{1,40})?|\.codex-router/[0-9a
 ACCOUNT = re.compile(r"[A-Za-z0-9_-]{1,32}\Z")
 CLAUDE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{3,127}\Z")
 SOCKET_REL = Path("app-server-control/app-server-control.sock")
-MAX_MESSAGES = 80
 MAX_HANDOFF_BYTES = 256 * 1024
+# A tool record matters less to the next session than a question or an answer (the board
+# folds runs of them into one line), so its text is cut much shorter.
+MESSAGE_TEXT_BYTES = 32 * 1024
+TOOL_TEXT_BYTES = 2 * 1024
 REDACTIONS = (
     re.compile(r"-----BEGIN (?:[A-Z ]+ )?PRIVATE KEY-----[\s\S]*?(?:-----END (?:[A-Z ]+ )?PRIVATE KEY-----|\Z)"),
     re.compile(r"\bsk-(?:proj-|ant-api\d{2}-|ant-oat\d{2}-|svcacct-)?[A-Za-z0-9_-]{12,}"),
@@ -468,17 +471,22 @@ def _handoff_text(source, target, messages, git, transfer=None):
                   "transfer 기록의 원본·목적 작업 경로와 Git 상태를 확인하세요. "
                   "첨부 파일은 attachmentsPathMap의 from→to를 적용하고, " + instance.current()["remote"]["attachmentsDir"]
                   + " 상대 경로는 목적 작업 폴더에서 읽으세요.\n\n") + header
+    import collector
     rows = messages if isinstance(messages, list) else []
-    record["omittedMessages"] = max(0, len(rows) - MAX_MESSAGES)
-    record["truncated"] = len(rows) > MAX_MESSAGES
-    # Keep the most recent records, then trim by encoded size rather than characters.
-    for row in rows[-MAX_MESSAGES:]:
+    # The board's own window: the last questions and answers with the tool runs between them,
+    # so a turn that ran many tools does not leave the next session only its last few lines.
+    window, older = collector.recent_window(rows)
+    record["omittedMessages"] = len(rows) - len(window)
+    record["truncated"] = older
+    # Then trim by encoded size rather than characters.
+    for row in window:
         if not isinstance(row, dict) or row.get("role") not in ("user", "assistant", "tool"):
             continue
         value = row.get("text")
         if isinstance(value, str) and value:
             # Bound each individual record before serializing the whole document.
-            capped = value.encode("utf-8")[:32 * 1024].decode("utf-8", errors="ignore")
+            limit = TOOL_TEXT_BYTES if row["role"] == "tool" else MESSAGE_TEXT_BYTES
+            capped = value.encode("utf-8")[:limit].decode("utf-8", errors="ignore")
             record["truncated"] = record["truncated"] or capped != value
             record["messages"].append({"role": row["role"], "text": capped,
                                        "ts": row.get("ts") if isinstance(row.get("ts"), (int, float)) else None})
@@ -502,10 +510,33 @@ def _handoff_text(source, target, messages, git, transfer=None):
     def render():
         return header + json.dumps(record, ensure_ascii=False, indent=2) + "\n"
 
+    def oldest_to_drop():
+        # Tool output goes before the conversation, oldest first.
+        rows = record["messages"]
+        return next((i for i, row in enumerate(rows) if row["role"] == "tool"), 0)
+
     result = render()
+    excess = len(result.encode("utf-8")) - MAX_HANDOFF_BYTES
+    if excess > 0 and len(record["messages"]) > 1:
+        # Size each record once (its indent inside the document included) and drop enough
+        # in one pass; re-rendering up to 400 records per dropped one would take seconds.
+        rows = record["messages"]
+        sizes = [len(json.dumps(row, ensure_ascii=False, indent=2).encode("utf-8")) + 24 for row in rows]
+        order = ([i for i, row in enumerate(rows) if row["role"] == "tool"]
+                 + [i for i, row in enumerate(rows) if row["role"] != "tool"])
+        dropped = set()
+        for index in order[:-1]:
+            if excess <= 0:
+                break
+            dropped.add(index)
+            excess -= sizes[index]
+        record["messages"] = [row for i, row in enumerate(rows) if i not in dropped]
+        record["omittedMessages"] += len(dropped)
+        record["truncated"] = True
+        result = render()
     while len(result.encode("utf-8")) > MAX_HANDOFF_BYTES and record["messages"]:
         if len(record["messages"]) > 1:
-            record["messages"].pop(0)
+            record["messages"].pop(oldest_to_drop())
             record["omittedMessages"] += 1
             record["truncated"] = True
         else:

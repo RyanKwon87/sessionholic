@@ -17,6 +17,7 @@ from unittest.mock import Mock, patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import chat
 import server
+import transfer
 from transfer import Transfers
 import test_goals_http as http_fixture
 
@@ -423,17 +424,37 @@ class WindowsRoutingTest(unittest.TestCase):
         self.assertIs(result['olderOmitted'], False)
 
     def test_unsupported_operations_rejected_before_transport(self):
-        for operation in ('attachment', 'profiles', 'start_app_server', 'stage_handoff'):
+        for operation in ('profiles', 'start_app_server', 'stage_handoff'):
             with patch('transfer.subprocess.run', side_effect=AssertionError('unexpected transport')):
                 with self.assertRaisesRegex(ValueError, REASON):
                     self.flow.transfers.rpc(HOST, operation, {'source': ROW})
+        # An upload is not one of them any more: it is checked as an upload (the next test).
+        with patch('transfer.subprocess.run', side_effect=AssertionError('unexpected transport')):
+            with self.assertRaisesRegex(ValueError, '첨부 파일 정보'):
+                self.flow.transfers.rpc(HOST, 'attachment', {'source': ROW})
+
+    def test_an_upload_is_checked_before_transport_and_only_base64_enters_the_program(self):
+        upload = {'source': ROW, 'cwd': ROW['cwd'], 'name': 'shot.png', 'sha256': '0' * 64, 'data': 'AAAA'}
+        too_long = 'A' * (((20 * 1024 * 1024 + 2) // 3) * 4 + 4)
+        for change in ({'data': "AAAA'),print('x')#"}, {'data': 'AAA'}, {'data': None}, {'data': too_long},
+                       {'cwd': None}, {'name': 3}, {'sha256': None}, {'source': {**ROW, 'id': '../outside'}}):
+            with self.subTest(change=str(change)[:40]), \
+                    patch('transfer.subprocess.run', side_effect=AssertionError('unexpected transport')):
+                with self.assertRaises(ValueError):
+                    self.flow.transfers.rpc(HOST, 'attachment', {**upload, **change}, timeout=60)
+        # A well-formed upload goes, with the caller's wait rather than a read's 30 seconds.
+        envelope = json.dumps({'ok': True, 'result': {'id': '0' * 32}}).encode()
+        with patch('transfer.subprocess.run', return_value=SimpleNamespace(returncode=0, stdout=envelope)) as run:
+            self.assertEqual(self.flow.transfers.rpc(HOST, 'attachment', upload, timeout=60), {'id': '0' * 32})
+        self.assertEqual(run.call_args.kwargs['timeout'], 60)
+        self.assertIn(b"DATA=[\n'AAAA',\n]\n", run.call_args.kwargs['input'])
 
     def test_text_capability_comes_from_native_runtime(self):
         service = chat.Chat(self.board, self.flow, self.root)
         with patch.object(self.flow.transfers, 'rpc', return_value={**READ, 'readOnly': False, 'capabilities': {'canSend': True}}):
             result = service.state({'source': REF})
         self.assertTrue(result['capability']['supported'])
-        self.assertFalse(result['capability']['attachments'])
+        self.assertTrue(result['capability']['attachments'])
         self.assertEqual(result['messages'], READ['messages'])
 
     def test_wrong_scope_rejected_before_transport(self):
@@ -484,16 +505,83 @@ class WindowsRoutingTest(unittest.TestCase):
                 self.assertIsNone(result['prompt'])
                 self.assertFalse(result['promptOpenable'])
 
-    def test_text_send_is_once_and_upload_stays_unsupported(self):
+    def test_text_send_is_once_and_a_file_goes_to_the_pc_with_its_session(self):
         service = chat.Chat(self.board, self.flow, self.root)
         with patch.object(self.flow.transfers, 'rpc', return_value={'delivery': 'accepted', 'confirmed': True}) as rpc:
             result = service.send({'source': REF, 'requestId': 'fixture-send-0001', 'text': '합성 입력', 'attachments': []})
         self.assertEqual(result['status'], 'accepted')
         self.assertEqual(rpc.call_count, 1)
         self.assertEqual(rpc.call_args.args[2]['action'], 'send')
-        with patch.object(self.flow.transfers, 'rpc', side_effect=AssertionError('attachment RPC')):
-            with self.assertRaisesRegex(ValueError, '텍스트만'):
-                service.upload(REF, 'fixture.txt', b'fixture')
+        # The PC stores the file and names its own path; the message then carries its ID.
+        identifier, calls = 'f' * 32, []
+        stored = {'id': identifier, 'name': 'shot.png', 'size': 7, 'sha256': '0' * 64, 'mime': 'image/png',
+                  'relativePath': '.sessionholic-attachments/' + identifier + '/shot.png',
+                  'path': 'C:\\Example\\project\\.sessionholic-attachments\\' + identifier + '\\shot.png'}
+
+        def remote(host, op, args, timeout=30):
+            calls.append((op, args, timeout))
+            if op == 'attachment':
+                return dict(stored)
+            return {**READ, 'cwd': ROW['cwd']} if args['action'] == 'read' else {'delivery': 'accepted', 'confirmed': True}
+        with patch.object(self.flow.transfers, 'rpc', side_effect=remote):
+            uploaded = service.upload(REF, 'shot.png', b'fixture')['attachment']
+            result = service.send({'source': REF, 'requestId': 'fixture-send-0002', 'text': '', 'attachments': [identifier]})
+        self.assertEqual(uploaded['path'], stored['path'])
+        op, args, timeout = calls[1]
+        self.assertEqual((op, timeout, args['cwd'], args['name']), ('attachment', 60, ROW['cwd'], 'shot.png'))
+        self.assertEqual(args['source'], {'host': HOST['name'], 'agent': 'codex', 'home': '.codex', 'id': SID})
+        self.assertEqual(base64.b64decode(args['data']), b'fixture')
+        self.assertEqual((calls[2][1]['action'], calls[2][1]['attachmentIds'], calls[2][1]['input']), ('send', [identifier], []))
+        self.assertEqual(result['status'], 'accepted')
+        self.assertEqual([item['name'] for item in result['receipt']['attachments']], ['shot.png'])
+
+    def test_the_program_sent_to_a_pc_stores_an_upload_in_the_sessions_own_folder(self):
+        # Both programs (a fresh read naming the Claude session's folder, then the upload, which
+        # the PC checks against its own record) run here on a synthetic PC home.
+        home, project = self.root.resolve() / 'pc-home', self.root.resolve() / 'pc-project'
+        (project / '.git').mkdir(parents=True)
+        folder = home / '.claude/projects/example'
+        folder.mkdir(parents=True)
+        (folder / (CLAUDE_REF['id'] + '.jsonl')).write_text(''.join(json.dumps(entry) + '\n' for entry in [
+            {'type': 'user', 'cwd': str(project), 'message': {'content': '예제 요청'}},
+            {'type': 'assistant', 'message': {'content': [{'type': 'text', 'text': '예제 답변'}]}}]))
+        self.board.state[HOST['name']]['data']['claude'][0]['cwd'] = str(project)
+        real, programs = subprocess.run, []
+
+        def run_here(argv, **kwargs):
+            programs.append((argv, kwargs['input'], kwargs['timeout']))
+            return real([sys.executable, '-I', '-'], input=kwargs['input'], capture_output=True,
+                        timeout=kwargs['timeout'], env={**os.environ, 'HOME': str(home), 'USERPROFILE': str(home)})
+        content = b'\x89PNG\r\n\x1a\n' + os.urandom(3 * 1024 * 1024)
+        service = chat.Chat(self.board, self.flow, self.root)
+        with patch('transfer.subprocess.run', side_effect=run_here):
+            uploaded = service.upload(CLAUDE_REF, '화면 1.png', content)['attachment']
+        self.assertEqual(len(programs), 2, 'a fresh read, then the upload')
+        path = Path(uploaded['path'])
+        self.assertEqual(path, project / '.sessionholic-attachments' / uploaded['id'] / '화면 1.png')
+        self.assertEqual(path.read_bytes(), content)
+        self.assertEqual((uploaded['type'], uploaded['size']), ('image/png', len(content)))
+        self.assertIn('.sessionholic-attachments/', (project / '.git/info/exclude').read_text().splitlines())
+        argv, program, timeout = programs[1]
+        self.assertEqual(timeout, 60)
+        self.assertNotIn('화면', ' '.join(argv))
+        # The file rides as short base64 lines, never inside the request's single JSON line.
+        lines = program.decode('ascii').split('\n')
+        data = lines[lines.index('DATA=[') + 1:lines.index(']')]
+        self.assertGreater(len(data), 1)
+        self.assertTrue(all(len(line) <= transfer.WINDOWS_DATA_LINE + 3 for line in data))
+        self.assertEqual(base64.b64decode(''.join(line[1:-2] for line in data)), content)
+        request = next(line for line in lines if line.startswith(' result=m.handle('))
+        self.assertTrue(request.endswith(',DATA)'))
+        self.assertLess(len(request), 4096)
+        # The PC refuses a folder its record does not name for the session.
+        elsewhere = self.root.resolve() / 'elsewhere'
+        elsewhere.mkdir()
+        with patch('transfer.subprocess.run', side_effect=run_here):
+            with self.assertRaisesRegex(transfer.WorkerError, '작업 폴더'):
+                self.flow.transfers.rpc(HOST, 'attachment', {
+                    'source': CLAUDE_REF, 'cwd': str(elsewhere), 'name': 'x.txt', 'sha256': '0' * 64, 'data': 'AAAA'}, timeout=60)
+        self.assertEqual(list(elsewhere.iterdir()), [])
 
     def test_windows_terminal_quotes_literal_args_and_preserves_profile(self):
         spec = {'argv': [r'C:\Program Files\Codex\codex.exe', 'resume', SID, '--remote', 'unix://C:/profile/app.sock'],

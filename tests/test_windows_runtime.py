@@ -1,5 +1,7 @@
 """Synthetic native responses only; no SSH, model calls, signals or real sessions."""
+import base64
 import copy
+import hashlib
 import json
 from pathlib import Path
 import struct
@@ -11,6 +13,7 @@ from unittest.mock import patch
 import uuid
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import windows_attachments as wa
 import windows_collector as wc
 import windows_runtime as wr
 
@@ -62,6 +65,9 @@ class FakeReader:
 
     def database_rows(self, sid=None):
         return [dict(self.row)] if sid in (None, self.sid) else []
+
+    def claude_rows(self, target_sid=None):
+        return [dict(row) for row in getattr(self, 'claude_list', []) if target_sid in (None, row['id'])]
 
     def process_reader(self, pid):
         return copy.deepcopy(self.processes.get(pid))
@@ -251,6 +257,89 @@ class WindowsRuntimeTest(unittest.TestCase):
         result = self.runtime.chat({'action': 'read', 'source': self.source, 'requestIds': ['request-1234']})
         self.assertEqual(result['receipts'][0]['turnId'], 'turn-sent')
         self.assertTrue(result['receipts'][0]['confirmed'])
+
+    def stored(self, name, data):
+        return wa.store(str(self.reader.cwd), name, data)
+
+    def send_files(self, ids, request='request-1234', text='합성 입력', source=None):
+        return self.runtime.chat({'action': 'send', 'source': source or self.source, 'requestId': request,
+                                  'input': [{'type': 'text', 'text': text}] if text else [], 'attachmentIds': ids})
+
+    def test_files_go_once_as_native_images_and_path_lines_with_their_names(self):
+        image = self.stored('screen.png', b'\x89PNG\r\n\x1a\nfixture-image')
+        memo = self.stored('memo.txt', b'fixture-memo')
+        first = self.send_files([image['id'], memo['id']])
+        self.assertTrue(first['confirmed'])
+        mutation = next(params for method, params in self.reader.calls if method == 'turn/start')
+        # As native_chat._send on a Mac: the image as a native input, any other file as its path.
+        self.assertEqual(mutation['input'], [
+            {'type': 'text', 'text': '합성 입력'}, {'type': 'localImage', 'path': image['path']},
+            {'type': 'text', 'text': '첨부 파일: ' + json.dumps(memo['path'], ensure_ascii=False)}])
+        self.assertEqual([(item['name'], item['kind'], item['type']) for item in first['attachments']],
+                         [('screen.png', 'image', 'image/png'), ('memo.txt', 'file', 'text/plain')])
+        self.assertTrue(all(set(item) == {'id', 'name', 'type', 'size', 'kind', 'source'} for item in first['attachments']))
+        # The same request is answered from its record; other files under its ID are refused.
+        self.assertEqual(self.send_files([image['id'], memo['id']]), first)
+        with self.assertRaisesRegex(ValueError, '같은 요청 ID'):
+            self.send_files([image['id']])
+        self.assertEqual(self.reader.send_calls, 1)
+        # A later read names the files with its receipt; the record keeps no contents, paths or words.
+        read = self.runtime.chat({'action': 'read', 'source': self.source, 'requestIds': ['request-1234']})
+        self.assertEqual(read['receipts'][0]['attachments'], first['attachments'])
+        self.assertEqual(read['messages'][0]['attachments'][0]['kind'], 'image')
+        saved = ''.join(path.read_text() for path in self.runtime.store.root.glob('*.json'))
+        for value in ('fixture-image', 'fixture-memo', image['path'], memo['path'], '합성 입력'):
+            self.assertNotIn(value, saved)
+
+    def test_a_message_of_files_alone_goes_and_bad_attachment_lists_never_do(self):
+        image = self.stored('screen.png', b'\x89PNG\r\n\x1a\nfixture')
+        refused = ([image['id'], image['id']], ['%032x' % number for number in range(9)], ['../outside'],
+                   [1], 'not-a-list', ['0' * 32], [])
+        for ids in refused:
+            with self.subTest(ids=ids), self.assertRaises(ValueError):
+                self.send_files(ids, text='')
+        with self.assertRaises(ValueError):
+            self.send_files([image['id']], source={key: value for key, value in self.source.items() if key != 'cwd'})
+        self.assertEqual(self.reader.send_calls, 0)
+        self.assertTrue(self.send_files([image['id']], text='')['confirmed'])
+        mutation = next(params for method, params in self.reader.calls if method == 'turn/start')
+        self.assertEqual(mutation['input'], [{'type': 'localImage', 'path': image['path']}])
+
+    def test_images_are_offered_exactly_when_direct_input_is(self):
+        capabilities = self.runtime.chat({'action': 'read', 'source': self.source})['capabilities']
+        self.assertEqual((capabilities['canSend'], capabilities['canAttachImages']), (True, True))
+        self.reader.thread['canAcceptDirectInput'] = False
+        capabilities = self.runtime.chat({'action': 'read', 'source': self.source})['capabilities']
+        self.assertEqual((capabilities['canSend'], capabilities['canAttachImages']), (False, False))
+
+    def test_an_upload_lands_only_in_the_work_folder_the_pc_records_for_its_session(self):
+        data = b'\x89PNG\r\n\x1a\nfixture'
+        args = {'source': self.source, 'cwd': str(self.reader.cwd), 'name': 'shot.png',
+                'sha256': hashlib.sha256(data).hexdigest()}
+        chunks = [base64.b64encode(data).decode()]
+        stored = self.runtime.attachment(args, chunks)
+        self.assertEqual(Path(stored['path']).read_bytes(), data)
+        self.assertEqual(wa.resolve(str(self.reader.cwd), stored['id']), stored)
+        other = self.home / 'Projects/other'
+        other.mkdir()
+        with self.assertRaises(ValueError):
+            self.runtime.attachment({**args, 'cwd': str(other)}, chunks)
+        self.assertEqual(list(other.iterdir()), [])
+        # A Claude session's folder is the one its list row names.
+        sid = str(uuid.uuid4())
+        claude = {'host': 'fixture-pc', 'agent': 'claude', 'id': sid, 'sessionId': sid, 'home': '.claude'}
+        with self.assertRaises(ValueError):
+            self.runtime.attachment({**args, 'source': claude}, chunks)
+        self.reader.claude_list = [{'id': sid, 'cwd': str(self.reader.cwd)}]
+        self.assertTrue(Path(self.runtime.attachment({**args, 'source': claude}, chunks)['path']).is_file())
+        self.reader.row['archived'] = 1
+        with self.assertRaises(ValueError):
+            self.runtime.attachment(args, chunks)
+        # Only an upload carries a file, and an upload always does.
+        with self.assertRaises(ValueError):
+            wr.handle({'op': 'chat', 'args': {'source': self.source, 'action': 'read'}}, chunks)
+        with self.assertRaises(ValueError):
+            wr.handle({'op': 'attachment', 'args': args})
 
     def test_duplicate_endpoint_refuses_mutation(self):
         self.reader.paths.append(self.reader.path)

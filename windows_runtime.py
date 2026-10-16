@@ -1,8 +1,9 @@
 """Finite Windows native-session actions, preserving the owning PC's settings.
 
-The board injects this module and windows_collector over SSH stdin. It starts no
-server and accepts no arbitrary shell command, PID, binary or filesystem path.
-Only metadata receipts and a local proof key are persisted; input is not logged.
+The board injects this module, windows_collector and windows_attachments over SSH stdin.
+It starts no server and accepts no arbitrary shell command, PID, binary or filesystem path.
+Besides uploads kept in the session's own work folder (windows_attachments), only metadata
+receipts and a local proof key are persisted; input is not logged.
 """
 from __future__ import annotations
 
@@ -21,6 +22,7 @@ import stat
 import time
 import uuid
 
+import windows_attachments as wa
 import windows_collector as wc
 
 REQUEST = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.:-]{7,127}\Z')
@@ -198,7 +200,7 @@ def _capabilities(thread):
     state = _state(thread)
     remote = _remote(thread.get('source')) or _remote(thread.get('threadSource'))
     supported = thread.get('canAcceptDirectInput') is True and state['runtimeKnown'] and not remote
-    return {'canRead': True, 'canSend': supported, 'canAttachImages': False,
+    return {'canRead': True, 'canSend': supported, 'canAttachImages': supported,
             'canAnswerApprovals': False, 'canAnswerQuestions': False,
             'reason': None if supported else '이 PC 세션의 직접 입력 지원을 확인하지 못했습니다. 터미널에서 이어가세요.'}
 
@@ -439,10 +441,20 @@ class WindowsRuntime:
             if not isinstance(request_id, str) or not REQUEST.fullmatch(request_id):
                 raise ValueError('PC 메시지 요청 식별자가 올바르지 않습니다.')
             receipt = _receipt(identity, request_id, thread)
-            if not receipt['confirmed'] and self.store.root.exists():
-                saved = self.store.read('chat-' + _digest([identity, request_id]) + '.json')
-                if saved and saved.get('result'):
-                    receipt = saved['result']
+            saved = None
+            if self.store.root.exists():
+                try:
+                    saved = self.store.read('chat-' + _digest([identity, request_id]) + '.json')
+                except (OSError, ValueError):
+                    # Only an unconfirmed receipt depends on its record; a confirmed one
+                    # merely loses its attachment names.
+                    if not receipt['confirmed']:
+                        raise
+            if not receipt['confirmed'] and saved and saved.get('result'):
+                receipt = saved['result']
+            # The names of the files a request carried, as a Mac's ledger keeps them.
+            if isinstance(saved, dict) and isinstance(saved.get('attachments'), list) and saved['attachments']:
+                receipt = {**receipt, 'attachments': saved['attachments']}
             receipts.append(receipt)
         capabilities = {**_capabilities(thread), 'canLaunch': True}
         messages, older = wc._recent_window(wc._codex_rows(thread['turns']))
@@ -453,16 +465,57 @@ class WindowsRuntime:
             result.update(receipts[0])
         return result
 
+    def attachment(self, args, data):
+        """Store one upload (windows_attachments.receive) in the work folder this PC records
+        for the session, never another path; it starts and sends nothing."""
+        identity = _identity(args.get('source'))
+        if identity['agent'] == 'codex':
+            rows = self.reader.database_rows(identity['id'])
+            known = rows[0].get('cwd') if len(rows) == 1 and not rows[0].get('archived') else None
+        else:
+            known = next(iter(self.reader.claude_rows(target_sid=identity['id'])), {}).get('cwd')
+        cwd = args.get('cwd')
+        if not isinstance(cwd, str) or not isinstance(known, str) or not known or wc._norm(cwd) != wc._norm(known):
+            raise ValueError('첨부할 세션의 실제 작업 폴더를 확인하지 못했습니다. 목록을 새로 읽어 주세요.')
+        return wa.receive({**args, 'cwd': known}, data)
+
+    def _attachments(self, args, observed):
+        """(native inputs, manifest) of the request's uploads, looked up by ID in the verified
+        session cwd as native_chat._send does: an image becomes a native image input, any
+        other file a "첨부 파일:" path line (never its contents)."""
+        ids = args.get('attachmentIds', [])
+        if (not isinstance(ids, list) or len(ids) > 8 or len(set(map(str, ids))) != len(ids)
+                or any(not isinstance(value, str) or not wa.ID.fullmatch(value) for value in ids)):
+            raise ValueError('첨부 식별자가 올바르지 않습니다.')
+        if ids and not (args.get('source') or {}).get('cwd'):
+            raise ValueError('실제 세션의 작업 폴더가 변경되었습니다. 목록을 다시 읽어 주세요.')
+        inputs, manifest = [], []
+        for identifier in ids:
+            item = wa.resolve(observed['cwd'], identifier)
+            manifest.append({'id': item['id'], 'name': item['name'], 'type': item['mime'], 'size': item['size'],
+                             'kind': 'image' if item['mime'].startswith('image/') else 'file', 'source': 'sessionholic'})
+            if item['mime'] in wa.IMAGE_TYPES:
+                inputs.append({'type': 'localImage', 'path': item['path']})
+            else:
+                inputs.append({'type': 'text', 'text': '첨부 파일: ' + json.dumps(item['path'], ensure_ascii=False)})
+        return inputs, manifest
+
     def _send(self, args, observed):
         identity, request_id = observed['source'], args['requestId']
         inputs = args.get('input')
-        if (not isinstance(inputs, list) or not 1 <= len(inputs) <= 16 or args.get('attachmentIds')
+        # The 32 KiB is the user's text; the board's attachment lines come on top of it.
+        if (not isinstance(inputs, list) or len(inputs) > 16
                 or any(not isinstance(item, dict) or set(item) != {'type', 'text'} or item.get('type') != 'text'
                        or not isinstance(item.get('text'), str) for item in inputs)
-                or not any(item['text'].strip() for item in inputs)
                 or sum(len(item['text'].encode()) for item in inputs) > 32768):
-            raise ValueError('PC 입력은 32 KiB 이하의 텍스트를 지원합니다.')
+            raise ValueError('PC 입력은 32 KiB 이하의 텍스트와 첨부 파일을 지원합니다.')
+        attached, manifest = self._attachments(args, observed)
+        if not attached and not any(item['text'].strip() for item in inputs):
+            raise ValueError('PC 입력은 32 KiB 이하의 텍스트와 첨부 파일을 지원합니다.')
+        # The digest covers the attachments' inputs: the same request ID with other files is refused.
+        inputs = list(inputs) + attached
         digest, name = _digest(inputs), 'chat-' + _digest([identity, request_id]) + '.json'
+        named = {'attachments': manifest} if manifest else {}
         with self.store.lock():
             prior = self.store.read(name)
             if prior:
@@ -478,7 +531,8 @@ class WindowsRuntime:
                 caps = _capabilities(thread)
                 if not caps['canSend']:
                     return {**before, 'delivery': 'rejected', 'reason': caps['reason']}
-                self.store.save(name, {'digest': digest, 'result': before})
+                before = {**before, **named}
+                self.store.save(name, {'digest': digest, 'result': before, **named})
                 result = before
                 try:
                     response = client.call('turn/start', {'threadId': identity['id'], 'input': inputs, 'clientUserMessageId': request_id})
@@ -488,10 +542,10 @@ class WindowsRuntime:
                     after = self._thread(client, identity, observed['cwd'])
                     confirmed = _receipt(identity, request_id, after)
                     if confirmed['confirmed']:
-                        result = confirmed
+                        result = {**confirmed, **named}
                 except (OSError, ValueError, TimeoutError):
                     pass
-                self.store.save(name, {'digest': digest, 'result': result})
+                self.store.save(name, {'digest': digest, 'result': result, **named})
                 return result
 
     def _verify_endpoint(self, observed):
@@ -667,11 +721,16 @@ class WindowsRuntime:
                     'reason': str(exc) or '이 PC 기록을 다시 열 수 없습니다.'}
 
 
-def handle(request):
+def handle(request, data=None):
+    """One request; `data` is an upload's base64 lines (transfer.windows_rpc), for `attachment` only."""
     if not isinstance(request, dict) or not isinstance(request.get('args'), dict):
         raise ValueError('PC 작업 요청 형식이 올바르지 않습니다.')
-    runtime, args = WindowsRuntime(), request['args']
-    op = request.get('op')
+    op, args = request.get('op'), request['args']
+    if (op == 'attachment') != (data is not None):
+        raise ValueError('PC 작업 요청 형식이 올바르지 않습니다.')
+    runtime = WindowsRuntime()
+    if op == 'attachment':
+        return runtime.attachment(args, data)
     if op == 'chat':
         return runtime.chat(args)
     if op == 'control_preview':

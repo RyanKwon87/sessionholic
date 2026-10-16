@@ -1047,9 +1047,11 @@ class WindowsCollector:
                             'historyNotice': dict(NOT_PERSISTED), 'executionMode': 'one-shot', 'transcriptAvailability': 'disabled'}
                 raise ValueError('정확한 PC Claude 대화 기록을 찾지 못했습니다.')
             entries, messages, older = _conversation(path, _claude_rows)
+            # The work folder, as the list row derives it: an upload is checked against it (chat.Chat.upload).
             return {'messages': messages, 'olderOmitted': older, 'modelSettings': _claude_model_settings(entries),
                     'phase': row.get('phase', 'unknown'), 'runtimeKnown': row.get('runtimeKnown', False),
                     'activeFlags': [], 'updatedAt': int(path.stat().st_mtime), 'readOnly': True,
+                    **({'cwd': row['cwd']} if isinstance(row.get('cwd'), str) and row['cwd'] else {}),
                     **{key: row[key] for key in ('executionMode', 'transcriptAvailability') if key in row}}
         if home != '.codex':
             raise ValueError('등록된 PC Codex home만 읽을 수 있습니다.')
@@ -1258,6 +1260,18 @@ def _message(role, text, ts=None, **metadata):
     return row
 
 
+def _native_attachments(blocks):
+    """As collector.native_attachments: evidence only, never a path or encoded contents."""
+    out = []
+    for block in blocks if isinstance(blocks, list) else []:
+        if isinstance(block, dict) and block.get('type') in ('image', 'localImage', 'document'):
+            image = block['type'] != 'document'
+            out.append({'id': None, 'name': '이미지' if image else '파일',
+                        'type': 'image/*' if image else 'application/octet-stream',
+                        'size': None, 'kind': 'image' if image else 'file', 'source': 'native'})
+    return out[:32]
+
+
 def _codex_messages(turns):
     return _recent_window(_codex_rows(turns))[0]
 
@@ -1275,8 +1289,14 @@ def _codex_rows(turns):
                 content = item.get('content') if isinstance(item.get('content'), list) else []
                 texts = (_codex_user_text(block.get('text', '')) for block in content if isinstance(block, dict) and block.get('type') == 'text' and isinstance(block.get('text'), str))
                 text = '\n'.join(value for value in texts if value is not None)
-                if text:
-                    result.append(_message('user', text, turn.get('startedAt'), **metadata))
+                attached = _native_attachments(content)
+                if text or attached:
+                    # As collector.codex_turn_rows: a message of images alone still shows.
+                    fallback = '[이미지 첨부]' if all(a['kind'] == 'image' for a in attached) else '[파일 첨부]'
+                    row = _message('user', text or fallback, turn.get('startedAt'), **metadata)
+                    if attached:
+                        row['attachments'] = attached
+                    result.append(row)
             elif item.get('type') == 'agentMessage' and item.get('text'):
                 result.append(_message('assistant', item['text'], turn.get('completedAt'), phase=item.get('phase'), **metadata))
             elif item.get('type') == 'commandExecution':

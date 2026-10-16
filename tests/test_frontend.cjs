@@ -7885,6 +7885,18 @@ test('B4: the board\'s own attachment path lines become file chips and "[이미�
     .attachments.map((file) => file.name), ['화면.png']);
 });
 
+test('B4: a Windows PC\'s attachment path lines become file chips as well', () => {
+  const c = client(undefined, noChatTimers);
+  // Codex gets the path as JSON (its backslashes doubled); Claude's terminal gets it as written.
+  const codexLine = '첨부 파일: "C:\\\\Users\\\\example\\\\project\\\\.sessionholic-attachments\\\\0a1b\\\\보고서.pdf"';
+  const claudeLine = '첨부 파일: C:\\Users\\example\\project\\.sessionholic-attachments\\0c2d\\화면.png';
+  const parts = c.userMessageParts({ text: '검토해 주세요\n' + codexLine + '\n' + claudeLine, attachments: [] });
+  assert.equal(parts.body, '검토해 주세요');
+  assert.deepEqual(parts.attachments.map((file) => [file.name, file.kind]), [['보고서.pdf', 'file'], ['화면.png', 'image']]);
+  const typed = c.userMessageParts({ text: '첨부 파일: C:\\Users\\example\\notes\\memo.txt', attachments: [] });
+  assert.deepEqual(typed.attachments, [], "a path outside the board's folder stays text");
+});
+
 test('B5: a timed final answer after untimed progress notes shows its own name and time', () => {
   const c = client(undefined, noChatTimers); const { s } = selectChat(c);
   c.renderMessages(s, [{ role: 'user', text: '질문', ts: 1000 }, { role: 'assistant', text: '살펴볼게요', ts: null },

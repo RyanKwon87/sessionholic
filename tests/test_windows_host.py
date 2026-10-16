@@ -2,8 +2,10 @@
 import base64
 import copy
 import json
+import os
 from pathlib import Path
 import re
+import subprocess
 import sys
 import tempfile
 import threading
@@ -395,6 +397,30 @@ class WindowsRoutingTest(unittest.TestCase):
         self.assertNotIn(SID, ' '.join(run.call_args.args[0]))
         self.assertEqual(run.call_args.kwargs['timeout'], 20)
         self.assertFalse(self.flow.transfers.runtime_installed)
+
+    def test_the_program_sent_to_a_pc_reads_the_conversation_with_its_model_and_effort(self):
+        # Every request carries windows_collector and windows_runtime on stdin (nothing is
+        # installed on the PC): that very program runs here, on a synthetic PC home.
+        home = self.root.resolve() / 'pc-home'
+        folder = home / '.claude/projects/example'
+        folder.mkdir(parents=True)
+        (folder / (CLAUDE_REF['id'] + '.jsonl')).write_text(''.join(json.dumps(entry) + '\n' for entry in [
+            {'type': 'user', 'message': {'content': '예제 요청'}},
+            {'type': 'assistant', 'effort': 'xhigh',
+             'message': {'model': 'claude-opus-5-5', 'content': [{'type': 'text', 'text': '예제 답변'}]}}]))
+        real, programs = subprocess.run, []
+
+        def run_here(argv, **kwargs):
+            programs.append(kwargs['input'])
+            return real([sys.executable, '-I', '-'], input=kwargs['input'], capture_output=True,
+                        timeout=kwargs['timeout'], env={**os.environ, 'HOME': str(home), 'USERPROFILE': str(home)})
+        service = chat.Chat(self.board, self.flow, self.root)
+        with patch('transfer.subprocess.run', side_effect=run_here):
+            result = service.state({'source': CLAUDE_REF})
+        self.assertEqual(len(programs), 1)
+        self.assertEqual(result['modelSettings'], {'model': 'claude-opus-5-5', 'effort': 'xhigh', 'observed': 'last_response'})
+        self.assertEqual([message['text'] for message in result['messages']], ['예제 요청', '예제 답변'])
+        self.assertIs(result['olderOmitted'], False)
 
     def test_unsupported_operations_rejected_before_transport(self):
         for operation in ('attachment', 'profiles', 'start_app_server', 'stage_handoff'):

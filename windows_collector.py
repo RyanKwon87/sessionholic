@@ -28,9 +28,13 @@ import uuid
 
 LIMIT = 100
 ENDPOINT_LIMIT = 16
-TAIL_BYTES = 2 * 1024 * 1024
-# Lines of a file's end parsed at most.
-ENTRY_LIMIT = 2000
+# A conversation read (a Claude transcript, the saved rollout of a stopped Codex server) takes
+# this much of the file's end, widened step by step while it holds fewer than MESSAGE_LIMIT
+# questions and answers (as collector.CLAUDE_READ_TAILS; _conversation).
+READ_TAILS = (2 * 1024 * 1024, 8 * 1024 * 1024, 32 * 1024 * 1024)
+# As native_chat.MODEL_ID and EFFORTS: the model and effort a session may be shown with.
+MODEL_ID = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.:/-]{0,119}\Z')
+EFFORTS = ('none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra')
 # A Claude list row reads only a transcript's end: Claude appends its rename and generated
 # titles again and again, so the newest of each and the last answer sit in the final kilobytes.
 CLAUDE_LABEL_TAIL = 64 * 1024
@@ -1042,9 +1046,8 @@ class WindowsCollector:
                             'activeFlags': [], 'updatedAt': row.get('updatedAt'), 'readOnly': True,
                             'historyNotice': dict(NOT_PERSISTED), 'executionMode': 'one-shot', 'transcriptAvailability': 'disabled'}
                 raise ValueError('정확한 PC Claude 대화 기록을 찾지 못했습니다.')
-            entries, whole = _tail_read(path)
-            messages, dropped = _recent_window(_claude_rows(entries))
-            return {'messages': messages, 'olderOmitted': dropped or not whole,
+            entries, messages, older = _conversation(path, _claude_rows)
+            return {'messages': messages, 'olderOmitted': older, 'modelSettings': _claude_model_settings(entries),
                     'phase': row.get('phase', 'unknown'), 'runtimeKnown': row.get('runtimeKnown', False),
                     'activeFlags': [], 'updatedAt': int(path.stat().st_mtime), 'readOnly': True,
                     **{key: row[key] for key in ('executionMode', 'transcriptAvailability') if key in row}}
@@ -1071,7 +1074,8 @@ class WindowsCollector:
                 if not isinstance(thread, dict) or thread.get('id') != sid or _norm(thread.get('cwd')) != _norm(row['cwd']):
                     raise ValueError('PC 서버 대화의 소유 경계가 다릅니다.')
                 messages, dropped = _recent_window(_codex_rows(thread.get('turns') or []))
-                observed.append({'messages': messages, 'olderOmitted': dropped, 'phase': _phase(thread.get('status')),
+                observed.append({'messages': messages, 'olderOmitted': dropped, 'modelSettings': _model_settings(thread),
+                        'phase': _phase(thread.get('status')),
                         'runtimeKnown': _phase(thread.get('status')) != 'unknown',
                         'activeFlags': _flags(thread.get('status')),
                         'updatedAt': _epoch(thread.get('updatedAt')), 'readOnly': True})
@@ -1089,9 +1093,9 @@ class WindowsCollector:
         meta = next((entry.get('payload') for entry in _head(path) if entry.get('type') == 'session_meta'), None)
         if not isinstance(meta, dict) or meta.get('id') != sid or _norm(meta.get('cwd')) != _norm(row['cwd']):
             raise ValueError('PC 저장 대화의 세션 신원을 확인하지 못했습니다.')
-        entries, whole = _tail_read(path)
-        messages, dropped = _recent_window(_rollout_rows(entries))
-        return {'messages': messages, 'olderOmitted': dropped or not whole, 'phase': 'unknown', 'runtimeKnown': False,
+        # Like a closed Codex read on a Mac, this names no model or effort.
+        unused, messages, older = _conversation(path, _rollout_rows)
+        return {'messages': messages, 'olderOmitted': older, 'phase': 'unknown', 'runtimeKnown': False,
                 'activeFlags': [], 'updatedAt': _epoch(row['updated_at']), 'readOnly': True,
                 'runtimeReason': '저장된 대화입니다. 현재 실행 상태는 확인되지 않았습니다.'}
 
@@ -1102,12 +1106,12 @@ def _head(path):
     return _entries(raw.splitlines()[:30])
 
 
-def _tail(path, limit=TAIL_BYTES):
+def _tail(path, limit):
     return _tail_read(path, limit)[0]
 
 
-def _tail_read(path, limit=TAIL_BYTES):
-    """(entries of the file's end, whether they reach back to its start)."""
+def _tail_read(path, limit):
+    """(entries of the file's last `limit` bytes, whether that reached its start)."""
     with path.open('rb') as stream:
         stream.seek(0, os.SEEK_END)
         size = stream.tell()
@@ -1115,8 +1119,49 @@ def _tail_read(path, limit=TAIL_BYTES):
         raw = stream.read(limit)
     lines = raw.splitlines()
     if size > limit:
-        lines = lines[1:]
-    return _entries(lines), size <= limit and len(lines) <= ENTRY_LIMIT
+        lines = lines[1:]  # the first line was cut in the middle
+    return _entries(lines), size <= limit
+
+
+def _conversation(path, rows_of):
+    """(entries, window, olderOmitted) of a transcript read from its end, as
+    collector.claude_conversation (this reader runs on its own).
+
+    2 MB first; while that holds fewer than MESSAGE_LIMIT questions and answers (and fewer than
+    ROW_LIMIT rows) and the file is longer, 8 MB and then 32 MB at most. Only the window goes
+    back over SSH; the bytes read stay on this PC. olderOmitted: the window dropped rows, or the
+    read did not reach the file's start."""
+    for limit in READ_TAILS:
+        entries, whole = _tail_read(path, limit)
+        rows = rows_of(entries)
+        if whole or _conversation_count(rows) >= MESSAGE_LIMIT or len(rows) >= ROW_LIMIT:
+            break
+    window, dropped = _recent_window(rows)
+    return entries, window, dropped or not whole
+
+
+def _conversation_count(rows):
+    return sum(1 for row in rows if row.get('role') in ('user', 'assistant'))
+
+
+def _model_settings(value):
+    """A Codex thread's {model, effort}, as native_chat.model_settings."""
+    value = value if isinstance(value, dict) else {}
+    model, effort = value.get('model'), value.get('reasoningEffort')
+    return {'model': model if isinstance(model, str) and MODEL_ID.fullmatch(model) else None,
+            'effort': effort if effort in EFFORTS else None}
+
+
+def _claude_model_settings(entries):
+    """As native_chat._claude: Claude records its model and effort on each response, so the
+    newest main-thread one counts (a subagent's or a <synthetic> one says nothing of the session)."""
+    for entry in reversed(entries):
+        message = entry.get('message') if entry.get('type') == 'assistant' and not entry.get('isSidechain') else None
+        model = message.get('model') if isinstance(message, dict) else None
+        if isinstance(model, str) and MODEL_ID.fullmatch(model):
+            effort = entry.get('effort') or entry.get('perTurnEffort')
+            return {'model': model, 'effort': effort if effort in EFFORTS else None, 'observed': 'last_response'}
+    return {'model': None, 'effort': None}
 
 
 def _recent_window(rows):
@@ -1155,7 +1200,7 @@ def _claude_label(path):
 
 def _entries(lines):
     entries = []
-    for raw in lines[-ENTRY_LIMIT:]:
+    for raw in lines:
         try:
             item = json.loads(raw)
             if isinstance(item, dict):

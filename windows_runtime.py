@@ -447,6 +447,7 @@ class WindowsRuntime:
         capabilities = {**_capabilities(thread), 'canLaunch': True}
         messages, older = wc._recent_window(wc._codex_rows(thread['turns']))
         result = {**_state(thread), 'messages': messages, 'olderOmitted': older, 'cwd': observed['cwd'],
+                  'modelSettings': wc._model_settings(thread),
                   'capabilities': capabilities, 'readOnly': not capabilities['canSend'], 'receipts': receipts}
         if action == 'receipt':
             result.update(receipts[0])

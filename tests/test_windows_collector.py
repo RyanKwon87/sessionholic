@@ -781,7 +781,102 @@ class WindowsCollectorTest(unittest.TestCase):
         sid, path = self.claude_transcript(messages=[{'type': 'user', 'message': {'content': '합성 %d' % index}} for index in range(3)])
         self.assertIs(self.reader.read('claude', sid)['olderOmitted'], False)
         # A transcript longer than the bytes read may hold older messages.
-        self.assertEqual([wc._tail_read(path, limit)[1] for limit in (64, wc.TAIL_BYTES)], [False, True])
+        self.assertEqual([wc._tail_read(path, limit)[1] for limit in (64, wc.READ_TAILS[0])], [False, True])
+
+    def pairs(self, numbers, filler=0):
+        """A question and an answer per number, each followed by a tool result of `filler`
+        bytes (no text, so never a row)."""
+        entries = []
+        for number in numbers:
+            entries += [{'type': 'user', 'message': {'content': '질문 %d' % number}},
+                        {'type': 'assistant', 'message': {'content': [{'type': 'text', 'text': '답변 %d' % number}]}}]
+            if filler:
+                entries.append({'type': 'user', 'message': {'content': [{'type': 'tool_result', 'content': 'x' * filler}]}})
+        return entries
+
+    @staticmethod
+    def conversation_reads(read):
+        # The list row's label read (_claude_label) is not the conversation's.
+        return [call.args[1] for call in read.call_args_list if call.args[1] != wc.CLAUDE_LABEL_TAIL]
+
+    def test_read_ranges_are_the_boards(self):
+        self.assertEqual(wc.READ_TAILS, (2 * 1024 * 1024, 8 * 1024 * 1024, 32 * 1024 * 1024))
+
+    def test_claude_read_widens_from_2_to_8_mb_until_80_questions_and_answers(self):
+        # Tool output fills a long session's end: its last 2 MB hold only 34 turns.
+        sid, path = self.claude_transcript(messages=self.pairs(range(100), 60 * 1024))
+        with patch.object(wc, '_tail_read', wraps=wc._tail_read) as read:
+            result = self.reader.read('claude', sid)
+        self.assertEqual((len(result['messages']), result['messages'][0]['text'], result['olderOmitted']), (80, '질문 60', True))
+        self.assertEqual(self.conversation_reads(read), [2 * 1024 * 1024, 8 * 1024 * 1024])
+        # Read to its start, a shorter session leaves nothing out.
+        sid, path = self.claude_transcript(messages=self.pairs(range(10)) + self.pairs([10], 3 * 1024 * 1024) + self.pairs([11, 12]))
+        result = self.reader.read('claude', sid)
+        self.assertEqual((len(result['messages']), result['messages'][0]['text'], result['olderOmitted']), (26, '질문 0', False))
+
+    def test_claude_read_stops_widening_at_32_mb(self):
+        sid, path = self.claude_transcript(messages=self.pairs(range(100), 20 * 1024))
+        # The same steps, a thousand times smaller.
+        with patch.object(wc, 'READ_TAILS', (2 * 1024, 8 * 1024, 32 * 1024)), \
+                patch.object(wc, '_tail_read', wraps=wc._tail_read) as read:
+            result = self.reader.read('claude', sid)
+        self.assertEqual(self.conversation_reads(read), [2 * 1024, 8 * 1024, 32 * 1024])
+        self.assertEqual([row['text'] for row in result['messages']], ['질문 99', '답변 99'])
+        self.assertIs(result['olderOmitted'], True, "the read never reached the transcript's start")
+
+    def test_claude_read_of_a_short_transcript_reads_once(self):
+        sid, path = self.claude_transcript(messages=self.pairs(range(3)))
+        with patch.object(wc, '_tail_read', wraps=wc._tail_read) as read:
+            result = self.reader.read('claude', sid)
+        self.assertEqual(self.conversation_reads(read), [2 * 1024 * 1024])
+        self.assertEqual((len(result['messages']), result['olderOmitted']), (6, False))
+
+    def test_claude_read_parses_every_line_it_reads(self):
+        # Thousands of short tool records no longer push the questions before them out of the read.
+        tools = [{'type': 'assistant', 'message': {'content': [{'type': 'tool_use', 'name': 'Bash', 'input': {}}]}}] * 2500
+        sid, path = self.claude_transcript(messages=self.pairs(range(30)) + tools + self.pairs([30]))
+        result = self.reader.read('claude', sid)
+        self.assertEqual((len(result['messages']), result['messages'][0]['text'], result['olderOmitted']), (62, '질문 0', False))
+
+    def test_saved_rollout_read_widens_the_same_way(self):
+        lines = [{'type': 'session_meta', 'payload': {'id': self.sid, 'cwd': self.cwd}}]
+        for number in range(100):
+            lines += [{'type': 'response_item', 'payload': {'type': 'message', 'role': 'user',
+                                                            'content': [{'type': 'input_text', 'text': '질문 %d' % number}]}},
+                      {'type': 'response_item', 'payload': {'type': 'message', 'role': 'assistant',
+                                                            'content': [{'type': 'output_text', 'text': '답변 %d' % number}]}},
+                      {'type': 'response_item', 'payload': {'type': 'function_call_output', 'output': 'x' * 60 * 1024}}]
+        self.rollout.write_text(''.join(json.dumps(line) + '\n' for line in lines))
+        result = self.reader.read('codex', self.sid, '.codex')
+        self.assertEqual((len(result['messages']), result['messages'][0]['text'], result['olderOmitted']), (80, '질문 60', True))
+        # A stored rollout names no model, as a closed Codex read on the board's own hosts.
+        self.assertNotIn('modelSettings', result)
+
+    def test_claude_read_names_the_newest_main_responses_model_and_effort(self):
+        answer = lambda model, **fields: {'type': 'assistant', 'message': {'model': model, 'content': [{'type': 'text', 'text': 'ok'}]}, **fields}
+
+        def read(entries):
+            sid, path = self.claude_transcript(messages=entries)
+            return self.reader.read('claude', sid)['modelSettings']
+
+        # A subagent's response and a <synthetic> one come later but say nothing of the session.
+        self.assertEqual(read([answer('claude-opus-5-5', effort='xhigh', perTurnEffort='xhigh'),
+                               answer('claude-haiku-5-5', effort='low', isSidechain=True),
+                               answer('<synthetic>', effort=None, perTurnEffort='max')]),
+                         {'model': 'claude-opus-5-5', 'effort': 'xhigh', 'observed': 'last_response'})
+        self.assertEqual(read([answer('claude-opus-5-5', perTurnEffort='max')])['effort'], 'max')
+        # A model without effort levels records none: the older response's effort is not carried.
+        self.assertEqual(read([answer('claude-opus-5-5', effort='high'), answer('claude-haiku-5-5', effort=None)]),
+                         {'model': 'claude-haiku-5-5', 'effort': None, 'observed': 'last_response'})
+        self.assertEqual(read([answer('claude-opus-5-5', effort='turbo')])['effort'], None)
+        self.assertEqual(read([{'type': 'user', 'message': {'content': '합성 요청'}}]), {'model': None, 'effort': None})
+
+    def test_live_codex_read_names_the_threads_model_and_effort(self):
+        self.endpoint()
+        self.live.update(model='example-model', reasoningEffort='high')
+        self.assertEqual(self.reader.read('codex', self.sid, '.codex')['modelSettings'], {'model': 'example-model', 'effort': 'high'})
+        self.live.update(model='../example', reasoningEffort='turbo')
+        self.assertEqual(self.reader.read('codex', self.sid, '.codex')['modelSettings'], {'model': None, 'effort': None})
 
     def test_pc_reads_follow_the_same_window_as_the_board(self):
         self.assertEqual((wc.MESSAGE_LIMIT, wc.ROW_LIMIT), (80, 400))

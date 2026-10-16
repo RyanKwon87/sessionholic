@@ -170,6 +170,25 @@ class WindowsRuntimeTest(unittest.TestCase):
         value = self.runtime.chat({'action': 'read', 'source': self.source})
         self.assertEqual((len(value['messages']), value['messages'][0]['text'], value['olderOmitted']), (120, '합성 입력 60', True))
 
+    def test_live_read_names_the_threads_model_and_effort(self):
+        self.reader.thread.update(model='example-model', reasoningEffort='xhigh')
+        value = self.runtime.chat({'action': 'read', 'source': self.source})
+        # As a Mac read (native_chat.model_settings); a PC keeps no board choice for the next input.
+        self.assertEqual(value['modelSettings'], {'model': 'example-model', 'effort': 'xhigh'})
+
+    def test_claude_read_names_the_newest_responses_model_and_effort(self):
+        reader = wc.WindowsCollector(self.home, hostname='fixture-pc', process_reader=lambda pid: None)
+        sid = str(uuid.uuid4())
+        folder = self.home / '.claude/projects/fixture'
+        folder.mkdir(parents=True)
+        (folder / (sid + '.jsonl')).write_text(''.join(json.dumps(entry) + '\n' for entry in [
+            {'type': 'user', 'message': {'content': '합성 요청'}},
+            {'type': 'assistant', 'effort': 'xhigh', 'message': {'model': 'claude-opus-5-5', 'content': [{'type': 'text', 'text': '합성 답변'}]}}]))
+        value = wr.WindowsRuntime(reader=reader).chat(
+            {'action': 'read', 'source': {'host': 'fixture-pc', 'agent': 'claude', 'id': sid, 'home': '.claude'}})
+        self.assertEqual(value['modelSettings'], {'model': 'claude-opus-5-5', 'effort': 'xhigh', 'observed': 'last_response'})
+        self.assertEqual(([m['text'] for m in value['messages']], value['olderOmitted']), (['합성 요청', '합성 답변'], False))
+
     def test_stored_or_unloaded_session_remains_readable_without_execution(self):
         self.reader.loaded = []
         value = self.runtime.chat({'action': 'read', 'source': self.source})

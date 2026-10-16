@@ -69,6 +69,11 @@ CLAUDE_READ_TAILS = (2 * 1024 * 1024, 8 * 1024 * 1024, 32 * 1024 * 1024)
 # Codex history is read newest-first in pages of this many items, at most this many pages.
 HISTORY_PAGE = 100
 HISTORY_PAGES = 10
+# Item pages past the first stop once a read has taken this long (seconds): after hours of
+# image work one page is tens of MB, and ten of an 18 GB rollout took 7 s on every read. The
+# turns before them come as display summaries (question and final answer), this many a page.
+HISTORY_ITEMS_BUDGET = 0.3
+HISTORY_SUMMARY_TURNS = 50
 SNIPPET_TAILS = (32 * 1024, 128 * 1024)
 CODEX_THREAD_LIMIT = 25
 # Codex homes listed at once; each uses its own daemon connection.
@@ -1272,15 +1277,18 @@ def codex_window_edge(entries, limit=MESSAGE_LIMIT, cap=ROW_LIMIT):
     return None
 
 
-def codex_recent_thread(server, thread_id):
+def codex_recent_thread(server, thread_id, clock=time.monotonic):
     """`thread/read` result whose thread carries only its latest turns, read page by page.
 
     `includeTurns` loads the whole rollout, which grows to hundreds of MB after hours of
     image work, so one conversation read could outlast its deadline. The metadata read is
-    cheap, and items come newest-first until the window (recent_window) is covered and the
-    turn of its oldest row reaches its user message. Turns come with their status only; their
-    items are those read, so the oldest turn may be cut short. The thread's `olderUnread` says
-    older items were left unread.
+    cheap, and items (tool records included) come newest-first until the window
+    (recent_window) is covered and the turn of its oldest row reaches its user message, or
+    HISTORY_ITEMS_BUDGET runs out after the first page. Turns come as display summaries,
+    which cost little: while the window still wants questions and answers, the turns past the
+    items read show by their summary (question and final answer, no tool records), and the
+    oldest turn read only in part takes its question from it. The thread's `olderUnread` says
+    older history was left unread.
     None when the daemon predates the paged methods or the thread is stored in the legacy
     format, so the caller reads the thread whole."""
     result = server.call("thread/read", {"threadId": thread_id, "includeTurns": False})
@@ -1288,6 +1296,7 @@ def codex_recent_thread(server, thread_id):
     if not isinstance(thread, dict) or thread.get("id") != thread_id:
         return result
     entries, cursor, method = [], None, "thread/items/list"
+    started = clock()
     try:
         for _ in range(HISTORY_PAGES):
             params = {"threadId": thread_id, "limit": HISTORY_PAGE, "sortDirection": "desc"}
@@ -1306,11 +1315,24 @@ def codex_recent_thread(server, thread_id):
             edge = codex_window_edge(entries)
             if edge and any(entry["turnId"] == edge and entry["item"].get("type") == "userMessage" for entry in entries):
                 break
-        older = bool(cursor)
+            if clock() - started > HISTORY_ITEMS_BUDGET:
+                break
+        items_cursor = cursor
         wanted = set(entry["turnId"] for entry in entries)
+        talk = sum(1 for entry in entries if codex_conversation_item(entry["item"]))
+
+        def short(turns):
+            # The window still wants questions and answers from turns past the items read.
+            if items_cursor is None or len(entries) >= ROW_LIMIT:
+                return False
+            ids = [turn["id"] for turn in turns]
+            last = max((ids.index(turn_id) for turn_id in wanted if turn_id in ids), default=-1)
+            return talk + sum(_summary_talk(turn) for turn in turns[last + 1:]) < MESSAGE_LIMIT
+
         turns, cursor, method = [], None, "thread/turns/list"
         for _ in range(HISTORY_PAGES):
-            params = {"threadId": thread_id, "limit": len(wanted) + 2, "sortDirection": "desc", "itemsView": "notLoaded"}
+            params = {"threadId": thread_id, "limit": max(len(wanted) + 2, HISTORY_SUMMARY_TURNS),
+                      "sortDirection": "desc", "itemsView": "summary"}
             if cursor:
                 params["cursor"] = cursor
             page = server.call(method, params)
@@ -1319,7 +1341,7 @@ def codex_recent_thread(server, thread_id):
                 raise ValueError("Codex turn 기록 형식이 올바르지 않습니다.")
             turns.extend(data)
             cursor = page.get("nextCursor")
-            if not cursor or wanted <= set(turn["id"] for turn in turns):
+            if not cursor or (wanted <= set(turn["id"] for turn in turns) and not short(turns)):
                 break
     except RpcError as error:
         if paging_unsupported(error, method):
@@ -1329,13 +1351,38 @@ def codex_recent_thread(server, thread_id):
     for entry in reversed(entries):
         items.setdefault(entry["turnId"], []).append(entry["item"])
     # Newest first: every turn down to the oldest one with items read (a just-started turn
-    # may have none yet). A turn past the pages read is left out with its items.
+    # may have none yet), then while the window wants more, older turns by their summary.
     found = [turn["id"] for turn in turns]
     last = max((found.index(turn_id) for turn_id in wanted if turn_id in found), default=-1)
-    thread["turns"] = [{**turn, "items": items.get(turn["id"], []), "itemsView": "full"}
-                       for turn in reversed(turns[:last + 1] if wanted else turns[:1])]
-    thread["olderUnread"] = older
+    kept = []
+    for index, turn in enumerate(turns[:last + 1] if wanted else turns[:1]):
+        read = items.get(turn["id"], [])
+        if index == last and items_cursor and not any(item.get("type") == "userMessage" for item in read):
+            # Cut short before its start: the summary still has its question.
+            read = [item for item in _summary_items(turn) if item.get("type") == "userMessage"] + read
+        kept.append({**turn, "items": read, "itemsView": "full"})
+    summarized = []
+    if items_cursor and wanted:
+        count = sum(1 for turn in kept for item in turn["items"] if codex_conversation_item(item))
+        shown = count + sum(1 for turn in kept for item in turn["items"] if item.get("type") in CODEX_TOOL_KINDS)
+        for turn in turns[last + 1:]:
+            if count >= MESSAGE_LIMIT or shown >= ROW_LIMIT:
+                break
+            summarized.append({**turn, "items": _summary_items(turn), "itemsView": "summary"})
+            count += _summary_talk(turn)
+            shown += _summary_talk(turn)
+    thread["turns"] = list(reversed(kept + summarized))
+    reached_start = cursor is None and len(summarized) == len(turns) - (last + 1)
+    thread["olderUnread"] = bool(items_cursor) and not reached_start
     return {**result, "thread": thread}
+
+
+def _summary_items(turn):
+    return [item for item in turn.get("items") or [] if isinstance(item, dict)]
+
+
+def _summary_talk(turn):
+    return sum(1 for item in _summary_items(turn) if codex_conversation_item(item))
 
 
 def codex_messages(turns):

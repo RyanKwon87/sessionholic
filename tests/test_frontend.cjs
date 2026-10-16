@@ -5147,6 +5147,21 @@ function cssBlock(css, selector) {
   return tokens;
 }
 
+test('a session card focus ring sits wholly inside the row that clips it, round corners included', () => {
+  const css = styleSheet();
+  const rule = (selector) => {
+    const start = css.indexOf(`\n${selector} {`);
+    assert.notEqual(start, -1, selector);
+    return css.slice(css.indexOf('{', start) + 1, css.indexOf('}', start));
+  };
+  const ring = Number(/outline:\s*(\d+)px/.exec(rule(':focus-visible'))[1]);
+  const inset = Number(/outline-offset:\s*(-?\d+)px/.exec(rule('.card:focus-visible'))[1]);
+  assert.ok(/overflow:\s*hidden/.test(rule('.card-row')), 'the row clips its card');
+  assert.ok(inset <= -ring, `a ${ring}px ring drawn ${-inset}px inside leaves ${ring + inset}px to be cut`);
+  assert.match(rule('.card-row:not(.is-swiping, .is-open) > .card:focus-visible'), /border-radius:\s*inherit/,
+    'the ring follows the rounded first and last rows, but a card slid aside keeps square edges');
+});
+
 test('every board color is a token, and dark values exist for the device setting and for a forced dark board', () => {
   const css = styleSheet().replace(/\/\*[\s\S]*?\*\//g, '');
   const tokenBlock = /^(:root(\[data-theme="(light|dark)"\]|:not\(\[data-theme="light"\]\))?)$/;

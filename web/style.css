@@ -1591,12 +1591,13 @@ button.host:focus-visible {
   background: var(--card-press);
 }
 /* The row clips its card (swipe actions, rounded first and last rows), so the focus ring
-   takes the row's corners and is drawn wholly inside them: no edge of it is cut. */
+   takes the row's corners and is drawn wholly inside them: no edge of it is cut. A card
+   slid aside keeps square edges, as its trailing edge then sits inside the row. */
 .card:focus-visible {
   z-index: 1;
   outline-offset: -3px;
 }
-.card-row > .card:focus-visible {
+.card-row:not(.is-swiping, .is-open) > .card:focus-visible {
   border-radius: inherit;
 }
 .card.selected {

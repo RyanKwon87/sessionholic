@@ -5158,7 +5158,8 @@ test('a session card focus ring sits wholly inside the row that clips it, round 
   const inset = Number(/outline-offset:\s*(-?\d+)px/.exec(rule('.card:focus-visible'))[1]);
   assert.ok(/overflow:\s*hidden/.test(rule('.card-row')), 'the row clips its card');
   assert.ok(inset <= -ring, `a ${ring}px ring drawn ${-inset}px inside leaves ${ring + inset}px to be cut`);
-  assert.match(rule('.card-row > .card:focus-visible'), /border-radius:\s*inherit/, 'the ring follows the rounded first and last rows');
+  assert.match(rule('.card-row:not(.is-swiping, .is-open) > .card:focus-visible'), /border-radius:\s*inherit/,
+    'the ring follows the rounded first and last rows, but a card slid aside keeps square edges');
 });
 
 test('every board color is a token, and dark values exist for the device setting and for a forced dark board', () => {

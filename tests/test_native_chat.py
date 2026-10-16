@@ -21,8 +21,17 @@ def paged(thread, method, params):
     if method == 'thread/items/list':
         rows = [{'item': item, 'turnId': turn['id']} for turn in turns if isinstance(turn, dict) for item in turn.get('items') or []]
     else:
-        # A malformed turn is passed on as it is, for the reader to reject.
-        rows = [{**turn, 'items': [], 'itemsView': 'notLoaded'} if isinstance(turn, dict) else turn for turn in turns]
+        def view(turn):
+            # A malformed turn is passed on as it is, for the reader to reject.
+            if not isinstance(turn, dict):
+                return turn
+            if params.get('itemsView') == 'summary':
+                # As app-server's display summary: the question and the final answer.
+                items = [item for item in turn.get('items') or [] if item.get('type') == 'userMessage']
+                answers = [item for item in turn.get('items') or [] if item.get('type') == 'agentMessage']
+                return {**turn, 'items': items + answers[-1:], 'itemsView': 'summary'}
+            return {**turn, 'items': [], 'itemsView': 'notLoaded'}
+        rows = [view(turn) for turn in turns]
     rows.reverse()
     start = int(params.get('cursor') or 0)
     end = start + params['limit']
@@ -1027,6 +1036,33 @@ class RecentHistoryTests(unittest.TestCase):
         self.assertEqual(result['phase'], 'working')
         self.assertEqual(result['activeTurnId'], 'turn-3')
         self.assertEqual(result['messages'][-1]['text'], 'answer 2')
+
+    def test_turns_past_a_slow_items_read_show_by_their_summaries(self):
+        # Image work makes item pages slow: past its budget the read stops after one page, and
+        # the turns before it come as summaries (question and final answer) up to 80 of them.
+        client = FakeClient(self.thread([self.turn(number, 20) for number in range(1, 61)]))
+        with patch.object(collector, 'HISTORY_ITEMS_BUDGET', -1, create=True):
+            result = self.read(client)
+        self.assertEqual(len([m for m, _ in client.calls if m == 'thread/items/list']), 1)
+        self.assertEqual(collector.conversation_count(result['messages']), collector.MESSAGE_LIMIT)
+        self.assertEqual(result['messages'][0]['text'], 'ask 21')
+        self.assertEqual(result['messages'][-1]['text'], 'answer 60')
+        # 22 items a turn: page one holds turns 57-60 and the last 12 of turn 56, whose
+        # question comes from its summary. Turns 21-55 show no tool records.
+        tools = set(row['turnId'] for row in result['messages'] if row['role'] == 'tool')
+        self.assertEqual(tools, {'turn-%d' % number for number in range(56, 61)})
+        self.assertIn('ask 56', [row['text'] for row in result['messages']])
+        self.assertEqual(result['turns'][0]['id'], 'turn-21')
+        self.assertIs(result['olderOmitted'], True)
+
+    def test_summaries_reaching_the_start_leave_nothing_out(self):
+        client = FakeClient(self.thread([self.turn(number, 20) for number in range(1, 31)]))
+        with patch.object(collector, 'HISTORY_ITEMS_BUDGET', -1, create=True):
+            result = self.read(client)
+        self.assertEqual(len([m for m, _ in client.calls if m == 'thread/items/list']), 1)
+        self.assertEqual(collector.conversation_count(result['messages']), 60)
+        self.assertEqual(result['messages'][0]['text'], 'ask 1')
+        self.assertIs(result['olderOmitted'], False)
 
     def test_history_pages_are_bounded(self):
         client = FakeClient(self.thread([self.turn(1, 5000)]))

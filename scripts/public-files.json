@@ -84,6 +84,7 @@
   "tests/test_transfer_native.py",
   "tests/test_transfer_workspace.py",
   "tests/test_usage.py",
+  "tests/test_windows_attachments.py",
   "tests/test_windows_collector.py",
   "tests/test_windows_host.py",
   "tests/test_windows_runtime.py",
@@ -119,6 +120,7 @@
   "web/vendor/xterm-LICENSE",
   "web/vendor/xterm.css",
   "web/vendor/xterm.js",
+  "windows_attachments.py",
   "windows_collector.py",
   "windows_runtime.py",
   "work_service.py"

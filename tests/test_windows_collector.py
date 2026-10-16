@@ -426,6 +426,25 @@ class WindowsCollectorTest(unittest.TestCase):
         path.write_text('\n'.join(json.dumps(entry) for entry in entries) + '\n')
         return sid, path
 
+    def test_a_claude_read_names_the_work_folder_its_list_row_names(self):
+        # An upload checks the folder a fresh read names against the listed one (chat.Chat.upload).
+        sid, path = self.claude_transcript()
+        row = next(row for row in self.reader.claude_rows() if row['id'] == sid)
+        self.assertEqual((self.reader.read('claude', sid)['cwd'], row['cwd']), (self.cwd, self.cwd))
+
+    def test_a_codex_message_of_images_alone_still_shows_as_the_mac_collector_shows_it(self):
+        import collector
+        turn = {'id': 'turn-1', 'status': 'completed', 'items': [
+            {'id': 'input-1', 'type': 'userMessage', 'content': [{'type': 'localImage', 'path': 'C:/Users/example/shot.png'}]},
+            {'id': 'input-2', 'type': 'userMessage', 'content': [{'type': 'text', 'text': '합성 입력'},
+                                                                  {'type': 'localImage', 'path': 'C:/Users/example/shot.png'}]},
+            {'id': 'input-3', 'type': 'userMessage', 'content': [{'type': 'text', 'text': '글만'}]}]}
+        rows = wc._codex_rows([turn])
+        mac = [row for item, found in collector.codex_turn_rows(turn) for row in found]
+        self.assertEqual([row['text'] for row in rows], ['[이미지 첨부]', '합성 입력', '글만'])
+        self.assertEqual([row.get('attachments') for row in rows], [row.get('attachments') for row in mac])
+        self.assertNotIn('shot.png', json.dumps(rows))
+
     def test_saved_records_are_visible_without_guessing_running_or_done(self):
         before = self.db.read_bytes()
         result = self.reader.snapshot()

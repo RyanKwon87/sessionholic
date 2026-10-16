@@ -1449,7 +1449,7 @@ class ChatClaudeTest(unittest.TestCase):
             state = self.state()
             self.assertEqual((state['capability']['supported'], state['capability']['reason']), (True, None))
             self.assertNotIn('action', state['capability'])
-            self.assertFalse(state['capability']['attachments'], 'a PC session takes text only')
+            self.assertTrue(state['capability']['attachments'], 'a PC session takes files as well')
             self.assertTrue(state['promptOpenable'])
             opened = []
 
@@ -1490,7 +1490,7 @@ class ChatClaudeTest(unittest.TestCase):
         try:
             # No terminal yet: its terminal button resumes it on the PC (or says it still runs there).
             state = self.state()
-            self.assertEqual(state['capability'], {'supported': False, 'attachments': False,
+            self.assertEqual(state['capability'], {'supported': False, 'attachments': True,
                                                    'reason': chat.CLAUDE_WINDOWS_OPEN, 'action': 'open_terminal'})
             self.assertFalse(state['promptOpenable'])
             with patch.object(self.flow, 'plan', side_effect=AssertionError('a send never opens a PC terminal')):
@@ -1502,7 +1502,7 @@ class ChatClaudeTest(unittest.TestCase):
             self.terminal(kind='interactive')
             state = self.state()
             self.assertTrue(state['capability']['supported'])
-            self.assertFalse(state['capability']['attachments'], 'a PC session takes text only')
+            self.assertTrue(state['capability']['attachments'], 'a PC session takes files as well')
             self.assertEqual(self.send()['status'], 'accepted')
             self.assertEqual(len(self.terms.pastes), 1)
             self.assertNotIn(('chat', 'send'), self.calls)
@@ -1698,6 +1698,33 @@ class ChatClaudeTest(unittest.TestCase):
         self.assertNotIn(uploaded['path'], self.records()[0].read_text())
         self.send(rid='request-0002', text='', attachments=[uploaded['id']])
         self.assertEqual(self.terms.pastes[1][1], '첨부 파일: ' + uploaded['path'])
+
+    def test_a_windows_claude_session_takes_a_file_the_pc_stored_as_its_windows_path_line(self):
+        # The PC stores the upload itself (windows_attachments) and names its own path; the paste
+        # carries that path, backslashes and all, as a Mac session's line.
+        self.board.hosts[0]['platform'] = 'windows'
+        uploads, original = [], self.flow.transfers.rpc
+
+        def rpc(host, op, args, timeout):
+            if op != 'attachment':
+                return original(host, op, args, timeout)
+            uploads.append({key: value for key, value in args.items() if key != 'data'})
+            stored = attachments.receive(args)
+            return {**stored, 'path': 'C:\\Users\\example\\project\\' + stored['relativePath'].replace('/', '\\')}
+        self.flow.transfers.rpc = rpc
+        try:
+            self.terminal()
+            self.assertTrue(self.state()['capability']['attachments'])
+            uploaded = self.chat.upload(CLAUDE_REF, 'shot.png', b'\x89PNG\r\n\x1a\nfixture')['attachment']
+            self.assertEqual(uploads[0]['source'], {'host': 'local', 'agent': 'claude', 'home': None, 'id': CLAUDE_REF['id']})
+            self.assertEqual(uploads[0]['cwd'], str(self.project))
+            result = self.send(text='PC 화면 확인', attachments=[uploaded['id']])
+            self.assertEqual(result['status'], 'accepted')
+            self.assertEqual(self.terms.pastes, [(TERMINAL_ID, 'PC 화면 확인\n첨부 파일: ' + uploaded['path'], True)])
+            self.assertTrue(uploaded['path'].startswith('C:\\Users\\example\\project\\.'))
+            self.assertEqual(result['receipt']['attachments'][0]['name'], 'shot.png')
+        finally:
+            self.board.hosts[0].pop('platform')
 
     # ---------- menus answered from the web ----------
     def answer(self, number, fingerprint=None, rid='answer-0001', source=CLAUDE_REF):

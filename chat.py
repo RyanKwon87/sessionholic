@@ -658,7 +658,7 @@ class Chat:
                                                                 host.get('platform') == 'windows')
         else:
             supported, reason = bool(caps.get('canSend')), caps.get('reason') or result.get('reason')
-        capability = {'supported': supported, 'attachments': bool(source.get('cwd')) and host.get('platform') != 'windows',
+        capability = {'supported': supported, 'attachments': bool(source.get('cwd')),
                       'reason': None if supported else reason}
         if action:
             # What the user can do to make sending possible ("open_terminal": the board's terminal button).
@@ -1299,8 +1299,6 @@ class Chat:
     def upload(self, ref, name, content):
         source, host = self.source(ref)
         self._direct_session(source)
-        if host.get('platform') == 'windows':
-            raise ValueError('Windows 세션에는 현재 텍스트만 보낼 수 있습니다.')
         if not isinstance(name, str) or len(name.encode()) > 512:
             raise ValueError('파일 이름이 너무 깁니다.')
         if not content or len(content) > MAX_FILE:
@@ -1313,9 +1311,12 @@ class Chat:
             cwd = current.get('cwd')
             if not cwd or cwd != source.get('cwd'):
                 raise ValueError('실제 세션의 작업 폴더를 확인하지 못했습니다. 목록을 새로 읽어 주세요.')
-            attachment = self.workflow.transfers.rpc(host, 'attachment', {
-                'cwd': cwd, 'name': name, 'data': base64.b64encode(content).decode('ascii'),
-                'sha256': hashlib.sha256(content).hexdigest()}, timeout=60)
+            args = {'cwd': cwd, 'name': name, 'data': base64.b64encode(content).decode('ascii'),
+                    'sha256': hashlib.sha256(content).hexdigest()}
+            if host.get('platform') == 'windows':
+                # A PC stores it only in the work folder it records for this exact session.
+                args['source'] = self.identity(source)
+            attachment = self.workflow.transfers.rpc(host, 'attachment', args, timeout=60)
             from server import private_json
             record = {'source': self.identity(source), 'cwd': cwd, 'attachment': attachment}
             private_json(self.root / 'attachments' / (attachment['id'] + '.json'), record)
@@ -1362,8 +1363,6 @@ class Chat:
         try:
             source, host, request_id, text, ids, manifest = self._prepare_send(data)
             self._direct_session(source)
-            if host.get('platform') == 'windows' and ids:
-                raise ValueError('Windows 세션에는 현재 텍스트만 보낼 수 있습니다.')
         except (ValueError, RuntimeError, OSError, KeyError) as exc:
             reason = str(exc) if isinstance(exc, (ValueError, RuntimeError)) else '메시지와 첨부 정보를 다시 확인해 주세요.'
             raise SendRejected(reason, 409 if isinstance(exc, RuntimeError) else 400) from None

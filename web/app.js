@@ -7053,6 +7053,8 @@ function userMessageParts(message) {
     if (path.startsWith('"')) {
       try { path = String(JSON.parse(path)); } catch { path = path.replace(/^"|"$/g, ""); }
     }
+    // A Windows PC's path separates its folders with backslashes.
+    path = path.replace(/\\/g, "/");
     // Only the board's attachment store; a typed "첨부 파일: …" line stays text.
     if (!path.includes(`/${INSTANCE.attachmentsDir}/`)) break;
     names.unshift(path.slice(path.lastIndexOf("/") + 1) || "첨부파일");

@@ -28,6 +28,13 @@ PS_SINGLE_QUOTES = "'\u2018\u2019\u201a\u201b"
 # The longest remote command a PC terminal is opened with (cmd.exe, a possible default shell,
 # stops at 8191 characters); a longer menu would end without saying why.
 WINDOWS_COMMAND_LIMIT = 8000
+# What a PC takes over windows_rpc. An upload (`attachment`) stays one program on stdin: its
+# base64 goes in literal lines of this length (Python 3.9's tokenizer grows its buffer a little
+# per read of one long line), and its wait is the caller's (Chat.upload), as on a Mac.
+WINDOWS_OPS = ('chat', 'control_preview', 'control_execute', 'terminal_plan', 'resume_preview', 'attachment')
+WINDOWS_DATA_LINE = 4096
+WINDOWS_UPLOAD_SECONDS = 120
+BASE64 = re.compile(r'[A-Za-z0-9+/]*={0,2}\Z')
 PROFILE_FAILURE_TTL = 120
 RUNTIME_MODULES = ('collector.py', 'launch.py', 'transfer_native.py', 'transfer_workspace.py', 'transfer_worker.py',
                    'native_chat.py', 'attachments.py', 'managed_launch.py', 'settings.py', 'instance.py',
@@ -358,9 +365,12 @@ class Transfers:
         return data.get('needRuntime') is True and data.get('sha256') == self.runtime()['sha256']
 
     def windows_rpc(self, host, op, args, timeout):
-        """Send reviewed code and one request on stdin; user input never enters argv."""
+        """Send reviewed code and one request on stdin; user input never enters argv.
+
+        An upload's file (`data`, base64) is kept out of the request's JSON: checked to be
+        base64 alone, it follows the modules as a list of short literal lines."""
         from server import WINDOWS_READ_ONLY, collector_command, SESSION_ID, HOME_KEY
-        if op not in ('chat', 'control_preview', 'control_execute', 'terminal_plan', 'resume_preview'):
+        if op not in WINDOWS_OPS:
             raise ValueError(WINDOWS_READ_ONLY)
         source = args.get('source') or {}
         agent, sid, home = source.get('agent'), source.get('id'), source.get('home')
@@ -369,20 +379,35 @@ class Transfers:
             raise ValueError('Windows 세션 정보를 확인해 주세요.')
         if op == 'chat' and args.get('action') not in ('read', 'capabilities', 'send', 'receipt'):
             raise ValueError('지원하지 않는 Windows 대화 요청입니다.')
+        data = None
+        if op == 'attachment':
+            from attachments import MAX_FILE_BYTES
+            data = args.get('data')
+            if (not isinstance(data, str) or len(data) % 4 or len(data) > ((MAX_FILE_BYTES + 2) // 3) * 4
+                    or not BASE64.fullmatch(data) or any(not isinstance(args.get(key), str) for key in ('cwd', 'name', 'sha256'))):
+                raise ValueError('PC에 보낼 첨부 파일 정보가 올바르지 않습니다.')
+            args = {key: value for key, value in args.items() if key != 'data'}
         args = {**args, 'source': {**source, 'host': host['name']}}
         root = Path(__file__).resolve().parent
         program = 'import types,sys,json\n'
-        for name in ('windows_collector', 'windows_runtime'):
+        for name in ('windows_collector', 'windows_attachments', 'windows_runtime'):
             program += ("m=types.ModuleType(" + repr(name) + ");sys.modules[" + repr(name) + "]=m\nexec("
                         + ascii((root / (name + '.py')).read_text(encoding='utf-8')) + ",m.__dict__)\n")
         program += 'm.STORE_RELATIVE=' + ascii(instance.current()['remote']['chatLedgerDir'] + '/windows') + '\n'
-        program += ('try:\n result=m.handle(json.loads(' + ascii(json.dumps({'op': op, 'args': args})) + '))\n'
+        program += ("sys.modules['windows_attachments'].DIRECTORY="
+                    + ascii(instance.current()['remote']['attachmentsDir']) + '\n')
+        if data is not None:
+            program += 'DATA=[\n' + ''.join("'" + data[start:start + WINDOWS_DATA_LINE] + "',\n"
+                                              for start in range(0, len(data), WINDOWS_DATA_LINE)) + ']\n'
+        program += ('try:\n result=m.handle(json.loads(' + ascii(json.dumps({'op': op, 'args': args})) + ')'
+                    + (',DATA' if data is not None else '') + ')\n'
                     ' print(json.dumps({"ok":True,"result":result},ensure_ascii=True))\n'
                     'except ValueError as exc:\n print(json.dumps({"ok":False,"error":str(exc)},ensure_ascii=True))\n'
                     'except Exception:\n print(json.dumps({"ok":False,"unknown":True}))\n')
         try:
             done = subprocess.run(collector_command(host, [], self.base_dir), input=program.encode(),
-                                  capture_output=True, timeout=min(timeout, 30))
+                                  capture_output=True,
+                                  timeout=min(timeout, WINDOWS_UPLOAD_SECONDS if data is not None else 30))
         except subprocess.TimeoutExpired:
             raise RuntimeError('PC 응답을 확인하지 못했습니다. 요청은 자동으로 다시 보내지 않습니다.') from None
         if done.returncode:

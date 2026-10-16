@@ -66,9 +66,13 @@ CONVERSATION_ROLES = ("user", "assistant")
 # A Claude conversation read takes this much of the transcript's end, widened step by step
 # while it holds fewer than MESSAGE_LIMIT questions and answers (claude_conversation).
 CLAUDE_READ_TAILS = (2 * 1024 * 1024, 8 * 1024 * 1024, 32 * 1024 * 1024)
-# Codex history is read newest-first in pages of this many items, at most this many pages.
+# Codex history is read newest-first in pages of this many items until the window is
+# covered, at most HISTORY_PAGES pages and no further page once HISTORY_BUDGET seconds have
+# passed (codex_recent_thread). Most pages take 2-6 ms; one of inline images ~13 MB and
+# ~170 ms. Measured: covering the window took up to 32 pages, and at most ~0.4 s (18 GB).
 HISTORY_PAGE = 100
-HISTORY_PAGES = 10
+HISTORY_PAGES = 40
+HISTORY_BUDGET = 1.0
 SNIPPET_TAILS = (32 * 1024, 128 * 1024)
 CODEX_THREAD_LIMIT = 25
 # Codex homes listed at once; each uses its own daemon connection.
@@ -1272,17 +1276,19 @@ def codex_window_edge(entries, limit=MESSAGE_LIMIT, cap=ROW_LIMIT):
     return None
 
 
-def codex_recent_thread(server, thread_id):
+def codex_recent_thread(server, thread_id, clock=time.monotonic):
     """`thread/read` result whose thread carries only its latest turns, read page by page.
 
     `includeTurns` loads the whole rollout, which grows to hundreds of MB after hours of
     image work, so one conversation read could outlast its deadline. The metadata read is
     cheap, and items come newest-first until the window (recent_window) is covered and the
-    turn of its oldest row reaches its user message. Turns come with their status only; their
-    items are those read, so the oldest turn may be cut short. The thread's `olderUnread` says
-    older items were left unread.
+    turn of its oldest row reaches its user message, or HISTORY_PAGES pages were read, or
+    HISTORY_BUDGET seconds have passed (pages of inline images are slow; the first page is
+    always read). Turns come with their status only; their items are those read, so the
+    oldest turn may be cut short. The thread's `olderUnread` says older items were left unread.
     None when the daemon predates the paged methods or the thread is stored in the legacy
     format, so the caller reads the thread whole."""
+    deadline = clock() + HISTORY_BUDGET
     result = server.call("thread/read", {"threadId": thread_id, "includeTurns": False})
     thread = result.get("thread") if isinstance(result, dict) else None
     if not isinstance(thread, dict) or thread.get("id") != thread_id:
@@ -1306,9 +1312,13 @@ def codex_recent_thread(server, thread_id):
             edge = codex_window_edge(entries)
             if edge and any(entry["turnId"] == edge and entry["item"].get("type") == "userMessage" for entry in entries):
                 break
+            if clock() >= deadline:
+                break
         older = bool(cursor)
         wanted = set(entry["turnId"] for entry in entries)
         turns, cursor, method = [], None, "thread/turns/list"
+        # No time budget here: items whose turn is not listed are dropped. One page holds them
+        # all (its limit is their count), so the page cap only guards a daemon that clamps it.
         for _ in range(HISTORY_PAGES):
             params = {"threadId": thread_id, "limit": len(wanted) + 2, "sortDirection": "desc", "itemsView": "notLoaded"}
             if cursor:

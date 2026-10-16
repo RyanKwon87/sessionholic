@@ -1035,6 +1035,35 @@ class RecentHistoryTests(unittest.TestCase):
         self.assertEqual(len(result['messages']), collector.ROW_LIMIT)
         self.assertIs(result['olderOmitted'], True)
 
+    def test_long_turn_is_read_back_to_its_request_past_ten_pages(self):
+        # Turn 2 holds 1402 items: the window is covered on page 4, its request is on page 15.
+        client = FakeClient(self.thread([self.turn(1, 5), self.turn(2, 1400)]))
+        with tempfile.TemporaryDirectory() as home, patch.object(chat, '_client', return_value=client):
+            result = chat.handle({'action': 'read', 'source': self.source, 'requestId': 'request-0002'}, home=home)
+        self.assertEqual(len([m for m, _ in client.calls if m == 'thread/items/list']), 15)
+        self.assertEqual(result['receipts'][0]['delivery'], 'completed')
+        self.assertEqual([turn['id'] for turn in result['turns']], ['turn-1', 'turn-2'])
+        self.assertEqual(len(result['messages']), collector.ROW_LIMIT)
+
+    def test_history_paging_stops_at_its_time_budget(self):
+        # Pages of inline images are slow: no page is asked for once the budget has passed,
+        # the first one always is, and the turns of the items read are still listed.
+        thread = self.thread([self.turn(1, 5000)])
+        for step, pages in ((collector.HISTORY_BUDGET / 2.5, 3), (collector.HISTORY_BUDGET * 2, 1)):
+            with self.subTest(step=step):
+                now = [0.0]
+
+                def slow(params, step=step):
+                    now[0] += step
+                    return paged(thread, 'thread/items/list', params)
+                client = FakeClient(thread, outcomes={'thread/items/list': slow})
+                result = collector.codex_recent_thread(client, thread['id'], clock=lambda: now[0])
+                self.assertEqual(len([m for m, _ in client.calls if m == 'thread/items/list']), pages)
+                self.assertEqual(len([m for m, _ in client.calls if m == 'thread/turns/list']), 1)
+                self.assertEqual([turn['id'] for turn in result['thread']['turns']], ['turn-1'])
+                self.assertEqual(len(result['thread']['turns'][0]['items']), pages * collector.HISTORY_PAGE)
+                self.assertIs(result['thread']['olderUnread'], True)
+
     def test_daemon_without_paged_history_is_read_whole(self):
         unknown = chat.NativeRejected({'code': -32600, 'message': 'Invalid request: unknown variant `thread/items/list`, '
                                                                   'expected one of `thread/attachment/add`'})

@@ -7351,7 +7351,7 @@ input.switch:focus-visible {
 /* 세션 종료 (keyboard): the run's choices, the default one first. */
 .end-session-dialog { width: min(480px, calc(100vw - 32px)); }
 .end-session-dialog h2:focus { outline: none; }
-.end-session-body { display: grid; gap: 10px; }
+.end-session-body { display: grid; gap: 10px; padding-bottom: max(16px, env(safe-area-inset-bottom)); }
 .end-session-name { margin: 0; font-weight: 600; overflow-wrap: anywhere; }
 .end-session-body .muted { margin: 0; font-size: 13px; line-height: 1.5; }
 .end-session-status { margin: 4px 0; line-height: 1.5; }
@@ -7360,13 +7360,14 @@ input.switch:focus-visible {
 /* 단축키: a key column and what it does. */
 .shortcuts {
   display: grid;
-  grid-template-columns: max-content minmax(0, 1fr);
+  /* One key column for every group, so the descriptions line up. */
+  grid-template-columns: 8.75rem minmax(0, 1fr);
   gap: 8px 14px;
   margin: 6px 0 16px;
   font-size: var(--fs-sub);
   line-height: 1.5;
 }
-.shortcuts dt { white-space: nowrap; }
+.shortcuts dt { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px; }
 .shortcuts dd { margin: 0; color: var(--label-2); }
 .shortcuts kbd {
   display: inline-block;

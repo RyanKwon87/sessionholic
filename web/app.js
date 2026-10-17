@@ -5753,12 +5753,14 @@ function scrollConversation(key) {
   // The reader's own scroll: readingScroll unpins it from the end.
   list.scrollTop = key === "Home" ? 0 : Math.max(0, list.scrollTop + step);
 }
+// [ ] step through the tabs; the new tab's first card takes the focus (↑↓ go on from there).
 function stepSessionCategory(step) {
   const categories = Object.keys(SESSION_CATEGORIES);
   const index = Math.max(0, categories.indexOf(state.sessionCategory));
   const category = categories[(index + step + categories.length) % categories.length];
   setSessionCategory(category);
-  $(`session-category-${category}`)?.focus?.();
+  const first = $("groups")?.querySelectorAll?.(".card")?.[0];
+  (first || $(`session-category-${category}`))?.focus?.();
 }
 // Ctrl+C or Ctrl+X (not with text selected: that is a copy), Delete, Backspace or ⌘⌫.
 function endSessionKey(event, key) {

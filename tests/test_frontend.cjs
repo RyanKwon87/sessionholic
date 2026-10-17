@@ -4562,7 +4562,7 @@ test('in a conversation ← goes back from an empty input or outside a field, ar
 });
 
 test('list letters work by key position (a Korean input source), and ? shows the shortcuts without stealing typing', () => {
-  const { c, s, cards, press, requests } = keyboardBoard();
+  const { c, s, cards, press, requests, focused } = keyboardBoard();
   assert.deepEqual(press(cards[2], 'ㅔ', { code: 'KeyP' }), [true, true]);
   assert.ok(requests.some((r) => r.url === '/api/session/pin'));
   let renamed = null;
@@ -4572,8 +4572,10 @@ test('list letters work by key position (a Korean input source), and ? shows the
   const search = c.get('search'); let searched = 0; search.focus = () => { searched++; };
   assert.deepEqual(press(cards[2], '/', { code: 'Slash' }), [true, true]); assert.equal(searched, 1);
   const category = c.state.sessionCategory;
+  focused.length = 0;
   assert.deepEqual(press(cards[2], ']', { code: 'BracketRight' }), [true, true]);
   assert.notEqual(c.state.sessionCategory, category);
+  assert.deepEqual(focused, [0], 'the new tab\'s first card takes the focus');
   assert.deepEqual(press(c.context.document.body, '[', { code: 'BracketLeft' }), [true, true]);
   assert.equal(c.state.sessionCategory, category);
   assert.deepEqual(press(cards[2], '?', { code: 'Slash', shiftKey: true }), [true, true]);

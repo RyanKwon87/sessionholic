@@ -1701,6 +1701,28 @@ button.host:focus-visible {
   font-size: var(--fs-cap);
   text-align: center;
 }
+/* Under the footnote where a hardware keyboard is: the shortcuts in one line, a button to all of them. */
+.keyboard-hint {
+  display: block;
+  width: 100%;
+  min-height: 32px;
+  padding: 4px 8px;
+  border: 0;
+  border-radius: var(--radius-s);
+  background: transparent;
+  color: var(--label-3);
+  font-size: var(--fs-cap);
+  text-align: center;
+}
+.keyboard-hint[hidden] {
+  display: none;
+}
+@media (hover: hover) and (pointer: fine) {
+  .keyboard-hint:hover {
+    color: var(--label-2);
+    background: var(--fill-soft);
+  }
+}
 
 /* 7. Detail -------------------------------------------------------------- */
 .detail-pane {
@@ -7326,6 +7348,45 @@ input.switch:focus-visible {
 }
 .detail-head .back::after { content: none; }
 .session-control-dialog { width: min(520px, calc(100vw - 32px)); }
+/* 세션 종료 (keyboard): the run's choices, the default one first. */
+.end-session-dialog { width: min(480px, calc(100vw - 32px)); }
+.end-session-dialog h2:focus { outline: none; }
+.end-session-body { display: grid; gap: 10px; }
+.end-session-name { margin: 0; font-weight: 600; overflow-wrap: anywhere; }
+.end-session-body .muted { margin: 0; font-size: 13px; line-height: 1.5; }
+.end-session-status { margin: 4px 0; line-height: 1.5; }
+.end-session-body > button { width: 100%; min-height: 44px; }
+.end-session-body > button[hidden] { display: none; }
+/* 단축키: a key column and what it does. */
+.shortcuts {
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
+  gap: 8px 14px;
+  margin: 6px 0 16px;
+  font-size: var(--fs-sub);
+  line-height: 1.5;
+}
+.shortcuts dt { white-space: nowrap; }
+.shortcuts dd { margin: 0; color: var(--label-2); }
+.shortcuts kbd {
+  display: inline-block;
+  min-width: 1.6em;
+  padding: 0 5px;
+  border: 1px solid var(--sep-strong);
+  border-radius: 5px;
+  background: var(--fill-soft);
+  color: var(--label);
+  font: inherit;
+  font-size: 0.92em;
+  text-align: center;
+}
+@media (max-width: 420px) {
+  .shortcuts { grid-template-columns: minmax(0, 1fr); gap: 2px; }
+  .shortcuts dd { margin-bottom: 8px; }
+}
+/* A keyboard entering a session without an input focuses the conversation itself. */
+.messages:focus { outline: none; }
+.messages:focus-visible { box-shadow: inset 0 0 0 2px var(--accent); }
 .session-control-body h3 { margin: 0 0 8px; overflow-wrap: anywhere; }
 .session-control-status { padding: 12px 0; line-height: 1.5; }
 .session-control-actions { display: grid; gap: 12px; }

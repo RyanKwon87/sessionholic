@@ -4453,6 +4453,220 @@ test('a hardware keyboard goes from the search field into the list, between card
   assert.deepEqual(press(search, 'Enter'), [true, true]); assert.deepEqual(clicked, [0]);
 });
 
+// A board with one listed session and cards a keyboard can move through (agent view keys).
+function keyboardBoard({ phase = 'idle', count = 8, fetchImpl } = {}) {
+  const requests = [];
+  const c = client(async (url, options) => {
+    requests.push({ url, body: options?.body && JSON.parse(options.body) });
+    return fetchImpl ? fetchImpl(url, options) : { ok: true, status: 200, json: async () => ({}) };
+  }, noChatTimers);
+  const { s, entry } = selectChat(c);
+  s.phase = phase;
+  c.state.selected = null;
+  const focused = [];
+  const cards = Array.from({ length: count }, (unused, index) => ({ index, dataset: { sessionKey: index === 2 ? s.key : 'other-' + index },
+    classList: { contains: (name) => name === 'card' }, closest: () => null,
+    focus() { focused.push(index); c.context.document.activeElement = this; }, click() { c.select(this.dataset.sessionKey); } }));
+  c.get('groups').querySelectorAll = (selector) => (selector === '.card' ? cards : []);
+  const detail = { closest: (selector) => (selector === '#detail' ? {} : null) };
+  const press = (target, key, extra = {}) => {
+    const event = { key, target, preventDefault() { this.prevented = true; }, ...extra };
+    return [c.listNavigationKeydown(event), !!event.prevented];
+  };
+  return { c, s, entry, cards, focused, detail, press, requests };
+}
+
+test('a hardware keyboard enters a session with → or Enter and its input focused, and moves through the list like agent view', () => {
+  const { c, s, cards, focused, press } = keyboardBoard();
+  // Opening draws the conversation, its input included, anew: the one on screen is read after.
+  assert.deepEqual(press(cards[2], 'ArrowRight'), [true, true]);
+  assert.equal(c.state.selected, s.key);
+  assert.equal(c.get('chat-input').focusCount, 1, 'the input takes the focus at once');
+  assert.equal(c.state.inputFocusFor, null);
+  // Enter does the same; Space is left to the card's own click (shown beside the list).
+  c.state.selected = null; c.state.detailFor = null;
+  assert.deepEqual(press(cards[2], 'Enter'), [true, true]); assert.equal(c.get('chat-input').focusCount, 1);
+  assert.deepEqual(press(cards[2], ' '), [false, false]);
+  // Home/End, PgUp/PgDn (five cards), and ↑ from the first card to the search field as before.
+  assert.deepEqual(press(cards[3], 'End'), [true, true]); assert.equal(focused.at(-1), 7);
+  assert.deepEqual(press(cards[7], 'Home'), [true, true]); assert.equal(focused.at(-1), 0);
+  assert.deepEqual(press(cards[0], 'PageDown'), [true, true]); assert.equal(focused.at(-1), 5);
+  assert.deepEqual(press(cards[5], 'PageDown'), [true, true]); assert.equal(focused.at(-1), 7);
+  assert.deepEqual(press(cards[1], 'PageUp'), [true, true]); assert.equal(focused.at(-1), 0);
+  // A card that is not a listed session (a bot request) keeps its own Enter.
+  assert.deepEqual(press(cards[4], 'Enter'), [false, false]);
+  // Nothing focused and no conversation open: ↓ starts at the first card (open, it scrolls instead).
+  c.state.selected = null;
+  focused.length = 0;
+  assert.deepEqual(press(c.context.document.body, 'ArrowDown'), [true, true]); assert.deepEqual(focused, [0]);
+});
+
+test('entering a session that needs an answer or does not take text yet focuses the conversation, then the input once it does', () => {
+  const asking = keyboardBoard({ phase: 'needs_input' });
+  asking.press(asking.cards[2], 'Enter');
+  assert.equal(asking.c.get('chat-input').focusCount || 0, 0, '1–9 stay with the question card');
+  assert.equal(asking.c.get('messages').focusCount, 1);
+  // A session whose state is not read yet: its input is drawn disabled.
+  const unread = (board) => { board.entry.data = null; return board; };
+  const { c, entry, cards, press } = unread(keyboardBoard());
+  press(cards[2], 'ArrowRight');
+  const input = c.get('chat-input');
+  assert.equal(input.disabled, true);
+  assert.equal(c.get('messages').focusCount, 1);
+  assert.equal(input.focusCount || 0, 0);
+  // Its state arrives with the focus still in the conversation: the input takes it.
+  c.context.document.activeElement = { closest: (selector) => (selector === '#detail' ? {} : null) };
+  entry.data = { capability: { supported: true }, phase: 'idle', route: entry.source };
+  c.updateChatComposer(entry);
+  assert.equal(input.disabled, false);
+  assert.equal(input.focusCount, 1);
+  // Not when the focus went back to the list meanwhile.
+  const later = unread(keyboardBoard());
+  later.press(later.cards[2], 'Enter');
+  later.c.context.document.activeElement = later.cards[2];
+  later.entry.data = { capability: { supported: true }, phase: 'idle', route: later.entry.source };
+  later.c.updateChatComposer(later.entry);
+  assert.equal(later.c.get('chat-input').focusCount || 0, 0);
+});
+
+test('in a conversation ← goes back from an empty input or outside a field, arrows scroll it and Enter or i go to the input', () => {
+  const { c, s, cards, focused, detail, press } = keyboardBoard();
+  c.state.selected = s.key;
+  const list = c.get('messages');
+  Object.assign(list, { clientHeight: 500, scrollHeight: 3000, scrollTop: 1000 });
+  assert.deepEqual(press(detail, 'ArrowDown'), [true, true]); assert.equal(list.scrollTop, 1060);
+  assert.deepEqual(press(detail, 'PageUp'), [true, true]); assert.equal(list.scrollTop, 1060 - 425);
+  assert.deepEqual(press(detail, 'Home'), [true, true]); assert.equal(list.scrollTop, 0);
+  assert.deepEqual(press(detail, 'ArrowLeft'), [true, true]); assert.equal(focused.at(-1), 2, 'back to its card');
+  const input = c.get('chat-input');
+  Object.assign(input, { id: 'chat-input', value: '', selectionStart: 0, selectionEnd: 0,
+    closest: (selector) => (selector === '#detail' || selector.includes('textarea') ? {} : null) });
+  assert.deepEqual(press(input, 'ArrowLeft'), [true, true]); assert.equal(focused.at(-1), 2);
+  input.value = '작성 중'; input.selectionStart = input.selectionEnd = 0;
+  assert.deepEqual(press(input, 'ArrowLeft'), [false, false], 'with words in it, ← moves the caret');
+  list.scrollTop = 1000;
+  assert.deepEqual(press(input, 'PageDown'), [true, true]); assert.equal(list.scrollTop, 1425);
+  assert.deepEqual(press(input, 'Backspace'), [false, false], 'typing keeps Backspace');
+  // Enter or i outside a field go to the input; a focused control keeps its Enter.
+  const before = input.focusCount || 0;
+  assert.deepEqual(press(detail, 'Enter'), [true, true]);
+  assert.deepEqual(press(detail, 'ㅑ', { code: 'KeyI' }), [true, true]);
+  assert.equal(input.focusCount, before + 2);
+  assert.deepEqual(press({ closest: (selector) => (selector === '#detail' || selector.startsWith('button') ? {} : null) }, 'Enter'), [false, false]);
+  // A phone layout goes back to the list screen.
+  c.context.window.matchMedia = (query) => ({ matches: query === '(max-width: 700px)' });
+  c.state.detailShown = true;
+  press(detail, 'ArrowLeft');
+  assert.equal(c.state.detailShown, false);
+  void cards;
+});
+
+test('list letters work by key position (a Korean input source), and ? shows the shortcuts without stealing typing', () => {
+  const { c, s, cards, press, requests } = keyboardBoard();
+  assert.deepEqual(press(cards[2], 'ㅔ', { code: 'KeyP' }), [true, true]);
+  assert.ok(requests.some((r) => r.url === '/api/session/pin'));
+  let renamed = null;
+  c.context.window.SessionholicLabels = { eligible: () => true, open: (session) => { renamed = session.key; } };
+  assert.deepEqual(press(cards[2], 'r', { code: 'KeyR' }), [true, true]); assert.equal(renamed, s.key);
+  assert.deepEqual(press(cards[2], 'p', { code: 'KeyP', metaKey: true }), [false, false], '⌘P stays the browser\'s');
+  const search = c.get('search'); let searched = 0; search.focus = () => { searched++; };
+  assert.deepEqual(press(cards[2], '/', { code: 'Slash' }), [true, true]); assert.equal(searched, 1);
+  const category = c.state.sessionCategory;
+  assert.deepEqual(press(cards[2], ']', { code: 'BracketRight' }), [true, true]);
+  assert.notEqual(c.state.sessionCategory, category);
+  assert.deepEqual(press(c.context.document.body, '[', { code: 'BracketLeft' }), [true, true]);
+  assert.equal(c.state.sessionCategory, category);
+  assert.deepEqual(press(cards[2], '?', { code: 'Slash', shiftKey: true }), [true, true]);
+  assert.equal(c.get('shortcuts-dialog').open, true);
+  const typing = { closest: (selector) => (selector.includes('textarea') ? {} : null) };
+  assert.deepEqual(press(typing, '?', { code: 'Slash', shiftKey: true }), [false, false]);
+  assert.deepEqual(press(typing, '/', { code: 'Slash' }), [false, false]);
+});
+
+test('the keyboard hint shows where a hardware keyboard is, and on a touch screen once one was seen', () => {
+  const c = client(undefined, noChatTimers);
+  const hint = c.get('keyboard-hint');
+  vm.runInContext('renderKeyboardHint()', c.context);
+  assert.equal(hint.hidden, false, 'a mouse and keyboard computer');
+  c.context.window.matchMedia = (query) => ({ matches: query === '(pointer: coarse)' });
+  c.state.hardwareKeyboard = false;
+  vm.runInContext('renderKeyboardHint()', c.context);
+  assert.equal(hint.hidden, true);
+  vm.runInContext('noteHardwareKey', c.context)({ key: 'ArrowDown' });
+  assert.equal(hint.hidden, false);
+});
+
+test('end keys ask to end a session only off a field and without a text selection, then end its run and take it off the list', async () => {
+  const preview = { targetProof: 'synthetic-proof', capabilities: { terminate: { supported: true, effect: '원본 CLI 실행을 종료합니다.' },
+    interrupt: { supported: false, reason: '진행 중인 응답이 없습니다.' } } };
+  const board = keyboardBoard({ fetchImpl: async (url) => ({ ok: true, status: 200, json: async () =>
+    url === '/api/session/preview' ? preview : url === '/api/session/action' ? { confirmed: true } : url === '/api/session/remove' ? { version: 3 } : {} }) });
+  const { c, s, cards, detail, press, requests, focused } = board;
+  c.context.document.body.append = () => {};
+  const selection = { isCollapsed: true, toString: () => '' };
+  c.context.window.getSelection = () => selection;
+  // Which keys ask: Delete, Backspace, ⌘⌫, Ctrl+C and Ctrl+X; not with Shift or Alt, not with text selected.
+  for (const [key, extra] of [['Delete', {}], ['Backspace', {}], ['Backspace', { metaKey: true }], ['c', { ctrlKey: true, code: 'KeyC' }], ['ㅌ', { ctrlKey: true, code: 'KeyX' }]]) {
+    assert.deepEqual(press(cards[2], key, extra), [true, true], key + JSON.stringify(extra));
+    c.get('end-session-dialog').close();
+  }
+  assert.deepEqual(press(cards[2], 'Delete', { shiftKey: true }), [false, false]);
+  Object.assign(selection, { isCollapsed: false, toString: () => '선택한 글' });
+  assert.deepEqual(press(cards[2], 'c', { ctrlKey: true, code: 'KeyC' }), [false, false], 'a selection is copied');
+  Object.assign(selection, { isCollapsed: true, toString: () => '' });
+  const typing = { id: 'chat-input', value: '', closest: (selector) => (selector === '#detail' || selector.includes('textarea') ? {} : null) };
+  c.state.selected = s.key;
+  assert.deepEqual(press(typing, 'Backspace'), [false, false], 'typing keeps Backspace');
+  // From the conversation (outside a field) as from its card.
+  requests.length = 0;
+  assert.deepEqual(press(detail, 'Delete'), [true, true]);
+  await settle();
+  assert.equal(requests.filter((r) => r.url === '/api/session/preview').length, 1);
+  assert.match(c.get('end-session-status').textContent, /원본 CLI 실행을 종료합니다\. 이어서 목록에서 지웁니다/);
+  const terminate = c.get('end-session-terminate');
+  assert.equal(terminate.disabled, false); assert.equal(terminate.focusCount, 1, 'Enter takes the default once it is known');
+  assert.equal(c.get('end-session-interrupt').hidden, true);
+  const next = focused.length;
+  await terminate.events.click(); await settle();
+  const action = requests.find((r) => r.url === '/api/session/action');
+  assert.deepEqual([action.body.action, action.body.targetProof], ['terminate', 'synthetic-proof']);
+  assert.equal(requests.filter((r) => r.url === '/api/session/remove').length, 1);
+  assert.equal(requests.find((r) => r.url === '/api/session/remove').body.removed, true);
+  assert.equal(c.get('end-session-dialog').open, false);
+  assert.match(c.get('toast').textContent, /실행을 끝내고 목록에서 지웠습니다/);
+  assert.equal(focused.slice(next).at(-1), 3, 'the next card takes the focus');
+});
+
+test('a session whose run cannot be ended is offered the list part only, and a refused end removes nothing', async () => {
+  const preview = { targetProof: 'p', capabilities: { terminate: { supported: false, reason: '종료된 세션입니다.' }, interrupt: { supported: false } } };
+  let confirmed = false;
+  const board = keyboardBoard({ fetchImpl: async (url) => ({ ok: true, status: 200, json: async () =>
+    url === '/api/session/preview' ? preview : url === '/api/session/action' ? { confirmed, reason: '실행이 이미 바뀌었습니다.' } : url === '/api/session/remove' ? { version: 4 } : {} }) });
+  const { c, cards, press, requests } = board;
+  c.context.document.body.append = () => {};
+  press(cards[2], 'Delete'); await settle();
+  assert.equal(c.get('end-session-dialog').open, true);
+  assert.equal(c.get('end-session-terminate').disabled, true);
+  assert.match(c.get('end-session-status').textContent, /종료된 세션입니다/);
+  const remove = c.get('end-session-remove');
+  assert.equal(remove.focusCount, 1);
+  await remove.events.click(); await settle();
+  assert.equal(requests.filter((r) => r.url === '/api/session/action').length, 0);
+  assert.equal(requests.filter((r) => r.url === '/api/session/remove').length, 1);
+  assert.equal(c.get('end-session-dialog').open, false);
+  // Supported, but the run refuses: the dialog says so and the list is left as it was.
+  preview.capabilities.terminate = { supported: true };
+  const other = keyboardBoard({ fetchImpl: async (url) => ({ ok: true, status: 200, json: async () =>
+    url === '/api/session/preview' ? preview : url === '/api/session/action' ? { confirmed: false, reason: '실행이 이미 바뀌었습니다.' } : {} }) });
+  other.c.context.document.body.append = () => {};
+  other.press(other.cards[2], 'Delete'); await settle();
+  await other.c.get('end-session-terminate').events.click(); await settle();
+  assert.match(other.c.get('end-session-status').textContent, /실행이 이미 바뀌었습니다/);
+  assert.equal(other.requests.filter((r) => r.url === '/api/session/remove').length, 0);
+  assert.equal(other.c.get('end-session-dialog').open, true);
+  void confirmed;
+});
+
 // A read of `count` rows: a question, an answer and three tool records in turn.
 const windowRows = (count) => Array.from({ length: count }, (unused, index) =>
   ({ role: ['user', 'assistant', 'tool', 'tool', 'tool'][index % 5], text: `항목 ${index}`, ts: index + 1 }));

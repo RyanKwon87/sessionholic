@@ -443,6 +443,17 @@ function keyboardOpen() {
 function compactChrome() {
   return touchDevice() && (phoneLayout() || shortLayout() || keyboardOpen());
 }
+// A tablet's screen (an iPad's), whatever the window's size: a narrow split view or Stage
+// Manager window on it lays out like a phone but keeps a tablet's height.
+function tabletScreen() {
+  const screen = globalThis.screen;
+  return touchDevice() && Math.min(screen?.width || 0, screen?.height || 0) >= 600;
+}
+// Typing folds the bars on a phone. A tablet folds them only while its on-screen keyboard takes
+// the space, its narrow window too: with a hardware keyboard the header (‹ 세션) stays.
+function typingFolds() {
+  return compactChrome() && (!tabletScreen() || keyboardOpen());
+}
 // Runs `update` inside a view transition sliding in `direction` ("push",
 // "pop", "present" or "dismiss"; style.css section 11). Without support,
 // with reduced motion or in a hidden tab it runs at once. Returns the
@@ -487,7 +498,8 @@ function setDetailShown(shown, { direction = null, focus = false } = {}) {
       if (typeof requestAnimationFrame === "function") requestAnimationFrame(() => keepAtEnd(list));
     }
     if (focus) {
-      if (shown) focusDetailBack();
+      // Entered from the keyboard (enterSession): its input, when it takes text already.
+      if (shown) focusPendingInput() || focusDetailBack();
       else restoreSelectedCardFocus();
     }
   };
@@ -654,6 +666,8 @@ const SHEETS = {
   "session-control-dialog": { onDismiss: () => closeSessionControl() },
   "session-label-dialog": { onDismiss: () => window.SessionholicLabels?.close?.() },
   "questions-dialog": { onDismiss: () => closeQuestions() },
+  "shortcuts-dialog": { onDismiss: () => closeShortcuts() },
+  "end-session-dialog": { onDismiss: () => closeEndSession() },
 };
 function sheet(id) {
   return BottomSheet.attach($(id), SHEETS[id]);
@@ -3100,6 +3114,8 @@ function restoreConversationView(list) {
 }
 function select(key) {
   if (state.launchBusy) return;
+  // Another session (a click, a notification) drops a keyboard entry's pending input focus.
+  if (state.inputFocusFor !== key) state.inputFocusFor = null;
   // A docked terminal stays beside its own conversation; another one shows without it.
   if (state.docked && key !== state.dockBeside) undock();
   if (state.selected !== key) rememberConversationView();
@@ -3375,6 +3391,8 @@ function drawDetail(s) {
   bar.append(el("strong", null, "최근 대화"), conversationActions);
   const list = el("div", "messages");
   list.id = "messages";
+  // Focusable by script only: a keyboard entering a session without an input lands here.
+  list.tabIndex = -1;
   const savedView = state.conversationViews.get(conversationIdentity(s));
   list.pendingView = savedView || null;
   list.pinned = savedView ? savedView.pinned : true;
@@ -3764,8 +3782,9 @@ function setTyping(typing) {
 // split view): only the temporary typing layout follows the available space.
 // The reader's focus choice is independent of the keyboard and viewport.
 function syncChromeMode() {
-  const compact = compactChrome();
-  setTyping(chatTyping() && compact);
+  // Read first, typing or not: reading it keeps the keyboard's baseline height current (keyboardInset).
+  const folds = typingFolds();
+  setTyping(chatTyping() && folds);
   const hint = $("tap-hint");
   if (!touchDevice() && hint && !hint.hidden) hint.hidden = true;
 }
@@ -5235,7 +5254,7 @@ function buildChatComposer(s) {
   // (syncChromeMode on the viewport's resize); a hardware keyboard never does.
   input.addEventListener("focus", () => {
     dictationFieldEvent(input, "focus");
-    setTyping(compactChrome());
+    setTyping(typingFolds());
   });
   input.addEventListener("blur", () => {
     dictationFieldEvent(input, "blur");
@@ -5548,10 +5567,12 @@ function sendShortcutLabel() {
 function noteHardwareKey(event) {
   if (state.hardwareKeyboard || !event || event.isComposing || event.keyCode === 229) return;
   const key = String(event.key || "");
+  // Letters typed with no on-screen keyboard up: a tablet's narrow window counts, a phone does not.
   const physical = event.metaKey || event.ctrlKey || event.altKey || HARDWARE_KEYS.has(key) ||
-    (key.length === 1 && chatTyping() && !phoneLayout() && !shortLayout() && !keyboardOpen());
+    (key.length === 1 && chatTyping() && (tabletScreen() || (!phoneLayout() && !shortLayout())) && !keyboardOpen());
   if (!physical) return;
   state.hardwareKeyboard = true;
+  renderKeyboardHint();
   const s = selectedSession();
   if (s) updateChatComposer(chatEntry(s));
 }
@@ -5597,20 +5618,36 @@ function documentKeydown(event) {
   if (listNavigationKeydown(event)) return;
   promptKeydown(event);
 }
-// A hardware keyboard (an iPad's) moves through the list: ↓ (or Enter) from the search
-// field goes to (or opens) the first card, ↑↓ move between cards, and in a conversation
-// Esc or ⌘[ goes back: to the list on a phone layout, to its card beside the conversation.
-// Typing, an input method's composition, a terminal or an open sheet keep their keys.
+// A hardware keyboard (an iPad's, a Mac's or a PC's) works the board like Claude Code's agent
+// view. In the list ↑↓ (Home/End, PgUp/PgDn) move between cards, → or Enter enters a session
+// with its input focused, and Space (a card's own click) shows it beside the list. ↓ (or Enter)
+// from the search field goes to (or opens) the first card. In a conversation ← in an empty
+// input, or outside a field ←, Esc or ⌘[, goes back: to the list on a phone layout, to its card
+// beside the conversation; outside a field ↑↓, PgUp/PgDn and Home/End scroll it and Enter (or i)
+// goes to the input. Ctrl+C, Ctrl+X, Delete or Backspace (⌘⌫) on a session asks to end it.
+// Typing, an input method's composition, a terminal, an open sheet and a text selection (for
+// Ctrl+C's copy) keep their keys.
 function listNavigationKeydown(event) {
   // A key something else already took (closing the tools menu with Esc) is not taken again.
-  if (event.defaultPrevented || boardKeysBlocked() || event.isComposing || event.keyCode === 229 ||
-      event.altKey || event.shiftKey) return false;
+  if (event.defaultPrevented || boardKeysBlocked() || event.isComposing || event.keyCode === 229) return false;
   const target = event.target;
   if (target?.id === "search" && state.historySearch.mode) return false;
   if (target?.closest?.("dialog")) return false;
   const key = TERMINAL_KEY_ALIASES[event.key] || event.key;
+  const code = String(event.code || "");
+  const editing = !!target?.closest?.("input, textarea, select, [contenteditable='true']");
+  const modified = event.metaKey || event.ctrlKey || event.altKey;
+  // Typed with Shift, so before the Shift rule below. A Korean layout gives the same "?".
+  if (!editing && !modified && (key === "?" || (event.shiftKey && code === "Slash"))) {
+    event.preventDefault();
+    openShortcuts(target);
+    return true;
+  }
+  if (event.altKey || event.shiftKey) return false;
   const cards = () => [...($("groups")?.querySelectorAll?.(".card") || [])];
   const plain = !event.metaKey && !event.ctrlKey;
+  // A letter by its key, so a Korean input source (ㅔ for p) gives the same shortcut.
+  const letter = (name) => plain && (code === "Key" + name.toUpperCase() || String(key).toLowerCase() === name);
   // A touch screen's own keyboard has a Return (search) key that only closes it: Enter
   // opens the first session only from a hardware keyboard.
   const enter = key === "Enter" && keyboardPresent();
@@ -5622,22 +5659,282 @@ function listNavigationKeydown(event) {
     else first.focus();
     return true;
   }
-  if (target?.classList?.contains?.("card") && plain && (key === "ArrowDown" || key === "ArrowUp")) {
-    const all = cards();
-    const next = all[all.indexOf(target) + (key === "ArrowDown" ? 1 : -1)];
-    event.preventDefault();
-    if (next) next.focus();
-    else if (key === "ArrowUp") $("search")?.focus();
-    return true;
+  const take = (run) => { event.preventDefault(); run(); return true; };
+  if (target?.classList?.contains?.("card")) {
+    const all = cards(), index = all.indexOf(target);
+    const s = target.dataset?.sessionKey ? allSessions().find((session) => session.key === target.dataset.sessionKey) : null;
+    if (plain && (key === "ArrowDown" || key === "ArrowUp")) {
+      const next = all[index + (key === "ArrowDown" ? 1 : -1)];
+      return take(() => { if (next) next.focus(); else if (key === "ArrowUp") $("search")?.focus(); });
+    }
+    if (plain && ["Home", "End", "PageUp", "PageDown"].includes(key) && all.length) {
+      const to = key === "Home" ? 0 : key === "End" ? all.length - 1 : index + (key === "PageDown" ? LIST_PAGE : -LIST_PAGE);
+      return take(() => all[Math.max(0, Math.min(all.length - 1, to))].focus());
+    }
+    if (s && plain && (key === "ArrowRight" || key === "Enter")) return take(() => enterSession(s, target));
+    if (s && endSessionKey(event, key)) return take(() => confirmEndSession(s, target));
+    if (s && letter("p")) return take(() => pinSession(s));
+    if (s && letter("r") && window.SessionholicLabels?.eligible?.(s)) return take(() => window.SessionholicLabels.open(s, target));
+    if (s && letter("t") && !sessionOneShot(s) && !state.launchBusy) return take(() => openSessionTerminal(s));
   }
-  const editing = target?.closest?.("input, textarea, select, [contenteditable='true']");
+  if (!editing && plain && (key === "/" || code === "Slash")) return take(() => { $("search")?.focus(); $("search")?.select?.(); });
+  if (!editing && plain && (code === "BracketLeft" || code === "BracketRight" || key === "[" || key === "]"))
+    return take(() => stepSessionCategory(code === "BracketRight" || key === "]" ? 1 : -1));
+  const open = !!state.selected && !!$("session-layout") && !$("session-layout").hidden && (!phoneLayout() || state.detailShown);
+  const nothing = !target || target === document.body || target === document.documentElement;
+  const here = open && (nothing || !!target?.closest?.("#detail"));
+  if (target?.id === "chat-input" && here && plain) {
+    const empty = !target.value && !target.selectionStart && !target.selectionEnd;
+    if (key === "ArrowLeft" && empty) return take(() => keyboardBack());
+    if (key === "PageUp" || key === "PageDown") return take(() => scrollConversation(key));
+  }
+  if (here && !editing) {
+    if (plain && ["ArrowUp", "ArrowDown", "PageUp", "PageDown", "Home", "End"].includes(key) && $("messages")?.clientHeight)
+      return take(() => scrollConversation(key));
+    if (plain && key === "ArrowLeft") return take(() => keyboardBack());
+    const control = !!target?.closest?.("button, a, summary, [role=button]");
+    if ((key === "Enter" && plain && !control) || letter("i")) {
+      const input = $("chat-input");
+      if (input && !input.disabled) return take(() => input.focus({ preventScroll: true }));
+    }
+    const s = selectedSession();
+    if (s && endSessionKey(event, key)) return take(() => confirmEndSession(s, target));
+  }
+  // Nothing focused on the list: ↑↓ start at the open session's card, or the first.
+  if (nothing && !open && plain && (key === "ArrowDown" || key === "ArrowUp")) {
+    const all = cards();
+    const card = all.find((node) => node.dataset?.sessionKey === state.selected) || all[0];
+    if (card) return take(() => card.focus());
+  }
   const back = (key === "Escape" && plain && !editing) || (event.metaKey && key === "[");
   if (!back || !state.selected || !$("session-layout") || $("session-layout").hidden) return false;
-  event.preventDefault();
+  return take(() => keyboardBack());
+}
+// PgUp/PgDn in the list move this many cards.
+const LIST_PAGE = 5;
+// Back from a conversation: to the list on a phone layout, to its card beside the conversation.
+function keyboardBack() {
+  state.inputFocusFor = null;
   if (phoneLayout() && state.detailShown) backToList();
   else if (state.dockSolo) backFromTerminal();
   else restoreSelectedCardFocus();
+}
+// → or Enter on a card: the session opens as its click opens it (a question is read to answer)
+// with its input focused, at once or once its state says it takes text (updateChatComposer);
+// until then, for a read-only session, and for one that needs an answer (1–9 choose on its
+// question card), the conversation has the focus. A click or Space keeps the card focused.
+function enterSession(s, card = null) {
+  state.inputFocusFor = groupOf(s) === "needs_input" ? null : s.key;
+  if (typeof card?.click === "function") card.click();
+  else select(s.key);
+  if (state.selected !== s.key) { state.inputFocusFor = null; return; }
+  // A phone layout focuses on showing the conversation (setDetailShown).
+  if (!phoneLayout() && !focusPendingInput()) $("messages")?.focus?.({ preventScroll: true });
+}
+function focusPendingInput() {
+  const input = $("chat-input");
+  if (!state.inputFocusFor || state.inputFocusFor !== state.selected || !input || input.disabled) return false;
+  state.inputFocusFor = null;
+  input.focus?.({ preventScroll: true });
   return true;
+}
+// The focus is on the open conversation (or nowhere), not on the list or another control.
+function conversationHasFocus() {
+  const node = document.activeElement;
+  return !node || node === document.body || !!node.closest?.("#detail");
+}
+// ↑↓ a few lines, PgUp/PgDn most of a screen, Home the oldest loaded, End the newest.
+function scrollConversation(key) {
+  const list = $("messages");
+  if (!list?.clientHeight) return;
+  if (key === "End") { scrollMessagesToEnd(); return; }
+  const page = Math.max(40, Math.round(list.clientHeight * 0.85));
+  const step = { ArrowUp: -60, ArrowDown: 60, PageUp: -page, PageDown: page }[key];
+  // The reader's own scroll: readingScroll unpins it from the end.
+  list.scrollTop = key === "Home" ? 0 : Math.max(0, list.scrollTop + step);
+}
+// [ ] step through the tabs; the new tab's first card takes the focus (↑↓ go on from there).
+function stepSessionCategory(step) {
+  const categories = Object.keys(SESSION_CATEGORIES);
+  const index = Math.max(0, categories.indexOf(state.sessionCategory));
+  const category = categories[(index + step + categories.length) % categories.length];
+  setSessionCategory(category);
+  const first = $("groups")?.querySelectorAll?.(".card")?.[0];
+  (first || $(`session-category-${category}`))?.focus?.();
+}
+// Ctrl+C or Ctrl+X (not with text selected: that is a copy), Delete, Backspace or ⌘⌫.
+function endSessionKey(event, key) {
+  const code = String(event.code || "");
+  if (event.altKey || event.shiftKey) return false;
+  if (event.ctrlKey && !event.metaKey) {
+    const lower = String(key).toLowerCase();
+    if (!(lower === "c" || lower === "x" || code === "KeyC" || code === "KeyX")) return false;
+    const selection = window.getSelection?.();
+    return !(selection && selection.isCollapsed === false && String(selection).length > 0);
+  }
+  return !event.ctrlKey && (key === "Delete" || key === "Backspace");
+}
+
+// ---------- 세션 종료 (keyboard) ----------
+// One confirmation for ending a session from the keyboard: its run ended (the same checked
+// request as 세션 관리 › 실행 종료) and then off the list (목록에서 지우기). What the run allows
+// is read first; a session that cannot be ended is offered the list part only, and Codex's
+// running answer can be stopped alone. Enter takes the focused choice once it is known.
+let endSession = null;
+function closeEndSession(force = false) {
+  if (!force && endSession?.busy) return;
+  const previous = endSession;
+  endSession = null;
+  const dialog = $("end-session-dialog");
+  if (dialog?.open) dialog.close();
+  if (!force && previous?.trigger?.isConnected !== false) previous?.trigger?.focus?.({ preventScroll: true });
+}
+async function confirmEndSession(s, trigger = null) {
+  if (!s || !state.authenticated || endSession?.busy) return;
+  if (botRequestForNative(sourceOf(s))) { toast("봇 요청 세션은 봇 요청 화면에서 관리합니다."); return; }
+  closeEndSession(true);
+  let dialog = $("end-session-dialog");
+  if (!dialog) {
+    dialog = el("dialog", "plan-dialog sheet end-session-dialog"); dialog.id = "end-session-dialog";
+    dialog.setAttribute("aria-labelledby", "end-session-title");
+    dialog.addEventListener("cancel", (event) => { event.preventDefault(); closeEndSession(); });
+    document.body.append(dialog);
+  }
+  const source = sourceOf(s);
+  if (!source.id && s.agent === "claude" && s.kind === "interactive" && /^[0-9A-Za-z-]{8,64}$/.test(s.sessionId || "")) source.id = s.sessionId;
+  const context = { s, source, trigger, authEpoch: state.authEpoch, busy: false, preview: null, used: false };
+  endSession = context;
+  const top = el("div", "dialog-top");
+  const cancel = button("취소", "sheet-done", () => closeEndSession()); cancel.id = "end-session-cancel";
+  top.append(el("p", "eyebrow", "세션 종료"), cancel);
+  const title = el("h2", "", "이 세션을 끝낼까요?"); title.id = "end-session-title"; title.tabIndex = -1;
+  const body = el("div", "dialog-body end-session-body");
+  const status = el("p", "end-session-status", "실행 상태를 확인하고 있습니다…");
+  status.id = "end-session-status"; status.setAttribute("role", "status");
+  const terminate = button("실행 종료하고 목록에서 지우기", "primary danger", () => endSessionRun(context));
+  terminate.id = "end-session-terminate"; terminate.disabled = true;
+  const removed = sessionRemoved(s);
+  const remove = button(removed ? "이미 목록에서 지운 세션입니다" : "목록에서만 지우기", "secondary", () => endSessionRemove(context));
+  remove.id = "end-session-remove"; remove.disabled = removed;
+  const interrupt = button("응답만 중단", "secondary", () => endSessionInterrupt(context));
+  interrupt.id = "end-session-interrupt"; interrupt.hidden = true;
+  body.append(el("p", "end-session-name", cardTitle(s)), el("p", "muted", `${s.hostLabel || s.host} · ${s.agent === "claude" ? "Claude" : "Codex"}`),
+    status, terminate, remove, interrupt,
+    el("p", "muted end-session-note", "목록에서 지운 세션은 필터의 '지운 세션 포함'에서 다시 표시할 수 있습니다. 대화 기록은 남습니다."));
+  const handle = el("div", "sheet-handle"); handle.setAttribute("aria-hidden", "true");
+  dialog.replaceChildren(handle, top, title, body);
+  sheet("end-session-dialog").open();
+  // Enter does nothing until the run's choices are known (the title holds the focus).
+  title.focus?.({ preventScroll: true });
+  try {
+    const result = await api("/api/session/preview", { method: "POST", body: { source }, authEpoch: context.authEpoch });
+    if (endSession !== context) return;
+    context.preview = result;
+    const end = result.capabilities?.terminate, stop = result.capabilities?.interrupt;
+    terminate.disabled = !end?.supported;
+    interrupt.hidden = !stop?.supported;
+    status.textContent = end?.supported ? `${end.effect || "원본 실행을 종료합니다."} 이어서 목록에서 지웁니다.`
+      : `실행 종료: ${end?.reason || "현재 실행에서 지원하지 않습니다."}`;
+    (end?.supported ? terminate : removed ? cancel : remove).focus?.();
+  } catch (err) {
+    if (endSession !== context || err.staleAuth || err.unauthorized) return;
+    status.textContent = `${err.message || "실행 상태를 확인하지 못했습니다."} 목록에서만 지울 수 있습니다.`;
+    (removed ? cancel : remove).focus?.();
+  }
+}
+function endSessionBusy(context, busy) {
+  context.busy = busy;
+  for (const item of $("end-session-dialog")?.querySelectorAll?.("button") || []) item.disabled = busy;
+  if (!busy) {
+    $("end-session-terminate").disabled = context.used || !context.preview?.capabilities?.terminate?.supported;
+    $("end-session-remove").disabled = sessionRemoved(context.s);
+  }
+}
+// The card after this one (or before, at the end) takes the focus once it is off the list.
+function cardAfter(s) {
+  const all = [...($("groups")?.querySelectorAll?.(".card") || [])];
+  const index = all.findIndex((node) => node.dataset?.sessionKey === s.key);
+  return index < 0 ? null : (all[index + 1] || all[index - 1] || null)?.dataset?.sessionKey || null;
+}
+function focusCardKey(key) {
+  const card = key && [...($("groups")?.querySelectorAll?.(".card") || [])].find((node) => node.dataset?.sessionKey === key);
+  (card || $("search"))?.focus?.({ preventScroll: true });
+}
+async function endSessionRun(context) {
+  if (endSession !== context || context.busy || context.used || !context.preview?.capabilities?.terminate?.supported) return;
+  context.used = true;
+  endSessionBusy(context, true);
+  $("end-session-status").textContent = "실행을 끝내고 있습니다…";
+  const next = cardAfter(context.s);
+  try {
+    const result = await api("/api/session/action", { method: "POST", body: { source: context.source, action: "terminate",
+      targetProof: context.preview.targetProof, requestId: requestId() }, authEpoch: context.authEpoch, csrfRetry: false });
+    if (endSession !== context) return;
+    if (result.confirmed !== true) {
+      $("end-session-status").textContent = result.reason || "실행 종료를 확인하지 못했습니다. 상태를 다시 확인해 주세요. 자동으로 다시 요청하지 않습니다.";
+      return;
+    }
+    const removed = sessionRemoved(context.s) || await removeSession(context.s, true, { quiet: true });
+    endSessionBusy(context, false);
+    closeEndSession(true);
+    toast(removed ? "실행을 끝내고 목록에서 지웠습니다. 필터의 '지운 세션 포함'에서 다시 볼 수 있습니다."
+      : "실행은 끝냈지만 목록에서 지우지 못했습니다. 세션 관리에서 다시 시도해 주세요.");
+    focusCardKey(next);
+    window.SessionholicGoals?.refresh?.();
+    poll(false);
+  } catch (err) {
+    if (endSession === context && !err.staleAuth && !err.unauthorized)
+      $("end-session-status").textContent = "실행 종료 결과를 확인하지 못했습니다. 상태를 다시 확인해 주세요. 요청을 자동으로 다시 보내지 않습니다.";
+  } finally {
+    if (endSession === context) endSessionBusy(context, false);
+  }
+}
+async function endSessionRemove(context) {
+  if (endSession !== context || context.busy || sessionRemoved(context.s)) return;
+  endSessionBusy(context, true);
+  const next = cardAfter(context.s);
+  const removed = await removeSession(context.s, true);
+  if (endSession !== context) return;
+  endSessionBusy(context, false);
+  if (!removed) return;
+  closeEndSession(true);
+  focusCardKey(next);
+}
+async function endSessionInterrupt(context) {
+  if (endSession !== context || context.busy || !context.preview?.capabilities?.interrupt?.supported) return;
+  endSessionBusy(context, true);
+  $("end-session-status").textContent = "응답을 멈추고 있습니다…";
+  try {
+    const result = await api("/api/session/action", { method: "POST", body: { source: context.source, action: "interrupt",
+      targetProof: context.preview.targetProof, requestId: requestId() }, authEpoch: context.authEpoch, csrfRetry: false });
+    if (endSession !== context) return;
+    if (result.confirmed === true) { endSessionBusy(context, false); closeEndSession(); toast("현재 응답을 중단했습니다. 대화 기록은 남아 있습니다."); poll(false); return; }
+    $("end-session-status").textContent = result.reason || "응답 중단을 확인하지 못했습니다. 자동으로 다시 요청하지 않습니다.";
+  } catch (err) {
+    if (endSession === context && !err.staleAuth && !err.unauthorized)
+      $("end-session-status").textContent = "응답 중단 결과를 확인하지 못했습니다. 요청을 자동으로 다시 보내지 않습니다.";
+  } finally {
+    if (endSession === context) endSessionBusy(context, false);
+  }
+}
+
+// ---------- 단축키 도움말 ----------
+// ? (or the keyboard hint under the list) shows the shortcuts; closing returns the focus.
+function openShortcuts(trigger = null) {
+  state.shortcutsTrigger = trigger && trigger !== document.body ? trigger : null;
+  sheet("shortcuts-dialog").open();
+  $("shortcuts-close")?.focus?.({ preventScroll: true });
+}
+function closeShortcuts() {
+  closeSheet("shortcuts-dialog");
+  const trigger = state.shortcutsTrigger;
+  state.shortcutsTrigger = null;
+  if (trigger?.isConnected !== false) trigger?.focus?.({ preventScroll: true });
+}
+// The one-line hint under the list, only where a hardware keyboard is (or was seen).
+function renderKeyboardHint() {
+  const hint = $("keyboard-hint");
+  if (hint) hint.hidden = !keyboardPresent();
 }
 function chatReceiptCopy(receipt) {
   if (receipt?.dispatchState === "not_started")
@@ -5753,6 +6050,9 @@ function updateChatComposer(entry, selected = selectedSession() || null) {
   chips.setAttribute("aria-label", selectedCaption);
   renderAttachmentTiles(entry, chips);
   resizeChatInput(entry, selected);
+  // Entered from the keyboard before its state said it takes text: the input once it does,
+  // unless the focus went elsewhere meanwhile (back to the list, another control).
+  if (state.inputFocusFor && state.inputFocusFor === selected?.key && conversationHasFocus()) focusPendingInput();
 }
 // Attachment tiles: a row that scrolls sideways. Images show a local preview
 // (an object URL of the picked file, memory only, revoked once the tile is
@@ -11734,10 +12034,12 @@ function renderKeyboardRoom() {
 // iOS scrolls the page to show a focused field above its keyboard before the app shrinks to
 // the space left (--app-height): the app then sits above what is on screen, which is blank
 // unless scrolled back. Both panes follow the visible area, including the interval after
-// focus leaves a field but Safari has not yet restored the viewport's scroll position.
+// focus leaves a field but Safari has not yet restored the viewport's scroll position. An
+// iPad scrolls for its hardware keyboard's shortcut bar too (below KEYBOARD_MIN_PX): unfollowed,
+// that hid a narrow window's header, its ‹ 세션 included.
 function renderAppShift() {
   const viewport = window.visualViewport;
-  const following = (editingText() && keyboardOpen()) || (state.appShift || 0) > 0;
+  const following = (editingText() && (keyboardOpen() || tabletScreen())) || (state.appShift || 0) > 0;
   const top = viewport && touchDevice() && (viewport.scale || 1) <= 1.01 && following
     ? Math.max(0, Math.round(viewport.pageTop ?? ((window.scrollY || 0) + (viewport.offsetTop || 0)))) : 0;
   if (top === (state.appShift || 0)) return;
@@ -11997,6 +12299,10 @@ window.addEventListener("DOMContentLoaded", () => {
   $("quick-replies-close")?.addEventListener("click", () => {
     rememberQuickReplyEdits(); rememberSavedPromptEdits(); $("settings-dialog").close(); $("settings")?.focus?.({ preventScroll: true });
   });
+  $("shortcuts-close")?.addEventListener("click", closeShortcuts);
+  $("shortcuts-dialog")?.addEventListener("cancel", (event) => { event.preventDefault(); closeShortcuts(); });
+  $("keyboard-hint")?.addEventListener("click", (event) => openShortcuts(event.currentTarget));
+  renderKeyboardHint();
   $("saved-prompts-save")?.addEventListener("click", saveSharedPrompts);
   $("saved-prompts-reload")?.addEventListener("click", () => loadSavedPrompts({ replaceEditor: true }));
   $("draft-recovery")?.addEventListener("change", (event) => {

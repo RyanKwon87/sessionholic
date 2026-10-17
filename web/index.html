@@ -248,6 +248,9 @@
             <p class="sr-only" role="status">세션을 확인하고 있습니다…</p>
           </div>
           <p class="list-footnote">메시지는 여기서, 자세한 작업은 터미널에서.</p>
+          <!-- Shown where a hardware keyboard is (or was seen); opens the shortcuts. -->
+          <button id="keyboard-hint" class="keyboard-hint" type="button" hidden aria-haspopup="dialog"
+            aria-label="키보드 단축키 보기">↑↓ 이동 · → 열기 · ← 목록 · ⌫ 종료 · ? 단축키</button>
           <!-- Floats at the bottom of the list while a board terminal stays open. -->
           <div id="terminal-return" class="terminal-return" hidden>
             <span class="terminal-return-icon" aria-hidden="true">›_</span
@@ -636,6 +639,40 @@
         <p id="questions-status" class="questions-status" role="status"></p>
         <div id="questions-list" class="questions-list"></div>
         <button id="questions-more" class="secondary questions-more" type="button" hidden>더 이전 질문 불러오기</button>
+      </div>
+    </dialog>
+    <dialog id="shortcuts-dialog" class="plan-dialog sheet shortcuts-dialog" aria-labelledby="shortcuts-title">
+      <div class="sheet-handle" aria-hidden="true"></div>
+      <div class="dialog-top">
+        <p class="eyebrow">키보드</p>
+        <button id="shortcuts-close" class="sheet-done" type="button">완료</button>
+      </div>
+      <h2 id="shortcuts-title">단축키</h2>
+      <div class="dialog-body">
+        <p class="theme-label">목록</p>
+        <dl class="shortcuts">
+          <dt><kbd>↑</kbd> <kbd>↓</kbd></dt><dd>세션 이동 (<kbd>Home</kbd> <kbd>End</kbd> 처음·끝, <kbd>PgUp</kbd> <kbd>PgDn</kbd> 5개씩)</dd>
+          <dt><kbd>→</kbd> <kbd>Enter</kbd></dt><dd>대화로 들어가 입력창에 바로 입력 (답 필요 세션은 선택지부터)</dd>
+          <dt><kbd>Space</kbd></dt><dd>들어가지 않고 옆에 보기</dd>
+          <dt><kbd>P</kbd></dt><dd>상단 고정·해제</dd>
+          <dt><kbd>R</kbd></dt><dd>제목 수정</dd>
+          <dt><kbd>T</kbd></dt><dd>터미널 열기</dd>
+          <dt><kbd>/</kbd></dt><dd>검색 (<kbd>⌘K</kbd> · <kbd>Ctrl+K</kbd>)</dd>
+          <dt><kbd>[</kbd> <kbd>]</kbd></dt><dd>일반·에이전트·봇 탭 바꾸기</dd>
+        </dl>
+        <p class="theme-label">대화</p>
+        <dl class="shortcuts">
+          <dt><kbd>←</kbd> <kbd>Esc</kbd></dt><dd>목록으로 (입력창에서는 비어 있을 때 <kbd>←</kbd>, 또는 <kbd>Esc</kbd> 두 번)</dd>
+          <dt><kbd>↑</kbd> <kbd>↓</kbd></dt><dd>대화 스크롤 (<kbd>PgUp</kbd> <kbd>PgDn</kbd>은 입력 중에도, <kbd>Home</kbd> <kbd>End</kbd> 처음·최신)</dd>
+          <dt><kbd>Enter</kbd> <kbd>I</kbd></dt><dd>입력창으로</dd>
+          <dt><kbd>1</kbd>–<kbd>9</kbd></dt><dd>질문 카드의 선택지 고르기</dd>
+          <dt><kbd>⌘↩</kbd> <kbd>Ctrl+Enter</kbd></dt><dd>보내기</dd>
+        </dl>
+        <p class="theme-label">세션 끝내기</p>
+        <dl class="shortcuts">
+          <dt><kbd>Ctrl+C</kbd> <kbd>Delete</kbd> <kbd>⌫</kbd></dt><dd>실행을 끝내고 목록에서 지울지 확인 (<kbd>Ctrl+X</kbd> · <kbd>⌘⌫</kbd>도 같음). 입력 중, 글자를 선택한 <kbd>Ctrl+C</kbd>(복사), 터미널 화면에서는 동작하지 않습니다.</dd>
+          <dt><kbd>?</kbd></dt><dd>이 도움말</dd>
+        </dl>
       </div>
     </dialog>
     <dialog id="action-sheet" class="plan-dialog sheet action-sheet" aria-labelledby="action-title">

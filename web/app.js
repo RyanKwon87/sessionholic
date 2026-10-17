@@ -273,6 +273,15 @@ const state = {
   quickRepliesSaving: null,
   quickRepliesEditor: null,
   quickRepliesUnsaved: null,
+  // 저장 프롬프트 as the board last answered ({ revision, prompts }); the list's poll names the
+  // revision only (savedPromptsSeen), and the bodies are read when it changes.
+  savedPrompts: null,
+  savedPromptsSeen: null,
+  savedPromptsLoading: null,
+  savedPromptsError: "",
+  savedPromptsSaving: null,
+  savedPromptsEditor: null,
+  savedPromptsUnsaved: null,
   historySearch: { mode: false, query: "", run: 0, busy: false, hits: new Map(), errors: new Map(), cursor: null, status: "", controller: null },
   // Reading state stays in this tab. Recoverable drafts are stored separately on this device.
   conversationViews: new Map(),
@@ -666,6 +675,12 @@ function openSettings() {
     : { value: $("quick-replies")?.value || "", revision: state.quickRepliesShared?.revision ?? null };
   renderQuickReplySettings();
   loadQuickReplyPreferences();
+  if ($("saved-prompts")) $("saved-prompts").value = state.savedPromptsUnsaved?.text ?? savedPromptText();
+  state.savedPromptsEditor = state.savedPromptsUnsaved
+    ? { value: state.savedPromptsUnsaved.baseValue, revision: state.savedPromptsUnsaved.revision }
+    : { value: $("saved-prompts")?.value || "", revision: state.savedPrompts?.revision ?? null };
+  renderSavedPromptSettings();
+  loadSavedPrompts();
   window.SessionholicPush?.render?.();
   sheet("settings-dialog").open();
 }
@@ -760,11 +775,16 @@ async function hardReload({ discard = false, preserveDrafts = false } = {}) {
 async function closeSettings() {
   if (!$("settings-dialog").open) return;
   // A phrase list edited without leaving the field is kept too.
-  const quick = $("quick-replies");
+  const quick = $("quick-replies"), prompts = $("saved-prompts"), kept = [];
   if (quick && quick.value !== quickReplies().join("\n") && !await saveSharedQuickReplies()) {
     rememberQuickReplyEdits();
-    toast("저장하지 못한 문구 편집을 이 화면에 보관했습니다. 설정에서 다시 저장할 수 있습니다.");
+    kept.push("문구");
   }
+  if (prompts && prompts.value !== savedPromptText() && !await saveSharedPrompts()) {
+    rememberSavedPromptEdits();
+    kept.push("프롬프트");
+  }
+  if (kept.length) toast(`저장하지 못한 ${kept.join("·")} 편집을 이 화면에 보관했습니다. 설정에서 다시 저장할 수 있습니다.`);
   $("settings-dialog").close();
   $("settings")?.focus?.({ preventScroll: true });
 }
@@ -2829,11 +2849,14 @@ function openActionSheet({ eyebrow = "", title = "", preview = "", actions = [],
   previewNode.textContent = preview;
   previewNode.hidden = !preview;
   const items = actions.map((action) => {
-    const item = button(action.label, `action-item${action.danger ? " danger" : ""}`, (event) => {
-      if (item.disabled || !menuItemPressed(dialog, item, event)) return;
-      closeActionSheet({ restoreFocus: false });
-      action.run();
-    });
+    const item = button(action.detail ? null : action.label,
+      `action-item${action.danger ? " danger" : ""}${action.detail ? " has-detail" : ""}`, (event) => {
+        if (item.disabled || !menuItemPressed(dialog, item, event)) return;
+        closeActionSheet({ restoreFocus: false });
+        action.run();
+      });
+    // A second, quieter line under the label (one line each, cut with an ellipsis).
+    if (action.detail) item.append(el("span", "action-label", action.label), el("span", "action-detail", action.detail));
     item.disabled = !!action.disabled;
     return item;
   });
@@ -6657,7 +6680,15 @@ function openQuickReplies(entry, input, trigger) {
     if (document.activeElement !== input) input.focus?.({ preventScroll: true });
     return sendChat(entry);
   };
-  const replies = quickReplies();
+  // A saved prompt goes in as a block of its own; one marked [입력창] waits there to be edited.
+  const choosePrompt = (prompt) => {
+    closeQuickReplies();
+    if (!ready()) return;
+    insertPromptText(entry, input, prompt.body);
+    if (document.activeElement !== input) input.focus?.({ preventScroll: true });
+    return prompt.mode === "insert" ? undefined : sendChat(entry);
+  };
+  const replies = quickReplies(), prompts = savedPrompts();
   const composer = touchDevice() && document.activeElement === input ? input.closest?.(".chat-composer") : null;
   if (composer) {
     const same = state.quickRepliesOpen?.input === input;
@@ -6675,7 +6706,8 @@ function openQuickReplies(entry, input, trigger) {
       return item;
     };
     for (const text of replies) add(text, () => choose(text));
-    if (!replies.length) add("설정 › 빠른 답장에서 문구를 추가해 주세요", () => {}).disabled = true;
+    for (const prompt of prompts) add(savedPromptLabel(prompt), () => choosePrompt(prompt)).className += " saved-prompt";
+    if (!replies.length && !prompts.length) add("설정 › 빠른 답장에서 문구를 추가해 주세요", () => {}).disabled = true;
     add("닫기", closeQuickReplies);
     trigger?.setAttribute?.("aria-expanded", "true");
     trigger?.setAttribute?.("aria-haspopup", "false");
@@ -6686,16 +6718,193 @@ function openQuickReplies(entry, input, trigger) {
   }
   // Chosen or cancelled, the keyboard goes back to the input, not to the closed tools menu.
   trigger?.setAttribute?.("aria-haspopup", "dialog");
+  const actions = [...replies.map((text) => ({ label: text, run: () => choose(text) })),
+    ...prompts.map((prompt) => ({ label: prompt.title, run: () => choosePrompt(prompt),
+      detail: (prompt.mode === "insert" ? "입력창에만 넣기 · " : "") + prompt.body.split("\n").find((line) => line.trim()).trim() }))];
   openActionSheet({ eyebrow: "문구를 선택하면 바로 전송", title: "빠른 답장", trigger: input || trigger,
-    actions: replies.length
-      ? replies.map((text) => ({ label: text, run: () => choose(text) }))
-      : [{ label: "설정 › 빠른 답장에서 문구를 추가해 주세요", disabled: true, run() {} }] });
+    actions: actions.length ? actions : [{ label: "설정 › 빠른 답장에서 문구를 추가해 주세요", disabled: true, run() {} }] });
 }
 function closeQuickReplies() {
   const opened = state.quickRepliesOpen;
   state.quickRepliesOpen = null;
   opened?.panel.remove?.();
   opened?.trigger?.setAttribute?.("aria-expanded", "false");
+}
+// ---------- 저장 프롬프트 ----------
+// Longer prompts beside the quick replies: a short title and a body of several lines each,
+// kept on the board for every device. 설정 edits them as one text: a "## 제목" line opens each
+// prompt and the lines under it are its body; "[입력창]" ending a title inserts without sending.
+const PROMPT_LIMIT = 20;
+const PROMPT_TITLE_LENGTH = 40;
+const PROMPT_BODY_LENGTH = 4000;
+const PROMPTS_BYTES = 61440;
+const PROMPT_INSERT_MARK = "[입력창]";
+const PROMPT_HEADING = /^##[ \t]+(.*)$/;
+// Each code unit of a lone surrogate half (paired ones are one character of Array.from).
+const loneSurrogate = (char) => char.length === 1 && char.charCodeAt(0) >= 0xd800 && char.charCodeAt(0) <= 0xdfff;
+function savedPrompts() {
+  return (state.savedPrompts?.prompts || []).map((prompt) => ({ ...prompt }));
+}
+function savedPromptLabel(prompt) {
+  return prompt.mode === "insert" ? `${prompt.title} · 입력창에만` : prompt.title;
+}
+function savedPromptText(prompts = savedPrompts()) {
+  return prompts.map((prompt) => `## ${prompt.title}${prompt.mode === "insert" ? " " + PROMPT_INSERT_MARK : ""}\n${prompt.body}`)
+    .join("\n\n");
+}
+// The editor's text as the board stores it, or the first problem in words. The board checks the
+// same rules again (session_labels.SavedPrompts).
+function parseSavedPrompts(text) {
+  const prompts = [];
+  for (const line of String(text || "").replace(/\r\n?/g, "\n").split("\n")) {
+    const heading = PROMPT_HEADING.exec(line);
+    if (heading) {
+      let title = heading[1].trim(), mode = "send";
+      if (title.endsWith(PROMPT_INSERT_MARK)) { title = title.slice(0, -PROMPT_INSERT_MARK.length).trim(); mode = "insert"; }
+      prompts.push({ title, lines: [], mode });
+    } else if (prompts.length) prompts.at(-1).lines.push(line);
+    else if (line.trim()) return { error: "첫 프롬프트는 \"## 제목\" 줄로 시작해 주세요." };
+  }
+  if (prompts.length > PROMPT_LIMIT) return { error: `저장 프롬프트는 ${PROMPT_LIMIT}개까지 저장할 수 있습니다.` };
+  const rows = [];
+  for (const [index, { title, lines, mode }] of prompts.entries()) {
+    const number = `${index + 1}번째 프롬프트`, body = lines.join("\n").trim();
+    if (!title || Array.from(title).length > PROMPT_TITLE_LENGTH ||
+        /[\x00-\x1f\x7f-\x9f\u202a-\u202e\u2066-\u2069]/.test(title) || Array.from(title).some(loneSurrogate))
+      return { error: `${number}의 제목은 제어문자 없이 ${PROMPT_TITLE_LENGTH}자 이내로 적어 주세요.` };
+    if (!body) return { error: `${number}에 보낼 본문을 적어 주세요.` };
+    if (Array.from(body).length > PROMPT_BODY_LENGTH || /[\x00-\x08\x0b-\x1f\x7f-\x9f]/.test(body) ||
+        Array.from(body).some(loneSurrogate))
+      return { error: `${number}의 본문은 제어문자 없이 ${PROMPT_BODY_LENGTH}자 이내로 적어 주세요.` };
+    // sendChat takes a message opening like "/model" for one of the board's own commands.
+    if (/^\/[a-z]+(?:\s|$)/.test(body)) return { error: `${number}의 본문이 /영문으로 시작해 보드 명령으로 처리됩니다. 앞에 다른 글자를 넣어 주세요.` };
+    rows.push({ title, body, mode });
+  }
+  return { prompts: rows };
+}
+// A prompt is a block of its own: beside other words of the draft, an empty line on each side.
+function insertPromptText(entry, input, text) {
+  const start = input.selectionStart ?? input.value.length, end = input.selectionEnd ?? start;
+  const before = input.value.slice(0, start), after = input.value.slice(end);
+  const gap = (side, edge) => !side.trim() || edge(side, "\n\n") ? "" : edge(side, "\n") ? "\n" : "\n\n";
+  insertChatText(entry, input, gap(before, (value, mark) => value.endsWith(mark)) + text +
+    gap(after, (value, mark) => value.startsWith(mark)));
+}
+function rememberSavedPromptEdits() {
+  if (state.savedPromptsEditor && $("saved-prompts")) state.savedPromptsUnsaved = {
+    text: $("saved-prompts").value, baseValue: state.savedPromptsEditor.value, revision: state.savedPromptsEditor.revision };
+}
+function renderSavedPromptSettings() {
+  const status = $("saved-prompts-status");
+  if (status) status.textContent = state.savedPromptsSaving ? "다른 기기와 공유할 프롬프트를 저장하고 있습니다…"
+    : state.savedPromptsError || (!state.savedPrompts ? "보드의 프롬프트를 불러오는 중입니다."
+      : state.savedPrompts.prompts.length ? `보드에 저장됨 · ${state.savedPrompts.prompts.length}개 · 모든 기기에서 공유합니다.`
+        : "저장한 프롬프트가 없습니다. 저장하면 모든 기기에서 공유합니다.");
+  for (const id of ["saved-prompts-save", "saved-prompts"]) if ($(id)) $(id).disabled = !!state.savedPromptsSaving;
+}
+function validSavedPrompts(data) {
+  return data?.ok === true && Number.isInteger(data.revision) && data.revision >= 0 && Array.isArray(data.prompts) &&
+    data.prompts.length <= PROMPT_LIMIT && data.prompts.every((prompt) => prompt && typeof prompt.title === "string" &&
+      prompt.title.trim() && typeof prompt.body === "string" && prompt.body.trim() && ["send", "insert"].includes(prompt.mode));
+}
+function adoptSavedPrompts(data) {
+  if (!validSavedPrompts(data)) {
+    if (data?.ok === false) { state.savedPromptsError = data.error || "저장 프롬프트를 읽지 못했습니다."; renderSavedPromptSettings(); }
+    return false;
+  }
+  if (state.savedPrompts && data.revision < state.savedPrompts.revision) return false;
+  state.savedPrompts = { revision: data.revision,
+    prompts: data.prompts.map(({ title, body, mode }) => ({ title, body, mode })) };
+  const editor = state.savedPromptsEditor, input = $("saved-prompts");
+  if ($("settings-dialog")?.open && editor && input && !state.savedPromptsSaving) {
+    if (input.value === editor.value) {
+      input.value = savedPromptText(); editor.value = input.value; editor.revision = data.revision;
+    } else if (editor.revision === null) editor.revision = data.revision;
+    else if (editor.revision !== data.revision)
+      state.savedPromptsError = "다른 기기에서 프롬프트를 바꿨습니다. 편집 내용은 유지됩니다. 최신 프롬프트를 불러온 뒤 다시 편집해 주세요.";
+  }
+  renderSavedPromptSettings();
+  return true;
+}
+// The list's poll names the revision; a newer one than this page holds is read once.
+function savedPromptsAnnounced(summary) {
+  if (summary?.ok !== true || !Number.isInteger(summary.revision)) return;
+  state.savedPromptsSeen = summary.revision;
+  if (summary.revision !== state.savedPrompts?.revision) loadSavedPrompts();
+}
+function loadSavedPrompts({ replaceEditor = false, followUp = true } = {}) {
+  if (state.savedPromptsLoading && !replaceEditor) return state.savedPromptsLoading;
+  const authEpoch = state.authEpoch;
+  const editor = state.savedPromptsEditor, text = $("saved-prompts")?.value;
+  if (!state.authenticated || networkOffline()) return Promise.resolve(false);
+  const loading = (async () => {
+    try {
+      const data = await api("/api/prompts", { authEpoch });
+      if (authEpoch !== state.authEpoch || !state.authenticated) return false;
+      const replacing = replaceEditor && state.savedPromptsEditor === editor && $("saved-prompts")?.value === text;
+      if (replacing && editor) editor.value = text;
+      state.savedPromptsError = "";
+      const adopted = adoptSavedPrompts(data);
+      if (adopted && replacing) state.savedPromptsUnsaved = null;
+      return adopted;
+    } catch (err) {
+      if (authEpoch === state.authEpoch && !err.unauthorized && !err.staleAuth) {
+        state.savedPromptsError = err.message; renderSavedPromptSettings();
+      }
+      return false;
+    } finally {
+      if (state.savedPromptsLoading === loading) state.savedPromptsLoading = null;
+    }
+  })();
+  state.savedPromptsLoading = loading;
+  // A revision named while this read was on its way is read after it (once; the next poll asks again).
+  loading.then(() => {
+    if (followUp && authEpoch === state.authEpoch && state.savedPrompts && state.savedPromptsSeen > state.savedPrompts.revision &&
+        !state.savedPromptsLoading) loadSavedPrompts({ followUp: false });
+  });
+  return loading;
+}
+function saveSharedPrompts() {
+  if (state.savedPromptsSaving) return state.savedPromptsSaving;
+  const input = $("saved-prompts"), editor = state.savedPromptsEditor;
+  if (!input || !editor || !state.authenticated) return Promise.resolve(false);
+  const authEpoch = state.authEpoch, revision = editor.revision;
+  const parsed = parseSavedPrompts(input.value);
+  if (parsed.error) {
+    state.savedPromptsError = `${parsed.error} 편집 내용은 유지됩니다.`;
+    renderSavedPromptSettings(); return Promise.resolve(false);
+  }
+  if (networkOffline() || revision === null) {
+    state.savedPromptsError = "연결 후 최신 프롬프트를 불러온 뒤 저장해 주세요. 편집 내용은 유지됩니다.";
+    renderSavedPromptSettings(); return Promise.resolve(false);
+  }
+  const body = { prompts: parsed.prompts, revision };
+  if (new TextEncoder().encode(JSON.stringify(body)).length > PROMPTS_BYTES) {
+    state.savedPromptsError = "저장 프롬프트 전체가 60KB를 넘습니다. 일부를 줄인 뒤 다시 저장해 주세요. 편집 내용은 유지됩니다.";
+    renderSavedPromptSettings(); return Promise.resolve(false);
+  }
+  state.savedPromptsError = "";
+  const saving = (async () => {
+    try {
+      const data = await api("/api/prompts", { method: "POST", body, authEpoch });
+      if (authEpoch !== state.authEpoch || !state.authenticated || state.savedPromptsEditor !== editor) return false;
+      if (data?.ok !== true || JSON.stringify(data.prompts) !== JSON.stringify(parsed.prompts) || !adoptSavedPrompts(data))
+        throw new Error("저장 결과를 확인하지 못했습니다. 최신 프롬프트를 다시 불러와 확인해 주세요.");
+      input.value = savedPromptText(); editor.value = input.value; editor.revision = data.revision;
+      state.savedPromptsUnsaved = null;
+      return true;
+    } catch (err) {
+      if (authEpoch === state.authEpoch && !err.unauthorized && !err.staleAuth) {
+        state.savedPromptsError = `${err.message} 편집 내용은 유지됩니다.`;
+      }
+      return false;
+    } finally {
+      if (state.savedPromptsSaving === saving) { state.savedPromptsSaving = null; renderSavedPromptSettings(); }
+    }
+  })();
+  state.savedPromptsSaving = saving;
+  renderSavedPromptSettings();
+  return saving;
 }
 // A Claude background conversation without a board terminal: its connection opens as its user
 // starts a message (typing, the mic or a quick reply; chat.py warm), so the send then pastes at
@@ -11137,6 +11346,7 @@ async function pollOnce(refresh = false, { capabilities = true } = {}) {
     if (Number.isInteger(snapshot?.version)) state.snapshotVersion = snapshot.version;
     const firstAuthentication = !state.authenticated;
     state.authenticated = true;
+    savedPromptsAnnounced(snapshot.savedPrompts);
     // One non-blocking metadata read separates known bot sessions immediately.
     // An ordinary poll never retries this initial read, even after failure.
     if (firstAuthentication) loadBotRequests();
@@ -11398,6 +11608,8 @@ function showLogin() {
   state.chats.clear();
   state.quickRepliesShared = null; state.quickRepliesEditor = null; state.quickRepliesSaving = null; state.quickRepliesError = "";
   state.quickRepliesUnsaved = null;
+  state.savedPrompts = null; state.savedPromptsSeen = null; state.savedPromptsLoading = null; state.savedPromptsSaving = null;
+  state.savedPromptsEditor = null; state.savedPromptsUnsaved = null; state.savedPromptsError = "";
   state.conversationViews.clear();
   window.SessionholicGoals?.locked?.();
   state.phaseFilter = "";
@@ -11783,8 +11995,10 @@ window.addEventListener("DOMContentLoaded", () => {
   $("quick-replies-save")?.addEventListener("click", saveSharedQuickReplies);
   $("quick-replies-reload")?.addEventListener("click", () => loadQuickReplyPreferences({ replaceEditor: true }));
   $("quick-replies-close")?.addEventListener("click", () => {
-    rememberQuickReplyEdits(); $("settings-dialog").close(); $("settings")?.focus?.({ preventScroll: true });
+    rememberQuickReplyEdits(); rememberSavedPromptEdits(); $("settings-dialog").close(); $("settings")?.focus?.({ preventScroll: true });
   });
+  $("saved-prompts-save")?.addEventListener("click", saveSharedPrompts);
+  $("saved-prompts-reload")?.addEventListener("click", () => loadSavedPrompts({ replaceEditor: true }));
   $("draft-recovery")?.addEventListener("change", (event) => {
     prefs.set("draftRecovery", event.target.checked);
     if (!event.target.checked) clearSavedDrafts(); else persistAllDrafts();

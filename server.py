@@ -39,7 +39,7 @@ import instance
 import settings
 from goals import GoalError, Goals
 from work_service import WorkService
-from session_labels import BoardPreferences, SessionLabels, SessionOpened, SessionPinned, SessionRemoved, SessionSeen, SessionTidied, reference as label_reference
+from session_labels import BoardPreferences, SavedPrompts, SessionLabels, SessionOpened, SessionPinned, SessionRemoved, SessionSeen, SessionTidied, reference as label_reference
 
 HERE = Path(__file__).resolve().parent
 WEB = HERE / "web"
@@ -2664,14 +2664,15 @@ def host_allowed(value):
 
 
 def display_stores(server):
-    """The stores a snapshot is decorated with, in order, then the shared preferences."""
+    """The stores a snapshot is decorated with, in order, then the shared preferences and the
+    saved prompts."""
     return (server.session_labels, server.session_seen, server.session_tidied, server.session_removed,
-            server.session_opened, server.session_pinned, server.preferences)
+            server.session_opened, server.session_pinned, server.preferences, server.prompts)
 
 
 # A snapshot field each display store adds; a body is kept only when every one read.
 STORE_FIELDS = ("sessionLabels", "sessionSeen", "sessionTidied", "sessionRemoved", "sessionOpened",
-                "sessionPinned", "quickReplyPreferences")
+                "sessionPinned", "quickReplyPreferences", "savedPrompts")
 
 
 class SnapshotResponses:
@@ -3117,6 +3118,8 @@ class Handler(BaseHTTPRequestHandler):
                     return self.send_json(200, self.server.goals.snapshot())
                 if url.path == "/api/preferences":
                     return self.send_json(200, self.server.preferences.snapshot())
+                if url.path == "/api/prompts":
+                    return self.send_json(200, self.server.prompts.snapshot())
                 if url.path in ("/api/history/message", "/api/history/search"):
                     if not self.server.history_gate.acquire(blocking=False):
                         return self.send_json(429, {"error": "기록을 읽고 있습니다. 잠시 뒤 다시 시도해 주세요."})
@@ -3381,15 +3384,21 @@ class Handler(BaseHTTPRequestHandler):
 
     def decorated_snapshot(self):
         """Board.snapshot() (a copy of its own, so decorated in place) with each display store's
-        fields, this server process's bootId and the shared preferences."""
+        fields, this server process's bootId, the shared preferences and the saved prompts'
+        revision (a page reads their bodies from /api/prompts when it changes)."""
         snapshot = self.server.board.snapshot()
-        for store in display_stores(self.server)[:-1]:
+        for store in display_stores(self.server)[:-2]:
             snapshot = store.decorate(snapshot, in_place=True)
         try:
             preferences = self.server.preferences.snapshot()
         except GoalError as exc:
             preferences = {"ok": False, **exc.payload}
-        return {**snapshot, "bootId": self.server.boot_id, "quickReplyPreferences": preferences}
+        try:
+            prompts = self.server.prompts.summary()
+        except GoalError as exc:
+            prompts = {"ok": False, **exc.payload}
+        return {**snapshot, "bootId": self.server.boot_id, "quickReplyPreferences": preferences,
+                "savedPrompts": prompts}
 
     def send_snapshot(self):
         """send_json(200, self.snapshot()), served by SnapshotResponses while nothing in it changed."""
@@ -3555,6 +3564,12 @@ class Handler(BaseHTTPRequestHandler):
                 if set(data) != {"quickReplies", "revision"}:
                     raise ValueError('빠른 답장과 설정 버전을 확인해 주세요.')
                 result = self.server.preferences.set_quick_replies(data['quickReplies'], data['revision'])
+                self.server.board.changed(force=True)
+                return self.send_json(200, result)
+            if path == "/api/prompts":
+                if set(data) != {"prompts", "revision"}:
+                    raise ValueError('저장 프롬프트와 설정 버전을 확인해 주세요.')
+                result = self.server.prompts.set_prompts(data['prompts'], data['revision'])
                 self.server.board.changed(force=True)
                 return self.send_json(200, result)
             if path == "/api/session/label":
@@ -3762,6 +3777,7 @@ def make_server(bind, port, board, token, terminals=None, workflow=None, state_d
     server.goals = Goals(state_dir)
     server.session_labels = SessionLabels(state_dir)
     server.preferences = BoardPreferences(state_dir)
+    server.prompts = SavedPrompts(state_dir)
     server.session_seen = SessionSeen(state_dir)
     server.session_pinned = SessionPinned(state_dir)
     server.session_tidied = SessionTidied(state_dir)

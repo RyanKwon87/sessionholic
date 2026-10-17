@@ -443,6 +443,17 @@ function keyboardOpen() {
 function compactChrome() {
   return touchDevice() && (phoneLayout() || shortLayout() || keyboardOpen());
 }
+// A tablet's screen (an iPad's), whatever the window's size: a narrow split view or Stage
+// Manager window on it lays out like a phone but keeps a tablet's height.
+function tabletScreen() {
+  const screen = globalThis.screen;
+  return touchDevice() && Math.min(screen?.width || 0, screen?.height || 0) >= 600;
+}
+// Typing folds the bars on a phone. A tablet folds them only while its on-screen keyboard takes
+// the space, its narrow window too: with a hardware keyboard the header (‹ 세션) stays.
+function typingFolds() {
+  return compactChrome() && (!tabletScreen() || keyboardOpen());
+}
 // Runs `update` inside a view transition sliding in `direction` ("push",
 // "pop", "present" or "dismiss"; style.css section 11). Without support,
 // with reduced motion or in a hidden tab it runs at once. Returns the
@@ -3764,8 +3775,9 @@ function setTyping(typing) {
 // split view): only the temporary typing layout follows the available space.
 // The reader's focus choice is independent of the keyboard and viewport.
 function syncChromeMode() {
-  const compact = compactChrome();
-  setTyping(chatTyping() && compact);
+  // Read first, typing or not: reading it keeps the keyboard's baseline height current (keyboardInset).
+  const folds = typingFolds();
+  setTyping(chatTyping() && folds);
   const hint = $("tap-hint");
   if (!touchDevice() && hint && !hint.hidden) hint.hidden = true;
 }
@@ -5235,7 +5247,7 @@ function buildChatComposer(s) {
   // (syncChromeMode on the viewport's resize); a hardware keyboard never does.
   input.addEventListener("focus", () => {
     dictationFieldEvent(input, "focus");
-    setTyping(compactChrome());
+    setTyping(typingFolds());
   });
   input.addEventListener("blur", () => {
     dictationFieldEvent(input, "blur");
@@ -11734,10 +11746,12 @@ function renderKeyboardRoom() {
 // iOS scrolls the page to show a focused field above its keyboard before the app shrinks to
 // the space left (--app-height): the app then sits above what is on screen, which is blank
 // unless scrolled back. Both panes follow the visible area, including the interval after
-// focus leaves a field but Safari has not yet restored the viewport's scroll position.
+// focus leaves a field but Safari has not yet restored the viewport's scroll position. An
+// iPad scrolls for its hardware keyboard's shortcut bar too (below KEYBOARD_MIN_PX): unfollowed,
+// that hid a narrow window's header, its ‹ 세션 included.
 function renderAppShift() {
   const viewport = window.visualViewport;
-  const following = (editingText() && keyboardOpen()) || (state.appShift || 0) > 0;
+  const following = (editingText() && (keyboardOpen() || tabletScreen())) || (state.appShift || 0) > 0;
   const top = viewport && touchDevice() && (viewport.scale || 1) <= 1.01 && following
     ? Math.max(0, Math.round(viewport.pageTop ?? ((window.scrollY || 0) + (viewport.offsetTop || 0)))) : 0;
   if (top === (state.appShift || 0)) return;

@@ -8615,6 +8615,44 @@ test('a tablet supports focus scrolling and taps, preserving the choice across k
   assert.equal(sideways.pane.classList.contains('is-typing'), true);
 });
 
+test('a narrow iPad window keeps its header while typing on a hardware keyboard and follows what iOS scrolled for its shortcut bar', () => {
+  const { c, pane } = phoneConversation();
+  const typing = () => pane.classList.contains('is-typing');
+  const shifted = new Set(), vars = {};
+  c.context.document.body.classList = { add: (n) => shifted.add(n), remove: (n) => shifted.delete(n), contains: (n) => shifted.has(n) };
+  c.context.document.documentElement.style = { setProperty: (name, value) => { vars[name] = value; } };
+  // A split view on an 820×1180 iPad: phone width, tablet height.
+  c.context.screen = { width: 820, height: 1180 };
+  Object.assign(c.context.window, { innerWidth: 600, innerHeight: 1180, visualViewport: { height: 1180, scale: 1, offsetTop: 0, pageTop: 0 } });
+  const input = c.get('chat-input');
+  c.context.document.activeElement = input; input.events.focus();
+  assert.equal(typing(), false, 'the header and its ‹ 세션 stay for a hardware keyboard');
+  // The shortcut bar (below 150px) and the 55px iOS scrolled to show the field above it.
+  c.context.window.visualViewport = { height: 1180 - 55, scale: 1, offsetTop: 0, pageTop: 55 };
+  c.updateViewport();
+  assert.equal(typing(), false, 'a shortcut bar is not an on-screen keyboard');
+  assert.equal(vars['--app-shift'], '55px', 'the app follows what is on screen');
+  assert.equal(shifted.has('app-shifted'), true);
+  // The on-screen keyboard took the space: folded as on a phone.
+  c.context.window.visualViewport = { height: 1180 - 420, scale: 1, offsetTop: 0, pageTop: 0 };
+  c.updateViewport();
+  assert.equal(typing(), true);
+  assert.equal(shifted.has('app-shifted'), false);
+  c.context.document.activeElement = null; input.events.blur();
+  assert.equal(typing(), false);
+  // A phone's own narrow screen folds at once, and a scroll without its keyboard counted is left as before.
+  const phone = phoneConversation();
+  const phoneVars = {};
+  phone.c.context.document.documentElement.style = { setProperty: (name, value) => { phoneVars[name] = value; } };
+  phone.c.context.screen = { width: 390, height: 844 };
+  Object.assign(phone.c.context.window, { innerWidth: 390, innerHeight: 844, visualViewport: { height: 844 - 55, scale: 1, offsetTop: 0, pageTop: 55 } });
+  const phoneInput = phone.c.get('chat-input');
+  phone.c.context.document.activeElement = phoneInput; phoneInput.events.focus();
+  assert.equal(phone.pane.classList.contains('is-typing'), true);
+  phone.c.updateViewport();
+  assert.notEqual(phoneVars['--app-shift'], '55px');
+});
+
 test('wide touch screens read like a phone: 16px text, one reading column for bubbles, question card and composer, and a narrower list', () => {
   const css = styleSheet();
   const wide = css.match(/@media \(pointer: coarse\) and \(min-width: 701px\) and \(min-height: 521px\) \{([\s\S]*?)\n\}/);

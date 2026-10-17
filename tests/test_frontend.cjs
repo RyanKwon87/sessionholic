@@ -12203,6 +12203,166 @@ test('quick reply delivery uncertainty stays locked and a confirmed refusal pres
   }
 });
 
+// A follow-up prompt of several paragraphs (fixture text) and one kept for editing first.
+const PROMPT_BODY = '이 작업을 더 깊이 있는 버전으로 만들어 주세요. 먼저 알려 주세요:\n\n(1) 전문가라면 무엇을 할지\n\n그런 다음 다시 작성해 주세요.';
+const SAVED_PROMPTS = [{ title: '깊게 다시', body: PROMPT_BODY, mode: 'send' },
+  { title: '검토', body: '변경을 검토해 주세요.\n\t- 위험부터', mode: 'insert' }];
+const plain = (value) => JSON.parse(JSON.stringify(value));
+
+test('saved prompts round-trip through the "## 제목" editor text with paragraphs, tabs and the [입력창] mark', () => {
+  const c = client(undefined, noChatTimers);
+  const p = vm.runInContext('({parseSavedPrompts,savedPromptText})', c.context);
+  const text = `## 깊게 다시\n${PROMPT_BODY}\n\n\n##\t검토 [입력창]\n변경을 검토해 주세요.\n\t- 위험부터\n`;
+  assert.deepEqual(plain(p.parseSavedPrompts(text).prompts), SAVED_PROMPTS);
+  assert.deepEqual(plain(p.parseSavedPrompts(text.replace(/\n/g, '\r\n')).prompts), SAVED_PROMPTS);
+  assert.equal(p.savedPromptText(SAVED_PROMPTS), `## 깊게 다시\n${PROMPT_BODY}\n\n## 검토 [입력창]\n변경을 검토해 주세요.\n\t- 위험부터`);
+  assert.deepEqual(plain(p.parseSavedPrompts(p.savedPromptText(SAVED_PROMPTS)).prompts), SAVED_PROMPTS);
+  assert.deepEqual(plain(p.parseSavedPrompts(' \n\n').prompts), []);
+  // Only "## " opens a prompt: a deeper heading or "##" alone stays in the body.
+  assert.deepEqual(plain(p.parseSavedPrompts('## 제목\n### 소제목\n##\n본문').prompts),
+    [{ title: '제목', body: '### 소제목\n##\n본문', mode: 'send' }]);
+  assert.equal(p.parseSavedPrompts(`## ${'😀'.repeat(40)}\n본문`).prompts.length, 1, 'counted in characters');
+  const errors = [
+    ['제목 없이 본문', /"## 제목" 줄로 시작/], ['## \n본문', /1번째 프롬프트의 제목/], [`## ${'x'.repeat(41)}\n본문`, /제목/],
+    ['## a\u202eb\n본문', /제목/], ['## 빈 프롬프트\n\n## 다음\n본문', /1번째 프롬프트에 보낼 본문/],
+    [`## a\n${'x'.repeat(4001)}`, /본문은/], ['## a\n화면 \x1b[2J', /본문은/], ['## a\n\ud800', /본문은/],
+    ['## a\n본문\n## b\n/model gpt', /2번째 프롬프트의 본문이 \/영문/], ['## a\n/compact', /보드 명령/],
+    [Array.from({ length: 21 }, (unused, index) => `## ${index}\n본문`).join('\n'), /20개/],
+  ];
+  for (const [value, message] of errors) assert.match(p.parseSavedPrompts(value).error, message, JSON.stringify(value).slice(0, 40));
+  // A path or a word after the slash is not one of the board's commands.
+  assert.equal(p.parseSavedPrompts('## a\n/Users/example 폴더\n## b\n/goal-handoff 정리').prompts.length, 2);
+});
+
+test('the poll\'s revision reads the saved prompts\' bodies only when it changes', async () => {
+  const requests = []; let snapshot, stored = 2;
+  const c = client(async (url) => {
+    requests.push(url);
+    if (url === '/api/prompts') return { ok: true, status: 200, json: async () => ({ ok: true, revision: stored, prompts: SAVED_PROMPTS }) };
+    return { ok: true, status: 200, json: async () => url === '/api/snapshot' ? snapshot : {} };
+  }, noChatTimers);
+  const reads = () => requests.filter((url) => url === '/api/prompts').length;
+  selectChat(c);
+  snapshot = { ...c.state.snapshot, savedPrompts: { ok: true, revision: 2 } };
+  c.state.capabilities = {}; c.state.capabilitiesRevision = c.capabilitiesRevision(snapshot);
+  await c.poll(); await settle();
+  assert.equal(reads(), 1);
+  assert.deepEqual(plain(vm.runInContext('savedPrompts', c.context)()), SAVED_PROMPTS);
+  await c.poll(); await settle();
+  assert.equal(reads(), 1, 'the same revision is not read again');
+  assert.equal(JSON.stringify(snapshot).includes('깊게'), false);
+  stored = 3; snapshot = { ...snapshot, savedPrompts: { ok: true, revision: 3 } };
+  await c.poll(); await settle();
+  assert.equal(reads(), 2, 'a newer revision is read');
+  // The board answered an older list than the poll named: read once more, then wait for the next poll.
+  snapshot = { ...snapshot, savedPrompts: { ok: true, revision: 4 } };
+  await c.poll(); await settle(6);
+  assert.equal(reads(), 4);
+  snapshot = { ...snapshot, savedPrompts: { ok: false, error: 'fixture' } };
+  await c.poll(); await settle();
+  assert.equal(reads(), 4);
+});
+
+test('a saved prompt sends its whole multi-line body once as its own block, and an [입력창] prompt only fills the draft', async () => {
+  const requests = [];
+  const c = client(async (url, options) => {
+    requests.push({ url, body: options?.body && JSON.parse(options.body) });
+    return { ok: true, status: 200, json: async () => url === '/api/chat/state'
+      ? { route: entry.source, capability: { supported: true }, phase: 'idle' } : { status: 'accepted' } };
+  }, noChatTimers);
+  const { entry } = selectChat(c); const input = c.get('chat-input');
+  vm.runInContext('adoptSavedPrompts', c.context)({ ok: true, revision: 1, prompts: SAVED_PROMPTS });
+  input.value = entry.text = '앞 문장';
+  c.openQuickReplies(entry, input, null);
+  const replies = c.quickReplies().length, items = c.get('action-list').children;
+  assert.equal(items.length, replies + 2);
+  assert.equal(items[replies - 1].textContent, c.quickReplies().at(-1), 'the phrases come first');
+  assert.match(items[replies].className, /has-detail/);
+  assert.deepEqual(items[replies].children.map((child) => child.textContent),
+    ['깊게 다시', '이 작업을 더 깊이 있는 버전으로 만들어 주세요. 먼저 알려 주세요:']);
+  assert.deepEqual(items[replies + 1].children.map((child) => child.textContent), ['검토', '입력창에만 넣기 · 변경을 검토해 주세요.']);
+  const item = items[replies];
+  item.events.click(); item.events.click();
+  await settle();
+  const sends = requests.filter((r) => r.url === '/api/chat/send');
+  assert.equal(sends.length, 1);
+  assert.equal(sends[0].body.text, `앞 문장\n\n${PROMPT_BODY}`);
+  assert.equal(entry.text, '');
+  input.value = entry.text = '앞\n'; input.selectionStart = input.selectionEnd = 1;
+  c.openQuickReplies(entry, input, null);
+  c.get('action-list').children[replies + 1].events.click();
+  await settle();
+  assert.equal(requests.filter((r) => r.url === '/api/chat/send').length, 1, 'an [입력창] prompt is not sent');
+  assert.equal(entry.text, `앞\n\n${SAVED_PROMPTS[1].body}\n`);
+  assert.equal(input.value, entry.text);
+});
+
+test('touch quick replies list saved prompts after the phrases, and prompts alone need no phrases', () => {
+  const c = client(undefined, noChatTimers);
+  c.context.window.matchMedia = (query) => ({ matches: query === '(pointer: coarse)' });
+  const { entry } = selectChat(c); const input = c.get('chat-input');
+  const composer = node(); composer.append = function (panel) { this.children.push(panel); panel.remove = () => { this.children = this.children.filter((item) => item !== panel); }; };
+  input.closest = () => composer; c.context.document.activeElement = input;
+  vm.runInContext('adoptSavedPrompts', c.context)({ ok: true, revision: 1, prompts: SAVED_PROMPTS });
+  c.openQuickReplies(entry, input, node());
+  let panel = c.state.quickRepliesOpen.panel;
+  assert.deepEqual(panel.children.slice(-3).map((item) => item.textContent), ['깊게 다시', '검토 · 입력창에만', '닫기']);
+  assert.match(panel.children.at(-3).className, /saved-prompt/);
+  vm.runInContext('closeQuickReplies', c.context)();
+  c.saveQuickReplies('');
+  c.openQuickReplies(entry, input, node());
+  panel = c.state.quickRepliesOpen.panel;
+  assert.deepEqual(panel.children.map((item) => item.textContent), ['깊게 다시', '검토 · 입력창에만', '닫기']);
+});
+
+test('saved prompt settings save the parsed list, refuse a malformed text without posting, and keep edits on conflict', async () => {
+  const bodies = [];
+  const c = client(async (url, options) => {
+    if (url === '/api/prompts' && options?.method === 'POST') {
+      const body = JSON.parse(options.body); bodies.push(body);
+      return { ok: true, status: 200, json: async () => ({ ok: true, revision: body.revision + 1, prompts: body.prompts }) };
+    }
+    return { ok: true, status: 200, json: async () => url === '/api/prompts'
+      ? { ok: true, revision: 1, prompts: SAVED_PROMPTS.slice(0, 1) } : { ok: true, revision: 0, quickReplies: null } };
+  }, noChatTimers);
+  selectChat(c);
+  const p = vm.runInContext('({adoptSavedPrompts,saveSharedPrompts,savedPrompts})', c.context);
+  p.adoptSavedPrompts({ ok: true, revision: 1, prompts: SAVED_PROMPTS.slice(0, 1) });
+  c.openSettings(); await settle();
+  const editor = c.get('saved-prompts');
+  assert.equal(editor.value, `## 깊게 다시\n${PROMPT_BODY}`);
+  editor.value = '## 새 프롬프트 [입력창]\r\n여러\r\n\r\n줄\r\n';
+  assert.equal(await p.saveSharedPrompts(), true);
+  assert.deepEqual(bodies[0], { prompts: [{ title: '새 프롬프트', body: '여러\n\n줄', mode: 'insert' }], revision: 1 });
+  assert.deepEqual(plain(p.savedPrompts()), bodies[0].prompts);
+  assert.equal(editor.value, '## 새 프롬프트 [입력창]\n여러\n\n줄');
+  assert.match(c.get('saved-prompts-status').textContent, /보드에 저장됨 · 1개/);
+  editor.value = '제목 없이 본문';
+  assert.equal(await p.saveSharedPrompts(), false);
+  assert.equal(bodies.length, 1);
+  assert.match(c.get('saved-prompts-status').textContent, /"## 제목" 줄로 시작.*편집 내용은 유지/);
+  p.adoptSavedPrompts({ ok: true, revision: 5, prompts: SAVED_PROMPTS.slice(1) });
+  assert.equal(editor.value, '제목 없이 본문');
+  assert.match(c.get('saved-prompts-status').textContent, /다른 기기에서 프롬프트를 바꿨습니다/);
+  assert.equal(p.savedPrompts()[0].title, '검토');
+});
+
+test('a saved prompt edit that fails to save closes with settings and comes back on reopening', async () => {
+  const c = client(async (url, options) => url === '/api/prompts' && options?.method === 'POST'
+    ? { ok: false, status: 503, json: async () => ({ error: 'fixture disk failure' }) }
+    : { ok: true, status: 200, json: async () => url === '/api/prompts'
+      ? { ok: true, revision: 1, prompts: SAVED_PROMPTS } : { ok: true, revision: 0, quickReplies: null } }, noChatTimers);
+  selectChat(c);
+  vm.runInContext('adoptSavedPrompts', c.context)({ ok: true, revision: 1, prompts: SAVED_PROMPTS });
+  c.openSettings(); await settle();
+  c.get('saved-prompts').value = '## 수정\n본문'; await c.closeSettings();
+  assert.equal(c.get('settings-dialog').open, false);
+  assert.match(c.get('toast').textContent, /저장하지 못한 프롬프트 편집을 이 화면에 보관/);
+  assert.deepEqual(plain(vm.runInContext('savedPrompts', c.context)()), SAVED_PROMPTS);
+  c.openSettings(); await settle();
+  assert.equal(c.get('saved-prompts').value, '## 수정\n본문');
+});
+
 test('header device chips include hardware-only devices with their actual status and no duplicates', () => {
   const c = client(undefined, noChatTimers); setRecentSnapshot(c, []);
   c.state.snapshot.hosts.push({ name: 'second', label: 'Second', ok: true }, { name: 'third', label: 'Third', ok: true });

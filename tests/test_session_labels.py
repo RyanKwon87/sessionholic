@@ -635,6 +635,124 @@ class BoardPreferencesHTTPTest(unittest.TestCase):
         self.assertEqual((response.status, result['code']), (409, 'preferences_conflict'))
 
 
+# A follow-up prompt of several paragraphs, as a person keeps one (fixture text).
+PROMPT_BODY = ('이 작업을 더 깊이 있는 버전으로 만들어 주세요. 먼저 알려 주세요:\n\n'
+               '(1) 전문가라면 무엇을 할지\n\n(2) 무엇부터 시작할지\n\n그런 다음 다시 작성해 주세요.')
+
+
+class SavedPromptsTest(unittest.TestCase):
+    def setUp(self):
+        from session_labels import SavedPrompts
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.store = SavedPrompts(self.temp.name)
+
+    def prompt(self, title='깊게 다시', body=PROMPT_BODY, mode='send'):
+        return {'title': title, 'body': body, 'mode': mode}
+
+    def test_multi_line_prompts_persist_privately_beside_the_quick_replies(self):
+        from session_labels import BoardPreferences, SavedPrompts
+        self.assertEqual(self.store.snapshot(), {'ok': True, 'revision': 0, 'prompts': []})
+        self.assertEqual(self.store.summary(), {'ok': True, 'revision': 0})
+        result = self.store.set_prompts([self.prompt(' 깊게 다시 ', '\n' + PROMPT_BODY + '\n\n'),
+                                         self.prompt('검토', '변경을 검토해 주세요.\n\t- 위험부터', 'insert')], 0)
+        self.assertEqual(result['revision'], 1)
+        self.assertEqual(result['prompts'], [self.prompt(), self.prompt('검토', '변경을 검토해 주세요.\n\t- 위험부터', 'insert')])
+        self.assertEqual(SavedPrompts(self.temp.name).snapshot(), result)
+        self.assertEqual(self.store.summary(), {'ok': True, 'revision': 1})
+        self.assertEqual(self.store.path.name, 'board-prompts.json')
+        self.assertEqual(self.store.path.stat().st_mode & 0o777, 0o600)
+        # The quick replies keep their own file and revision.
+        self.assertEqual(BoardPreferences(self.temp.name).snapshot(), {'ok': True, 'revision': 0, 'quickReplies': None})
+        self.assertEqual(self.store.set_prompts([], 1), {'ok': True, 'revision': 2, 'prompts': []})
+
+    def test_two_devices_conflict_without_overwriting_and_same_value_retry_is_idempotent(self):
+        from session_labels import SavedPrompts
+        second = SavedPrompts(self.temp.name)
+        self.store.set_prompts([self.prompt('first')], 0)
+        with self.assertRaises(GoalError) as caught:
+            second.set_prompts([self.prompt('second')], 0)
+        self.assertEqual((caught.exception.status, caught.exception.payload['code']), (409, 'prompts_conflict'))
+        self.assertEqual(second.snapshot()['prompts'], [self.prompt('first')])
+        self.assertEqual(second.set_prompts([self.prompt('first')], 0)['revision'], 1)
+
+    def test_validation_names_the_prompt_and_never_replaces_saved_content(self):
+        self.store.set_prompts([self.prompt('safe')], 0)
+        cases = [
+            ([self.prompt()] * 21, '20개'),
+            ([self.prompt('')], '1번째'), ([self.prompt('x' * 41)], '제목'), ([self.prompt('a\tb')], '제목'),
+            ([self.prompt('a\u202eb')], '제목'), ([self.prompt('a\ud800')], '제목'),
+            ([self.prompt(body=' \n ')], '본문'), ([self.prompt(body='x' * 4001)], '본문'),
+            ([self.prompt(body='bad\x1b[2J')], '본문'), ([self.prompt(body='bad\rline')], '본문'),
+            ([self.prompt(body='bad\ud800')], '본문'),
+            ([self.prompt(), self.prompt(body='/model gpt')], '2번째'), ([self.prompt(body=' /compact')], '/영문'),
+            ([self.prompt(mode='auto')], '형식'), ([{**self.prompt(), 'id': 'x'}], '형식'), (['text'], '형식'), ({}, '20개'),
+        ]
+        for prompts, words in cases:
+            with self.subTest(prompts=repr(prompts)[:60]), self.assertRaises(GoalError) as caught:
+                self.store.set_prompts(prompts, 1)
+            self.assertIn(words, caught.exception.payload['error'])
+            self.assertEqual(caught.exception.payload['code'], 'invalid_prompts')
+        for revision in (True, -1, '1'):
+            with self.subTest(revision=revision), self.assertRaises(GoalError):
+                self.store.set_prompts([self.prompt('new')], revision)
+        # A path or a word after the slash is not a board command.
+        self.store.set_prompts([self.prompt(body='/Users/example 폴더를 봐 주세요'), self.prompt(body='/goal-handoff 정리')], 1)
+        self.assertEqual(self.store.snapshot()['revision'], 2)
+
+    def test_a_list_past_the_request_size_is_refused_and_the_previous_one_kept(self):
+        from session_labels import PROMPT_BODY_LIMIT, PROMPT_LIMIT
+        self.store.set_prompts([self.prompt('old')], 0)
+        large = [self.prompt(f'제목 {index}', '가' * PROMPT_BODY_LIMIT) for index in range(PROMPT_LIMIT)]
+        with self.assertRaises(GoalError) as caught:
+            self.store.set_prompts(large, 1)
+        self.assertEqual(caught.exception.payload['code'], 'preferences_too_large')
+        self.assertEqual(self.store.snapshot()['prompts'], [self.prompt('old')])
+        # What fits is under the 64 KiB a JSON request may be.
+        fits = [self.prompt(f'제목 {index}', '가' * 4000) for index in range(5)]
+        self.store.set_prompts(fits, 1)
+        self.assertLess(len(json.dumps({'prompts': fits, 'revision': 1}, ensure_ascii=False).encode()), 65536)
+
+    def test_corrupt_or_unsafe_storage_is_not_read_or_replaced(self):
+        self.store.set_prompts([self.prompt('safe')], 0)
+        for raw in (b'PRIVATE_CORRUPT_CONTENT', json.dumps({'version': 1, 'revision': 1, 'prompts': None}).encode(),
+                    json.dumps({'version': 1, 'revision': 1, 'prompts': [{'title': 'x', 'body': '/model', 'mode': 'send'}]}).encode()):
+            with self.subTest(raw=raw[:20]):
+                self.store.path.write_bytes(raw)
+                with self.assertRaises(GoalError): self.store.snapshot()
+                with self.assertRaises(GoalError): self.store.summary()
+                with self.assertRaises(GoalError): self.store.set_prompts([self.prompt('replacement')], 1)
+                self.assertEqual(self.store.path.read_bytes(), raw)
+        self.store.path.unlink()
+        target = Path(self.temp.name) / 'unrelated.json'; target.write_text('private'); target.chmod(0o600)
+        self.store.path.symlink_to(target)
+        with self.assertRaises(GoalError): self.store.set_prompts([self.prompt('replacement')], 0)
+        self.assertEqual(target.read_text(), 'private')
+
+
+class SavedPromptsHTTPTest(unittest.TestCase):
+    setUp = SessionLabelsHTTPTest.setUp
+    tearDown = SessionLabelsHTTPTest.tearDown
+    request = SessionLabelsHTTPTest.request
+
+    def test_prompts_auth_csrf_origin_conflict_and_a_poll_without_bodies(self):
+        self.assertEqual(self.request('GET', '/api/prompts', auth=False)[0].status, 401)
+        body = {'prompts': [{'title': '깊게 다시', 'body': PROMPT_BODY, 'mode': 'send'}], 'revision': 0}
+        for changes in ({'auth': False}, {'csrf': False}, {'extra': {'Origin': 'https://other.invalid'}}):
+            self.assertIn(self.request('POST', '/api/prompts', body, **changes)[0].status, (401, 403))
+        self.assertEqual(self.request('GET', '/api/snapshot')[1]['savedPrompts'], {'ok': True, 'revision': 0})
+        response, result = self.request('POST', '/api/prompts', body)
+        self.assertEqual((response.status, result['revision'], result['prompts']), (200, 1, body['prompts']))
+        self.assertEqual(self.request('GET', '/api/prompts')[1], result)
+        snapshot = self.request('GET', '/api/snapshot')[1]
+        self.assertEqual(snapshot['savedPrompts'], {'ok': True, 'revision': 1})
+        self.assertNotIn('깊게 다시', json.dumps(snapshot, ensure_ascii=False))
+        response, result = self.request('POST', '/api/prompts', {**body, 'prompts': []})
+        self.assertEqual((response.status, result['code']), (409, 'prompts_conflict'))
+        for wrong in ({'prompts': []}, {**body, 'extra': 1}, {**body, 'prompts': [{'title': 'x', 'body': '/clear', 'mode': 'send'}]}):
+            self.assertEqual(self.request('POST', '/api/prompts', wrong)[0].status, 400)
+
+
 class HistoryHTTPTest(unittest.TestCase):
     setUp = SessionLabelsHTTPTest.setUp
     tearDown = SessionLabelsHTTPTest.tearDown
@@ -829,11 +947,13 @@ class SnapshotResponseTest(unittest.TestCase):
 
     def fresh(self):
         """What the board answered before answers were kept: every store's decorate on its
-        own copy, chained, then the bootId and preferences, serialized as send_json does."""
+        own copy, chained, then the bootId, preferences and saved prompts' revision, serialized
+        as send_json does."""
         snapshot = self.board.snapshot()
         for name in self.STORES:
             snapshot = getattr(self.httpd, name).decorate(snapshot)
-        snapshot = {**snapshot, 'bootId': self.httpd.boot_id, 'quickReplyPreferences': self.httpd.preferences.snapshot()}
+        snapshot = {**snapshot, 'bootId': self.httpd.boot_id, 'quickReplyPreferences': self.httpd.preferences.snapshot(),
+                    'savedPrompts': self.httpd.prompts.summary()}
         return json.dumps(snapshot, ensure_ascii=False).encode()
 
     def test_an_unchanged_snapshot_is_answered_without_copying_or_reading_any_store(self):
@@ -865,6 +985,7 @@ class SnapshotResponseTest(unittest.TestCase):
         self.httpd.session_seen.mark(self.source, 4000)
         self.httpd.session_pinned.mark(self.source, 4100)
         self.httpd.preferences.set_quick_replies(['계속 진행'], 0)
+        self.httpd.prompts.set_prompts([{'title': '깊게', 'body': '첫 줄\n\n둘째 줄', 'mode': 'send'}], 0)
         other = {**self.native, 'id': str(uuid.uuid4()), 'title': None, 'name': '이름 sk-proj-12345678901234567890'}
         claude = {'id': '', 'kind': 'interactive', 'sessionId': str(uuid.uuid4()), 'title': 'Claude'}
         broken = {'id': 'not a session id', 'title': 'Unidentifiable'}
@@ -889,6 +1010,7 @@ class SnapshotResponseTest(unittest.TestCase):
             self.assertEqual(response.getheader('Vary'), 'Accept-Encoding')
             self.assertEqual(response.getheader('Cache-Control'), 'no-store')
         decoded = json.loads(expected)
+        self.assertEqual(decoded['savedPrompts'], {'ok': True, 'revision': 1}, 'the poll carries no prompt bodies')
         rows = decoded['hosts'][0]['data']
         self.assertEqual(rows['codex'][0]['displayTitle'], 'Board name')
         self.assertNotIn('sk-proj', rows['codex'][1]['originalTitle'])
@@ -896,7 +1018,7 @@ class SnapshotResponseTest(unittest.TestCase):
         self.assertEqual(rows['claude'][0]['displayTitle'], 'Claude')
 
     def test_every_input_of_a_kept_answer_changes_the_next_one(self):
-        from session_labels import BoardPreferences, SessionOpened, SessionPinned, SessionRemoved
+        from session_labels import BoardPreferences, SavedPrompts, SessionOpened, SessionPinned, SessionRemoved
         directory = self.temp.name
 
         def row():
@@ -920,6 +1042,8 @@ class SnapshotResponseTest(unittest.TestCase):
             ('pinned', lambda: SessionPinned(directory).mark(self.source, 4005), lambda: row()['pinnedAt'], 4005),
             ('preferences', lambda: BoardPreferences(directory).set_quick_replies(['다음'], 0),
              lambda: self.snapshot()['quickReplyPreferences']['quickReplies'], ['다음']),
+            ('prompts', lambda: SavedPrompts(directory).set_prompts([{'title': '다음', 'body': '본문', 'mode': 'insert'}], 0),
+             lambda: self.snapshot()['savedPrompts']['revision'], 1),
             ('bootId', boot, lambda: self.snapshot()['bootId'], 'another-boot'),
         )
         for name, change, read, expected in changes:
@@ -959,7 +1083,7 @@ class SnapshotResponseTest(unittest.TestCase):
         finally:
             os.chmod(self.temp.name, 0o700)
         self.assertFalse(any(snapshot[field]['ok'] for field in self.FIELDS))
-        self.assertTrue(all(self.snapshot()[field]['ok'] for field in self.FIELDS + ('quickReplyPreferences',)))
+        self.assertTrue(all(self.snapshot()[field]['ok'] for field in self.FIELDS + ('quickReplyPreferences', 'savedPrompts')))
 
     def test_a_row_key_is_the_same_with_or_without_the_memo(self):
         import session_labels

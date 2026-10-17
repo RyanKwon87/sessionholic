@@ -511,6 +511,21 @@
           <button id="quick-replies-reload" class="push-button" type="button">최신 문구 불러오기</button>
           <button id="quick-replies-close" class="push-button" type="button">편집 보관하고 닫기</button>
         </div>
+        <p id="saved-prompts-label" class="theme-label settings-section">저장 프롬프트</p>
+        <textarea id="saved-prompts" class="quick-replies saved-prompts" rows="8" spellcheck="false"
+          placeholder="## 제목&#10;보낼 내용 (여러 줄)" aria-labelledby="saved-prompts-label"
+          aria-describedby="saved-prompts-help"></textarea>
+        <p id="saved-prompts-help" class="plan-preserve">
+          빠른 답장 목록의 문구 아래에 제목으로 보이는 긴 프롬프트입니다. 항목마다 "## 제목" 줄을
+          적고 그 아래 줄부터 본문을 적습니다(빈 줄을 포함한 여러 줄, 본문 4,000자, 20개까지). 선택하면
+          입력창에 넣고 바로 보내며, 제목 끝에 [입력창]을 붙인 항목은 보내지 않고 입력창에만 넣습니다.
+          본문의 줄은 "## "로 시작할 수 없습니다. 저장한 프롬프트는 이 보드의 모든 기기에서 공유합니다.
+        </p>
+        <p id="saved-prompts-status" class="plan-preserve" role="status" aria-live="polite"></p>
+        <div class="push-actions">
+          <button id="saved-prompts-save" class="push-button" type="button">프롬프트 저장</button>
+          <button id="saved-prompts-reload" class="push-button" type="button">최신 프롬프트 불러오기</button>
+        </div>
         <p id="push-label" class="theme-label settings-section">알림</p>
         <p id="push-status" class="plan-preserve" role="status" aria-live="polite"></p>
         <div class="push-actions">

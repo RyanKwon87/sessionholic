@@ -7492,6 +7492,44 @@ input.switch:focus-visible {
   line-height: 1.45;
   resize: vertical;
 }
+/* 설정 › 저장 프롬프트: "## 제목" lines and the bodies under them. */
+.quick-replies.saved-prompts {
+  min-height: 12em;
+}
+/* A menu item with a quieter second line (a saved prompt's first line). */
+.action-item.has-detail {
+  flex-direction: column;
+  align-items: flex-start;
+  justify-content: center;
+  gap: 2px;
+  padding-top: 8px;
+  padding-bottom: 8px;
+}
+.action-item .action-label,
+.action-item .action-detail {
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.action-item .action-detail {
+  color: var(--label-2);
+  font-size: var(--fs-sub);
+}
+@media (hover: hover) and (pointer: fine) {
+  .action-sheet.is-popover .action-item:hover:not(:disabled) .action-detail {
+    color: inherit;
+  }
+}
+/* Saved prompts under the phrases of the keyboard's quick reply choices. */
+.chat-quick-options .action-item.saved-prompt {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.chat-quick-options .action-item:not(.saved-prompt) + .action-item.saved-prompt {
+  box-shadow: inset 0 1px 0 var(--sep-strong);
+}
 /* A session not looked at since it answered or finished. */
 .card-unread {
   flex: none;

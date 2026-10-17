@@ -342,10 +342,13 @@ class SessionPinned(SessionSeen):
 
 class BoardPreferences(_KeptRead, Goals):
     """Small shared UI preferences; never credentials, drafts or native settings."""
+    NAME, FIELD, MAX_FILE = 'board-preferences', 'quickReplies', 16384
+    CONFLICT = ('다른 기기에서 문구를 바꿨습니다. 최신 문구를 확인한 뒤 다시 저장해 주세요.', 'preferences_conflict')
+
     def __init__(self, state_dir):
         super().__init__(state_dir)
-        self.path = self.directory / 'board-preferences.json'
-        self.lock_path = self.directory / 'board-preferences.lock'
+        self.path = self.directory / (self.NAME + '.json')
+        self.lock_path = self.directory / (self.NAME + '.lock')
 
     def _unavailable(self):
         return GoalError('빠른 답장 설정을 읽거나 저장하지 못했습니다. 편집 내용은 유지됩니다.',
@@ -359,21 +362,30 @@ class BoardPreferences(_KeptRead, Goals):
             raise GoalError('빠른 답장은 한 줄 200자, 최대 12개까지 저장할 수 있습니다.', 'invalid_quick_replies')
         return [row.strip() for row in value]
 
+    def _valid(self, value):
+        """The stored form of `value`, or a GoalError."""
+        return self.rows(value)
+
+    @staticmethod
+    def _empty():
+        """The value before anything is saved: None keeps each browser's own phrases."""
+        return None
+
     def _read(self):
         settings.safe_path(self.path, private=True, allow_missing=True)
         try:
             fd = os.open(str(self.path), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
         except FileNotFoundError:
-            return {'version': 1, 'revision': 0, 'quickReplies': None}
+            return {'version': 1, 'revision': 0, self.FIELD: self._empty()}
         try:
             with os.fdopen(fd, 'rb') as stream:
-                if self._private_file(stream.fileno()).st_size > 16384:
+                if self._private_file(stream.fileno()).st_size > self.MAX_FILE:
                     raise ValueError('size')
-                data = json.loads(stream.read(16385))
-            if (not isinstance(data, dict) or set(data) != {'version', 'revision', 'quickReplies'} or
+                data = json.loads(stream.read(self.MAX_FILE + 1))
+            if (not isinstance(data, dict) or set(data) != {'version', 'revision', self.FIELD} or
                     type(data['version']) is not int or data['version'] != 1 or
                     type(data['revision']) is not int or data['revision'] < 0 or
-                    data['quickReplies'] is not None and self.rows(data['quickReplies']) != data['quickReplies']):
+                    data[self.FIELD] != self._empty() and self._valid(data[self.FIELD]) != data[self.FIELD]):
                 raise ValueError('format')
             return data
         except (GoalError, ValueError, TypeError, KeyError, UnicodeError, RecursionError):
@@ -382,18 +394,78 @@ class BoardPreferences(_KeptRead, Goals):
     def snapshot(self):
         with self._storage():
             data = self._read()
-            return {'ok': True, 'revision': data['revision'], 'quickReplies': data['quickReplies']}
+            return {'ok': True, 'revision': data['revision'], self.FIELD: data[self.FIELD]}
 
-    def set_quick_replies(self, rows, revision):
-        rows = self.rows(rows)
+    def _set(self, value, revision):
+        value = self._valid(value)
         if type(revision) is not int or revision < 0:
             raise GoalError('저장할 설정 버전을 다시 확인해 주세요.', 'invalid_preferences_revision')
         with self._storage(write=True):
             data = self._read()
-            if data['quickReplies'] != rows:
+            if data[self.FIELD] != value:
                 if data['revision'] != revision:
-                    raise GoalError('다른 기기에서 문구를 바꿨습니다. 최신 문구를 확인한 뒤 다시 저장해 주세요.',
-                                    'preferences_conflict', 409)
-                data.update(quickReplies=rows, revision=data['revision'] + 1)
+                    raise GoalError(*self.CONFLICT, 409)
+                data.update({self.FIELD: value, 'revision': data['revision'] + 1})
+                if len(json.dumps(data, ensure_ascii=False, separators=(',', ':')).encode()) + 1 > self.MAX_FILE:
+                    raise GoalError('저장할 내용이 너무 큽니다. 일부를 줄인 뒤 다시 저장해 주세요.', 'preferences_too_large')
                 self._write(data)
-            return {'ok': True, 'revision': data['revision'], 'quickReplies': data['quickReplies']}
+            return {'ok': True, 'revision': data['revision'], self.FIELD: data[self.FIELD]}
+
+    def set_quick_replies(self, rows, revision):
+        return self._set(rows, revision)
+
+
+PROMPT_LIMIT, PROMPT_TITLE_LIMIT, PROMPT_BODY_LIMIT = 20, 40, 4000
+# The board takes a message that opens like "/model" for one of its own commands, never sent.
+BOARD_COMMAND = re.compile(r'/[a-z]+(?:\s|$)')
+
+
+class SavedPrompts(BoardPreferences):
+    """Saved prompts: a short title and a multi-line body each, shared by the board's devices.
+    The list's poll carries only the revision (summary); a page reads the bodies when it changes.
+    The file stays under the 64 KiB a JSON request may be, so a list that fits is also one a page
+    can send."""
+    NAME, FIELD, MAX_FILE = 'board-prompts', 'prompts', 61440
+    CONFLICT = ('다른 기기에서 저장 프롬프트를 바꿨습니다. 최신 프롬프트를 확인한 뒤 다시 저장해 주세요.', 'prompts_conflict')
+    MODES = ('send', 'insert')
+
+    def _unavailable(self):
+        return GoalError('저장 프롬프트를 읽거나 저장하지 못했습니다. 편집 내용은 유지됩니다.', 'prompts_unavailable', 503)
+
+    @staticmethod
+    def _empty():
+        return []
+
+    @staticmethod
+    def _bad(message):
+        return GoalError(message, 'invalid_prompts')
+
+    def _valid(self, value):
+        if not isinstance(value, list) or len(value) > PROMPT_LIMIT:
+            raise self._bad(f'저장 프롬프트는 {PROMPT_LIMIT}개까지 저장할 수 있습니다.')
+        rows = []
+        for number, row in enumerate(value, 1):
+            if not isinstance(row, dict) or set(row) != {'title', 'body', 'mode'} or row['mode'] not in self.MODES:
+                raise self._bad(f'{number}번째 프롬프트의 형식을 확인해 주세요.')
+            title, body = row['title'], row['body']
+            if (not isinstance(title, str) or not title.strip() or len(title) > PROMPT_TITLE_LIMIT
+                    or any(unicodedata.category(char) in ('Cc', 'Cs') or '\u202a' <= char <= '\u202e'
+                           or '\u2066' <= char <= '\u2069' for char in title)):
+                raise self._bad(f'{number}번째 프롬프트의 제목은 제어문자 없이 {PROMPT_TITLE_LIMIT}자 이내로 적어 주세요.')
+            # Line breaks and tabs are the body's own; any other control character is not text.
+            if (not isinstance(body, str) or not body.strip() or len(body) > PROMPT_BODY_LIMIT
+                    or any(unicodedata.category(char) == 'Cs' or unicodedata.category(char) == 'Cc'
+                           and char not in '\n\t' for char in body)):
+                raise self._bad(f'{number}번째 프롬프트의 본문은 제어문자 없이 {PROMPT_BODY_LIMIT}자 이내로 적어 주세요.')
+            if BOARD_COMMAND.match(body.strip()):
+                raise self._bad(f'{number}번째 프롬프트의 본문이 /영문으로 시작해 보드 명령으로 처리됩니다. 앞에 다른 글자를 넣어 주세요.')
+            rows.append({'title': title.strip(), 'body': body.strip(), 'mode': row['mode']})
+        return rows
+
+    def summary(self):
+        """What the list's poll carries: whether the prompts read, and their revision."""
+        with self._storage():
+            return {'ok': True, 'revision': self._read_cached()['revision']}
+
+    def set_prompts(self, prompts, revision):
+        return self._set(prompts, revision)

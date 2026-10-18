@@ -38,7 +38,7 @@ BASE64 = re.compile(r'[A-Za-z0-9+/]*={0,2}\Z')
 PROFILE_FAILURE_TTL = 120
 RUNTIME_MODULES = ('collector.py', 'launch.py', 'transfer_native.py', 'transfer_workspace.py', 'transfer_worker.py',
                    'native_chat.py', 'attachments.py', 'managed_launch.py', 'settings.py', 'instance.py',
-                   'agent_router.py', 'session_control.py', 'launcher_programs.py')
+                   'agent_router.py', 'session_control.py', 'launcher_programs.py', 'history_native.py')
 # Prepare stages before a native session is bound; a failure there started nothing.
 PRE_BIND_STAGES = frozenset(('validate', 'import', 'build'))
 UNKNOWN_PREPARE = ('대상 준비 결과를 확인하지 못했습니다. 이미 작업이 시작되었을 수 있으므로 '

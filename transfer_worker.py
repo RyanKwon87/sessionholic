@@ -396,6 +396,9 @@ def _rpc(request):
     from transfer_native import profiles, source_state, interrupt_source
     from transfer_workspace import inspect_workspace, export_workspace, import_workspace
     op, args = request.get('op'), request.get('args', {})
+    if op == 'session_history':
+        from history_native import handle
+        return handle(args)
     if op == 'chat':
         from native_chat import handle
         return handle(args)

@@ -7811,3 +7811,11 @@ body.terminal-docked .detail-head > .chat-model-controls { grid-column: 1 / -1; 
 }
 .dictation-send:focus-visible,
 .dictation-stop:focus-visible { outline: 3px solid var(--accent); outline-offset: 3px; }
+/* History is stored as text: preserve paragraphs without overflowing narrow screens. */
+.history-policy { display: flex; flex-wrap: wrap; gap: 12px; margin: 12px 0; }
+.history-policy input { width: 5em; }
+.history-record { padding: 14px 0; border-bottom: 1px solid var(--sep); }
+.history-record button { margin: 4px 8px 4px 0; }
+.history-dialog { width: min(760px, 94vw); max-height: 90dvh; overflow: auto; }
+.history-dialog pre { white-space: pre-wrap; overflow-wrap: anywhere; font: inherit; }
+.history-message { margin: 16px 0; padding: 12px; border: 1px solid var(--sep); border-radius: 10px; }

@@ -695,6 +695,7 @@ function openSettings() {
     : { value: $("saved-prompts")?.value || "", revision: state.savedPrompts?.revision ?? null };
   renderSavedPromptSettings();
   loadSavedPrompts();
+  window.SessionholicHistory?.load?.();
   window.SessionholicPush?.render?.();
   sheet("settings-dialog").open();
 }
@@ -11912,6 +11913,7 @@ function showLogin() {
   state.savedPromptsEditor = null; state.savedPromptsUnsaved = null; state.savedPromptsError = "";
   state.conversationViews.clear();
   window.SessionholicGoals?.locked?.();
+  window.SessionholicHistory?.close?.();
   state.phaseFilter = "";
   state.sessionCategory = "general"; state.filters.initiator = "";
   state.selectedBotRequest = null; state.botRequests = emptyBotRequests(); state.botConversations = new Map();
@@ -12265,6 +12267,7 @@ window.addEventListener("DOMContentLoaded", () => {
       render();
     } });
   window.SessionholicPush?.init?.({ api, toast });
+  window.SessionholicHistory?.init?.({ api, toast });
   window.SessionholicGoals?.init?.({ api, sessions: allSessions, openSession: select,
     startWork: openNewSession, manageSession,
     hideSession: () => setDetailShown(false), getSheet: sheet,

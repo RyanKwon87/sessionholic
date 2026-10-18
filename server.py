@@ -2670,6 +2670,81 @@ def display_stores(server):
             server.session_opened, server.session_pinned, server.preferences, server.prompts)
 
 
+def history_candidates(server, refresh=True):
+    """Only registered, recently collected owners; a hidden row is not proof of termination."""
+    from session_history import DAY, key
+    status = server.session_history.status()
+    if not status['policy']['enabled']:
+        return [], set()
+    now = time.time()
+    if refresh:
+        for host in server.board.hosts:
+            if host.get('monitorOnly') or host.get('platform') == 'windows':
+                continue
+            state = server.board.state.get(host['name']) or {}
+            if now - (state.get('fetchedAt') or 0) > 300:
+                server.board.poll(host)
+    snapshot = server.session_pinned.decorate(server.board.snapshot())
+    if not (snapshot.get('sessionPinned') or {}).get('ok'):
+        raise ValueError('보존할 고정 세션 정보를 읽지 못했습니다.')
+    candidates, protected, seen = [], set(), set()
+    for owner in snapshot['hosts']:
+        if not owner.get('ok') or now - (owner.get('fetchedAt') or 0) > 300:
+            continue
+        config = next(h for h in server.board.hosts if h['name'] == owner['name'])
+        if config.get('monitorOnly') or config.get('platform') == 'windows':
+            continue
+        for agent in ('codex', 'claude'):
+            for row in (owner.get('data') or {}).get(agent, []):
+                sid = row.get('id') or row.get('sessionId')
+                if not sid:
+                    continue
+                source = {field: row.get(field) for field in ('home', 'cwd', 'kind', 'sessionId', 'title')}
+                source.update(host=owner['name'], agent=agent, id=sid)
+                if row.get('pinnedAt') or row.get('phase') not in ('closed', 'done'):
+                    protected.add((owner['name'], agent, row.get('home'), sid))
+                    if any(r['key'] == key(source) and r['state'] not in ('deleted', 'uncertain') for r in status['records']):
+                        seen.add(key(source))
+                        candidates.append(source)
+                if row.get('pinnedAt') or row.get('phase') not in ('closed', 'done'):
+                    continue
+                changed = row.get('updatedAt')
+                if not isinstance(changed, (int, float)) or now - changed < status['policy']['idleDays'] * DAY:
+                    continue
+                seen.add(key(source))
+                candidates.append(source)
+    # A row can disappear from the native picker after archive; its stable identity remains.
+    for record in status['records']:
+        source = record['source']
+        owner = server.board.state.get(source['host']) or {}
+        if (record['key'] not in seen and record['state'] not in ('deleted', 'uncertain')
+                and owner.get('ok') and now - (owner.get('fetchedAt') or 0) <= 300
+                and (source['host'], source['agent'], source.get('home'), source['id']) not in protected):
+            candidates.append(source)
+    return candidates, protected
+
+
+def history_rpc(server, source, args):
+    host = next((h for h in server.board.hosts if h['name'] == source['host']), None)
+    owner = server.board.state.get(source['host']) or {}
+    if (host is None or host.get('monitorOnly') or host.get('platform') == 'windows'
+            or not owner.get('ok') or time.time() - (owner.get('fetchedAt') or 0) > 300):
+        raise ValueError('기기의 현재 상태를 확인하지 못했습니다.')
+    if args['action'] == 'delete':
+        snapshot = server.session_pinned.decorate(server.board.snapshot())
+        if not (snapshot.get('sessionPinned') or {}).get('ok'):
+            raise ValueError('고정 상태를 확인하지 못했습니다.')
+        for owner in snapshot['hosts']:
+            if owner['name'] != source['host']:
+                continue
+            for row in (owner.get('data') or {}).get(source['agent'], []):
+                if ((row.get('id') or row.get('sessionId')) in (args.get('family') or [])
+                        and row.get('home') == source.get('home')
+                        and (row.get('pinnedAt') or row.get('phase') not in ('closed', 'done'))):
+                    raise ValueError('보존하거나 사용 중인 세션입니다.')
+    return server.workflow.transfers.rpc(host, 'session_history', args, timeout=50)
+
+
 # A snapshot field each display store adds; a body is kept only when every one read.
 STORE_FIELDS = ("sessionLabels", "sessionSeen", "sessionTidied", "sessionRemoved", "sessionOpened",
                 "sessionPinned", "quickReplyPreferences", "savedPrompts")
@@ -3120,6 +3195,10 @@ class Handler(BaseHTTPRequestHandler):
                     return self.send_json(200, self.server.preferences.snapshot())
                 if url.path == "/api/prompts":
                     return self.send_json(200, self.server.prompts.snapshot())
+                if url.path == "/api/session-history":
+                    return self.send_json(200, self.server.session_history.status())
+                if url.path == "/api/session-history/conversation":
+                    return self.send_json(200, self.server.session_history.conversation(query.get('key'), query.get('offset', 0)))
                 if url.path in ("/api/history/message", "/api/history/search"):
                     if not self.server.history_gate.acquire(blocking=False):
                         return self.send_json(429, {"error": "기록을 읽고 있습니다. 잠시 뒤 다시 시도해 주세요."})
@@ -3543,6 +3622,12 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_json(403, {"error": "보안 연결을 갱신한 뒤 다시 시도해 주세요.",
                                         "code": "csrf_expired", **not_started})
         try:
+            if path == "/api/session-history/policy":
+                return self.send_json(200, self.server.session_history.policy(data))
+            if path == "/api/session-history/preserve":
+                if set(data) != {'key', 'preserved'}:
+                    raise ValueError('보존할 대화를 다시 선택해 주세요.')
+                return self.send_json(200, self.server.session_history.preserve(data['key'], data['preserved']))
             if path == "/api/bot-requests/refresh":
                 return self.send_json(200, scrub_payload(self.server.bot_requests.snapshot(force=True)))
             if path == "/api/push/subscribe":
@@ -3740,6 +3825,9 @@ class BoardHTTPServer(ThreadingHTTPServer):
     request_queue_size = 128
 
     def server_close(self):
+        history = getattr(self, "session_history", None)
+        if history is not None:
+            history.stop.set()
         work = getattr(self, "work", None)
         if work is not None:
             work.close()
@@ -3807,6 +3895,8 @@ def make_server(bind, port, board, token, terminals=None, workflow=None, state_d
         raise
     server.workflow = workflow if workflow is not None else Workflow(board, server.terminals, state_dir)
     server.workflow.goals = server.goals
+    from session_history import Histories
+    server.session_history = Histories(state_dir, lambda source, args: history_rpc(server, source, args))
     server.work = WorkService(board, server.goals, state_dir)
     server.work_list = work_list
     server.workflow.work = server.work
@@ -3865,6 +3955,7 @@ def main(argv=None):
     # The automatic work tab is retired: its off-screen conversation reads are opt-in.
     parser.add_argument("--auto-work", action="store_true", help="화면 밖 자동 작업 관찰을 켬(기본 꺼짐)")
     parser.add_argument("--no-auto-work", action="store_true", help="화면 밖 자동 작업 관찰을 끔(기본값, 이전 설정 호환)")
+    parser.add_argument("--no-history-retention", action="store_true", help="대화 자동 보존·정리 실행을 끔(검수용 서버 등)")
     parser.add_argument("--no-push", action="store_true", help="폰 알림을 끔(구독이 있어도 화면 밖 수집과 발송을 하지 않음)")
     parser.add_argument("--tailscale-user-file", type=Path,
                         help="비공개 파일에 적힌 Tailscale 사용자에게 HTTPS Serve 자동 인증 허용")
@@ -3918,6 +4009,8 @@ def main(argv=None):
         threading.Thread(target=rotate_logs_forever, args=(args.state_dir,), daemon=True,
                          name=THREAD_PREFIX + "-logs").start()
     httpd.workflow.start_hold_sweep()
+    if not args.no_history_retention:
+        httpd.session_history.start(lambda: history_candidates(httpd))
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:

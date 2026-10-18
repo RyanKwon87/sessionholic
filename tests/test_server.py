@@ -904,11 +904,15 @@ class HelperTest(unittest.TestCase):
             def __init__(self):
                 self.once, self.once_lock = ("", 0), threading.Lock()
                 self.workflow = SimpleNamespace(start_hold_sweep=lambda: None)
+                self.history_started = False
+                def start(collect):
+                    self.history_started = True
+                self.session_history = SimpleNamespace(start=start)
             def serve_forever(self):
                 raise KeyboardInterrupt
             def server_close(self):
                 pass
-        for flags in ([], ["--open"]):
+        for flags in ([], ["--open"], ["--no-history-retention"]):
             fake = FakeServer()
             with tempfile.TemporaryDirectory() as directory, patch("server.settings.load"), \
                  patch("server.settings.safe_path", side_effect=lambda path, **kw: Path(path)), \
@@ -916,7 +920,8 @@ class HelperTest(unittest.TestCase):
                  patch("server.make_server", return_value=fake), \
                  patch("sys.stdout", new_callable=io.StringIO) as out, patch("sys.stderr", new_callable=io.StringIO):
                 self.assertEqual(server.main(["--state-dir", directory] + flags), 0)
-            if not flags:
+            self.assertEqual(fake.history_started, '--no-history-retention' not in flags)
+            if '--open' not in flags:
                 self.assertEqual((out.getvalue(), fake.once), ("", ("", 0)))
                 continue
             code, expires = fake.once

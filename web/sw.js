@@ -14,6 +14,7 @@ const CACHE = "sessionholic-shell-v14";
 const ASSETS = new Set([
   "/app.js",
   "/session_labels.js",
+  "/session_history.js",
   "/push.js",
   "/theme-init.js",
   "/message-format.js",

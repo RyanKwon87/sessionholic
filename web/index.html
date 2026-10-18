@@ -26,6 +26,7 @@
     <!-- The terminal library (vendor/xterm.*, addon-fit) loads on first terminal open. -->
     <script src="/message-format.js" defer></script>
     <script src="/session_labels.js" defer></script>
+    <script src="/session_history.js" defer></script>
     <script src="/push.js" defer></script>
     <script src="/app.js" defer></script>
   </head>
@@ -500,6 +501,20 @@
         <p class="theme-label settings-section">초안 복원</p>
         <label class="draft-recovery-option"><input id="draft-recovery" type="checkbox" checked> 이 기기에 초안 보관</label>
         <p id="draft-recovery-status" class="plan-preserve" role="status">새로고침·탭 닫기 뒤 복원합니다. 잠그거나 로그인이 만료되면 삭제합니다.</p>
+        <details class="settings-section">
+          <summary class="theme-label">대화 보존·정리</summary>
+          <p class="plan-preserve">종료된 세션의 전체 텍스트 대화와 발췌 요약을 보존합니다. 사진·영상·첨부 파일은 포함하지 않으며 작업 파일은 그대로 둡니다.</p>
+          <p class="plan-preserve">맥 기기의 대화를 보존합니다. Codex의 확인된 원본 기록만 자동 정리하며, Claude 원본과 Windows 기록은 유지합니다.</p>
+          <label><input id="history-enabled" type="checkbox" /> 자동 보존·정리</label>
+          <div class="history-policy">
+            <label>미사용 기간 <input id="history-idle-days" type="number" min="1" max="365" value="14" />일</label>
+            <label>정리 유예 <input id="history-grace-days" type="number" min="1" max="365" value="7" />일</label>
+          </div>
+          <button id="history-save" class="push-button" type="button">보존 설정 저장</button>
+          <button id="history-reload" class="push-button" type="button">상태 새로고침</button>
+          <p id="history-status" class="plan-preserve" role="status" aria-live="polite"></p>
+          <div id="history-records"></div>
+        </details>
         <p id="quick-replies-label" class="theme-label settings-section">빠른 답장</p>
         <textarea id="quick-replies" class="quick-replies" rows="5" spellcheck="false"
           aria-labelledby="quick-replies-label" aria-describedby="quick-replies-help"></textarea>

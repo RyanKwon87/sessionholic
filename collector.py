@@ -735,7 +735,7 @@ class AppServer:
             params = {"clientInfo": {"name": NAMES["brand"]["codexClientName"], "version": "1"}}
             if capabilities:
                 params["capabilities"] = capabilities
-            self.call("initialize", params)
+            self.initialized = self.call("initialize", params)
             self._send(0x1, json.dumps({"method": "initialized", "params": {}}).encode())
         except BaseException:
             self.sock.close()
